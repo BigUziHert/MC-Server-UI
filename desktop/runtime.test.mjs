@@ -484,7 +484,11 @@ test("fresh desktop stays empty across restarts and gives the first explicit ser
     }),
   );
   const instance = second.fleet.runtimes.get(created.id);
-  assert.equal(instance.dataDir, path.join(dataDir, "instances", created.id));
+  // Windows temp paths can use different casing or an 8.3 alias; storage is canonicalized.
+  assert.equal(
+    instance.dataDir,
+    await fs.realpath(path.join(dataDir, "instances", created.id)),
+  );
   await second.close();
   const third = await launch();
   assert.equal(third.fleet.runtimes.get(created.id).dataDir, instance.dataDir);

@@ -232,8 +232,8 @@ async function launchPackaged({ expectEmpty = false } = {}) {
     "This script must test the packaged executable, not Electron development mode.",
   );
   assert.equal(
-    path.resolve(mainState.userData).toLowerCase(),
-    profileDirectory.toLowerCase(),
+    await fs.realpath(mainState.userData),
+    await fs.realpath(profileDirectory),
   );
   assert.equal(
     mainState.visible,
@@ -418,6 +418,20 @@ async function snapshotSmokeFolder(directory, prefix = "") {
   return snapshot;
 }
 
+async function assertOutsideProfile(directory) {
+  const [profile, canonicalDirectory] = await Promise.all([
+    fs.realpath(profileDirectory),
+    fs.realpath(directory),
+  ]);
+  const relative = path.relative(profile, canonicalDirectory);
+  assert.ok(
+    relative === ".." ||
+      relative.startsWith(`..${path.sep}`) ||
+      path.isAbsolute(relative),
+    "Imported fixtures must remain outside the isolated desktop profile.",
+  );
+}
+
 async function importSmokeExisting(page) {
   step(
     "Importing an existing external folder through the native picker, with cancellation and source preservation checks.",
@@ -438,7 +452,7 @@ async function importSmokeExisting(page) {
     await fs.writeFile(destination, contents);
   }
   const original = await snapshotSmokeFolder(directory);
-  assert.ok(path.relative(profileDirectory, directory).startsWith(".."));
+  await assertOutsideProfile(directory);
   const capabilities = await browserApi(page, "/server-import");
   assert.equal(capabilities.status, 200);
   assert.equal(capabilities.data.canBrowse, true);
@@ -511,7 +525,7 @@ async function importSmokeExisting(page) {
     assert.equal(imported.mode, "live");
     assert.equal(imported.status, "offline");
     assert.equal(imported.source, "imported");
-    assert.equal(path.resolve(imported.serverDir), path.resolve(directory));
+    assert.equal(imported.serverDir, await fs.realpath(directory));
     assert.equal(imported.jar, "paper-fixture.jar");
     assert.equal(imported.port, 25691);
     assert.deepEqual(await snapshotSmokeFolder(directory), original);
@@ -565,7 +579,7 @@ async function importSmokeNeoForge(page) {
     await fs.writeFile(destination, contents);
   }
   const original = await snapshotSmokeFolder(directory);
-  assert.ok(path.relative(profileDirectory, directory).startsWith(".."));
+  await assertOutsideProfile(directory);
   await page.getByRole("button", { name: "Add server", exact: true }).click();
   await page
     .getByRole("dialog", { name: "Add a server", exact: true })
@@ -611,7 +625,7 @@ async function importSmokeNeoForge(page) {
   assert.equal(imported.mode, "live");
   assert.equal(imported.status, "offline");
   assert.equal(imported.source, "imported");
-  assert.equal(path.resolve(imported.serverDir), path.resolve(directory));
+  assert.equal(imported.serverDir, await fs.realpath(directory));
   assert.equal(imported.launchType, "java-args");
   assert.equal(imported.launchScript, "");
   const launchArgs = [
@@ -712,10 +726,12 @@ async function quitPackaged(mode = "quit") {
 
 async function cleanupTemporaryProfile() {
   if (!temporaryRoot) return;
-  const target = path.resolve(temporaryRoot);
-  const parent = path.resolve(tmpdir());
+  assert.equal((await fs.lstat(temporaryRoot)).isSymbolicLink(), false);
+  const target = await fs.realpath(temporaryRoot);
+  const parent = await fs.realpath(tmpdir());
   if (
     path.dirname(target).toLowerCase() !== parent.toLowerCase() ||
+    !path.basename(temporaryRoot).startsWith("mc-panel-desktop-smoke-") ||
     !path.basename(target).startsWith("mc-panel-desktop-smoke-")
   ) {
     throw new Error(
@@ -913,10 +929,7 @@ try {
     (server) => server.id === imported.id,
   );
   assert.ok(retainedImport);
-  assert.equal(
-    path.resolve(retainedImport.serverDir),
-    path.resolve(imported.directory),
-  );
+  assert.equal(retainedImport.serverDir, await fs.realpath(imported.directory));
   assert.equal(retainedImport.mode, "live");
   assert.equal(retainedImport.status, "offline");
   await page
@@ -939,8 +952,8 @@ try {
   );
   assert.ok(retainedNeoForge);
   assert.equal(
-    path.resolve(retainedNeoForge.serverDir),
-    path.resolve(neoForge.directory),
+    retainedNeoForge.serverDir,
+    await fs.realpath(neoForge.directory),
   );
   assert.equal(retainedNeoForge.launchType, "java-args");
   assert.equal(retainedNeoForge.launchScript, "");

@@ -7,8 +7,10 @@ import {
 import {
   mkdtemp,
   mkdir,
+  lstat,
   readFile,
   readdir,
+  realpath,
   rm,
   writeFile,
 } from "node:fs/promises";
@@ -1755,8 +1757,16 @@ async function existingServerFixture({
     await mkdir(path.dirname(destination), { recursive: true });
     await writeFile(destination, contents);
   }
-  const panelDirectory = path.resolve(process.env.PANEL_E2E_DATA_DIR!);
-  expect(path.relative(panelDirectory, directory).startsWith("..")).toBe(true);
+  const [panelDirectory, canonicalDirectory] = await Promise.all([
+    realpath(process.env.PANEL_E2E_DATA_DIR!),
+    realpath(directory),
+  ]);
+  const relative = path.relative(panelDirectory, canonicalDirectory);
+  expect(
+    relative === ".." ||
+      relative.startsWith(`..${path.sep}`) ||
+      path.isAbsolute(relative),
+  ).toBe(true);
   return directory;
 }
 
@@ -1779,9 +1789,13 @@ async function snapshotExistingFolder(
 }
 
 async function removeExistingFixture(directory: string) {
-  const target = path.resolve(directory);
+  expect((await lstat(directory)).isSymbolicLink()).toBe(false);
+  const target = await realpath(directory);
   expect(path.dirname(target).toLowerCase()).toBe(
-    path.resolve(tmpdir()).toLowerCase(),
+    (await realpath(tmpdir())).toLowerCase(),
+  );
+  expect(path.basename(directory).startsWith("mc-panel-import-e2e-")).toBe(
+    true,
   );
   expect(path.basename(target).startsWith("mc-panel-import-e2e-")).toBe(true);
   await rm(target, { recursive: true, force: true, maxRetries: 3 });
@@ -1853,7 +1867,7 @@ test("imports an existing external server in place without changing its files or
       jar: "paper-fixture.jar",
       source: "imported",
     });
-    expect(path.resolve(server.serverDir)).toBe(path.resolve(directory));
+    expect(server.serverDir).toBe(await realpath(directory));
     await expect(dialog).not.toBeVisible();
     await expect(
       page.getByRole("heading", { name: "E2E Imported World", exact: true }),
@@ -2104,7 +2118,7 @@ test("imports a NeoForge run.bat server without a JAR and preserves its JVM argu
       memoryLimitMB: 6144,
       source: "imported",
     });
-    expect(path.resolve(server.serverDir)).toBe(path.resolve(directory));
+    expect(server.serverDir).toBe(await realpath(directory));
     await expect(dialog).not.toBeVisible();
     await expect(
       page.getByRole("heading", { name: "E2E NeoForge World", exact: true }),
@@ -2267,7 +2281,7 @@ test("imports a custom startup script without requiring a JAR or executing its c
       source: "imported",
       port: 25684,
     });
-    expect(path.resolve(server.serverDir)).toBe(path.resolve(directory));
+    expect(server.serverDir).toBe(await realpath(directory));
     await expect(dialog).not.toBeVisible();
     await expect(
       page.getByRole("heading", {

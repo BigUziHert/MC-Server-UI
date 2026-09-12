@@ -51,6 +51,7 @@ async function fixture(t, options = {}) {
 function gatedJava() {
   const commands = [];
   const flushing = deferred();
+  const ready = deferred();
   const child = new EventEmitter();
   child.stdout = new PassThrough();
   child.stderr = new PassThrough();
@@ -68,13 +69,15 @@ function gatedJava() {
     child,
     commands,
     flushing: flushing.promise,
+    ready: ready.promise,
     confirm: () => child.stdout.write("[Server thread/INFO]: Saved the game\n"),
     spawnServer: () => {
-      setImmediate(() =>
+      setImmediate(() => {
         child.stdout.write(
           '[Server thread/INFO]: Done (1.24s)! For help, type "help"\n',
-        ),
-      );
+        );
+        ready.resolve();
+      });
       return child;
     },
   };
@@ -98,7 +101,12 @@ for (const trigger of ["manual", "scheduled"]) {
       path.join(panel.serverDir, "world-proof.txt"),
       "world must survive quit",
     );
-    await panel.request("/api/server/power", json("POST", { action: "start" }));
+    const started = await panel.request(
+      "/api/server/power",
+      json("POST", { action: "start" }),
+    );
+    assert.equal(started.status, 200, JSON.stringify(started));
+    await java.ready;
     const abort = new AbortController();
     let pending;
     if (trigger === "manual") {
@@ -122,7 +130,16 @@ for (const trigger of ["manual", "scheduled"]) {
         new Date(new Date(saved.body.schedule.nextRun).getTime() + 1),
       );
     }
-    await java.flushing;
+    // A request rejected before reaching Java must fail the test, rather than
+    // leave an unresolved fixture gate that hides the original HTTP failure.
+    await Promise.race([
+      java.flushing,
+      pending.then((result) =>
+        assert.fail(
+          `The ${trigger} backup completed before requesting its world flush: ${JSON.stringify(result)}`,
+        ),
+      ),
+    ]);
     // A closed browser tab does not mean its backup stopped doing disk work.
     if (trigger === "manual") abort.abort();
     let completed = false;
@@ -179,7 +196,9 @@ test("shutdown drains a disconnected file mutation through its disk write and au
   const reachedWrite = deferred();
   const releaseWrite = deferred();
   panel.cleanup.push(releaseWrite.resolve);
-  const target = path.join(panel.serverDir, "slow.txt");
+  // safePath resolves existing parents before writing. Windows CI can expose
+  // TEMP using a short-name alias or different casing, so match that same path.
+  const target = path.join(await fs.realpath(panel.serverDir), "slow.txt");
   const original = fs.writeFile;
   t.mock.method(fs, "writeFile", async (destination, ...args) => {
     if (destination === target) {
@@ -199,7 +218,14 @@ test("shutdown drains a disconnected file mutation through its disk write and au
       signal: abort.signal,
     })
     .catch((cause) => cause);
-  await reachedWrite.promise;
+  await Promise.race([
+    reachedWrite.promise,
+    pending.then((result) =>
+      assert.fail(
+        `The file request completed before its gated disk write: ${JSON.stringify(result)}`,
+      ),
+    ),
+  ]);
   abort.abort();
   assert.equal(
     (

@@ -465,8 +465,8 @@ function EmptyFleet({ onAdd }: { onAdd: () => void }) {
               <FolderOpen size={21} />
               <h3>Bring your world</h3>
               <p>
-                Upload a JAR for a new server, or keep your existing world and
-                plugins right where they are.
+                Add your server software, or keep your existing world and mods
+                right where they are.
               </p>
             </li>
             <li>
@@ -784,10 +784,10 @@ function ServerWorkspace({
               <div>
                 <strong>Add a Minecraft server</strong>
                 <p>
-                  Choose Add server in the sidebar, select Minecraft Java, and
-                  configure its port and Java executable. Upload the JAR in File
-                  Manager, then follow the setup guide before starting. Use
-                  Settings to rename a server and Players to manage in-game OP.
+                  Choose Add server to create a workspace or import your
+                  existing server folder. Select its launch method: a JAR, Java
+                  arguments, script, or executable. Use Settings to rename a
+                  server and Players to manage in-game OP.
                 </p>
               </div>
             </div>
