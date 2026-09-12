@@ -1,8 +1,55 @@
 # Minecraft Server UI
 
-A local Minecraft server panel inspired by the navigation and console layout of Apollo. Built with React, TypeScript, Vite, and an Express API. Development work is on the `dev` branch.
+A local Minecraft server panel inspired by the navigation and console layout of Apollo. Available as a Windows desktop app or a browser-based development server. Built with React, TypeScript, Vite, and an Express API, with Electron for the desktop app. Development work is on the `dev` branch.
 
-## Run the panel
+## Windows desktop app
+
+**MC Panel runs in its own Windows window and includes its Node.js runtime.** End users do not need to install Node.js, use a terminal, or start a separate web server. Running a real Minecraft server still requires the Java version expected by its server JAR. Configure the Java executable, JAR, and memory in that server's settings, and accept the Minecraft EULA yourself.
+
+The Windows x64 build produces two executables in `release/`:
+
+| File                              | Use                                            |
+| --------------------------------- | ---------------------------------------------- |
+| `MC-Panel-0.1.0-Setup-x64.exe`    | Install MC Panel, then launch it from Windows. |
+| `MC-Panel-0.1.0-Portable-x64.exe` | Run MC Panel without installing it.            |
+
+The version in each filename follows `package.json`. These development builds are unsigned, so Windows may report an unknown publisher or show a SmartScreen notice. A code-signing certificate is not configured.
+
+Closing the window keeps MC Panel in the Windows notification area so running servers and backup schedules can continue. Reopen it from its tray icon. Choose **Quit MC Panel** in the desktop or tray menu to exit completely; when Java servers are running, the app asks before stopping them and shutting down. Quit waits for active backups and file changes to finish before stopping Java. Servers and schedules run only while the app is running. Saved Java servers stay stopped after you reopen the app until you choose **Start**. Press **Alt** to show the desktop menu. Its **Panel** menu also provides **Open server data folder**, **Open downloads folder**, and **Help and documentation**.
+
+### Desktop data
+
+Both the installed and portable editions save their server registry, worlds, backups, and settings under:
+
+```text
+%APPDATA%\MC Panel\data
+```
+
+This is separate from the repository's `data/` directory, so the desktop app does not automatically import an existing development workspace. The portable executable uses the same per-user data location; it does not keep worlds beside the executable. App upgrades and uninstalling the app preserve this data. Use **Open server data folder** to find it, and retain your own backups before moving or removing server files. Existing custom Minecraft directories remain in their configured locations. Desktop startup and shutdown errors are recorded one level above this folder in `%APPDATA%\MC Panel\desktop.log`.
+
+### Build the Windows app from source
+
+On Windows, install **Node.js 24 or newer** and **pnpm 11.19.0** (pinned in `package.json`), then run from the repository:
+
+```sh
+pnpm install --frozen-lockfile
+pnpm desktop
+```
+
+`pnpm desktop` builds the frontend and opens the desktop app. Other build commands are:
+
+```sh
+pnpm desktop:pack
+pnpm desktop:dist
+```
+
+`desktop:pack` creates an unpacked Windows app under `release/win-unpacked/`. Keep the entire directory together when running its executable. `desktop:dist` builds the installer and portable executable listed above. These commands prepare the Electron runtime automatically. Generated executables and packaging output stay in `release/` and are not committed to Git.
+
+After `desktop:pack` or `desktop:dist`, run `pnpm test:desktop` to smoke-test the packaged app. It uses an isolated temporary workspace so it does not change your normal desktop server data.
+
+The [Windows desktop workflow](.github/workflows/windows-desktop.yml) installs locked dependencies on a Windows runner, builds both executables, runs the backend and desktop unit tests, browser suite, and packaged-app smoke test, and uploads the executables as a workflow artifact. It is started manually with `workflow_dispatch` and does not publish a GitHub release. Once the workflow is available on the repository's default branch, choose **Windows desktop** in GitHub Actions, select the branch to build, and run it. Download the `MC-Panel-windows-x64` artifact from the completed run and extract the executables. Workflow artifacts expire after 14 days.
+
+## Run from source in a browser
 
 Install **Node.js 24 or newer**, then:
 
@@ -109,7 +156,7 @@ API clients can list/create servers at `/api/servers` and update one at `/api/se
 
 ## Local access boundary
 
-The server and development frontend bind to `127.0.0.1`. The API rejects nonlocal Host headers and cross-site mutation requests. This initial version has no login or network authorization, so do not expose it through a public reverse proxy or tunnel. Remote hosting and real role enforcement require authentication before deployment.
+The server and development frontend bind to `127.0.0.1`. The API rejects nonlocal Host headers and cross-site mutation requests. The browser development server has no login or user authorization, so do not expose it through a public reverse proxy or tunnel. The desktop app additionally protects its randomly assigned local port with a private session cookie and accepts only its own origin. Neither edition provides authenticated Subuser accounts or role enforcement for remote hosting.
 
 ## Verify
 

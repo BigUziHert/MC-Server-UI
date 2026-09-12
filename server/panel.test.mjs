@@ -227,7 +227,7 @@ test("backup is a readable gzip tar containing uploaded files, and survives a re
   assert.equal(
     (await request(`/api/backups/${created.body.id}`, { method: "DELETE" }))
       .status,
-    200,
+    503,
   );
 });
 

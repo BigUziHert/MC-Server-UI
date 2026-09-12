@@ -389,6 +389,30 @@ export async function createPanel(options = {}) {
   let processHandle = null;
   let restartRequested = false;
   let closed = false;
+  let closePromise;
+  const inFlightTasks = new Set();
+  const trackTask = (work) => {
+    const task = Promise.resolve().then(work);
+    inFlightTasks.add(task);
+    const finished = () => inFlightTasks.delete(task);
+    task.then(finished, finished);
+    return task;
+  };
+  const trackOperation = (handler) => async (req, res, next) => {
+    req.panelMutationStarted = true;
+    try {
+      if (closed) {
+        // Multer may have completed just as shutdown began. Its temporary files
+        // are outside the server tree and must not become a new file mutation.
+        for (const file of req.files ?? [])
+          await fs.rm(file.path, { force: true });
+        throw error(503, "The panel is shutting down.");
+      }
+      await trackTask(() => handler(req, res, next));
+    } finally {
+      req.panelMutationDone?.();
+    }
+  };
   let demoTimer = null;
   let lineId = 0;
   const lines = [];
@@ -907,7 +931,7 @@ export async function createPanel(options = {}) {
   }
 
   let schedulerBusy = false;
-  async function tick(now = new Date()) {
+  async function performTick(now = new Date()) {
     if (
       closed ||
       schedulerBusy ||
@@ -931,6 +955,8 @@ export async function createPanel(options = {}) {
       schedulerBusy = false;
     }
   }
+  const tick = (now) =>
+    closed ? Promise.resolve() : trackTask(() => performTick(now));
   if (state.schedule.enabled && !state.schedule.nextRun) {
     state.schedule.nextRun = nextRunFor(state.schedule);
     await save();
@@ -951,6 +977,7 @@ export async function createPanel(options = {}) {
     res.setHeader("X-Content-Type-Options", "nosniff");
     res.setHeader("Referrer-Policy", "no-referrer");
     res.setHeader("Cache-Control", "no-store");
+    if (closed) return next(error(503, "The panel is shutting down."));
     const host = (() => {
       try {
         return new URL(`http://${req.headers.host}`).hostname;
@@ -1008,8 +1035,12 @@ export async function createPanel(options = {}) {
           activeMutations--;
         }
       };
-      res.once("finish", done);
-      res.once("close", done);
+      req.panelMutationDone = done;
+      const abandoned = () => {
+        if (!req.panelMutationStarted) done();
+      };
+      res.once("finish", abandoned);
+      res.once("close", abandoned);
     }
     next();
   });
@@ -1101,82 +1132,91 @@ export async function createPanel(options = {}) {
     res.json({ operators, mode, status });
   });
   for (const action of ["op", "deop"]) {
-    app.post(`/api/players/${action}`, async (req, res) => {
-      const name = validatePlayerName(req.body?.name);
-      if (status !== "running")
-        throw error(
-          409,
-          "Start this server before changing in-game operators.",
+    app.post(
+      `/api/players/${action}`,
+      trackOperation(async (req, res) => {
+        const name = validatePlayerName(req.body?.name);
+        if (status !== "running")
+          throw error(
+            409,
+            "Start this server before changing in-game operators.",
+          );
+        const command = `${action} ${name}`;
+        if (mode === "live") {
+          if (!processHandle?.stdin.writable)
+            throw error(409, "The server is not ready to receive commands.");
+          await writeServer(processHandle, command);
+        } else {
+          state.demoOperators = state.demoOperators.filter(
+            (entry) => entry.name.toLowerCase() !== name.toLowerCase(),
+          );
+          if (action === "op") state.demoOperators.push({ name, level: 4 });
+        }
+        append(
+          `[${mode === "demo" ? "Demo" : "Panel"}] ${mode === "demo" ? "Simulated" : "Requested"}: ${command}`,
         );
-      const command = `${action} ${name}`;
-      if (mode === "live") {
-        if (!processHandle?.stdin.writable)
-          throw error(409, "The server is not ready to receive commands.");
-        await writeServer(processHandle, command);
-      } else {
-        state.demoOperators = state.demoOperators.filter(
-          (entry) => entry.name.toLowerCase() !== name.toLowerCase(),
+        await audit(
+          "player",
+          action === "op"
+            ? "Operator access requested"
+            : "Operator removal requested",
+          `${mode === "demo" ? "Simulated" : "Sent to Java"}: ${command}.`,
         );
-        if (action === "op") state.demoOperators.push({ name, level: 4 });
-      }
-      append(
-        `[${mode === "demo" ? "Demo" : "Panel"}] ${mode === "demo" ? "Simulated" : "Requested"}: ${command}`,
-      );
-      await audit(
-        "player",
-        action === "op"
-          ? "Operator access requested"
-          : "Operator removal requested",
-        `${mode === "demo" ? "Simulated" : "Sent to Java"}: ${command}.`,
-      );
-      res.json({
-        simulated: mode === "demo",
-        message:
-          mode === "demo"
-            ? `Demo: ${name} ${action === "op" ? "was added as an operator" : "had operator access removed"}. No in-game permissions were changed.`
-            : `Requested ${command}. Check the console for Minecraft's confirmation; ops.json may update after the command completes.`,
-      });
-    });
+        res.json({
+          simulated: mode === "demo",
+          message:
+            mode === "demo"
+              ? `Demo: ${name} ${action === "op" ? "was added as an operator" : "had operator access removed"}. No in-game permissions were changed.`
+              : `Requested ${command}. Check the console for Minecraft's confirmation; ops.json may update after the command completes.`,
+        });
+      }),
+    );
   }
-  app.post("/api/server/power", async (req, res) => {
-    await power(req.body?.action);
-    res.json({ status });
-  });
-  app.post("/api/console/command", async (req, res) => {
-    const command = req.body?.command;
-    if (
-      typeof command !== "string" ||
-      !command.trim() ||
-      command.length > 2048 ||
-      /[\r\n\0]/.test(command)
-    )
-      throw error(400, "Enter one console command, up to 2048 characters.");
-    if (status !== "running")
-      throw error(409, "Start the server before sending a command.");
-    const normalized = command.trim().replace(/^\//, "");
-    append(`> ${normalized}`);
-    if (normalized === "stop") await power("stop");
-    else if (mode === "live") processHandle.stdin.write(`${normalized}\n`);
-    else if (normalized === "help")
-      append(
-        "[Demo] Available examples: help, list, say <message>, save-all, time query daytime, stop.",
-      );
-    else if (normalized === "list")
-      append("[Demo] There are 0 of a max of 20 players online.");
-    else if (normalized.startsWith("say "))
-      append(`[Demo] [Server] ${normalized.slice(4)}`);
-    else if (normalized === "save-all")
-      append("[Demo] Saved the game (simulated).", "success");
-    else if (normalized === "time query daytime")
-      append("[Demo] The time is 6000.");
-    else
-      append(
-        `[Demo] Received “${normalized}”. Connect a live server to execute Minecraft commands.`,
-        "warn",
-      );
-    await audit("server", "Console command", normalized);
-    res.json({ ok: true });
-  });
+  app.post(
+    "/api/server/power",
+    trackOperation(async (req, res) => {
+      await power(req.body?.action);
+      res.json({ status });
+    }),
+  );
+  app.post(
+    "/api/console/command",
+    trackOperation(async (req, res) => {
+      const command = req.body?.command;
+      if (
+        typeof command !== "string" ||
+        !command.trim() ||
+        command.length > 2048 ||
+        /[\r\n\0]/.test(command)
+      )
+        throw error(400, "Enter one console command, up to 2048 characters.");
+      if (status !== "running")
+        throw error(409, "Start the server before sending a command.");
+      const normalized = command.trim().replace(/^\//, "");
+      append(`> ${normalized}`);
+      if (normalized === "stop") await power("stop");
+      else if (mode === "live") processHandle.stdin.write(`${normalized}\n`);
+      else if (normalized === "help")
+        append(
+          "[Demo] Available examples: help, list, say <message>, save-all, time query daytime, stop.",
+        );
+      else if (normalized === "list")
+        append("[Demo] There are 0 of a max of 20 players online.");
+      else if (normalized.startsWith("say "))
+        append(`[Demo] [Server] ${normalized.slice(4)}`);
+      else if (normalized === "save-all")
+        append("[Demo] Saved the game (simulated).", "success");
+      else if (normalized === "time query daytime")
+        append("[Demo] The time is 6000.");
+      else
+        append(
+          `[Demo] Received “${normalized}”. Connect a live server to execute Minecraft commands.`,
+          "warn",
+        );
+      await audit("server", "Console command", normalized);
+      res.json({ ok: true });
+    }),
+  );
 
   app.get("/api/files", async (req, res) => {
     const relative = req.query.path ?? "";
@@ -1206,68 +1246,75 @@ export async function createPanel(options = {}) {
     dest: uploadDir,
     limits: { fileSize: 256 * 1024 * 1024, files: 20, fields: 5 },
   });
-  app.post("/api/files/upload", upload.array("files", 20), async (req, res) => {
-    const files = req.files ?? [];
-    try {
-      const directory = req.query.path ?? "";
-      const parent = await safePath(serverDir, directory);
-      if (!(await fs.stat(parent)).isDirectory())
-        throw error(400, "Choose a directory to upload into.");
-      if (!files.length) throw error(400, "Choose at least one file.");
-      const destinations = [];
-      for (const file of files) {
-        const name = validateName(file.originalname);
-        const target = await safePath(
-          serverDir,
-          [directory, name].filter(Boolean).join("/"),
-        );
-        if (destinations.includes(target) || (await exists(target)))
-          throw error(
-            409,
-            `A file named “${name}” already exists. Rename it before uploading.`,
+  app.post(
+    "/api/files/upload",
+    upload.array("files", 20),
+    trackOperation(async (req, res) => {
+      const files = req.files ?? [];
+      try {
+        const directory = req.query.path ?? "";
+        const parent = await safePath(serverDir, directory);
+        if (!(await fs.stat(parent)).isDirectory())
+          throw error(400, "Choose a directory to upload into.");
+        if (!files.length) throw error(400, "Choose at least one file.");
+        const destinations = [];
+        for (const file of files) {
+          const name = validateName(file.originalname);
+          const target = await safePath(
+            serverDir,
+            [directory, name].filter(Boolean).join("/"),
           );
-        destinations.push(target);
+          if (destinations.includes(target) || (await exists(target)))
+            throw error(
+              409,
+              `A file named “${name}” already exists. Rename it before uploading.`,
+            );
+          destinations.push(target);
+        }
+        for (let i = 0; i < files.length; i++)
+          await fs.copyFile(files[i].path, destinations[i], 1);
+        await audit(
+          "file",
+          "Files uploaded",
+          `${files.length} file(s) uploaded to /${directory}.`,
+        );
+        diskCache.at = 0;
+        res.status(201).json({ uploaded: files.length });
+      } finally {
+        for (const file of files) await fs.rm(file.path, { force: true });
       }
-      for (let i = 0; i < files.length; i++)
-        await fs.copyFile(files[i].path, destinations[i], 1);
-      await audit(
-        "file",
-        "Files uploaded",
-        `${files.length} file(s) uploaded to /${directory}.`,
-      );
-      diskCache.at = 0;
-      res.status(201).json({ uploaded: files.length });
-    } finally {
-      for (const file of files) await fs.rm(file.path, { force: true });
-    }
-  });
+    }),
+  );
   app.get("/api/files/download", async (req, res) => {
     const target = await safePath(serverDir, req.query.path);
     if (!(await fs.stat(target)).isFile())
       throw error(400, "Choose a file to download.");
     res.download(target);
   });
-  app.post("/api/files", async (req, res) => {
-    const { path: directory = "", name, type, content = "" } = req.body ?? {};
-    validateName(name);
-    if (!["file", "directory"].includes(type) || typeof content !== "string")
-      throw error(400, "Choose a file or directory and valid text content.");
-    const target = await safePath(
-      serverDir,
-      [directory, name].filter(Boolean).join("/"),
-    );
-    if (await exists(target))
-      throw error(409, "A file or directory with this name already exists.");
-    if (type === "directory") await fs.mkdir(target);
-    else await fs.writeFile(target, content, { flag: "wx" });
-    await audit(
-      "file",
-      `${type === "file" ? "File" : "Directory"} created`,
-      [directory, name].filter(Boolean).join("/"),
-    );
-    diskCache.at = 0;
-    res.status(201).json({ ok: true });
-  });
+  app.post(
+    "/api/files",
+    trackOperation(async (req, res) => {
+      const { path: directory = "", name, type, content = "" } = req.body ?? {};
+      validateName(name);
+      if (!["file", "directory"].includes(type) || typeof content !== "string")
+        throw error(400, "Choose a file or directory and valid text content.");
+      const target = await safePath(
+        serverDir,
+        [directory, name].filter(Boolean).join("/"),
+      );
+      if (await exists(target))
+        throw error(409, "A file or directory with this name already exists.");
+      if (type === "directory") await fs.mkdir(target);
+      else await fs.writeFile(target, content, { flag: "wx" });
+      await audit(
+        "file",
+        `${type === "file" ? "File" : "Directory"} created`,
+        [directory, name].filter(Boolean).join("/"),
+      );
+      diskCache.at = 0;
+      res.status(201).json({ ok: true });
+    }),
+  );
   const editable = async (relative) => {
     const target = await safePath(serverDir, relative);
     const stat = await fs.stat(target);
@@ -1288,29 +1335,35 @@ export async function createPanel(options = {}) {
     const { content } = await editable(req.query.path);
     res.json({ content });
   });
-  app.put("/api/files/content", async (req, res) => {
-    if (
-      typeof req.body?.content !== "string" ||
-      Buffer.byteLength(req.body.content) > 1024 * 1024
-    )
-      throw error(400, "The editor supports text files up to 1 MB.");
-    const { target } = await editable(req.body.path);
-    await fs.writeFile(target, req.body.content);
-    await audit("file", "File edited", req.body.path);
-    diskCache.at = 0;
-    res.json({ ok: true });
-  });
-  app.delete("/api/files", async (req, res) => {
-    const relative = req.query.path;
-    if (!relative) throw error(400, "The server root cannot be deleted.");
-    const target = await safePath(serverDir, relative);
-    if (!(await exists(target)))
-      throw error(404, "File or directory not found.");
-    await fs.rm(target, { recursive: true });
-    await audit("file", "File deleted", relative);
-    diskCache.at = 0;
-    res.json({ ok: true });
-  });
+  app.put(
+    "/api/files/content",
+    trackOperation(async (req, res) => {
+      if (
+        typeof req.body?.content !== "string" ||
+        Buffer.byteLength(req.body.content) > 1024 * 1024
+      )
+        throw error(400, "The editor supports text files up to 1 MB.");
+      const { target } = await editable(req.body.path);
+      await fs.writeFile(target, req.body.content);
+      await audit("file", "File edited", req.body.path);
+      diskCache.at = 0;
+      res.json({ ok: true });
+    }),
+  );
+  app.delete(
+    "/api/files",
+    trackOperation(async (req, res) => {
+      const relative = req.query.path;
+      if (!relative) throw error(400, "The server root cannot be deleted.");
+      const target = await safePath(serverDir, relative);
+      if (!(await exists(target)))
+        throw error(404, "File or directory not found.");
+      await fs.rm(target, { recursive: true });
+      await audit("file", "File deleted", relative);
+      diskCache.at = 0;
+      res.json({ ok: true });
+    }),
+  );
 
   app.get("/api/backups", (_req, res) =>
     res.json({
@@ -1319,26 +1372,32 @@ export async function createPanel(options = {}) {
       timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
     }),
   );
-  app.post("/api/backups", async (req, res) => {
-    try {
-      res.status(201).json(await createBackup(req.body?.name));
-    } catch (cause) {
-      await audit("backup", "Backup failed", cause.message);
-      throw cause;
-    }
-  });
-  app.put("/api/backups/schedule", async (req, res) => {
-    const schedule = validateSchedule(req.body);
-    state.schedule = { ...schedule, nextRun: nextRunFor(schedule), timezone };
-    await audit(
-      "backup",
-      "Backup schedule updated",
-      schedule.enabled
-        ? `${schedule.type} schedule enabled; retain ${schedule.retention} scheduled backups. Timezone: ${Intl.DateTimeFormat().resolvedOptions().timeZone}.`
-        : "Automatic backups disabled.",
-    );
-    res.json({ schedule: state.schedule });
-  });
+  app.post(
+    "/api/backups",
+    trackOperation(async (req, res) => {
+      try {
+        res.status(201).json(await createBackup(req.body?.name));
+      } catch (cause) {
+        await audit("backup", "Backup failed", cause.message);
+        throw cause;
+      }
+    }),
+  );
+  app.put(
+    "/api/backups/schedule",
+    trackOperation(async (req, res) => {
+      const schedule = validateSchedule(req.body);
+      state.schedule = { ...schedule, nextRun: nextRunFor(schedule), timezone };
+      await audit(
+        "backup",
+        "Backup schedule updated",
+        schedule.enabled
+          ? `${schedule.type} schedule enabled; retain ${schedule.retention} scheduled backups. Timezone: ${Intl.DateTimeFormat().resolvedOptions().timeZone}.`
+          : "Automatic backups disabled.",
+      );
+      res.json({ schedule: state.schedule });
+    }),
+  );
   const getItem = (collection, id) => {
     const item = collection.find((entry) => entry.id === id);
     if (!item) throw error(404, "Record not found.");
@@ -1351,46 +1410,56 @@ export async function createPanel(options = {}) {
       `${item.name}.tar.gz`,
     );
   });
-  app.delete("/api/backups/:id", async (req, res) => {
-    if (backupBusy) throw error(409, "Wait for the current backup to finish.");
-    const item = getItem(state.backups, req.params.id);
-    await fs.rm(path.join(backupDir, `${item.id}.tar.gz`), { force: true });
-    state.backups = state.backups.filter((entry) => entry.id !== item.id);
-    await audit("backup", "Backup deleted", item.name);
-    res.json({ ok: true });
-  });
+  app.delete(
+    "/api/backups/:id",
+    trackOperation(async (req, res) => {
+      if (backupBusy)
+        throw error(409, "Wait for the current backup to finish.");
+      const item = getItem(state.backups, req.params.id);
+      await fs.rm(path.join(backupDir, `${item.id}.tar.gz`), { force: true });
+      state.backups = state.backups.filter((entry) => entry.id !== item.id);
+      await audit("backup", "Backup deleted", item.name);
+      res.json({ ok: true });
+    }),
+  );
   app.get("/api/subusers", (_req, res) => res.json({ users: state.users }));
-  app.post("/api/subusers", async (req, res) => {
-    const { email, role } = req.body ?? {};
-    if (
-      typeof email !== "string" ||
-      email.length > 254 ||
-      !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) ||
-      !roles.has(role)
-    )
-      throw error(400, "Enter a valid email address and role.");
-    if (state.users.some((item) => item.email === email.toLowerCase()))
-      throw error(409, "This email already has a local access record.");
-    const item = {
-      id: randomUUID(),
-      email: email.toLowerCase(),
-      role,
-      createdAt: new Date().toISOString(),
-    };
-    state.users.push(item);
-    await audit(
-      "user",
-      "Local access record added",
-      `${item.email} · ${role}. No invitation was sent; authentication is not configured.`,
-    );
-    res.status(201).json(item);
-  });
-  app.delete("/api/subusers/:id", async (req, res) => {
-    const item = getItem(state.users, req.params.id);
-    state.users = state.users.filter((entry) => entry.id !== item.id);
-    await audit("user", "Local access record removed", item.email);
-    res.json({ ok: true });
-  });
+  app.post(
+    "/api/subusers",
+    trackOperation(async (req, res) => {
+      const { email, role } = req.body ?? {};
+      if (
+        typeof email !== "string" ||
+        email.length > 254 ||
+        !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) ||
+        !roles.has(role)
+      )
+        throw error(400, "Enter a valid email address and role.");
+      if (state.users.some((item) => item.email === email.toLowerCase()))
+        throw error(409, "This email already has a local access record.");
+      const item = {
+        id: randomUUID(),
+        email: email.toLowerCase(),
+        role,
+        createdAt: new Date().toISOString(),
+      };
+      state.users.push(item);
+      await audit(
+        "user",
+        "Local access record added",
+        `${item.email} · ${role}. No invitation was sent; authentication is not configured.`,
+      );
+      res.status(201).json(item);
+    }),
+  );
+  app.delete(
+    "/api/subusers/:id",
+    trackOperation(async (req, res) => {
+      const item = getItem(state.users, req.params.id);
+      state.users = state.users.filter((entry) => entry.id !== item.id);
+      await audit("user", "Local access record removed", item.email);
+      res.json({ ok: true });
+    }),
+  );
   app.get("/api/databases", async (_req, res) => {
     const databases = await Promise.all(
       state.databases.map(async (item) => ({
@@ -1400,44 +1469,47 @@ export async function createPanel(options = {}) {
     );
     res.json({ databases });
   });
-  app.post("/api/databases", async (req, res) => {
-    const name = validateName(req.body?.name);
-    if (!/^[a-zA-Z][a-zA-Z0-9_-]{0,47}$/.test(name))
-      throw error(
-        400,
-        "Database names must start with a letter and use up to 48 letters, numbers, underscores, or dashes.",
-      );
-    if (
-      state.databases.some(
-        (item) => item.name.toLowerCase() === name.toLowerCase(),
+  app.post(
+    "/api/databases",
+    trackOperation(async (req, res) => {
+      const name = validateName(req.body?.name);
+      if (!/^[a-zA-Z][a-zA-Z0-9_-]{0,47}$/.test(name))
+        throw error(
+          400,
+          "Database names must start with a letter and use up to 48 letters, numbers, underscores, or dashes.",
+        );
+      if (
+        state.databases.some(
+          (item) => item.name.toLowerCase() === name.toLowerCase(),
+        )
       )
-    )
-      throw error(409, "A database with this name already exists.");
-    const item = {
-      id: randomUUID(),
-      name,
-      type: "SQLite",
-      size: 0,
-      createdAt: new Date().toISOString(),
-    };
-    const target = path.join(databaseDir, `${item.id}.sqlite`);
-    const db = new DatabaseSync(target);
-    try {
-      db.exec(
-        "CREATE TABLE panel_metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
-      );
-      db.prepare("INSERT INTO panel_metadata (key, value) VALUES (?, ?)").run(
-        "createdAt",
-        item.createdAt,
-      );
-    } finally {
-      db.close();
-    }
-    item.size = (await fs.stat(target)).size;
-    state.databases.push(item);
-    await audit("database", "SQLite database created", name);
-    res.status(201).json(item);
-  });
+        throw error(409, "A database with this name already exists.");
+      const item = {
+        id: randomUUID(),
+        name,
+        type: "SQLite",
+        size: 0,
+        createdAt: new Date().toISOString(),
+      };
+      const target = path.join(databaseDir, `${item.id}.sqlite`);
+      const db = new DatabaseSync(target);
+      try {
+        db.exec(
+          "CREATE TABLE panel_metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
+        );
+        db.prepare("INSERT INTO panel_metadata (key, value) VALUES (?, ?)").run(
+          "createdAt",
+          item.createdAt,
+        );
+      } finally {
+        db.close();
+      }
+      item.size = (await fs.stat(target)).size;
+      state.databases.push(item);
+      await audit("database", "SQLite database created", name);
+      res.status(201).json(item);
+    }),
+  );
   app.get("/api/databases/:id/download", (req, res) => {
     const item = getItem(state.databases, req.params.id);
     res.download(
@@ -1445,13 +1517,16 @@ export async function createPanel(options = {}) {
       `${item.name}.sqlite`,
     );
   });
-  app.delete("/api/databases/:id", async (req, res) => {
-    const item = getItem(state.databases, req.params.id);
-    await fs.rm(path.join(databaseDir, `${item.id}.sqlite`), { force: true });
-    state.databases = state.databases.filter((entry) => entry.id !== item.id);
-    await audit("database", "SQLite database deleted", item.name);
-    res.json({ ok: true });
-  });
+  app.delete(
+    "/api/databases/:id",
+    trackOperation(async (req, res) => {
+      const item = getItem(state.databases, req.params.id);
+      await fs.rm(path.join(databaseDir, `${item.id}.sqlite`), { force: true });
+      state.databases = state.databases.filter((entry) => entry.id !== item.id);
+      await audit("database", "SQLite database deleted", item.name);
+      res.json({ ok: true });
+    }),
+  );
   app.get("/api/audit", (_req, res) => res.json({ entries: state.audit }));
   app.use("/api", (_req, _res, next) =>
     next(error(404, "API endpoint not found.")),
@@ -1474,11 +1549,11 @@ export async function createPanel(options = {}) {
             : 500);
     res.status(status).json({
       error:
-        status >= 500
+        status >= 500 && status !== 503
           ? "The operation failed. Check the API terminal for details."
           : cause.message,
     });
-    if (status >= 500) console.error(cause);
+    if (status >= 500 && status !== 503) console.error(cause);
   });
 
   return {
@@ -1487,23 +1562,47 @@ export async function createPanel(options = {}) {
     serverDir,
     tick,
     descriptor,
-    updateConfiguration,
+    updateConfiguration: (...args) => {
+      if (closed)
+        return Promise.reject(error(503, "The panel is shutting down."));
+      return trackTask(() => updateConfiguration(...args));
+    },
     audit,
-    close: async () => {
-      closed = true;
-      clearPlayers();
-      clearInterval(scheduler);
-      clearTimeout(demoTimer);
-      if (processHandle) {
-        const child = processHandle;
-        child.stdin.write("stop\n");
-        await Promise.race([
-          new Promise((resolve) => child.once("close", resolve)),
-          new Promise((resolve) => setTimeout(resolve, 15000).unref()),
-        ]);
-        if (processHandle) child.kill();
+    close: () => {
+      if (!closePromise) {
+        closed = true;
+        clearPlayers();
+        clearInterval(scheduler);
+        clearTimeout(demoTimer);
+        closePromise = (async () => {
+          // An HTTP client can leave before its disk writes or backup finish.
+          // Wait for the handler itself, including save-on and its audit write.
+          while (inFlightTasks.size)
+            await Promise.allSettled([...inFlightTasks]);
+          clearTimeout(demoTimer);
+          if (processHandle) {
+            const child = processHandle;
+            const exited = new Promise((resolve) =>
+              child.once("close", resolve),
+            );
+            child.stdin.write("stop\n");
+            let timeout;
+            try {
+              await Promise.race([
+                exited,
+                new Promise((resolve) => {
+                  timeout = setTimeout(resolve, 15000);
+                }),
+              ]);
+              if (processHandle === child) child.kill();
+            } finally {
+              clearTimeout(timeout);
+            }
+          }
+          await saveChain;
+        })();
       }
-      await saveChain;
+      return closePromise;
     },
   };
 }
@@ -1522,6 +1621,8 @@ export async function createFleet(options = {}) {
   let changeChain = Promise.resolve();
   let closed = false;
   const serialize = (work) => {
+    if (closed)
+      return Promise.reject(error(503, "The panel is shutting down."));
     const pending = changeChain.catch(() => {}).then(work);
     changeChain = pending;
     return pending;
@@ -1850,10 +1951,10 @@ export async function createFleet(options = {}) {
   app.use((cause, _req, res, _next) => {
     if (res.headersSent) return;
     const status = cause.status ?? (cause.code === "ENOENT" ? 404 : 500);
-    if (status >= 500) console.error(cause);
+    if (status >= 500 && status !== 503) console.error(cause);
     res.status(status).json({
       error:
-        status >= 500
+        status >= 500 && status !== 503
           ? "The operation failed. Check the API terminal for details."
           : cause.message,
     });
