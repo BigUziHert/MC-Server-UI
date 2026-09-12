@@ -817,19 +817,21 @@ input:disabled {
   display: flex;
   flex-direction: column;
   min-width: 0;
+  align-self: start;
 }
 .console-output {
   background: #131712;
-  min-height: 322px;
+  min-height: 0;
   height: 322px;
   overflow: auto;
+  overscroll-behavior: contain;
   padding: 21px 18px;
   scrollbar-width: thin;
   scrollbar-color: #36442a transparent;
   font-family: "JetBrains Mono", monospace;
   font-size: 10px;
   line-height: 1.85;
-  flex: 1;
+  flex: 0 0 auto;
 }
 .log-line {
   display: grid;

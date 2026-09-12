@@ -121,6 +121,112 @@ test("console loads real API logs, sends commands, and controls the demo lifecyc
   );
 });
 
+for (const viewport of [
+  { name: "desktop", width: 1823, height: 1216 },
+  { name: "mobile", width: 390, height: 844 },
+]) {
+  test(`console stays a fixed scrolling box as logs stream in on ${viewport.name}`, async ({
+    page,
+  }, testInfo) => {
+    await page.setViewportSize(viewport);
+    let lineCount = 6;
+    await page.route("**/api/console", (route) =>
+      route.fulfill({
+        json: {
+          lines: Array.from({ length: lineCount }, (_, index) => ({
+            id: `streamed-log-${index}`,
+            time: "12:34:56",
+            level: "info",
+            message: `[Server thread] Log ${index}: Saving chunk data and processing scheduled world updates for the connected players.`,
+          })),
+        },
+      }),
+    );
+    await page.goto("/#console");
+    const logs = page.getByRole("log", {
+      name: "Server console output",
+      exact: true,
+    });
+    await expect(logs.locator(".log-line")).toHaveCount(lineCount);
+    await page.evaluate(() => document.fonts.ready);
+    const dimensions = () =>
+      logs.evaluate((element) => {
+        const log = element as HTMLElement;
+        const panel = log.closest(".console-panel")!;
+        const command = panel.querySelector<HTMLInputElement>(
+          'input[aria-label="Server command"]',
+        )!;
+        const logRect = log.getBoundingClientRect();
+        const commandRect = command.getBoundingClientRect();
+        return {
+          panelHeight: panel.getBoundingClientRect().height,
+          pageHeight: document.documentElement.scrollHeight,
+          logHeight: logRect.height,
+          logBottom: logRect.bottom + window.scrollY,
+          scrollHeight: log.scrollHeight,
+          scrollTop: log.scrollTop,
+          bottomGap: log.scrollHeight - log.clientHeight - log.scrollTop,
+          commandTop: commandRect.top + window.scrollY,
+          commandInsideLog: log.contains(command),
+        };
+      });
+    const baseline = await dimensions();
+
+    // The component's regular polling receives more lines without a page reload.
+    lineCount = 180;
+    await expect(logs.locator(".log-line")).toHaveCount(lineCount);
+    const overflowed = await dimensions();
+    expect(overflowed.panelHeight).toBeCloseTo(baseline.panelHeight, 0);
+    expect(overflowed.logHeight).toBeCloseTo(baseline.logHeight, 0);
+    expect(overflowed.pageHeight).toBeCloseTo(baseline.pageHeight, 0);
+    expect(overflowed.scrollHeight).toBeGreaterThan(
+      baseline.scrollHeight + 1000,
+    );
+    expect(overflowed.commandInsideLog).toBe(false);
+    expect(overflowed.commandTop).toBeGreaterThanOrEqual(overflowed.logBottom);
+    expect(overflowed.commandTop).toBeCloseTo(baseline.commandTop, 0);
+    await expect
+      .poll(async () => (await dimensions()).bottomGap)
+      .toBeLessThanOrEqual(1);
+
+    const autoscroll = page.getByRole("button", {
+      name: "Autoscroll",
+      exact: true,
+    });
+    await autoscroll.click();
+    await expect(autoscroll).not.toHaveClass(/\bactive\b/);
+    await logs.evaluate((element) => {
+      element.scrollTop = 50;
+    });
+    const paused = await dimensions();
+    expect(paused.scrollTop).toBe(50);
+    lineCount = 360;
+    await expect(logs.locator(".log-line")).toHaveCount(lineCount);
+    const appended = await dimensions();
+    expect(appended.scrollHeight).toBeGreaterThan(
+      overflowed.scrollHeight + 1000,
+    );
+    expect(appended.scrollTop).toBeCloseTo(paused.scrollTop, 0);
+    expect(appended.panelHeight).toBeCloseTo(baseline.panelHeight, 0);
+    expect(appended.logHeight).toBeCloseTo(baseline.logHeight, 0);
+    expect(appended.pageHeight).toBeCloseTo(baseline.pageHeight, 0);
+    expect(appended.commandTop).toBeCloseTo(baseline.commandTop, 0);
+
+    await autoscroll.click();
+    await expect(autoscroll).toHaveClass(/\bactive\b/);
+    await expect
+      .poll(async () => (await dimensions()).bottomGap)
+      .toBeLessThanOrEqual(1);
+    await expect(
+      page.getByRole("textbox", { name: "Server command", exact: true }),
+    ).toBeEnabled();
+    await page.screenshot({
+      path: testInfo.outputPath(`dense-console-${viewport.name}.png`),
+      fullPage: true,
+    });
+  });
+}
+
 test("file manager creates and edits nested files and preserves upload/download bytes", async ({
   page,
   request,
