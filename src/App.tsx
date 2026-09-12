@@ -40,6 +40,7 @@ import Subusers from "./pages/Subusers";
 import Databases from "./pages/Databases";
 import AuditLogs from "./pages/AuditLogs";
 import Players from "./pages/Players";
+import PlayerHead from "./PlayerHead";
 import ServerManager, {
   ServerSwitcher,
   type ServerRecord,
@@ -67,7 +68,7 @@ type Server = {
   disk: number;
   diskLimit: number;
   diskAvailable?: number;
-  players: { name: string; latency: number }[];
+  players: { name: string; uuid?: string; latency?: number | null }[];
   maxPlayers: number;
   metricsAvailable?: boolean;
   playersAvailable?: boolean;
@@ -761,9 +762,7 @@ function ConsolePage({
       <div className="page-heading console-heading">
         <div>
           <div className="eyebrow">SERVER OVERVIEW</div>
-          <h1>
-            Console<span className="heading-dot">.</span>
-          </h1>
+          <h1>Console</h1>
           <p>
             A front-row seat to your world. Keep everything running smoothly.
           </p>
@@ -1159,19 +1158,21 @@ function ConsolePage({
             </div>
             <div className="players-list">
               {server?.players.length ? (
-                server.players.map((player, index) => (
+                server.players.map((player) => (
                   <div className="player-row" key={player.name}>
-                    <span className={`player-avatar player-color-${index % 3}`}>
-                      {player.name.slice(0, 2)}
-                    </span>
+                    <PlayerHead name={player.name} uuid={player.uuid} />
                     <div>
                       <strong>{player.name}</strong>
                       <span>Exploring the world</span>
                     </div>
-                    <span className="player-latency">
-                      <Activity size={11} />
-                      {player.latency} ms
-                    </span>
+                    {typeof player.latency === "number" &&
+                      Number.isFinite(player.latency) &&
+                      player.latency >= 0 && (
+                        <span className="player-latency">
+                          <Activity size={11} />
+                          {player.latency} ms
+                        </span>
+                      )}
                   </div>
                 ))
               ) : (

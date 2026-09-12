@@ -72,20 +72,6 @@
 .players-operator:hover {
   background: #1e251b;
 }
-.players-game-avatar {
-  display: grid;
-  place-items: center;
-  width: 41px;
-  height: 41px;
-  flex-shrink: 0;
-  border: 1px solid #5c7041;
-  border-bottom: 5px solid #3b512b;
-  border-radius: 5px;
-  background: linear-gradient(135deg, #435a2c 49%, #354823 50%);
-  color: #d0e8ac;
-  font-family: "JetBrains Mono", monospace;
-  font-size: 13px;
-}
 .players-operator-identity {
   min-width: 0;
   flex: 1;

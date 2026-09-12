@@ -454,6 +454,11 @@ test("live player actions send validated single commands; ops.json remains autho
   );
   assert.deepEqual(starts.map((result) => result.status).sort(), [200, 409]);
   assert.equal(launches, 1);
+  child.stdout.write("[12:00:00 INFO]: BuilderOne joined the game\n");
+  assert.deepEqual((await request("/api/server", {}, live.id)).body.players, [
+    { name: "BuilderOne" },
+  ]);
+  assert.deepEqual((await request("/api/server")).body.players, []);
   assert.equal(
     (
       await request(

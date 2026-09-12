@@ -21,6 +21,7 @@ import {
   X,
 } from "lucide-react";
 import { useServerApi, type PageProps } from "../api";
+import PlayerHead from "../PlayerHead";
 import "./management.css";
 import "./players.css";
 
@@ -334,9 +335,7 @@ export default function Players({ notify }: PageProps) {
           <ul className="players-operator-list">
             {filtered.map((player) => (
               <li className="players-operator" key={player.uuid || player.name}>
-                <span className="players-game-avatar" aria-hidden="true">
-                  {player.name.slice(0, 2).toUpperCase()}
-                </span>
+                <PlayerHead name={player.name} uuid={player.uuid} size={40} />
                 <div className="players-operator-identity">
                   <strong>{player.name}</strong>
                   <span>

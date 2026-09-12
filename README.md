@@ -70,7 +70,11 @@ MC_VERSION=1.21.4
 
 The panel owns the Java process it launches. It cannot attach to an already running server. A normal panel shutdown sends `stop` and waits up to 15 seconds before terminating the process. The panel does not download JARs, change your EULA, or install plugins automatically. A custom `MC_SERVER_DIR` is never populated with demonstration files.
 
-Live stdout, commands, power state, uptime, disk usage, and in-game operator commands work. Live CPU/memory telemetry and online-player querying are not yet connected; the API marks those readings unavailable rather than presenting simulated values as real measurements. Storage capacity is the host filesystem's capacity, not an enforced per-server quota. Memory allocation is enforced through the Java heap arguments. Version, software, maximum player count, and the imported address are display configuration; change `server.properties` to alter other actual Minecraft server settings. The managed port and MOTD are available in the panel's server settings.
+Live stdout, commands, power state, uptime, disk usage, in-game operator commands, and online-player tracking work. The online-player list follows recognized vanilla/Paper join and leave messages from the Java process launched by the panel. UUID authentication announcements supply player UUIDs when available. Tracking starts with that process and clears on stop, exit, and restart; it does not read old logs or attach to a separate running server. Plugins or server versions that replace these standard log messages may prevent complete tracking. This is log tracking, not a server query, and no player latency is invented. Demo mode keeps the online-player list empty.
+
+The Console and Players pages fetch Minecraft head images in the browser from [MCHeads](https://mc-heads.net/), using the player's UUID when available and their username otherwise. No API key is needed. If an image cannot load, the panel shows its local default head.
+
+Live CPU/memory telemetry is not yet connected; the API marks those readings unavailable rather than presenting simulated values as real measurements. Storage capacity is the host filesystem's capacity, not an enforced per-server quota. Memory allocation is enforced through the Java heap arguments. Version, software, maximum player count, and the imported address are display configuration; change `server.properties` to alter other actual Minecraft server settings. The managed port and MOTD are available in the panel's server settings.
 
 ## Backup scheduling and data
 

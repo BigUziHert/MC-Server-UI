@@ -540,3 +540,95 @@ test("unconfirmed live world save fails without an archive and still sends save-
     201,
   );
 });
+
+test("managed Java tracks vanilla and Paper online players without trusting chat or command echoes", async (t) => {
+  const java = fakeJava();
+  const { request, serverDir } = await fixture(t, {
+    jar: "server.jar",
+    spawnServer: java.spawnServer,
+  });
+  await fs.writeFile(path.join(serverDir, "server.jar"), "never executed");
+  await fs.writeFile(path.join(serverDir, "eula.txt"), "eula=true\n");
+  await request("/api/server/power", json("POST", { action: "start" }));
+  const uuid = "12345678-1234-1234-1234-123456789abc";
+  java.child.stdout.write(
+    `[12:00:00] [User Authenticator #1/INFO]: UUID of player BuilderOne is ${uuid}\n`,
+  );
+  java.child.stdout.write(
+    "[12:00:01] [Server thread/INFO]: BuilderOne joined the ",
+  );
+  java.child.stdout.write(
+    "game\r\n\u001b[32m[12:00:02 INFO]: BuilderTwo joined the game\u001b[0m\n",
+  );
+  assert.deepEqual((await request("/api/server")).body.players, [
+    { name: "BuilderOne", uuid },
+    { name: "BuilderTwo" },
+  ]);
+  assert.equal((await request("/api/server")).body.playersAvailable, true);
+  java.child.stdout.write(
+    [
+      "[12:00:03] [Server thread/INFO]: <BuilderTwo> ForgedUser joined the game",
+      "[12:00:03 INFO]: [Server] ForgedUser joined the game",
+      "[12:00:03 INFO]: [Not Secure] <BuilderTwo> BuilderOne left the game",
+      "[12:00:03 INFO]: [Plugin] ForgedUser joined the game",
+      "[12:00:03] [Async Chat Thread - #1/INFO]: ForgedUser joined the game",
+      "[12:00:03] [User Authenticator #1/INFO]: ForgedUser joined the game",
+      "ForgedUser joined the game",
+      "> [Server thread/INFO]: BuilderOne left the game",
+      "[12:00:03 INFO]: BuilderOne left the game!",
+    ].join("\n") + "\n",
+  );
+  await request(
+    "/api/console/command",
+    json("POST", { command: "say ForgedUser joined the game" }),
+  );
+  assert.deepEqual((await request("/api/server")).body.players, [
+    { name: "BuilderOne", uuid },
+    { name: "BuilderTwo" },
+  ]);
+  const secondUuid = "87654321-abcd-1234-abcd-123456789abc";
+  java.child.stderr.write(
+    `[12:00:04 INFO]: UUID of player BuilderTwo is ${secondUuid.toUpperCase()}\n`,
+  );
+  java.child.stdout.write(
+    "[12:00:05] [Server thread/INFO]: BuilderOne left the game\n[12:00:06 INFO]: BuilderTwo joined the game\n",
+  );
+  assert.deepEqual((await request("/api/server")).body.players, [
+    { name: "BuilderTwo", uuid: secondUuid },
+  ]);
+  java.child.stdout.write("[12:00:07 INFO]: BuilderTwo left the game\n");
+  assert.deepEqual((await request("/api/server")).body.players, []);
+});
+
+test("online-player tracking clears at stop, process exit and restart and ignores obsolete processes", async (t) => {
+  const processes = [];
+  const { request, serverDir } = await fixture(t, {
+    jar: "server.jar",
+    spawnServer: () => {
+      const java = fakeJava();
+      processes.push(java);
+      return java.spawnServer();
+    },
+  });
+  await fs.writeFile(path.join(serverDir, "server.jar"), "never executed");
+  await fs.writeFile(path.join(serverDir, "eula.txt"), "eula=true\n");
+  await request("/api/server/power", json("POST", { action: "start" }));
+  const first = processes[0];
+  first.child.stdout.write(
+    "[12:00:00 INFO]: UUID of player BuilderOne is 12345678-1234-1234-1234-123456789abc\n[12:00:01 INFO]: BuilderOne joined the game\n",
+  );
+  assert.equal((await request("/api/server")).body.players.length, 1);
+  await request("/api/server/power", json("POST", { action: "stop" }));
+  assert.deepEqual((await request("/api/server")).body.players, []);
+  await request("/api/server/power", json("POST", { action: "start" }));
+  assert.deepEqual((await request("/api/server")).body.players, []);
+  first.child.stdout.write("[12:00:02 INFO]: StalePlayer joined the game\n");
+  const second = processes[1];
+  second.child.stdout.write("[12:00:03 INFO]: BuilderOne joined the game\n");
+  assert.deepEqual((await request("/api/server")).body.players, [
+    { name: "BuilderOne" },
+  ]);
+  second.child.emit("close", 1);
+  assert.deepEqual((await request("/api/server")).body.players, []);
+  assert.equal((await request("/api/server")).body.status, "offline");
+});

@@ -392,6 +392,55 @@ export async function createPanel(options = {}) {
   let demoTimer = null;
   let lineId = 0;
   const lines = [];
+  const onlinePlayers = new Map();
+  const playerUuids = new Map();
+  const clearPlayers = () => {
+    onlinePlayers.clear();
+    playerUuids.clear();
+  };
+  const trackPlayerOutput = (text, child) => {
+    // Only inspect the managed process's logger output, never panel echoes or chat.
+    if (
+      closed ||
+      child !== processHandle ||
+      !["starting", "running"].includes(status)
+    )
+      return;
+    const clean = text.replace(/\x1b\[[0-9;]*m/g, "");
+    if (clean.length > 2048) return;
+    const vanilla = clean.match(
+      /^(?:\[\d{2}:\d{2}:\d{2}\] )?\[(Server thread|User Authenticator #\d+)\/INFO\]: (.+)$/,
+    );
+    const paper = clean.match(/^\[\d{2}:\d{2}:\d{2} INFO\]: (.+)$/);
+    if (!vanilla && !paper) return;
+    const message = vanilla ? vanilla[2] : paper[1];
+    const uuid = message.match(
+      /^UUID of player ([A-Za-z0-9_]{3,16}) is ([a-fA-F0-9]{8}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{12})$/,
+    );
+    if (uuid) {
+      const key = uuid[1].toLowerCase();
+      const value = uuid[2].toLowerCase();
+      playerUuids.delete(key);
+      playerUuids.set(key, value);
+      // Failed authentication attempts need not accumulate indefinitely.
+      if (playerUuids.size > 4096)
+        playerUuids.delete(playerUuids.keys().next().value);
+      const player = onlinePlayers.get(key);
+      if (player) player.uuid = value;
+      return;
+    }
+    if (vanilla && vanilla[1] !== "Server thread") return;
+    const event = message.match(
+      /^([A-Za-z0-9_]{3,16}) (joined|left) the game$/,
+    );
+    if (!event) return;
+    const key = event[1].toLowerCase();
+    if (event[2] === "left") onlinePlayers.delete(key);
+    else {
+      const uuid = playerUuids.get(key);
+      onlinePlayers.set(key, { name: event[1], ...(uuid ? { uuid } : {}) });
+    }
+  };
   const append = (message, level = "info") => {
     const line = {
       id: String(++lineId),
@@ -546,6 +595,7 @@ export async function createPanel(options = {}) {
       throw error(409, "The server is already running or changing state.");
     // Reserve the transition before any filesystem awaits so concurrent starts cannot spawn twice.
     status = "starting";
+    clearPlayers();
     try {
       if (mode === "demo") {
         status = "starting";
@@ -604,6 +654,7 @@ export async function createPanel(options = {}) {
           const chunks = buffer.split(/\r?\n/);
           buffer = chunks.pop().slice(-32768);
           for (const text of chunks) {
+            trackPlayerOutput(text, child);
             if (/Done \(/.test(text) && status === "starting")
               status = "running";
             append(
@@ -617,7 +668,10 @@ export async function createPanel(options = {}) {
           }
         });
         stream.on("end", () => {
-          if (buffer) append(buffer, defaultLevel);
+          if (buffer) {
+            trackPlayerOutput(buffer, child);
+            append(buffer, defaultLevel);
+          }
         });
       };
       bindOutput(child.stdout, "info");
@@ -632,6 +686,7 @@ export async function createPanel(options = {}) {
         processHandle = null;
         status = "offline";
         startedAt = null;
+        clearPlayers();
         events.emit("server-exit", child);
         append(
           `[Panel] Server process exited (code ${code ?? "unknown"}).`,
@@ -663,6 +718,7 @@ export async function createPanel(options = {}) {
         );
       restartRequested = action === "restart";
       status = "stopping";
+      clearPlayers();
       append(
         `[${mode === "demo" ? "Demo" : "Panel"}] ${action === "restart" ? "Restarting" : "Stopping"} the server…`,
       );
@@ -985,10 +1041,12 @@ export async function createPanel(options = {}) {
       disk: diskCache.value,
       diskLimit: storage.blocks * storage.bsize,
       diskAvailable: storage.bavail * storage.bsize,
-      players: [],
+      players: [...onlinePlayers.values()].sort((a, b) =>
+        a.name.localeCompare(b.name),
+      ),
       maxPlayers: configuration.maxPlayers,
       metricsAvailable: mode === "demo",
-      playersAvailable: mode === "demo",
+      playersAvailable: true,
     });
   });
   app.get("/api/console", (_req, res) => res.json({ lines }));
@@ -1433,6 +1491,7 @@ export async function createPanel(options = {}) {
     audit,
     close: async () => {
       closed = true;
+      clearPlayers();
       clearInterval(scheduler);
       clearTimeout(demoTimer);
       if (processHandle) {

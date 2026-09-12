@@ -439,9 +439,6 @@ input:disabled {
   font-weight: 600;
   margin-bottom: 9px;
 }
-.heading-dot {
-  color: #bbef62;
-}
 .heading-meta {
   display: flex;
   align-items: center;
@@ -1067,30 +1064,16 @@ input:disabled {
 .player-row + .player-row {
   border-top: 1px solid #283222;
 }
-.player-avatar {
-  height: 28px;
-  width: 28px;
-  border-radius: 5px;
-  display: grid;
-  place-items: center;
-  font-family: monospace;
-  font-size: 11px;
-  background: #3d4b29;
-  color: #c1d794;
-  text-transform: uppercase;
-}
-.player-color-1 {
-  background: #3b3a53;
-  color: #b8aedb;
-}
-.player-color-2 {
-  background: #50422e;
-  color: #d7bf87;
+.player-row > div {
+  min-width: 0;
 }
 .player-row > div > strong {
   font-size: 10px;
   display: block;
   font-weight: 500;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 .player-row > div > span {
   font-size: 8px;
@@ -1105,6 +1088,7 @@ input:disabled {
   font-size: 8px;
   color: #97be74;
   margin-left: auto;
+  white-space: nowrap;
 }
 .backup-nudge {
   display: flex;

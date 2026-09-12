@@ -7,6 +7,16 @@ import {
 import { readFile } from "node:fs/promises";
 import * as tar from "tar";
 
+const minecraftHeadFixture =
+  '<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 8 8"><path fill="#70513d" d="M0 0h8v8H0z"/><path fill="#c99777" d="M1 3h6v4H1z"/><path fill="#284c78" d="M1 3h2v1H1zm4 0h2v1H5z"/><path fill="#452c20" d="M2 6h4v1H2z"/></svg>';
+
+test.beforeEach(async ({ page }) => {
+  // Exercise real image decoding while keeping skin-service networking deterministic.
+  await page.route("https://mc-heads.net/**", (route) =>
+    route.fulfill({ contentType: "image/svg+xml", body: minecraftHeadFixture }),
+  );
+});
+
 async function openPage(page: Page, hash: string, heading: string) {
   const endpoint = (
     {
@@ -37,7 +47,7 @@ test("console loads real API logs, sends commands, and controls the demo lifecyc
 }) => {
   await page.goto("/");
   await expect(
-    page.getByRole("heading", { level: 1, name: "Console." }),
+    page.getByRole("heading", { level: 1, name: "Console" }),
   ).toBeVisible();
   await expect(
     page.getByRole("heading", { name: "E2E Overworld" }),
@@ -489,7 +499,7 @@ test("all pages fit a mobile viewport and navigation remains usable", async ({
     expect((await request.post(endpoint, { data })).ok()).toBe(true);
   await page.setViewportSize({ width: 390, height: 844 });
   const pages = [
-    { hash: "console", heading: "Console." },
+    { hash: "console", heading: "Console" },
     { hash: "files", heading: "File Manager" },
     { hash: "subusers", heading: "Subusers" },
     { hash: "players", heading: "Players" },
@@ -771,7 +781,7 @@ test("server selection scopes file edits and downloads, console commands, backup
     ]),
   );
 
-  await openPage(page, "console", "Console.");
+  await openPage(page, "console", "Console");
   await expect(
     page.getByRole("heading", { name: "E2E Isolated World", exact: true }),
   ).toBeVisible();
@@ -1051,7 +1061,7 @@ test("Players grants and removes simulated OP independently of panel access and 
     page.getByRole("button", { name: "Add access record", exact: true }),
   ).toBeVisible();
 
-  await openPage(page, "console", "Console.");
+  await openPage(page, "console", "Console");
   await page.getByRole("button", { name: "Stop", exact: true }).click();
   await page
     .getByRole("dialog", { name: "Stop your server?", exact: true })
@@ -1093,7 +1103,7 @@ test("mobile navigation exposes server controls and the Players page without hor
   await page.setViewportSize({ width: 390, height: 844 });
   await page.goto("/");
   await expect(
-    page.getByRole("heading", { name: "Console.", exact: true }),
+    page.getByRole("heading", { name: "Console", exact: true }),
   ).toBeVisible();
   const assertFits = async (label: string) => {
     await page.evaluate(() => document.fonts.ready);
@@ -1183,4 +1193,253 @@ test("mobile navigation exposes server controls and the Players page without hor
     }),
   ).toBeVisible();
   await assertFits("Populated Players page");
+});
+
+type MockOnlinePlayer = {
+  name: string;
+  uuid?: string;
+  latency?: number | null;
+};
+
+async function mockOnlinePlayers(
+  page: Page,
+  players: () => MockOnlinePlayer[],
+) {
+  await page.route("**/api/server", async (route) => {
+    const response = await route.fetch();
+    const server = await response.json();
+    await route.fulfill({
+      json: {
+        ...server,
+        mode: "live",
+        status: "running",
+        playersAvailable: true,
+        players: players(),
+      },
+    });
+  });
+}
+
+async function mockOperators(
+  page: Page,
+  operators: Array<{ name: string; uuid?: string; level?: number }>,
+) {
+  await page.route("**/api/players", (route) =>
+    route.fulfill({
+      json: { operators, mode: "demo", status: "running" },
+    }),
+  );
+}
+
+async function expectHeadImage(
+  page: Page,
+  name: string,
+  identifier: string,
+  size: number,
+) {
+  const image = page.getByRole("img", {
+    name: `${name}'s Minecraft head`,
+    exact: true,
+  });
+  await expect(image).toHaveAttribute(
+    "src",
+    `https://mc-heads.net/avatar/${identifier}/64`,
+  );
+  await expect(image).toHaveAttribute("width", String(size));
+  await expect(image).toHaveAttribute("height", String(size));
+  await image.scrollIntoViewIfNeeded();
+  await expect
+    .poll(() =>
+      image.evaluate((element) => (element as HTMLImageElement).naturalWidth),
+    )
+    .toBeGreaterThan(0);
+}
+
+test("Minecraft head images use UUIDs or usernames, while console polling updates player joins and leaves", async ({
+  page,
+}, testInfo) => {
+  const uuid = "4bd20cf8-60be-4bf0-a791-4ec8a88c82d7";
+  let online: MockOnlinePlayer[] = [
+    { name: "UUID_Player", uuid },
+    { name: "Name_Only", latency: 42 },
+    { name: "Unknown_Ping", latency: null },
+  ];
+  await mockOnlinePlayers(page, () => online);
+  await mockOperators(page, [
+    { name: "UUID_Player", uuid, level: 4 },
+    { name: "Name_Only", level: 4 },
+  ]);
+  await page.goto("/");
+  await expect(
+    page.getByRole("heading", { level: 1, name: "Console", exact: true }),
+  ).toBeVisible();
+  await expect(
+    page.getByRole("heading", { level: 1, name: "Console.", exact: true }),
+  ).toHaveCount(0);
+  const playerRows = page.locator(".online-players .player-row");
+  await expect(playerRows).toHaveCount(3);
+  await expectHeadImage(page, "UUID_Player", uuid, 32);
+  await expectHeadImage(page, "Name_Only", "Name_Only", 32);
+  await expectHeadImage(page, "Unknown_Ping", "Unknown_Ping", 32);
+  await expect(playerRows.filter({ hasText: "Name_Only" })).toContainText(
+    "42 ms",
+  );
+  await expect(
+    playerRows.filter({ hasText: "UUID_Player" }).locator(".player-latency"),
+  ).toHaveCount(0);
+  await expect(
+    playerRows.filter({ hasText: "Unknown_Ping" }).locator(".player-latency"),
+  ).toHaveCount(0);
+  await expect(page.locator(".online-players .count-badge")).toHaveText("3");
+  await page.evaluate(() => document.fonts.ready);
+  await page.screenshot({
+    path: testInfo.outputPath("console-player-heads-desktop.png"),
+    fullPage: true,
+  });
+
+  online = [{ name: "Name_Only", latency: 42 }, { name: "Joined_Player" }];
+  await expect(playerRows.filter({ hasText: "Joined_Player" })).toBeVisible();
+  await expect(playerRows.filter({ hasText: "UUID_Player" })).toHaveCount(0);
+  await expect(playerRows.filter({ hasText: "Unknown_Ping" })).toHaveCount(0);
+  await expect(playerRows).toHaveCount(2);
+  await expectHeadImage(page, "Joined_Player", "Joined_Player", 32);
+  await expect(page.locator(".online-players .count-badge")).toHaveText("2");
+  online = [];
+  await expect(playerRows).toHaveCount(0);
+  await expect(page.locator(".online-players .count-badge")).toHaveText("0");
+  await expect(page.locator(".online-players .players-empty")).toBeVisible();
+
+  await openPage(page, "players", "Players");
+  await expectHeadImage(page, "UUID_Player", uuid, 40);
+  await expectHeadImage(page, "Name_Only", "Name_Only", 40);
+  await expect(page.locator(".players-operator")).toHaveCount(2);
+  await expect(
+    page.getByRole("button", {
+      name: "Remove OP for UUID_Player",
+      exact: true,
+    }),
+  ).toBeVisible();
+  await page.evaluate(() => document.fonts.ready);
+  await page.screenshot({
+    path: testInfo.outputPath("operator-heads-desktop.png"),
+    fullPage: true,
+  });
+});
+
+test("failed skin requests use local Minecraft heads and changing a player identity retries the correct skin", async ({
+  page,
+}, testInfo) => {
+  const uuid = "59006320-8d7d-4c61-a2b4-2548b51c3c47";
+  let online: MockOnlinePlayer[] = [{ name: "OfflineSkin" }];
+  const failedRequests: string[] = [];
+  await page.route(
+    "https://mc-heads.net/avatar/OfflineSkin/64",
+    async (route) => {
+      failedRequests.push(route.request().url());
+      await route.abort("failed");
+    },
+  );
+  await mockOnlinePlayers(page, () => online);
+  await mockOperators(page, [{ name: "OfflineSkin", level: 4 }]);
+  await page.goto("/");
+  let fallback = page.getByRole("img", {
+    name: "OfflineSkin's Minecraft head (default)",
+    exact: true,
+  });
+  await expect(fallback).toHaveAttribute("src", "/player-head-fallback.svg");
+  await fallback.scrollIntoViewIfNeeded();
+  await expect
+    .poll(() =>
+      fallback.evaluate(
+        (element) => (element as HTMLImageElement).naturalWidth,
+      ),
+    )
+    .toBeGreaterThan(0);
+  expect(failedRequests).toHaveLength(1);
+  await expect(
+    page
+      .locator(".online-players .player-row")
+      .filter({ hasText: "OfflineSkin" }),
+  ).toBeVisible();
+
+  // A resolved UUID for the same connected username must clear its failed-name lookup.
+  online = [{ name: "OfflineSkin", uuid }];
+  await expectHeadImage(page, "OfflineSkin", uuid, 32);
+  await expect(
+    page.getByRole("img", {
+      name: "OfflineSkin's Minecraft head (default)",
+      exact: true,
+    }),
+  ).toHaveCount(0);
+  expect(failedRequests).toHaveLength(1);
+
+  await openPage(page, "players", "Players");
+  fallback = page.getByRole("img", {
+    name: "OfflineSkin's Minecraft head (default)",
+    exact: true,
+  });
+  await expect(fallback).toHaveAttribute("src", "/player-head-fallback.svg");
+  await fallback.scrollIntoViewIfNeeded();
+  await expect
+    .poll(() =>
+      fallback.evaluate(
+        (element) => (element as HTMLImageElement).naturalWidth,
+      ),
+    )
+    .toBeGreaterThan(0);
+  await expect(fallback).toHaveAttribute("width", "40");
+  expect(failedRequests).toHaveLength(2);
+  await expect(
+    page.getByRole("button", {
+      name: "Remove OP for OfflineSkin",
+      exact: true,
+    }),
+  ).toBeVisible();
+  await page.screenshot({
+    path: testInfo.outputPath("operator-local-head-fallback.png"),
+    fullPage: true,
+  });
+});
+
+test("populated Minecraft head lists fit mobile Console and Players layouts", async ({
+  page,
+}, testInfo) => {
+  const uuid = "6eb7b2e9-3fa1-4fc6-bf8d-f293d731c421";
+  const players = [
+    { name: "Long_Player_1234", uuid },
+    { name: "Mobile_Builder01" },
+  ];
+  await page.setViewportSize({ width: 390, height: 844 });
+  await mockOnlinePlayers(page, () => players);
+  await mockOperators(
+    page,
+    players.map((player) => ({ ...player, level: 4 })),
+  );
+  for (const [hash, heading, size, screenshot] of [
+    ["console", "Console", 32, "console-player-heads-mobile.png"],
+    ["players", "Players", 40, "operator-heads-mobile.png"],
+  ] as const) {
+    await openPage(page, hash, heading);
+    await expectHeadImage(page, "Long_Player_1234", uuid, size);
+    await expectHeadImage(page, "Mobile_Builder01", "Mobile_Builder01", size);
+    await page.evaluate(() => document.fonts.ready);
+    const overflow = await page.evaluate(
+      () => document.documentElement.scrollWidth - window.innerWidth,
+    );
+    expect(
+      overflow,
+      `${heading} with Minecraft heads must fit the mobile viewport`,
+    ).toBeLessThanOrEqual(1);
+    for (const head of await page
+      .getByRole("img", { name: /Minecraft head/ })
+      .all()) {
+      const bounds = await head.boundingBox();
+      expect(bounds?.width).toBe(size);
+      expect(bounds?.height).toBe(size);
+    }
+    await page.screenshot({
+      path: testInfo.outputPath(screenshot),
+      fullPage: true,
+    });
+  }
 });
