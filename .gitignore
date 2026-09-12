@@ -1,0 +1,9 @@
+node_modules/
+dist/
+.env
+data/
+*.tsbuildinfo
+test-results/
+playwright-report/
+.dev-*.log
+.dev-*.pid

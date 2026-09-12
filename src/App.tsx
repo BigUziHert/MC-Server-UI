@@ -1,0 +1,1093 @@
+import { useCallback, useEffect, useRef, useState } from "react";
+import {
+  Activity,
+  ArrowDown,
+  ArrowDownToLine,
+  ArrowRight,
+  Box,
+  Check,
+  CheckCheck,
+  ChevronRight,
+  CircleHelp,
+  Clock3,
+  Cloud,
+  Copy,
+  Cpu,
+  Database,
+  ExternalLink,
+  FileText,
+  FolderOpen,
+  HardDrive,
+  Layers3,
+  ListFilter,
+  Menu,
+  MemoryStick,
+  Play,
+  RotateCw,
+  Search,
+  Send,
+  ShieldCheck,
+  Square,
+  Terminal,
+  Users,
+  X,
+} from "lucide-react";
+import { api, formatBytes, post } from "./api";
+import FileManager from "./pages/FileManager";
+import Backups from "./pages/Backups";
+import Subusers from "./pages/Subusers";
+import Databases from "./pages/Databases";
+import AuditLogs from "./pages/AuditLogs";
+
+type Page =
+  "console" | "files" | "subusers" | "databases" | "backups" | "audit";
+type Server = {
+  name: string;
+  address: string;
+  status: "running" | "offline" | "starting" | "stopping";
+  mode: "demo" | "live";
+  version: string;
+  software: string;
+  uptime: number;
+  cpu: number;
+  memory: number;
+  memoryLimit: number;
+  disk: number;
+  diskLimit: number;
+  diskAvailable?: number;
+  players: { name: string; latency: number }[];
+  maxPlayers: number;
+  metricsAvailable?: boolean;
+  playersAvailable?: boolean;
+};
+type LogLine = {
+  id: string | number;
+  time: string;
+  level: string;
+  message: string;
+};
+const navigation = [
+  { id: "console", label: "Console", icon: Terminal, group: "SERVER" },
+  { id: "files", label: "File Manager", icon: FolderOpen },
+  { id: "subusers", label: "Subusers", icon: Users, group: "MANAGEMENT" },
+  { id: "databases", label: "Databases", icon: Database },
+  { id: "backups", label: "Backups", icon: Cloud },
+  { id: "audit", label: "Audit Logs", icon: FileText },
+] as const;
+function getPage(): Page {
+  const hash = window.location.hash.slice(1);
+  return navigation.some((n) => n.id === hash) ? (hash as Page) : "console";
+}
+function uptime(seconds: number) {
+  return seconds < 60
+    ? `${Math.floor(seconds)}s`
+    : seconds < 3600
+      ? `${Math.floor(seconds / 60)}m ${Math.floor(seconds % 60)}s`
+      : `${Math.floor(seconds / 3600)}h ${Math.floor((seconds % 3600) / 60)}m`;
+}
+
+function useDialogFocus(open: boolean, onClose: () => void) {
+  const close = useRef(onClose);
+  close.current = onClose;
+  useEffect(() => {
+    if (!open) return;
+    const previous = document.activeElement as HTMLElement | null;
+    const dialog = document.querySelector<HTMLElement>(
+      ".modal-backdrop .modal",
+    );
+    if (!dialog) return;
+    const focusable = () =>
+      Array.from(
+        dialog.querySelectorAll<HTMLElement>(
+          'button:not(:disabled), a[href], input:not(:disabled), select:not(:disabled), textarea:not(:disabled), [tabindex="0"]',
+        ),
+      );
+    focusable()[0]?.focus();
+    const keydown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        close.current();
+      }
+      if (event.key === "Tab") {
+        const elements = focusable();
+        const first = elements[0],
+          last = elements.at(-1);
+        if (event.shiftKey && document.activeElement === first) {
+          event.preventDefault();
+          last?.focus();
+        } else if (!event.shiftKey && document.activeElement === last) {
+          event.preventDefault();
+          first?.focus();
+        }
+      }
+    };
+    document.addEventListener("keydown", keydown);
+    return () => {
+      document.removeEventListener("keydown", keydown);
+      previous?.focus();
+    };
+  }, [open]);
+}
+
+function Sparkline({
+  values,
+  color = "#bbef62",
+}: {
+  values: number[];
+  color?: string;
+}) {
+  const max = Math.max(...values, 1) * 1.25;
+  const points = values
+    .map(
+      (v, i) =>
+        `${(i / Math.max(values.length - 1, 1)) * 260},${45 - (v / max) * 35}`,
+    )
+    .join(" ");
+  return (
+    <svg
+      className="sparkline"
+      viewBox="0 0 260 50"
+      preserveAspectRatio="none"
+      aria-hidden="true"
+    >
+      <defs>
+        <linearGradient
+          id={`fade-${color.slice(1)}`}
+          x1="0"
+          y1="0"
+          x2="0"
+          y2="1"
+        >
+          <stop offset="0%" stopColor={color} stopOpacity=".15" />
+          <stop offset="100%" stopColor={color} stopOpacity="0" />
+        </linearGradient>
+      </defs>
+      <polygon
+        points={`0,50 ${points} 260,50`}
+        fill={`url(#fade-${color.slice(1)})`}
+      />
+      <polyline
+        points={points}
+        fill="none"
+        stroke={color}
+        strokeWidth="1.7"
+        vectorEffect="non-scaling-stroke"
+      />
+    </svg>
+  );
+}
+
+export default function App() {
+  const [page, setPage] = useState<Page>(getPage);
+  const [server, setServer] = useState<Server | null>(null);
+  const [connectionError, setConnectionError] = useState("");
+  const [toast, setToast] = useState<{
+    message: string;
+    error?: boolean;
+  } | null>(null);
+  const [sidebar, setSidebar] = useState(false);
+  const [help, setHelp] = useState(false);
+  useDialogFocus(help, () => setHelp(false));
+  const [history, setHistory] = useState<{ cpu: number[]; memory: number[] }>({
+    cpu: [],
+    memory: [],
+  });
+  const notify = useCallback(
+    (message: string, error?: boolean) => setToast({ message, error }),
+    [],
+  );
+  const refresh = useCallback(async () => {
+    try {
+      const s = await api<Server>("/server");
+      setServer(s);
+      setConnectionError("");
+      setHistory((h) => ({
+        cpu: [...h.cpu.slice(-39), s.cpu],
+        memory: [...h.memory.slice(-39), s.memory],
+      }));
+    } catch (error) {
+      setConnectionError((error as Error).message);
+    }
+  }, []);
+  useEffect(() => {
+    void refresh();
+    const timer = window.setInterval(refresh, 3000);
+    return () => clearInterval(timer);
+  }, [refresh]);
+  useEffect(() => {
+    const changed = () => {
+      setPage(getPage());
+      setSidebar(false);
+    };
+    window.addEventListener("hashchange", changed);
+    return () => window.removeEventListener("hashchange", changed);
+  }, []);
+  useEffect(() => {
+    if (!toast) return;
+    const timer = window.setTimeout(() => setToast(null), 5000);
+    return () => clearTimeout(timer);
+  }, [toast]);
+  useEffect(() => {
+    document.title = `${navigation.find((n) => n.id === page)?.label} · MC Panel`;
+  }, [page]);
+  const navigate = (id: Page) => {
+    window.location.hash = id;
+    setPage(id);
+    setSidebar(false);
+  };
+  return (
+    <div className="app-shell">
+      {sidebar && (
+        <button
+          className="sidebar-shade"
+          aria-label="Close navigation"
+          onClick={() => setSidebar(false)}
+        />
+      )}
+      <aside className={`sidebar ${sidebar ? "is-open" : ""}`}>
+        <a className="brand" href="#console" aria-label="MC Panel home">
+          <span className="brand-icon">
+            <Box size={24} />
+          </span>
+          <span>
+            MC<span className="brand-light">PANEL</span>
+            <small>YOUR WORLD. YOUR RULES.</small>
+          </span>
+        </a>
+        <div className="server-selector">
+          <span className="server-mini">
+            <Box size={19} />
+          </span>
+          <div>
+            <strong>{server?.name || "Minecraft Server"}</strong>
+            <span>
+              <i
+                className={`status-dot ${server?.status === "running" ? "" : "offline"}`}
+              />
+              {server?.status || "Connecting"}
+            </span>
+          </div>
+          <span className="server-number">01</span>
+        </div>
+        <nav aria-label="Main navigation">
+          {navigation.map((item) => (
+            <div key={item.id}>
+              {"group" in item && <div className="nav-label">{item.group}</div>}
+              <a
+                href={`#${item.id}`}
+                className={`nav-item ${page === item.id ? "active" : ""}`}
+                aria-current={page === item.id ? "page" : undefined}
+                onClick={() => setSidebar(false)}
+              >
+                <item.icon size={19} />
+                <span>{item.label}</span>
+                {page === item.id && <span className="nav-active-dot" />}
+              </a>
+            </div>
+          ))}
+        </nav>
+        <div className="sidebar-bottom">
+          <div className="workspace-note">
+            <div className="workspace-note-title">
+              <ShieldCheck size={16} />
+              <strong>Made for your world</strong>
+            </div>
+            <p>
+              Your files, your server.
+              <br />
+              Everything in one place.
+            </p>
+            <button onClick={() => setHelp(true)}>
+              Getting started <ArrowRight size={14} />
+            </button>
+          </div>
+          <div className="profile">
+            <div className="avatar">C</div>
+            <div>
+              <strong>Local administrator</strong>
+              <small>Development workspace</small>
+            </div>
+            <span className="profile-dot" />
+          </div>
+        </div>
+      </aside>
+      <div className="main-shell">
+        <header className="topbar">
+          <div className="breadcrumbs">
+            <button
+              className="btn icon mobile-menu"
+              aria-label="Open navigation"
+              onClick={() => setSidebar(true)}
+            >
+              <Menu size={20} />
+            </button>
+            <Layers3 size={16} />
+            <span>My server</span>
+            <ChevronRight size={14} />
+            <strong>{navigation.find((n) => n.id === page)?.label}</strong>
+          </div>
+          <div className="topbar-right">
+            <span className="environment-badge">
+              <span />
+              {server?.mode === "live" ? "Local server" : "Demo workspace"}
+            </span>
+            <span className="topbar-divider" />
+            <button
+              className="help-button"
+              aria-label="Help and documentation"
+              onClick={() => setHelp(true)}
+            >
+              <CircleHelp size={17} />
+              <span>Help & docs</span>
+            </button>
+          </div>
+        </header>
+        <main className="main-content">
+          {connectionError && (
+            <div className="connection-error" role="alert">
+              Unable to reach the local backend. {connectionError}
+              <button className="btn" onClick={refresh}>
+                Retry
+              </button>
+            </div>
+          )}
+          {page === "console" && (
+            <ConsolePage
+              server={server}
+              history={history}
+              notify={notify}
+              refresh={refresh}
+              navigate={navigate}
+            />
+          )}
+          {page === "files" && <FileManager notify={notify} />}
+          {page === "backups" && <Backups notify={notify} />}
+          {page === "subusers" && <Subusers notify={notify} />}
+          {page === "databases" && <Databases notify={notify} />}
+          {page === "audit" && <AuditLogs notify={notify} />}
+          <footer className="footer">
+            <span>
+              <Box size={13} /> MC Panel <span className="muted">/</span>{" "}
+              <span className="muted">
+                A little more control. A lot more play.
+              </span>
+            </span>
+            <span className="muted">
+              Development build <span className="footer-version">v0.1.0</span>
+            </span>
+          </footer>
+        </main>
+      </div>
+      {toast && (
+        <div
+          className={`toast ${toast.error ? "error" : ""}`}
+          role={toast.error ? "alert" : "status"}
+        >
+          {toast.error ? <CircleHelp size={18} /> : <CheckCheck size={18} />}
+          <span>{toast.message}</span>
+          <button
+            aria-label="Dismiss notification"
+            onClick={() => setToast(null)}
+          >
+            <X size={16} />
+          </button>
+        </div>
+      )}
+      {help && (
+        <div className="modal-backdrop" onClick={() => setHelp(false)}>
+          <section
+            className="modal help-modal"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="help-title"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="modal-header">
+              <span className="feature-icon">
+                <Box size={24} />
+              </span>
+              <button
+                className="btn icon"
+                aria-label="Close help"
+                autoFocus
+                onClick={() => setHelp(false)}
+              >
+                <X size={18} />
+              </button>
+            </div>
+            <h2 id="help-title">Your server starts here.</h2>
+            <p>
+              This development workspace runs on your computer. Files, backup
+              archives, schedules, database files, and activity are stored
+              locally.
+            </p>
+            <div className="help-step">
+              <span>01</span>
+              <div>
+                <strong>Explore the console</strong>
+                <p>
+                  Demo mode simulates a Minecraft server. Try <code>help</code>,{" "}
+                  <code>list</code>, or <code>say Hello world</code>.
+                </p>
+              </div>
+            </div>
+            <div className="help-step">
+              <span>02</span>
+              <div>
+                <strong>Make it your own</strong>
+                <p>
+                  Upload files in File Manager and set an automatic backup
+                  schedule. These operations use real local files, including in
+                  demo mode.
+                </p>
+              </div>
+            </div>
+            <div className="help-step">
+              <span>03</span>
+              <div>
+                <strong>Connect a Minecraft server</strong>
+                <p>
+                  Follow the repository README to configure your Java executable
+                  and server JAR in <code>.env</code>, then restart the backend.
+                  Subusers are local records; authentication is not configured.
+                </p>
+              </div>
+            </div>
+            <a
+              className="btn primary"
+              href="https://github.com/BigUziHert/MC-Server-UI/tree/dev#readme"
+              target="_blank"
+              rel="noreferrer"
+            >
+              Open setup guide <ExternalLink size={15} />
+            </a>
+          </section>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function ConsolePage({
+  server,
+  history,
+  notify,
+  refresh,
+  navigate,
+}: {
+  server: Server | null;
+  history: { cpu: number[]; memory: number[] };
+  notify: (message: string, error?: boolean) => void;
+  refresh: () => Promise<void>;
+  navigate: (page: Page) => void;
+}) {
+  const [lines, setLines] = useState<LogLine[]>([]);
+  const [command, setCommand] = useState("");
+  const [search, setSearch] = useState("");
+  const [showSearch, setShowSearch] = useState(false);
+  const [autoScroll, setAutoScroll] = useState(true);
+  const [busy, setBusy] = useState(false);
+  const [confirmPower, setConfirmPower] = useState<"stop" | "restart" | null>(
+    null,
+  );
+  useDialogFocus(confirmPower !== null, () => setConfirmPower(null));
+  const [hiddenUntil, setHiddenUntil] = useState<string | number | null>(null);
+  const [logError, setLogError] = useState(false);
+  const commandInput = useRef<HTMLInputElement>(null);
+  const logContainer = useRef<HTMLDivElement>(null);
+  const commandHistory = useRef<string[]>([]);
+  const historyIndex = useRef(-1);
+  const loadLogs = useCallback(async () => {
+    try {
+      const result = await api<{ lines: LogLine[] }>("/console");
+      setLines(result.lines);
+      setLogError(false);
+    } catch {
+      setLogError(true);
+    }
+  }, []);
+  useEffect(() => {
+    void loadLogs();
+    const timer = setInterval(loadLogs, 1500);
+    return () => clearInterval(timer);
+  }, [loadLogs]);
+  useEffect(() => {
+    if (autoScroll && logContainer.current)
+      logContainer.current.scrollTop = logContainer.current.scrollHeight;
+  }, [lines, autoScroll]);
+  useEffect(() => {
+    const listener = (e: KeyboardEvent) => {
+      if ((e.ctrlKey || e.metaKey) && e.key === "k") {
+        e.preventDefault();
+        commandInput.current?.focus();
+      }
+      if (e.key === "Escape") setConfirmPower(null);
+    };
+    document.addEventListener("keydown", listener);
+    return () => document.removeEventListener("keydown", listener);
+  }, []);
+  async function power(action: "start" | "stop" | "restart") {
+    setBusy(true);
+    setConfirmPower(null);
+    try {
+      await post("/server/power", { action });
+      await refresh();
+      await loadLogs();
+      notify(
+        `Server ${action === "stop" ? "stop" : action === "restart" ? "restart" : "start"} requested.`,
+      );
+    } catch (error) {
+      notify((error as Error).message, true);
+    } finally {
+      setBusy(false);
+    }
+  }
+  async function sendCommand(e: React.FormEvent) {
+    e.preventDefault();
+    if (!command.trim() || busy) return;
+    setBusy(true);
+    try {
+      await post("/console/command", { command: command.trim() });
+      commandHistory.current.unshift(command);
+      historyIndex.current = -1;
+      setCommand("");
+      await loadLogs();
+      await refresh();
+    } catch (error) {
+      notify((error as Error).message, true);
+    } finally {
+      setBusy(false);
+      commandInput.current?.focus();
+    }
+  }
+  async function copyAddress() {
+    try {
+      await navigator.clipboard.writeText(server?.address || "localhost:25565");
+      notify("Server address copied.");
+    } catch {
+      notify("Could not access the clipboard.", true);
+    }
+  }
+  function downloadLogs() {
+    const blob = new Blob(
+      [
+        lines
+          .map(
+            (line) =>
+              `[${line.time}] [${line.level.toUpperCase()}] ${line.message}`,
+          )
+          .join("\n"),
+      ],
+      { type: "text/plain" },
+    );
+    const url = URL.createObjectURL(blob);
+    const anchor = document.createElement("a");
+    anchor.href = url;
+    anchor.download = "server-console.log";
+    anchor.click();
+    URL.revokeObjectURL(url);
+    notify("Console log downloaded.");
+  }
+  const isRunning = server?.status === "running";
+  const unavailable = server?.metricsAvailable === false;
+  const playersUnavailable = server?.playersAvailable === false;
+  const hiddenIndex =
+    hiddenUntil === null ? -1 : lines.findIndex((l) => l.id === hiddenUntil);
+  const visibleLines = lines
+    .slice(hiddenIndex + 1)
+    .filter((line) =>
+      `${line.message} ${line.level}`
+        .toLowerCase()
+        .includes(search.toLowerCase()),
+    );
+  return (
+    <>
+      <div className="page-heading console-heading">
+        <div>
+          <div className="eyebrow">SERVER OVERVIEW</div>
+          <h1>
+            Console<span className="heading-dot">.</span>
+          </h1>
+          <p>
+            A front-row seat to your world. Keep everything running smoothly.
+          </p>
+        </div>
+        <div className="heading-meta">
+          <Clock3 size={14} />
+          <span>
+            {server?.mode === "demo"
+              ? "Simulated server activity"
+              : "Updated every 3 seconds"}
+          </span>
+        </div>
+      </div>
+      <section className="server-banner">
+        <div className="server-identity">
+          <div className="world-icon">
+            <div className="pixel-world">
+              <span />
+              <span />
+              <span />
+              <span />
+              <span />
+              <span />
+              <span />
+              <span />
+              <span />
+            </div>
+          </div>
+          <div>
+            <div className="server-title">
+              <h2>{server?.name || "Minecraft Server"}</h2>
+              <span
+                className={`status-badge ${isRunning ? "running" : "offline"}`}
+              >
+                <i />
+                {server?.status || "Connecting"}
+              </span>
+            </div>
+            <button
+              className="address-button"
+              onClick={copyAddress}
+              aria-label="Copy server address"
+            >
+              <span>{server?.address || "localhost:25565"}</span>
+              <Copy size={12} />
+            </button>
+          </div>
+        </div>
+        <div className="server-power">
+          <span className="uptime">
+            <Clock3 size={13} />
+            {isRunning
+              ? `Up for ${uptime(server?.uptime || 0)}`
+              : server?.status === "starting"
+                ? "Server starting…"
+                : server?.status === "stopping"
+                  ? "Server stopping…"
+                  : "Server offline"}
+          </span>
+          <div className="power-buttons">
+            <button
+              className="btn start-button"
+              disabled={
+                !server || isRunning || busy || server.status !== "offline"
+              }
+              onClick={() => power("start")}
+            >
+              <Play size={14} fill="currentColor" />
+              Start
+            </button>
+            <button
+              className="btn"
+              disabled={!isRunning || busy}
+              onClick={() => setConfirmPower("restart")}
+            >
+              <RotateCw size={14} />
+              Restart
+            </button>
+            <button
+              className="btn stop-button"
+              disabled={(!isRunning && server?.status !== "starting") || busy}
+              onClick={() => setConfirmPower("stop")}
+            >
+              <Square size={12} fill="currentColor" />
+              Stop
+            </button>
+          </div>
+        </div>
+      </section>
+      <section className="metrics-grid" aria-label="Server resources">
+        <div className="metric-card">
+          <div className="metric-label">
+            <Cpu size={15} />
+            <span>CPU usage</span>
+            <span className="metric-indicator" />
+          </div>
+          <div className="metric-value">
+            {unavailable ? "—" : (server?.cpu || 0).toFixed(1)}
+            <span>{unavailable ? "" : "%"}</span>
+          </div>
+          <div className="metric-subtitle">
+            {unavailable
+              ? "Telemetry not connected"
+              : server?.mode === "demo"
+                ? "Simulated utilization"
+                : "Process utilization"}
+          </div>
+          {!unavailable && <Sparkline values={history.cpu} />}
+        </div>
+        <div className="metric-card">
+          <div className="metric-label">
+            <MemoryStick size={15} />
+            <span>Memory</span>
+          </div>
+          <div className="metric-value">
+            {unavailable ? "—" : ((server?.memory || 0) / 1024 ** 3).toFixed(2)}
+            <span>{unavailable ? "" : "GB"}</span>
+          </div>
+          <div className="metric-subtitle">
+            {unavailable
+              ? "Telemetry not connected"
+              : `of ${formatBytes(server?.memoryLimit || 0)} allocated`}
+          </div>
+          {!unavailable && (
+            <Sparkline values={history.memory} color="#97b9f5" />
+          )}
+        </div>
+        <div className="metric-card">
+          <div className="metric-label">
+            <HardDrive size={15} />
+            <span>Storage</span>
+          </div>
+          <div className="metric-value">
+            {formatBytes(server?.disk || 0).split(" ")[0]}
+            <span>{formatBytes(server?.disk || 0).split(" ")[1]}</span>
+          </div>
+          <div className="metric-subtitle">
+            {server?.diskLimit
+              ? `${formatBytes(server.diskAvailable ?? server.diskLimit)} free on host`
+              : "Local server files"}
+          </div>
+          <div className="storage-progress">
+            <div
+              style={{
+                width: `${Math.max(1, Math.min(100, ((server?.disk || 0) / (server?.diskLimit || 1024 ** 3)) * 100))}%`,
+              }}
+            />
+          </div>
+          <div className="metric-footnote">Filesystem storage</div>
+        </div>
+        <div className="metric-card players-metric">
+          <div className="metric-label">
+            <Users size={15} />
+            <span>Players online</span>
+          </div>
+          <div className="metric-value">
+            {playersUnavailable ? "—" : server?.players.length || 0}
+            <span>/ {server?.maxPlayers || 20}</span>
+          </div>
+          <div className="metric-subtitle">
+            {playersUnavailable
+              ? "Player query not connected"
+              : server?.mode === "demo"
+                ? "Demo player list"
+                : "Connected to your world"}
+          </div>
+          <div className="player-capacity">
+            {Array.from({ length: 20 }, (_, i) => (
+              <span
+                key={i}
+                className={
+                  i <
+                  ((server?.players.length || 0) / (server?.maxPlayers || 20)) *
+                    20
+                    ? "filled"
+                    : ""
+                }
+              />
+            ))}
+          </div>
+          <div className="metric-footnote">Room for more adventures</div>
+        </div>
+      </section>
+      <div className="console-layout">
+        <section className="panel console-panel">
+          <div className="panel-heading">
+            <div className="panel-title">
+              <Terminal size={17} />
+              <h2>Server console</h2>
+              <span className="live-label">
+                <i />
+                {server?.mode === "demo" ? "DEMO" : "LIVE"}
+              </span>
+            </div>
+            <div className="console-tools">
+              <button
+                className={`tool-button ${showSearch ? "selected" : ""}`}
+                aria-label="Search console logs"
+                title="Search logs"
+                onClick={() => setShowSearch((v) => !v)}
+              >
+                <Search size={16} />
+              </button>
+              <button
+                className="tool-button"
+                aria-label="Clear console view"
+                title="Clear view"
+                onClick={() => setHiddenUntil(lines.at(-1)?.id ?? null)}
+              >
+                <ListFilter size={16} />
+              </button>
+              <button
+                className="tool-button"
+                aria-label="Download console logs"
+                title="Download logs"
+                onClick={downloadLogs}
+              >
+                <ArrowDownToLine size={16} />
+              </button>
+            </div>
+          </div>
+          {showSearch && (
+            <div className="log-search">
+              <Search size={15} />
+              <input
+                aria-label="Filter console logs"
+                placeholder="Search console output…"
+                value={search}
+                onChange={(e) => setSearch(e.target.value)}
+                autoFocus
+              />
+              <button
+                className="tool-button"
+                aria-label="Close log search"
+                onClick={() => {
+                  setShowSearch(false);
+                  setSearch("");
+                }}
+              >
+                <X size={15} />
+              </button>
+            </div>
+          )}
+          <div
+            className="console-output"
+            ref={logContainer}
+            role="log"
+            aria-label="Server console output"
+            aria-live="off"
+          >
+            {logError ? (
+              <div className="console-empty">
+                Console connection unavailable. Retrying…
+              </div>
+            ) : visibleLines.length ? (
+              visibleLines.map((line, index) => (
+                <div
+                  className={`log-line log-${line.level}`}
+                  key={`${line.id}-${index}`}
+                >
+                  <time>
+                    {/^\d{2}:\d{2}/.test(line.time)
+                      ? line.time
+                      : new Date(line.time).toLocaleTimeString("en-GB")}
+                  </time>
+                  <span className="log-level">{line.level.toUpperCase()}</span>
+                  <span className="log-message">{line.message}</span>
+                </div>
+              ))
+            ) : (
+              <div className="console-empty">
+                <Terminal size={24} />
+                <p>
+                  {search
+                    ? "No logs match your search."
+                    : "Console is ready. Server output will appear here."}
+                </p>
+              </div>
+            )}
+          </div>
+          <div className="console-status">
+            <span>
+              <span className={`status-dot ${logError ? "offline" : ""}`} />
+              {logError ? "Reconnecting" : "Console connected"}
+              <span className="console-status-separator">•</span>UTF-8
+            </span>
+            <button
+              onClick={() => setAutoScroll((v) => !v)}
+              className={autoScroll ? "autoscroll active" : "autoscroll"}
+            >
+              {autoScroll ? <Check size={12} /> : <ArrowDown size={12} />}
+              Autoscroll
+            </button>
+          </div>
+          <form className="command-form" onSubmit={sendCommand}>
+            <ChevronRight size={18} />
+            <input
+              ref={commandInput}
+              aria-label="Server command"
+              placeholder={
+                isRunning
+                  ? "Type a command…"
+                  : "Start your server to send a command…"
+              }
+              value={command}
+              disabled={!isRunning}
+              onChange={(e) => setCommand(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "ArrowUp") {
+                  e.preventDefault();
+                  historyIndex.current = Math.min(
+                    historyIndex.current + 1,
+                    commandHistory.current.length - 1,
+                  );
+                  setCommand(
+                    commandHistory.current[historyIndex.current] || "",
+                  );
+                }
+                if (e.key === "ArrowDown") {
+                  e.preventDefault();
+                  historyIndex.current = Math.max(-1, historyIndex.current - 1);
+                  setCommand(
+                    commandHistory.current[historyIndex.current] || "",
+                  );
+                }
+              }}
+            />
+            <kbd>Ctrl K</kbd>
+            <button
+              type="submit"
+              aria-label="Send command"
+              disabled={!isRunning || !command.trim() || busy}
+            >
+              <Send size={16} />
+            </button>
+          </form>
+        </section>
+        <aside className="console-side">
+          <section className="panel server-details">
+            <div className="panel-heading">
+              <div className="panel-title">
+                <Box size={16} />
+                <h2>Server details</h2>
+              </div>
+            </div>
+            <dl>
+              <div>
+                <dt>Software</dt>
+                <dd>
+                  <span className="software-dot" />
+                  {server?.software || "Paper"}
+                </dd>
+              </div>
+              <div>
+                <dt>Version</dt>
+                <dd>
+                  <span className="version-badge">
+                    {server?.version || "—"}
+                  </span>
+                </dd>
+              </div>
+              <div>
+                <dt>Environment</dt>
+                <dd>{server?.mode === "live" ? "Local Java" : "Demo"}</dd>
+              </div>
+              <div>
+                <dt>Connection</dt>
+                <dd className="lime-text">Localhost</dd>
+              </div>
+            </dl>
+            <button className="card-link" onClick={() => navigate("files")}>
+              Manage server files <ArrowRight size={14} />
+            </button>
+          </section>
+          <section className="panel online-players">
+            <div className="panel-heading">
+              <div className="panel-title">
+                <Users size={16} />
+                <h2>Players</h2>
+                <span className="count-badge">
+                  {playersUnavailable ? "—" : server?.players.length || 0}
+                </span>
+              </div>
+              <span className="muted small">Online</span>
+            </div>
+            <div className="players-list">
+              {server?.players.length ? (
+                server.players.map((player, index) => (
+                  <div className="player-row" key={player.name}>
+                    <span className={`player-avatar player-color-${index % 3}`}>
+                      {player.name.slice(0, 2)}
+                    </span>
+                    <div>
+                      <strong>{player.name}</strong>
+                      <span>Exploring the world</span>
+                    </div>
+                    <span className="player-latency">
+                      <Activity size={11} />
+                      {player.latency} ms
+                    </span>
+                  </div>
+                ))
+              ) : (
+                <div className="players-empty">
+                  <Users size={23} />
+                  <strong>
+                    {playersUnavailable
+                      ? "Player query not connected"
+                      : "A world of possibilities"}
+                  </strong>
+                  <p>
+                    {playersUnavailable ? (
+                      "Live player tracking is not configured yet."
+                    ) : (
+                      <>
+                        Players will appear here
+                        <br />
+                        when they join your server.
+                      </>
+                    )}
+                  </p>
+                </div>
+              )}
+            </div>
+          </section>
+          <div className="backup-nudge">
+            <span className="backup-nudge-icon">
+              <Cloud size={21} />
+            </span>
+            <div>
+              <strong>Keep your world safe.</strong>
+              <p>Set it. Save it. Get back to playing.</p>
+              <button onClick={() => navigate("backups")}>
+                Configure backups <ArrowRight size={13} />
+              </button>
+            </div>
+          </div>
+        </aside>
+      </div>
+      <div className="console-bottom-note">
+        <ShieldCheck size={14} />
+        <span>
+          {server?.mode === "demo"
+            ? "You’re in demo mode. Console activity is simulated; files and backups are real."
+            : "Your panel is running locally. Server commands are sent directly to the Java process."}
+        </span>
+      </div>
+      {confirmPower && (
+        <div className="modal-backdrop">
+          <section
+            className="modal"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="power-title"
+          >
+            <h2 id="power-title">
+              {confirmPower === "stop" ? "Stop" : "Restart"} your server?
+            </h2>
+            <p>
+              Connected players will be disconnected. The server will receive a
+              graceful stop command to save its world.
+            </p>
+            <div className="modal-actions">
+              <button
+                className="btn"
+                autoFocus
+                onClick={() => setConfirmPower(null)}
+              >
+                Cancel
+              </button>
+              <button
+                className="btn danger"
+                onClick={() => power(confirmPower)}
+              >
+                {confirmPower === "stop" ? "Stop server" : "Restart server"}
+              </button>
+            </div>
+          </section>
+        </div>
+      )}
+    </>
+  );
+}
