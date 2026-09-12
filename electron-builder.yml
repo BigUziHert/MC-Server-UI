@@ -7,6 +7,7 @@ directories:
 files:
   - dist/**/*
   - server/index.mjs
+  - server/import.mjs
   - desktop/main.mjs
   - desktop/runtime.mjs
   - desktop/assets/**/*

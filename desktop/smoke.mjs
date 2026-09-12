@@ -293,11 +293,11 @@ async function launchPackaged({ expectEmpty = false } = {}) {
       "A fresh desktop profile must contain only an empty fleet registry, without seeded server files.",
     );
   } else {
-    assert.equal(servers.data.servers.length, 1);
-    assert.equal(
-      servers.data.servers[0].mode,
-      "demo",
-      "The smoke profile must retain only the explicitly created demo server.",
+    assert.equal(servers.data.servers.length, 2);
+    assert.deepEqual(
+      servers.data.servers.map((server) => server.mode).sort(),
+      ["demo", "live"],
+      "The smoke profile must retain its explicitly created demo and imported real server.",
     );
   }
   await installDownloadCapture(application, downloadDirectory);
@@ -315,8 +315,22 @@ async function createSmokeDemo(page) {
   await page
     .getByRole("button", { name: "Add your first server", exact: true })
     .click();
-  const dialog = page.getByRole("dialog", {
+  const choice = page.getByRole("dialog", {
     name: "Add a server",
+    exact: true,
+  });
+  await ui(
+    choice.getByRole("button", {
+      name: "Import an existing server",
+      exact: true,
+    }),
+  ).toBeVisible();
+  await capturePackaged("packaged-add-choice.png");
+  await choice
+    .getByRole("button", { name: "Create a new server", exact: true })
+    .click();
+  const dialog = page.getByRole("dialog", {
+    name: "Create a new server",
     exact: true,
   });
   await ui(dialog.getByLabel("Mode", { exact: true })).toHaveValue("live");
@@ -340,6 +354,145 @@ async function createSmokeDemo(page) {
   assert.equal(result.data.servers[0].mode, "demo");
   assert.equal(result.data.servers[0].id, result.data.defaultServerId);
   return result.data.defaultServerId;
+}
+
+async function snapshotSmokeFolder(directory, prefix = "") {
+  const snapshot = {};
+  for (const entry of await fs.readdir(directory, { withFileTypes: true })) {
+    const relative = prefix ? `${prefix}/${entry.name}` : entry.name;
+    const absolute = path.join(directory, entry.name);
+    if (entry.isDirectory()) {
+      snapshot[`${relative}/`] = "directory";
+      Object.assign(snapshot, await snapshotSmokeFolder(absolute, relative));
+    } else
+      snapshot[relative] = (await fs.readFile(absolute)).toString("base64");
+  }
+  return snapshot;
+}
+
+async function importSmokeExisting(page) {
+  step(
+    "Importing an existing external folder through the native picker, with cancellation and source preservation checks.",
+  );
+  const directory = path.join(temporaryRoot, "existing-minecraft-server");
+  const files = {
+    "server.properties":
+      "# Existing desktop server\r\nserver-port=25691\r\nmotd=Desktop imported world\r\nlevel-name=existing-world\r\nmax-players=32\r\n",
+    "eula.txt": "# Keep this decision unchanged.\r\neula=false\r\n",
+    "paper-fixture.jar": Buffer.from([80, 75, 3, 4, 0, 128, 255]),
+    "existing-world/level.dat": Buffer.from([31, 139, 8, 0, 45, 127, 128, 254]),
+    "plugins/Example/config.yml":
+      "enabled: true\nmessage: Original plugin configuration\n",
+  };
+  for (const [name, contents] of Object.entries(files)) {
+    const destination = path.join(directory, name);
+    await fs.mkdir(path.dirname(destination), { recursive: true });
+    await fs.writeFile(destination, contents);
+  }
+  const original = await snapshotSmokeFolder(directory);
+  assert.ok(path.relative(profileDirectory, directory).startsWith(".."));
+  const capabilities = await browserApi(page, "/server-import");
+  assert.equal(capabilities.status, 200);
+  assert.equal(capabilities.data.canBrowse, true);
+  await application.evaluate(({ dialog }, directory) => {
+    globalThis.__panelSmokePicker = {
+      original: dialog.showOpenDialog,
+      calls: [],
+    };
+    dialog.showOpenDialog = async (_window, options) => {
+      const calls = globalThis.__panelSmokePicker.calls;
+      calls.push({ title: options.title, properties: options.properties });
+      return calls.length === 1
+        ? { canceled: true, filePaths: [] }
+        : { canceled: false, filePaths: [directory] };
+    };
+  }, directory);
+  try {
+    await page.getByRole("button", { name: "Add server", exact: true }).click();
+    await page
+      .getByRole("dialog", { name: "Add a server", exact: true })
+      .getByRole("button", { name: "Import an existing server", exact: true })
+      .click();
+    const dialog = page.getByRole("dialog", {
+      name: "Import an existing server",
+      exact: true,
+    });
+    const folder = dialog.getByLabel("Server folder", { exact: true });
+    await dialog.getByRole("button", { name: "Browse", exact: true }).click();
+    await ui
+      .poll(() =>
+        application.evaluate(() => globalThis.__panelSmokePicker.calls.length),
+      )
+      .toBe(1);
+    await ui(folder).toHaveValue("");
+    await dialog.getByRole("button", { name: "Browse", exact: true }).click();
+    await ui(folder).toHaveValue(directory);
+    const calls = await application.evaluate(
+      () => globalThis.__panelSmokePicker.calls,
+    );
+    assert.equal(calls.length, 2);
+    assert.deepEqual(calls[1].properties, ["openDirectory", "dontAddToRecent"]);
+    assert.equal(calls[1].title, "Choose existing Minecraft server folder");
+    await dialog
+      .getByRole("button", { name: "Inspect folder", exact: true })
+      .click();
+    await ui(dialog.getByLabel("Server JAR", { exact: true })).toHaveValue(
+      "paper-fixture.jar",
+    );
+    await ui(dialog).toContainText(/not accepted/i);
+    assert.deepEqual(await snapshotSmokeFolder(directory), original);
+    await dialog
+      .getByLabel("Server name", { exact: true })
+      .fill("Desktop imported world");
+    await capturePackaged("packaged-import-review.png");
+    await dialog
+      .getByRole("button", { name: "Import server", exact: true })
+      .click();
+    await ui(dialog).not.toBeVisible();
+    await ui(
+      page.getByRole("heading", {
+        name: "Desktop imported world",
+        exact: true,
+      }),
+    ).toBeVisible();
+    const fleet = await browserApi(page, "/servers");
+    const imported = fleet.data.servers.find(
+      (server) => server.name === "Desktop imported world",
+    );
+    assert.ok(imported);
+    assert.equal(imported.mode, "live");
+    assert.equal(imported.status, "offline");
+    assert.equal(imported.source, "imported");
+    assert.equal(path.resolve(imported.serverDir), path.resolve(directory));
+    assert.equal(imported.jar, "paper-fixture.jar");
+    assert.equal(imported.port, 25691);
+    assert.deepEqual(await snapshotSmokeFolder(directory), original);
+    await page.getByRole("link", { name: "File Manager", exact: true }).click();
+    for (const name of [
+      "server.properties",
+      "eula.txt",
+      "paper-fixture.jar",
+      "existing-world",
+      "plugins",
+    ])
+      await ui(page.getByRole("button", { name, exact: true })).toBeVisible();
+    const eula = await browserApi(page, "/files/content?path=eula.txt", {
+      serverId: imported.id,
+    });
+    assert.equal(eula.data.content, files["eula.txt"]);
+    const registry = JSON.parse(
+      await fs.readFile(
+        path.join(profileDirectory, "data", "servers.json"),
+        "utf8",
+      ),
+    );
+    assert.ok(JSON.stringify(registry).includes("existing-minecraft-server"));
+    return { id: imported.id, directory, original };
+  } finally {
+    await application.evaluate(({ dialog }) => {
+      dialog.showOpenDialog = globalThis.__panelSmokePicker.original;
+    });
+  }
 }
 
 async function quitPackaged(mode = "quit") {
@@ -531,6 +684,8 @@ try {
   );
   assert.equal(renamed.status, 200);
 
+  const imported = await importSmokeExisting(page);
+
   step("Closing the hidden window keeps the tray runtime available.");
   const trayState = await application.evaluate(({ BrowserWindow, Menu }) => {
     const window = BrowserWindow.getAllWindows()[0];
@@ -596,12 +751,38 @@ try {
     ),
   );
   await capturePackaged("packaged-relaunch.png");
+  const retainedFleet = await browserApi(page, "/servers");
+  const retainedImport = retainedFleet.data.servers.find(
+    (server) => server.id === imported.id,
+  );
+  assert.ok(retainedImport);
+  assert.equal(
+    path.resolve(retainedImport.serverDir),
+    path.resolve(imported.directory),
+  );
+  assert.equal(retainedImport.mode, "live");
+  assert.equal(retainedImport.status, "offline");
+  await page
+    .getByRole("combobox", { name: "Switch server", exact: true })
+    .selectOption(imported.id);
+  await ui(
+    page.getByRole("heading", { name: "Desktop imported world", exact: true }),
+  ).toBeVisible();
+  const retainedEula = await browserApi(page, "/files/content?path=eula.txt", {
+    serverId: imported.id,
+  });
+  assert.equal(retainedEula.status, 200);
+  assert.ok(retainedEula.data.content.includes("eula=false"));
+  assert.deepEqual(
+    await snapshotSmokeFolder(imported.directory),
+    imported.original,
+  );
   step(
     "Simulating the window's Windows session-ending event and checking graceful exit.",
   );
   await quitPackaged("query-session-end");
   step(
-    `Passed: startup, isolation, authenticated API, sandboxing, uploads/downloads, SQLite, persistence, tray close, normal quit, and Windows-session shutdown. Artifacts: ${outputDirectory}`,
+    `Passed: clean startup, explicit creation, native folder picker cancellation/import, source and EULA preservation, isolation, authenticated API, sandboxing, uploads/downloads, SQLite, persistence, tray close, normal quit, and Windows-session shutdown. Artifacts: ${outputDirectory}`,
   );
 } catch (error) {
   failed = true;

@@ -36,6 +36,7 @@ let runtime;
 let quitting = false;
 let canQuit = false;
 let startup;
+let directoryDialog;
 
 async function logError(cause) {
   const message =
@@ -75,6 +76,25 @@ async function openDocumentation(url = documentation) {
 async function openFolder(folder) {
   const failure = await shell.openPath(folder);
   if (failure) dialog.showErrorBox("Could not open folder", failure);
+}
+
+async function selectServerDirectory() {
+  if (quitting || !window || window.isDestroyed()) return null;
+  if (!directoryDialog) {
+    directoryDialog = dialog
+      .showOpenDialog(window, {
+        title: "Choose existing Minecraft server folder",
+        buttonLabel: "Use server folder",
+        properties: ["openDirectory", "dontAddToRecent"],
+      })
+      .then(({ canceled, filePaths }) =>
+        canceled || quitting ? null : (filePaths[0] ?? null),
+      )
+      .finally(() => {
+        directoryDialog = undefined;
+      });
+  }
+  return directoryDialog;
 }
 
 async function requestQuit() {
@@ -201,7 +221,10 @@ function createMenus() {
 }
 
 async function launch() {
-  runtime = await startDesktopRuntime({ dataDir: path.join(userData, "data") });
+  runtime = await startDesktopRuntime({
+    dataDir: path.join(userData, "data"),
+    selectServerDirectory,
+  });
   const panelSession = session.fromPartition(`mc-panel-${randomUUID()}`);
   await panelSession.cookies.set({
     url: runtime.url,

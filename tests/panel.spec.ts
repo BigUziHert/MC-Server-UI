@@ -4,7 +4,15 @@ import {
   type APIRequestContext,
   type Page,
 } from "@playwright/test";
-import { readFile } from "node:fs/promises";
+import {
+  mkdtemp,
+  mkdir,
+  readFile,
+  readdir,
+  rm,
+  writeFile,
+} from "node:fs/promises";
+import { tmpdir } from "node:os";
 import path from "node:path";
 import * as tar from "tar";
 
@@ -603,6 +611,29 @@ async function switchServer(page: Page, id: string) {
   ).toHaveValue(id);
 }
 
+async function chooseNewServer(page: Page) {
+  const choice = page.getByRole("dialog", {
+    name: "Add a server",
+    exact: true,
+  });
+  await expect(choice).toBeVisible();
+  await expect(
+    choice.getByRole("button", {
+      name: "Import an existing server",
+      exact: true,
+    }),
+  ).toBeVisible();
+  await choice
+    .getByRole("button", { name: "Create a new server", exact: true })
+    .click();
+  const dialog = page.getByRole("dialog", {
+    name: "Create a new server",
+    exact: true,
+  });
+  await expect(dialog).toBeVisible();
+  return dialog;
+}
+
 test("server creation, editable names, and the selected workspace persist across reloads", async ({
   page,
   request,
@@ -615,10 +646,10 @@ test("server creation, editable names, and the selected workspace persist across
   });
   await expect(selector).toHaveValue(initial.defaultServerId);
   await page.getByRole("button", { name: "Add server", exact: true }).click();
-  let dialog = page.getByRole("dialog", { name: "Add a server", exact: true });
-  await expect(dialog).toBeVisible();
+  let dialog = await chooseNewServer(page);
   await dialog.getByLabel("Server name", { exact: true }).fill("E2E Creative");
   await dialog.getByLabel("Mode", { exact: true }).selectOption("demo");
+  await dialog.getByText("Advanced settings", { exact: true }).click();
   await dialog.getByLabel("Server port", { exact: true }).fill("25671");
   await dialog
     .getByRole("button", { name: "Create server", exact: true })
@@ -1124,8 +1155,7 @@ test("mobile navigation exposes server controls and the Players page without hor
     page.getByRole("combobox", { name: "Switch server", exact: true }),
   ).toBeInViewport();
   await page.getByRole("button", { name: "Add server", exact: true }).click();
-  let dialog = page.getByRole("dialog", { name: "Add a server", exact: true });
-  await expect(dialog).toBeVisible();
+  let dialog = await chooseNewServer(page);
   await dialog
     .getByLabel("Server name", { exact: true })
     .fill("A longer mobile server name");
@@ -1524,11 +1554,12 @@ test("an empty fleet shows clean onboarding and the first server defaults to Min
   await page
     .getByRole("button", { name: "Add your first server", exact: true })
     .click();
-  const dialog = page.getByRole("dialog", {
-    name: "Add a server",
-    exact: true,
-  });
+  const dialog = await chooseNewServer(page);
   await expect(dialog.getByLabel("Mode", { exact: true })).toHaveValue("live");
+  await expect(
+    dialog.getByLabel("Server JAR", { exact: true }),
+  ).not.toBeVisible();
+  await dialog.getByText("Advanced settings", { exact: true }).click();
   await expect(dialog.getByLabel("Server JAR", { exact: true })).toHaveValue(
     "server.jar",
   );
@@ -1684,4 +1715,280 @@ test("removing the last listed demo returns to onboarding and preserves its file
   await expect(
     page.getByRole("button", { name: "Add your first server", exact: true }),
   ).toBeVisible();
+});
+
+async function existingServerFixture({ multipleJars = false } = {}) {
+  const directory = await mkdtemp(path.join(tmpdir(), "mc-panel-import-e2e-"));
+  const files: Record<string, string | Buffer> = {
+    "server.properties":
+      "# Existing server: preserve these exact bytes\r\nserver-port=25681\r\nmotd=Imported E2E world\r\nlevel-name=existing-world\r\nmax-players=37\r\nonline-mode=true\r\n",
+    "eula.txt": "# The panel must not accept this agreement.\r\neula=false\r\n",
+    "paper-fixture.jar": Buffer.from([80, 75, 3, 4, 0, 128, 255]),
+    "existing-world/level.dat": Buffer.from([31, 139, 8, 0, 45, 127, 128, 254]),
+    "plugins/Example/config.yml":
+      "enabled: true\nmessage: Existing plugin settings\n",
+    "logs/latest.log": "[12:00:00] [Server thread/INFO]: Existing log entry\n",
+  };
+  if (multipleJars)
+    files["alternate-fixture.jar"] = Buffer.from([80, 75, 5, 6]);
+  for (const [name, contents] of Object.entries(files)) {
+    const destination = path.join(directory, name);
+    await mkdir(path.dirname(destination), { recursive: true });
+    await writeFile(destination, contents);
+  }
+  const panelDirectory = path.resolve(process.env.PANEL_E2E_DATA_DIR!);
+  expect(path.relative(panelDirectory, directory).startsWith("..")).toBe(true);
+  return directory;
+}
+
+async function snapshotExistingFolder(
+  directory: string,
+  prefix = "",
+): Promise<Record<string, string>> {
+  const snapshot: Record<string, string> = {};
+  for (const entry of await readdir(directory, { withFileTypes: true })) {
+    const relative = prefix ? `${prefix}/${entry.name}` : entry.name;
+    const absolute = path.join(directory, entry.name);
+    if (entry.isDirectory()) {
+      snapshot[`${relative}/`] = "directory";
+      Object.assign(snapshot, await snapshotExistingFolder(absolute, relative));
+    } else {
+      snapshot[relative] = (await readFile(absolute)).toString("base64");
+    }
+  }
+  return snapshot;
+}
+
+async function removeExistingFixture(directory: string) {
+  const target = path.resolve(directory);
+  expect(path.dirname(target).toLowerCase()).toBe(
+    path.resolve(tmpdir()).toLowerCase(),
+  );
+  expect(path.basename(target).startsWith("mc-panel-import-e2e-")).toBe(true);
+  await rm(target, { recursive: true, force: true, maxRetries: 3 });
+}
+
+async function chooseImportServer(page: Page) {
+  await page.getByRole("button", { name: "Add server", exact: true }).click();
+  const choice = page.getByRole("dialog", {
+    name: "Add a server",
+    exact: true,
+  });
+  await choice
+    .getByRole("button", { name: "Import an existing server", exact: true })
+    .click();
+  const dialog = page.getByRole("dialog", {
+    name: "Import an existing server",
+    exact: true,
+  });
+  await expect(dialog).toBeVisible();
+  return dialog;
+}
+
+test("imports an existing external server in place without changing its files or accepting the EULA", async ({
+  page,
+  request,
+}, testInfo) => {
+  const directory = await existingServerFixture();
+  const original = await snapshotExistingFolder(directory);
+  try {
+    await page.goto("/");
+    let dialog = await chooseImportServer(page);
+    await expect(
+      dialog.getByRole("button", { name: "Browse", exact: true }),
+    ).toHaveCount(0);
+    await dialog.getByLabel("Server folder", { exact: true }).fill(directory);
+    await dialog
+      .getByRole("button", { name: "Inspect folder", exact: true })
+      .click();
+    await expect(dialog.getByLabel("Server JAR", { exact: true })).toHaveValue(
+      "paper-fixture.jar",
+    );
+    await expect(dialog).toContainText("25681");
+    await expect(dialog).toContainText(/EULA/i);
+    await expect(dialog).toContainText(/not accepted/i);
+    expect(await snapshotExistingFolder(directory)).toEqual(original);
+    await dialog
+      .getByLabel("Server name", { exact: true })
+      .fill("E2E Imported World");
+    await page.screenshot({
+      path: testInfo.outputPath("import-review-desktop.png"),
+      fullPage: true,
+    });
+    const importedResponse = page.waitForResponse(
+      (response) =>
+        new URL(response.url()).pathname === "/api/server-import" &&
+        response.request().method() === "POST",
+    );
+    await dialog
+      .getByRole("button", { name: "Import server", exact: true })
+      .click();
+    const response = await importedResponse;
+    expect(response.status()).toBe(201);
+    const { server } = await response.json();
+    expect(server).toMatchObject({
+      name: "E2E Imported World",
+      mode: "live",
+      status: "offline",
+      port: 25681,
+      jar: "paper-fixture.jar",
+      source: "imported",
+    });
+    expect(path.resolve(server.serverDir)).toBe(path.resolve(directory));
+    await expect(dialog).not.toBeVisible();
+    await expect(
+      page.getByRole("heading", { name: "E2E Imported World", exact: true }),
+    ).toBeVisible();
+    await expect(
+      page.getByRole("button", { name: "Start", exact: true }),
+    ).toBeEnabled();
+    expect((await scopedGet(request, server.id, "/server")).status).toBe(
+      "offline",
+    );
+    expect(await snapshotExistingFolder(directory)).toEqual(original);
+
+    await page.getByRole("link", { name: "File Manager", exact: true }).click();
+    for (const name of [
+      "server.properties",
+      "eula.txt",
+      "paper-fixture.jar",
+      "existing-world",
+      "plugins",
+    ])
+      await expect(
+        page.getByRole("button", { name, exact: true }),
+      ).toBeVisible();
+    await page
+      .getByRole("button", { name: "existing-world", exact: true })
+      .click();
+    await expect(
+      page.getByRole("button", { name: "level.dat", exact: true }),
+    ).toBeVisible();
+    const downloadEvent = page.waitForEvent("download");
+    await page
+      .getByRole("link", { name: "Download level.dat", exact: true })
+      .click();
+    const download = await downloadEvent;
+    const downloadPath = testInfo.outputPath("imported-level.dat");
+    await download.saveAs(downloadPath);
+    expect((await readFile(downloadPath)).toString("base64")).toBe(
+      original["existing-world/level.dat"],
+    );
+    await page.reload();
+    await expect(
+      page.getByRole("combobox", { name: "Switch server", exact: true }),
+    ).toHaveValue(server.id);
+    expect(
+      (await listServers(request)).servers.some(
+        (item) => item.id === server.id,
+      ),
+    ).toBe(true);
+    expect(
+      (await scopedGet(request, server.id, "/files/content?path=eula.txt"))
+        .content,
+    ).toContain("eula=false");
+
+    dialog = await chooseImportServer(page);
+    await dialog.getByLabel("Server folder", { exact: true }).fill(directory);
+    await dialog
+      .getByRole("button", { name: "Inspect folder", exact: true })
+      .click();
+    await expect(dialog).toContainText(/already|overlap/i);
+    await expect(
+      dialog
+        .getByRole("button", { name: "Import server", exact: true })
+        .and(page.locator(":enabled")),
+    ).toHaveCount(0);
+    expect(await snapshotExistingFolder(directory)).toEqual(original);
+  } finally {
+    await removeExistingFixture(directory);
+  }
+});
+
+test("import review handles canceled folder selection, invalid folders, and multiple JARs on mobile", async ({
+  page,
+}, testInfo) => {
+  const directory = await existingServerFixture({ multipleJars: true });
+  const invalidDirectory = path.join(directory, "not-a-server");
+  await mkdir(invalidDirectory);
+  const original = await snapshotExistingFolder(directory);
+  let browseCalls = 0;
+  await page.route("**/api/server-import", async (route) => {
+    if (route.request().method() === "GET")
+      await route.fulfill({ json: { canBrowse: true } });
+    else await route.continue();
+  });
+  await page.route("**/api/server-import/browse", async (route) => {
+    browseCalls += 1;
+    await route.fulfill({ json: { directory: null } });
+  });
+  try {
+    await page.setViewportSize({ width: 390, height: 844 });
+    await page.goto("/");
+    await page
+      .getByRole("button", { name: "Open navigation", exact: true })
+      .click();
+    const dialog = await chooseImportServer(page);
+    const folder = dialog.getByLabel("Server folder", { exact: true });
+    await folder.fill(invalidDirectory);
+    await dialog.getByRole("button", { name: "Browse", exact: true }).click();
+    await expect.poll(() => browseCalls).toBe(1);
+    await expect(folder).toHaveValue(invalidDirectory);
+    await dialog
+      .getByRole("button", { name: "Inspect folder", exact: true })
+      .click();
+    await expect(dialog).toContainText(/server\.properties/i);
+    await expect(
+      dialog
+        .getByRole("button", { name: "Import server", exact: true })
+        .and(page.locator(":enabled")),
+    ).toHaveCount(0);
+    await folder.fill(directory);
+    await dialog
+      .getByRole("button", { name: "Inspect folder", exact: true })
+      .click();
+    const jar = dialog.getByLabel("Server JAR", { exact: true });
+    await expect(jar).toHaveValue("");
+    await expect(
+      dialog.getByRole("button", { name: "Import server", exact: true }),
+    ).toBeDisabled();
+    const port = dialog.getByLabel("Server port", { exact: true });
+    if (!(await port.isVisible()))
+      await dialog.getByText("Advanced settings", { exact: true }).click();
+    await expect(port).toHaveValue("25681");
+    await port.fill("25682");
+    await jar.selectOption("paper-fixture.jar");
+    await expect(
+      dialog.getByRole("button", { name: "Import server", exact: true }),
+    ).toBeEnabled();
+    const box = await dialog.boundingBox();
+    expect(box!.x).toBeGreaterThanOrEqual(0);
+    expect(box!.x + box!.width).toBeLessThanOrEqual(391);
+    expect(
+      await page.evaluate(
+        () => document.documentElement.scrollWidth - window.innerWidth,
+      ),
+    ).toBeLessThanOrEqual(1);
+    await page.screenshot({
+      path: testInfo.outputPath("import-review-mobile.png"),
+      fullPage: true,
+    });
+    await folder.fill(invalidDirectory);
+    await expect(
+      dialog
+        .getByRole("button", { name: "Import server", exact: true })
+        .and(page.locator(":enabled")),
+    ).toHaveCount(0);
+    await dialog.getByRole("button", { name: "Back", exact: true }).click();
+    const choice = page.getByRole("dialog", {
+      name: "Add a server",
+      exact: true,
+    });
+    await expect(choice).toBeVisible();
+    await choice.getByRole("button", { name: "Cancel", exact: true }).click();
+    await expect(choice).not.toBeVisible();
+    expect(await snapshotExistingFolder(directory)).toEqual(original);
+  } finally {
+    await removeExistingFixture(directory);
+  }
 });

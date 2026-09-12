@@ -30,6 +30,7 @@ export async function startDesktopRuntime({
   scheduler,
   spawnServer,
   backupFlushTimeoutMs,
+  selectServerDirectory,
 } = {}) {
   if (typeof dataDir !== "string" || !path.isAbsolute(dataDir))
     throw new Error(
@@ -44,6 +45,7 @@ export async function startDesktopRuntime({
     scheduler,
     spawnServer,
     backupFlushTimeoutMs,
+    selectServerDirectory,
   });
   let url;
   let host;

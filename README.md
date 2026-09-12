@@ -6,14 +6,14 @@ A local Minecraft server panel inspired by the navigation and console layout of 
 
 **MC Panel runs in its own Windows window and includes its Node.js runtime.** End users do not need to install Node.js, use a terminal, or start a separate web server. Running a real Minecraft server still requires the Java version expected by its server JAR. Configure the Java executable, JAR, and memory in that server's settings, and accept the Minecraft EULA yourself.
 
-A fresh desktop workspace starts with no servers. Choose **Add your first server** on the welcome screen to create one; **Minecraft Java** is selected by default. Demo servers are optional and are created only when you choose that mode.
+A fresh desktop workspace starts with no servers. **Add your first server** offers two paths: **Create a new server** or **Import an existing server**. New servers default to Minecraft Java. Demo mode remains optional.
 
 The Windows x64 build produces two executables in `release/`:
 
 | File                              | Use                                            |
 | --------------------------------- | ---------------------------------------------- |
-| `MC-Panel-0.1.1-Setup-x64.exe`    | Install MC Panel, then launch it from Windows. |
-| `MC-Panel-0.1.1-Portable-x64.exe` | Run MC Panel without installing it.            |
+| `MC-Panel-0.1.2-Setup-x64.exe`    | Install MC Panel, then launch it from Windows. |
+| `MC-Panel-0.1.2-Portable-x64.exe` | Run MC Panel without installing it.            |
 
 The version in each filename follows `package.json`. These development builds are unsigned, so Windows may report an unknown publisher or show a SmartScreen notice. A code-signing certificate is not configured.
 
@@ -21,7 +21,7 @@ Closing the window keeps MC Panel in the Windows notification area so running se
 
 ### Desktop data
 
-Both the installed and portable editions save their server registry, worlds, backups, and settings under:
+Both the installed and portable editions save the server registry, panel settings, backups, and newly created server files under:
 
 ```text
 %APPDATA%\MC Panel\data
@@ -30,6 +30,16 @@ Both the installed and portable editions save their server registry, worlds, bac
 This is separate from the repository's `data/` directory, so the desktop app does not automatically import an existing development workspace. The portable executable uses the same per-user data location; it does not keep worlds beside the executable. App upgrades and uninstalling the app preserve this data. Use **Open server data folder** to find it, and retain your own backups before moving or removing server files. Existing custom Minecraft directories remain in their configured locations. Desktop startup and shutdown errors are recorded one level above this folder in `%APPDATA%\MC Panel\desktop.log`.
 
 If version 0.1.0 already created a demo, updating preserves it along with any changes you made. Open that demo's **Settings**, choose **Remove demo server**, and confirm to clear it from the panel. Its files and backups remain in the server data folder. Removing the last demo returns to the welcome screen.
+
+### Import an existing server
+
+Choose **Import an existing server**, then browse to the folder containing its `server.properties`, server JAR, and world files. The desktop edition opens a native folder picker; you can also enter an absolute folder path. In browser mode, the path refers to the computer running the panel API. For a server hosted elsewhere, download and extract its files to that computer first.
+
+The panel detects the server port, MOTD, player limit, EULA status, and top-level JAR files. Review the name and select the JAR used to start the server; if there are multiple JARs, choose one explicitly. Java and memory settings are available for review. Stop any separately running copy before starting it through MC Panel.
+
+Import registers the existing folder **in place**. It does not copy, move, overwrite, or start the server, and it preserves the existing EULA decision. Worlds, plugins, and configuration stay in the selected folder. File Manager and Console subsequently operate on that folder; backups and panel metadata go under `data/instances/<server-id>/`. Any port override is applied when you next start the server through the panel. Resetting MC Panel's app data removes the registration and panel backups, but leaves that external server folder intact.
+
+The current launcher runs a server JAR with Java. It does not execute existing `.bat`, `.sh`, or argument-file launchers. Servers that require those launchers need compatible JAR startup configuration before they can be imported. An import source must be separate from panel storage and other registered server folders. If its folder or selected JAR becomes unavailable, the panel keeps the server listed with an actionable error instead of creating an empty replacement. Restoring the original folder lets subsequent server requests reconnect it.
 
 ### Build the Windows app from source
 
@@ -154,11 +164,13 @@ data/
       panel.json    that server's schedule, records, demo operators, and audit
 ```
 
-An empty desktop workspace contains only `servers.json`. Servers created through the panel use their own `instances/<server-id>/` directory, including the first server. Existing storage locations are preserved when switching the default server or removing a demo.
+An empty desktop workspace contains only `servers.json`. Servers created through the panel use their own `instances/<server-id>/` directory, including the first server. Imported servers use that directory for panel metadata and backups while keeping Minecraft files in the selected external folder. Existing storage locations are preserved when switching the default server or removing a demo.
 
 `PANEL_DATA_DIR` changes the panel's data directory. Keep it outside a custom server directory so backups never archive themselves. Use only one API process per data directory. There is no background service installer; scheduling runs within the API process.
 
 API clients can list/create servers at `/api/servers` and update one at `/api/servers/:id`. Creating a server defaults to live Java mode; simulations require `mode: "demo"`. `DELETE /api/servers/:id` removes a demo from the registry without deleting its files or backups; live servers cannot be removed through this endpoint. Select a server for existing APIs with the `X-Server-Id` header or the `serverId` query parameter for direct download links. Unknown IDs return 404; conflicting selectors return 400. Calls without either selector use the current default server. An empty fleet has `defaultServerId: null`, and server-specific API calls return 404 until a server is created.
+
+For imports, `GET /api/server-import` reports native browsing availability. `POST /api/server-import/browse` opens the desktop folder picker and returns a selected `directory` or `null` on cancellation. `POST /api/server-import/inspect` accepts `{ "directory": "absolute path" }` and returns detected settings without modifying source files. `POST /api/server-import` accepts `directory`, `name`, `jar`, `javaPath`, `memoryLimitMB`, and `port`, revalidates the source, and returns a stopped live server. Imported server descriptors include `source: "imported"` and `serverDir`; unavailable imports also include `unavailable` and `sourceError`.
 
 ## Local access boundary
 

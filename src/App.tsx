@@ -285,7 +285,9 @@ export default function App() {
     setNotice(
       manager?.editing
         ? "Server settings saved."
-        : "Server created. Your new workspace is ready.",
+        : server.source === "imported"
+          ? "Server imported. Your files stay in their original folder."
+          : "Server created. Your new workspace is ready.",
     );
     setManager(null);
     void loadServers();
@@ -409,8 +411,8 @@ function EmptyFleet({ onAdd }: { onAdd: () => void }) {
               <span>starts here</span>
             </h1>
             <p>
-              Add your first Minecraft server. Keep your console, files,
-              players, and backups together, right on your computer.
+              Create a new Minecraft server or import one you already have. Your
+              console, files, players, and backups, together in one place.
             </p>
             <button className="btn primary fleet-welcome-add" onClick={onAdd}>
               <Plus size={18} /> Add your first server <ArrowRight size={17} />
@@ -451,18 +453,15 @@ function EmptyFleet({ onAdd }: { onAdd: () => void }) {
               <span className="fleet-step-number">01</span>
               <Box size={21} />
               <h3>Add your server</h3>
-              <p>
-                Give it a name and set up Minecraft Java with its own port and
-                memory.
-              </p>
+              <p>Create a fresh server or select the folder you already use.</p>
             </li>
             <li>
               <span className="fleet-step-number">02</span>
               <FolderOpen size={21} />
               <h3>Bring your world</h3>
               <p>
-                Upload your server JAR and files, then review and accept the
-                Minecraft EULA.
+                Upload a JAR for a new server, or keep your existing world and
+                plugins right where they are.
               </p>
             </li>
             <li>
@@ -481,7 +480,7 @@ function EmptyFleet({ onAdd }: { onAdd: () => void }) {
             <ShieldCheck size={15} /> Your servers. Your computer. Your control.
           </span>
           <span>
-            MC Panel <span className="footer-version">v0.1.1</span>
+            MC Panel <span className="footer-version">v0.1.2</span>
           </span>
         </footer>
       </main>
@@ -671,7 +670,10 @@ function ServerWorkspace({
         <main className="main-content">
           {connectionError && (
             <div className="connection-error" role="alert">
-              Unable to reach the local backend. {connectionError}
+              {selected.sourceError
+                ? "Server folder unavailable."
+                : "Unable to reach the local backend."}{" "}
+              {selected.sourceError || connectionError}
               <button className="btn" onClick={refresh}>
                 Retry
               </button>
@@ -701,7 +703,7 @@ function ServerWorkspace({
               </span>
             </span>
             <span className="muted">
-              Development build <span className="footer-version">v0.1.1</span>
+              Development build <span className="footer-version">v0.1.2</span>
             </span>
           </footer>
         </main>

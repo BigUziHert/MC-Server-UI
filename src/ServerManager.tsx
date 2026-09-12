@@ -10,6 +10,7 @@ import {
   X,
 } from "lucide-react";
 import { api, post } from "./api";
+import AddServer from "./AddServer";
 import "./servers.css";
 
 export type ServerRecord = {
@@ -25,6 +26,10 @@ export type ServerRecord = {
   motd?: string;
   version?: string;
   software?: string;
+  source?: "imported" | "managed";
+  serverDir?: string;
+  unavailable?: boolean;
+  sourceError?: string;
 };
 
 export function ServerSwitcher({
@@ -92,19 +97,33 @@ export function ServerSwitcher({
   );
 }
 
-export default function ServerManager({
-  editing,
-  servers,
-  onClose,
-  onSaved,
-  onRemoved,
-}: {
+type ServerManagerProps = {
   editing: ServerRecord | null;
   servers: ServerRecord[];
   onClose: () => void;
   onSaved: (server: ServerRecord) => void;
   onRemoved: (serverId: string) => void;
-}) {
+};
+
+export default function ServerManager(props: ServerManagerProps) {
+  return props.editing ? (
+    <ServerSettings {...props} />
+  ) : (
+    <AddServer
+      servers={props.servers}
+      onClose={props.onClose}
+      onSaved={props.onSaved}
+    />
+  );
+}
+
+function ServerSettings({
+  editing,
+  servers,
+  onClose,
+  onSaved,
+  onRemoved,
+}: ServerManagerProps) {
   let nextPort = 25565;
   while (servers.some((server) => server.port === nextPort)) nextPort++;
   const [name, setName] = useState(editing?.name ?? "");
@@ -232,6 +251,27 @@ export default function ServerManager({
           />
           <small>The name shown throughout this panel.</small>
         </div>
+        {editing?.source === "imported" && editing.serverDir && (
+          <div className="form-field">
+            <label htmlFor="saved-server-directory">Server folder</label>
+            <input
+              id="saved-server-directory"
+              value={editing.serverDir}
+              readOnly
+              spellCheck={false}
+            />
+            <small>
+              This server uses the original folder. Worlds, plugins, and
+              configuration stay here.
+            </small>
+          </div>
+        )}
+        {editing?.sourceError && (
+          <div className="server-form-error server-source-error" role="alert">
+            <AlertCircle size={17} />
+            <span>{editing.sourceError}</span>
+          </div>
+        )}
         {running && (
           <div className="server-form-note">
             <AlertCircle size={16} />

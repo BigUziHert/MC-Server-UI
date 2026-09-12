@@ -196,6 +196,309 @@
   color: #f0ae9a;
   margin-top: 17px;
 }
+.server-add-dialog .server-add-intro {
+  font-size: 12px;
+  color: #9caa91;
+  line-height: 1.8;
+  margin: 0 0 25px;
+}
+.server-choice-dialog {
+  width: min(575px, calc(100vw - 32px));
+}
+.server-add-choices {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+.server-add-choice {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  gap: 15px;
+  border: 1px solid #405232;
+  border-radius: 10px;
+  padding: 20px 18px;
+  background: #202c19;
+  text-align: left;
+}
+.server-add-choice:hover {
+  border-color: #86ac51;
+  background: #293920;
+}
+.server-choice-icon {
+  width: 43px;
+  height: 43px;
+  flex-shrink: 0;
+  display: grid;
+  place-items: center;
+  border: 1px solid #4c6437;
+  background: #304325;
+  border-radius: 10px;
+  color: #bee48f;
+}
+.server-add-choice > span:nth-child(2) {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.server-add-choice strong {
+  font-size: 14px;
+  font-weight: 550;
+  color: #e1ecd7;
+}
+.server-add-choice > span:nth-child(2) > span {
+  font-size: 11px;
+  line-height: 1.7;
+  color: #97ab84;
+}
+.server-add-choice > svg:last-child {
+  margin-left: auto;
+  color: #acc58f;
+}
+.server-choice-hint {
+  font-size: 11px;
+  color: #809571;
+  line-height: 1.8;
+  margin: 20px 0 0;
+}
+.server-back-button {
+  border: 0;
+  padding: 7px 0;
+  background: transparent;
+  color: #a6bf92;
+}
+.server-back-button:hover {
+  background: transparent;
+  color: #d3eba8;
+}
+.server-create-defaults {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  font-size: 11px;
+  color: #a4b895;
+  margin: -3px 0 20px;
+}
+.server-create-defaults > span > span {
+  color: #697b5a;
+  margin: 0 9px;
+}
+.server-advanced {
+  border: 1px solid #3a462f;
+  border-radius: 8px;
+  margin-bottom: 20px;
+  background: #1b2516;
+}
+.server-advanced > summary {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  cursor: pointer;
+  font-size: 12px;
+  color: #bacdae;
+  padding: 14px;
+  list-style: none;
+  border-radius: 7px;
+}
+.server-advanced > summary::-webkit-details-marker {
+  display: none;
+}
+.server-advanced > summary:hover {
+  color: #d3e6ba;
+  background: #26341e;
+}
+.server-advanced > summary:focus-visible {
+  outline: 2px solid #bbef62;
+  outline-offset: 3px;
+}
+.server-advanced > summary > svg:last-child {
+  margin-left: auto;
+  transition: transform 0.15s;
+}
+.server-advanced[open] > summary > svg:last-child {
+  transform: rotate(180deg);
+}
+.server-advanced[open] > summary {
+  border-bottom: 1px solid #35432a;
+  border-radius: 7px 7px 0 0;
+}
+.server-advanced-fields {
+  padding: 18px 14px 0;
+}
+.server-advanced-hint {
+  font-size: 10px;
+  color: #92a382;
+  line-height: 1.7;
+  margin: -7px 0 17px;
+}
+.server-import-path {
+  display: flex;
+  gap: 9px;
+  min-width: 0;
+}
+.server-import-path > input {
+  min-width: 0;
+  flex: 1;
+}
+.server-import-path > button {
+  flex-shrink: 0;
+}
+.server-import-inspect {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 12px;
+  margin: 0 0 22px;
+}
+.server-import-inspect > span {
+  font-size: 10px;
+  color: #8ea57b;
+  line-height: 1.7;
+}
+.server-import-review {
+  border-top: 1px solid #3e4c32;
+  padding-top: 21px;
+}
+.server-import-reviewed {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  font-size: 11px;
+  color: #b5d78d;
+  margin-bottom: 13px;
+}
+.server-import-reviewed strong {
+  font-weight: 550;
+}
+.server-import-reviewed > span {
+  margin-left: auto;
+  color: #8b9b7d;
+  font-size: 10px;
+}
+.server-import-location {
+  display: flex;
+  align-items: flex-start;
+  gap: 9px;
+  padding: 12px;
+  background: #151f11;
+  border: 1px solid #34442a;
+  border-radius: 7px;
+  font-size: 11px;
+  color: #a8bf94;
+  margin-bottom: 20px;
+  line-height: 1.7;
+  overflow-wrap: anywhere;
+}
+.server-import-location > svg {
+  margin-top: 2px;
+}
+.server-import-location > span {
+  min-width: 0;
+}
+.server-import-facts {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 12px 20px;
+  font-size: 11px;
+  color: #9eaf8f;
+  margin: 0 0 19px;
+}
+.server-import-facts > span {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+}
+.server-import-facts strong {
+  font-weight: 550;
+  color: #c1d3ad;
+}
+.server-import-warnings {
+  margin: 0 0 19px;
+  padding: 12px 14px 12px 28px;
+  background: #2c2d1d;
+  border: 1px solid #494b2e;
+  border-radius: 7px;
+  color: #c0bd92;
+  font-size: 11px;
+  line-height: 1.8;
+  overflow-wrap: anywhere;
+}
+.server-import-warnings li + li {
+  margin-top: 6px;
+}
+.server-import-port-warning {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  color: #e0b595;
+  font-size: 11px;
+  line-height: 1.7;
+  margin: 0 0 13px;
+  overflow-wrap: anywhere;
+}
+.server-import-port-warning > svg {
+  margin-top: 2px;
+}
+.server-add-dialog form > .server-import-start-note {
+  font-size: 11px;
+  color: #a5b994;
+  line-height: 1.8;
+  margin: 15px 0 0;
+}
+.server-add-dialog form > .server-import-hosted-hint {
+  font-size: 10px;
+  color: #899d79;
+  line-height: 1.8;
+  margin: 11px 0 0;
+}
+.server-source-error {
+  align-items: flex-start;
+  border: 1px solid #684333;
+  border-radius: 7px;
+  padding: 13px;
+  background: #2e241c;
+  margin: 0 0 19px;
+  line-height: 1.7;
+  overflow-wrap: anywhere;
+}
+.server-source-error > svg {
+  margin-top: 2px;
+}
+.server-import-spinning {
+  animation: server-import-spin 1s linear infinite;
+}
+@keyframes server-import-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+@media (max-width: 500px) {
+  .server-add-choice {
+    padding: 17px 13px;
+    gap: 11px;
+  }
+  .server-add-choice strong {
+    font-size: 13px;
+  }
+  .server-add-choice > span:nth-child(2) > span {
+    font-size: 10px;
+  }
+  .server-choice-icon {
+    width: 36px;
+    height: 36px;
+  }
+  .server-import-inspect {
+    gap: 8px;
+  }
+  .server-import-path {
+    gap: 7px;
+  }
+  .server-import-path > button {
+    padding: 9px;
+  }
+}
 .server-workspace-loading {
   min-height: 100vh;
   display: flex;

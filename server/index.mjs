@@ -8,6 +8,11 @@ import { randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import {
+  canonicalExternalDirectory,
+  containedSourcePath,
+  inspectServerDirectory,
+} from "./import.mjs";
 
 const projectDir = path.resolve(
   path.dirname(fileURLToPath(import.meta.url)),
@@ -52,7 +57,11 @@ export function validatePlayerName(name) {
   return name;
 }
 
-export function validateServerConfiguration(input, previous = {}) {
+export function validateServerConfiguration(
+  input,
+  previous = {},
+  preserveExistingMotd = false,
+) {
   if (!input || typeof input !== "object" || Array.isArray(input))
     throw error(400, "Provide server settings.");
   const allowed = new Set([
@@ -104,7 +113,7 @@ export function validateServerConfiguration(input, previous = {}) {
     throw error(400, "Memory must be an integer between 256 and 262144 MB.");
   if (
     typeof result.jar !== "string" ||
-    !result.jar.endsWith(".jar") ||
+    !/\.jar$/i.test(result.jar) ||
     result.jar.length > 180 ||
     result.jar.split("/").some((part) => !part || part === "." || part === "..")
   )
@@ -117,10 +126,13 @@ export function validateServerConfiguration(input, previous = {}) {
     /[\x00-\x1f\x7f]/.test(result.javaPath)
   )
     throw error(400, "Enter java or the path to a Java executable.");
+  const unchangedImportedMotd =
+    preserveExistingMotd &&
+    (input.motd === undefined || input.motd === previous.motd);
   if (
     typeof result.motd !== "string" ||
-    result.motd.length > 256 ||
-    /[\x00-\x1f\x7f]/.test(result.motd)
+    (!unchangedImportedMotd &&
+      (result.motd.length > 256 || /[\x00-\x1f\x7f]/.test(result.motd)))
   )
     throw error(
       400,
@@ -297,7 +309,15 @@ export async function createPanel(options = {}) {
   const databaseDir = await safePath(dataDir, "databases");
   const uploadDir = await safePath(dataDir, "uploads");
   const statePath = await safePath(dataDir, "panel.json");
-  for (const dir of [dataDir, serverDir, backupDir, databaseDir, uploadDir])
+  if (options.existingServerDir)
+    await canonicalExternalDirectory(serverDir, { requireCanonical: true });
+  for (const dir of [
+    dataDir,
+    ...(options.existingServerDir ? [] : [serverDir]),
+    backupDir,
+    databaseDir,
+    uploadDir,
+  ])
     await fs.mkdir(dir, { recursive: true });
   const relativeBackup = path.relative(
     await fs.realpath(serverDir),
@@ -612,7 +632,12 @@ export async function createPanel(options = {}) {
     }
   }
 
-  const descriptor = () => ({ ...configuration, id: options.id, status });
+  const descriptor = () => ({
+    ...configuration,
+    id: options.id,
+    status,
+    ...(options.source === "imported" ? { source: "imported", serverDir } : {}),
+  });
 
   async function startServer() {
     if (status !== "offline")
@@ -621,6 +646,8 @@ export async function createPanel(options = {}) {
     status = "starting";
     clearPlayers();
     try {
+      if (options.existingServerDir)
+        await canonicalExternalDirectory(serverDir, { requireCanonical: true });
       if (mode === "demo") {
         status = "starting";
         append("[Demo] Starting the Minecraft server…");
@@ -1673,8 +1700,60 @@ export async function createFleet(options = {}) {
         `Port ${port} is already assigned to another server. Choose a different port.`,
       );
   };
-  const makeRuntime = async (entry) => {
-    await fs.mkdir(entry.serverDir, { recursive: true });
+  const inspectImport = (directory, exceptId, requireCanonical = false) =>
+    inspectServerDirectory(directory, {
+      forbiddenDirectories: [
+        dataDir,
+        ...registry.servers
+          .filter((entry) => entry.id !== exceptId)
+          .map((entry) => entry.serverDir),
+      ],
+      requireCanonical,
+    });
+  const unavailableRuntime = (entry, cause) => {
+    const sourceError = `Imported server unavailable: ${cause.message} Its existing folder has not been recreated or changed.`;
+    const app = express();
+    app.use((_req, res) => res.status(409).json({ error: sourceError }));
+    return {
+      app,
+      dataDir: entry.dataDir,
+      serverDir: entry.serverDir,
+      unavailable: true,
+      descriptor: () => ({
+        ...onlyConfig(entry),
+        id: entry.id,
+        address: entry.address,
+        version: entry.version,
+        software: entry.software,
+        status: "offline",
+        source: "imported",
+        serverDir: entry.serverDir,
+        unavailable: true,
+        sourceError,
+      }),
+      updateConfiguration: async () => {
+        throw error(409, sourceError);
+      },
+      tick: async () => {},
+      close: async () => {},
+    };
+  };
+  const makeRuntime = async (entry, allowUnavailable = false) => {
+    if (entry.storage === "external") {
+      try {
+        const inspected = await inspectImport(entry.serverDir, entry.id, true);
+        if (!inspected.jars.includes(entry.jar))
+          throw error(
+            409,
+            "The selected server JAR is missing or is no longer a regular file in the source folder.",
+          );
+      } catch (cause) {
+        if (!allowUnavailable) throw cause;
+        const runtime = unavailableRuntime(entry, cause);
+        runtimes.set(entry.id, runtime);
+        return runtime;
+      }
+    } else await fs.mkdir(entry.serverDir, { recursive: true });
     await fs.mkdir(entry.dataDir, { recursive: true });
     const actualServer = await fs.realpath(entry.serverDir);
     const contains = (root, target) => {
@@ -1686,8 +1765,14 @@ export async function createFleet(options = {}) {
           !relative.startsWith(`..${path.sep}`))
       );
     };
-    for (const runtime of runtimes.values()) {
-      const existingServer = await fs.realpath(runtime.serverDir);
+    for (const [id, runtime] of runtimes) {
+      if (id === entry.id) continue;
+      const existingServer = await fs
+        .realpath(runtime.serverDir)
+        .catch((cause) => {
+          if (!runtime.unavailable) throw cause;
+          return path.resolve(runtime.serverDir);
+        });
       if (
         contains(existingServer, actualServer) ||
         contains(actualServer, existingServer)
@@ -1701,6 +1786,7 @@ export async function createFleet(options = {}) {
       ...entry,
       memoryLimit: entry.memoryLimitMB,
       useEnvironment: false,
+      existingServerDir: entry.storage === "external",
       scheduler: options.scheduler,
       spawnServer: options.spawnServer,
       backupFlushTimeoutMs: options.backupFlushTimeoutMs,
@@ -1734,7 +1820,14 @@ export async function createFleet(options = {}) {
           "The server registry contains invalid or duplicate IDs.",
         );
       ids.add(entry.id);
-      Object.assign(entry, validateServerConfiguration(onlyConfig(entry)));
+      Object.assign(
+        entry,
+        validateServerConfiguration(
+          {},
+          onlyConfig(entry),
+          entry.storage === "external",
+        ),
+      );
       if (ports.has(entry.port))
         throw new Error(
           "The server registry contains duplicate Minecraft ports.",
@@ -1744,7 +1837,7 @@ export async function createFleet(options = {}) {
       // keep their legacy root; explicitly created instances keep their own roots.
       entry.storage ??=
         entry.id === registry.defaultServerId ? "legacy" : "instance";
-      if (!["legacy", "instance"].includes(entry.storage))
+      if (!["legacy", "instance", "external"].includes(entry.storage))
         throw new Error(
           "The server registry contains an invalid storage location.",
         );
@@ -1756,7 +1849,16 @@ export async function createFleet(options = {}) {
       } else {
         entry.dataDir = await safePath(dataDir, `instances/${entry.id}`);
         await fs.mkdir(entry.dataDir, { recursive: true });
-        entry.serverDir = await safePath(entry.dataDir, "server");
+        if (entry.storage === "external") {
+          if (
+            typeof entry.serverDir !== "string" ||
+            !path.isAbsolute(entry.serverDir)
+          )
+            throw new Error(
+              "The imported server registry path must be absolute.",
+            );
+          entry.source = "imported";
+        } else entry.serverDir = await safePath(entry.dataDir, "server");
       }
     }
   } else if (
@@ -1834,7 +1936,7 @@ export async function createFleet(options = {}) {
     await persist();
   }
   try {
-    for (const entry of registry.servers) await makeRuntime(entry);
+    for (const entry of registry.servers) await makeRuntime(entry, true);
   } catch (cause) {
     await Promise.all([...runtimes.values()].map((runtime) => runtime.close()));
     throw cause;
@@ -1876,6 +1978,104 @@ export async function createFleet(options = {}) {
     next();
   });
   app.use(express.json({ limit: "2mb" }));
+  app.get("/api/server-import", (_req, res) =>
+    res.json({
+      canBrowse: typeof options.selectServerDirectory === "function",
+    }),
+  );
+  app.post("/api/server-import/browse", async (_req, res) => {
+    if (typeof options.selectServerDirectory !== "function")
+      throw error(
+        400,
+        "Folder browsing is available in the desktop app. Enter the server folder's absolute path instead.",
+      );
+    const directory = await options.selectServerDirectory();
+    res.json({ directory: directory ?? null });
+  });
+  app.post("/api/server-import/inspect", async (req, res) => {
+    res.json(await inspectImport(req.body?.directory));
+  });
+  app.post("/api/server-import", async (req, res) => {
+    const server = await serialize(async () => {
+      const input = req.body;
+      const allowed = new Set([
+        "directory",
+        "name",
+        "jar",
+        "javaPath",
+        "memoryLimitMB",
+        "port",
+      ]);
+      if (
+        !input ||
+        typeof input !== "object" ||
+        Array.isArray(input) ||
+        Object.keys(input).some((key) => !allowed.has(key))
+      )
+        throw error(
+          400,
+          "Provide the folder, server name, selected JAR, Java executable, memory, and port.",
+        );
+      const inspected = await inspectImport(input.directory);
+      if (typeof input.jar !== "string" || !inspected.jars.includes(input.jar))
+        throw error(
+          400,
+          "Choose a regular server JAR from the inspected folder's root. Scripts, installers, and nested library paths are not selected automatically.",
+        );
+      const selectedJar = await containedSourcePath(
+        inspected.directory,
+        input.jar,
+      );
+      if (!(await fs.stat(selectedJar)).isFile())
+        throw error(400, "The selected server JAR is no longer available.");
+      const config = validateServerConfiguration(
+        {
+          name: input.name ?? inspected.name,
+          mode: "live",
+          port: input.port ?? inspected.port,
+          jar: input.jar,
+          javaPath: input.javaPath ?? "java",
+          memoryLimitMB: input.memoryLimitMB ?? 4096,
+        },
+        { motd: inspected.motd },
+        true,
+      );
+      checkPort(config.port);
+      const id = randomUUID();
+      const instanceDir = await safePath(dataDir, `instances/${id}`);
+      const entry = {
+        ...config,
+        id,
+        storage: "external",
+        source: "imported",
+        dataDir: instanceDir,
+        serverDir: inspected.directory,
+        address: inspected.address.replace(/:\d+$/, `:${config.port}`),
+        maxPlayers: inspected.maxPlayers,
+        version: "Configured JAR",
+        software: "Java",
+      };
+      const runtime = await makeRuntime(entry);
+      try {
+        await persist({
+          ...registry,
+          defaultServerId: registry.defaultServerId ?? id,
+          servers: [...registry.servers, entry],
+        });
+      } catch (cause) {
+        runtimes.delete(id);
+        await runtime.close();
+        throw cause;
+      }
+      await runtime.audit(
+        "server",
+        "Existing server imported",
+        `Existing folder linked in place: ${inspected.directory}. No source files were changed and the server was not started.`,
+      );
+      return runtime.descriptor();
+    });
+    res.status(201).json({ server });
+  });
   app.get("/api/servers", (_req, res) =>
     res.json({
       servers: registry.servers.map(descriptor),
@@ -1890,7 +2090,10 @@ export async function createFleet(options = {}) {
       const instanceDir = await safePath(dataDir, `instances/${id}`);
       for (const runtime of runtimes.values()) {
         const relative = path.relative(
-          await fs.realpath(runtime.serverDir),
+          await fs.realpath(runtime.serverDir).catch((cause) => {
+            if (!runtime.unavailable) throw cause;
+            return path.resolve(runtime.serverDir);
+          }),
           instanceDir,
         );
         if (
@@ -1955,7 +2158,11 @@ export async function createFleet(options = {}) {
     const server = await serialize(async () => {
       const entry = registry.servers.find((item) => item.id === req.params.id);
       if (!entry) throw error(404, "Server not found.");
-      const config = validateServerConfiguration(req.body, onlyConfig(entry));
+      const config = validateServerConfiguration(
+        req.body,
+        onlyConfig(entry),
+        entry.storage === "external",
+      );
       checkPort(config.port, entry.id);
       const next = { ...entry, ...config };
       if (config.port !== entry.port) next.address = `localhost:${config.port}`;
@@ -2012,7 +2219,7 @@ export async function createFleet(options = {}) {
     });
     res.json(result);
   });
-  app.use((req, res, next) => {
+  app.use(async (req, res, next) => {
     if (!/^\/api(?:\/|$)/.test(req.path)) return next();
     const header = req.headers["x-server-id"];
     const query = req.query.serverId;
@@ -2025,7 +2232,19 @@ export async function createFleet(options = {}) {
       );
     if (typeof id !== "string" || !runtimes.has(id))
       return next(error(404, "Server not found."));
-    runtimes.get(id).app(req, res, next);
+    let runtime = runtimes.get(id);
+    if (runtime.unavailable)
+      runtime = await serialize(() => {
+        const current = runtimes.get(id);
+        if (!current) throw error(404, "Server not found.");
+        return current.unavailable
+          ? makeRuntime(
+              registry.servers.find((entry) => entry.id === id),
+              true,
+            )
+          : current;
+      });
+    runtime.app(req, res, next);
   });
   const distDir = path.join(projectDir, "dist");
   app.use(express.static(distDir));

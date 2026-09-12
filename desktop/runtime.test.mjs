@@ -124,6 +124,49 @@ test("desktop runtime requires its random session cookie for all API, file and s
   );
 });
 
+test("desktop folder selection is available only to its authenticated session and handles cancellation", async (t) => {
+  const { launch, rootDir } = await fixture(t);
+  const directory = path.join(rootDir, "Existing Minecraft Server");
+  await fs.mkdir(directory);
+  let selections = 0;
+  const runtime = await launch({
+    selectServerDirectory: async () => {
+      selections++;
+      return selections === 1 ? null : directory;
+    },
+  });
+  assert.deepEqual(await (await runtime.request("/api/server-import")).json(), {
+    canBrowse: true,
+  });
+  const route = "/api/server-import/browse";
+  assert.equal(
+    (await fetch(runtime.url + route, { method: "POST" })).status,
+    401,
+  );
+  assert.equal(
+    (
+      await runtime.request(route, {
+        ...json("POST", {}),
+        headers: { Origin: "https://untrusted.example" },
+      })
+    ).status,
+    403,
+  );
+  assert.equal(selections, 0);
+  const canceled = await runtime.request(route, json("POST", {}));
+  assert.equal(canceled.status, 200);
+  assert.deepEqual(await canceled.json(), { directory: null });
+  const selected = await runtime.request(route, json("POST", {}));
+  assert.equal(selected.status, 200);
+  assert.deepEqual(await selected.json(), { directory });
+  assert.equal(selections, 2);
+  assert.deepEqual(await fs.readdir(directory), []);
+  assert.deepEqual(await (await runtime.request("/api/servers")).json(), {
+    servers: [],
+    defaultServerId: null,
+  });
+});
+
 test("desktop runtime enforces its exact origin and host, even with a valid cookie", async (t) => {
   const { launch } = await fixture(t);
   const runtime = await launch();
