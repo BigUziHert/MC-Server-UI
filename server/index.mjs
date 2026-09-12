@@ -68,7 +68,7 @@ export function validateServerConfiguration(input, previous = {}) {
     throw error(400, "Unknown server setting.");
   const result = {
     name: "New server",
-    mode: "demo",
+    mode: "live",
     port: 25565,
     memoryLimitMB: 4096,
     jar: "server.jar",
@@ -1616,6 +1616,19 @@ export async function createFleet(options = {}) {
   await fs.mkdir(requestedDataDir, { recursive: true });
   const dataDir = await fs.realpath(requestedDataDir);
   const registryPath = await safePath(dataDir, "servers.json");
+  const legacyServerDir = path.resolve(
+    options.serverDir ?? env.MC_SERVER_DIR ?? path.join(dataDir, "server"),
+  );
+  const hasLegacyWorkspace = async () => {
+    if (await exists(await safePath(dataDir, "panel.json"))) return true;
+    if (await exists(await safePath(dataDir, ".seeded"))) return true;
+    try {
+      return (await fs.readdir(legacyServerDir)).length > 0;
+    } catch (cause) {
+      if (cause.code !== "ENOENT") throw cause;
+      return false;
+    }
+  };
   const runtimes = new Map();
   let registry;
   let changeChain = Promise.resolve();
@@ -1700,8 +1713,11 @@ export async function createFleet(options = {}) {
     if (
       registry.version !== 1 ||
       !Array.isArray(registry.servers) ||
-      !registry.servers.length ||
-      !registry.servers.some((entry) => entry.id === registry.defaultServerId)
+      (registry.servers.length === 0
+        ? registry.defaultServerId !== null
+        : !registry.servers.some(
+            (entry) => entry.id === registry.defaultServerId,
+          ))
     )
       throw new Error(
         "The server registry is invalid; restore data/servers.json from a known good copy.",
@@ -1724,7 +1740,15 @@ export async function createFleet(options = {}) {
           "The server registry contains duplicate Minecraft ports.",
         );
       ports.add(entry.port);
-      if (entry.id === registry.defaultServerId) {
+      // The default selection is not a storage location. Original installations
+      // keep their legacy root; explicitly created instances keep their own roots.
+      entry.storage ??=
+        entry.id === registry.defaultServerId ? "legacy" : "instance";
+      if (!["legacy", "instance"].includes(entry.storage))
+        throw new Error(
+          "The server registry contains an invalid storage location.",
+        );
+      if (entry.storage === "legacy") {
         entry.dataDir = dataDir;
         entry.serverDir = path.resolve(
           entry.serverDir ?? path.join(dataDir, "server"),
@@ -1735,6 +1759,12 @@ export async function createFleet(options = {}) {
         entry.serverDir = await safePath(entry.dataDir, "server");
       }
     }
+  } else if (
+    options.createDefaultServer === false &&
+    !(await hasLegacyWorkspace())
+  ) {
+    registry = { version: 1, defaultServerId: null, servers: [] };
+    await persist();
   } else {
     const serverDir = path.resolve(
       options.serverDir ?? env.MC_SERVER_DIR ?? path.join(dataDir, "server"),
@@ -1777,6 +1807,7 @@ export async function createFleet(options = {}) {
         {
           ...config,
           id,
+          storage: "legacy",
           dataDir,
           serverDir,
           address:
@@ -1892,6 +1923,7 @@ export async function createFleet(options = {}) {
       const entry = {
         ...config,
         id,
+        storage: "instance",
         dataDir: instanceDir,
         serverDir,
         address: `localhost:${config.port}`,
@@ -1900,7 +1932,11 @@ export async function createFleet(options = {}) {
       };
       const runtime = await makeRuntime(entry);
       try {
-        await persist({ ...registry, servers: [...registry.servers, entry] });
+        await persist({
+          ...registry,
+          defaultServerId: registry.defaultServerId ?? id,
+          servers: [...registry.servers, entry],
+        });
       } catch (cause) {
         runtimes.delete(id);
         await runtime.close();
@@ -1938,16 +1974,64 @@ export async function createFleet(options = {}) {
     });
     res.json({ server });
   });
+  app.delete("/api/servers/:id", async (req, res) => {
+    const result = await serialize(async () => {
+      const entry = registry.servers.find((item) => item.id === req.params.id);
+      if (!entry) throw error(404, "Server not found.");
+      if (entry.mode !== "demo")
+        throw error(
+          409,
+          "Only demo servers can be removed here. Live servers and their worlds are protected.",
+        );
+      const runtime = runtimes.get(entry.id);
+      await runtime.audit(
+        "server",
+        "Demo removal requested",
+        "Remove this demo from the panel registry and preserve all of its files and backups on disk.",
+      );
+      await runtime.close();
+      const servers = registry.servers.filter((item) => item.id !== entry.id);
+      const defaultServerId =
+        registry.defaultServerId === entry.id
+          ? (servers[0]?.id ?? null)
+          : registry.defaultServerId;
+      try {
+        await persist({ ...registry, servers, defaultServerId });
+      } catch (cause) {
+        runtimes.delete(entry.id);
+        await makeRuntime(entry);
+        throw cause;
+      }
+      runtimes.delete(entry.id);
+      return {
+        ok: true,
+        serverId: entry.id,
+        defaultServerId,
+        filesPreserved: true,
+      };
+    });
+    res.json(result);
+  });
   app.use((req, res, next) => {
+    if (!/^\/api(?:\/|$)/.test(req.path)) return next();
     const header = req.headers["x-server-id"];
     const query = req.query.serverId;
     if (header !== undefined && query !== undefined && header !== query)
       return next(error(400, "Conflicting server selectors."));
     const id = header ?? query ?? registry.defaultServerId;
+    if (!registry.servers.length)
+      return next(
+        error(404, "No servers are configured. Add a server to get started."),
+      );
     if (typeof id !== "string" || !runtimes.has(id))
       return next(error(404, "Server not found."));
     runtimes.get(id).app(req, res, next);
   });
+  const distDir = path.join(projectDir, "dist");
+  app.use(express.static(distDir));
+  app.get("/{*path}", (_req, res) =>
+    res.sendFile(path.join(distDir, "index.html")),
+  );
   app.use((cause, _req, res, _next) => {
     if (res.headersSent) return;
     const status = cause.status ?? (cause.code === "ENOENT" ? 404 : 500);

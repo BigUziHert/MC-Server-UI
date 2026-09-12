@@ -24,6 +24,7 @@ import {
   MemoryStick,
   Pencil,
   Play,
+  Plus,
   RotateCw,
   Search,
   Send,
@@ -201,42 +202,63 @@ export default function App() {
     }
   });
   const [error, setError] = useState("");
+  const [loading, setLoading] = useState(true);
   const [manager, setManager] = useState<{
     editing: ServerRecord | null;
   } | null>(null);
   const [notice, setNotice] = useState("");
   const fleetRequest = useRef(0);
-  const loadServers = useCallback(async () => {
+  const fleetInFlight = useRef(false);
+  const loadServers = useCallback(async (showLoading = false) => {
+    if (fleetInFlight.current) return;
+    fleetInFlight.current = true;
     const request = ++fleetRequest.current;
+    if (showLoading) {
+      setLoading(true);
+      setError("");
+    }
     try {
       const result = await fleetApi<{
         servers: ServerRecord[];
-        defaultServerId: string;
-      }>("/servers");
+        defaultServerId: string | null;
+      }>("/servers", { signal: AbortSignal.timeout(10_000) });
       if (request !== fleetRequest.current) return;
       setServers(result.servers);
       setActiveId((current) =>
         result.servers.some((server) => server.id === current)
           ? current
-          : result.defaultServerId,
+          : (result.servers.find(
+              (server) => server.id === result.defaultServerId,
+            )?.id ??
+            result.servers[0]?.id ??
+            ""),
       );
       setError("");
     } catch (cause) {
-      if (request === fleetRequest.current) setError((cause as Error).message);
+      if (request === fleetRequest.current)
+        setError(
+          cause instanceof Error && cause.name === "TimeoutError"
+            ? "The local panel took too long to respond. Try connecting again."
+            : cause instanceof Error
+              ? cause.message
+              : "The local panel could not be reached.",
+        );
+    } finally {
+      fleetInFlight.current = false;
+      if (request === fleetRequest.current) setLoading(false);
     }
   }, []);
   useEffect(() => {
-    void loadServers();
-    const timer = setInterval(loadServers, 5000);
+    void loadServers(true);
+    const timer = setInterval(() => void loadServers(), 5000);
     return () => clearInterval(timer);
   }, [loadServers]);
   useEffect(() => {
-    if (activeId) {
-      try {
-        localStorage.setItem("mc-panel.active-server", activeId);
-      } catch {
-        /* Selection still works without browser storage. */
-      }
+    try {
+      if (activeId) localStorage.setItem("mc-panel.active-server", activeId);
+      else localStorage.removeItem("mc-panel.active-server");
+    } catch {
+      /* Selection still works without browser storage. */
     }
   }, [activeId]);
   useEffect(() => {
@@ -245,14 +267,21 @@ export default function App() {
     return () => clearTimeout(timer);
   }, [notice]);
   const active = servers.find((server) => server.id === activeId);
+  useEffect(() => {
+    if (!active)
+      document.title = `${loading ? "Opening" : error ? "Connection error" : "Welcome"} · MC Panel`;
+  }, [active, error, loading]);
   const saved = (server: ServerRecord) => {
     fleetRequest.current++;
+    setLoading(false);
+    setError("");
     setServers((current) =>
       current.some((item) => item.id === server.id)
         ? current.map((item) => (item.id === server.id ? server : item))
         : [...current, server],
     );
     setActiveId(server.id);
+    if (!manager?.editing) window.location.hash = "console";
     setNotice(
       manager?.editing
         ? "Server settings saved."
@@ -261,47 +290,75 @@ export default function App() {
     setManager(null);
     void loadServers();
   };
-  if (!active)
-    return (
-      <div className="server-workspace-loading">
-        <Box size={33} />
-        <h1>
-          {error ? "Unable to load your servers" : "Opening your worlds…"}
-        </h1>
-        <p>{error || "Connecting to your local server panel."}</p>
-        {error && (
-          <button className="btn primary" onClick={loadServers}>
-            Retry connection
-          </button>
-        )}
-      </div>
+  const removed = (serverId: string) => {
+    fleetRequest.current++;
+    setServers((current) => current.filter((server) => server.id !== serverId));
+    setActiveId((current) =>
+      current === serverId
+        ? (servers.find((server) => server.id !== serverId)?.id ?? "")
+        : current,
     );
+    setLoading(false);
+    setError("");
+    setManager(null);
+    setNotice(
+      "Demo removed from the panel. Its files and backups are still on disk.",
+    );
+    void loadServers();
+  };
   return (
     <>
-      <ServerScope.Provider value={active.id}>
-        <ServerWorkspace
-          key={active.id}
-          servers={servers}
-          selected={active}
-          onSelect={setActiveId}
-          onAdd={() => setManager({ editing: null })}
-          onSettings={(status) =>
-            setManager({
-              editing: { ...active, status: status ?? active.status },
-            })
-          }
-        />
-      </ServerScope.Provider>
+      {active ? (
+        <ServerScope.Provider value={active.id}>
+          <ServerWorkspace
+            key={active.id}
+            servers={servers}
+            selected={active}
+            onSelect={setActiveId}
+            onAdd={() => setManager({ editing: null })}
+            onSettings={(status) =>
+              setManager({
+                editing: { ...active, status: status ?? active.status },
+              })
+            }
+          />
+        </ServerScope.Provider>
+      ) : loading || error ? (
+        <div
+          className="server-workspace-loading"
+          role={error ? "alert" : "status"}
+        >
+          <span className="fleet-loading-mark">
+            <Box size={33} />
+          </span>
+          <h1>{error ? "Unable to load your servers" : "Opening MC Panel…"}</h1>
+          <p>{error || "Connecting to your local server panel."}</p>
+          {error && (
+            <button
+              className="btn primary"
+              onClick={() => void loadServers(true)}
+            >
+              Retry connection
+            </button>
+          )}
+        </div>
+      ) : (
+        <EmptyFleet onAdd={() => setManager({ editing: null })} />
+      )}
       {manager && (
         <ServerManager
           editing={manager.editing}
           servers={servers}
           onClose={() => setManager(null)}
           onSaved={saved}
+          onRemoved={removed}
         />
       )}
       {notice && (
-        <div className="toast" role="status">
+        <div
+          className={`toast ${!active ? "fleet-empty-toast" : ""}`}
+          role="status"
+        >
           <CheckCheck size={18} />
           <span>{notice}</span>
           <button
@@ -313,6 +370,122 @@ export default function App() {
         </div>
       )}
     </>
+  );
+}
+
+function EmptyFleet({ onAdd }: { onAdd: () => void }) {
+  return (
+    <div className="fleet-welcome-shell">
+      <header className="fleet-welcome-header">
+        <div className="brand" aria-label="MC Panel">
+          <span className="brand-icon">
+            <Box size={24} />
+          </span>
+          <span>
+            MC<span className="brand-light">PANEL</span>
+            <small>YOUR WORLD. YOUR RULES.</small>
+          </span>
+        </div>
+        <a
+          className="help-button"
+          href="https://github.com/BigUziHert/MC-Server-UI/tree/dev#readme"
+          target="_blank"
+          rel="noreferrer"
+        >
+          <CircleHelp size={17} /> <span>Setup guide</span>{" "}
+          <ExternalLink size={13} />
+        </a>
+      </header>
+      <main className="fleet-welcome-main">
+        <section
+          className="fleet-welcome-intro"
+          aria-labelledby="fleet-welcome-title"
+        >
+          <div className="fleet-welcome-copy">
+            <span className="fleet-welcome-eyebrow">WELCOME TO MC PANEL</span>
+            <h1 id="fleet-welcome-title">
+              Your next world
+              <br />
+              <span>starts here</span>
+            </h1>
+            <p>
+              Add your first Minecraft server. Keep your console, files,
+              players, and backups together, right on your computer.
+            </p>
+            <button className="btn primary fleet-welcome-add" onClick={onAdd}>
+              <Plus size={18} /> Add your first server <ArrowRight size={17} />
+            </button>
+            <span className="fleet-welcome-hint">
+              Just exploring? Demo mode is available when you add a server.
+            </span>
+          </div>
+          <div className="fleet-welcome-art" aria-hidden="true">
+            <div className="fleet-art-grid" />
+            <div className="fleet-art-ring" />
+            <span className="fleet-art-cube">
+              <Box size={102} strokeWidth={1.2} />
+            </span>
+            <span className="fleet-art-tool fleet-art-terminal">
+              <Terminal size={24} />
+            </span>
+            <span className="fleet-art-tool fleet-art-files">
+              <FolderOpen size={25} />
+            </span>
+            <span className="fleet-art-tool fleet-art-backup">
+              <Cloud size={25} />
+            </span>
+            <span className="fleet-art-dot fleet-art-dot-one" />
+            <span className="fleet-art-dot fleet-art-dot-two" />
+          </div>
+        </section>
+        <section
+          className="fleet-welcome-steps"
+          aria-labelledby="fleet-steps-title"
+        >
+          <div className="fleet-steps-heading">
+            <h2 id="fleet-steps-title">From an idea to your own world</h2>
+            <span>THREE SIMPLE STEPS</span>
+          </div>
+          <ol>
+            <li>
+              <span className="fleet-step-number">01</span>
+              <Box size={21} />
+              <h3>Add your server</h3>
+              <p>
+                Give it a name and set up Minecraft Java with its own port and
+                memory.
+              </p>
+            </li>
+            <li>
+              <span className="fleet-step-number">02</span>
+              <FolderOpen size={21} />
+              <h3>Bring your world</h3>
+              <p>
+                Upload your server JAR and files, then review and accept the
+                Minecraft EULA.
+              </p>
+            </li>
+            <li>
+              <span className="fleet-step-number">03</span>
+              <Play size={21} />
+              <h3>Make it yours</h3>
+              <p>
+                Start from Console, invite your players, and set a backup
+                schedule that fits.
+              </p>
+            </li>
+          </ol>
+        </section>
+        <footer className="fleet-welcome-footer">
+          <span>
+            <ShieldCheck size={15} /> Your servers. Your computer. Your control.
+          </span>
+          <span>
+            MC Panel <span className="footer-version">v0.1.1</span>
+          </span>
+        </footer>
+      </main>
+    </div>
   );
 }
 
@@ -480,7 +653,9 @@ function ServerWorkspace({
           <div className="topbar-right">
             <span className="environment-badge">
               <span />
-              {server?.mode === "live" ? "Local server" : "Demo workspace"}
+              {(server?.mode ?? selected.mode) === "live"
+                ? "Local server"
+                : "Demo workspace"}
             </span>
             <span className="topbar-divider" />
             <button
@@ -526,7 +701,7 @@ function ServerWorkspace({
               </span>
             </span>
             <span className="muted">
-              Development build <span className="footer-version">v0.1.0</span>
+              Development build <span className="footer-version">v0.1.1</span>
             </span>
           </footer>
         </main>

@@ -40,6 +40,7 @@ export async function startDesktopRuntime({
   const fleet = await createFleet({
     dataDir,
     useEnvironment: false,
+    createDefaultServer: false,
     scheduler,
     spawnServer,
     backupFlushTimeoutMs,

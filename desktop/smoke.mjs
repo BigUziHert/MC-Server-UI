@@ -87,6 +87,38 @@ async function assertPrivateApi(origin) {
   );
 }
 
+async function capturePackaged(filename) {
+  try {
+    const png = await bounded(
+      application.evaluate(async ({ BrowserWindow }, origin) => {
+        const window = BrowserWindow.getAllWindows().find((item) =>
+          item.webContents.getURL().startsWith(origin),
+        );
+        if (!window)
+          throw new Error("No packaged application window is available.");
+        const image = await window.webContents.capturePage(undefined, {
+          stayHidden: true,
+          stayAwake: true,
+        });
+        if (image.isEmpty())
+          throw new Error("The hidden window returned an empty capture.");
+        return image.toPNG().toString("base64");
+      }, currentOrigin),
+      10_000,
+      "The hidden Electron window did not finish its optional screenshot.",
+    );
+    await fs.writeFile(
+      path.join(outputDirectory, filename),
+      Buffer.from(png, "base64"),
+    );
+  } catch (error) {
+    // Renderer/compositor capture is optional; browser screenshots cover layout.
+    console.warn(
+      `[desktop smoke] Skipping optional screenshot ${filename}: ${error.message}`,
+    );
+  }
+}
+
 async function installDownloadCapture(app, destination) {
   await app.evaluate(({ BrowserWindow }, destination) => {
     globalThis.__panelSmokeDownloads = [];
@@ -123,7 +155,7 @@ async function expectDownload(filename) {
   return fs.readFile(path.join(downloadDirectory, filename));
 }
 
-async function launchPackaged() {
+async function launchPackaged({ expectEmpty = false } = {}) {
   const launchEnvironment = { ...process.env, ELECTRON_ENABLE_LOGGING: "1" };
   delete launchEnvironment.ELECTRON_RUN_AS_NODE;
   delete launchEnvironment.NODE_OPTIONS;
@@ -139,7 +171,11 @@ async function launchPackaged() {
     route.fulfill({ contentType: "image/svg+xml", body: imageFixture }),
   );
   await ui(
-    page.getByRole("heading", { level: 1, name: "Console", exact: true }),
+    page.getByRole("heading", {
+      level: 1,
+      name: expectEmpty ? "Your next world starts here" : "Console",
+      exact: true,
+    }),
   ).toBeVisible();
   await ui(page).toHaveTitle(/MC\s*Panel/i);
   const url = new URL(page.url());
@@ -237,17 +273,73 @@ async function launchPackaged() {
     200,
     "The window must authenticate its own API requests.",
   );
-  assert.ok(servers.data.servers.length > 0);
-  assert.equal(
-    servers.data.servers[0].mode,
-    "demo",
-    "A smoke profile must not start a live Java server.",
-  );
+  if (expectEmpty) {
+    assert.deepEqual(
+      servers.data.servers,
+      [],
+      "A fresh desktop profile must not create a demonstration server.",
+    );
+    assert.equal(servers.data.defaultServerId, null);
+    await ui(
+      page.getByRole("heading", { level: 1, name: "Console", exact: true }),
+    ).toHaveCount(0);
+    await ui(
+      page.getByRole("combobox", { name: "Switch server", exact: true }),
+    ).toHaveCount(0);
+    const initialFiles = await fs.readdir(path.join(profileDirectory, "data"));
+    assert.deepEqual(
+      initialFiles.sort(),
+      ["servers.json"],
+      "A fresh desktop profile must contain only an empty fleet registry, without seeded server files.",
+    );
+  } else {
+    assert.equal(servers.data.servers.length, 1);
+    assert.equal(
+      servers.data.servers[0].mode,
+      "demo",
+      "The smoke profile must retain only the explicitly created demo server.",
+    );
+  }
   await installDownloadCapture(application, downloadDirectory);
   step(
     `Packaged Electron ${mainState.electronVersion}, Node ${mainState.nodeVersion}; private local runtime ready.`,
   );
   return { page, serverId: servers.data.defaultServerId };
+}
+
+async function createSmokeDemo(page) {
+  step(
+    "Verifying the clean welcome screen, then explicitly creating a demo for the smoke checks.",
+  );
+  await capturePackaged("packaged-first-launch.png");
+  await page
+    .getByRole("button", { name: "Add your first server", exact: true })
+    .click();
+  const dialog = page.getByRole("dialog", {
+    name: "Add a server",
+    exact: true,
+  });
+  await ui(dialog.getByLabel("Mode", { exact: true })).toHaveValue("live");
+  await dialog.getByLabel("Mode", { exact: true }).selectOption("demo");
+  await dialog
+    .getByLabel("Server name", { exact: true })
+    .fill("Desktop smoke demo");
+  await dialog
+    .getByRole("button", { name: "Create server", exact: true })
+    .click();
+  await ui(dialog).not.toBeVisible();
+  await ui(
+    page.getByRole("heading", { level: 1, name: "Console", exact: true }),
+  ).toBeVisible();
+  await ui(
+    page.getByRole("heading", { name: "Desktop smoke demo", exact: true }),
+  ).toBeVisible();
+  const result = await browserApi(page, "/servers");
+  assert.equal(result.status, 200);
+  assert.equal(result.data.servers.length, 1);
+  assert.equal(result.data.servers[0].mode, "demo");
+  assert.equal(result.data.servers[0].id, result.data.defaultServerId);
+  return result.data.defaultServerId;
 }
 
 async function quitPackaged(mode = "quit") {
@@ -353,7 +445,8 @@ try {
   step(
     `Launching ${path.basename(executablePath)} with an isolated test profile.`,
   );
-  let { page, serverId } = await launchPackaged();
+  let { page, serverId } = await launchPackaged({ expectEmpty: true });
+  serverId = await createSmokeDemo(page);
 
   step("Creating and uploading files through the packaged File Manager.");
   await page.goto(`${currentOrigin}/#files`);
@@ -391,10 +484,7 @@ try {
     .getByRole("link", { name: "Download desktop-smoke.bin", exact: true })
     .click();
   assert.deepEqual(await expectDownload("desktop-smoke.bin"), uploadBytes);
-  await page.screenshot({
-    path: path.join(outputDirectory, "packaged-file-manager.png"),
-    fullPage: true,
-  });
+  await capturePackaged("packaged-file-manager.png");
 
   step("Creating and downloading SQLite through the bundled Node runtime.");
   await page.goto(`${currentOrigin}/#databases`);
@@ -505,10 +595,7 @@ try {
       (item) => item.name === "desktop_smoke",
     ),
   );
-  await page.screenshot({
-    path: path.join(outputDirectory, "packaged-relaunch.png"),
-    fullPage: true,
-  });
+  await capturePackaged("packaged-relaunch.png");
   step(
     "Simulating the window's Windows session-ending event and checking graceful exit.",
   );
@@ -525,12 +612,7 @@ try {
         () => globalThis.__panelSmokeDownloads ?? [],
       );
       console.error(`Smoke download states: ${JSON.stringify(downloads)}`);
-      const windows = application.windows();
-      if (windows[0])
-        await windows[0].screenshot({
-          path: path.join(outputDirectory, "packaged-smoke-failure.png"),
-          fullPage: true,
-        });
+      await capturePackaged("packaged-smoke-failure.png");
     } catch {
       /* The failing process may already have exited. */
     }

@@ -6,6 +6,7 @@ import {
   Plus,
   Save,
   Settings2,
+  Trash2,
   X,
 } from "lucide-react";
 import { api, post } from "./api";
@@ -96,16 +97,18 @@ export default function ServerManager({
   servers,
   onClose,
   onSaved,
+  onRemoved,
 }: {
   editing: ServerRecord | null;
   servers: ServerRecord[];
   onClose: () => void;
   onSaved: (server: ServerRecord) => void;
+  onRemoved: (serverId: string) => void;
 }) {
   let nextPort = 25565;
   while (servers.some((server) => server.port === nextPort)) nextPort++;
   const [name, setName] = useState(editing?.name ?? "");
-  const [mode, setMode] = useState<"demo" | "live">(editing?.mode ?? "demo");
+  const [mode, setMode] = useState<"demo" | "live">(editing?.mode ?? "live");
   const [port, setPort] = useState(String(editing?.port ?? nextPort));
   const [memory, setMemory] = useState(String(editing?.memoryLimitMB ?? 4096));
   const [jar, setJar] = useState(editing?.jar || "server.jar");
@@ -115,16 +118,22 @@ export default function ServerManager({
   );
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
+  const [confirmingRemoval, setConfirmingRemoval] = useState(false);
   const dialog = useRef<HTMLDialogElement>(null);
+  const removalCancel = useRef<HTMLButtonElement>(null);
   const running = !!editing && editing.status !== "offline";
   useEffect(() => {
     const element = dialog.current;
     element?.showModal();
     return () => element?.close();
   }, []);
+  useEffect(() => {
+    if (confirmingRemoval) removalCancel.current?.focus();
+  }, [confirmingRemoval]);
 
   async function submit(event: FormEvent) {
     event.preventDefault();
+    if (confirmingRemoval || busy) return;
     setBusy(true);
     setError("");
     const settings = {
@@ -149,6 +158,26 @@ export default function ServerManager({
       onSaved(result.server);
     } catch (cause) {
       setError((cause as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function removeDemo() {
+    if (!editing || editing.mode !== "demo" || busy) return;
+    setBusy(true);
+    setError("");
+    try {
+      await api(`/servers/${encodeURIComponent(editing.id)}`, {
+        method: "DELETE",
+      });
+      onRemoved(editing.id);
+    } catch (cause) {
+      setError(
+        cause instanceof Error
+          ? cause.message
+          : "Unable to remove this demo server.",
+      );
     } finally {
       setBusy(false);
     }
@@ -185,7 +214,9 @@ export default function ServerManager({
         <p>
           {editing
             ? "Give your world a name and configure how it runs."
-            : "Another world, one familiar panel. Each server gets its own files, console, and backups."}
+            : servers.length === 0
+              ? "Set up your first world. Your server gets its own files, console, and backups."
+              : "Another world, one familiar panel. Each server gets its own files, console, and backups."}
         </p>
         <div className="form-field">
           <label htmlFor="server-name">Server name</label>
@@ -219,8 +250,8 @@ export default function ServerManager({
                 value={mode}
                 onChange={(e) => setMode(e.target.value as "demo" | "live")}
               >
-                <option value="demo">Demo server</option>
                 <option value="live">Minecraft Java</option>
+                <option value="demo">Demo server</option>
               </select>
             </div>
             <div className="form-field">
@@ -316,13 +347,62 @@ export default function ServerManager({
           </button>
           <button
             className="btn primary"
-            disabled={busy || !name.trim()}
+            disabled={busy || confirmingRemoval || !name.trim()}
             type="submit"
           >
             {editing ? <Save size={15} /> : <Plus size={15} />}{" "}
             {busy ? "Saving…" : editing ? "Save changes" : "Create server"}
           </button>
         </div>
+        {editing?.mode === "demo" && (
+          <div className="server-remove-demo">
+            {confirmingRemoval ? (
+              <div role="group" aria-labelledby="remove-demo-title">
+                <h3 id="remove-demo-title">Remove this demo server?</h3>
+                <p>
+                  <strong>{editing.name}</strong> and its backup schedule will
+                  stop, and the demo will disappear from your server list. Its
+                  files and backups will stay on your computer.
+                </p>
+                <div className="server-remove-actions">
+                  <button
+                    ref={removalCancel}
+                    className="btn"
+                    type="button"
+                    disabled={busy}
+                    onClick={() => {
+                      setConfirmingRemoval(false);
+                      setError("");
+                    }}
+                  >
+                    Cancel removal
+                  </button>
+                  <button
+                    className="btn danger"
+                    type="button"
+                    disabled={busy}
+                    onClick={() => void removeDemo()}
+                  >
+                    <Trash2 size={15} />
+                    {busy ? "Removing…" : "Remove demo server"}
+                  </button>
+                </div>
+              </div>
+            ) : (
+              <button
+                className="server-remove-link"
+                type="button"
+                disabled={busy}
+                onClick={() => {
+                  setConfirmingRemoval(true);
+                  setError("");
+                }}
+              >
+                <Trash2 size={14} /> Remove demo server
+              </button>
+            )}
+          </div>
+        )}
       </form>
     </dialog>
   );

@@ -591,3 +591,174 @@ test("a failed registry write rolls server.properties back and leaves active set
     200,
   );
 });
+
+test("removing the last demo preserves its files and backups and leaves an empty registry after restart", async (t) => {
+  const { boot, dataDir } = await fixture(t);
+  const first = await boot();
+  const id = (await first.request("/api/servers")).body.defaultServerId;
+  await first.request(
+    "/api/files",
+    json("POST", {
+      name: "kept.txt",
+      type: "file",
+      content: "do not delete this demo's files",
+    }),
+  );
+  const backup = await first.request(
+    "/api/backups",
+    json("POST", { name: "Retained backup" }),
+  );
+  const removed = await first.request(`/api/servers/${id}`, {
+    method: "DELETE",
+  });
+  assert.equal(removed.status, 200);
+  assert.deepEqual(removed.body, {
+    ok: true,
+    serverId: id,
+    defaultServerId: null,
+    filesPreserved: true,
+  });
+  assert.equal(first.runtimes.size, 0);
+  assert.equal(
+    await fs.readFile(path.join(dataDir, "server", "kept.txt"), "utf8"),
+    "do not delete this demo's files",
+  );
+  assert.ok(
+    (await fs.stat(path.join(dataDir, "backups", `${backup.body.id}.tar.gz`)))
+      .size > 0,
+  );
+  assert.deepEqual((await first.request("/api/servers")).body, {
+    servers: [],
+    defaultServerId: null,
+  });
+  assert.equal((await first.request("/api/server")).status, 404);
+  await first.close();
+  const restarted = await boot();
+  assert.deepEqual((await restarted.request("/api/servers")).body, {
+    servers: [],
+    defaultServerId: null,
+  });
+  assert.equal(restarted.runtimes.size, 0);
+  const explicit = await restarted.request(
+    "/api/servers",
+    json("POST", { name: "My real server" }),
+  );
+  assert.equal(explicit.body.server.mode, "live");
+  assert.equal(explicit.body.server.port, 25565);
+  assert.equal(
+    (await restarted.request("/api/servers")).body.defaultServerId,
+    explicit.body.server.id,
+  );
+  assert.equal(
+    (
+      await restarted.request(`/api/servers/${explicit.body.server.id}`, {
+        method: "DELETE",
+      })
+    ).status,
+    409,
+  );
+});
+
+test("removing a legacy default retains another server's instance storage across default reassignment", async (t) => {
+  const { boot, dataDir } = await fixture(t);
+  const original = await boot();
+  const legacyId = (await original.request("/api/servers")).body
+    .defaultServerId;
+  const live = (
+    await original.request(
+      "/api/servers",
+      json("POST", { name: "Keep this world", mode: "live", port: 25566 }),
+    )
+  ).body.server;
+  await original.request(
+    "/api/files",
+    json("POST", {
+      name: "world-proof.txt",
+      type: "file",
+      content: "instance data stays here",
+    }),
+    live.id,
+  );
+  await original.request(
+    "/api/subusers",
+    json("POST", { email: "kept@example.com", role: "viewer" }),
+    live.id,
+  );
+  const backup = await original.request(
+    "/api/backups",
+    json("POST", { name: "Instance backup" }),
+    live.id,
+  );
+  const instanceDir = original.runtimes.get(live.id).dataDir;
+  await original.close();
+  // Simulate a registry written by the previously installed app, before storage tags existed.
+  const registryPath = path.join(dataDir, "servers.json");
+  const oldRegistry = JSON.parse(await fs.readFile(registryPath, "utf8"));
+  for (const entry of oldRegistry.servers) delete entry.storage;
+  await fs.writeFile(registryPath, JSON.stringify(oldRegistry));
+  const upgraded = await boot({ createDefaultServer: false });
+  assert.equal(
+    (await upgraded.request(`/api/servers/${legacyId}`, { method: "DELETE" }))
+      .status,
+    200,
+  );
+  assert.equal(
+    (await upgraded.request("/api/servers")).body.defaultServerId,
+    live.id,
+  );
+  assert.equal(
+    (await upgraded.request("/api/files/content?path=world-proof.txt")).body
+      .content,
+    "instance data stays here",
+  );
+  await upgraded.close();
+  const restarted = await boot({ createDefaultServer: false });
+  assert.equal(restarted.runtimes.get(live.id).dataDir, instanceDir);
+  assert.equal(
+    (await restarted.request("/api/files/content?path=world-proof.txt")).body
+      .content,
+    "instance data stays here",
+  );
+  assert.equal(
+    (await restarted.request("/api/backups")).body.backups[0].id,
+    backup.body.id,
+  );
+  assert.equal(
+    (await restarted.request("/api/subusers")).body.users[0].email,
+    "kept@example.com",
+  );
+  assert.ok(
+    (
+      await fs.stat(
+        path.join(instanceDir, "backups", `${backup.body.id}.tar.gz`),
+      )
+    ).size > 0,
+  );
+});
+
+test("clean-start option imports recognizable pre-registry workspaces without deleting existing files", async (t) => {
+  const { boot, dataDir } = await fixture(t);
+  const legacy = await createPanel({
+    dataDir,
+    useEnvironment: false,
+    scheduler: false,
+  });
+  await fs.writeFile(
+    path.join(legacy.serverDir, "precious.txt"),
+    "pre-registry world",
+  );
+  await legacy.audit("file", "Existing world", "Keep all legacy data");
+  await legacy.close();
+  const imported = await boot({ createDefaultServer: false });
+  assert.equal((await imported.request("/api/servers")).body.servers.length, 1);
+  assert.equal(
+    (await imported.request("/api/files/content?path=precious.txt")).body
+      .content,
+    "pre-registry world",
+  );
+  assert.ok(
+    (await imported.request("/api/audit")).body.entries.some(
+      (entry) => entry.action === "Existing world",
+    ),
+  );
+});

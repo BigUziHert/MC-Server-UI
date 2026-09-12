@@ -8,8 +8,17 @@ import { fileURLToPath } from "node:url";
 import { EventEmitter } from "node:events";
 import { PassThrough, Writable } from "node:stream";
 import { DESKTOP_COOKIE_NAME, startDesktopRuntime } from "./runtime.mjs";
+import { createFleet } from "../server/index.mjs";
 
 const json = (method, body) => ({ method, body: JSON.stringify(body) });
+async function addServer(runtime, settings = {}) {
+  const response = await runtime.request(
+    "/api/servers",
+    json("POST", { name: "My server", port: 25565, ...settings }),
+  );
+  assert.equal(response.status, 201);
+  return (await response.json()).server;
+}
 async function fixture(t) {
   const rootDir = await fs.mkdtemp(
     path.join(os.tmpdir(), "mc-desktop-runtime-"),
@@ -76,7 +85,8 @@ test("desktop runtime requires its random session cookie for all API, file and s
     );
   const api = await runtime.request("/api/servers");
   assert.equal(api.status, 200);
-  assert.equal((await api.json()).servers.length, 1);
+  assert.deepEqual(await api.json(), { servers: [], defaultServerId: null });
+  await addServer(runtime);
   const file = await runtime.request(
     "/api/files/download?path=server.properties",
   );
@@ -131,8 +141,11 @@ test("desktop runtime enforces its exact origin and host, even with a valid cook
       origin,
     );
   assert.equal(
-    (await runtime.request("/api/server", { headers: { Origin: runtime.url } }))
-      .status,
+    (
+      await runtime.request("/api/servers", {
+        headers: { Origin: runtime.url },
+      })
+    ).status,
     200,
   );
   assert.equal(
@@ -160,6 +173,7 @@ test("desktop runtime enforces its exact origin and host, even with a valid cook
     req.on("error", reject);
   });
   assert.equal(hostResult, 403);
+  await addServer(runtime);
   assert.equal(
     (
       await runtime.request("/api/files", {
@@ -200,10 +214,12 @@ test("desktop runtime isolates environment settings and persists its data across
     }
   }
   const servers = await (await first.request("/api/servers")).json();
-  const id = servers.defaultServerId;
-  assert.equal(servers.servers[0].name, "The Overworld");
-  assert.equal(servers.servers[0].mode, "demo");
-  assert.equal(servers.servers[0].javaPath, "java");
+  assert.deepEqual(servers, { servers: [], defaultServerId: null });
+  const created = await addServer(first, { name: "My chosen server" });
+  const id = created.id;
+  assert.equal(created.name, "My chosen server");
+  assert.equal(created.mode, "live");
+  assert.equal(created.javaPath, "java");
   await assert.rejects(fs.access(path.join(rootDir, "unrelated-data")));
   await assert.rejects(fs.access(path.join(rootDir, "unrelated-server")));
   assert.equal(
@@ -327,8 +343,10 @@ test("desktop startup requires an explicit absolute data directory", async () =>
 });
 
 test("desktop shutdown aborts an unfinished upload without hanging or publishing partial server files", async (t) => {
-  const { launch, dataDir } = await fixture(t);
+  const { launch } = await fixture(t);
   const runtime = await launch();
+  const created = await addServer(runtime);
+  const { dataDir, serverDir } = runtime.fleet.runtimes.get(created.id);
   const upload = http.request(runtime.url + "/api/files/upload", {
     method: "POST",
     headers: {
@@ -364,5 +382,104 @@ test("desktop shutdown aborts an unfinished upload without hanging or publishing
     clearTimeout(timeout);
     upload.destroy();
   }
-  await assert.rejects(fs.access(path.join(dataDir, "server", "partial.txt")));
+  await assert.rejects(fs.access(path.join(serverDir, "partial.txt")));
+});
+
+test("fresh desktop stays empty across restarts and gives the first explicit server its own persistent storage", async (t) => {
+  const { launch, dataDir } = await fixture(t);
+  const first = await launch();
+  assert.deepEqual(await (await first.request("/api/servers")).json(), {
+    servers: [],
+    defaultServerId: null,
+  });
+  assert.deepEqual(await fs.readdir(dataDir), ["servers.json"]);
+  for (const route of [
+    "/api/server",
+    "/api/files",
+    "/api/backups",
+    "/api/players",
+    "/api/not-an-endpoint",
+  ]) {
+    const response = await first.request(route);
+    assert.equal(response.status, 404);
+    assert.match((await response.json()).error, /Add a server/);
+  }
+  const distIndex = path.resolve(
+    path.dirname(fileURLToPath(import.meta.url)),
+    "../dist/index.html",
+  );
+  if (
+    await fs.access(distIndex).then(
+      () => true,
+      () => false,
+    )
+  ) {
+    const ui = await first.request("/");
+    assert.equal(ui.status, 200);
+    assert.match(await ui.text(), /<div id="root"><\/div>/);
+  }
+  await first.close();
+  const second = await launch();
+  assert.deepEqual(await (await second.request("/api/servers")).json(), {
+    servers: [],
+    defaultServerId: null,
+  });
+  assert.deepEqual(await fs.readdir(dataDir), ["servers.json"]);
+  const created = await addServer(second, { name: "Actual server" });
+  assert.equal(created.mode, "live");
+  assert.equal(created.status, "offline");
+  assert.equal(
+    (await (await second.request("/api/servers")).json()).defaultServerId,
+    created.id,
+  );
+  await second.request(
+    "/api/files",
+    json("POST", {
+      name: "keep.txt",
+      type: "file",
+      content: "first explicit server",
+    }),
+  );
+  const instance = second.fleet.runtimes.get(created.id);
+  assert.equal(instance.dataDir, path.join(dataDir, "instances", created.id));
+  await second.close();
+  const third = await launch();
+  assert.equal(third.fleet.runtimes.get(created.id).dataDir, instance.dataDir);
+  assert.equal(
+    await (await third.request("/api/files/download?path=keep.txt")).text(),
+    "first explicit server",
+  );
+  assert.equal(
+    (await (await third.request("/api/audit")).json()).entries.some(
+      (entry) => entry.action === "File created",
+    ),
+    true,
+  );
+  await assert.rejects(fs.access(path.join(dataDir, "server")));
+});
+
+test("desktop preserves previously registered servers and their existing world files", async (t) => {
+  const { launch, dataDir } = await fixture(t);
+  const previous = await createFleet({
+    dataDir,
+    scheduler: false,
+    useEnvironment: false,
+  });
+  const [id, instance] = previous.runtimes.entries().next().value;
+  await fs.writeFile(
+    path.join(instance.serverDir, "keep-world.txt"),
+    "existing installation",
+  );
+  await previous.close();
+  const runtime = await launch();
+  const restored = await (await runtime.request("/api/servers")).json();
+  assert.equal(restored.defaultServerId, id);
+  assert.equal(restored.servers[0].name, "The Overworld");
+  assert.equal(restored.servers[0].mode, "demo");
+  assert.equal(
+    await (
+      await runtime.request("/api/files/download?path=keep-world.txt")
+    ).text(),
+    "existing installation",
+  );
 });

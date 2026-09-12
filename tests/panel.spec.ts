@@ -5,6 +5,7 @@ import {
   type Page,
 } from "@playwright/test";
 import { readFile } from "node:fs/promises";
+import path from "node:path";
 import * as tar from "tar";
 
 const minecraftHeadFixture =
@@ -1442,4 +1443,245 @@ test("populated Minecraft head lists fit mobile Console and Players layouts", as
       fullPage: true,
     });
   }
+});
+
+test("an empty fleet shows clean onboarding and the first server defaults to Minecraft Java", async ({
+  page,
+}, testInfo) => {
+  let firstServer: TestServer | undefined;
+  const unexpectedServerRequests: string[] = [];
+  page.on("request", (request) => {
+    const pathname = new URL(request.url()).pathname;
+    if (
+      !firstServer &&
+      /^\/api\/(?:server|console|files|backups|players|subusers|databases|audit)(?:\/|$)/.test(
+        pathname,
+      )
+    ) {
+      unexpectedServerRequests.push(pathname);
+    }
+  });
+  await page.route("**/api/servers", async (route) => {
+    if (route.request().method() === "GET") {
+      await route.fulfill({
+        json: {
+          servers: firstServer ? [firstServer] : [],
+          defaultServerId: firstServer?.id ?? null,
+        },
+      });
+      return;
+    }
+    const response = await route.fetch();
+    const body = await response.json();
+    if (response.ok() && route.request().method() === "POST")
+      firstServer = body.server;
+    await route.fulfill({ response, json: body });
+  });
+
+  await page.goto("/");
+  const welcome = page.getByRole("heading", {
+    level: 1,
+    name: "Your next world starts here",
+    exact: true,
+  });
+  await expect(welcome).toBeVisible();
+  await expect(
+    page.getByRole("navigation", { name: "Main navigation", exact: true }),
+  ).toHaveCount(0);
+  await expect(
+    page.getByRole("combobox", { name: "Switch server", exact: true }),
+  ).toHaveCount(0);
+  await expect(
+    page.getByRole("heading", { level: 1, name: "Console", exact: true }),
+  ).toHaveCount(0);
+  await expect(
+    page.getByRole("log", { name: "Server console output", exact: true }),
+  ).toHaveCount(0);
+  await expect(
+    page.getByRole("button", { name: "Start", exact: true }),
+  ).toHaveCount(0);
+  await page.screenshot({
+    path: testInfo.outputPath("empty-fleet-desktop.png"),
+    fullPage: true,
+  });
+  await page.reload();
+  await expect(welcome).toBeVisible();
+  expect(
+    unexpectedServerRequests,
+    "An empty fleet must not query a fabricated selected server.",
+  ).toEqual([]);
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.evaluate(() => document.fonts.ready);
+  expect(
+    await page.evaluate(
+      () => document.documentElement.scrollWidth - window.innerWidth,
+    ),
+  ).toBeLessThanOrEqual(1);
+  await page.screenshot({
+    path: testInfo.outputPath("empty-fleet-mobile.png"),
+    fullPage: true,
+  });
+  await page
+    .getByRole("button", { name: "Add your first server", exact: true })
+    .click();
+  const dialog = page.getByRole("dialog", {
+    name: "Add a server",
+    exact: true,
+  });
+  await expect(dialog.getByLabel("Mode", { exact: true })).toHaveValue("live");
+  await expect(dialog.getByLabel("Server JAR", { exact: true })).toHaveValue(
+    "server.jar",
+  );
+  await dialog
+    .getByLabel("Server name", { exact: true })
+    .fill("E2E First Real Server");
+  await dialog.getByLabel("Server port", { exact: true }).fill("25675");
+  await dialog.getByLabel("Memory (MB)", { exact: true }).fill("1024");
+  await dialog
+    .getByRole("button", { name: "Create server", exact: true })
+    .click();
+  await expect(dialog).not.toBeVisible();
+  await expect(
+    page.getByRole("heading", { level: 1, name: "Console", exact: true }),
+  ).toBeVisible();
+  await expect(
+    page.getByRole("heading", { name: "E2E First Real Server", exact: true }),
+  ).toBeVisible();
+  expect(firstServer).toMatchObject({
+    name: "E2E First Real Server",
+    mode: "live",
+    port: 25675,
+    memoryLimitMB: 1024,
+  });
+  await expect(
+    page.getByRole("button", { name: "Start", exact: true }),
+  ).toBeEnabled();
+  await expect(page.locator(".online-players .player-row")).toHaveCount(0);
+  await page.reload();
+  await expect(
+    page.getByRole("heading", { name: "E2E First Real Server", exact: true }),
+  ).toBeVisible();
+  await expect(welcome).toHaveCount(0);
+});
+
+test("removing the last listed demo returns to onboarding and preserves its files and backups", async ({
+  page,
+  request,
+}) => {
+  const demo = await createTestServer(request, "E2E Demo To Remove", 25676);
+  const marker =
+    "Preserve these files when removing the demonstration server.\n";
+  const file = await request.post("/api/files", {
+    headers: serverHeaders(demo.id),
+    data: {
+      path: "",
+      name: "keep-after-removal.txt",
+      type: "file",
+      content: marker,
+    },
+  });
+  expect(file.ok()).toBe(true);
+  const backupResponse = await request.post("/api/backups", {
+    headers: serverHeaders(demo.id),
+    data: { name: "Keep after demo removal" },
+  });
+  expect(backupResponse.ok()).toBe(true);
+  const backup = await backupResponse.json();
+  expect(process.env.PANEL_E2E_DATA_DIR).toBeTruthy();
+  const instanceDirectory = path.join(
+    process.env.PANEL_E2E_DATA_DIR!,
+    "instances",
+    demo.id,
+  );
+  const markerPath = path.join(
+    instanceDirectory,
+    "server",
+    "keep-after-removal.txt",
+  );
+  const backupPath = path.join(
+    instanceDirectory,
+    "backups",
+    `${backup.id}.tar.gz`,
+  );
+  expect(await readFile(markerPath, "utf8")).toBe(marker);
+  const archiveBefore = await readFile(backupPath);
+  let removed = false;
+  let removalResult: { filesPreserved: boolean } | undefined;
+  await page.route("**/api/servers", (route) => {
+    if (route.request().method() === "GET") {
+      return route.fulfill({
+        json: {
+          servers: removed ? [] : [demo],
+          defaultServerId: removed ? null : demo.id,
+        },
+      });
+    }
+    return route.fallback();
+  });
+  await page.route(`**/api/servers/${demo.id}`, async (route) => {
+    if (route.request().method() !== "DELETE") return route.fallback();
+    const response = await route.fetch();
+    const body = await response.json();
+    if (response.ok()) {
+      removed = true;
+      removalResult = body;
+    }
+    await route.fulfill({ response, json: body });
+  });
+  await page.goto("/");
+  await expect(
+    page.getByRole("heading", { name: "E2E Demo To Remove", exact: true }),
+  ).toBeVisible();
+  await page
+    .getByRole("button", { name: "Server settings", exact: true })
+    .click();
+  const dialog = page.getByRole("dialog", {
+    name: "Server settings",
+    exact: true,
+  });
+  await dialog
+    .getByRole("button", { name: "Remove demo server", exact: true })
+    .click();
+  const confirmation = dialog.getByRole("group", {
+    name: "Remove this demo server?",
+    exact: true,
+  });
+  await expect(confirmation).toContainText("E2E Demo To Remove");
+  await expect(confirmation).toContainText(
+    "files and backups will stay on your computer",
+  );
+  await confirmation
+    .getByRole("button", { name: "Cancel removal", exact: true })
+    .click();
+  await expect(confirmation).not.toBeVisible();
+  expect(removed).toBe(false);
+  await dialog
+    .getByRole("button", { name: "Remove demo server", exact: true })
+    .click();
+  await confirmation
+    .getByRole("button", { name: "Remove demo server", exact: true })
+    .click();
+  await expect(dialog).not.toBeVisible();
+  const welcome = page.getByRole("heading", {
+    level: 1,
+    name: "Your next world starts here",
+    exact: true,
+  });
+  await expect(welcome).toBeVisible();
+  await expect(
+    page.getByRole("combobox", { name: "Switch server", exact: true }),
+  ).toHaveCount(0);
+  expect(removalResult?.filesPreserved).toBe(true);
+  expect(
+    (await listServers(request)).servers.some(
+      (server) => server.id === demo.id,
+    ),
+  ).toBe(false);
+  expect(await readFile(markerPath, "utf8")).toBe(marker);
+  expect(await readFile(backupPath)).toEqual(archiveBefore);
+  await page.reload();
+  await expect(welcome).toBeVisible();
+  await expect(
+    page.getByRole("button", { name: "Add your first server", exact: true }),
+  ).toBeVisible();
 });
