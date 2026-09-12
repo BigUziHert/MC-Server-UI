@@ -52,6 +52,21 @@ async function openPage(page: Page, hash: string, heading: string) {
   ).toBeVisible();
 }
 
+async function seedServerProperties(request: APIRequestContext) {
+  // File tests own their input; optional demo seeding is not a fixture contract.
+  const content =
+    "# Browser test fixture\nserver-port=25565\nmotd=E2E file workspace\nmax-players=20\n";
+  const created = await request.post("/api/files", {
+    data: { name: "server.properties", type: "file", content },
+  });
+  if (created.status() === 409) {
+    const updated = await request.put("/api/files/content", {
+      data: { path: "server.properties", content },
+    });
+    expect(updated.status(), await updated.text()).toBe(200);
+  } else expect(created.status(), await created.text()).toBe(201);
+}
+
 test("console loads real API logs, sends commands, and controls the demo lifecycle", async ({
   page,
   request,
@@ -110,6 +125,7 @@ test("file manager creates and edits nested files and preserves upload/download 
   page,
   request,
 }, testInfo) => {
+  await seedServerProperties(request);
   await openPage(page, "files", "File Manager");
   await expect(
     page.getByRole("button", { name: "server.properties", exact: true }),
@@ -197,6 +213,7 @@ test("manual backups download a real archive and automatic schedules persist", a
   page,
   request,
 }, testInfo) => {
+  await seedServerProperties(request);
   const seed = await request.post("/api/files", {
     data: {
       path: "",
