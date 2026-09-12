@@ -14,6 +14,10 @@ import { mkdirSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { startDesktopRuntime } from "./runtime.mjs";
+import updaterPackage from "electron-updater";
+import { applyDownloadedUpdate, createUpdateController } from "./updates.mjs";
+
+const { autoUpdater } = updaterPackage;
 
 const desktopDir = path.dirname(fileURLToPath(import.meta.url));
 const documentation =
@@ -37,6 +41,9 @@ let quitting = false;
 let canQuit = false;
 let startup;
 let directoryDialog;
+let updates;
+let updateTimer;
+let initialUpdateTimer;
 
 async function logError(cause) {
   const message =
@@ -97,8 +104,8 @@ async function selectServerDirectory() {
   return directoryDialog;
 }
 
-async function requestQuit() {
-  if (quitting || canQuit) return;
+async function requestQuit(installUpdate = false) {
+  if (quitting || canQuit) return false;
   quitting = true;
   try {
     await startup;
@@ -110,26 +117,44 @@ async function requestQuit() {
     if (running.length) {
       const { response } = await dialog.showMessageBox(window, {
         type: "question",
-        title: "Quit MC Panel?",
-        message: "Quit and stop your Minecraft servers?",
-        detail: `${running.map((server) => server.name).join(", ")} will shut down. Scheduled backups resume when you open MC Panel again. Closing the window keeps everything running in the system tray.`,
-        buttons: ["Keep running", "Stop servers and quit"],
+        title: installUpdate ? "Install MC Panel update?" : "Quit MC Panel?",
+        message: installUpdate
+          ? "Stop your servers and update MC Panel?"
+          : "Quit and stop your Minecraft servers?",
+        detail: `${running.map((server) => server.name).join(", ")} will shut down after active backups finish. ${installUpdate ? "MC Panel will install the update and reopen. Your files and settings stay in place; start your servers again when you are ready." : "Scheduled backups resume when you open MC Panel again. Closing the window keeps everything running in the system tray."}`,
+        buttons: [
+          "Keep running",
+          installUpdate ? "Stop servers and update" : "Stop servers and quit",
+        ],
         defaultId: 0,
         cancelId: 0,
         noLink: true,
       });
       if (response !== 1) {
         quitting = false;
-        return;
+        return false;
       }
     }
     if (window && !window.isDestroyed())
       window.setTitle("Shutting down · MC Panel");
     tray?.setToolTip("MC Panel — shutting down servers");
-    await runtime?.close();
+    await runtime?.close({ gracefulOnly: installUpdate });
+    clearTimeout(initialUpdateTimer);
+    clearInterval(updateTimer);
     tray?.destroy();
     canQuit = true;
-    app.quit();
+    if (installUpdate)
+      applyDownloadedUpdate(autoUpdater, (cause) => {
+        void logError(cause);
+        dialog.showErrorBox(
+          "Update could not start",
+          "Your servers have been stopped safely, but the update installer could not start. MC Panel will reopen so you can retry. Your server files and settings are unchanged. Details are in desktop.log.",
+        );
+        app.relaunch();
+        app.exit(1);
+      });
+    else app.quit();
+    return true;
   } catch (cause) {
     quitting = false;
     await logError(cause);
@@ -149,6 +174,7 @@ async function requestQuit() {
       tray?.destroy();
       app.exit(1);
     } else await openFolder(userData);
+    return false;
   }
 }
 
@@ -177,6 +203,13 @@ function createMenus() {
       click: () => void openFolder(app.getPath("downloads")),
     },
     { type: "separator" },
+    {
+      label: "Check for updates",
+      click: () => {
+        showWindow();
+        updates?.check();
+      },
+    },
     { label: "Help and documentation", click: () => void openDocumentation() },
     { label: "Quit MC Panel", click: () => void requestQuit() },
   ];
@@ -221,9 +254,31 @@ function createMenus() {
 }
 
 async function launch() {
+  const installed =
+    app.isPackaged &&
+    !process.env.PORTABLE_EXECUTABLE_FILE &&
+    (await fs
+      .access(
+        path.join(path.dirname(app.getPath("exe")), "Uninstall MC Panel.exe"),
+      )
+      .then(
+        () => true,
+        () => false,
+      ));
+  const supported = process.platform === "win32" && installed && !smokeTest;
+  updates = createUpdateController({
+    updater: autoUpdater,
+    version: app.getVersion(),
+    supported,
+    reason:
+      "Install the Setup edition once to enable in-app updates. Portable and unpacked copies do not update themselves.",
+    install: () => requestQuit(true),
+    log: (cause) => void logError(cause),
+  });
   runtime = await startDesktopRuntime({
     dataDir: path.join(userData, "data"),
     selectServerDirectory,
+    updates,
   });
   const panelSession = session.fromPartition(`mc-panel-${randomUUID()}`);
   await panelSession.cookies.set({
@@ -305,6 +360,12 @@ async function launch() {
   window.on("session-end", endWindowsSession);
   createMenus();
   await window.loadURL(runtime.url);
+  if (supported) {
+    initialUpdateTimer = setTimeout(() => updates.check(), 30000);
+    updateTimer = setInterval(() => updates.check(), 4 * 60 * 60 * 1000);
+    initialUpdateTimer.unref();
+    updateTimer.unref();
+  }
   if (!smokeTest) showWindow();
 }
 

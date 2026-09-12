@@ -12,6 +12,8 @@ import {
   canonicalExternalDirectory,
   containedSourcePath,
   inspectServerDirectory,
+  validateStartupFiles,
+  buildScriptInvocation,
 } from "./import.mjs";
 
 const projectDir = path.resolve(
@@ -39,6 +41,46 @@ const exists = async (target) => {
     return false;
   }
 };
+
+export async function terminateProcessTree(
+  child,
+  { tree = false, platform = process.platform, spawnProcess = spawn } = {},
+) {
+  if (!tree || !Number.isInteger(child.pid) || child.pid <= 0) {
+    child.kill();
+    return;
+  }
+  if (platform === "win32") {
+    await new Promise((resolve, reject) => {
+      const killer = spawnProcess(
+        path.win32.join(
+          process.env.SystemRoot || "C:\\Windows",
+          "System32",
+          "taskkill.exe",
+        ),
+        ["/PID", String(child.pid), "/T", "/F"],
+        { shell: false, windowsHide: true, stdio: "ignore" },
+      );
+      killer.once("error", reject);
+      killer.once("close", (code) =>
+        code === 0
+          ? resolve()
+          : reject(
+              new Error(
+                `Could not stop the server process tree (taskkill ${code}). Check the server before starting another copy.`,
+              ),
+            ),
+      );
+    });
+  } else {
+    try {
+      process.kill(-child.pid, "SIGKILL");
+    } catch (cause) {
+      if (cause.code !== "ESRCH") throw cause;
+      child.kill("SIGKILL");
+    }
+  }
+}
 
 const escapeProperty = (value) =>
   String(value)
@@ -70,6 +112,10 @@ export function validateServerConfiguration(
     "port",
     "memoryLimitMB",
     "jar",
+    "launchType",
+    "launchScript",
+    "launchArgs",
+    "launchExecutable",
     "javaPath",
     "motd",
   ]);
@@ -81,6 +127,10 @@ export function validateServerConfiguration(
     port: 25565,
     memoryLimitMB: 4096,
     jar: "server.jar",
+    launchType: "jar",
+    launchScript: "",
+    launchArgs: [],
+    launchExecutable: "",
     javaPath: "java",
     motd: "Welcome to the Overworld",
     ...previous,
@@ -111,14 +161,75 @@ export function validateServerConfiguration(
     result.memoryLimitMB > 262144
   )
     throw error(400, "Memory must be an integer between 256 and 262144 MB.");
+  if (!["jar", "java-args", "script", "executable"].includes(result.launchType))
+    throw error(
+      400,
+      "Choose a server JAR, Java arguments, startup script, or executable.",
+    );
   if (
-    typeof result.jar !== "string" ||
-    !/\.jar$/i.test(result.jar) ||
-    result.jar.length > 180 ||
-    result.jar.split("/").some((part) => !part || part === "." || part === "..")
+    !Array.isArray(result.launchArgs) ||
+    result.launchArgs.length > 128 ||
+    result.launchArgs.some(
+      (value) =>
+        typeof value !== "string" ||
+        value.length > 8192 ||
+        /[\x00-\x1f\x7f]/.test(value),
+    )
   )
-    throw error(400, "Choose a relative .jar path inside this server's files.");
-  for (const part of result.jar.split("/")) validateName(part);
+    throw error(
+      400,
+      "Provide up to 128 startup arguments as separate text values without control characters.",
+    );
+  if (result.launchType !== "jar") {
+    result.jar = "";
+    if (result.launchType === "java-args" && !result.launchArgs.length)
+      throw error(
+        400,
+        "Enter the Java startup arguments, including its JAR, main class, or argument files.",
+      );
+    if (result.launchType === "script") {
+      if (
+        typeof result.launchScript !== "string" ||
+        !/\.(bat|cmd|sh|ps1)$/i.test(result.launchScript) ||
+        result.launchScript.length > 1024
+      )
+        throw error(
+          400,
+          "Choose a relative .bat, .cmd, .sh, or .ps1 startup script inside the server folder.",
+        );
+      for (const part of result.launchScript.split("/")) validateName(part);
+    } else result.launchScript = "";
+    if (result.launchType === "executable") {
+      if (
+        typeof result.launchExecutable !== "string" ||
+        !result.launchExecutable.trim() ||
+        result.launchExecutable.length > 1024 ||
+        /["\x00-\x1f\x7f]/.test(result.launchExecutable) ||
+        /\.(bat|cmd|sh|ps1)$/i.test(result.launchExecutable)
+      )
+        throw error(
+          400,
+          "Enter an executable name or path without surrounding quotes; select Startup script for script files.",
+        );
+    } else result.launchExecutable = "";
+  } else {
+    result.launchScript = "";
+    result.launchExecutable = "";
+    result.launchArgs = [];
+    if (
+      typeof result.jar !== "string" ||
+      !/\.jar$/i.test(result.jar) ||
+      result.jar.length > 180 ||
+      result.jar
+        .split("/")
+        .some((part) => !part || part === "." || part === "..")
+    )
+      throw error(
+        400,
+        "Choose a relative .jar path inside this server's files.",
+      );
+    for (const part of result.jar.split("/")) validateName(part);
+  }
   if (
     typeof result.javaPath !== "string" ||
     !result.javaPath.trim() ||
@@ -272,7 +383,10 @@ export async function createPanel(options = {}) {
   const serverDir = path.resolve(
     options.serverDir ?? env.MC_SERVER_DIR ?? path.join(dataDir, "server"),
   );
-  let configuredJar = (options.jar ?? env.MC_SERVER_JAR) || "server.jar";
+  let configuredJar =
+    options.launchType && options.launchType !== "jar"
+      ? ""
+      : (options.jar ?? env.MC_SERVER_JAR) || "server.jar";
   let mode =
     options.mode ?? (options.jar || env.MC_SERVER_JAR ? "live" : "demo");
   let memoryLimit = Number(options.memoryLimit ?? env.MC_MEMORY_MB ?? 4096);
@@ -282,6 +396,10 @@ export async function createPanel(options = {}) {
     port: Number(options.port ?? env.MC_PORT ?? 25565),
     memoryLimitMB: memoryLimit,
     jar: configuredJar,
+    launchType: options.launchType ?? "jar",
+    launchScript: options.launchScript ?? "",
+    launchArgs: options.launchArgs ?? [],
+    launchExecutable: options.launchExecutable ?? "",
     javaPath: options.javaPath ?? env.JAVA_PATH ?? "java",
     address:
       options.address ??
@@ -407,6 +525,8 @@ export async function createPanel(options = {}) {
   let configBusy = false;
   let startedAt = mode === "demo" ? Date.now() - 3_600_000 : null;
   let processHandle = null;
+  let stopTimer;
+  let terminationPromise;
   let restartRequested = false;
   let closed = false;
   let closePromise;
@@ -555,11 +675,18 @@ export async function createPanel(options = {}) {
       "port",
       "memoryLimitMB",
       "jar",
+      "launchType",
+      "launchScript",
+      "launchArgs",
+      "launchExecutable",
       "javaPath",
       "motd",
     ];
     if (
-      restartFields.some((key) => next[key] !== configuration[key]) &&
+      restartFields.some(
+        (key) =>
+          JSON.stringify(next[key]) !== JSON.stringify(configuration[key]),
+      ) &&
       status !== "offline"
     )
       throw error(
@@ -568,7 +695,11 @@ export async function createPanel(options = {}) {
       );
     configBusy = true;
     try {
-      await safePath(serverDir, next.jar);
+      if (next.launchType === "jar") await safePath(serverDir, next.jar);
+      else if (options.existingServerDir) {
+        const startup = await validateStartupFiles(serverDir, next);
+        if (startup.memoryLimitMB) next.memoryLimitMB = startup.memoryLimitMB;
+      }
       const updates = {};
       if (next.port !== configuration.port) updates["server-port"] = next.port;
       if (next.motd !== configuration.motd) updates.motd = next.motd;
@@ -659,12 +790,40 @@ export async function createPanel(options = {}) {
         demoTimer.unref();
         return;
       }
-      const jar = await safePath(serverDir, configuredJar);
-      if (!(await exists(jar)))
-        throw error(
-          400,
-          "MC_SERVER_JAR does not exist in the server directory.",
-        );
+      let launchArgs;
+      let executable = configuration.javaPath;
+      let windowsVerbatimArguments = false;
+      if (configuration.launchType !== "jar") {
+        const startup = await validateStartupFiles(serverDir, configuration);
+        launchArgs = configuration.launchArgs;
+        if (startup.memoryLimitMB) {
+          memoryLimit = startup.memoryLimitMB;
+          configuration.memoryLimitMB = memoryLimit;
+        }
+        if (configuration.launchType === "script") {
+          const script = await safePath(serverDir, configuration.launchScript);
+          const invocation = buildScriptInvocation(script, launchArgs);
+          executable = invocation.executable;
+          launchArgs = invocation.args;
+          windowsVerbatimArguments =
+            invocation.windowsVerbatimArguments ?? false;
+        } else if (configuration.launchType === "executable")
+          executable = configuration.launchExecutable;
+      } else {
+        const jar = await safePath(serverDir, configuredJar);
+        if (!(await exists(jar)))
+          throw error(
+            400,
+            "The selected server JAR does not exist in the server directory.",
+          );
+        launchArgs = [
+          `-Xms${Math.min(memoryLimit, 1024)}M`,
+          `-Xmx${memoryLimit}M`,
+          "-jar",
+          jar,
+          "nogui",
+        ];
+      }
       let eula = "";
       try {
         eula = await fs.readFile(await safePath(serverDir, "eula.txt"), "utf8");
@@ -678,23 +837,18 @@ export async function createPanel(options = {}) {
         );
       await writeProperties({ "server-port": configuration.port });
       status = "starting";
-      append("[Panel] Starting Java server…");
-      const child = (options.spawnServer ?? spawn)(
-        configuration.javaPath,
-        [
-          `-Xms${Math.min(memoryLimit, 1024)}M`,
-          `-Xmx${memoryLimit}M`,
-          "-jar",
-          jar,
-          "nogui",
-        ],
-        {
-          cwd: serverDir,
-          shell: false,
-          windowsHide: true,
-          stdio: ["pipe", "pipe", "pipe"],
-        },
-      );
+      append("[Panel] Starting server…");
+      const child = (options.spawnServer ?? spawn)(executable, launchArgs, {
+        cwd: serverDir,
+        shell: false,
+        windowsHide: true,
+        ...(windowsVerbatimArguments ? { windowsVerbatimArguments: true } : {}),
+        ...(process.platform !== "win32" &&
+        ["script", "executable"].includes(configuration.launchType)
+          ? { detached: true }
+          : {}),
+        stdio: ["pipe", "pipe", "pipe"],
+      });
       processHandle = child;
       startedAt = Date.now();
       const bindOutput = (stream, defaultLevel) => {
@@ -734,8 +888,9 @@ export async function createPanel(options = {}) {
         append(`[Panel] Java failed: ${cause.message}`, "error");
       });
       child.on("close", (code) => {
+        clearTimeout(stopTimer);
         processHandle = null;
-        status = "offline";
+        status = terminationPromise ? "stopping" : "offline";
         startedAt = null;
         clearPlayers();
         events.emit("server-exit", child);
@@ -743,10 +898,19 @@ export async function createPanel(options = {}) {
           `[Panel] Server process exited (code ${code ?? "unknown"}).`,
           code === 0 ? "info" : "error",
         );
-        if (restartRequested && !closed) {
-          restartRequested = false;
-          startServer().catch((cause) => append(cause.message, "error"));
-        }
+        const finishExit = () => {
+          terminationPromise = undefined;
+          status = "offline";
+          if (restartRequested && !closed) {
+            restartRequested = false;
+            startServer().catch((cause) => append(cause.message, "error"));
+          }
+        };
+        if (terminationPromise)
+          terminationPromise.then(finishExit, () => {
+            restartRequested = false;
+          });
+        else finishExit();
       });
     } catch (cause) {
       status = "offline";
@@ -785,7 +949,32 @@ export async function createPanel(options = {}) {
           }
         }, 650);
         demoTimer.unref();
-      } else processHandle?.stdin.write("stop\n");
+      } else {
+        const child = processHandle;
+        // A foreground script may fail to pass stop through or wait after Java
+        // exits. Bound that wait and terminate the owned tree before restarting.
+        if (["script", "executable"].includes(configuration.launchType)) {
+          stopTimer = setTimeout(() => {
+            if (processHandle !== child) return;
+            append(
+              "[Panel] The launcher did not exit after stop. Terminating its process tree…",
+              "warn",
+            );
+            terminationPromise = Promise.resolve().then(() =>
+              terminateProcessTree(child, {
+                tree: true,
+                spawnProcess: options.spawnProcess,
+              }),
+            );
+            terminationPromise.catch((cause) => {
+              restartRequested = false;
+              append(`[Panel] ${cause.message}`, "error");
+            });
+          }, options.stopTimeoutMs ?? 15000);
+          stopTimer.unref();
+        }
+        child.stdin.write("stop\n");
+      }
     }
     await audit(
       "server",
@@ -1595,18 +1784,21 @@ export async function createPanel(options = {}) {
       return trackTask(() => updateConfiguration(...args));
     },
     audit,
-    close: () => {
+    close: ({ gracefulOnly = false } = {}) => {
       if (!closePromise) {
         closed = true;
         clearPlayers();
         clearInterval(scheduler);
         clearTimeout(demoTimer);
+        clearTimeout(stopTimer);
         closePromise = (async () => {
           // An HTTP client can leave before its disk writes or backup finish.
           // Wait for the handler itself, including save-on and its audit write.
           while (inFlightTasks.size)
             await Promise.allSettled([...inFlightTasks]);
           clearTimeout(demoTimer);
+          clearTimeout(stopTimer);
+          if (terminationPromise) await terminationPromise;
           if (processHandle) {
             const child = processHandle;
             const exited = new Promise((resolve) =>
@@ -1615,13 +1807,44 @@ export async function createPanel(options = {}) {
             child.stdin.write("stop\n");
             let timeout;
             try {
-              await Promise.race([
-                exited,
-                new Promise((resolve) => {
-                  timeout = setTimeout(resolve, 15000);
-                }),
-              ]);
-              if (processHandle === child) child.kill();
+              if (gracefulOnly) await exited;
+              else
+                await Promise.race([
+                  exited,
+                  new Promise((resolve) => {
+                    timeout = setTimeout(
+                      resolve,
+                      options.stopTimeoutMs ?? 15000,
+                    );
+                  }),
+                ]);
+              if (processHandle === child) {
+                await terminateProcessTree(child, {
+                  tree: ["script", "executable"].includes(
+                    configuration.launchType,
+                  ),
+                  spawnProcess: options.spawnProcess,
+                });
+                let killTimeout;
+                try {
+                  await Promise.race([
+                    exited,
+                    new Promise((_resolve, reject) => {
+                      killTimeout = setTimeout(
+                        () =>
+                          reject(
+                            new Error(
+                              "The server process did not exit after termination. Close it before restarting the panel.",
+                            ),
+                          ),
+                        5000,
+                      );
+                    }),
+                  ]);
+                } finally {
+                  clearTimeout(killTimeout);
+                }
+              }
             } finally {
               clearTimeout(timeout);
             }
@@ -1679,6 +1902,10 @@ export async function createFleet(options = {}) {
     "port",
     "memoryLimitMB",
     "jar",
+    "launchType",
+    "launchScript",
+    "launchArgs",
+    "launchExecutable",
     "javaPath",
     "motd",
   ];
@@ -1742,7 +1969,9 @@ export async function createFleet(options = {}) {
     if (entry.storage === "external") {
       try {
         const inspected = await inspectImport(entry.serverDir, entry.id, true);
-        if (!inspected.jars.includes(entry.jar))
+        if (entry.launchType !== "jar")
+          await validateStartupFiles(entry.serverDir, entry);
+        else if (!inspected.jars.includes(entry.jar))
           throw error(
             409,
             "The selected server JAR is missing or is no longer a regular file in the source folder.",
@@ -1770,7 +1999,14 @@ export async function createFleet(options = {}) {
       const existingServer = await fs
         .realpath(runtime.serverDir)
         .catch((cause) => {
-          if (!runtime.unavailable) throw cause;
+          if (
+            !runtime.unavailable &&
+            !(
+              runtime.descriptor().source === "imported" &&
+              ["ENOENT", "ENOTDIR"].includes(cause.code)
+            )
+          )
+            throw cause;
           return path.resolve(runtime.serverDir);
         });
       if (
@@ -1789,6 +2025,8 @@ export async function createFleet(options = {}) {
       existingServerDir: entry.storage === "external",
       scheduler: options.scheduler,
       spawnServer: options.spawnServer,
+      spawnProcess: options.spawnProcess,
+      stopTimeoutMs: options.stopTimeoutMs,
       backupFlushTimeoutMs: options.backupFlushTimeoutMs,
     });
     runtimes.set(entry.id, runtime);
@@ -2002,6 +2240,10 @@ export async function createFleet(options = {}) {
         "directory",
         "name",
         "jar",
+        "launchType",
+        "launchScript",
+        "launchArgs",
+        "launchExecutable",
         "javaPath",
         "memoryLimitMB",
         "port",
@@ -2014,31 +2256,49 @@ export async function createFleet(options = {}) {
       )
         throw error(
           400,
-          "Provide the folder, server name, selected JAR, Java executable, memory, and port.",
+          "Provide the folder, server name, launch method, Java executable, memory, and port.",
         );
       const inspected = await inspectImport(input.directory);
-      if (typeof input.jar !== "string" || !inspected.jars.includes(input.jar))
-        throw error(
-          400,
-          "Choose a regular server JAR from the inspected folder's root. Scripts, installers, and nested library paths are not selected automatically.",
+      const launchType = input.launchType ?? "jar";
+      if (launchType === "jar") {
+        if (
+          typeof input.jar !== "string" ||
+          !inspected.jars.includes(input.jar)
+        )
+          throw error(
+            400,
+            "Choose a regular server JAR from the inspected folder's root. Scripts, installers, and nested library paths are not selected automatically.",
+          );
+        const selectedJar = await containedSourcePath(
+          inspected.directory,
+          input.jar,
         );
-      const selectedJar = await containedSourcePath(
-        inspected.directory,
-        input.jar,
-      );
-      if (!(await fs.stat(selectedJar)).isFile())
-        throw error(400, "The selected server JAR is no longer available.");
+        if (!(await fs.stat(selectedJar)).isFile())
+          throw error(400, "The selected server JAR is no longer available.");
+      }
       const config = validateServerConfiguration(
         {
           name: input.name ?? inspected.name,
           mode: "live",
           port: input.port ?? inspected.port,
-          jar: input.jar,
-          javaPath: input.javaPath ?? "java",
+          launchType,
+          launchScript: input.launchScript ?? "",
+          launchArgs: input.launchArgs ?? [],
+          launchExecutable: input.launchExecutable ?? "",
+          jar: launchType === "jar" ? input.jar : "",
+          javaPath: input.javaPath ?? inspected.javaPath ?? "java",
           memoryLimitMB: input.memoryLimitMB ?? 4096,
         },
         { motd: inspected.motd },
         true,
+      );
+      const startup = await validateStartupFiles(inspected.directory, config);
+      if (startup.memoryLimitMB) config.memoryLimitMB = startup.memoryLimitMB;
+      const candidate = inspected.launches.find(
+        (candidate) =>
+          candidate.type === launchType &&
+          JSON.stringify(candidate.launchArgs ?? []) ===
+            JSON.stringify(config.launchArgs),
       );
       checkPort(config.port);
       const id = randomUUID();
@@ -2052,8 +2312,10 @@ export async function createFleet(options = {}) {
         serverDir: inspected.directory,
         address: inspected.address.replace(/:\d+$/, `:${config.port}`),
         maxPlayers: inspected.maxPlayers,
-        version: "Configured JAR",
-        software: "Java",
+        version: launchType === "jar" ? "Configured JAR" : "Configured launch",
+        software:
+          candidate?.software ??
+          (launchType === "executable" ? "Custom" : "Java"),
       };
       const runtime = await makeRuntime(entry);
       try {
@@ -2091,7 +2353,14 @@ export async function createFleet(options = {}) {
       for (const runtime of runtimes.values()) {
         const relative = path.relative(
           await fs.realpath(runtime.serverDir).catch((cause) => {
-            if (!runtime.unavailable) throw cause;
+            if (
+              !runtime.unavailable &&
+              !(
+                runtime.descriptor().source === "imported" &&
+                ["ENOENT", "ENOTDIR"].includes(cause.code)
+              )
+            )
+              throw cause;
             return path.resolve(runtime.serverDir);
           }),
           instanceDir,
@@ -2268,11 +2537,11 @@ export async function createFleet(options = {}) {
     runtimes,
     tick: async (now) =>
       Promise.all([...runtimes.values()].map((runtime) => runtime.tick(now))),
-    close: async () => {
+    close: async (closeOptions = {}) => {
       closed = true;
       await changeChain.catch(() => {});
       await Promise.all(
-        [...runtimes.values()].map((runtime) => runtime.close()),
+        [...runtimes.values()].map((runtime) => runtime.close(closeOptions)),
       );
     },
   };

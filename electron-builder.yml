@@ -10,10 +10,17 @@ files:
   - server/import.mjs
   - desktop/main.mjs
   - desktop/runtime.mjs
+  - desktop/updates.mjs
   - desktop/assets/**/*
   - package.json
 asar: true
 npmRebuild: false
+publish:
+  provider: github
+  owner: BigUziHert
+  repo: MC-Server-UI
+  releaseType: prerelease
+  channel: dev
 win:
   icon: desktop/assets/icon.ico
   target:

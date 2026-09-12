@@ -1,6 +1,8 @@
 name: Windows desktop
 
 on:
+  push:
+    branches: [dev]
   workflow_dispatch:
 
 permissions:
@@ -45,7 +47,15 @@ jobs:
         run: pnpm install --frozen-lockfile
 
       - name: Build installer and portable app
+        if: github.ref != 'refs/heads/dev'
         run: pnpm desktop:dist
+
+      - name: Stamp unique dev version and build
+        if: github.ref == 'refs/heads/dev'
+        run: |
+          node desktop/stamp-dev-version.mjs --write
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          pnpm desktop:dist
 
       - name: Run backend and desktop unit tests
         run: pnpm test
@@ -66,6 +76,8 @@ jobs:
           path: |
             release/MC-Panel-*-Setup-x64.exe
             release/MC-Panel-*-Portable-x64.exe
+            release/*.blockmap
+            release/dev.yml
           if-no-files-found: error
           compression-level: 0
           retention-days: 14
@@ -80,3 +92,63 @@ jobs:
             release/smoke-results/*.png
           if-no-files-found: ignore
           retention-days: 7
+
+  publish:
+    name: Publish tested dev update
+    needs: build
+    if: github.ref == 'refs/heads/dev'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Download tested Windows build
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          name: MC-Panel-windows-x64
+          path: release
+
+      - name: Publish complete prerelease
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          current_head=$(gh api "repos/$GH_REPO/git/ref/heads/dev" --jq .object.sha)
+          if [ "$current_head" != "$GITHUB_SHA" ]; then
+            echo "A newer dev commit exists; leaving this build as a workflow artifact."
+            exit 0
+          fi
+          version=$(sed -n 's/^version: //p' release/dev.yml | tr -d '\r')
+          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+-dev\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Missing or invalid dev update manifest" >&2
+            exit 1
+          fi
+          tag="v$version"
+          gh release list --limit 100 --json tagName,isDraft > release/existing-releases.json
+          should_publish=$(VERSION="$version" python3 - <<'PY'
+          import json, os, re
+          def key(value):
+              match = re.fullmatch(r'v?(\d+)\.(\d+)\.(\d+)-dev\.(\d+)\.(\d+)', value)
+              return tuple(map(int, match.groups())) if match else None
+          candidate = key(os.environ['VERSION'])
+          releases = json.load(open('release/existing-releases.json'))
+          published = [key(r['tagName']) for r in releases if not r['isDraft'] and key(r['tagName'])]
+          print('yes' if not published or candidate > max(published) else 'no')
+          PY
+          )
+          if [ "$should_publish" != "yes" ]; then
+            echo "An equal or newer dev version is already published; skipping this rerun."
+            exit 0
+          fi
+          sha256sum release/*.exe > release/SHA256SUMS.txt
+          cat > release/release-notes.md <<EOF
+          MC Panel dev build from commit $GITHUB_SHA.
+
+          This build passed backend, browser, and packaged Windows tests. Installed copies can download it from App updates. Server files and settings are preserved. Servers stay stopped after the app restarts.
+
+          Use the Setup executable for in-app updates; the portable executable is available for manual use.
+          EOF
+          gh release create "$tag" release/*.exe release/*.blockmap release/dev.yml release/SHA256SUMS.txt --target "$GITHUB_SHA" --title "MC Panel $version" --notes-file release/release-notes.md --draft --prerelease
+          gh release edit "$tag" --draft=false --prerelease --latest=false

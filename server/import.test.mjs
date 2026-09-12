@@ -3,9 +3,20 @@ import assert from "node:assert/strict";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { EventEmitter } from "node:events";
+import { PassThrough, Writable } from "node:stream";
+import { spawn } from "node:child_process";
 import * as tar from "tar";
-import { createFleet } from "./index.mjs";
-import { parseProperties } from "./import.mjs";
+import {
+  createFleet,
+  terminateProcessTree,
+  validateServerConfiguration,
+} from "./index.mjs";
+import {
+  parseProperties,
+  parseJavaScript,
+  buildScriptInvocation,
+} from "./import.mjs";
 
 const json = (method, body) => ({ method, body: JSON.stringify(body) });
 async function fixture(t, options = {}) {
@@ -570,4 +581,578 @@ test("folder browsing capability is explicit and cancellation performs no import
     { directory },
   );
   assert.deepEqual((await desktop.request("/api/servers")).body.servers, []);
+});
+
+const forgeArgs = (family = "neoforged/neoforge") => [
+  "@user_jvm_args.txt",
+  `@libraries/net/${family}/21.1.200/win_args.txt`,
+  "nogui",
+];
+async function prepareForge(directory, family = "neoforged/neoforge") {
+  const args = forgeArgs(family);
+  const generated = path.join(directory, args[1].slice(1));
+  await fs.mkdir(path.dirname(generated), { recursive: true });
+  await fs.writeFile(
+    generated,
+    "# Generated launcher arguments\n-Dfixture=preserved\nnet.fixture.Main\n",
+  );
+  await fs.writeFile(
+    path.join(directory, "user_jvm_args.txt"),
+    "# -Xmx1G is only a comment\n-Xms2G\n-Xmx6G\n",
+  );
+  await fs.writeFile(
+    path.join(directory, "run.bat"),
+    `@echo off\r\nREM Preserve installed argument files\r\njava ${args.slice(0, 2).join(" ")} %*\r\npause\r\n`,
+  );
+  return args;
+}
+const eventually = async (condition) => {
+  for (let attempt = 0; attempt < 100; attempt++) {
+    if (await condition()) return;
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  assert.fail("Expected state transition did not complete");
+};
+function mockServer(onCommand = () => {}) {
+  const child = new EventEmitter();
+  child.stdout = new PassThrough();
+  child.stderr = new PassThrough();
+  child.kill = () => {
+    setImmediate(() => child.emit("close", 1));
+    return true;
+  };
+  child.stdin = new Writable({
+    write(chunk, _encoding, callback) {
+      const command = chunk.toString();
+      onCommand(command);
+      if (command === "stop\n") setImmediate(() => child.emit("close", 0));
+      callback();
+    },
+  });
+  return child;
+}
+
+for (const [family, software] of [
+  ["neoforged/neoforge", "NeoForge"],
+  ["minecraftforge/forge", "Forge"],
+]) {
+  test(`${software} import needs no root JAR and preserves its world, launcher files, RAM and lifecycle`, async (t) => {
+    const launches = [];
+    const commands = [];
+    const { directory, prepare, boot } = await fixture(t, {
+      spawnServer: (executable, args, options) => {
+        const child = mockServer((command) => commands.push(command));
+        launches.push({ executable, args, options, child });
+        setImmediate(() =>
+          child.stdout.write(
+            '[Server thread/INFO]: Done (1.0s)! For help, type "help"\n',
+          ),
+        );
+        return child;
+      },
+    });
+    await prepare(directory, { jars: [] });
+    const args = await prepareForge(directory, family);
+    await fs.writeFile(path.join(directory, "eula.txt"), "eula=true\n");
+    const before = await snapshot(directory);
+    const first = await boot();
+    const inspected = (
+      await first.request(
+        "/api/server-import/inspect",
+        json("POST", { directory }),
+      )
+    ).body;
+    assert.equal(inspected.launchType, "java-args");
+    assert.equal(inspected.launchScript, "");
+    assert.equal(inspected.jar, null);
+    assert.deepEqual(inspected.launchArgs, args);
+    assert.equal(inspected.memoryLimitMB, 6144);
+    assert.equal(inspected.launches[0].software, software);
+    assert.equal(inspected.worldExists, true);
+    const imported = await first.request(
+      "/api/server-import",
+      json("POST", {
+        directory,
+        launchType: "java-args",
+        launchArgs: args,
+        memoryLimitMB: 1024,
+      }),
+    );
+    assert.equal(imported.status, 201);
+    const id = imported.body.server.id;
+    assert.equal(imported.body.server.memoryLimitMB, 6144);
+    assert.equal(imported.body.server.jar, "");
+    assert.equal(imported.body.server.software, software);
+    assert.deepEqual(await snapshot(directory), before);
+    assert.equal(launches.length, 0);
+    await first.close();
+    const restarted = await boot();
+    const saved = (await restarted.request("/api/servers")).body.servers[0];
+    assert.equal(saved.id, id);
+    assert.deepEqual(saved.launchArgs, args);
+    assert.deepEqual(await snapshot(directory), before);
+    assert.equal(
+      (
+        await restarted.request(
+          "/api/server/power",
+          json("POST", { action: "start" }),
+        )
+      ).status,
+      200,
+    );
+    await eventually(
+      async () =>
+        (await restarted.request("/api/server")).body.status === "running",
+    );
+    assert.equal(launches[0].executable, "java");
+    assert.deepEqual(launches[0].args, args);
+    assert.equal(launches[0].options.cwd, await fs.realpath(directory));
+    assert.equal(launches[0].options.shell, false);
+    assert.ok(!launches[0].args.some((arg) => arg.startsWith("-Xmx")));
+    assert.equal(
+      (
+        await restarted.request(
+          `/api/servers/${id}`,
+          json("PATCH", { name: "Rename while running", launchArgs: args }),
+        )
+      ).status,
+      200,
+    );
+    assert.equal(
+      (
+        await restarted.request(
+          "/api/server/power",
+          json("POST", { action: "restart" }),
+        )
+      ).status,
+      200,
+    );
+    await eventually(() => launches.length === 2);
+    assert.deepEqual(launches[1].args, args);
+    assert.equal(
+      (
+        await restarted.request(
+          "/api/server/power",
+          json("POST", { action: "stop" }),
+        )
+      ).status,
+      200,
+    );
+    await eventually(
+      async () =>
+        (await restarted.request("/api/server")).body.status === "offline",
+    );
+    assert.deepEqual(commands, ["stop\n", "stop\n"]);
+    const after = await snapshot(directory);
+    delete before["server.properties"];
+    delete after["server.properties"];
+    assert.deepEqual(after, before);
+  });
+}
+
+test("startup parsing preserves quoted Java paths, explicit flags and @files without executing shell syntax", () => {
+  const parsed = parseJavaScript(
+    '"C:\\Program Files\\Java\\bin\\java.exe" "-Dlabel=Our world" -Xmx8G @user_jvm_args.txt @libraries\\net\\neoforged\\neoforge\\21.1.200\\win_args.txt %*',
+  );
+  assert.equal(parsed.javaPath, "C:\\Program Files\\Java\\bin\\java.exe");
+  assert.deepEqual(parsed.args, [
+    "-Dlabel=Our world",
+    "-Xmx8G",
+    ...forgeArgs(),
+  ]);
+  for (const script of [
+    "java @user_jvm_args.txt & echo unwanted",
+    "java @user_jvm_args.txt > output.log",
+    "set JAVA=java\n%JAVA% @user_jvm_args.txt",
+    "start java @user_jvm_args.txt",
+    'java "unterminated',
+    "call run-other.bat",
+    "java @args.txt\njava @args.txt",
+    "java @args.txt %DYNAMIC%",
+    "java @args.txt !DYNAMIC!",
+    "java @args.txt ^& echo bad",
+  ])
+    assert.throws(() => parseJavaScript(script), /commands beyond/);
+});
+
+test("Java-argument imports reject missing or escaping launch files and recover when dependencies return", async (t) => {
+  const { directory, prepare, boot } = await fixture(t);
+  await prepare(directory, { jars: [] });
+  const args = await prepareForge(directory);
+  const panel = await boot();
+  const importWith = (launchArgs) =>
+    panel.request(
+      "/api/server-import",
+      json("POST", { directory, launchType: "java-args", launchArgs }),
+    );
+  for (const launchArgs of [
+    ["@missing.txt"],
+    ["@../outside.txt"],
+    ["@C:/outside.txt"],
+    ["-jar", "missing.jar"],
+  ]) {
+    const response = await importWith(launchArgs);
+    assert.equal(response.status, 400);
+  }
+  const imported = await importWith(args);
+  assert.equal(imported.status, 201);
+  await panel.close();
+  const argumentFile = path.join(directory, args[1].slice(1));
+  const original = await fs.readFile(argumentFile);
+  await fs.unlink(argumentFile);
+  const restarted = await boot();
+  const unavailable = (await restarted.request("/api/servers")).body.servers[0];
+  assert.equal(unavailable.unavailable, true);
+  assert.match(unavailable.sourceError, /Startup requires/);
+  assert.equal((await restarted.request("/api/server")).status, 409);
+  await fs.writeFile(argumentFile, original);
+  assert.equal((await restarted.request("/api/server")).status, 200);
+});
+
+test("custom script and executable imports retain explicit startup options without running anything", async (t) => {
+  const { directory, root, prepare, boot } = await fixture(t, {
+    spawnServer: () => assert.fail("Import cannot start a process"),
+  });
+  await prepare(directory, { jars: [] });
+  await fs.writeFile(
+    path.join(directory, "run.bat"),
+    "@echo off\ncall custom-launcher.bat\n",
+  );
+  const before = await snapshot(directory);
+  const panel = await boot();
+  const inspected = (
+    await panel.request(
+      "/api/server-import/inspect",
+      json("POST", { directory }),
+    )
+  ).body;
+  assert.equal(inspected.launchType, "script");
+  assert.equal(inspected.launchScript, "run.bat");
+  const imported = await panel.request(
+    "/api/server-import",
+    json("POST", {
+      directory,
+      launchType: "script",
+      launchScript: "run.bat",
+      launchArgs: ["nogui"],
+    }),
+  );
+  assert.equal(imported.status, 201);
+  assert.deepEqual(imported.body.server.launchArgs, ["nogui"]);
+  assert.deepEqual(await snapshot(directory), before);
+  const second = await prepare(path.join(root, "Executable server"), {
+    jars: [],
+  });
+  const custom = await panel.request(
+    "/api/server-import",
+    json("POST", {
+      directory: second,
+      port: 25572,
+      launchType: "executable",
+      launchExecutable: "custom-server.exe",
+      launchArgs: ["--config", "config with spaces.json"],
+    }),
+  );
+  assert.equal(custom.status, 201);
+  assert.equal(custom.body.server.launchExecutable, "custom-server.exe");
+  assert.deepEqual(custom.body.server.launchArgs, [
+    "--config",
+    "config with spaces.json",
+  ]);
+  const created = await panel.request(
+    "/api/servers",
+    json("POST", {
+      name: "Fresh custom",
+      port: 25573,
+      launchType: "java-args",
+      launchArgs: ["@not-uploaded-yet.txt"],
+    }),
+  );
+  assert.equal(created.status, 201);
+  assert.equal(
+    (
+      await panel.request(
+        `/api/servers/${created.body.server.id}`,
+        json("PATCH", { launchArgs: ["@upload-next.txt"] }),
+      )
+    ).status,
+    200,
+  );
+});
+
+test("Windows script invocation quotes spaced paths and argument boundaries and rejects shell expansion", async (t) => {
+  const script = "C:\\Servers\\Our world\\run.bat";
+  const invocation = buildScriptInvocation(
+    script,
+    ["one two", "(three)", ""],
+    "win32",
+  );
+  assert.equal(invocation.windowsVerbatimArguments, true);
+  assert.deepEqual(invocation.args, [
+    "/d",
+    "/v:off",
+    "/s",
+    "/c",
+    '""C:\\Servers\\Our world\\run.bat" "one two" "(three)" """',
+  ]);
+  for (const value of [
+    '"',
+    "%PATH%",
+    "!value!",
+    "x&echo y",
+    "a|b",
+    "a>b",
+    "a<b",
+    "^x",
+    "a\nb",
+  ])
+    assert.throws(
+      () => buildScriptInvocation(script, [value], "win32"),
+      /cannot contain/,
+    );
+  assert.throws(
+    () => buildScriptInvocation(script, [], "linux"),
+    /require Windows/,
+  );
+  assert.throws(
+    () => buildScriptInvocation("/server/run.sh", [], "win32"),
+    /require a Unix shell/,
+  );
+  if (process.platform !== "win32") return;
+  const { directory, prepare } = await fixture(t);
+  await prepare();
+  const actual = path.join(directory, "echo arguments.cmd");
+  await fs.writeFile(
+    actual,
+    "@echo off\r\necho FIRST=%~1\r\necho SECOND=%~2\r\nexit /b 0\r\n",
+  );
+  const real = buildScriptInvocation(actual, ["one two", "(three)"]);
+  const output = await new Promise((resolve, reject) => {
+    const child = spawn(real.executable, real.args, {
+      cwd: directory,
+      shell: false,
+      windowsHide: true,
+      windowsVerbatimArguments: true,
+    });
+    let result = "";
+    child.stdout.on("data", (chunk) => (result += chunk));
+    child.stderr.on("data", (chunk) => (result += chunk));
+    child.once("error", reject);
+    child.once("close", (code) =>
+      code === 0 ? resolve(result) : reject(new Error(result)),
+    );
+  });
+  assert.match(output, /FIRST=one two/);
+  assert.match(output, /SECOND=\(three\)/);
+});
+
+test("Windows process termination targets the owned tree and waits for taskkill completion", async () => {
+  const child = {
+    pid: 12345,
+    kill: () => assert.fail("Do not kill just the wrapper"),
+  };
+  const killer = new EventEmitter();
+  let completed = false;
+  const stopping = terminateProcessTree(child, {
+    tree: true,
+    platform: "win32",
+    spawnProcess: (executable, args, options) => {
+      assert.match(executable, /System32\\taskkill\.exe$/i);
+      assert.deepEqual(args, ["/PID", "12345", "/T", "/F"]);
+      assert.equal(options.shell, false);
+      assert.equal(options.windowsHide, true);
+      return killer;
+    },
+  }).then(() => (completed = true));
+  await Promise.resolve();
+  assert.equal(completed, false);
+  killer.emit("close", 0);
+  await stopping;
+  assert.equal(completed, true);
+});
+
+test("startup configuration rejects malformed arguments and paths", () => {
+  for (const config of [
+    { launchType: "unknown" },
+    { launchType: "java-args", launchArgs: [] },
+    { launchType: "java-args", launchArgs: ["a\nb"] },
+    { launchType: "java-args", launchArgs: "--flags" },
+    { launchType: "script", launchScript: "../run.bat" },
+    { launchType: "script", launchScript: "C:/run.bat" },
+    { launchType: "executable", launchExecutable: "run.bat" },
+  ])
+    assert.throws(() => validateServerConfiguration(config));
+});
+
+test("custom launcher restart waits for the entire owned tree after its wrapper exits", async (t) => {
+  const launches = [];
+  const killers = [];
+  const { directory, prepare, boot } = await fixture(t, {
+    stopTimeoutMs: 5,
+    spawnServer: () => {
+      const child = mockServer();
+      child.pid = 12345 + launches.length;
+      // This wrapper does not exit in response to stop; its tree must be drained.
+      child.stdin = new Writable({
+        write(_chunk, _encoding, callback) {
+          callback();
+        },
+      });
+      launches.push(child);
+      return child;
+    },
+    spawnProcess: () => {
+      const killer = new EventEmitter();
+      killers.push(killer);
+      return killer;
+    },
+  });
+  await prepare(directory, { jars: [] });
+  await fs.writeFile(
+    path.join(directory, "run.bat"),
+    "call custom-server.bat\n",
+  );
+  await fs.writeFile(path.join(directory, "eula.txt"), "eula=true\n");
+  const panel = await boot();
+  assert.equal(
+    (
+      await panel.request(
+        "/api/server-import",
+        json("POST", {
+          directory,
+          launchType: "script",
+          launchScript: "run.bat",
+        }),
+      )
+    ).status,
+    201,
+  );
+  assert.equal(
+    (
+      await panel.request(
+        "/api/server/power",
+        json("POST", { action: "start" }),
+      )
+    ).status,
+    200,
+  );
+  assert.equal(
+    (
+      await panel.request(
+        "/api/server/power",
+        json("POST", { action: "restart" }),
+      )
+    ).status,
+    200,
+  );
+  await eventually(() => killers.length === 1);
+  launches[0].emit("close", 1);
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.equal(launches.length, 1);
+  assert.equal((await panel.request("/api/server")).body.status, "stopping");
+  assert.equal(
+    (
+      await panel.request(
+        "/api/server/power",
+        json("POST", { action: "start" }),
+      )
+    ).status,
+    409,
+  );
+  killers[0].emit("close", 0);
+  await eventually(() => launches.length === 2);
+  let closed = false;
+  const closing = panel.close().then(() => (closed = true));
+  await eventually(() => killers.length === 2);
+  launches[1].emit("close", 1);
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.equal(closed, false);
+  killers[1].emit("close", 0);
+  await closing;
+  assert.equal(closed, true);
+});
+
+test("graceful-only fleet shutdown cancels an existing stop deadline and waits for the world save", async (t) => {
+  const child = mockServer();
+  const commands = [];
+  child.pid = 12345;
+  child.kill = () =>
+    assert.fail("An update must not force-kill the saving server");
+  child.stdin = new Writable({
+    write(chunk, _encoding, callback) {
+      commands.push(chunk.toString());
+      callback();
+    },
+  });
+  const { directory, prepare, boot } = await fixture(t, {
+    stopTimeoutMs: 30,
+    spawnServer: () => child,
+    spawnProcess: () =>
+      assert.fail("An update must not terminate the process tree"),
+  });
+  await prepare(directory, { jars: [] });
+  await fs.writeFile(
+    path.join(directory, "run.bat"),
+    "call custom-server.bat\n",
+  );
+  await fs.writeFile(path.join(directory, "eula.txt"), "eula=true\n");
+  const panel = await boot();
+  await panel.request(
+    "/api/server-import",
+    json("POST", { directory, launchType: "script", launchScript: "run.bat" }),
+  );
+  await panel.request("/api/server/power", json("POST", { action: "start" }));
+  await panel.request("/api/server/power", json("POST", { action: "stop" }));
+  let completed = false;
+  const closing = panel
+    .close({ gracefulOnly: true })
+    .then(() => (completed = true));
+  try {
+    await new Promise((resolve) => setTimeout(resolve, 80));
+    assert.equal(completed, false);
+    assert.ok(commands.every((command) => command === "stop\n"));
+  } finally {
+    child.emit("close", 0);
+  }
+  await closing;
+  assert.equal(completed, true);
+});
+
+test("an imported folder disappearing during the session does not block unrelated import or creation", async (t) => {
+  const { root, directory, prepare, boot } = await fixture(t);
+  await prepare();
+  const panel = await boot();
+  assert.equal(
+    (
+      await panel.request(
+        "/api/server-import",
+        json("POST", { directory, jar: "server.jar" }),
+      )
+    ).status,
+    201,
+  );
+  const parked = path.join(root, "Parked original");
+  assert.equal(path.dirname(directory), root);
+  assert.equal(path.dirname(parked), root);
+  await fs.rename(directory, parked);
+  const second = await prepare(path.join(root, "Second import"));
+  assert.equal(
+    (
+      await panel.request(
+        "/api/server-import",
+        json("POST", { directory: second, jar: "server.jar", port: 25572 }),
+      )
+    ).status,
+    201,
+  );
+  assert.equal(
+    (
+      await panel.request(
+        "/api/servers",
+        json("POST", { name: "Independent", port: 25573 }),
+      )
+    ).status,
+    201,
+  );
+  await assert.rejects(fs.access(directory));
 });

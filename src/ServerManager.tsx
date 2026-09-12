@@ -11,6 +11,14 @@ import {
 } from "lucide-react";
 import { api, post } from "./api";
 import AddServer from "./AddServer";
+import {
+  LaunchAdvancedFields,
+  LaunchMemoryNote,
+  LaunchMethodFields,
+  startupDraft,
+  startupPayload,
+  type LaunchType,
+} from "./LaunchSettings";
 import "./servers.css";
 
 export type ServerRecord = {
@@ -23,6 +31,10 @@ export type ServerRecord = {
   memoryLimitMB: number;
   jar: string;
   javaPath: string;
+  launchType?: LaunchType;
+  launchScript?: string;
+  launchExecutable?: string;
+  launchArgs?: string[];
   motd?: string;
   version?: string;
   software?: string;
@@ -73,7 +85,8 @@ export function ServerSwitcher({
             />
             {selected.status}{" "}
             <span className="fleet-mode">
-              · {selected.mode === "demo" ? "Demo" : "Java"}
+              ·{" "}
+              {selected.mode === "demo" ? "Demo" : selected.software || "Live"}
             </span>
           </span>
         </div>
@@ -130,8 +143,9 @@ function ServerSettings({
   const [mode, setMode] = useState<"demo" | "live">(editing?.mode ?? "live");
   const [port, setPort] = useState(String(editing?.port ?? nextPort));
   const [memory, setMemory] = useState(String(editing?.memoryLimitMB ?? 4096));
-  const [jar, setJar] = useState(editing?.jar || "server.jar");
-  const [javaPath, setJavaPath] = useState(editing?.javaPath || "java");
+  const [startup, setStartup] = useState(() =>
+    startupDraft(editing ?? undefined),
+  );
   const [motd, setMotd] = useState(
     editing?.motd ?? "Welcome to our Minecraft server",
   );
@@ -159,9 +173,10 @@ function ServerSettings({
       name: name.trim(),
       mode,
       port: Number(port),
-      memoryLimitMB: Number(memory),
-      jar: jar.trim() || "server.jar",
-      javaPath: javaPath.trim() || "java",
+      ...(startup.launchType === "jar"
+        ? { memoryLimitMB: Number(memory) }
+        : {}),
+      ...startupPayload(mode === "live" ? startup : startupDraft()),
       motd,
     };
     try {
@@ -261,7 +276,7 @@ function ServerSettings({
               spellCheck={false}
             />
             <small>
-              This server uses the original folder. Worlds, plugins, and
+              This server uses the original folder. Worlds, mods, plugins, and
               configuration stay here.
             </small>
           </div>
@@ -290,7 +305,7 @@ function ServerSettings({
                 value={mode}
                 onChange={(e) => setMode(e.target.value as "demo" | "live")}
               >
-                <option value="live">Minecraft Java</option>
+                <option value="live">Live Minecraft server</option>
                 <option value="demo">Demo server</option>
               </select>
             </div>
@@ -321,7 +336,12 @@ function ServerSettings({
           </div>
           {mode === "live" && (
             <>
-              <div className="server-form-grid">
+              <LaunchMethodFields
+                idPrefix="server"
+                value={startup}
+                onChange={setStartup}
+              />
+              {startup.launchType === "jar" && (
                 <div className="form-field">
                   <label htmlFor="server-memory">Memory (MB)</label>
                   <input
@@ -335,30 +355,13 @@ function ServerSettings({
                     onChange={(e) => setMemory(e.target.value)}
                   />
                 </div>
-                <div className="form-field">
-                  <label htmlFor="server-jar">Server JAR</label>
-                  <input
-                    id="server-jar"
-                    required
-                    placeholder="server.jar"
-                    value={jar}
-                    onChange={(e) => setJar(e.target.value)}
-                  />
-                </div>
-              </div>
-              <div className="form-field">
-                <label htmlFor="server-java">Java executable</label>
-                <input
-                  id="server-java"
-                  required
-                  placeholder="java"
-                  value={javaPath}
-                  onChange={(e) => setJavaPath(e.target.value)}
-                />
-                <small>
-                  Use java from PATH or the full path to your Java executable.
-                </small>
-              </div>
+              )}
+              <LaunchMemoryNote type={startup.launchType} />
+              <LaunchAdvancedFields
+                idPrefix="server"
+                value={startup}
+                onChange={setStartup}
+              />
             </>
           )}
         </fieldset>
@@ -367,7 +370,7 @@ function ServerSettings({
           <p>
             {mode === "demo"
               ? "Console and player actions are simulated in demo mode. File operations and backups use real local files."
-              : "Upload your server JAR in File Manager, review the Minecraft EULA, and set eula=true yourself before starting. This panel won’t download or accept anything for you."}
+              : "Startup changes take effect the next time you start this server. Its existing files and EULA remain in place."}
           </p>
         </div>
         {error && (

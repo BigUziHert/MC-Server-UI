@@ -293,11 +293,11 @@ async function launchPackaged({ expectEmpty = false } = {}) {
       "A fresh desktop profile must contain only an empty fleet registry, without seeded server files.",
     );
   } else {
-    assert.equal(servers.data.servers.length, 2);
+    assert.equal(servers.data.servers.length, 3);
     assert.deepEqual(
       servers.data.servers.map((server) => server.mode).sort(),
-      ["demo", "live"],
-      "The smoke profile must retain its explicitly created demo and imported real server.",
+      ["demo", "live", "live"],
+      "The smoke profile must retain its explicitly created demo, imported JAR server, and imported NeoForge server.",
     );
   }
   await installDownloadCapture(application, downloadDirectory);
@@ -354,6 +354,54 @@ async function createSmokeDemo(page) {
   assert.equal(result.data.servers[0].mode, "demo");
   assert.equal(result.data.servers[0].id, result.data.defaultServerId);
   return result.data.defaultServerId;
+}
+
+async function assertDesktopUpdates(page) {
+  step(
+    "Checking packaged update status without contacting a release service or installing anything.",
+  );
+  const version = await application.evaluate(({ app }) => app.getVersion());
+  const state = await browserApi(page, "/desktop/updates");
+  assert.equal(state.status, 200);
+  assert.equal(state.data.desktop, true);
+  assert.equal(state.data.version, version);
+  assert.equal(state.data.supported, false);
+  assert.equal(state.data.status, "unsupported");
+  const actions = [];
+  const recordAction = (request) => {
+    if (
+      request.method() === "POST" &&
+      new URL(request.url()).pathname.startsWith("/api/desktop/updates/")
+    )
+      actions.push(request.url());
+  };
+  page.on("request", recordAction);
+  try {
+    await page
+      .getByRole("button", { name: "App updates", exact: true })
+      .click();
+    const dialog = page.getByRole("dialog", {
+      name: "App updates",
+      exact: true,
+    });
+    await ui(dialog).toBeVisible();
+    await ui(dialog).toContainText(version);
+    await ui(dialog).toContainText("Setup edition once");
+    for (const name of [
+      "Check for updates",
+      "Download update",
+      "Restart to update",
+    ])
+      await ui(dialog.getByRole("button", { name, exact: true })).toHaveCount(
+        0,
+      );
+    await capturePackaged("packaged-updates.png");
+    await page.keyboard.press("Escape");
+    await ui(dialog).not.toBeVisible();
+    assert.deepEqual(actions, []);
+  } finally {
+    page.off("request", recordAction);
+  }
 }
 
 async function snapshotSmokeFolder(directory, prefix = "") {
@@ -495,6 +543,113 @@ async function importSmokeExisting(page) {
   }
 }
 
+async function importSmokeNeoForge(page) {
+  step(
+    "Importing an existing NeoForge launcher without a root JAR or changes to its JVM arguments.",
+  );
+  const directory = path.join(temporaryRoot, "existing-neoforge-server");
+  const files = {
+    "server.properties":
+      "# Existing NeoForge desktop server\r\nserver-port=25692\r\nmotd=Original NeoForge world\r\nlevel-name=existing-world\r\nmax-players=32\r\n",
+    "eula.txt": "# Do not accept automatically.\r\neula=false\r\n",
+    "run.bat":
+      "@echo off\r\nREM NeoForge requires JVM arguments.\r\njava @user_jvm_args.txt @libraries/net/neoforged/neoforge/21.1.200/win_args.txt %*\r\npause\r\n",
+    "user_jvm_args.txt": "# Original RAM settings\r\n-Xms2G\r\n-Xmx6G\r\n",
+    "libraries/net/neoforged/neoforge/21.1.200/win_args.txt":
+      "# Existing generated NeoForge arguments\r\n--launchTarget neoforgeserver\r\n",
+    "existing-world/level.dat": Buffer.from([31, 139, 8, 0, 45, 127, 128, 254]),
+  };
+  for (const [name, contents] of Object.entries(files)) {
+    const destination = path.join(directory, name);
+    await fs.mkdir(path.dirname(destination), { recursive: true });
+    await fs.writeFile(destination, contents);
+  }
+  const original = await snapshotSmokeFolder(directory);
+  assert.ok(path.relative(profileDirectory, directory).startsWith(".."));
+  await page.getByRole("button", { name: "Add server", exact: true }).click();
+  await page
+    .getByRole("dialog", { name: "Add a server", exact: true })
+    .getByRole("button", { name: "Import an existing server", exact: true })
+    .click();
+  const dialog = page.getByRole("dialog", {
+    name: "Import an existing server",
+    exact: true,
+  });
+  await dialog.getByLabel("Server folder", { exact: true }).fill(directory);
+  await dialog
+    .getByRole("button", { name: "Inspect folder", exact: true })
+    .click();
+  await ui(dialog.getByLabel("Launch method", { exact: true })).toHaveValue(
+    "java-args",
+  );
+  await ui(dialog.getByLabel("Detected launcher", { exact: true })).toHaveValue(
+    "run.bat",
+  );
+  await ui(dialog.getByLabel("Server JAR", { exact: true })).toHaveCount(0);
+  await ui(dialog.getByLabel("Memory (MB)", { exact: true })).toHaveCount(0);
+  await ui(dialog).toContainText("user_jvm_args.txt");
+  await ui(
+    dialog.getByRole("button", { name: "Import server", exact: true }),
+  ).toBeEnabled();
+  assert.deepEqual(await snapshotSmokeFolder(directory), original);
+  await dialog
+    .getByLabel("Server name", { exact: true })
+    .fill("Desktop NeoForge world");
+  await capturePackaged("packaged-neoforge-import.png");
+  await dialog
+    .getByRole("button", { name: "Import server", exact: true })
+    .click();
+  await ui(dialog).not.toBeVisible();
+  await ui(
+    page.getByRole("heading", { name: "Desktop NeoForge world", exact: true }),
+  ).toBeVisible();
+  const fleet = await browserApi(page, "/servers");
+  const imported = fleet.data.servers.find(
+    (server) => server.name === "Desktop NeoForge world",
+  );
+  assert.ok(imported);
+  assert.equal(imported.mode, "live");
+  assert.equal(imported.status, "offline");
+  assert.equal(imported.source, "imported");
+  assert.equal(path.resolve(imported.serverDir), path.resolve(directory));
+  assert.equal(imported.launchType, "java-args");
+  assert.equal(imported.launchScript, "");
+  const launchArgs = [
+    "@user_jvm_args.txt",
+    "@libraries/net/neoforged/neoforge/21.1.200/win_args.txt",
+    "nogui",
+  ];
+  assert.deepEqual(imported.launchArgs, launchArgs);
+  assert.equal(imported.jar, "");
+  assert.equal(imported.memoryLimitMB, 6144);
+  assert.deepEqual(await snapshotSmokeFolder(directory), original);
+  await page
+    .getByRole("button", { name: "Server settings", exact: true })
+    .click();
+  const settings = page.getByRole("dialog", {
+    name: "Server settings",
+    exact: true,
+  });
+  await ui(settings.getByLabel("Launch method", { exact: true })).toHaveValue(
+    "java-args",
+  );
+  await ui(
+    settings.getByLabel("Startup arguments", { exact: true }),
+  ).toHaveValue(launchArgs.join("\n"));
+  await ui(settings).toContainText("user_jvm_args.txt");
+  await settings
+    .getByRole("button", { name: "Save changes", exact: true })
+    .click();
+  await ui(settings).not.toBeVisible();
+  const world = await browserApi(page, "/files?path=existing-world", {
+    serverId: imported.id,
+  });
+  assert.equal(world.status, 200);
+  assert.ok(world.data.entries.some((entry) => entry.name === "level.dat"));
+  assert.deepEqual(await snapshotSmokeFolder(directory), original);
+  return { id: imported.id, directory, original, launchArgs };
+}
+
 async function quitPackaged(mode = "quit") {
   if (!application) return;
   const app = application;
@@ -599,6 +754,7 @@ try {
     `Launching ${path.basename(executablePath)} with an isolated test profile.`,
   );
   let { page, serverId } = await launchPackaged({ expectEmpty: true });
+  await assertDesktopUpdates(page);
   serverId = await createSmokeDemo(page);
 
   step("Creating and uploading files through the packaged File Manager.");
@@ -685,6 +841,7 @@ try {
   assert.equal(renamed.status, 200);
 
   const imported = await importSmokeExisting(page);
+  const neoForge = await importSmokeNeoForge(page);
 
   step("Closing the hidden window keeps the tray runtime available.");
   const trayState = await application.evaluate(({ BrowserWindow, Menu }) => {
@@ -777,12 +934,36 @@ try {
     await snapshotSmokeFolder(imported.directory),
     imported.original,
   );
+  const retainedNeoForge = retainedFleet.data.servers.find(
+    (server) => server.id === neoForge.id,
+  );
+  assert.ok(retainedNeoForge);
+  assert.equal(
+    path.resolve(retainedNeoForge.serverDir),
+    path.resolve(neoForge.directory),
+  );
+  assert.equal(retainedNeoForge.launchType, "java-args");
+  assert.equal(retainedNeoForge.launchScript, "");
+  assert.deepEqual(retainedNeoForge.launchArgs, neoForge.launchArgs);
+  assert.equal(retainedNeoForge.jar, "");
+  assert.equal(retainedNeoForge.status, "offline");
+  const retainedJvm = await browserApi(
+    page,
+    "/files/content?path=user_jvm_args.txt",
+    { serverId: neoForge.id },
+  );
+  assert.equal(retainedJvm.status, 200);
+  assert.ok(retainedJvm.data.content.includes("-Xmx6G"));
+  assert.deepEqual(
+    await snapshotSmokeFolder(neoForge.directory),
+    neoForge.original,
+  );
   step(
     "Simulating the window's Windows session-ending event and checking graceful exit.",
   );
   await quitPackaged("query-session-end");
   step(
-    `Passed: clean startup, explicit creation, native folder picker cancellation/import, source and EULA preservation, isolation, authenticated API, sandboxing, uploads/downloads, SQLite, persistence, tray close, normal quit, and Windows-session shutdown. Artifacts: ${outputDirectory}`,
+    `Passed: clean startup, read-only update status, explicit creation, native folder picker cancellation/import, JAR and NeoForge imports, source/JVM/EULA preservation, isolation, authenticated API, sandboxing, uploads/downloads, SQLite, persistence, tray close, normal quit, and Windows-session shutdown. Artifacts: ${outputDirectory}`,
   );
 } catch (error) {
   failed = true;

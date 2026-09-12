@@ -4,16 +4,16 @@ A local Minecraft server panel inspired by the navigation and console layout of 
 
 ## Windows desktop app
 
-**MC Panel runs in its own Windows window and includes its Node.js runtime.** End users do not need to install Node.js, use a terminal, or start a separate web server. Running a real Minecraft server still requires the Java version expected by its server JAR. Configure the Java executable, JAR, and memory in that server's settings, and accept the Minecraft EULA yourself.
+**MC Panel runs in its own Windows window and includes its Node.js runtime.** End users do not need to install Node.js, use a terminal, or start a separate web server. Running a real Minecraft server still requires the Java version expected by its server software. Configure the Java executable and startup settings, and accept the Minecraft EULA yourself. Install the desktop app on the computer that will run Minecraft; it cannot attach to a Java process on another PC.
 
 A fresh desktop workspace starts with no servers. **Add your first server** offers two paths: **Create a new server** or **Import an existing server**. New servers default to Minecraft Java. Demo mode remains optional.
 
 The Windows x64 build produces two executables in `release/`:
 
-| File                              | Use                                            |
-| --------------------------------- | ---------------------------------------------- |
-| `MC-Panel-0.1.2-Setup-x64.exe`    | Install MC Panel, then launch it from Windows. |
-| `MC-Panel-0.1.2-Portable-x64.exe` | Run MC Panel without installing it.            |
+| File                                    | Use                                            |
+| --------------------------------------- | ---------------------------------------------- |
+| `MC-Panel-0.1.3-dev.0-Setup-x64.exe`    | Install MC Panel, then launch it from Windows. |
+| `MC-Panel-0.1.3-dev.0-Portable-x64.exe` | Run MC Panel without installing it.            |
 
 The version in each filename follows `package.json`. These development builds are unsigned, so Windows may report an unknown publisher or show a SmartScreen notice. A code-signing certificate is not configured.
 
@@ -33,13 +33,28 @@ If version 0.1.0 already created a demo, updating preserves it along with any ch
 
 ### Import an existing server
 
-Choose **Import an existing server**, then browse to the folder containing its `server.properties`, server JAR, and world files. The desktop edition opens a native folder picker; you can also enter an absolute folder path. In browser mode, the path refers to the computer running the panel API. For a server hosted elsewhere, download and extract its files to that computer first.
+Choose **Import an existing server**, then browse to the folder containing its `server.properties`, startup files, and world. The desktop edition opens a native folder picker; you can also enter an absolute folder path. In browser mode, the path refers to the computer running the panel API. If your server is on another Windows PC, install MC Panel there and select its existing server folder. To move the server to a different computer instead, first stop it and copy the complete server folder to the destination.
 
-The panel detects the server port, MOTD, player limit, EULA status, and top-level JAR files. Review the name and select the JAR used to start the server; if there are multiple JARs, choose one explicitly. Java and memory settings are available for review. Stop any separately running copy before starting it through MC Panel.
+The panel detects the server port, MOTD, player limit, world folder, EULA status, top-level JAR files, and supported NeoForge startup configuration. Review the name and startup method. For a JAR server, select the JAR used to start it; if there are multiple JARs, choose one explicitly. Java and memory settings are available for review. Stop any separately running copy before starting it through MC Panel.
 
 Import registers the existing folder **in place**. It does not copy, move, overwrite, or start the server, and it preserves the existing EULA decision. Worlds, plugins, and configuration stay in the selected folder. File Manager and Console subsequently operate on that folder; backups and panel metadata go under `data/instances/<server-id>/`. Any port override is applied when you next start the server through the panel. Resetting MC Panel's app data removes the registration and panel backups, but leaves that external server folder intact.
 
-The current launcher runs a server JAR with Java. It does not execute existing `.bat`, `.sh`, or argument-file launchers. Servers that require those launchers need compatible JAR startup configuration before they can be imported. An import source must be separate from panel storage and other registered server folders. If its folder or selected JAR becomes unavailable, the panel keeps the server listed with an actionable error instead of creating an empty replacement. Restoring the original folder lets subsequent server requests reconnect it.
+Startup is configurable for different Minecraft Java distributions and modpacks: **Server JAR**, **Java arguments**, **Startup script**, or **Custom executable**. Standard Windows Forge, NeoForge, Fabric, and other simple Java launch scripts are detected when possible. For custom packs, select their script or enter the executable and its arguments; each argument gets its own line, preserving spaces without shell quoting. Windows supports `.bat`, `.cmd`, and `.ps1`; `.sh` requires a Unix shell. Scripts must keep the server in the foreground without `pause`, detached windows, or automatic restart loops so the panel can track and stop it. OS-specific launchers still need their required runtime and libraries.
+
+An import source must be separate from panel storage and other registered server folders. If its folder or required startup files become unavailable, the panel keeps the server listed with an actionable error instead of creating an empty replacement. Restoring the original files lets subsequent server requests reconnect it.
+
+### Import NeoForge and an existing world
+
+NeoForge's standard server installation uses `run.bat`, `user_jvm_args.txt`, and an argument file under `libraries/net/neoforged/neoforge/`; it does not require a root-level `server.jar`. See the [official NeoForge server guide](https://docs.neoforged.net/user/docs/server/).
+
+1. Install MC Panel on the Windows computer holding your NeoForge server. Stop the server's existing console before starting it through the panel.
+2. Choose **Add server → Import an existing server** and select the entire server folder containing `run.bat` and `server.properties`, rather than the world folder alone.
+3. Choose **Inspect folder**. The panel recognizes standard NeoForge startup, reads the world name from `level-name` in `server.properties`, and lets you review the Java executable. No server JAR is needed.
+4. Import the server, then use **Console → Start**. The existing `mods`, `config`, world, and player data stay in place. Keep the same Minecraft, NeoForge, and mod versions used by that world.
+
+For a recognized NeoForge script, MC Panel reads its Java command and starts Java directly so console input, stop, and restart work. It preserves the NeoForge argument files and JVM options; configure NeoForge's memory in `user_jvm_args.txt` through File Manager while the server is stopped. This detected Java mode skips the batch wrapper and final `pause`. If a launcher cannot be translated, the panel offers its script as an explicit startup choice with foreground requirements. Import itself never starts Minecraft or accepts the EULA. After updating a modpack's startup command, inspect/import again or update the saved Java arguments to match; the panel preserves the arguments reviewed at import.
+
+If your world is a separate save, stop the server, back up the existing server and save, and copy the **whole save folder** (including `level.dat`, `region`, and any mod data) inside the NeoForge server folder under an unused name. Set `level-name` in `server.properties` to that folder name before starting. The importer registers an existing server folder; it does not transfer a separate save or convert a world between server types.
 
 ### Build the Windows app from source
 
@@ -61,7 +76,15 @@ pnpm desktop:dist
 
 After `desktop:pack` or `desktop:dist`, run `pnpm test:desktop` to smoke-test the packaged app. It uses an isolated temporary workspace so it does not change your normal desktop server data.
 
-The [Windows desktop workflow](.github/workflows/windows-desktop.yml) installs locked dependencies on a Windows runner, builds both executables, runs the backend and desktop unit tests, browser suite, and packaged-app smoke test, and uploads the executables as a workflow artifact. It is started manually with `workflow_dispatch` and does not publish a GitHub release. Once the workflow is available on the repository's default branch, choose **Windows desktop** in GitHub Actions, select the branch to build, and run it. Download the `MC-Panel-windows-x64` artifact from the completed run and extract the executables. Workflow artifacts expire after 14 days.
+The [Windows desktop workflow](.github/workflows/windows-desktop.yml) runs on pushes to `dev` and can also be started manually. It builds both executables, runs backend and desktop unit tests, browser tests, and the packaged-app smoke test. A successful current `dev` build publishes a GitHub prerelease with a unique version, such as `0.1.3-dev.12.1`, the installer, portable copy, and updater metadata. Other branches produce workflow artifacts only. Incomplete builds remain unpublished, superseded commits are skipped, and older reruns cannot replace a newer dev update. Workflow artifacts expire after 14 days; published releases remain available.
+
+### Update MC Panel
+
+Install the **Setup** edition once on the server PC to enable updates. Earlier builds do not have an updater, so installing this first updater-enabled build is the one-time bootstrap. Future updates use **Updates → Check for updates → Download update → Restart to update**. The app also checks in the background after launch and every four hours, but never downloads, installs, or stops a server without an update action.
+
+Updates download from this repository's published dev releases and are checked against the release manifest's SHA-512 checksum by `electron-updater`. No GitHub login or token is bundled into the app. These development builds are unsigned; checksum verification is not a publisher signature. Portable/unpacked copies explain that the Setup edition is required rather than launching an installer over themselves.
+
+Downloading leaves servers running. Applying an update asks before stopping running servers, waits for active backups and writes, then waits for graceful server exit before replacing the app. It preserves `%APPDATA%\MC Panel` and imported server folders. MC Panel reopens after installation with servers stopped; start them when ready. An offline network, failed download, or unavailable dev release can be retried from the same dialog. Updates change MC Panel only; they do not update Minecraft, Java, NeoForge, or mods.
 
 ## Run from source in a browser
 
@@ -129,7 +152,7 @@ MC_SOFTWARE=Paper
 MC_VERSION=1.21.4
 ```
 
-The panel owns the Java process it launches. It cannot attach to an already running server. A normal panel shutdown sends `stop` and waits up to 15 seconds before terminating the process. The panel does not download JARs, change your EULA, or install plugins automatically. A custom `MC_SERVER_DIR` is never populated with demonstration files.
+The panel owns the Java process it launches. It cannot attach to an already running server. A normal panel shutdown sends `stop` and waits up to 15 seconds before terminating the process. The panel does not download JARs, change your EULA, or install plugins automatically. A custom `MC_SERVER_DIR` is never populated with demonstration files. Use the **Import an existing server** interface for NeoForge startup detection; the legacy environment example above configures a JAR server.
 
 Live stdout, commands, power state, uptime, disk usage, in-game operator commands, and online-player tracking work. The online-player list follows recognized vanilla/Paper join and leave messages from the Java process launched by the panel. UUID authentication announcements supply player UUIDs when available. Tracking starts with that process and clears on stop, exit, and restart; it does not read old logs or attach to a separate running server. Plugins or server versions that replace these standard log messages may prevent complete tracking. This is log tracking, not a server query, and no player latency is invented. Demo mode keeps the online-player list empty.
 

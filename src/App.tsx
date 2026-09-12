@@ -42,6 +42,8 @@ import Databases from "./pages/Databases";
 import AuditLogs from "./pages/AuditLogs";
 import Players from "./pages/Players";
 import PlayerHead from "./PlayerHead";
+import DesktopUpdates from "./DesktopUpdates";
+import { version as appVersion } from "../package.json";
 import ServerManager, {
   ServerSwitcher,
   type ServerRecord,
@@ -388,15 +390,18 @@ function EmptyFleet({ onAdd }: { onAdd: () => void }) {
             <small>YOUR WORLD. YOUR RULES.</small>
           </span>
         </div>
-        <a
-          className="help-button"
-          href="https://github.com/BigUziHert/MC-Server-UI/tree/dev#readme"
-          target="_blank"
-          rel="noreferrer"
-        >
-          <CircleHelp size={17} /> <span>Setup guide</span>{" "}
-          <ExternalLink size={13} />
-        </a>
+        <div className="welcome-header-actions">
+          <DesktopUpdates />
+          <a
+            className="help-button"
+            href="https://github.com/BigUziHert/MC-Server-UI/tree/dev#readme"
+            target="_blank"
+            rel="noreferrer"
+          >
+            <CircleHelp size={17} /> <span>Setup guide</span>{" "}
+            <ExternalLink size={13} />
+          </a>
+        </div>
       </header>
       <main className="fleet-welcome-main">
         <section
@@ -480,7 +485,7 @@ function EmptyFleet({ onAdd }: { onAdd: () => void }) {
             <ShieldCheck size={15} /> Your servers. Your computer. Your control.
           </span>
           <span>
-            MC Panel <span className="footer-version">v0.1.2</span>
+            MC Panel <span className="footer-version">v{appVersion}</span>
           </span>
         </footer>
       </main>
@@ -650,6 +655,7 @@ function ServerWorkspace({
             <strong>{navigation.find((n) => n.id === page)?.label}</strong>
           </div>
           <div className="topbar-right">
+            <DesktopUpdates />
             <span className="environment-badge">
               <span />
               {(server?.mode ?? selected.mode) === "live"
@@ -703,7 +709,8 @@ function ServerWorkspace({
               </span>
             </span>
             <span className="muted">
-              Development build <span className="footer-version">v0.1.2</span>
+              Development build{" "}
+              <span className="footer-version">v{appVersion}</span>
             </span>
           </footer>
         </main>

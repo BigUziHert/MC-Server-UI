@@ -1,0 +1,76 @@
+.update-ready {
+  color: var(--accent, #bbef62);
+}
+.updates-dialog {
+  width: min(480px, calc(100vw - 32px));
+  max-height: calc(100dvh - 40px);
+  overflow: auto;
+  padding: 28px;
+  border: 1px solid #343e2d;
+  border-radius: 12px;
+  background: #171d16;
+  color: #e6eadf;
+}
+.updates-dialog::backdrop {
+  background: #060906b8;
+  backdrop-filter: blur(3px);
+}
+.updates-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 20px;
+}
+.updates-heading h2 {
+  margin: 0;
+  font-size: 23px;
+}
+.updates-dialog p {
+  color: #a5ae98;
+  font-size: 13px;
+  line-height: 1.7;
+}
+.updates-versions {
+  margin: 24px 0;
+  font-size: 13px;
+}
+.updates-versions div {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  gap: 8px 20px;
+  padding: 10px 0;
+  border-bottom: 1px solid #30372b;
+}
+.updates-versions dt {
+  color: #a5ae98;
+}
+.updates-versions dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+.updates-dialog .updates-message {
+  color: #d6e8b6;
+}
+.updates-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+  margin-top: 24px;
+}
+.update-progress {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  font-size: 12px;
+}
+.update-progress progress {
+  flex: 1;
+  min-width: 0;
+  accent-color: #bbef62;
+}
+.welcome-header-actions {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+}

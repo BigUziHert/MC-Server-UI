@@ -31,6 +31,7 @@ export async function startDesktopRuntime({
   spawnServer,
   backupFlushTimeoutMs,
   selectServerDirectory,
+  updates,
 } = {}) {
   if (typeof dataDir !== "string" || !path.isAbsolute(dataDir))
     throw new Error(
@@ -71,6 +72,37 @@ export async function startDesktopRuntime({
       return reject(403, "This request is outside the desktop session.");
     if (!authenticated(req.headers.cookie, expectedToken))
       return reject(401, "An authenticated desktop session is required.");
+    const requestPath = new URL(req.url, url).pathname;
+    if (
+      requestPath === "/api/desktop/updates" ||
+      requestPath.startsWith("/api/desktop/updates/")
+    ) {
+      const action = requestPath.slice("/api/desktop/updates".length);
+      if (
+        (!action && req.method !== "GET") ||
+        (action && req.method !== "POST")
+      )
+        return reject(
+          405,
+          "Use GET for update status and POST for update actions.",
+        );
+      if (!["", "/check", "/download", "/install"].includes(action))
+        return reject(404, "Unknown update action.");
+      const result = updates
+        ? action
+          ? updates[action.slice(1)]()
+          : updates.snapshot()
+        : {
+            desktop: true,
+            supported: false,
+            version: "development",
+            channel: "dev",
+            status: "unsupported",
+            message: "Updates are available in the installed Windows app.",
+          };
+      res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
+      return res.end(JSON.stringify(result));
+    }
     fleet.app(req, res);
   });
   try {
@@ -98,7 +130,7 @@ export async function startDesktopRuntime({
     url,
     token,
     fleet,
-    close() {
+    close({ gracefulOnly = false } = {}) {
       if (!closing) {
         closing = (async () => {
           const httpClosed = new Promise((resolve, reject) =>
@@ -107,7 +139,7 @@ export async function startDesktopRuntime({
           // The fleet sends stop to its managed Java processes and waits for their exit.
           // Stop accepting HTTP first, but keep current responses alive during that shutdown.
           try {
-            await fleet.close();
+            await fleet.close({ gracefulOnly });
           } finally {
             listener.closeAllConnections();
             await httpClosed;

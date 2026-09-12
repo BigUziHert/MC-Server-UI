@@ -211,6 +211,234 @@ async function readProperties(directory, filename, { optional = false } = {}) {
   }
 }
 
+async function readLaunchFile(directory, relative) {
+  const target = await containedSourcePath(directory, relative);
+  try {
+    const stat = await fs.stat(target);
+    if (!stat.isFile() || stat.size > 1024 * 1024)
+      throw error(400, `${relative} must be a regular text file under 1 MB.`);
+    const text = new TextDecoder("utf-8", { fatal: true }).decode(
+      await fs.readFile(target),
+    );
+    if (text.includes("\0"))
+      throw error(400, `${relative} must be a plain UTF-8 text file.`);
+    return text.replace(/^\uFEFF/, "");
+  } catch (cause) {
+    if (cause.code === "ENOENT" || cause.code === "ENOTDIR")
+      throw error(
+        400,
+        `Startup requires ${relative}. Restore this file from the existing server installation before importing or starting.`,
+      );
+    if (cause.code === "ERR_ENCODING_INVALID_ENCODED_DATA")
+      throw error(400, `${relative} must be a plain UTF-8 text file.`);
+    throw cause;
+  }
+}
+
+// Interpret only the installer's single Java command. Never execute batch commands
+// or shell expansion: Java remains the child process so stdin, stop and restart work.
+export function parseJavaScript(text) {
+  const unsupported = () =>
+    error(
+      400,
+      "This launcher contains commands beyond a single Java invocation. Select Startup script to run it as configured, or enter the Java arguments explicitly. Scripts must keep the server in the foreground without pause, automatic restart loops, or detached launch commands.",
+    );
+  const lines = text
+    .replace(/^\uFEFF/, "")
+    .split(/\r\n|\n|\r/)
+    .map((line) => line.trim().replace(/^@/, ""))
+    .filter(
+      (line) => line && !/^(?:rem(?:\s|$)|::|echo\s+off$|pause$)/i.test(line),
+    );
+  if (lines.length !== 1) throw unsupported();
+  const line = lines[0];
+  if (/[&|<>^!\x00-\x1f]/.test(line)) throw unsupported();
+  const tokens = [];
+  let quoted = false;
+  let token = "";
+  for (const char of line) {
+    if (char === '"') quoted = !quoted;
+    else if (/\s/.test(char) && !quoted) {
+      if (token) tokens.push(token);
+      token = "";
+    } else token += char;
+  }
+  if (quoted) throw unsupported();
+  if (token) tokens.push(token);
+  const javaPath = tokens.shift();
+  if (
+    !javaPath ||
+    !/(?:^|[\\/])java(?:\.exe)?$/i.test(javaPath) ||
+    /%/.test(javaPath)
+  )
+    throw unsupported();
+  if (tokens.at(-1) === "%*") tokens.pop();
+  if (tokens.some((value) => /%/.test(value))) throw unsupported();
+  const argFiles = tokens
+    .filter((value) => value.startsWith("@"))
+    .map((value) => value.slice(1).replace(/\\/g, "/"));
+  if (!tokens.length) throw unsupported();
+  const args = tokens.map((value) =>
+    value.startsWith("@") ? `@${value.slice(1).replace(/\\/g, "/")}` : value,
+  );
+  if (!args.includes("nogui") && !args.includes("--nogui")) args.push("nogui");
+  const forgeArgs = argFiles.find((file) =>
+    /^libraries\/(?:net\/neoforged\/neoforge|net\/minecraftforge\/forge)\/[^/]+\/(?:win|unix)_args\.txt$/.test(
+      file,
+    ),
+  );
+  const software = forgeArgs?.includes("neoforged")
+    ? "NeoForge"
+    : forgeArgs
+      ? "Forge"
+      : /fabric/i.test(args.join(" "))
+        ? "Fabric"
+        : /quilt/i.test(args.join(" "))
+          ? "Quilt"
+          : "Java";
+  return {
+    javaPath,
+    args,
+    argFiles,
+    software,
+    version: forgeArgs?.split("/").at(-2) ?? "Configured launch",
+  };
+}
+
+export async function inspectJavaArguments(directory, args) {
+  const contents = [];
+  for (const argument of args) {
+    if (!argument.startsWith("@")) continue;
+    contents.push(
+      await readLaunchFile(directory, argument.slice(1).replace(/\\/g, "/")),
+    );
+  }
+  const jarIndex = args.indexOf("-jar");
+  if (jarIndex !== -1) {
+    const jar = args[jarIndex + 1];
+    if (typeof jar !== "string" || !/\.jar$/i.test(jar))
+      throw error(
+        400,
+        "The -jar startup option must be followed by a relative server JAR path.",
+      );
+    const target = await containedSourcePath(
+      directory,
+      jar.replace(/\\/g, "/"),
+    );
+    const available = await fs
+      .stat(target)
+      .then((stat) => stat.isFile())
+      .catch((cause) => {
+        if (cause.code !== "ENOENT" && cause.code !== "ENOTDIR") throw cause;
+        return false;
+      });
+    if (!available)
+      throw error(
+        400,
+        `Startup requires ${jar}. Restore the selected server JAR before importing or starting.`,
+      );
+  }
+  // Memory metadata is advisory; the original argument file is passed to Java intact.
+  const expanded = args
+    .map((argument) => (argument.startsWith("@") ? contents.shift() : argument))
+    .join("\n");
+  const memoryArgs = [
+    ...expanded
+      .replace(/#.*$/gm, "")
+      .matchAll(/(?:^|\s)["']?-Xmx(\d+)([kmg])(?:["']?)(?=\s|$)/gi),
+  ];
+  const memory = memoryArgs.at(-1);
+  const memoryLimitMB = memory
+    ? Number(memory[1]) *
+      { k: 1 / 1024, m: 1, g: 1024 }[memory[2].toLowerCase()]
+    : undefined;
+  return Number.isInteger(memoryLimitMB) &&
+    memoryLimitMB >= 256 &&
+    memoryLimitMB <= 262144
+    ? { memoryLimitMB }
+    : {};
+}
+
+export async function inspectJavaLauncher(directory, launchScript) {
+  const launch = parseJavaScript(await readLaunchFile(directory, launchScript));
+  return {
+    ...launch,
+    ...(await inspectJavaArguments(directory, launch.args)),
+    launchScript,
+  };
+}
+
+export async function validateStartupFiles(directory, config) {
+  if (config.launchType === "java-args")
+    return inspectJavaArguments(directory, config.launchArgs);
+  if (config.launchType === "script") {
+    await readLaunchFile(directory, config.launchScript);
+  }
+  return {};
+}
+
+export function buildScriptInvocation(
+  script,
+  args,
+  platform = process.platform,
+) {
+  if (/\.(bat|cmd)$/i.test(script)) {
+    if (platform !== "win32")
+      throw error(
+        400,
+        "Windows batch launchers require Windows. Select a shell script or Java arguments on this system.",
+      );
+    // cmd expands %, ! and metacharacters even where ordinary argv quoting would
+    // be safe. Deliberately reject those inputs instead of building a shell command.
+    if ([script, ...args].some((value) => /[%!^"&|<>\x00-\x1f]/.test(value)))
+      throw error(
+        400,
+        "Windows startup script paths and arguments cannot contain quotes, %, !, ^, &, |, <, >, or control characters. Use Java arguments or an executable for these values.",
+      );
+    return {
+      executable: path.win32.join(
+        process.env.SystemRoot || "C:\\Windows",
+        "System32",
+        "cmd.exe",
+      ),
+      args: [
+        "/d",
+        "/v:off",
+        "/s",
+        "/c",
+        `"${[script, ...args].map((value) => `"${value}"`).join(" ")}"`,
+      ],
+      windowsVerbatimArguments: true,
+    };
+  }
+  if (/\.ps1$/i.test(script))
+    return {
+      executable:
+        platform === "win32"
+          ? path.win32.join(
+              process.env.SystemRoot || "C:\\Windows",
+              "System32",
+              "WindowsPowerShell",
+              "v1.0",
+              "powershell.exe",
+            )
+          : "pwsh",
+      args: ["-NoProfile", "-NonInteractive", "-File", script, ...args],
+    };
+  if (/\.sh$/i.test(script)) {
+    if (platform === "win32")
+      throw error(
+        400,
+        "Shell scripts require a Unix shell. Choose the Windows launcher, Java arguments, or configure a shell executable explicitly.",
+      );
+    return { executable: "/bin/sh", args: [script, ...args] };
+  }
+  throw error(
+    400,
+    "Choose a .bat, .cmd, .ps1, or .sh startup script, or use an executable with explicit arguments.",
+  );
+}
+
 export async function inspectServerDirectory(
   directory,
   { forbiddenDirectories = [], requireCanonical = false } = {},
@@ -260,19 +488,70 @@ export async function inspectServerDirectory(
   const warnings = [
     "Import keeps the existing folder in place. Stop any separately running server before starting it from this panel.",
   ];
-  if (
-    entries.some(
+  const launches = [];
+  const detected = new Map();
+  const scripts = entries
+    .filter(
       (entry) =>
-        /\.(bat|cmd|sh|ps1|args)$/i.test(entry.name) ||
-        entry.name === "user_jvm_args.txt",
+        entry.isFile() &&
+        !entry.isSymbolicLink() &&
+        /\.(bat|cmd|sh|ps1)$/i.test(entry.name),
     )
-  )
-    warnings.push(
-      "Launcher scripts are not executed. Servers that require run.bat, run.sh, argument files, or custom JVM flags need manual setup; select a server JAR that supports java -jar.",
+    .sort(
+      (a, b) =>
+        Number(!/^run\.bat$/i.test(a.name)) -
+          Number(!/^run\.bat$/i.test(b.name)) || a.name.localeCompare(b.name),
     );
-  if (!jars.length)
+  for (const script of scripts) {
+    if (/\.(bat|cmd)$/i.test(script.name)) {
+      try {
+        const java = await inspectJavaLauncher(canonical, script.name);
+        const candidate = {
+          type: "java-args",
+          path: script.name,
+          label: `${java.software} · ${script.name}`,
+          launchArgs: java.args,
+          javaPath: java.javaPath,
+          software: java.software,
+        };
+        launches.push(candidate);
+        detected.set(candidate, java);
+      } catch (cause) {
+        warnings.push(
+          `${script.name}: ${cause.message} Launcher scripts are not executed during inspection or import.`,
+        );
+      }
+    }
+    launches.push({
+      type: "script",
+      path: script.name,
+      label: `Startup script · ${script.name}`,
+    });
+  }
+  launches.push(
+    ...jars.map((jar) => ({
+      type: "jar",
+      path: jar,
+      label: `Server JAR · ${jar}`,
+    })),
+  );
+  const recommended =
+    launches.find(
+      (candidate) =>
+        candidate.type === "java-args" &&
+        ["NeoForge", "Forge"].includes(candidate.software),
+    ) ??
+    launches.find((candidate) => candidate.type === "java-args") ??
+    (jars.length === 1 && !/installer/i.test(jars[0])
+      ? launches.find((candidate) => candidate.type === "jar")
+      : undefined) ??
+    (scripts.length === 1 && !jars.length
+      ? launches.find((candidate) => candidate.type === "script")
+      : undefined);
+  const detectedJava = detected.get(recommended);
+  if (!jars.length && !scripts.length)
     warnings.push(
-      "No root-level server JAR was found. This importer cannot launch a script-only server; place a runnable server JAR in this folder before importing.",
+      "No root-level server JAR or startup script was found. Choose the complete server folder, or configure Java arguments or a server executable manually.",
     );
   if (jars.length > 1)
     warnings.push(
@@ -285,6 +564,18 @@ export async function inspectServerDirectory(
   if (port < 1024)
     warnings.push(
       "Choose a port between 1024 and 65535 for this panel; an override is applied only when the server is started.",
+    );
+  const levelFile = await containedSourcePath(canonical, `${world}/level.dat`);
+  const worldExists = await fs
+    .stat(levelFile)
+    .then((stat) => stat.isFile())
+    .catch((cause) => {
+      if (cause.code !== "ENOENT" && cause.code !== "ENOTDIR") throw cause;
+      return false;
+    });
+  if (!worldExists)
+    warnings.push(
+      `No saved level.dat was found in ${world}. Starting may create a new world; place your existing world in that folder before starting.`,
     );
   const serverIp = properties.get("server-ip")?.trim();
   const host =
@@ -306,8 +597,18 @@ export async function inspectServerDirectory(
     motd: properties.get("motd") ?? "A Minecraft Server",
     maxPlayers,
     world,
+    worldExists,
     jars,
-    jar: jars.length === 1 ? jars[0] : null,
+    jar: recommended?.type === "jar" ? recommended.path : null,
+    launches,
+    launchType: recommended?.type ?? "jar",
+    launchScript: recommended?.type === "script" ? recommended.path : "",
+    launchExecutable: "",
+    launchArgs: detectedJava?.args ?? [],
+    javaPath: detectedJava?.javaPath ?? "java",
+    ...(detectedJava?.memoryLimitMB
+      ? { memoryLimitMB: detectedJava.memoryLimitMB }
+      : {}),
     eulaAccepted,
     warnings,
   };

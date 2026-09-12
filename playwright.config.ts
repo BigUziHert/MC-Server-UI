@@ -21,7 +21,7 @@ const port = 3111;
 
 export default defineConfig({
   testDir: "./tests",
-  testMatch: "panel.spec.ts",
+  testMatch: ["panel.spec.ts", "updates.spec.ts"],
   fullyParallel: false,
   workers: 1,
   retries: 0,

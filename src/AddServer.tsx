@@ -14,6 +14,16 @@ import {
 } from "lucide-react";
 import { api, post } from "./api";
 import type { ServerRecord } from "./ServerManager";
+import {
+  LaunchAdvancedFields,
+  LaunchMemoryNote,
+  LaunchMethodFields,
+  startupDraft,
+  startupError,
+  startupPayload,
+  type LaunchCandidate,
+  type LaunchType,
+} from "./LaunchSettings";
 
 type Inspection = {
   directory: string;
@@ -25,6 +35,14 @@ type Inspection = {
   jar: string | null;
   eulaAccepted: boolean;
   warnings: string[];
+  world?: string;
+  launches?: LaunchCandidate[];
+  launchType?: LaunchType;
+  launchScript?: string;
+  launchExecutable?: string;
+  launchArgs?: string[];
+  javaPath?: string;
+  memoryLimitMB?: number;
 };
 type Step = "choice" | "create" | "import";
 type Work = "browse" | "inspect" | "create" | "import" | null;
@@ -45,8 +63,7 @@ export default function AddServer({
   const [mode, setMode] = useState<"live" | "demo">("live");
   const [port, setPort] = useState(String(nextPort));
   const [memory, setMemory] = useState("4096");
-  const [jar, setJar] = useState("server.jar");
-  const [javaPath, setJavaPath] = useState("java");
+  const [startup, setStartup] = useState(() => startupDraft());
   const [motd, setMotd] = useState("Welcome to our Minecraft server");
   const [advanced, setAdvanced] = useState(false);
   const [canBrowse, setCanBrowse] = useState(false);
@@ -54,10 +71,11 @@ export default function AddServer({
   const [directory, setDirectory] = useState("");
   const [inspection, setInspection] = useState<Inspection | null>(null);
   const [importName, setImportName] = useState("");
-  const [importJar, setImportJar] = useState("");
+  const [importStartup, setImportStartup] = useState(() =>
+    startupDraft({ jar: "" }),
+  );
   const [importPort, setImportPort] = useState("25565");
   const [importMemory, setImportMemory] = useState("4096");
-  const [importJava, setImportJava] = useState("java");
   const [importAdvanced, setImportAdvanced] = useState(false);
   const [work, setWork] = useState<Work>(null);
   const [error, setError] = useState("");
@@ -72,6 +90,13 @@ export default function AddServer({
   const freshInspection = inspection?.directory === directory;
   const portConflict = servers.find(
     (server) => server.port === Number(importPort),
+  );
+  const validImportLaunch =
+    !startupError(importStartup) &&
+    (importStartup.launchType !== "jar" ||
+      !!inspection?.jars.includes(importStartup.jar));
+  const detectedLauncher = inspection?.launches?.find(
+    (candidate) => candidate.type === importStartup.launchType,
   );
 
   useEffect(() => {
@@ -126,15 +151,11 @@ export default function AddServer({
     setWork(null);
     setDirectory(value);
     setInspection(null);
-    setImportJar("");
+    setImportStartup(startupDraft({ jar: "" }));
     setError("");
   }
 
-  function settingsError(
-    serverPort: string,
-    serverMemory: string,
-    executable: string,
-  ) {
+  function settingsError(serverPort: string, serverMemory: string | null) {
     const portNumber = Number(serverPort);
     if (
       !Number.isInteger(portNumber) ||
@@ -147,13 +168,12 @@ export default function AddServer({
       return `Port ${portNumber} is already used by ${conflict.name}. Choose another server port.`;
     const memoryNumber = Number(serverMemory);
     if (
-      !Number.isInteger(memoryNumber) ||
-      memoryNumber < 256 ||
-      memoryNumber > 262144
+      serverMemory !== null &&
+      (!Number.isInteger(memoryNumber) ||
+        memoryNumber < 256 ||
+        memoryNumber > 262144)
     )
       return "Memory must be a whole number from 256 to 262144 MB.";
-    if (!executable.trim())
-      return "Enter java or the full path to your Java executable.";
     return "";
   }
 
@@ -162,18 +182,15 @@ export default function AddServer({
     if (work) return;
     const invalid = settingsError(
       port,
-      memory,
-      mode === "live" ? javaPath : "java",
+      startup.launchType === "jar" ? memory : null,
     );
     if (!name.trim()) {
       setError("Give your server a name.");
       nameInput.current?.focus();
       return;
     }
-    if (invalid || (mode === "live" && !jar.trim())) {
-      setError(
-        invalid || "Enter the filename of the server JAR you will upload.",
-      );
+    if (invalid || (mode === "live" && startupError(startup))) {
+      setError(invalid || startupError(startup));
       setAdvanced(true);
       return;
     }
@@ -185,9 +202,10 @@ export default function AddServer({
         name: name.trim(),
         mode,
         port: Number(port),
-        memoryLimitMB: Number(memory),
-        jar: jar.trim() || "server.jar",
-        javaPath: javaPath.trim(),
+        ...(startup.launchType === "jar"
+          ? { memoryLimitMB: Number(memory) }
+          : {}),
+        ...startupPayload(mode === "live" ? startup : startupDraft()),
         motd,
       });
       if (request === operation.current) onSaved(result.server);
@@ -216,7 +234,7 @@ export default function AddServer({
       if (result.directory) {
         setDirectory(result.directory);
         setInspection(null);
-        setImportJar("");
+        setImportStartup(startupDraft({ jar: "" }));
       }
       directoryInput.current?.focus();
     } catch (cause) {
@@ -255,9 +273,13 @@ export default function AddServer({
       setDirectory(result.directory);
       setInspection(result);
       setImportName(result.name);
-      setImportJar(
-        result.jar && result.jars.includes(result.jar) ? result.jar : "",
+      setImportStartup(
+        startupDraft({
+          ...result,
+          jar: result.jar && result.jars.includes(result.jar) ? result.jar : "",
+        }),
       );
+      setImportMemory(String(result.memoryLimitMB ?? 4096));
       setImportPort(String(result.port));
       setImportAdvanced(servers.some((server) => server.port === result.port));
     } catch (cause) {
@@ -280,11 +302,15 @@ export default function AddServer({
       inspectedName.current?.focus();
       return;
     }
-    if (!importJar || !inspection.jars.includes(importJar)) {
-      setError("Choose the server JAR to run.");
+    if (!validImportLaunch) {
+      setError(startupError(importStartup) || "Choose the server JAR to run.");
+      setImportAdvanced(true);
       return;
     }
-    const invalid = settingsError(importPort, importMemory, importJava);
+    const invalid = settingsError(
+      importPort,
+      importStartup.launchType === "jar" ? importMemory : null,
+    );
     if (invalid) {
       setError(invalid);
       setImportAdvanced(true);
@@ -297,9 +323,10 @@ export default function AddServer({
       const result = await post<{ server: ServerRecord }>("/server-import", {
         directory: inspection.directory,
         name: importName.trim(),
-        jar: importJar,
-        javaPath: importJava.trim(),
-        memoryLimitMB: Number(importMemory),
+        ...startupPayload(importStartup),
+        ...(importStartup.launchType === "jar"
+          ? { memoryLimitMB: Number(importMemory) }
+          : {}),
         port: Number(importPort),
       });
       if (request === operation.current) onSaved(result.server);
@@ -362,7 +389,7 @@ export default function AddServer({
           ? "Start a fresh world or bring the server you already have."
           : step === "create"
             ? "Give your server a name. You can add its files next."
-            : "Connect a server folder on this computer, right where it is."}
+            : "Connect the existing server folder on the computer running MC Panel."}
       </p>
 
       {step === "choice" && (
@@ -395,7 +422,9 @@ export default function AddServer({
               </span>
               <span>
                 <strong>Import an existing server</strong>
-                <span>Use your current world, plugins, and settings.</span>
+                <span>
+                  Use your current world, mods, plugins, and settings.
+                </span>
               </span>
               <ArrowRight size={18} />
             </button>
@@ -437,16 +466,18 @@ export default function AddServer({
               }
               disabled={locked}
             >
-              <option value="live">Minecraft Java</option>
+              <option value="live">Live Minecraft server</option>
               <option value="demo">Demo server</option>
             </select>
           </div>
           <div className="server-create-defaults">
             <Box size={16} />
             <span>
-              {mode === "live"
+              {mode === "live" && startup.launchType === "jar"
                 ? `${Number(memory) / 1024} GB memory`
-                : "Simulated console"}
+                : mode === "live"
+                  ? "Custom startup"
+                  : "Simulated console"}
               <span>·</span>Port {port || "—"}
             </span>
           </div>
@@ -476,44 +507,34 @@ export default function AddServer({
                     onChange={(event) => setPort(event.target.value)}
                   />
                 </div>
-                <div className="form-field">
-                  <label htmlFor="new-server-memory">Memory (MB)</label>
-                  <input
-                    id="new-server-memory"
-                    type="number"
-                    required
-                    min={256}
-                    max={262144}
-                    value={memory}
-                    onChange={(event) => setMemory(event.target.value)}
-                  />
-                </div>
+                {startup.launchType === "jar" && (
+                  <div className="form-field">
+                    <label htmlFor="new-server-memory">Memory (MB)</label>
+                    <input
+                      id="new-server-memory"
+                      type="number"
+                      required
+                      min={256}
+                      max={262144}
+                      value={memory}
+                      onChange={(event) => setMemory(event.target.value)}
+                    />
+                  </div>
+                )}
               </div>
               {mode === "live" && (
                 <>
-                  <div className="form-field">
-                    <label htmlFor="new-server-jar">Server JAR</label>
-                    <input
-                      id="new-server-jar"
-                      required
-                      value={jar}
-                      onChange={(event) => setJar(event.target.value)}
-                    />
-                    <small>The filename you will upload in File Manager.</small>
-                  </div>
-                  <div className="form-field">
-                    <label htmlFor="new-server-java">Java executable</label>
-                    <input
-                      id="new-server-java"
-                      required
-                      value={javaPath}
-                      onChange={(event) => setJavaPath(event.target.value)}
-                    />
-                    <small>
-                      Use java from PATH or the full path to your Java
-                      executable.
-                    </small>
-                  </div>
+                  <LaunchMethodFields
+                    idPrefix="new-server"
+                    value={startup}
+                    onChange={setStartup}
+                  />
+                  <LaunchMemoryNote type={startup.launchType} />
+                  <LaunchAdvancedFields
+                    idPrefix="new-server"
+                    value={startup}
+                    onChange={setStartup}
+                  />
                 </>
               )}
               <div className="form-field">
@@ -534,7 +555,9 @@ export default function AddServer({
             <p>
               {mode === "demo"
                 ? "Console and player actions are simulated. Files and backups use real local storage."
-                : "After creating, upload your server JAR and accept the Minecraft EULA before starting. Java must be installed on this computer."}
+                : startup.launchType === "jar"
+                  ? "After creating, upload your server JAR and accept the Minecraft EULA before starting. Java must be installed on this computer."
+                  : "After creating, add your server files in File Manager and finish your server's setup before starting."}
             </p>
           </div>
           {error && (
@@ -599,8 +622,9 @@ export default function AddServer({
             </div>
             <small>
               {browseUnavailable ? "Folder browsing is unavailable. " : ""}Enter
-              a folder on the computer running MC Panel, containing your server
-              JAR.
+              the folder containing your server launcher and existing world. For
+              a server on another PC, open MC Panel on that PC and select its
+              folder there.
             </small>
           </div>
           <div className="server-import-inspect">
@@ -627,7 +651,7 @@ export default function AddServer({
               <div className="server-import-reviewed">
                 <Check size={15} />
                 <strong>Folder inspected</strong>
-                <span>Minecraft Java</span>
+                <span>{detectedLauncher?.software || "Minecraft server"}</span>
               </div>
               <div className="server-import-location">
                 <FolderOpen size={16} />
@@ -645,35 +669,52 @@ export default function AddServer({
                   disabled={locked}
                 />
               </div>
-              <div className="form-field">
-                <label htmlFor="import-server-jar">Server JAR</label>
-                <select
-                  id="import-server-jar"
-                  value={importJar}
-                  onChange={(event) => setImportJar(event.target.value)}
-                  disabled={locked || inspection.jars.length === 0}
-                  required
-                >
-                  <option value="">
-                    {inspection.jars.length
-                      ? "Select the JAR that runs this server"
-                      : "No server JAR found"}
-                  </option>
-                  {inspection.jars.map((filename) => (
-                    <option key={filename} value={filename}>
-                      {filename}
-                    </option>
-                  ))}
-                </select>
-                <small>
-                  {inspection.jars.length === 0
-                    ? "Add your server JAR to this folder, then inspect it again."
-                    : !importJar
-                      ? "Choose the server JAR you normally launch."
-                      : "MC Panel will use this JAR when you choose Start."}
-                </small>
-              </div>
+              <fieldset className="server-config-fields" disabled={locked}>
+                <LaunchMethodFields
+                  idPrefix="import-server"
+                  value={importStartup}
+                  onChange={(value) => {
+                    setImportStartup(value);
+                    if (
+                      value.launchType === "java-args" &&
+                      !value.launchArgs.trim()
+                    )
+                      setImportAdvanced(true);
+                  }}
+                  jars={inspection.jars}
+                  candidates={inspection.launches}
+                />
+              </fieldset>
+              {detectedLauncher && importStartup.launchType === "java-args" && (
+                <div className="form-field">
+                  <label htmlFor="import-detected-launcher">
+                    Detected launcher
+                  </label>
+                  <input
+                    id="import-detected-launcher"
+                    readOnly
+                    value={detectedLauncher.path}
+                  />
+                  <small>
+                    Its Java arguments are ready in Advanced settings. MC Panel
+                    starts Java directly using those arguments.
+                  </small>
+                </div>
+              )}
+              <LaunchMemoryNote
+                type={importStartup.launchType}
+                detectedMemory={
+                  importStartup.launchType === inspection.launchType
+                    ? inspection.memoryLimitMB
+                    : undefined
+                }
+              />
               <div className="server-import-facts">
+                {inspection.world && (
+                  <span>
+                    Existing world <strong>{inspection.world}</strong>
+                  </span>
+                )}
                 <span>
                   Detected port <strong>{inspection.port}</strong>
                 </span>
@@ -730,37 +771,34 @@ export default function AddServer({
                         onChange={(event) => setImportPort(event.target.value)}
                       />
                     </div>
-                    <div className="form-field">
-                      <label htmlFor="import-server-memory">Memory (MB)</label>
-                      <input
-                        id="import-server-memory"
-                        type="number"
-                        required
-                        min={256}
-                        max={262144}
-                        value={importMemory}
-                        onChange={(event) =>
-                          setImportMemory(event.target.value)
-                        }
-                      />
-                    </div>
+                    {importStartup.launchType === "jar" && (
+                      <div className="form-field">
+                        <label htmlFor="import-server-memory">
+                          Memory (MB)
+                        </label>
+                        <input
+                          id="import-server-memory"
+                          type="number"
+                          required
+                          min={256}
+                          max={262144}
+                          value={importMemory}
+                          onChange={(event) =>
+                            setImportMemory(event.target.value)
+                          }
+                        />
+                      </div>
+                    )}
                   </div>
                   <p className="server-advanced-hint">
                     A port change is applied to server.properties when you next
                     start this server.
                   </p>
-                  <div className="form-field">
-                    <label htmlFor="import-server-java">Java executable</label>
-                    <input
-                      id="import-server-java"
-                      required
-                      value={importJava}
-                      onChange={(event) => setImportJava(event.target.value)}
-                    />
-                    <small>
-                      Use the Java version required by this server's JAR.
-                    </small>
-                  </div>
+                  <LaunchAdvancedFields
+                    idPrefix="import-server"
+                    value={importStartup}
+                    onChange={setImportStartup}
+                  />
                 </fieldset>
               </details>
             </div>
@@ -768,8 +806,8 @@ export default function AddServer({
           <div className="server-setup-note server-import-preservation">
             <FolderOpen size={18} />
             <p>
-              Your world, plugins, and configuration stay in their original
-              folder. Backups and panel settings are stored separately.
+              Your world, mods, plugins, and configuration stay in their
+              original folder. Backups and panel settings are stored separately.
             </p>
           </div>
           <p className="server-import-start-note">
@@ -803,7 +841,7 @@ export default function AddServer({
               disabled={
                 !!work ||
                 !freshInspection ||
-                !importJar ||
+                !validImportLaunch ||
                 !importName.trim() ||
                 !!portConflict
               }

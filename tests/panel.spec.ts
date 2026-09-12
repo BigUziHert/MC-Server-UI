@@ -1717,18 +1717,37 @@ test("removing the last listed demo returns to onboarding and preserves its file
   ).toBeVisible();
 });
 
-async function existingServerFixture({ multipleJars = false } = {}) {
+async function existingServerFixture({
+  multipleJars = false,
+  neoforge = false,
+  customLauncher = false,
+} = {}) {
   const directory = await mkdtemp(path.join(tmpdir(), "mc-panel-import-e2e-"));
   const files: Record<string, string | Buffer> = {
     "server.properties":
       "# Existing server: preserve these exact bytes\r\nserver-port=25681\r\nmotd=Imported E2E world\r\nlevel-name=existing-world\r\nmax-players=37\r\nonline-mode=true\r\n",
     "eula.txt": "# The panel must not accept this agreement.\r\neula=false\r\n",
-    "paper-fixture.jar": Buffer.from([80, 75, 3, 4, 0, 128, 255]),
     "existing-world/level.dat": Buffer.from([31, 139, 8, 0, 45, 127, 128, 254]),
     "plugins/Example/config.yml":
       "enabled: true\nmessage: Existing plugin settings\n",
     "logs/latest.log": "[12:00:00] [Server thread/INFO]: Existing log entry\n",
   };
+  if (neoforge) {
+    files["server.properties"] =
+      "# Existing NeoForge server\r\nserver-port=25683\r\nmotd=Original NeoForge world\r\nlevel-name=existing-world\r\nmax-players=37\r\n";
+    files["run.bat"] =
+      "@echo off\r\nREM NeoForge requires JVM arguments.\r\njava @user_jvm_args.txt @libraries/net/neoforged/neoforge/21.1.200/win_args.txt %*\r\npause\r\n";
+    files["user_jvm_args.txt"] =
+      "# Keep this original RAM configuration\r\n-Xms2G\r\n-Xmx6G\r\n";
+    files["libraries/net/neoforged/neoforge/21.1.200/win_args.txt"] =
+      "# Existing generated NeoForge arguments\r\n--launchTarget neoforgeserver\r\n";
+  } else if (customLauncher) {
+    files["server.properties"] =
+      "# Existing custom launcher server\r\nserver-port=25684\r\nmotd=Original custom world\r\nlevel-name=existing-world\r\nmax-players=37\r\n";
+    files["run.bat"] = "@echo off\r\ncall custom-launcher.bat\r\n";
+    files["custom-launcher.bat"] =
+      "@echo off\r\nREM Test fixture: never execute this launcher.\r\nexit /b 0\r\n";
+  } else files["paper-fixture.jar"] = Buffer.from([80, 75, 3, 4, 0, 128, 255]);
   if (multipleJars)
     files["alternate-fixture.jar"] = Buffer.from([80, 75, 5, 6]);
   for (const [name, contents] of Object.entries(files)) {
@@ -1987,6 +2006,313 @@ test("import review handles canceled folder selection, invalid folders, and mult
     await expect(choice).toBeVisible();
     await choice.getByRole("button", { name: "Cancel", exact: true }).click();
     await expect(choice).not.toBeVisible();
+    expect(await snapshotExistingFolder(directory)).toEqual(original);
+  } finally {
+    await removeExistingFixture(directory);
+  }
+});
+
+test("imports a NeoForge run.bat server without a JAR and preserves its JVM arguments and existing world", async ({
+  page,
+  request,
+}, testInfo) => {
+  const directory = await existingServerFixture({ neoforge: true });
+  const original = await snapshotExistingFolder(directory);
+  try {
+    await page.goto("/");
+    let dialog = await chooseImportServer(page);
+    await dialog.getByLabel("Server folder", { exact: true }).fill(directory);
+    const inspectedResponse = page.waitForResponse(
+      (response) =>
+        new URL(response.url()).pathname === "/api/server-import/inspect",
+    );
+    await dialog
+      .getByRole("button", { name: "Inspect folder", exact: true })
+      .click();
+    const inspectionResponse = await inspectedResponse;
+    expect(inspectionResponse.status()).toBe(200);
+    const inspection = await inspectionResponse.json();
+    const launchArgs = [
+      "@user_jvm_args.txt",
+      "@libraries/net/neoforged/neoforge/21.1.200/win_args.txt",
+      "nogui",
+    ];
+    expect(inspection).toMatchObject({
+      jars: [],
+      jar: null,
+      launchType: "java-args",
+      launchScript: "",
+      javaPath: "java",
+      memoryLimitMB: 6144,
+      launchArgs,
+    });
+    expect(inspection.launches).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          type: "java-args",
+          path: "run.bat",
+          label: "NeoForge · run.bat",
+          launchArgs,
+        }),
+      ]),
+    );
+    await expect(dialog).toContainText("NeoForge");
+    await expect(
+      dialog.getByLabel("Launch method", { exact: true }),
+    ).toHaveValue("java-args");
+    await expect(
+      dialog.getByLabel("Detected launcher", { exact: true }),
+    ).toHaveValue("run.bat");
+    await expect(dialog).toContainText("user_jvm_args.txt");
+    await expect(dialog.getByLabel("Server JAR", { exact: true })).toHaveCount(
+      0,
+    );
+    await expect(dialog.getByLabel("Memory (MB)", { exact: true })).toHaveCount(
+      0,
+    );
+    await expect(
+      dialog.getByRole("button", { name: "Import server", exact: true }),
+    ).toBeEnabled();
+    expect(await snapshotExistingFolder(directory)).toEqual(original);
+    await dialog
+      .getByLabel("Server name", { exact: true })
+      .fill("E2E NeoForge World");
+    await page.screenshot({
+      path: testInfo.outputPath("neoforge-import-review.png"),
+      fullPage: true,
+    });
+    const importedResponse = page.waitForResponse(
+      (response) =>
+        new URL(response.url()).pathname === "/api/server-import" &&
+        response.request().method() === "POST",
+    );
+    await dialog
+      .getByRole("button", { name: "Import server", exact: true })
+      .click();
+    const response = await importedResponse;
+    expect(response.status()).toBe(201);
+    const { server } = await response.json();
+    expect(server).toMatchObject({
+      name: "E2E NeoForge World",
+      mode: "live",
+      status: "offline",
+      port: 25683,
+      jar: "",
+      launchType: "java-args",
+      launchScript: "",
+      launchArgs,
+      memoryLimitMB: 6144,
+      source: "imported",
+    });
+    expect(path.resolve(server.serverDir)).toBe(path.resolve(directory));
+    await expect(dialog).not.toBeVisible();
+    await expect(
+      page.getByRole("heading", { name: "E2E NeoForge World", exact: true }),
+    ).toBeVisible();
+    expect((await scopedGet(request, server.id, "/server")).status).toBe(
+      "offline",
+    );
+    expect(await snapshotExistingFolder(directory)).toEqual(original);
+
+    await page
+      .getByRole("button", { name: "Server settings", exact: true })
+      .click();
+    dialog = page.getByRole("dialog", { name: "Server settings", exact: true });
+    await expect(
+      dialog.getByLabel("Launch method", { exact: true }),
+    ).toHaveValue("java-args");
+    await expect(
+      dialog.getByLabel("Startup arguments", { exact: true }),
+    ).toHaveValue(launchArgs.join("\n"));
+    await expect(dialog).toContainText("user_jvm_args.txt");
+    await expect(dialog.getByLabel("Server JAR", { exact: true })).toHaveCount(
+      0,
+    );
+    await expect(dialog.getByLabel("Memory (MB)", { exact: true })).toHaveCount(
+      0,
+    );
+    await dialog
+      .getByRole("button", { name: "Save changes", exact: true })
+      .click();
+    await expect(dialog).not.toBeVisible();
+    expect(await snapshotExistingFolder(directory)).toEqual(original);
+
+    await page.getByRole("link", { name: "File Manager", exact: true }).click();
+    for (const name of [
+      "run.bat",
+      "user_jvm_args.txt",
+      "libraries",
+      "existing-world",
+    ])
+      await expect(
+        page.getByRole("button", { name, exact: true }),
+      ).toBeVisible();
+    await page
+      .getByRole("button", { name: "existing-world", exact: true })
+      .click();
+    await expect(
+      page.getByRole("button", { name: "level.dat", exact: true }),
+    ).toBeVisible();
+    const download = await request.get(
+      "/api/files/download?path=existing-world/level.dat",
+      { headers: serverHeaders(server.id) },
+    );
+    expect(download.status()).toBe(200);
+    expect((await download.body()).toString("base64")).toBe(
+      original["existing-world/level.dat"],
+    );
+    await page.reload();
+    await expect(
+      page.getByRole("combobox", { name: "Switch server", exact: true }),
+    ).toHaveValue(server.id);
+    expect(
+      (await listServers(request)).servers.find(
+        (item) => item.id === server.id,
+      ),
+    ).toMatchObject({
+      launchType: "java-args",
+      launchScript: "",
+      launchArgs,
+      jar: "",
+    });
+    expect(
+      (
+        await scopedGet(
+          request,
+          server.id,
+          "/files/content?path=user_jvm_args.txt",
+        )
+      ).content,
+    ).toContain("-Xmx6G");
+    expect(
+      (await scopedGet(request, server.id, "/files/content?path=eula.txt"))
+        .content,
+    ).toContain("eula=false");
+    expect(await snapshotExistingFolder(directory)).toEqual(original);
+  } finally {
+    await removeExistingFixture(directory);
+  }
+});
+
+test("imports a custom startup script without requiring a JAR or executing its commands", async ({
+  page,
+  request,
+}, testInfo) => {
+  const directory = await existingServerFixture({ customLauncher: true });
+  const original = await snapshotExistingFolder(directory);
+  const launchArgs = ["--world", "existing-world", "--label=Friends world"];
+  try {
+    await page.goto("/");
+    let dialog = await chooseImportServer(page);
+    await dialog.getByLabel("Server folder", { exact: true }).fill(directory);
+    const responseEvent = page.waitForResponse(
+      (response) =>
+        new URL(response.url()).pathname === "/api/server-import/inspect",
+    );
+    await dialog
+      .getByRole("button", { name: "Inspect folder", exact: true })
+      .click();
+    const inspectionResponse = await responseEvent;
+    expect(inspectionResponse.status()).toBe(200);
+    const inspection = await inspectionResponse.json();
+    expect(inspection.jars).toEqual([]);
+    expect(inspection.launches).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ type: "script", path: "run.bat" }),
+      ]),
+    );
+    await dialog
+      .getByLabel("Launch method", { exact: true })
+      .selectOption("script");
+    await dialog.getByLabel("Startup script", { exact: true }).fill("run.bat");
+    await dialog
+      .getByLabel("Server name", { exact: true })
+      .fill("E2E Custom Launcher World");
+    await expect(dialog.getByLabel("Server JAR", { exact: true })).toHaveCount(
+      0,
+    );
+    await expect(dialog.getByLabel("Memory (MB)", { exact: true })).toHaveCount(
+      0,
+    );
+    await dialog.getByText("Advanced settings", { exact: true }).click();
+    await dialog
+      .getByLabel("Startup arguments", { exact: true })
+      .fill(launchArgs.join("\n"));
+    await expect(
+      dialog.getByRole("button", { name: "Import server", exact: true }),
+    ).toBeEnabled();
+    await page.screenshot({
+      path: testInfo.outputPath("custom-launcher-import.png"),
+      fullPage: true,
+    });
+    const importedEvent = page.waitForResponse(
+      (response) =>
+        new URL(response.url()).pathname === "/api/server-import" &&
+        response.request().method() === "POST",
+    );
+    await dialog
+      .getByRole("button", { name: "Import server", exact: true })
+      .click();
+    const response = await importedEvent;
+    expect(response.status()).toBe(201);
+    const { server } = await response.json();
+    expect(server).toMatchObject({
+      name: "E2E Custom Launcher World",
+      mode: "live",
+      status: "offline",
+      launchType: "script",
+      launchScript: "run.bat",
+      launchArgs,
+      jar: "",
+      source: "imported",
+      port: 25684,
+    });
+    expect(path.resolve(server.serverDir)).toBe(path.resolve(directory));
+    await expect(dialog).not.toBeVisible();
+    await expect(
+      page.getByRole("heading", {
+        name: "E2E Custom Launcher World",
+        exact: true,
+      }),
+    ).toBeVisible();
+    expect((await scopedGet(request, server.id, "/server")).status).toBe(
+      "offline",
+    );
+    expect(await snapshotExistingFolder(directory)).toEqual(original);
+    await page
+      .getByRole("button", { name: "Server settings", exact: true })
+      .click();
+    dialog = page.getByRole("dialog", { name: "Server settings", exact: true });
+    await expect(
+      dialog.getByLabel("Launch method", { exact: true }),
+    ).toHaveValue("script");
+    await expect(
+      dialog.getByLabel("Startup script", { exact: true }),
+    ).toHaveValue("run.bat");
+    await expect(
+      dialog.getByLabel("Startup arguments", { exact: true }),
+    ).toHaveValue(launchArgs.join("\n"));
+    await dialog
+      .getByRole("button", { name: "Save changes", exact: true })
+      .click();
+    await expect(dialog).not.toBeVisible();
+    await page.reload();
+    await expect(
+      page.getByRole("heading", {
+        name: "E2E Custom Launcher World",
+        exact: true,
+      }),
+    ).toBeVisible();
+    expect(
+      (await listServers(request)).servers.find(
+        (item) => item.id === server.id,
+      ),
+    ).toMatchObject({
+      launchType: "script",
+      launchScript: "run.bat",
+      launchArgs,
+      jar: "",
+    });
     expect(await snapshotExistingFolder(directory)).toEqual(original);
   } finally {
     await removeExistingFixture(directory);

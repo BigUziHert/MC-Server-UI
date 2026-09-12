@@ -121,8 +121,18 @@
   color: #c7d4bd;
 }
 .server-dialog .form-field input,
-.server-dialog .form-field select {
+.server-dialog .form-field select,
+.server-dialog .form-field textarea {
   font-size: 12px;
+}
+.server-dialog .form-field textarea {
+  width: 100%;
+  min-width: 0;
+  min-height: 105px;
+  resize: vertical;
+  font-family: "JetBrains Mono", monospace;
+  font-size: 11px;
+  line-height: 1.7;
 }
 .server-dialog .form-field small {
   font-size: 10px;
@@ -409,6 +419,28 @@
   display: flex;
   align-items: center;
   gap: 7px;
+  min-width: 0;
+  flex-wrap: wrap;
+  overflow-wrap: anywhere;
+}
+.server-launch-memory {
+  border-left: 2px solid #58733f;
+  background: #202b19;
+  color: #a3b792;
+  margin: 0 0 19px;
+  padding: 11px 13px;
+  font-size: 11px;
+  line-height: 1.8;
+  overflow-wrap: anywhere;
+}
+.server-launch-memory strong {
+  color: #c3d7b0;
+  font-weight: 550;
+}
+.server-launch-memory > span {
+  display: block;
+  color: #94a984;
+  margin-top: 3px;
 }
 .server-import-facts strong {
   font-weight: 550;
