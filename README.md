@@ -26,19 +26,33 @@ Open **http://127.0.0.1:3001**. `npm run preview` previews only the built fronte
 
 ## What works
 
+- **Multiple servers:** create independent demo or live Java servers, switch between them, and rename them. Each server has its own console, files, backups, schedule, access records, databases, in-game operators, and audit logs. Servers can run concurrently on distinct ports.
 - **Console:** start, stop, restart, timestamped output, command entry, resource charts, and server status. In live mode commands go directly to the Java process's standard input, never to an operating system shell.
+- **Players:** grant or remove Minecraft operator access using a Java username. Live actions send `op <name>` or `deop <name>` to the running server and report that the command was requested; check the console for Minecraft's result. The operator list reads the server's `ops.json`, so it can lag behind a command. Demo operator changes are clearly simulated and saved separately from `ops.json`.
 - **File Manager:** browse folders, create files and directories, edit text files up to 1 MB, delete files or folders, and upload/download original files. Upload up to 20 files per request, 256 MB per file. Existing names are protected from accidental upload overwrites. Paths and symbolic links are checked to keep operations inside the configured server directory.
 - **Backups:** create and download real `.tar.gz` archives; configure interval, daily, or weekly schedules and retention. Manual backups are kept until deleted. Retention applies only to scheduled backups, after a new archive succeeds. Symbolic links are excluded.
 - **Subusers:** store email and role records locally. These records do **not** create authenticated accounts, enforce permissions, or send invitations. All access to this local panel has administrator capabilities.
 - **Databases:** create, download, and delete actual SQLite files. This is local SQLite storage, not a hosted MySQL service or automatic Minecraft plugin configuration.
-- **Audit Logs:** persistent records of server commands, file changes, backup jobs, local access records, and database changes. The most recent 2,000 events are retained.
+- **Audit Logs:** persistent records of server commands, settings, in-game operator changes, file changes, backup jobs, local access records, and database changes. The most recent 2,000 events are retained per server.
+
+## Manage multiple servers
+
+Use the server selector to switch workspaces and add a server. Choose **demo** for simulated activity or **live** to run an actual Java server. Give each server a unique Minecraft port (1024–65535) and its own Java heap allocation. The panel creates a separate server directory for every new server. New live instances contain `eula=false` and a starter `server.properties`; upload your JAR in File Manager, configure Java, and accept the EULA yourself before starting.
+
+The server's **display name** can change while it runs. Its **server list message (MOTD)** is a separate setting, shown in Minecraft's multiplayer server list. Stop a server before changing its MOTD, port, mode, Java executable, JAR, or memory allocation. The selected port is written to `server.properties` when settings change and checked again at launch. Renaming alone does not change the MOTD.
+
+Switching servers does not stop them or pause their backup schedules. Files and permissions always belong to the server selected when the operation was started. In-game OP access belongs in **Players**; **Subusers** continues to hold local panel access records and does not grant Minecraft permissions.
 
 ## Connect a real Java server
 
-1. Copy `.env.example` to `.env`.
+For a new server, use the server selector and settings as described above. To import an existing server directory into a fresh panel installation:
+
+1. Copy `.env.example` to `.env` before the first startup.
 2. Set `MC_SERVER_DIR` to your existing Minecraft server directory, and `MC_SERVER_JAR` to the JAR filename inside that directory. Set `JAVA_PATH` if Java is not available on your PATH. Use the Java version required by your chosen server JAR.
 3. Read and accept the [Minecraft EULA](https://aka.ms/MinecraftEULA) yourself, then set `eula=true` in the server's `eula.txt`.
-4. Set `MC_MEMORY_MB` and the optional server display settings. Restart the panel and use **Start**.
+4. Set `MC_MEMORY_MB` and the optional server display settings, then start the panel and use **Start**.
+
+The first fleet startup imports the original default server's configuration and existing files, backups, schedules, access records, and databases without moving or deleting them. The registry is saved in `data/servers.json`. After that, edit server settings in the panel: changing `MC_*` or `JAVA_PATH` in `.env` does not override saved server settings. `PORT` and `PANEL_DATA_DIR` still configure the API process. Environment settings for the original server are never implicitly applied to newly created servers.
 
 Example configuration:
 
@@ -47,6 +61,7 @@ MC_SERVER_DIR=C:/Minecraft/survival
 MC_SERVER_JAR=paper.jar
 JAVA_PATH=C:/Program Files/Java/jdk-21/bin/java.exe
 MC_MEMORY_MB=4096
+MC_PORT=25565
 MC_SERVER_NAME="Survival Server"
 MC_SERVER_ADDRESS=localhost:25565
 MC_SOFTWARE=Paper
@@ -55,13 +70,13 @@ MC_VERSION=1.21.4
 
 The panel owns the Java process it launches. It cannot attach to an already running server. A normal panel shutdown sends `stop` and waits up to 15 seconds before terminating the process. The panel does not download JARs, change your EULA, or install plugins automatically. A custom `MC_SERVER_DIR` is never populated with demonstration files.
 
-Live stdout, commands, power state, uptime, and disk usage work. Live CPU/memory telemetry and player querying are not yet connected; the API marks those readings unavailable rather than presenting simulated values as real measurements. Storage capacity is the host filesystem's capacity, not an enforced per-server quota. Memory allocation is enforced through the Java heap arguments. `MC_SERVER_ADDRESS`, version, software, and maximum player count are display configuration; change `server.properties` to alter the actual Minecraft server settings.
+Live stdout, commands, power state, uptime, disk usage, and in-game operator commands work. Live CPU/memory telemetry and online-player querying are not yet connected; the API marks those readings unavailable rather than presenting simulated values as real measurements. Storage capacity is the host filesystem's capacity, not an enforced per-server quota. Memory allocation is enforced through the Java heap arguments. Version, software, maximum player count, and the imported address are display configuration; change `server.properties` to alter other actual Minecraft server settings. The managed port and MOTD are available in the panel's server settings.
 
 ## Backup scheduling and data
 
-Schedules use the **API host's local timezone**, included in the API response and schedule interface. The scheduler checks every 15 seconds and persists its next deadline in `data/panel.json`. Keep the API running for jobs to execute. After downtime, one overdue job runs on the next check; missed intervals are not replayed in a burst.
+Schedules use the **API host's local timezone**, included in the API response and schedule interface. Each server's scheduler checks every 15 seconds and persists its next deadline in that server's `panel.json`. Keep the API running for jobs to execute. After downtime, one overdue job runs per server on the next check; missed intervals are not replayed in a burst.
 
-Online backups send `save-off` followed by `save-all flush`, then wait up to 15 seconds for the vanilla/Paper console to confirm that the game or world was saved. The archive is created while automatic world saving is paused. The panel sends `save-on` afterward, including failure paths. File changes, console commands, and power controls are blocked during a backup. If a save is not confirmed, no archive is created and the failure appears in Audit Logs. Unsupported server implementations can be backed up while stopped. Plugin-managed databases and files may still change independently; stop the server for a fully quiescent archive of those files.
+Online backups send `save-off` followed by `save-all flush`, then wait up to 15 seconds for the vanilla/Paper console to confirm that the game or world was saved. The archive is created while automatic world saving is paused. The panel sends `save-on` afterward, including failure paths. That server's file changes, settings, operator commands, console commands, and power controls are blocked during a backup; other servers remain usable. If a save is not confirmed, no archive is created and the failure appears in Audit Logs. Unsupported server implementations can be backed up while stopped. Plugin-managed databases and files may still change independently; stop the server for a fully quiescent archive of those files.
 
 A scheduled failure is recorded in Audit Logs and the job tries again at its next deadline. Backup restore is not implemented; downloaded archives can be restored manually while the server is stopped.
 
@@ -74,9 +89,19 @@ data/
   databases/    SQLite files
   uploads/      temporary upload storage
   panel.json    schedules, backup metadata, access records, and audit events
+  servers.json  server registry and saved configurations
+  instances/
+    <server-id>/
+      server/       that server's Minecraft files
+      backups/      that server's archives
+      databases/    that server's SQLite files
+      uploads/      that server's temporary uploads
+      panel.json    that server's schedule, records, demo operators, and audit
 ```
 
 `PANEL_DATA_DIR` changes the panel's data directory. Keep it outside a custom server directory so backups never archive themselves. Use only one API process per data directory. There is no background service installer; scheduling runs within the API process.
+
+API clients can list/create servers at `/api/servers` and update one at `/api/servers/:id`. Select a server for existing APIs with the `X-Server-Id` header or the `serverId` query parameter for direct download links. Unknown IDs return 404; conflicting selectors return 400. Calls without either selector retain the original default server for backward compatibility.
 
 ## Local access boundary
 
@@ -89,7 +114,7 @@ npm test
 npm run build
 ```
 
-Integration tests exercise original-byte uploads/downloads, editing and deletion, path traversal and symlink rejection, request-origin checks, readable backup archives, persistence and retention, missed schedule handling, SQLite validity, access records, simulated console controls, and online Java backup coordination with a stub process. Tests use isolated temporary directories and do not touch your server data.
+Integration tests exercise original-byte uploads/downloads, editing and deletion, path traversal and symlink rejection, request-origin checks, readable backup archives, persistence and retention, missed schedule handling, SQLite validity, access records, simulated console controls, and online Java backup coordination with a stub process. Fleet tests also check server isolation, selector validation, legacy migration, rename persistence, unique-port creation races, launch races, and validated live OP/deOP commands. Tests use isolated temporary directories and do not touch your server data.
 
 Browser integration tests cover the console, file editor and transfers, backup downloads and schedules, local access records, SQLite downloads, audit filtering, and mobile layouts:
 

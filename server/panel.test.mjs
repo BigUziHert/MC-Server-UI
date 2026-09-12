@@ -494,6 +494,11 @@ test("live online backup flushes, blocks concurrent writes, and restores automat
     ).status,
     409,
   );
+  assert.equal(
+    (await request("/api/players/op", json("POST", { name: "BuilderOne" })))
+      .status,
+    409,
+  );
   assert.equal((await pending).status, 201);
   assert.deepEqual(java.commands, ["save-off", "save-all flush", "save-on"]);
   assert.equal((await request("/api/server")).body.status, "running");

@@ -1,3 +1,7 @@
+import { createContext, useContext, useMemo } from "react";
+
+export const ServerScope = createContext<string | null>(null);
+
 export async function api<T = any>(
   path: string,
   options: RequestInit = {},
@@ -15,6 +19,26 @@ export async function api<T = any>(
 }
 export const post = <T = any>(path: string, body: unknown = {}) =>
   api<T>(path, { method: "POST", body: JSON.stringify(body) });
+
+// Bind requests and downloads to the mounted workspace, including async work
+// that finishes after the user switches servers. No mutable global selector.
+export function useServerApi() {
+  const serverId = useContext(ServerScope);
+  return useMemo(() => {
+    const scopedApi = <T = any>(path: string, options: RequestInit = {}) => {
+      const headers = new Headers(options.headers);
+      if (serverId) headers.set("X-Server-Id", serverId);
+      return api<T>(path, { ...options, headers });
+    };
+    return {
+      api: scopedApi,
+      post: <T = any>(path: string, body: unknown = {}) =>
+        scopedApi<T>(path, { method: "POST", body: JSON.stringify(body) }),
+      downloadUrl: (path: string) =>
+        `/api${path}${serverId ? `${path.includes("?") ? "&" : "?"}serverId=${encodeURIComponent(serverId)}` : ""}`,
+    };
+  }, [serverId]);
+}
 export function formatBytes(bytes: number) {
   if (!bytes) return "0 B";
   const unit = Math.min(Math.floor(Math.log(bytes) / Math.log(1024)), 3);

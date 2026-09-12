@@ -21,7 +21,7 @@ import {
   Wrench,
   X,
 } from "lucide-react";
-import { api, post, relativeTime, type PageProps } from "../api";
+import { useServerApi, relativeTime, type PageProps } from "../api";
 import "./management.css";
 
 type Role = "admin" | "operator" | "viewer";
@@ -51,6 +51,7 @@ const roles = [
 ];
 
 export default function Subusers({ notify }: PageProps) {
+  const { api, post } = useServerApi();
   const [users, setUsers] = useState<Subuser[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");

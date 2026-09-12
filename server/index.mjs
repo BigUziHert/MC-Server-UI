@@ -35,6 +35,100 @@ const exists = async (target) => {
   }
 };
 
+const escapeProperty = (value) =>
+  String(value)
+    .replace(/\\/g, "\\\\")
+    .replace(
+      /[^\x20-\x7e]/g,
+      (char) => `\\u${char.charCodeAt(0).toString(16).padStart(4, "0")}`,
+    );
+
+export function validatePlayerName(name) {
+  if (typeof name !== "string" || !/^[A-Za-z0-9_]{3,16}$/.test(name))
+    throw error(
+      400,
+      "Use a Minecraft Java username with 3–16 letters, numbers, or underscores.",
+    );
+  return name;
+}
+
+export function validateServerConfiguration(input, previous = {}) {
+  if (!input || typeof input !== "object" || Array.isArray(input))
+    throw error(400, "Provide server settings.");
+  const allowed = new Set([
+    "name",
+    "mode",
+    "port",
+    "memoryLimitMB",
+    "jar",
+    "javaPath",
+    "motd",
+  ]);
+  if (Object.keys(input).some((key) => !allowed.has(key)))
+    throw error(400, "Unknown server setting.");
+  const result = {
+    name: "New server",
+    mode: "demo",
+    port: 25565,
+    memoryLimitMB: 4096,
+    jar: "server.jar",
+    javaPath: "java",
+    motd: "Welcome to the Overworld",
+    ...previous,
+    ...input,
+  };
+  if (
+    typeof result.name !== "string" ||
+    !result.name.trim() ||
+    result.name.length > 64 ||
+    /[\x00-\x1f\x7f]/.test(result.name)
+  )
+    throw error(
+      400,
+      "Server names must contain 1–64 characters without control characters.",
+    );
+  result.name = result.name.trim();
+  if (!["demo", "live"].includes(result.mode))
+    throw error(400, "Choose demo or live mode.");
+  if (
+    !Number.isInteger(result.port) ||
+    result.port < 1024 ||
+    result.port > 65535
+  )
+    throw error(400, "Use a Minecraft port between 1024 and 65535.");
+  if (
+    !Number.isInteger(result.memoryLimitMB) ||
+    result.memoryLimitMB < 256 ||
+    result.memoryLimitMB > 262144
+  )
+    throw error(400, "Memory must be an integer between 256 and 262144 MB.");
+  if (
+    typeof result.jar !== "string" ||
+    !result.jar.endsWith(".jar") ||
+    result.jar.length > 180 ||
+    result.jar.split("/").some((part) => !part || part === "." || part === "..")
+  )
+    throw error(400, "Choose a relative .jar path inside this server's files.");
+  for (const part of result.jar.split("/")) validateName(part);
+  if (
+    typeof result.javaPath !== "string" ||
+    !result.javaPath.trim() ||
+    result.javaPath.length > 1024 ||
+    /[\x00-\x1f\x7f]/.test(result.javaPath)
+  )
+    throw error(400, "Enter java or the path to a Java executable.");
+  if (
+    typeof result.motd !== "string" ||
+    result.motd.length > 256 ||
+    /[\x00-\x1f\x7f]/.test(result.motd)
+  )
+    throw error(
+      400,
+      "The server list description must be one line, up to 256 characters.",
+    );
+  return result;
+}
+
 export function validateName(name) {
   if (
     typeof name !== "string" ||
@@ -158,31 +252,51 @@ async function directorySize(root) {
 }
 
 export async function createPanel(options = {}) {
+  // A fleet passes every setting explicitly. Legacy callers may still use .env.
+  const env = options.useEnvironment === false ? {} : process.env;
   const dataDir = path.resolve(
-    options.dataDir ??
-      process.env.PANEL_DATA_DIR ??
-      path.join(projectDir, "data"),
+    options.dataDir ?? env.PANEL_DATA_DIR ?? path.join(projectDir, "data"),
   );
   const serverDir = path.resolve(
-    options.serverDir ??
-      process.env.MC_SERVER_DIR ??
-      path.join(dataDir, "server"),
+    options.serverDir ?? env.MC_SERVER_DIR ?? path.join(dataDir, "server"),
   );
-  const configuredJar = options.jar ?? process.env.MC_SERVER_JAR;
-  const mode = configuredJar ? "live" : "demo";
-  const memoryLimit = Number(
-    options.memoryLimit ?? process.env.MC_MEMORY_MB ?? 4096,
-  );
+  let configuredJar = (options.jar ?? env.MC_SERVER_JAR) || "server.jar";
+  let mode =
+    options.mode ?? (options.jar || env.MC_SERVER_JAR ? "live" : "demo");
+  let memoryLimit = Number(options.memoryLimit ?? env.MC_MEMORY_MB ?? 4096);
+  let configuration = {
+    name: options.name ?? env.MC_SERVER_NAME ?? "The Overworld",
+    mode,
+    port: Number(options.port ?? env.MC_PORT ?? 25565),
+    memoryLimitMB: memoryLimit,
+    jar: configuredJar,
+    javaPath: options.javaPath ?? env.JAVA_PATH ?? "java",
+    address:
+      options.address ??
+      env.MC_SERVER_ADDRESS ??
+      `localhost:${options.port ?? env.MC_PORT ?? 25565}`,
+    version:
+      options.version ??
+      env.MC_VERSION ??
+      (mode === "demo" ? "1.21.4" : "Configured JAR"),
+    software:
+      options.software ??
+      env.MC_SOFTWARE ??
+      (mode === "demo" ? "Paper" : "Java"),
+    maxPlayers: Number(options.maxPlayers ?? env.MC_MAX_PLAYERS ?? 20),
+    motd: options.motd ?? "Welcome to the Overworld",
+  };
   if (
     !Number.isInteger(memoryLimit) ||
     memoryLimit < 256 ||
     memoryLimit > 262144
   )
     throw new Error("MC_MEMORY_MB must be an integer between 256 and 262144.");
-  const backupDir = path.join(dataDir, "backups");
-  const databaseDir = path.join(dataDir, "databases");
-  const uploadDir = path.join(dataDir, "uploads");
-  const statePath = path.join(dataDir, "panel.json");
+  await fs.mkdir(dataDir, { recursive: true });
+  const backupDir = await safePath(dataDir, "backups");
+  const databaseDir = await safePath(dataDir, "databases");
+  const uploadDir = await safePath(dataDir, "uploads");
+  const statePath = await safePath(dataDir, "panel.json");
   for (const dir of [dataDir, serverDir, backupDir, databaseDir, uploadDir])
     await fs.mkdir(dir, { recursive: true });
   const relativeBackup = path.relative(
@@ -202,6 +316,7 @@ export async function createPanel(options = {}) {
     databases: [],
     backups: [],
     audit: [],
+    demoOperators: [],
     schedule: { ...defaultSchedule },
   };
   if (await exists(statePath))
@@ -242,8 +357,7 @@ export async function createPanel(options = {}) {
     for (const dir of ["world", "plugins", "config", "logs"])
       await fs.mkdir(path.join(serverDir, dir), { recursive: true });
     const seed = {
-      "server.properties":
-        "# Local demo configuration\nmotd=Welcome to the Overworld\nserver-port=25565\nmax-players=20\ndifficulty=normal\ngamemode=survival\nonline-mode=true\nview-distance=10\n",
+      "server.properties": `# Local demo configuration\nmotd=${escapeProperty(configuration.motd)}\nserver-port=${configuration.port}\nmax-players=20\ndifficulty=normal\ngamemode=survival\nonline-mode=true\nview-distance=10\n`,
       "eula.txt":
         "# Set eula=true yourself after reading https://aka.ms/MinecraftEULA.\neula=false\n",
       "whitelist.json": "[]\n",
@@ -270,6 +384,7 @@ export async function createPanel(options = {}) {
   }
 
   let status = mode === "demo" ? "running" : "offline";
+  let configBusy = false;
   let startedAt = mode === "demo" ? Date.now() - 3_600_000 : null;
   let processHandle = null;
   let restartRequested = false;
@@ -312,99 +427,226 @@ export async function createPanel(options = {}) {
       "[Panel] Live mode configured. Start the server when your JAR and EULA are ready.",
     );
 
+  async function writeProperties(updates) {
+    const target = await safePath(serverDir, "server.properties");
+    let content = "";
+    try {
+      content = await fs.readFile(target, "utf8");
+    } catch (cause) {
+      if (cause.code !== "ENOENT") throw cause;
+    }
+    for (const [key, value] of Object.entries(updates)) {
+      const line = `${key}=${escapeProperty(value)}`;
+      const pattern = new RegExp(`^\\s*${key}\\s*[=:].*$`, "gm");
+      content = pattern.test(content)
+        ? content.replace(pattern, () => line)
+        : `${content}${content.endsWith("\n") || !content ? "" : "\n"}${line}\n`;
+    }
+    const temp = path.join(serverDir, `.panel-properties-${randomUUID()}.tmp`);
+    try {
+      await fs.writeFile(temp, content, { flag: "wx" });
+      await fs.rename(temp, target);
+    } finally {
+      await fs.rm(temp, { force: true });
+    }
+  }
+
+  async function updateConfiguration(next, persist = async () => {}) {
+    if (configBusy || backupBusy || activeMutations)
+      throw error(
+        409,
+        "Wait for the current backup, file change, or server command to finish.",
+      );
+    const restartFields = [
+      "mode",
+      "port",
+      "memoryLimitMB",
+      "jar",
+      "javaPath",
+      "motd",
+    ];
+    if (
+      restartFields.some((key) => next[key] !== configuration[key]) &&
+      status !== "offline"
+    )
+      throw error(
+        409,
+        "Stop this server before changing its connection, Java, memory, or server list settings.",
+      );
+    configBusy = true;
+    try {
+      await safePath(serverDir, next.jar);
+      const updates = {};
+      if (next.port !== configuration.port) updates["server-port"] = next.port;
+      if (next.motd !== configuration.motd) updates.motd = next.motd;
+      let previousProperties;
+      let propertyTarget;
+      if (Object.keys(updates).length) {
+        propertyTarget = await safePath(serverDir, "server.properties");
+        try {
+          previousProperties = await fs.readFile(propertyTarget);
+        } catch (cause) {
+          if (cause.code !== "ENOENT") throw cause;
+        }
+        await writeProperties(updates);
+      }
+      try {
+        await persist();
+      } catch (cause) {
+        if (propertyTarget) {
+          if (previousProperties === undefined)
+            await fs.rm(propertyTarget, { force: true });
+          else await fs.writeFile(propertyTarget, previousProperties);
+        }
+        throw cause;
+      }
+      const oldName = configuration.name;
+      const oldMode = configuration.mode;
+      configuration = {
+        ...configuration,
+        ...Object.fromEntries(
+          Object.keys(configuration).map((key) => [
+            key,
+            next[key] ?? configuration[key],
+          ]),
+        ),
+      };
+      mode = configuration.mode;
+      memoryLimit = configuration.memoryLimitMB;
+      configuredJar = configuration.jar;
+      if (oldMode !== mode) {
+        configuration.version = mode === "demo" ? "1.21.4" : "Configured JAR";
+        configuration.software = mode === "demo" ? "Paper" : "Java";
+        append(
+          `[Panel] ${mode === "demo" ? "Demo mode — activity is simulated" : "Live Java mode configured"}.`,
+        );
+      }
+      if (oldName !== configuration.name)
+        await audit(
+          "server",
+          "Server renamed",
+          `${oldName} → ${configuration.name}.`,
+        );
+      else
+        await audit(
+          "server",
+          "Server settings updated",
+          `Settings saved for ${configuration.name}.`,
+        );
+      return descriptor();
+    } finally {
+      configBusy = false;
+    }
+  }
+
+  const descriptor = () => ({ ...configuration, id: options.id, status });
+
   async function startServer() {
     if (status !== "offline")
       throw error(409, "The server is already running or changing state.");
-    if (mode === "demo") {
-      status = "starting";
-      append("[Demo] Starting the Minecraft server…");
-      demoTimer = setTimeout(() => {
-        status = "running";
-        startedAt = Date.now();
-        append("[Demo] Done! Server is ready.", "success");
-      }, 900);
-      demoTimer.unref();
-      return;
-    }
-    const jar = await safePath(serverDir, configuredJar);
-    if (!(await exists(jar)))
-      throw error(400, "MC_SERVER_JAR does not exist in the server directory.");
-    let eula = "";
-    try {
-      eula = await fs.readFile(await safePath(serverDir, "eula.txt"), "utf8");
-    } catch {
-      /* Shown as an actionable error below. */
-    }
-    if (!/^\s*eula\s*=\s*true\s*$/im.test(eula))
-      throw error(
-        400,
-        "Read the Minecraft EULA, then set eula=true in your server eula.txt before starting.",
-      );
+    // Reserve the transition before any filesystem awaits so concurrent starts cannot spawn twice.
     status = "starting";
-    append("[Panel] Starting Java server…");
-    const child = (options.spawnServer ?? spawn)(
-      options.javaPath ?? process.env.JAVA_PATH ?? "java",
-      [
-        `-Xms${Math.min(memoryLimit, 1024)}M`,
-        `-Xmx${memoryLimit}M`,
-        "-jar",
-        jar,
-        "nogui",
-      ],
-      {
-        cwd: serverDir,
-        shell: false,
-        windowsHide: true,
-        stdio: ["pipe", "pipe", "pipe"],
-      },
-    );
-    processHandle = child;
-    startedAt = Date.now();
-    const bindOutput = (stream, defaultLevel) => {
-      let buffer = "";
-      stream.setEncoding("utf8");
-      stream.on("data", (chunk) => {
-        buffer += chunk;
-        const chunks = buffer.split(/\r?\n/);
-        buffer = chunks.pop().slice(-32768);
-        for (const text of chunks) {
-          if (/Done \(/.test(text) && status === "starting") status = "running";
-          append(
-            text,
-            /\bERROR\b|\bFATAL\b/.test(text)
-              ? "error"
-              : /\bWARN\b/.test(text)
-                ? "warn"
-                : defaultLevel,
-          );
+    try {
+      if (mode === "demo") {
+        status = "starting";
+        append("[Demo] Starting the Minecraft server…");
+        demoTimer = setTimeout(() => {
+          status = "running";
+          startedAt = Date.now();
+          append("[Demo] Done! Server is ready.", "success");
+        }, 900);
+        demoTimer.unref();
+        return;
+      }
+      const jar = await safePath(serverDir, configuredJar);
+      if (!(await exists(jar)))
+        throw error(
+          400,
+          "MC_SERVER_JAR does not exist in the server directory.",
+        );
+      let eula = "";
+      try {
+        eula = await fs.readFile(await safePath(serverDir, "eula.txt"), "utf8");
+      } catch {
+        /* Shown as an actionable error below. */
+      }
+      if (!/^\s*eula\s*=\s*true\s*$/im.test(eula))
+        throw error(
+          400,
+          "Read the Minecraft EULA, then set eula=true in your server eula.txt before starting.",
+        );
+      await writeProperties({ "server-port": configuration.port });
+      status = "starting";
+      append("[Panel] Starting Java server…");
+      const child = (options.spawnServer ?? spawn)(
+        configuration.javaPath,
+        [
+          `-Xms${Math.min(memoryLimit, 1024)}M`,
+          `-Xmx${memoryLimit}M`,
+          "-jar",
+          jar,
+          "nogui",
+        ],
+        {
+          cwd: serverDir,
+          shell: false,
+          windowsHide: true,
+          stdio: ["pipe", "pipe", "pipe"],
+        },
+      );
+      processHandle = child;
+      startedAt = Date.now();
+      const bindOutput = (stream, defaultLevel) => {
+        let buffer = "";
+        stream.setEncoding("utf8");
+        stream.on("data", (chunk) => {
+          buffer += chunk;
+          const chunks = buffer.split(/\r?\n/);
+          buffer = chunks.pop().slice(-32768);
+          for (const text of chunks) {
+            if (/Done \(/.test(text) && status === "starting")
+              status = "running";
+            append(
+              text,
+              /\bERROR\b|\bFATAL\b/.test(text)
+                ? "error"
+                : /\bWARN\b/.test(text)
+                  ? "warn"
+                  : defaultLevel,
+            );
+          }
+        });
+        stream.on("end", () => {
+          if (buffer) append(buffer, defaultLevel);
+        });
+      };
+      bindOutput(child.stdout, "info");
+      bindOutput(child.stderr, "warn");
+      child.stdin.on("error", (cause) =>
+        append(`[Panel] Server input: ${cause.message}`, "error"),
+      );
+      child.on("error", (cause) => {
+        append(`[Panel] Java failed: ${cause.message}`, "error");
+      });
+      child.on("close", (code) => {
+        processHandle = null;
+        status = "offline";
+        startedAt = null;
+        events.emit("server-exit", child);
+        append(
+          `[Panel] Server process exited (code ${code ?? "unknown"}).`,
+          code === 0 ? "info" : "error",
+        );
+        if (restartRequested && !closed) {
+          restartRequested = false;
+          startServer().catch((cause) => append(cause.message, "error"));
         }
       });
-      stream.on("end", () => {
-        if (buffer) append(buffer, defaultLevel);
-      });
-    };
-    bindOutput(child.stdout, "info");
-    bindOutput(child.stderr, "warn");
-    child.stdin.on("error", (cause) =>
-      append(`[Panel] Server input: ${cause.message}`, "error"),
-    );
-    child.on("error", (cause) => {
-      append(`[Panel] Java failed: ${cause.message}`, "error");
-    });
-    child.on("close", (code) => {
-      processHandle = null;
+    } catch (cause) {
       status = "offline";
       startedAt = null;
-      events.emit("server-exit", child);
-      append(
-        `[Panel] Server process exited (code ${code ?? "unknown"}).`,
-        code === 0 ? "info" : "error",
-      );
-      if (restartRequested && !closed) {
-        restartRequested = false;
-        startServer().catch((cause) => append(cause.message, "error"));
-      }
-    });
+      throw cause;
+    }
   }
 
   async function power(action) {
@@ -414,6 +656,11 @@ export async function createPanel(options = {}) {
     else {
       if (!["running", "starting"].includes(status))
         throw error(409, "The server is not running.");
+      if (mode === "live" && !processHandle)
+        throw error(
+          409,
+          "Java is still being prepared. Wait for the process to start before stopping or restarting it.",
+        );
       restartRequested = action === "restart";
       status = "stopping";
       append(
@@ -445,7 +692,12 @@ export async function createPanel(options = {}) {
   const writeServer = (child, command) =>
     new Promise((resolve, reject) => {
       if (child !== processHandle || !child.stdin.writable)
-        return reject(error(409, "The server disconnected during backup."));
+        return reject(
+          error(
+            409,
+            "The server disconnected before the command could be sent.",
+          ),
+        );
       child.stdin.write(`${command}\n`, (cause) =>
         cause ? reject(cause) : resolve(),
       );
@@ -504,6 +756,8 @@ export async function createPanel(options = {}) {
     }
   }
   async function createBackup(name, trigger = "manual") {
+    if (configBusy)
+      throw error(409, "Wait for the server settings to finish saving.");
     if (backupBusy) throw error(409, "A backup is already in progress.");
     if (activeMutations)
       throw error(
@@ -675,9 +929,14 @@ export async function createPanel(options = {}) {
     const protectedMutation =
       !["GET", "HEAD", "OPTIONS"].includes(req.method) &&
       (/^\/api\/files(?:\/|$)/.test(req.path) ||
+        /^\/api\/players(?:\/|$)/.test(req.path) ||
         req.path === "/api/server/power" ||
         req.path === "/api/console/command");
     if (protectedMutation) {
+      if (configBusy)
+        return next(
+          error(409, "Wait for the server settings to finish saving."),
+        );
       if (backupBusy)
         return next(
           error(
@@ -706,14 +965,13 @@ export async function createPanel(options = {}) {
     const active = status === "running";
     const storage = await fs.statfs(serverDir);
     res.json({
-      name: options.name ?? process.env.MC_SERVER_NAME ?? "The Overworld",
-      address: process.env.MC_SERVER_ADDRESS ?? "localhost:25565",
+      id: options.id,
+      name: configuration.name,
+      address: configuration.address,
       status,
       mode,
-      version:
-        process.env.MC_VERSION ??
-        (mode === "demo" ? "1.21.4" : "Configured JAR"),
-      software: mode === "demo" ? "Paper" : (process.env.MC_SOFTWARE ?? "Java"),
+      version: configuration.version,
+      software: configuration.software,
       uptime: startedAt ? Math.floor((Date.now() - startedAt) / 1000) : 0,
       cpu:
         mode === "demo" && active
@@ -728,12 +986,100 @@ export async function createPanel(options = {}) {
       diskLimit: storage.blocks * storage.bsize,
       diskAvailable: storage.bavail * storage.bsize,
       players: [],
-      maxPlayers: Number(process.env.MC_MAX_PLAYERS ?? 20),
+      maxPlayers: configuration.maxPlayers,
       metricsAvailable: mode === "demo",
       playersAvailable: mode === "demo",
     });
   });
   app.get("/api/console", (_req, res) => res.json({ lines }));
+  app.get("/api/players", async (_req, res) => {
+    let operators = state.demoOperators;
+    if (mode === "live") {
+      const target = await safePath(serverDir, "ops.json");
+      try {
+        const stat = await fs.stat(target);
+        if (!stat.isFile() || stat.size > 1024 * 1024)
+          throw error(409, "ops.json must be a JSON file under 1 MB.");
+        try {
+          operators = JSON.parse(await fs.readFile(target, "utf8"));
+        } catch (cause) {
+          if (!(cause instanceof SyntaxError)) throw cause;
+          throw error(
+            409,
+            "ops.json contains invalid JSON. Check the file or refresh after the server finishes writing it.",
+          );
+        }
+        if (
+          !Array.isArray(operators) ||
+          operators.some(
+            (entry) =>
+              !entry ||
+              typeof entry !== "object" ||
+              typeof entry.name !== "string" ||
+              !/^[A-Za-z0-9_]{3,16}$/.test(entry.name) ||
+              typeof entry.uuid !== "string" ||
+              !/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i.test(
+                entry.uuid,
+              ) ||
+              !Number.isInteger(entry.level) ||
+              entry.level < 1 ||
+              entry.level > 4,
+          )
+        )
+          throw error(
+            409,
+            "ops.json contains an invalid operator record. Check the server file before relying on this list.",
+          );
+        operators = operators.map(({ name, uuid, level }) => ({
+          name,
+          uuid,
+          level,
+        }));
+      } catch (cause) {
+        if (cause.code !== "ENOENT") throw cause;
+        operators = [];
+      }
+    }
+    res.json({ operators, mode, status });
+  });
+  for (const action of ["op", "deop"]) {
+    app.post(`/api/players/${action}`, async (req, res) => {
+      const name = validatePlayerName(req.body?.name);
+      if (status !== "running")
+        throw error(
+          409,
+          "Start this server before changing in-game operators.",
+        );
+      const command = `${action} ${name}`;
+      if (mode === "live") {
+        if (!processHandle?.stdin.writable)
+          throw error(409, "The server is not ready to receive commands.");
+        await writeServer(processHandle, command);
+      } else {
+        state.demoOperators = state.demoOperators.filter(
+          (entry) => entry.name.toLowerCase() !== name.toLowerCase(),
+        );
+        if (action === "op") state.demoOperators.push({ name, level: 4 });
+      }
+      append(
+        `[${mode === "demo" ? "Demo" : "Panel"}] ${mode === "demo" ? "Simulated" : "Requested"}: ${command}`,
+      );
+      await audit(
+        "player",
+        action === "op"
+          ? "Operator access requested"
+          : "Operator removal requested",
+        `${mode === "demo" ? "Simulated" : "Sent to Java"}: ${command}.`,
+      );
+      res.json({
+        simulated: mode === "demo",
+        message:
+          mode === "demo"
+            ? `Demo: ${name} ${action === "op" ? "was added as an operator" : "had operator access removed"}. No in-game permissions were changed.`
+            : `Requested ${command}. Check the console for Minecraft's confirmation; ops.json may update after the command completes.`,
+      });
+    });
+  }
   app.post("/api/server/power", async (req, res) => {
     await power(req.body?.action);
     res.json({ status });
@@ -1068,14 +1414,12 @@ export async function createPanel(options = {}) {
           : cause instanceof multer.MulterError
             ? 400
             : 500);
-    res
-      .status(status)
-      .json({
-        error:
-          status >= 500
-            ? "The operation failed. Check the API terminal for details."
-            : cause.message,
-      });
+    res.status(status).json({
+      error:
+        status >= 500
+          ? "The operation failed. Check the API terminal for details."
+          : cause.message,
+    });
     if (status >= 500) console.error(cause);
   });
 
@@ -1084,6 +1428,9 @@ export async function createPanel(options = {}) {
     dataDir,
     serverDir,
     tick,
+    descriptor,
+    updateConfiguration,
+    audit,
     close: async () => {
       closed = true;
       clearInterval(scheduler);
@@ -1102,6 +1449,372 @@ export async function createPanel(options = {}) {
   };
 }
 
+// Registry changes are serialized, but each server has its own process, state and scheduler.
+export async function createFleet(options = {}) {
+  const env = options.useEnvironment === false ? {} : process.env;
+  const requestedDataDir = path.resolve(
+    options.dataDir ?? env.PANEL_DATA_DIR ?? path.join(projectDir, "data"),
+  );
+  await fs.mkdir(requestedDataDir, { recursive: true });
+  const dataDir = await fs.realpath(requestedDataDir);
+  const registryPath = await safePath(dataDir, "servers.json");
+  const runtimes = new Map();
+  let registry;
+  let changeChain = Promise.resolve();
+  let closed = false;
+  const serialize = (work) => {
+    const pending = changeChain.catch(() => {}).then(work);
+    changeChain = pending;
+    return pending;
+  };
+  const persist = async (next = registry) => {
+    const temp = `${registryPath}.${randomUUID()}.tmp`;
+    await fs.writeFile(temp, JSON.stringify(next, null, 2));
+    await fs.rename(temp, registryPath);
+    registry = next;
+  };
+  const configKeys = [
+    "name",
+    "mode",
+    "port",
+    "memoryLimitMB",
+    "jar",
+    "javaPath",
+    "motd",
+  ];
+  const onlyConfig = (entry) =>
+    Object.fromEntries(
+      configKeys
+        .filter((key) => entry[key] !== undefined)
+        .map((key) => [key, entry[key]]),
+    );
+  const descriptor = (entry) => runtimes.get(entry.id).descriptor();
+  const checkPort = (port, exceptId) => {
+    if (
+      registry.servers.some(
+        (entry) => entry.id !== exceptId && entry.port === port,
+      )
+    )
+      throw error(
+        409,
+        `Port ${port} is already assigned to another server. Choose a different port.`,
+      );
+  };
+  const makeRuntime = async (entry) => {
+    await fs.mkdir(entry.serverDir, { recursive: true });
+    await fs.mkdir(entry.dataDir, { recursive: true });
+    const actualServer = await fs.realpath(entry.serverDir);
+    const contains = (root, target) => {
+      const relative = path.relative(root, target);
+      return (
+        !relative ||
+        (!path.isAbsolute(relative) &&
+          relative !== ".." &&
+          !relative.startsWith(`..${path.sep}`))
+      );
+    };
+    for (const runtime of runtimes.values()) {
+      const existingServer = await fs.realpath(runtime.serverDir);
+      if (
+        contains(existingServer, actualServer) ||
+        contains(actualServer, existingServer)
+      )
+        throw error(
+          400,
+          "Each server must use a separate, non-overlapping server directory.",
+        );
+    }
+    const runtime = await createPanel({
+      ...entry,
+      memoryLimit: entry.memoryLimitMB,
+      useEnvironment: false,
+      scheduler: options.scheduler,
+      spawnServer: options.spawnServer,
+      backupFlushTimeoutMs: options.backupFlushTimeoutMs,
+    });
+    runtimes.set(entry.id, runtime);
+    return runtime;
+  };
+  if (await exists(registryPath)) {
+    registry = JSON.parse(await fs.readFile(registryPath, "utf8"));
+    if (
+      registry.version !== 1 ||
+      !Array.isArray(registry.servers) ||
+      !registry.servers.length ||
+      !registry.servers.some((entry) => entry.id === registry.defaultServerId)
+    )
+      throw new Error(
+        "The server registry is invalid; restore data/servers.json from a known good copy.",
+      );
+    const ids = new Set();
+    const ports = new Set();
+    for (const entry of registry.servers) {
+      if (
+        typeof entry.id !== "string" ||
+        !/^[a-f0-9-]{36}$/i.test(entry.id) ||
+        ids.has(entry.id)
+      )
+        throw new Error(
+          "The server registry contains invalid or duplicate IDs.",
+        );
+      ids.add(entry.id);
+      Object.assign(entry, validateServerConfiguration(onlyConfig(entry)));
+      if (ports.has(entry.port))
+        throw new Error(
+          "The server registry contains duplicate Minecraft ports.",
+        );
+      ports.add(entry.port);
+      if (entry.id === registry.defaultServerId) {
+        entry.dataDir = dataDir;
+        entry.serverDir = path.resolve(
+          entry.serverDir ?? path.join(dataDir, "server"),
+        );
+      } else {
+        entry.dataDir = await safePath(dataDir, `instances/${entry.id}`);
+        await fs.mkdir(entry.dataDir, { recursive: true });
+        entry.serverDir = await safePath(entry.dataDir, "server");
+      }
+    }
+  } else {
+    const serverDir = path.resolve(
+      options.serverDir ?? env.MC_SERVER_DIR ?? path.join(dataDir, "server"),
+    );
+    let properties = "";
+    if (await exists(serverDir)) {
+      const propertyPath = await safePath(serverDir, "server.properties");
+      try {
+        properties = await fs.readFile(propertyPath, "utf8");
+      } catch (cause) {
+        if (cause.code !== "ENOENT") throw cause;
+      }
+    }
+    const property = (key) =>
+      properties
+        .match(new RegExp(`^\\s*${key}\\s*[=:](.*)$`, "m"))?.[1]
+        ?.trim();
+    const mode =
+      options.mode ?? (options.jar || env.MC_SERVER_JAR ? "live" : "demo");
+    const config = validateServerConfiguration({
+      name: options.name ?? env.MC_SERVER_NAME ?? "The Overworld",
+      mode,
+      port: Number(
+        options.port ??
+          env.MC_PORT ??
+          property("server-port") ??
+          env.MC_SERVER_ADDRESS?.match(/:(\d+)$/)?.[1] ??
+          25565,
+      ),
+      memoryLimitMB: Number(options.memoryLimit ?? env.MC_MEMORY_MB ?? 4096),
+      jar: (options.jar ?? env.MC_SERVER_JAR) || "server.jar",
+      javaPath: options.javaPath ?? env.JAVA_PATH ?? "java",
+      motd: options.motd ?? property("motd") ?? "Welcome to the Overworld",
+    });
+    const id = randomUUID();
+    registry = {
+      version: 1,
+      defaultServerId: id,
+      servers: [
+        {
+          ...config,
+          id,
+          dataDir,
+          serverDir,
+          address:
+            options.address ??
+            env.MC_SERVER_ADDRESS ??
+            `localhost:${config.port}`,
+          maxPlayers: Number(
+            options.maxPlayers ??
+              env.MC_MAX_PLAYERS ??
+              property("max-players") ??
+              20,
+          ),
+          version:
+            options.version ??
+            env.MC_VERSION ??
+            (mode === "demo" ? "1.21.4" : "Configured JAR"),
+          software:
+            options.software ??
+            env.MC_SOFTWARE ??
+            (mode === "demo" ? "Paper" : "Java"),
+        },
+      ],
+    };
+    await persist();
+  }
+  try {
+    for (const entry of registry.servers) await makeRuntime(entry);
+  } catch (cause) {
+    await Promise.all([...runtimes.values()].map((runtime) => runtime.close()));
+    throw cause;
+  }
+
+  const app = express();
+  app.disable("x-powered-by");
+  app.use((req, res, next) => {
+    res.setHeader("X-Content-Type-Options", "nosniff");
+    res.setHeader("Referrer-Policy", "no-referrer");
+    res.setHeader("Cache-Control", "no-store");
+    let host;
+    try {
+      host = new URL(`http://${req.headers.host}`).hostname;
+    } catch {
+      host = "";
+    }
+    if (!localHosts.has(host))
+      return next(
+        error(403, "This local panel only accepts localhost connections."),
+      );
+    if (!["GET", "HEAD", "OPTIONS"].includes(req.method)) {
+      if (req.headers["sec-fetch-site"] === "cross-site")
+        return next(error(403, "Cross-site requests are not allowed."));
+      if (req.headers.origin) {
+        try {
+          const origin = new URL(req.headers.origin);
+          if (
+            !localHosts.has(origin.hostname) ||
+            !["http:", "https:"].includes(origin.protocol)
+          )
+            throw new Error();
+        } catch {
+          return next(error(403, "Cross-origin requests are not allowed."));
+        }
+      }
+    }
+    if (closed) return next(error(503, "The panel is shutting down."));
+    next();
+  });
+  app.use(express.json({ limit: "2mb" }));
+  app.get("/api/servers", (_req, res) =>
+    res.json({
+      servers: registry.servers.map(descriptor),
+      defaultServerId: registry.defaultServerId,
+    }),
+  );
+  app.post("/api/servers", async (req, res) => {
+    const server = await serialize(async () => {
+      const config = validateServerConfiguration(req.body);
+      checkPort(config.port);
+      const id = randomUUID();
+      const instanceDir = await safePath(dataDir, `instances/${id}`);
+      for (const runtime of runtimes.values()) {
+        const relative = path.relative(
+          await fs.realpath(runtime.serverDir),
+          instanceDir,
+        );
+        if (
+          !relative ||
+          (!path.isAbsolute(relative) &&
+            relative !== ".." &&
+            !relative.startsWith(`..${path.sep}`))
+        )
+          throw error(
+            400,
+            "The instances storage directory overlaps an existing server. Choose a panel data directory outside your server files.",
+          );
+      }
+      await fs.mkdir(instanceDir, { recursive: true });
+      const serverDir = await safePath(instanceDir, "server");
+      await fs.mkdir(serverDir);
+      // New live instances need an explicit user EULA decision and uploaded JAR.
+      if (config.mode === "live") {
+        await fs.writeFile(
+          path.join(serverDir, "eula.txt"),
+          "# Read https://aka.ms/MinecraftEULA before accepting.\neula=false\n",
+          { flag: "wx" },
+        );
+        await fs.writeFile(
+          path.join(serverDir, "server.properties"),
+          `motd=${escapeProperty(config.motd)}\nserver-port=${config.port}\nmax-players=20\nonline-mode=true\n`,
+          { flag: "wx" },
+        );
+      }
+      const entry = {
+        ...config,
+        id,
+        dataDir: instanceDir,
+        serverDir,
+        address: `localhost:${config.port}`,
+        version: config.mode === "demo" ? "1.21.4" : "Configured JAR",
+        software: config.mode === "demo" ? "Paper" : "Java",
+      };
+      const runtime = await makeRuntime(entry);
+      try {
+        await persist({ ...registry, servers: [...registry.servers, entry] });
+      } catch (cause) {
+        runtimes.delete(id);
+        await runtime.close();
+        throw cause;
+      }
+      await runtime.audit(
+        "server",
+        "Server created",
+        `${config.name} created in ${config.mode} mode on port ${config.port}.`,
+      );
+      return runtime.descriptor();
+    });
+    res.status(201).json({ server });
+  });
+  app.patch("/api/servers/:id", async (req, res) => {
+    const server = await serialize(async () => {
+      const entry = registry.servers.find((item) => item.id === req.params.id);
+      if (!entry) throw error(404, "Server not found.");
+      const config = validateServerConfiguration(req.body, onlyConfig(entry));
+      checkPort(config.port, entry.id);
+      const next = { ...entry, ...config };
+      if (config.port !== entry.port) next.address = `localhost:${config.port}`;
+      if (config.mode !== entry.mode) {
+        next.version = config.mode === "demo" ? "1.21.4" : "Configured JAR";
+        next.software = config.mode === "demo" ? "Paper" : "Java";
+      }
+      return runtimes.get(entry.id).updateConfiguration(next, () =>
+        persist({
+          ...registry,
+          servers: registry.servers.map((item) =>
+            item.id === entry.id ? next : item,
+          ),
+        }),
+      );
+    });
+    res.json({ server });
+  });
+  app.use((req, res, next) => {
+    const header = req.headers["x-server-id"];
+    const query = req.query.serverId;
+    if (header !== undefined && query !== undefined && header !== query)
+      return next(error(400, "Conflicting server selectors."));
+    const id = header ?? query ?? registry.defaultServerId;
+    if (typeof id !== "string" || !runtimes.has(id))
+      return next(error(404, "Server not found."));
+    runtimes.get(id).app(req, res, next);
+  });
+  app.use((cause, _req, res, _next) => {
+    if (res.headersSent) return;
+    const status = cause.status ?? (cause.code === "ENOENT" ? 404 : 500);
+    if (status >= 500) console.error(cause);
+    res.status(status).json({
+      error:
+        status >= 500
+          ? "The operation failed. Check the API terminal for details."
+          : cause.message,
+    });
+  });
+  return {
+    app,
+    dataDir,
+    runtimes,
+    tick: async (now) =>
+      Promise.all([...runtimes.values()].map((runtime) => runtime.tick(now))),
+    close: async () => {
+      closed = true;
+      await changeChain.catch(() => {});
+      await Promise.all(
+        [...runtimes.values()].map((runtime) => runtime.close()),
+      );
+    },
+  };
+}
+
 if (
   process.argv[1] &&
   import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href
@@ -1111,11 +1824,11 @@ if (
   } catch (cause) {
     if (cause.code !== "ENOENT") throw cause;
   }
-  const panel = await createPanel();
+  const panel = await createFleet();
   const port = Number(process.env.PORT ?? 3001);
   const listener = panel.app.listen(port, "127.0.0.1", () =>
     console.log(
-      `Minecraft panel API: http://127.0.0.1:${port} · ${process.env.MC_SERVER_JAR ? "live" : "demo"} mode`,
+      `Minecraft panel API: http://127.0.0.1:${port} · ${panel.runtimes.size} server(s)`,
     ),
   );
   let shuttingDown = false;

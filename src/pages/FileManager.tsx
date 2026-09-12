@@ -24,7 +24,12 @@ import {
   Upload,
   X,
 } from "lucide-react";
-import { api, post, formatBytes, relativeTime, type PageProps } from "../api";
+import {
+  useServerApi,
+  formatBytes,
+  relativeTime,
+  type PageProps,
+} from "../api";
 import "./storage.css";
 
 type Entry = {
@@ -59,6 +64,7 @@ function EntryIcon({ entry }: { entry: Entry }) {
 }
 
 export default function FileManager({ notify }: PageProps) {
+  const { api, post, downloadUrl } = useServerApi();
   const [path, setPath] = useState("");
   const [entries, setEntries] = useState<Entry[]>([]);
   const [query, setQuery] = useState("");
@@ -499,7 +505,9 @@ export default function FileManager({ notify }: PageProps) {
                               className="btn icon"
                               aria-label={`Download ${entry.name}`}
                               title="Download file"
-                              href={`/api/files/download?path=${encodeURIComponent(entry.path)}`}
+                              href={downloadUrl(
+                                `/files/download?path=${encodeURIComponent(entry.path)}`,
+                              )}
                               download
                             >
                               <Download size={15} />

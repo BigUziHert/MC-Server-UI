@@ -17,7 +17,12 @@ import {
   Trash2,
   X,
 } from "lucide-react";
-import { api, formatBytes, post, relativeTime, type PageProps } from "../api";
+import {
+  useServerApi,
+  formatBytes,
+  relativeTime,
+  type PageProps,
+} from "../api";
 import "./management.css";
 
 type DatabaseRecord = {
@@ -29,6 +34,7 @@ type DatabaseRecord = {
 };
 
 export default function Databases({ notify }: PageProps) {
+  const { api, post, downloadUrl } = useServerApi();
   const [databases, setDatabases] = useState<DatabaseRecord[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
@@ -270,7 +276,9 @@ export default function Databases({ notify }: PageProps) {
                       <div>
                         <a
                           className="btn icon"
-                          href={`/api/databases/${encodeURIComponent(database.id)}/download`}
+                          href={downloadUrl(
+                            `/databases/${encodeURIComponent(database.id)}/download`,
+                          )}
                           download
                           title="Download SQLite file"
                           aria-label={`Download ${database.name}`}
@@ -379,7 +387,9 @@ export default function Databases({ notify }: PageProps) {
           {deleting && (
             <a
               className="btn management-download-before-delete"
-              href={`/api/databases/${encodeURIComponent(deleting.id)}/download`}
+              href={downloadUrl(
+                `/databases/${encodeURIComponent(deleting.id)}/download`,
+              )}
               download
             >
               <Download size={15} /> Download database

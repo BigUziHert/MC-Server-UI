@@ -1,0 +1,227 @@
+.players-page {
+  min-width: 0;
+}
+.players-overview {
+  display: grid;
+  grid-template-columns: minmax(260px, 0.9fr) minmax(0, 1.5fr);
+  gap: 18px;
+}
+.players-summary,
+.players-about {
+  display: flex;
+  align-items: center;
+  gap: 18px;
+  padding: 24px;
+}
+.players-summary > div,
+.players-about > div {
+  min-width: 0;
+}
+.players-summary > div > span {
+  display: block;
+  color: #98a38f;
+  font-size: 12px;
+  margin-bottom: 8px;
+}
+.players-summary strong {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 12px;
+  font-family: "Manrope", sans-serif;
+  font-size: 30px;
+  line-height: 1.2;
+  font-weight: 650;
+}
+.players-summary small {
+  max-width: 95px;
+  color: #889580;
+  font-family: "DM Sans", sans-serif;
+  font-size: 11px;
+  font-weight: 400;
+  line-height: 1.5;
+}
+.players-about > svg {
+  color: #99b67b;
+}
+.players-about strong {
+  font-size: 13px;
+  font-weight: 550;
+  color: #d4dfc9;
+}
+.players-about p {
+  max-width: 470px;
+  font-size: 12px;
+  margin: 7px 0 0;
+  color: #8e9b84;
+}
+.players-operator-list {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+}
+.players-operator {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  padding: 20px 23px;
+}
+.players-operator + .players-operator {
+  border-top: 1px solid #2c3229;
+}
+.players-operator:hover {
+  background: #1e251b;
+}
+.players-game-avatar {
+  display: grid;
+  place-items: center;
+  width: 41px;
+  height: 41px;
+  flex-shrink: 0;
+  border: 1px solid #5c7041;
+  border-bottom: 5px solid #3b512b;
+  border-radius: 5px;
+  background: linear-gradient(135deg, #435a2c 49%, #354823 50%);
+  color: #d0e8ac;
+  font-family: "JetBrains Mono", monospace;
+  font-size: 13px;
+}
+.players-operator-identity {
+  min-width: 0;
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.players-operator-identity strong {
+  color: #dde7d4;
+  font-size: 13px;
+  font-weight: 550;
+  overflow-wrap: anywhere;
+}
+.players-operator-identity > span {
+  color: #8a9b7c;
+  font-size: 11px;
+  line-height: 1.5;
+}
+.players-op-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 5px 8px;
+  border: 1px solid #3f5030;
+  border-radius: 5px;
+  background: #2a3620;
+  color: #b8d991;
+  font-size: 10px;
+  font-weight: 600;
+  margin-right: 24px;
+}
+.players-remove {
+  flex-shrink: 0;
+}
+.players-remove:hover:enabled {
+  color: #efac95;
+  border-color: #714332;
+  background: #35271e;
+}
+.players-list-footer {
+  line-height: 1.8;
+}
+.players-list-footer a,
+.players-offline-notice a {
+  color: #bbd89d;
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+.players-offline-notice a {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  margin-top: 10px;
+  font-size: 12px;
+}
+.players-result {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  border: 1px solid #3e5031;
+  background: #212e19;
+  border-radius: 9px;
+  padding: 17px 20px;
+  color: #bfdd9e;
+}
+.players-result > svg {
+  margin-top: 2px;
+}
+.players-result > div {
+  min-width: 0;
+  flex: 1;
+}
+.players-result strong {
+  font-size: 12px;
+  font-weight: 550;
+}
+.players-result p {
+  margin: 4px 0 0;
+  font-size: 12px;
+  color: #a5b895;
+  overflow-wrap: anywhere;
+}
+.players-result > button {
+  flex-shrink: 0;
+}
+.players-permission-note {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  background: #252c1e;
+  border: 1px solid #414b34;
+  color: #b7c59e;
+  border-radius: 7px;
+  padding: 14px;
+}
+.players-permission-note > svg {
+  margin-top: 2px;
+}
+.players-permission-note p {
+  margin: 0;
+  color: #a6b494;
+  font-size: 12px;
+  line-height: 1.75;
+}
+@media (max-width: 1000px) {
+  .players-overview {
+    grid-template-columns: 1fr;
+    gap: 14px;
+  }
+  .players-summary,
+  .players-about {
+    padding: 20px;
+  }
+  .players-summary small {
+    max-width: none;
+  }
+  .players-op-badge {
+    margin-right: 0;
+  }
+}
+@media (max-width: 500px) {
+  .players-operator {
+    flex-wrap: wrap;
+    gap: 12px;
+    padding: 18px 17px;
+  }
+  .players-operator-identity {
+    flex-basis: calc(100% - 100px);
+  }
+  .players-remove {
+    margin-left: 53px;
+  }
+  .players-op-badge {
+    margin-left: auto;
+  }
+  .players-result {
+    padding: 15px;
+  }
+}

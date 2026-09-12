@@ -15,10 +15,10 @@ import {
   Users,
   X,
 } from "lucide-react";
-import { api, relativeTime, type PageProps } from "../api";
+import { useServerApi, relativeTime, type PageProps } from "../api";
 import "./management.css";
 
-type Category = "server" | "file" | "backup" | "user" | "database";
+type Category = "server" | "file" | "backup" | "user" | "database" | "player";
 type AuditEntry = {
   id: string;
   action: string;
@@ -32,6 +32,7 @@ const categories = [
   { value: "file" as Category, label: "Files", icon: FileText },
   { value: "backup" as Category, label: "Backups", icon: Archive },
   { value: "user" as Category, label: "Subusers", icon: Users },
+  { value: "player" as Category, label: "Players", icon: ShieldCheck },
   { value: "database" as Category, label: "Databases", icon: Database },
 ];
 function actionLabel(action: string) {
@@ -40,6 +41,7 @@ function actionLabel(action: string) {
 }
 
 export default function AuditLogs({ notify }: PageProps) {
+  const { api } = useServerApi();
   const [entries, setEntries] = useState<AuditEntry[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");

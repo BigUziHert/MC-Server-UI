@@ -22,6 +22,7 @@ import {
   ListFilter,
   Menu,
   MemoryStick,
+  Pencil,
   Play,
   RotateCw,
   Search,
@@ -32,15 +33,26 @@ import {
   Users,
   X,
 } from "lucide-react";
-import { api, formatBytes, post } from "./api";
+import { api as fleetApi, formatBytes, ServerScope, useServerApi } from "./api";
 import FileManager from "./pages/FileManager";
 import Backups from "./pages/Backups";
 import Subusers from "./pages/Subusers";
 import Databases from "./pages/Databases";
 import AuditLogs from "./pages/AuditLogs";
+import Players from "./pages/Players";
+import ServerManager, {
+  ServerSwitcher,
+  type ServerRecord,
+} from "./ServerManager";
 
 type Page =
-  "console" | "files" | "subusers" | "databases" | "backups" | "audit";
+  | "console"
+  | "files"
+  | "players"
+  | "subusers"
+  | "databases"
+  | "backups"
+  | "audit";
 type Server = {
   name: string;
   address: string;
@@ -69,6 +81,7 @@ type LogLine = {
 const navigation = [
   { id: "console", label: "Console", icon: Terminal, group: "SERVER" },
   { id: "files", label: "File Manager", icon: FolderOpen },
+  { id: "players", label: "Players", icon: ShieldCheck },
   { id: "subusers", label: "Subusers", icon: Users, group: "MANAGEMENT" },
   { id: "databases", label: "Databases", icon: Database },
   { id: "backups", label: "Backups", icon: Cloud },
@@ -178,6 +191,144 @@ function Sparkline({
 }
 
 export default function App() {
+  const [servers, setServers] = useState<ServerRecord[]>([]);
+  const [activeId, setActiveId] = useState(() => {
+    try {
+      return localStorage.getItem("mc-panel.active-server") || "";
+    } catch {
+      return "";
+    }
+  });
+  const [error, setError] = useState("");
+  const [manager, setManager] = useState<{
+    editing: ServerRecord | null;
+  } | null>(null);
+  const [notice, setNotice] = useState("");
+  const fleetRequest = useRef(0);
+  const loadServers = useCallback(async () => {
+    const request = ++fleetRequest.current;
+    try {
+      const result = await fleetApi<{
+        servers: ServerRecord[];
+        defaultServerId: string;
+      }>("/servers");
+      if (request !== fleetRequest.current) return;
+      setServers(result.servers);
+      setActiveId((current) =>
+        result.servers.some((server) => server.id === current)
+          ? current
+          : result.defaultServerId,
+      );
+      setError("");
+    } catch (cause) {
+      if (request === fleetRequest.current) setError((cause as Error).message);
+    }
+  }, []);
+  useEffect(() => {
+    void loadServers();
+    const timer = setInterval(loadServers, 5000);
+    return () => clearInterval(timer);
+  }, [loadServers]);
+  useEffect(() => {
+    if (activeId) {
+      try {
+        localStorage.setItem("mc-panel.active-server", activeId);
+      } catch {
+        /* Selection still works without browser storage. */
+      }
+    }
+  }, [activeId]);
+  useEffect(() => {
+    if (!notice) return;
+    const timer = setTimeout(() => setNotice(""), 5000);
+    return () => clearTimeout(timer);
+  }, [notice]);
+  const active = servers.find((server) => server.id === activeId);
+  const saved = (server: ServerRecord) => {
+    fleetRequest.current++;
+    setServers((current) =>
+      current.some((item) => item.id === server.id)
+        ? current.map((item) => (item.id === server.id ? server : item))
+        : [...current, server],
+    );
+    setActiveId(server.id);
+    setNotice(
+      manager?.editing
+        ? "Server settings saved."
+        : "Server created. Your new workspace is ready.",
+    );
+    setManager(null);
+    void loadServers();
+  };
+  if (!active)
+    return (
+      <div className="server-workspace-loading">
+        <Box size={33} />
+        <h1>
+          {error ? "Unable to load your servers" : "Opening your worlds…"}
+        </h1>
+        <p>{error || "Connecting to your local server panel."}</p>
+        {error && (
+          <button className="btn primary" onClick={loadServers}>
+            Retry connection
+          </button>
+        )}
+      </div>
+    );
+  return (
+    <>
+      <ServerScope.Provider value={active.id}>
+        <ServerWorkspace
+          key={active.id}
+          servers={servers}
+          selected={active}
+          onSelect={setActiveId}
+          onAdd={() => setManager({ editing: null })}
+          onSettings={(status) =>
+            setManager({
+              editing: { ...active, status: status ?? active.status },
+            })
+          }
+        />
+      </ServerScope.Provider>
+      {manager && (
+        <ServerManager
+          editing={manager.editing}
+          servers={servers}
+          onClose={() => setManager(null)}
+          onSaved={saved}
+        />
+      )}
+      {notice && (
+        <div className="toast" role="status">
+          <CheckCheck size={18} />
+          <span>{notice}</span>
+          <button
+            aria-label="Dismiss server notification"
+            onClick={() => setNotice("")}
+          >
+            <X size={16} />
+          </button>
+        </div>
+      )}
+    </>
+  );
+}
+
+function ServerWorkspace({
+  servers,
+  selected,
+  onSelect,
+  onAdd,
+  onSettings,
+}: {
+  servers: ServerRecord[];
+  selected: ServerRecord;
+  onSelect: (id: string) => void;
+  onAdd: () => void;
+  onSettings: (status?: ServerRecord["status"]) => void;
+}) {
+  const { api } = useServerApi();
   const [page, setPage] = useState<Page>(getPage);
   const [server, setServer] = useState<Server | null>(null);
   const [connectionError, setConnectionError] = useState("");
@@ -208,12 +359,17 @@ export default function App() {
     } catch (error) {
       setConnectionError((error as Error).message);
     }
-  }, []);
+  }, [api]);
   useEffect(() => {
     void refresh();
     const timer = window.setInterval(refresh, 3000);
     return () => clearInterval(timer);
   }, [refresh]);
+  useEffect(() => {
+    setServer((current) =>
+      current ? { ...current, name: selected.name } : current,
+    );
+  }, [selected.name]);
   useEffect(() => {
     const changed = () => {
       setPage(getPage());
@@ -254,21 +410,13 @@ export default function App() {
             <small>YOUR WORLD. YOUR RULES.</small>
           </span>
         </a>
-        <div className="server-selector">
-          <span className="server-mini">
-            <Box size={19} />
-          </span>
-          <div>
-            <strong>{server?.name || "Minecraft Server"}</strong>
-            <span>
-              <i
-                className={`status-dot ${server?.status === "running" ? "" : "offline"}`}
-              />
-              {server?.status || "Connecting"}
-            </span>
-          </div>
-          <span className="server-number">01</span>
-        </div>
+        <ServerSwitcher
+          servers={servers}
+          selected={{ ...selected, status: server?.status ?? selected.status }}
+          onSelect={onSelect}
+          onAdd={onAdd}
+          onSettings={() => onSettings(server?.status)}
+        />
         <nav aria-label="Main navigation">
           {navigation.map((item) => (
             <div key={item.id}>
@@ -322,7 +470,9 @@ export default function App() {
               <Menu size={20} />
             </button>
             <Layers3 size={16} />
-            <span>My server</span>
+            <span className="fleet-breadcrumb-name" title={selected.name}>
+              {selected.name}
+            </span>
             <ChevronRight size={14} />
             <strong>{navigation.find((n) => n.id === page)?.label}</strong>
           </div>
@@ -358,9 +508,11 @@ export default function App() {
               notify={notify}
               refresh={refresh}
               navigate={navigate}
+              onSettings={() => onSettings(server?.status)}
             />
           )}
           {page === "files" && <FileManager notify={notify} />}
+          {page === "players" && <Players notify={notify} />}
           {page === "backups" && <Backups notify={notify} />}
           {page === "subusers" && <Subusers notify={notify} />}
           {page === "databases" && <Databases notify={notify} />}
@@ -445,11 +597,12 @@ export default function App() {
             <div className="help-step">
               <span>03</span>
               <div>
-                <strong>Connect a Minecraft server</strong>
+                <strong>Add a Minecraft server</strong>
                 <p>
-                  Follow the repository README to configure your Java executable
-                  and server JAR in <code>.env</code>, then restart the backend.
-                  Subusers are local records; authentication is not configured.
+                  Choose Add server in the sidebar, select Minecraft Java, and
+                  configure its port and Java executable. Upload the JAR in File
+                  Manager, then follow the setup guide before starting. Use
+                  Settings to rename a server and Players to manage in-game OP.
                 </p>
               </div>
             </div>
@@ -474,13 +627,16 @@ function ConsolePage({
   notify,
   refresh,
   navigate,
+  onSettings,
 }: {
   server: Server | null;
   history: { cpu: number[]; memory: number[] };
   notify: (message: string, error?: boolean) => void;
   refresh: () => Promise<void>;
   navigate: (page: Page) => void;
+  onSettings: () => void;
 }) {
+  const { api, post } = useServerApi();
   const [lines, setLines] = useState<LogLine[]>([]);
   const [command, setCommand] = useState("");
   const [search, setSearch] = useState("");
@@ -505,7 +661,7 @@ function ConsolePage({
     } catch {
       setLogError(true);
     }
-  }, []);
+  }, [api]);
   useEffect(() => {
     void loadLogs();
     const timer = setInterval(loadLogs, 1500);
@@ -639,6 +795,14 @@ function ConsolePage({
           <div>
             <div className="server-title">
               <h2>{server?.name || "Minecraft Server"}</h2>
+              <button
+                className="rename-server-button"
+                aria-label="Rename server"
+                title="Rename server"
+                onClick={onSettings}
+              >
+                <Pencil size={14} />
+              </button>
               <span
                 className={`status-badge ${isRunning ? "running" : "offline"}`}
               >

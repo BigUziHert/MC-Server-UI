@@ -19,7 +19,12 @@ import {
   Trash2,
   X,
 } from "lucide-react";
-import { api, post, formatBytes, relativeTime, type PageProps } from "../api";
+import {
+  useServerApi,
+  formatBytes,
+  relativeTime,
+  type PageProps,
+} from "../api";
 import "./storage.css";
 
 type Backup = {
@@ -66,6 +71,7 @@ const fullDate = (date: string) =>
   });
 
 export default function Backups({ notify }: PageProps) {
+  const { api, post, downloadUrl } = useServerApi();
   const [backups, setBackups] = useState<Backup[]>([]);
   const [schedule, setSchedule] = useState<Schedule>(defaults);
   const [savedSchedule, setSavedSchedule] = useState<Schedule>(defaults);
@@ -344,7 +350,9 @@ export default function Backups({ notify }: PageProps) {
                         <div className="backup-item-actions">
                           <a
                             className="btn icon"
-                            href={`/api/backups/${encodeURIComponent(backup.id)}/download`}
+                            href={downloadUrl(
+                              `/backups/${encodeURIComponent(backup.id)}/download`,
+                            )}
                             download
                             aria-label={`Download backup ${backup.name}`}
                             title="Download backup"

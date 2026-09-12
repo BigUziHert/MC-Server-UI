@@ -1,0 +1,588 @@
+import test from "node:test";
+import assert from "node:assert/strict";
+import fs from "node:fs/promises";
+import path from "node:path";
+import os from "node:os";
+import { EventEmitter } from "node:events";
+import { PassThrough, Writable } from "node:stream";
+import { createFleet, createPanel } from "./index.mjs";
+
+const json = (method, body) => ({ method, body: JSON.stringify(body) });
+async function fixture(t, settings = {}) {
+  const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), "mc-fleet-test-"));
+  const fleets = [];
+  const listeners = [];
+  const boot = async (extra = {}) => {
+    const fleet = await createFleet({
+      dataDir,
+      scheduler: false,
+      useEnvironment: false,
+      ...settings,
+      ...extra,
+    });
+    fleets.push(fleet);
+    const listener = await new Promise((resolve) => {
+      const server = fleet.app.listen(0, "127.0.0.1", () => resolve(server));
+    });
+    listeners.push(listener);
+    const base = `http://127.0.0.1:${listener.address().port}`;
+    const request = async (route, options = {}, id) => {
+      const response = await fetch(base + route, {
+        ...options,
+        headers: {
+          "Content-Type": "application/json",
+          ...(id ? { "X-Server-Id": id } : {}),
+          ...options.headers,
+        },
+      });
+      return { status: response.status, body: await response.json() };
+    };
+    return { ...fleet, request, base };
+  };
+  t.after(async () => {
+    for (const fleet of fleets) await fleet.close();
+    for (const listener of listeners) {
+      listener.closeAllConnections();
+      await new Promise((resolve) => listener.close(resolve));
+    }
+    assert.equal(path.dirname(dataDir), path.resolve(os.tmpdir()));
+    assert.ok(path.basename(dataDir).startsWith("mc-fleet-test-"));
+    await fs.rm(dataDir, { recursive: true, force: true });
+  });
+  return { dataDir, boot };
+}
+
+test("fleet scopes files, console, backups, schedules, users, databases and player permissions", async (t) => {
+  const { boot } = await fixture(t);
+  const { request, base, tick } = await boot();
+  const first = (await request("/api/servers")).body.defaultServerId;
+  const created = await request(
+    "/api/servers",
+    json("POST", {
+      name: "Creative",
+      mode: "demo",
+      port: 25566,
+      memoryLimitMB: 2048,
+    }),
+  );
+  assert.equal(created.status, 201);
+  const second = created.body.server.id;
+  assert.notEqual(second, first);
+  assert.equal(
+    (await request("/api/server", {}, second)).body.name,
+    "Creative",
+  );
+  assert.equal((await request("/api/server")).body.name, "The Overworld");
+  await request(
+    "/api/files",
+    json("POST", {
+      name: "private.txt",
+      type: "file",
+      content: "first server only",
+    }),
+    first,
+  );
+  assert.equal(
+    (await request("/api/files/content?path=private.txt", {}, second)).status,
+    404,
+  );
+  assert.equal(
+    await (
+      await fetch(
+        `${base}/api/files/download?path=private.txt&serverId=${first}`,
+      )
+    ).text(),
+    "first server only",
+  );
+  assert.equal(
+    (
+      await fetch(
+        `${base}/api/files/download?path=private.txt&serverId=${second}`,
+      )
+    ).status,
+    404,
+  );
+  await request(
+    "/api/console/command",
+    json("POST", { command: "say isolated first server" }),
+    first,
+  );
+  assert.ok(
+    !(await request("/api/console", {}, second)).body.lines.some((line) =>
+      line.message.includes("isolated first server"),
+    ),
+  );
+  const backup = await request(
+    "/api/backups",
+    json("POST", { name: "World snapshot" }),
+    first,
+  );
+  assert.equal(
+    (await request(`/api/backups/${backup.body.id}/download`, {}, second))
+      .status,
+    404,
+  );
+  assert.equal(
+    (await request("/api/backups", {}, second)).body.backups.length,
+    0,
+  );
+  const schedule = await request(
+    "/api/backups/schedule",
+    json("PUT", {
+      enabled: true,
+      type: "interval",
+      intervalHours: 1,
+      retention: 2,
+    }),
+    first,
+  );
+  assert.equal(
+    (await request("/api/backups", {}, second)).body.schedule.enabled,
+    false,
+  );
+  await tick(new Date(new Date(schedule.body.schedule.nextRun).getTime() + 10));
+  assert.equal(
+    (await request("/api/backups", {}, first)).body.backups.length,
+    2,
+  );
+  assert.equal(
+    (await request("/api/backups", {}, second)).body.backups.length,
+    0,
+  );
+  const user = await request(
+    "/api/subusers",
+    json("POST", { email: "admin@example.com", role: "admin" }),
+    first,
+  );
+  assert.equal(
+    (
+      await request(
+        `/api/subusers/${user.body.id}`,
+        { method: "DELETE" },
+        second,
+      )
+    ).status,
+    404,
+  );
+  assert.deepEqual((await request("/api/subusers", {}, second)).body.users, []);
+  const db = await request(
+    "/api/databases",
+    json("POST", { name: "first_world" }),
+    first,
+  );
+  assert.equal(
+    (await request(`/api/databases/${db.body.id}/download`, {}, second)).status,
+    404,
+  );
+  assert.deepEqual(
+    (await request("/api/databases", {}, second)).body.databases,
+    [],
+  );
+  assert.equal(
+    (
+      await request(
+        "/api/players/op",
+        json("POST", { name: "BuilderOne" }),
+        first,
+      )
+    ).body.simulated,
+    true,
+  );
+  assert.equal(
+    (await request("/api/players", {}, first)).body.operators[0].name,
+    "BuilderOne",
+  );
+  assert.deepEqual(
+    (await request("/api/players", {}, second)).body.operators,
+    [],
+  );
+  assert.equal(
+    (await request("/api/files/content?path=ops.json", {}, first)).body.content,
+    "[]\n",
+  );
+  assert.ok(
+    !(await request("/api/audit", {}, second)).body.entries.some(
+      (entry) => entry.category === "player" || entry.category === "backup",
+    ),
+  );
+});
+
+test("unknown and conflicting selectors fail closed, including direct downloads", async (t) => {
+  const { boot } = await fixture(t);
+  const { request } = await boot();
+  const id = (await request("/api/servers")).body.defaultServerId;
+  assert.equal((await request("/api/server", {}, "unknown")).status, 404);
+  assert.equal(
+    (
+      await request(
+        "/api/files/download?path=server.properties&serverId=unknown",
+      )
+    ).status,
+    404,
+  );
+  assert.equal(
+    (await request(`/api/server?serverId=${id}`, {}, "unknown")).status,
+    400,
+  );
+  assert.equal((await request("/api/server?serverId=")).status, 404);
+  assert.equal(
+    (await request("/api/server?serverId=a&serverId=b")).status,
+    404,
+  );
+  assert.equal(
+    (
+      await request("/api/servers", {
+        ...json("POST", { name: "Cross site" }),
+        headers: { Origin: "https://attacker.example" },
+      })
+    ).status,
+    403,
+  );
+});
+
+test("legacy data stays in place, rename and simulated operators persist across restarts", async (t) => {
+  const { dataDir, boot } = await fixture(t);
+  const legacy = await createPanel({
+    dataDir,
+    useEnvironment: false,
+    scheduler: false,
+  });
+  await legacy.audit("server", "Legacy data", "Must remain here");
+  await legacy.close();
+  await fs.writeFile(
+    path.join(dataDir, "server", "precious.txt"),
+    "world data",
+  );
+  const panel = await boot({ name: "Original env name" });
+  const id = (await panel.request("/api/servers")).body.defaultServerId;
+  assert.equal(
+    (
+      await panel.request(
+        `/api/servers/${id}`,
+        json("PATCH", { name: "Renamed world" }),
+      )
+    ).status,
+    200,
+  );
+  await panel.request(
+    "/api/players/op",
+    json("POST", { name: "BuilderOne" }),
+    id,
+  );
+  const second = (
+    await panel.request(
+      "/api/servers",
+      json("POST", { name: "Second", mode: "demo", port: 25566 }),
+    )
+  ).body.server;
+  await panel.close();
+  const restarted = await boot({ name: "Changed env ignored", port: 29999 });
+  const registry = (await restarted.request("/api/servers")).body;
+  assert.equal(registry.defaultServerId, id);
+  assert.equal(registry.servers.length, 2);
+  assert.equal(registry.servers[0].name, "Renamed world");
+  assert.equal(registry.servers[0].port, 25565);
+  assert.equal(registry.servers[1].id, second.id);
+  assert.equal(
+    (await restarted.request("/api/players", {}, id)).body.operators[0].name,
+    "BuilderOne",
+  );
+  assert.equal(
+    (await restarted.request("/api/players", {}, second.id)).body.operators
+      .length,
+    0,
+  );
+  assert.equal(
+    await fs.readFile(path.join(dataDir, "server", "precious.txt"), "utf8"),
+    "world data",
+  );
+  assert.ok(
+    (await restarted.request("/api/audit", {}, id)).body.entries.some(
+      (entry) => entry.action === "Legacy data",
+    ),
+  );
+});
+
+test("concurrent creation reserves unique ports; config edits need a stopped server", async (t) => {
+  const { boot, dataDir } = await fixture(t);
+  const { request } = await boot();
+  const results = await Promise.all(
+    ["One", "Two"].map((name) =>
+      request(
+        "/api/servers",
+        json("POST", { name, mode: "live", port: 25566 }),
+      ),
+    ),
+  );
+  assert.deepEqual(results.map((result) => result.status).sort(), [201, 409]);
+  const live = results.find((result) => result.status === 201).body.server;
+  assert.equal(
+    (await request(`/api/servers/${live.id}`, json("PATCH", { port: 25565 })))
+      .status,
+    409,
+  );
+  assert.equal(
+    (
+      await request(
+        `/api/servers/${live.id}`,
+        json("PATCH", {
+          port: 25567,
+          memoryLimitMB: 2048,
+          motd: "Creative builds",
+        }),
+      )
+    ).status,
+    200,
+  );
+  const contents = (
+    await request("/api/files/content?path=server.properties", {}, live.id)
+  ).body.content;
+  assert.match(contents, /server-port=25567/);
+  assert.match(contents, /motd=Creative builds/);
+  assert.match(
+    (await request("/api/files/content?path=eula.txt", {}, live.id)).body
+      .content,
+    /eula=false/,
+  );
+  const id = (await request("/api/servers")).body.defaultServerId;
+  assert.equal(
+    (
+      await request(
+        `/api/servers/${id}`,
+        json("PATCH", { name: "Allowed while running" }),
+      )
+    ).status,
+    200,
+  );
+  assert.equal(
+    (
+      await request(
+        `/api/servers/${id}`,
+        json("PATCH", { memoryLimitMB: 2048 }),
+      )
+    ).status,
+    409,
+  );
+  for (const invalid of [
+    { name: "\nInjected" },
+    { port: 22 },
+    { port: "25570" },
+    { mode: "other" },
+    { jar: "../escape.jar" },
+    { javaPath: "java\nstop" },
+    { memoryLimitMB: 255 },
+    { motd: "hello\nserver-port=22" },
+    { serverDir: "../" },
+  ])
+    assert.equal(
+      (await request(`/api/servers/${live.id}`, json("PATCH", invalid))).status,
+      400,
+    );
+  const registry = JSON.parse(
+    await fs.readFile(path.join(dataDir, "servers.json"), "utf8"),
+  );
+  assert.equal(
+    registry.servers.find((entry) => entry.id === live.id).port,
+    25567,
+  );
+});
+
+test("live player actions send validated single commands; ops.json remains authoritative", async (t) => {
+  const commands = [];
+  let launches = 0;
+  const child = new EventEmitter();
+  child.stdout = new PassThrough();
+  child.stderr = new PassThrough();
+  child.kill = () => child.emit("close", 1);
+  child.stdin = new Writable({
+    write(chunk, _encoding, callback) {
+      commands.push(chunk.toString());
+      if (chunk.toString() === "stop\n")
+        setImmediate(() => child.emit("close", 0));
+      callback();
+    },
+  });
+  const { boot } = await fixture(t, {
+    spawnServer: (executable, args, options) => {
+      launches++;
+      assert.equal(executable, "java");
+      assert.equal(options.shell, false);
+      assert.ok(args.includes("-Xmx4096M"));
+      setImmediate(() =>
+        child.stdout.write(
+          '[Server thread/INFO]: Done (1.24s)! For help, type "help"\n',
+        ),
+      );
+      return child;
+    },
+  });
+  const { request } = await boot();
+  const live = (
+    await request(
+      "/api/servers",
+      json("POST", { name: "Live", mode: "live", port: 25566 }),
+    )
+  ).body.server;
+  assert.equal(
+    (
+      await request(
+        "/api/players/op",
+        json("POST", { name: "BuilderOne" }),
+        live.id,
+      )
+    ).status,
+    409,
+  );
+  await request(
+    "/api/files",
+    json("POST", {
+      name: "server.jar",
+      type: "file",
+      content: "never executed",
+    }),
+    live.id,
+  );
+  await request(
+    "/api/files/content",
+    json("PUT", { path: "eula.txt", content: "eula=true\n" }),
+    live.id,
+  );
+  const starts = await Promise.all(
+    [1, 2].map(() =>
+      request("/api/server/power", json("POST", { action: "start" }), live.id),
+    ),
+  );
+  assert.deepEqual(starts.map((result) => result.status).sort(), [200, 409]);
+  assert.equal(launches, 1);
+  assert.equal(
+    (
+      await request(
+        `/api/servers/${live.id}`,
+        json("PATCH", { name: "Renamed live" }),
+      )
+    ).status,
+    200,
+  );
+  assert.equal(launches, 1);
+  for (const name of [
+    "x",
+    "a".repeat(17),
+    "Player\nstop",
+    "Player;stop",
+    "Player Other",
+    "/op Player",
+  ])
+    assert.equal(
+      (await request("/api/players/op", json("POST", { name }), live.id))
+        .status,
+      400,
+    );
+  const opped = await request(
+    "/api/players/op",
+    json("POST", { name: "BuilderOne" }),
+    live.id,
+  );
+  assert.equal(opped.body.simulated, false);
+  assert.match(opped.body.message, /Requested op BuilderOne/);
+  assert.deepEqual(
+    (await request("/api/players", {}, live.id)).body.operators,
+    [],
+  );
+  assert.equal(
+    (
+      await request(
+        "/api/players/deop",
+        json("POST", { name: "BuilderTwo" }),
+        live.id,
+      )
+    ).status,
+    200,
+  );
+  assert.deepEqual(commands, ["op BuilderOne\n", "deop BuilderTwo\n"]);
+  const operators = [
+    {
+      name: "BuilderOne",
+      uuid: "12345678-1234-1234-1234-123456789abc",
+      level: 4,
+    },
+  ];
+  await request(
+    "/api/files",
+    json("POST", {
+      name: "ops.json",
+      type: "file",
+      content: JSON.stringify(operators),
+    }),
+    live.id,
+  );
+  assert.deepEqual(
+    (await request("/api/players", {}, live.id)).body.operators,
+    operators,
+  );
+  await request(
+    "/api/files/content",
+    json("PUT", { path: "ops.json", content: "[broken" }),
+    live.id,
+  );
+  assert.equal((await request("/api/players", {}, live.id)).status, 409);
+});
+
+test("fleet rejects junctions connecting another instance's private directories", async (t) => {
+  const { boot, dataDir } = await fixture(t);
+  const panel = await boot();
+  const second = (
+    await panel.request(
+      "/api/servers",
+      json("POST", { name: "Second", port: 25566 }),
+    )
+  ).body.server;
+  await panel.close();
+  const secondDir = path.join(dataDir, "instances", second.id);
+  const backupDir = path.join(secondDir, "backups");
+  assert.equal(path.dirname(backupDir), secondDir);
+  await fs.rmdir(backupDir);
+  await fs.symlink(
+    path.join(dataDir, "backups"),
+    backupDir,
+    process.platform === "win32" ? "junction" : "dir",
+  );
+  await assert.rejects(
+    createFleet({ dataDir, scheduler: false, useEnvironment: false }),
+    /Symbolic links/,
+  );
+});
+
+test("a failed registry write rolls server.properties back and leaves active settings unchanged", async (t) => {
+  const { boot } = await fixture(t);
+  const { request, runtimes } = await boot();
+  const live = (
+    await request(
+      "/api/servers",
+      json("POST", { name: "Offline", mode: "live", port: 25566 }),
+    )
+  ).body.server;
+  const runtime = runtimes.get(live.id);
+  const target = path.join(runtime.serverDir, "server.properties");
+  const original = await fs.readFile(target, "utf8");
+  await assert.rejects(
+    runtime.updateConfiguration(
+      { ...runtime.descriptor(), port: 25567, motd: "Must roll back" },
+      async () => {
+        throw new Error("Fixture disk failure");
+      },
+    ),
+    /Fixture disk failure/,
+  );
+  assert.equal(await fs.readFile(target, "utf8"), original);
+  assert.equal(runtime.descriptor().port, 25566);
+  assert.equal(runtime.descriptor().motd, live.motd);
+  assert.equal(
+    (
+      await request(
+        `/api/servers/${live.id}`,
+        json("PATCH", { name: "Still editable" }),
+      )
+    ).status,
+    200,
+  );
+});
