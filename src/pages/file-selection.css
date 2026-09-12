@@ -1,0 +1,132 @@
+.file-selection-name {
+  display: flex;
+  align-items: center;
+  gap: 13px;
+  min-width: 0;
+}
+.file-selection-name .file-name {
+  flex: 1;
+  min-width: 0;
+}
+.file-selection-checkbox {
+  flex: 0 0 auto;
+  width: 16px;
+  height: 16px;
+  margin: 0;
+  accent-color: var(--accent, #ffd000);
+  cursor: pointer;
+}
+.file-selection-checkbox:focus-visible {
+  outline: 2px solid var(--accent, #ffd000);
+  outline-offset: 4px;
+}
+.file-selection-checkbox:disabled {
+  cursor: default;
+  opacity: 0.5;
+}
+.file-table tbody tr.file-row-selected {
+  background: color-mix(
+    in srgb,
+    var(--accent, #ffd000) 6%,
+    var(--panel, #20212b)
+  );
+}
+.file-selection-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 12px 23px;
+  border-top: 1px solid var(--border, #373948);
+  border-bottom: 1px solid var(--border, #373948);
+  background: color-mix(
+    in srgb,
+    var(--accent, #ffd000) 4%,
+    var(--panel, #20212b)
+  );
+}
+.file-selection-summary {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px 12px;
+  font-size: 12px;
+  color: var(--text, #dfe2f1);
+}
+.file-selection-summary span {
+  color: var(--muted, #969bb3);
+}
+.file-selection-actions {
+  display: flex;
+  flex-shrink: 0;
+  gap: 8px;
+}
+.file-selection-actions .btn.small {
+  min-height: 32px;
+  padding: 6px 10px;
+  font-size: 11px;
+}
+.file-bulk-confirmation > p {
+  font-size: 13px;
+  line-height: 1.6;
+  color: var(--text, #dfe2f1);
+}
+.file-bulk-confirmation .file-bulk-folder-warning {
+  color: var(--muted, #969bb3);
+}
+.file-bulk-targets {
+  list-style: none;
+  max-height: 240px;
+  overflow-y: auto;
+  padding: 0;
+  margin: 18px 0;
+  border: 1px solid var(--border, #373948);
+  border-radius: 8px;
+  background: var(--panel, #20212b);
+}
+.file-bulk-targets li {
+  display: flex;
+  align-items: flex-start;
+  gap: 11px;
+  padding: 12px 14px;
+}
+.file-bulk-targets li + li {
+  border-top: 1px solid var(--border, #373948);
+}
+.file-bulk-targets li > svg {
+  flex-shrink: 0;
+  margin-top: 2px;
+  color: var(--accent, #ffd000);
+}
+.file-bulk-targets li > div {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+.file-bulk-targets span,
+.file-bulk-targets small {
+  color: var(--muted, #969bb3);
+  font-size: 11px;
+}
+.file-bulk-errors {
+  padding-left: 20px;
+  color: #f3a3ab;
+  font-size: 12px;
+  line-height: 1.6;
+  overflow-wrap: anywhere;
+}
+@media (max-width: 600px) {
+  .file-selection-name {
+    gap: 8px;
+  }
+  .file-selection-bar {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 10px;
+    padding: 12px;
+  }
+  .file-selection-actions {
+    flex-wrap: wrap;
+  }
+}

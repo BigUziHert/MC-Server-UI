@@ -1,54 +1,82 @@
 import {
   useCallback,
   useEffect,
+  useId,
   useRef,
   useState,
   type FormEvent,
 } from "react";
 import {
   AlertCircle,
-  Check,
-  ChevronDown,
-  Eye,
   Info,
+  Pencil,
   Plus,
   RefreshCw,
   Search,
-  Shield,
   Trash2,
-  UserRound,
   Users,
-  Wrench,
   X,
 } from "lucide-react";
 import { useServerApi, relativeTime, type PageProps } from "../api";
-import "./management.css";
+import catalog from "../../shared/subuser-permissions.json";
+import "./subusers.css";
 
-type Role = "admin" | "operator" | "viewer";
-type Subuser = { id: string; email: string; role: Role; createdAt: string };
-const roles = [
-  {
-    value: "admin" as Role,
-    label: "Administrator",
-    icon: Shield,
-    detail: "Full server management",
-    description: "Intended for trusted people who manage your server.",
-  },
-  {
-    value: "operator" as Role,
-    label: "Operator",
-    icon: Wrench,
-    detail: "Day-to-day operations",
-    description: "Intended for people helping with server operations.",
-  },
-  {
-    value: "viewer" as Role,
-    label: "Viewer",
-    icon: Eye,
-    detail: "Observe server activity",
-    description: "Intended for people who only need to view activity.",
-  },
-];
+type Subuser = {
+  id: string;
+  email: string;
+  role?: string;
+  permissions?: string[];
+  createdAt: string;
+};
+const permissionIds = catalog.groups.flatMap((group) =>
+  group.permissions.map((permission) => permission.id),
+);
+
+function permissionsFor(user: Subuser) {
+  const defaults =
+    catalog.roleDefaults[user.role as keyof typeof catalog.roleDefaults] ?? [];
+  const selected = new Set(user.permissions ?? defaults);
+  return permissionIds.filter((permission) => selected.has(permission));
+}
+
+function PermissionCheckbox({
+  label,
+  accessibleLabel,
+  description,
+  checked,
+  mixed = false,
+  onChange,
+}: {
+  label: string;
+  accessibleLabel?: string;
+  description?: string;
+  checked: boolean;
+  mixed?: boolean;
+  onChange: () => void;
+}) {
+  const checkbox = useRef<HTMLInputElement>(null);
+  const descriptionId = useId();
+  useEffect(() => {
+    if (checkbox.current) checkbox.current.indeterminate = mixed;
+  }, [mixed]);
+  return (
+    <label className={`subuser-permission ${description ? "" : "compact"}`}>
+      <input
+        ref={checkbox}
+        type="checkbox"
+        checked={checked}
+        aria-checked={mixed ? "mixed" : checked}
+        aria-label={accessibleLabel ?? label}
+        aria-describedby={description ? descriptionId : undefined}
+        onChange={onChange}
+      />
+      <span>
+        <strong>{label}</strong>
+        {description && <small id={descriptionId}>{description}</small>}
+      </span>
+    </label>
+  );
+}
 
 export default function Subusers({ notify }: PageProps) {
   const { api, post } = useServerApi();
@@ -56,49 +84,85 @@ export default function Subusers({ notify }: PageProps) {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
   const [search, setSearch] = useState("");
-  const [editing, setEditing] = useState(false);
+  const [editor, setEditor] = useState<"create" | Subuser | null>(null);
   const [email, setEmail] = useState("");
-  const [role, setRole] = useState<Role>("operator");
+  const [selected, setSelected] = useState<string[]>([]);
   const [deleting, setDeleting] = useState<Subuser | null>(null);
   const [busy, setBusy] = useState(false);
   const [formError, setFormError] = useState("");
   const dialog = useRef<HTMLDialogElement>(null);
+  const emailInput = useRef<HTMLInputElement>(null);
+  const cancelButton = useRef<HTMLButtonElement>(null);
+  const request = useRef<AbortController | null>(null);
+  const errorMessage = useRef<HTMLParagraphElement>(null);
+  const editing = editor && editor !== "create" ? editor : null;
 
   const refresh = useCallback(async () => {
+    request.current?.abort();
+    const controller = new AbortController();
+    request.current = controller;
     setLoading(true);
     setError("");
     try {
-      setUsers((await api<{ users: Subuser[] }>("/subusers")).users);
-    } catch (e) {
-      setError(
-        e instanceof Error ? e.message : "Unable to load access records.",
-      );
+      const result = await api<{ users: Subuser[] }>("/subusers", {
+        signal: controller.signal,
+      });
+      if (!controller.signal.aborted) setUsers(result.users);
+    } catch (cause) {
+      if (!controller.signal.aborted)
+        setError(
+          cause instanceof Error ? cause.message : "Unable to load subusers.",
+        );
     } finally {
-      setLoading(false);
+      if (!controller.signal.aborted) setLoading(false);
     }
-  }, []);
+  }, [api]);
   useEffect(() => {
     void refresh();
+    return () => request.current?.abort();
   }, [refresh]);
   useEffect(() => {
-    if (editing || deleting) dialog.current?.showModal();
-    else dialog.current?.close();
-  }, [editing, deleting]);
+    const element = dialog.current;
+    if (editor || deleting) {
+      element?.showModal();
+      if (deleting) cancelButton.current?.focus();
+      else if (editor === "create") emailInput.current?.focus();
+      else
+        element
+          ?.querySelector<HTMLInputElement>('input[type="checkbox"]')
+          ?.focus();
+    } else element?.close();
+  }, [editor, deleting]);
+  useEffect(() => {
+    if (formError) errorMessage.current?.scrollIntoView({ block: "nearest" });
+  }, [formError]);
 
   function closeDialog() {
     if (busy) return;
-    setEditing(false);
+    setEditor(null);
     setDeleting(null);
     setFormError("");
   }
-  function openCreate() {
-    setEmail("");
-    setRole("operator");
+  function openEditor(user?: Subuser) {
+    setEmail(user?.email ?? "");
+    setSelected(user ? permissionsFor(user) : []);
     setFormError("");
-    setEditing(true);
+    setEditor(user ?? "create");
+  }
+  function togglePermissions(ids: string[]) {
+    setSelected((previous) => {
+      const next = new Set(previous);
+      const allSelected = ids.every((id) => next.has(id));
+      for (const id of ids) {
+        if (allSelected) next.delete(id);
+        else next.add(id);
+      }
+      return permissionIds.filter((id) => next.has(id));
+    });
   }
   async function submit(event: FormEvent) {
     event.preventDefault();
+    if (busy) return;
     setBusy(true);
     setFormError("");
     try {
@@ -106,104 +170,83 @@ export default function Subusers({ notify }: PageProps) {
         await api(`/subusers/${encodeURIComponent(deleting.id)}`, {
           method: "DELETE",
         });
-        notify("Access record removed.");
+        notify("Local access record removed.");
+      } else if (editing) {
+        await api(`/subusers/${encodeURIComponent(editing.id)}`, {
+          method: "PATCH",
+          body: JSON.stringify({ permissions: selected }),
+        });
+        notify("Subuser permissions saved locally.");
       } else {
-        await post("/subusers", { email: email.trim(), role });
-        notify("Local access record added.");
+        await post("/subusers", { email: email.trim(), permissions: selected });
+        notify("Local subuser record created.");
       }
-      setEditing(false);
+      setEditor(null);
       setDeleting(null);
       await refresh();
-    } catch (e) {
+    } catch (cause) {
       setFormError(
-        e instanceof Error ? e.message : "Unable to save this change.",
+        cause instanceof Error
+          ? cause.message
+          : "Unable to save this record. Try again.",
       );
     } finally {
       setBusy(false);
     }
   }
   const filtered = users.filter((user) =>
-    `${user.email} ${user.role}`.toLowerCase().includes(search.toLowerCase()),
+    user.email.toLowerCase().includes(search.toLowerCase()),
   );
 
   return (
-    <div className="management-page">
-      <div className="page-heading management-heading">
-        <div>
-          <div className="management-eyebrow">SERVER MANAGEMENT</div>
-          <h1>Subusers</h1>
-          <p>Keep the people behind your server organized.</p>
-        </div>
-        <button className="btn primary" onClick={openCreate}>
-          <Plus size={16} /> Add access record
+    <div className="subusers-page">
+      <header className="subusers-heading">
+        <h1>Subusers</h1>
+        <button className="btn primary" onClick={() => openEditor()}>
+          <Plus size={16} />
+          New user
         </button>
-      </div>
-
-      <div className="management-notice">
-        <Info size={18} />
-        <div>
-          <strong>Local access records</strong>
-          <p>
-            These records describe your team. Authentication, permission
-            enforcement, and email invitations are not configured yet. Adding a
-            record does not grant access.
-          </p>
-        </div>
-      </div>
-
-      <div className="role-overview">
-        {roles.map(({ value, label, icon: Icon, detail }) => (
-          <div className="role-overview-item" key={value}>
-            <span className={`management-icon role-${value}`}>
-              <Icon size={19} />
-            </span>
-            <div>
-              <strong>{label}</strong>
-              <span>{detail}</span>
-            </div>
-            <span className="role-count">
-              {users.filter((user) => user.role === value).length}
-            </span>
+      </header>
+      <p className="subusers-local-notice">
+        <Info size={16} />
+        <span>
+          Local records only. Adding a record does not grant access. Permissions
+          are not enforced, and no invitation is sent.
+        </span>
+      </p>
+      <section className="subusers-list" aria-label="Subuser records">
+        <div className="subusers-toolbar">
+          <div className="subusers-list-title">
+            <Users size={17} />
+            <h2>Users</h2>
+            <span>{users.length}</span>
           </div>
-        ))}
-      </div>
-
-      <section
-        className="panel management-list"
-        aria-labelledby="access-records-title"
-      >
-        <div className="management-panel-header">
-          <div className="management-section-title">
-            <Users size={18} />
-            <h2 id="access-records-title">Access records</h2>
-            <span className="management-count">{users.length}</span>
-          </div>
-          <div className="management-controls">
-            <label className="management-search">
+          <div className="subusers-controls">
+            <label className="subusers-search">
               <Search size={16} />
               <input
                 aria-label="Search access records"
-                placeholder="Search people..."
+                placeholder="Search by email…"
                 value={search}
-                onChange={(e) => setSearch(e.target.value)}
+                onChange={(event) => setSearch(event.target.value)}
               />
             </label>
             <button
               className="btn icon"
-              title="Refresh access records"
               aria-label="Refresh access records"
+              title="Refresh users"
               disabled={loading}
               onClick={() => void refresh()}
             >
               <RefreshCw
-                size={16}
-                className={loading ? "management-spinning" : ""}
+                size={15}
+                className={loading ? "subusers-spinning" : ""}
               />
             </button>
           </div>
         </div>
         {error ? (
-          <div className="management-error" role="alert">
+          <div className="subusers-error" role="alert">
             <AlertCircle size={18} />
             <span>{error}</span>
             <button className="btn" onClick={() => void refresh()}>
@@ -211,68 +254,58 @@ export default function Subusers({ notify }: PageProps) {
             </button>
           </div>
         ) : loading ? (
-          <div className="management-loading" role="status">
-            <RefreshCw size={20} className="management-spinning" /> Loading
-            access records...
+          <div className="subusers-empty" role="status">
+            <RefreshCw size={20} className="subusers-spinning" />
+            <span>Loading subusers…</span>
           </div>
         ) : filtered.length === 0 ? (
-          <div className="empty-state management-empty">
-            <div className="management-empty-icon">
-              <Users size={26} />
+          <div className="subusers-empty">
+            <Users size={25} />
+            <div>
+              <h2>{search ? "No matching people" : "No subusers"}</h2>
+              <p>
+                {search
+                  ? "Try another email address."
+                  : "Create a local record for someone who helps manage this server."}
+              </p>
             </div>
-            <h3>
-              {search
-                ? "No matching people"
-                : "A great server starts with a team"}
-            </h3>
-            <p>
-              {search
-                ? "Try another email address or role."
-                : "Add a local record for each person who helps manage your server."}
-            </p>
-            {!search && (
-              <button className="btn" onClick={openCreate}>
-                <Plus size={15} /> Add your first record
-              </button>
-            )}
           </div>
         ) : (
-          <div className="table-wrap">
-            <table className="data-table management-table">
-              <thead>
-                <tr>
-                  <th>Person</th>
-                  <th>Role</th>
-                  <th>Added</th>
-                  <th>Status</th>
-                  <th>
-                    <span className="management-sr-only">Actions</span>
-                  </th>
-                </tr>
-              </thead>
-              <tbody>
-                {filtered.map((user) => (
+          <table className="subusers-table">
+            <thead>
+              <tr>
+                <th>User</th>
+                <th>Permissions</th>
+                <th className="subuser-added">Added</th>
+                <th className="subuser-row-actions">
+                  <span className="subusers-sr-only">Actions</span>
+                </th>
+              </tr>
+            </thead>
+            <tbody>
+              {filtered.map((user) => {
+                const count = permissionsFor(user).length;
+                return (
                   <tr key={user.id}>
                     <td>
-                      <div className="management-person">
-                        <span className="management-avatar">
+                      <div className="subuser-identity">
+                        <span className="subuser-avatar" aria-hidden="true">
                           {user.email.slice(0, 2).toUpperCase()}
                         </span>
                         <div>
                           <strong>{user.email}</strong>
-                          <span>Local access record</span>
+                          <span>Local record</span>
                         </div>
                       </div>
                     </td>
                     <td>
-                      <span
-                        className={`management-role-badge role-${user.role}`}
-                      >
-                        {roles.find((item) => item.value === user.role)
-                          ?.label || user.role}
+                      <span className="subuser-permission-count">
+                        {count === permissionIds.length
+                          ? "All permissions"
+                          : `${count} selected`}
                       </span>
                     </td>
-                    <td className="muted">
+                    <td className="subuser-added">
                       <time
                         dateTime={user.createdAt}
                         title={new Date(user.createdAt).toLocaleString()}
@@ -280,41 +313,40 @@ export default function Subusers({ notify }: PageProps) {
                         {relativeTime(user.createdAt)}
                       </time>
                     </td>
-                    <td>
-                      <span className="management-record-status">
-                        <span /> Recorded
-                      </span>
-                    </td>
-                    <td className="management-actions">
-                      <button
-                        className="btn icon management-delete"
-                        aria-label={`Remove access record for ${user.email}`}
-                        title="Remove access record"
-                        onClick={() => {
-                          setFormError("");
-                          setDeleting(user);
-                        }}
-                      >
-                        <Trash2 size={16} />
-                      </button>
+                    <td className="subuser-row-actions">
+                      <div>
+                        <button
+                          className="btn icon"
+                          aria-label={`Edit permissions for ${user.email}`}
+                          title="Edit permissions"
+                          onClick={() => openEditor(user)}
+                        >
+                          <Pencil size={15} />
+                        </button>
+                        <button
+                          className="btn icon subuser-delete"
+                          aria-label={`Remove access record for ${user.email}`}
+                          title="Remove local record"
+                          onClick={() => {
+                            setFormError("");
+                            setDeleting(user);
+                          }}
+                        >
+                          <Trash2 size={15} />
+                        </button>
+                      </div>
                     </td>
                   </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
+                );
+              })}
+            </tbody>
+          </table>
         )}
-        <div className="management-panel-footer">
-          <Shield size={14} />
-          <span>
-            Roles are descriptive records until authentication is connected.
-          </span>
-        </div>
       </section>
 
       <dialog
         ref={dialog}
-        className="modal management-dialog"
+        className={`subusers-dialog ${deleting ? "subusers-delete-dialog" : ""}`}
         aria-labelledby="subuser-dialog-title"
         onCancel={(event) => {
           event.preventDefault();
@@ -322,10 +354,14 @@ export default function Subusers({ notify }: PageProps) {
         }}
       >
         <form onSubmit={submit}>
-          <div className="management-dialog-heading">
-            <span className="management-icon">
-              {deleting ? <Trash2 size={21} /> : <UserRound size={21} />}
-            </span>
+          <header className="subusers-dialog-heading">
+            <h2 id="subuser-dialog-title">
+              {deleting
+                ? "Remove access record?"
+                : editing
+                  ? "Edit subuser permissions"
+                  : "Create new subuser"}
+            </h2>
             <button
               type="button"
               className="btn icon"
@@ -335,96 +371,143 @@ export default function Subusers({ notify }: PageProps) {
             >
               <X size={18} />
             </button>
-          </div>
-          <h2 id="subuser-dialog-title">
-            {deleting ? "Remove access record?" : "Add someone to your team"}
-          </h2>
-          <p className="management-dialog-description">
+          </header>
+          <div className="subusers-editor-body">
             {deleting ? (
-              <>
+              <p className="subusers-delete-description">
                 Remove the local record for <strong>{deleting.email}</strong>?
                 You can add it again later.
-              </>
+              </p>
             ) : (
-              "Create a local access record. No invitation will be sent."
-            )}
-          </p>
-          {!deleting && (
-            <>
-              <div className="form-field">
-                <label htmlFor="subuser-email">Email address</label>
-                <input
-                  id="subuser-email"
-                  type="email"
-                  autoFocus
-                  required
-                  maxLength={254}
-                  placeholder="alex@example.com"
-                  value={email}
-                  onChange={(event) => setEmail(event.target.value)}
-                  disabled={busy}
-                />
-              </div>
-              <fieldset className="management-role-options">
-                <legend>
-                  Intended role <span>Descriptive only</span>
-                </legend>
-                {roles.map(({ value, label, icon: Icon, description }) => (
-                  <label
-                    className={`management-role-option ${role === value ? "selected" : ""}`}
-                    key={value}
-                  >
-                    <input
-                      type="radio"
-                      name="role"
-                      value={value}
-                      checked={role === value}
-                      onChange={() => setRole(value)}
-                      disabled={busy}
+              <>
+                <p className="subusers-editor-notice">
+                  Permissions are saved locally. No invitation will be sent, and
+                  this record does not grant access.
+                </p>
+                <div className="subusers-email">
+                  <label htmlFor="subuser-email">Email address</label>
+                  <input
+                    ref={emailInput}
+                    id="subuser-email"
+                    type="email"
+                    required
+                    maxLength={254}
+                    placeholder="user@example.com"
+                    value={email}
+                    onChange={(event) => setEmail(event.target.value)}
+                    readOnly={!!editing}
+                    disabled={busy}
+                  />
+                </div>
+                <fieldset className="subusers-permissions" disabled={busy}>
+                  <legend className="subusers-sr-only">
+                    Intended permissions
+                  </legend>
+                  <div className="subusers-all-permissions">
+                    <PermissionCheckbox
+                      label="All permissions"
+                      description="Select every permission for this local record."
+                      checked={selected.length === permissionIds.length}
+                      mixed={
+                        selected.length > 0 &&
+                        selected.length < permissionIds.length
+                      }
+                      onChange={() => togglePermissions(permissionIds)}
                     />
-                    <Icon size={19} />
-                    <div>
-                      <strong>{label}</strong>
-                      <span>{description}</span>
-                    </div>
-                    <span className="management-radio-indicator">
-                      {role === value && <Check size={12} />}
+                    <span>
+                      {selected.length} / {permissionIds.length}
                     </span>
-                  </label>
-                ))}
-              </fieldset>
-            </>
-          )}
-          {formError && (
-            <p className="management-form-error" role="alert">
-              <AlertCircle size={15} />
-              {formError}
-            </p>
-          )}
-          <div className="management-dialog-actions">
-            <button
-              type="button"
-              className="btn"
-              onClick={closeDialog}
-              disabled={busy}
-            >
-              Cancel
-            </button>
-            <button
-              type="submit"
-              className={`btn ${deleting ? "danger" : "primary"}`}
-              disabled={busy}
-            >
-              {busy
-                ? "Saving..."
-                : deleting
-                  ? "Remove record"
-                  : "Add access record"}
-              {!busy && !deleting && (
-                <ChevronDown size={14} className="management-arrow" />
-              )}
-            </button>
+                  </div>
+                  {catalog.groups.map((group) => {
+                    const ids = group.permissions.map(
+                      (permission) => permission.id,
+                    );
+                    const count = ids.filter((id) =>
+                      selected.includes(id),
+                    ).length;
+                    return (
+                      <section
+                        className="subusers-permission-group"
+                        key={group.id}
+                        aria-labelledby={`permission-group-${group.id}`}
+                      >
+                        <div className="subusers-group-heading">
+                          <div>
+                            <h3 id={`permission-group-${group.id}`}>
+                              {group.label}
+                            </h3>
+                            <p>{group.description}</p>
+                          </div>
+                          <PermissionCheckbox
+                            label="Select all"
+                            accessibleLabel={`Select all ${group.label}`}
+                            checked={count === ids.length}
+                            mixed={count > 0 && count < ids.length}
+                            onChange={() => togglePermissions(ids)}
+                          />
+                        </div>
+                        <div className="subusers-permission-grid">
+                          {group.permissions.map((permission) => (
+                            <PermissionCheckbox
+                              key={permission.id}
+                              label={permission.label}
+                              description={permission.description}
+                              checked={selected.includes(permission.id)}
+                              onChange={() =>
+                                togglePermissions([permission.id])
+                              }
+                            />
+                          ))}
+                        </div>
+                      </section>
+                    );
+                  })}
+                </fieldset>
+              </>
+            )}
+            {formError && (
+              <p
+                ref={errorMessage}
+                className="subusers-form-error"
+                role="alert"
+              >
+                <AlertCircle size={16} />
+                {formError}
+              </p>
+            )}
           </div>
+          <footer className="subusers-dialog-actions">
+            {!deleting && (
+              <span>
+                {selected.length}{" "}
+                {selected.length === 1 ? "permission" : "permissions"} selected
+              </span>
+            )}
+            <div>
+              <button
+                ref={cancelButton}
+                type="button"
+                className="btn"
+                disabled={busy}
+                onClick={closeDialog}
+              >
+                Cancel
+              </button>
+              <button
+                type="submit"
+                className={`btn ${deleting ? "danger" : "primary"}`}
+                disabled={busy}
+              >
+                {busy
+                  ? "Saving…"
+                  : deleting
+                    ? "Remove record"
+                    : editing
+                      ? "Save permissions"
+                      : "Create subuser"}
+              </button>
+            </div>
+          </footer>
         </form>
       </dialog>
     </div>

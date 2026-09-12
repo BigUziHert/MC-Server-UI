@@ -23,6 +23,7 @@ async function fixture(t, options = {}) {
     dataDir,
     scheduler: false,
     useEnvironment: false,
+    publicAddress: { resolve: async () => null },
     ...options,
   });
   const listener = await new Promise((resolve) => {

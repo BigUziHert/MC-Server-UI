@@ -17,6 +17,7 @@ async function fixture(t, settings = {}) {
       dataDir,
       scheduler: false,
       useEnvironment: false,
+      publicAddress: { resolve: async () => null },
       ...settings,
       ...extra,
     });

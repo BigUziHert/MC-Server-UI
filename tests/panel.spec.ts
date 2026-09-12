@@ -443,24 +443,25 @@ test("subusers records are clearly local and can be added, searched, and removed
   await expect(
     page.getByText(/Adding a record does not grant access/),
   ).toBeVisible();
-  await page
-    .getByRole("button", { name: "Add access record", exact: true })
-    .click();
-  let dialog = page.getByRole("dialog", { name: "Add someone to your team" });
+  await page.getByRole("button", { name: "New user", exact: true }).click();
+  let dialog = page.getByRole("dialog", { name: "Create new subuser" });
   await expect(dialog.getByText(/No invitation will be sent/)).toBeVisible();
   await dialog.getByLabel("Email address").fill("operator@example.com");
-  await dialog.getByRole("radio", { name: /Viewer/ }).check();
   await dialog
-    .getByRole("button", { name: "Add access record", exact: true })
+    .getByRole("checkbox", { name: "View audit logs", exact: true })
+    .check();
+  await dialog
+    .getByRole("button", { name: "Create subuser", exact: true })
     .click();
   await expect(dialog).not.toBeVisible();
   const row = page.getByRole("row").filter({ hasText: "operator@example.com" });
-  await expect(row).toContainText("Viewer");
+  await expect(row).toContainText("1 selected");
   expect((await (await request.get("/api/subusers")).json()).users).toEqual(
     expect.arrayContaining([
       expect.objectContaining({
         email: "operator@example.com",
-        role: "viewer",
+        role: "custom",
+        permissions: ["audit.read"],
       }),
     ]),
   );
@@ -1044,14 +1045,14 @@ test("server selection scopes file edits and downloads, console commands, backup
   await expect(
     page.getByRole("button", { name: /Grant OP|Revoke OP|Remove OP/ }),
   ).toHaveCount(0);
-  await page
-    .getByRole("button", { name: "Add access record", exact: true })
-    .click();
-  dialog = page.getByRole("dialog", { name: "Add someone to your team" });
+  await page.getByRole("button", { name: "New user", exact: true }).click();
+  dialog = page.getByRole("dialog", { name: "Create new subuser" });
   await dialog.getByLabel("Email address").fill("secondary-only@example.com");
-  await dialog.getByRole("radio", { name: /Viewer/ }).check();
   await dialog
-    .getByRole("button", { name: "Add access record", exact: true })
+    .getByRole("checkbox", { name: "View audit logs", exact: true })
+    .check();
+  await dialog
+    .getByRole("button", { name: "Create subuser", exact: true })
     .click();
   await expect(dialog).not.toBeVisible();
   await expect(
@@ -1215,7 +1216,7 @@ test("Players grants and removes simulated OP independently of panel access and 
     page.getByRole("button", { name: /Grant OP|Remove OP|Revoke OP/ }),
   ).toHaveCount(0);
   await expect(
-    page.getByRole("button", { name: "Add access record", exact: true }),
+    page.getByRole("button", { name: "New user", exact: true }),
   ).toBeVisible();
 
   await openPage(page, "console", "Console");

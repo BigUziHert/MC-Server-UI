@@ -3,8 +3,8 @@
   flex-shrink: 0;
   object-fit: contain;
   image-rendering: pixelated;
-  border: 1px solid #46553a;
+  border: 1px solid #404356;
   border-radius: 4px;
-  background: #263120;
-  box-shadow: 0 2px 0 #11170e;
+  background: #272833;
+  box-shadow: 0 2px 0 #101016;
 }

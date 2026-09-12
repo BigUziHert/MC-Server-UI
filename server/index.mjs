@@ -8,6 +8,15 @@ import { randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import permissionsCatalog from "../shared/subuser-permissions.json" with { type: "json" };
+import { createProcessTelemetry } from "./telemetry.mjs";
+import {
+  advertisedConnection,
+  createPublicAddressResolver,
+  validateConnectionHost,
+  legacyConnectionHost,
+} from "./connection.mjs";
+import { decodeIcon, readServerIcon, writeServerIcon } from "./server-icon.mjs";
 import {
   canonicalExternalDirectory,
   containedSourcePath,
@@ -21,7 +30,26 @@ const projectDir = path.resolve(
   "..",
 );
 const localHosts = new Set(["localhost", "127.0.0.1", "[::1]"]);
-const roles = new Set(["admin", "operator", "viewer"]);
+const roles = new Set(["admin", "operator", "viewer", "custom"]);
+const permissionIds = new Set(
+  permissionsCatalog.groups.flatMap((group) =>
+    group.permissions.map((permission) => permission.id),
+  ),
+);
+const userWithPermissions = (user) => ({
+  ...user,
+  permissions:
+    user.permissions ?? permissionsCatalog.roleDefaults[user.role] ?? [],
+});
+function validatePermissions(value) {
+  if (
+    !Array.isArray(value) ||
+    value.length > permissionIds.size ||
+    value.some((id) => !permissionIds.has(id))
+  )
+    throw error(400, "Choose permissions from the available list.");
+  return [...new Set(value)];
+}
 const defaultSchedule = {
   enabled: false,
   type: "interval",
@@ -118,6 +146,7 @@ export function validateServerConfiguration(
     "launchExecutable",
     "javaPath",
     "motd",
+    "connectionHost",
   ]);
   if (Object.keys(input).some((key) => !allowed.has(key)))
     throw error(400, "Unknown server setting.");
@@ -133,6 +162,7 @@ export function validateServerConfiguration(
     launchExecutable: "",
     javaPath: "java",
     motd: "Welcome to the Overworld",
+    connectionHost: "",
     ...previous,
     ...input,
   };
@@ -147,6 +177,11 @@ export function validateServerConfiguration(
       "Server names must contain 1–64 characters without control characters.",
     );
   result.name = result.name.trim();
+  try {
+    result.connectionHost = validateConnectionHost(result.connectionHost);
+  } catch (cause) {
+    throw error(400, cause.message);
+  }
   if (!["demo", "live"].includes(result.mode))
     throw error(400, "Choose demo or live mode.");
   if (
@@ -375,6 +410,8 @@ async function directorySize(root) {
 }
 
 export async function createPanel(options = {}) {
+  const telemetry = options.telemetry ?? createProcessTelemetry();
+  const publicAddress = options.publicAddress ?? createPublicAddressResolver();
   // A fleet passes every setting explicitly. Legacy callers may still use .env.
   const env = options.useEnvironment === false ? {} : process.env;
   const dataDir = path.resolve(
@@ -401,6 +438,9 @@ export async function createPanel(options = {}) {
     launchArgs: options.launchArgs ?? [],
     launchExecutable: options.launchExecutable ?? "",
     javaPath: options.javaPath ?? env.JAVA_PATH ?? "java",
+    connectionHost:
+      options.connectionHost ??
+      legacyConnectionHost(options.address ?? env.MC_SERVER_ADDRESS),
     address:
       options.address ??
       env.MC_SERVER_ADDRESS ??
@@ -850,6 +890,7 @@ export async function createPanel(options = {}) {
         stdio: ["pipe", "pipe", "pipe"],
       });
       processHandle = child;
+      telemetry.reset(child.pid);
       startedAt = Date.now();
       const bindOutput = (stream, defaultLevel) => {
         let buffer = "";
@@ -888,6 +929,7 @@ export async function createPanel(options = {}) {
         append(`[Panel] Java failed: ${cause.message}`, "error");
       });
       child.on("close", (code) => {
+        telemetry.reset(child.pid);
         clearTimeout(stopTimer);
         processHandle = null;
         status = terminationPromise ? "stopping" : "offline";
@@ -1230,6 +1272,7 @@ export async function createPanel(options = {}) {
       (/^\/api\/files(?:\/|$)/.test(req.path) ||
         /^\/api\/players(?:\/|$)/.test(req.path) ||
         req.path === "/api/server/power" ||
+        req.path === "/api/server/icon" ||
         req.path === "/api/console/command");
     if (protectedMutation) {
       if (configBusy)
@@ -1267,10 +1310,27 @@ export async function createPanel(options = {}) {
       diskCache = { value: await directorySize(serverDir), at: Date.now() };
     const active = status === "running";
     const storage = await fs.statfs(serverDir);
+    const sampledChild = processHandle;
+    const [sample, connection, icon] = await Promise.all([
+      mode === "live" && sampledChild && Number.isInteger(sampledChild.pid)
+        ? telemetry.sample(sampledChild.pid)
+        : null,
+      advertisedConnection(configuration, publicAddress),
+      readServerIcon(serverDir, safePath),
+    ]);
+    const currentSample =
+      sampledChild &&
+      processHandle === sampledChild &&
+      sampledChild.exitCode == null
+        ? sample
+        : null;
+    const liveIdle = mode === "live" && !processHandle && status === "offline";
     res.json({
       id: options.id,
       name: configuration.name,
       address: configuration.address,
+      ...connection,
+      iconVersion: icon?.version ?? null,
       status,
       mode,
       version: configuration.version,
@@ -1279,11 +1339,15 @@ export async function createPanel(options = {}) {
       cpu:
         mode === "demo" && active
           ? Number((7.2 + Math.sin(Date.now() / 7000) * 2.6).toFixed(1))
-          : 0,
+          : mode === "demo" || liveIdle
+            ? 0
+            : (currentSample?.cpu ?? null),
       memory:
         mode === "demo" && active
           ? Math.round(1840 + Math.sin(Date.now() / 12000) * 60) * 1024 ** 2
-          : 0,
+          : mode === "demo" || liveIdle
+            ? 0
+            : (currentSample?.memory ?? null),
       memoryLimit: memoryLimit * 1024 ** 2,
       disk: diskCache.value,
       diskLimit: storage.blocks * storage.bsize,
@@ -1292,10 +1356,47 @@ export async function createPanel(options = {}) {
         a.name.localeCompare(b.name),
       ),
       maxPlayers: configuration.maxPlayers,
-      metricsAvailable: mode === "demo",
+      metricsAvailable:
+        mode === "demo" || liveIdle || currentSample?.available === true,
+      metricsMessage: liveIdle
+        ? "Server offline"
+        : (currentSample?.error ??
+          (currentSample?.cpu === null
+            ? "Measuring CPU usage…"
+            : currentSample?.available
+              ? "Server process telemetry"
+              : "Waiting for server process…")),
+      processCount: currentSample?.processCount ?? 0,
       playersAvailable: true,
     });
   });
+  app.get("/api/server/icon", async (_req, res) => {
+    const icon = await readServerIcon(serverDir, safePath);
+    if (!icon) throw error(404, "No custom server icon.");
+    res.set("Cache-Control", "no-cache").type("png").send(icon.bytes);
+  });
+  app.post(
+    "/api/server/icon",
+    trackOperation(async (req, res) => {
+      await writeServerIcon(serverDir, decodeIcon(req.body?.image), safePath);
+      await audit(
+        "file",
+        "Server icon updated",
+        "server-icon.png · game clients see the new icon after a server restart.",
+      );
+      res.json({ ok: true });
+    }),
+  );
+  app.delete(
+    "/api/server/icon",
+    trackOperation(async (_req, res) => {
+      await fs.rm(await safePath(serverDir, "server-icon.png"), {
+        force: true,
+      });
+      await audit("file", "Server icon removed", "server-icon.png");
+      res.json({ ok: true });
+    }),
+  );
   app.get("/api/console", (_req, res) => res.json({ lines }));
   app.get("/api/players", async (_req, res) => {
     let operators = state.demoOperators;
@@ -1638,11 +1739,13 @@ export async function createPanel(options = {}) {
       res.json({ ok: true });
     }),
   );
-  app.get("/api/subusers", (_req, res) => res.json({ users: state.users }));
+  app.get("/api/subusers", (_req, res) =>
+    res.json({ users: state.users.map(userWithPermissions) }),
+  );
   app.post(
     "/api/subusers",
     trackOperation(async (req, res) => {
-      const { email, role } = req.body ?? {};
+      const { email, role = "custom", permissions } = req.body ?? {};
       if (
         typeof email !== "string" ||
         email.length > 254 ||
@@ -1656,6 +1759,10 @@ export async function createPanel(options = {}) {
         id: randomUUID(),
         email: email.toLowerCase(),
         role,
+        permissions:
+          permissions === undefined
+            ? [...(permissionsCatalog.roleDefaults[role] ?? [])]
+            : validatePermissions(permissions),
         createdAt: new Date().toISOString(),
       };
       state.users.push(item);
@@ -1665,6 +1772,21 @@ export async function createPanel(options = {}) {
         `${item.email} · ${role}. No invitation was sent; authentication is not configured.`,
       );
       res.status(201).json(item);
+    }),
+  );
+  app.patch(
+    "/api/subusers/:id",
+    trackOperation(async (req, res) => {
+      const item = getItem(state.users, req.params.id);
+      const permissions = validatePermissions(req.body?.permissions);
+      item.permissions = permissions;
+      item.role = "custom";
+      await audit(
+        "user",
+        "Local access permissions updated",
+        `${item.email} · ${permissions.length} intended permissions. Authentication is not configured.`,
+      );
+      res.json(userWithPermissions(item));
     }),
   );
   app.delete(
@@ -1789,6 +1911,7 @@ export async function createPanel(options = {}) {
         closed = true;
         clearPlayers();
         clearInterval(scheduler);
+        if (!options.telemetry) telemetry.close();
         clearTimeout(demoTimer);
         clearTimeout(stopTimer);
         closePromise = (async () => {
@@ -1859,6 +1982,8 @@ export async function createPanel(options = {}) {
 
 // Registry changes are serialized, but each server has its own process, state and scheduler.
 export async function createFleet(options = {}) {
+  const telemetry = options.telemetry ?? createProcessTelemetry();
+  const publicAddress = options.publicAddress ?? createPublicAddressResolver();
   const env = options.useEnvironment === false ? {} : process.env;
   const requestedDataDir = path.resolve(
     options.dataDir ?? env.PANEL_DATA_DIR ?? path.join(projectDir, "data"),
@@ -1897,6 +2022,7 @@ export async function createFleet(options = {}) {
     registry = next;
   };
   const configKeys = [
+    "connectionHost",
     "name",
     "mode",
     "port",
@@ -1913,7 +2039,12 @@ export async function createFleet(options = {}) {
     Object.fromEntries(
       configKeys
         .filter((key) => entry[key] !== undefined)
-        .map((key) => [key, entry[key]]),
+        .map((key) => [key, entry[key]])
+        .concat(
+          entry.connectionHost === undefined
+            ? [["connectionHost", legacyConnectionHost(entry.address)]]
+            : [],
+        ),
     );
   const descriptor = (entry) => runtimes.get(entry.id).descriptor();
   const checkPort = (port, exceptId) => {
@@ -2028,6 +2159,8 @@ export async function createFleet(options = {}) {
       spawnProcess: options.spawnProcess,
       stopTimeoutMs: options.stopTimeoutMs,
       backupFlushTimeoutMs: options.backupFlushTimeoutMs,
+      telemetry,
+      publicAddress,
     });
     runtimes.set(entry.id, runtime);
     return runtime;
@@ -2543,6 +2676,7 @@ export async function createFleet(options = {}) {
       await Promise.all(
         [...runtimes.values()].map((runtime) => runtime.close(closeOptions)),
       );
+      if (!options.telemetry) telemetry.close();
     },
   };
 }

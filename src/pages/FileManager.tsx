@@ -31,6 +31,7 @@ import {
   type PageProps,
 } from "../api";
 import "./storage.css";
+import "./file-selection.css";
 
 type Entry = {
   name: string;
@@ -43,7 +44,12 @@ type FileResult = { path: string; entries: Entry[] };
 type FileDialog =
   | { type: "create"; kind: "file" | "directory" }
   | { type: "edit"; entry: Entry }
-  | { type: "delete"; entry: Entry };
+  | { type: "delete"; entry: Entry }
+  | {
+      type: "delete-many";
+      entries: Entry[];
+      failures?: { entry: Entry; message: string }[];
+    };
 const messageOf = (error: unknown) =>
   error instanceof Error
     ? error.message
@@ -79,7 +85,10 @@ export default function FileManager({ notify }: PageProps) {
   const [reading, setReading] = useState(false);
   const [readFailed, setReadFailed] = useState(false);
   const [dialogError, setDialogError] = useState("");
+  const [selected, setSelected] = useState<Set<string>>(new Set());
+  const [deleteProgress, setDeleteProgress] = useState<number | null>(null);
   const uploadInput = useRef<HTMLInputElement>(null);
+  const searchInput = useRef<HTMLInputElement>(null);
   const requestId = useRef(0);
   const dialogRef = useRef<HTMLDivElement>(null);
   const dragDepth = useRef(0);
@@ -97,13 +106,20 @@ export default function FileManager({ notify }: PageProps) {
       const result = await api<FileResult>(
         `/files?path=${encodeURIComponent(path)}`,
       );
-      if (id === requestId.current) setEntries(result.entries);
+      if (id === requestId.current) {
+        setEntries(result.entries);
+        const available = new Set(result.entries.map((entry) => entry.path));
+        setSelected(
+          (previous) =>
+            new Set([...previous].filter((item) => available.has(item))),
+        );
+      }
     } catch (failure) {
       if (id === requestId.current) setError(messageOf(failure));
     } finally {
       if (id === requestId.current) setLoading(false);
     }
-  }, [path]);
+  }, [path, api]);
 
   useEffect(() => {
     void load();
@@ -111,6 +127,9 @@ export default function FileManager({ notify }: PageProps) {
       requestId.current++;
     };
   }, [load]);
+  useEffect(() => {
+    setSelected(new Set());
+  }, [path, api]);
   useEffect(() => {
     if (!dialog) return;
     const previous = document.activeElement as HTMLElement | null;
@@ -155,12 +174,16 @@ export default function FileManager({ notify }: PageProps) {
     document.addEventListener("keydown", onKey);
     return () => {
       document.removeEventListener("keydown", onKey);
-      previous?.focus();
+      if (previous?.isConnected) previous.focus();
+      else searchInput.current?.focus();
     };
   }, [dialog]);
 
   function navigate(next: string) {
+    if (savingRef.current || next === path) return;
+    setSelected(new Set());
     setQuery("");
+    setEntries([]);
     setPath(next);
   }
   function closeDialog() {
@@ -173,6 +196,22 @@ export default function FileManager({ notify }: PageProps) {
     setReading(false);
     setDialogError("");
     setDialog({ type: "delete", entry });
+  }
+  function openDeleteSelected() {
+    const targets = entries.filter((entry) => selected.has(entry.path));
+    if (!targets.length || savingRef.current) return;
+    editRequestId.current++;
+    setReading(false);
+    setDialogError("");
+    setDialog({ type: "delete-many", entries: targets });
+  }
+  function toggleSelection(entryPath: string) {
+    setSelected((previous) => {
+      const next = new Set(previous);
+      if (next.has(entryPath)) next.delete(entryPath);
+      else next.add(entryPath);
+      return next;
+    });
   }
   function openCreate(kind: "file" | "directory") {
     editRequestId.current++;
@@ -239,11 +278,51 @@ export default function FileManager({ notify }: PageProps) {
 
   async function submitDialog(event: FormEvent) {
     event.preventDefault();
-    if (!dialog || saving) return;
+    if (!dialog || savingRef.current) return;
+    savingRef.current = true;
     setSaving(true);
     setDialogError("");
     try {
-      if (dialog.type === "create") {
+      if (dialog.type === "delete-many") {
+        const deleted = new Set<string>();
+        const failures: { entry: Entry; message: string }[] = [];
+        setDeleteProgress(0);
+        // Freeze the confirmed targets and this server's API binding for the
+        // whole operation. Each deletion finishes before the next one starts.
+        for (const entry of dialog.entries) {
+          try {
+            await api(`/files?path=${encodeURIComponent(entry.path)}`, {
+              method: "DELETE",
+            });
+            deleted.add(entry.path);
+          } catch (failure) {
+            failures.push({ entry, message: messageOf(failure) });
+          }
+          setDeleteProgress(deleted.size + failures.length);
+        }
+        setSelected((previous) => {
+          const remaining = new Set(
+            [...previous].filter((item) => !deleted.has(item)),
+          );
+          failures.forEach(({ entry }) => remaining.add(entry.path));
+          return remaining;
+        });
+        setEntries((previous) =>
+          previous.filter((entry) => !deleted.has(entry.path)),
+        );
+        const summary = `${deleted.size} ${deleted.size === 1 ? "item" : "items"} deleted.${failures.length ? ` ${failures.length} ${failures.length === 1 ? "item could not be deleted and remains" : "items could not be deleted and remain"} selected.` : ""}`;
+        notify(summary, failures.length > 0);
+        if (failures.length) {
+          setDialog({
+            type: "delete-many",
+            entries: failures.map(({ entry }) => entry),
+            failures,
+          });
+          setDialogError(summary);
+        } else closeDialog();
+        await load();
+        return;
+      } else if (dialog.type === "create") {
         await post("/files", {
           path,
           name: name.trim(),
@@ -268,7 +347,9 @@ export default function FileManager({ notify }: PageProps) {
     } catch (failure) {
       setDialogError(messageOf(failure));
     } finally {
+      savingRef.current = false;
       setSaving(false);
+      setDeleteProgress(null);
     }
   }
 
@@ -282,6 +363,22 @@ export default function FileManager({ notify }: PageProps) {
           : 1,
     );
   const segments = path.split("/").filter(Boolean);
+  const selectedEntries = entries.filter((entry) => selected.has(entry.path));
+  const visibleSelectedCount = visible.filter((entry) =>
+    selected.has(entry.path),
+  ).length;
+  const allVisibleSelected =
+    visible.length > 0 && visibleSelectedCount === visible.length;
+  const hiddenSelectedCount = selectedEntries.length - visibleSelectedCount;
+  function toggleVisibleSelection() {
+    setSelected((previous) => {
+      const next = new Set(previous);
+      visible.forEach((entry) =>
+        allVisibleSelected ? next.delete(entry.path) : next.add(entry.path),
+      );
+      return next;
+    });
+  }
   const totalSize = entries.reduce(
     (sum, entry) => sum + (entry.type === "file" ? entry.size : 0),
     0,
@@ -402,6 +499,7 @@ export default function FileManager({ notify }: PageProps) {
           <label className="storage-search">
             <Search size={16} />
             <input
+              ref={searchInput}
               placeholder="Search files and folders…"
               aria-label="Search files and folders"
               value={query}
@@ -415,6 +513,36 @@ export default function FileManager({ notify }: PageProps) {
           </label>
           <span className="muted files-count">{entries.length} items</span>
         </div>
+        {selectedEntries.length > 0 && (
+          <div
+            className="file-selection-bar"
+            role="region"
+            aria-label="Selected files and folders"
+          >
+            <div className="file-selection-summary" aria-live="polite">
+              <strong>{selectedEntries.length} selected</strong>
+              {hiddenSelectedCount > 0 && (
+                <span>{hiddenSelectedCount} hidden by the filter</span>
+              )}
+            </div>
+            <div className="file-selection-actions">
+              <button
+                className="btn small"
+                onClick={() => setSelected(new Set())}
+                disabled={saving}
+              >
+                Clear selection
+              </button>
+              <button
+                className="btn danger small"
+                onClick={openDeleteSelected}
+                disabled={saving || loading || !!error}
+              >
+                <Trash2 size={15} /> Delete selected
+              </button>
+            </div>
+          </div>
+        )}
         {error ? (
           <div className="empty-state">
             <strong>Unable to load files</strong>
@@ -433,7 +561,29 @@ export default function FileManager({ notify }: PageProps) {
             <table className="data-table file-table">
               <thead>
                 <tr>
-                  <th scope="col">Name</th>
+                  <th scope="col">
+                    <div className="file-selection-name">
+                      <input
+                        className="file-selection-checkbox"
+                        type="checkbox"
+                        aria-label="Select all visible files and folders"
+                        checked={allVisibleSelected}
+                        aria-checked={
+                          visibleSelectedCount > 0 && !allVisibleSelected
+                            ? "mixed"
+                            : allVisibleSelected
+                        }
+                        ref={(input) => {
+                          if (input)
+                            input.indeterminate =
+                              visibleSelectedCount > 0 && !allVisibleSelected;
+                        }}
+                        disabled={!visible.length || saving}
+                        onChange={toggleVisibleSelection}
+                      />
+                      <span>Name</span>
+                    </div>
+                  </th>
                   <th scope="col">Size</th>
                   <th scope="col">Last modified</th>
                   <th scope="col">
@@ -459,22 +609,37 @@ export default function FileManager({ notify }: PageProps) {
                   </tr>
                 )}
                 {visible.map((entry) => (
-                  <tr key={entry.path}>
+                  <tr
+                    key={entry.path}
+                    className={
+                      selected.has(entry.path) ? "file-row-selected" : undefined
+                    }
+                  >
                     <td>
-                      <button
-                        className={`file-name ${entry.type === "directory" ? "directory" : ""}`}
-                        onClick={() => void openEntry(entry)}
-                        title={entry.name}
-                      >
-                        <EntryIcon entry={entry} />
-                        <span>{entry.name}</span>
-                        {entry.type === "directory" && (
-                          <ChevronRight
-                            size={13}
-                            className="file-open-chevron"
-                          />
-                        )}
-                      </button>
+                      <div className="file-selection-name">
+                        <input
+                          className="file-selection-checkbox"
+                          type="checkbox"
+                          aria-label={`Select ${entry.name}`}
+                          checked={selected.has(entry.path)}
+                          disabled={saving}
+                          onChange={() => toggleSelection(entry.path)}
+                        />
+                        <button
+                          className={`file-name ${entry.type === "directory" ? "directory" : ""}`}
+                          onClick={() => void openEntry(entry)}
+                          title={entry.name}
+                        >
+                          <EntryIcon entry={entry} />
+                          <span>{entry.name}</span>
+                          {entry.type === "directory" && (
+                            <ChevronRight
+                              size={13}
+                              className="file-open-chevron"
+                            />
+                          )}
+                        </button>
+                      </div>
                     </td>
                     <td className="muted">
                       {entry.type === "directory"
@@ -590,7 +755,9 @@ export default function FileManager({ notify }: PageProps) {
                       ? `New ${dialog.kind === "directory" ? "folder" : "file"}`
                       : dialog.type === "edit"
                         ? dialog.entry.name
-                        : "Delete this item?"}
+                        : dialog.type === "delete-many"
+                          ? "Delete selected items?"
+                          : "Delete this item?"}
                   </h2>
                   <p>
                     {dialog.type === "create"
@@ -660,6 +827,52 @@ export default function FileManager({ notify }: PageProps) {
                   from your server?
                 </p>
               )}
+              {dialog.type === "delete-many" && (
+                <div className="file-bulk-confirmation">
+                  <p>
+                    Permanently delete these {dialog.entries.length}{" "}
+                    {dialog.entries.length === 1 ? "item" : "items"} from your
+                    server?
+                  </p>
+                  {dialog.entries.some(
+                    (entry) => entry.type === "directory",
+                  ) && (
+                    <p className="file-bulk-folder-warning">
+                      Selected folders and everything inside them will be
+                      deleted, including nested files and folders.
+                    </p>
+                  )}
+                  <ul
+                    className="file-bulk-targets"
+                    aria-label="Items to delete"
+                  >
+                    {dialog.entries.map((entry) => (
+                      <li key={entry.path}>
+                        <EntryIcon entry={entry} />
+                        <div>
+                          <strong>{entry.name}</strong>
+                          <span>/{entry.path}</span>
+                          {entry.type === "directory" && (
+                            <small>Folder · includes all contents</small>
+                          )}
+                        </div>
+                      </li>
+                    ))}
+                  </ul>
+                  {!!dialog.failures?.length && (
+                    <ul
+                      className="file-bulk-errors"
+                      aria-label="Deletion errors"
+                    >
+                      {dialog.failures.map(({ entry, message }) => (
+                        <li key={entry.path}>
+                          <strong>{entry.name}:</strong> {message}
+                        </li>
+                      ))}
+                    </ul>
+                  )}
+                </div>
+              )}
               {dialogError && (
                 <p className="storage-form-error" role="alert">
                   {dialogError}
@@ -675,7 +888,7 @@ export default function FileManager({ notify }: PageProps) {
                   Cancel
                 </button>
                 <button
-                  className={`btn ${dialog.type === "delete" ? "danger" : "primary"}`}
+                  className={`btn ${dialog.type === "delete" || dialog.type === "delete-many" ? "danger" : "primary"}`}
                   disabled={
                     saving ||
                     (dialog.type === "edit" && (reading || readFailed)) ||
@@ -683,11 +896,17 @@ export default function FileManager({ notify }: PageProps) {
                   }
                 >
                   {saving && <LoaderCircle size={15} className="spin" />}
-                  {dialog.type === "delete"
-                    ? "Delete permanently"
-                    : dialog.type === "edit"
-                      ? "Save changes"
-                      : `Create ${dialog.kind === "directory" ? "folder" : "file"}`}
+                  {dialog.type === "delete-many"
+                    ? saving && deleteProgress !== null
+                      ? `Deleting ${deleteProgress} of ${dialog.entries.length}…`
+                      : dialog.failures?.length
+                        ? "Retry failed deletions"
+                        : "Delete selected permanently"
+                    : dialog.type === "delete"
+                      ? "Delete permanently"
+                      : dialog.type === "edit"
+                        ? "Save changes"
+                        : `Create ${dialog.kind === "directory" ? "folder" : "file"}`}
                 </button>
               </div>
             </form>

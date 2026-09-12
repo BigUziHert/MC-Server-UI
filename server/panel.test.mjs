@@ -17,7 +17,12 @@ import {
 
 async function fixture(t, options = {}) {
   const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), "mc-panel-test-"));
-  const panel = await createPanel({ dataDir, scheduler: false, ...options });
+  const panel = await createPanel({
+    dataDir,
+    scheduler: false,
+    publicAddress: { resolve: async () => null },
+    ...options,
+  });
   const listener = await new Promise((resolve) => {
     const instance = panel.app.listen(0, "127.0.0.1", () => resolve(instance));
   });

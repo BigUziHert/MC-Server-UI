@@ -11,6 +11,7 @@ import {
 } from "lucide-react";
 import { api, post } from "./api";
 import AddServer from "./AddServer";
+import { ServerIconImage } from "./ServerIcon";
 import {
   LaunchAdvancedFields,
   LaunchMemoryNote,
@@ -27,6 +28,8 @@ export type ServerRecord = {
   status: "running" | "offline" | "starting" | "stopping";
   mode: "demo" | "live";
   address: string;
+  connectionHost?: string;
+  iconVersion?: string | null;
   port: number;
   memoryLimitMB: number;
   jar: string;
@@ -65,7 +68,10 @@ export function ServerSwitcher({
       </div>
       <div className="fleet-select-wrap">
         <span className="server-mini">
-          <Box size={19} />
+          <ServerIconImage
+            name={selected.name}
+            version={selected.iconVersion}
+          />
         </span>
         <div className="fleet-selection">
           <select
@@ -140,6 +146,9 @@ function ServerSettings({
   let nextPort = 25565;
   while (servers.some((server) => server.port === nextPort)) nextPort++;
   const [name, setName] = useState(editing?.name ?? "");
+  const [connectionHost, setConnectionHost] = useState(
+    editing?.connectionHost ?? "",
+  );
   const [mode, setMode] = useState<"demo" | "live">(editing?.mode ?? "live");
   const [port, setPort] = useState(String(editing?.port ?? nextPort));
   const [memory, setMemory] = useState(String(editing?.memoryLimitMB ?? 4096));
@@ -171,6 +180,7 @@ function ServerSettings({
     setError("");
     const settings = {
       name: name.trim(),
+      connectionHost: connectionHost.trim(),
       mode,
       port: Number(port),
       ...(startup.launchType === "jar"
@@ -185,7 +195,11 @@ function ServerSettings({
             `/servers/${encodeURIComponent(editing.id)}`,
             {
               method: "PATCH",
-              body: JSON.stringify(running ? { name: name.trim() } : settings),
+              body: JSON.stringify(
+                running
+                  ? { name: name.trim(), connectionHost: connectionHost.trim() }
+                  : settings,
+              ),
             },
           )
         : await post<{ server: ServerRecord }>("/servers", settings);
@@ -266,6 +280,31 @@ function ServerSettings({
           />
           <small>The name shown throughout this panel.</small>
         </div>
+        <div className="form-field">
+          <label htmlFor="server-connection-host">
+            Player connection address
+          </label>
+          <input
+            id="server-connection-host"
+            value={connectionHost}
+            onChange={(event) => setConnectionHost(event.target.value)}
+            disabled={busy}
+            maxLength={253}
+            placeholder={
+              mode === "demo"
+                ? "Local demo address, or play.example.com"
+                : "Automatic public IP, or play.example.com"
+            }
+            spellCheck={false}
+          />
+          <small>
+            {mode === "demo"
+              ? "Leave blank to keep the local demo address."
+              : "Leave blank to detect the server PC’s public IP."}{" "}
+            Enter a hostname or IP without a port to override it. This does not
+            change server-ip or set up port forwarding.
+          </small>
+        </div>
         {editing?.source === "imported" && editing.serverDir && (
           <div className="form-field">
             <label htmlFor="saved-server-directory">Server folder</label>
@@ -291,8 +330,9 @@ function ServerSettings({
           <div className="server-form-note">
             <AlertCircle size={16} />
             <span>
-              You can rename this server now. Stop it from the console to change
-              its mode, connection settings, or in-game message.
+              You can rename this server or change its displayed address now.
+              Stop it from the console to change its mode, port, or in-game
+              message.
             </span>
           </div>
         )}

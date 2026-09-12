@@ -19,7 +19,7 @@
 }
 .players-summary > div > span {
   display: block;
-  color: #98a38f;
+  color: #b1b6ce;
   font-size: 12px;
   margin-bottom: 8px;
 }
@@ -35,25 +35,25 @@
 }
 .players-summary small {
   max-width: 95px;
-  color: #889580;
+  color: #969bb3;
   font-family: "DM Sans", sans-serif;
   font-size: 11px;
   font-weight: 400;
   line-height: 1.5;
 }
 .players-about > svg {
-  color: #99b67b;
+  color: #b1b6ce;
 }
 .players-about strong {
   font-size: 13px;
   font-weight: 550;
-  color: #d4dfc9;
+  color: #d4d8e9;
 }
 .players-about p {
   max-width: 470px;
   font-size: 12px;
   margin: 7px 0 0;
-  color: #8e9b84;
+  color: #969bb3;
 }
 .players-operator-list {
   list-style: none;
@@ -67,10 +67,10 @@
   padding: 20px 23px;
 }
 .players-operator + .players-operator {
-  border-top: 1px solid #2c3229;
+  border-top: 1px solid #272833;
 }
 .players-operator:hover {
-  background: #1e251b;
+  background: #20212b;
 }
 .players-operator-identity {
   min-width: 0;
@@ -80,13 +80,13 @@
   gap: 6px;
 }
 .players-operator-identity strong {
-  color: #dde7d4;
+  color: #eef0f8;
   font-size: 13px;
   font-weight: 550;
   overflow-wrap: anywhere;
 }
 .players-operator-identity > span {
-  color: #8a9b7c;
+  color: #969bb3;
   font-size: 11px;
   line-height: 1.5;
 }
@@ -95,10 +95,10 @@
   align-items: center;
   gap: 5px;
   padding: 5px 8px;
-  border: 1px solid #3f5030;
+  border: 1px solid #404356;
   border-radius: 5px;
-  background: #2a3620;
-  color: #b8d991;
+  background: #272833;
+  color: #b1b6ce;
   font-size: 10px;
   font-weight: 600;
   margin-right: 24px;
@@ -116,7 +116,7 @@
 }
 .players-list-footer a,
 .players-offline-notice a {
-  color: #bbd89d;
+  color: #d4d8e9;
   text-decoration: underline;
   text-underline-offset: 3px;
 }
@@ -131,11 +131,11 @@
   display: flex;
   align-items: flex-start;
   gap: 12px;
-  border: 1px solid #3e5031;
-  background: #212e19;
+  border: 1px solid #404356;
+  background: #20212b;
   border-radius: 9px;
   padding: 17px 20px;
-  color: #bfdd9e;
+  color: #d4d8e9;
 }
 .players-result > svg {
   margin-top: 2px;
@@ -151,7 +151,7 @@
 .players-result p {
   margin: 4px 0 0;
   font-size: 12px;
-  color: #a5b895;
+  color: #b1b6ce;
   overflow-wrap: anywhere;
 }
 .players-result > button {
@@ -161,9 +161,9 @@
   display: flex;
   align-items: flex-start;
   gap: 10px;
-  background: #252c1e;
-  border: 1px solid #414b34;
-  color: #b7c59e;
+  background: #20212b;
+  border: 1px solid #404356;
+  color: #b1b6ce;
   border-radius: 7px;
   padding: 14px;
 }
@@ -172,7 +172,7 @@
 }
 .players-permission-note p {
   margin: 0;
-  color: #a6b494;
+  color: #b1b6ce;
   font-size: 12px;
   line-height: 1.75;
 }

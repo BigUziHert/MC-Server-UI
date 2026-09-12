@@ -43,6 +43,7 @@ import AuditLogs from "./pages/AuditLogs";
 import Players from "./pages/Players";
 import PlayerHead from "./PlayerHead";
 import DesktopUpdates from "./DesktopUpdates";
+import ServerIcon from "./ServerIcon";
 import { version as appVersion } from "../package.json";
 import ServerManager, {
   ServerSwitcher,
@@ -65,8 +66,12 @@ type Server = {
   version: string;
   software: string;
   uptime: number;
-  cpu: number;
-  memory: number;
+  cpu: number | null;
+  memory: number | null;
+  metricsMessage?: string;
+  iconVersion?: string | null;
+  addressSource?: "public" | "custom" | "local";
+  addressNote?: string;
   memoryLimit: number;
   disk: number;
   diskLimit: number;
@@ -148,7 +153,7 @@ function useDialogFocus(open: boolean, onClose: () => void) {
 
 function Sparkline({
   values,
-  color = "#bbef62",
+  color = "#ffd000",
 }: {
   values: number[];
   color?: string;
@@ -531,8 +536,9 @@ function ServerWorkspace({
       setServer(s);
       setConnectionError("");
       setHistory((h) => ({
-        cpu: [...h.cpu.slice(-39), s.cpu],
-        memory: [...h.memory.slice(-39), s.memory],
+        cpu: s.cpu === null ? h.cpu : [...h.cpu.slice(-39), s.cpu],
+        memory:
+          s.memory === null ? h.memory : [...h.memory.slice(-39), s.memory],
       }));
     } catch (error) {
       setConnectionError((error as Error).message);
@@ -590,7 +596,11 @@ function ServerWorkspace({
         </a>
         <ServerSwitcher
           servers={servers}
-          selected={{ ...selected, status: server?.status ?? selected.status }}
+          selected={{
+            ...selected,
+            status: server?.status ?? selected.status,
+            iconVersion: server?.iconVersion,
+          }}
           onSelect={onSelect}
           onAdd={onAdd}
           onSettings={() => onSettings(server?.status)}
@@ -931,6 +941,7 @@ function ConsolePage({
   }
   const isRunning = server?.status === "running";
   const unavailable = server?.metricsAvailable === false;
+  const cpuUnavailable = unavailable || server?.cpu === null;
   const playersUnavailable = server?.playersAvailable === false;
   const hiddenIndex =
     hiddenUntil === null ? -1 : lines.findIndex((l) => l.id === hiddenUntil);
@@ -962,19 +973,11 @@ function ConsolePage({
       </div>
       <section className="server-banner">
         <div className="server-identity">
-          <div className="world-icon">
-            <div className="pixel-world">
-              <span />
-              <span />
-              <span />
-              <span />
-              <span />
-              <span />
-              <span />
-              <span />
-              <span />
-            </div>
-          </div>
+          <ServerIcon
+            version={server?.iconVersion}
+            name={server?.name || "Minecraft server"}
+            onSaved={refresh}
+          />
           <div>
             <div className="server-title">
               <h2>{server?.name || "Minecraft Server"}</h2>
@@ -997,10 +1000,20 @@ function ConsolePage({
               className="address-button"
               onClick={copyAddress}
               aria-label="Copy server address"
+              title={server?.addressNote}
             >
               <span>{server?.address || "localhost:25565"}</span>
               <Copy size={12} />
             </button>
+            {server?.mode === "live" && (
+              <span className="address-source" title={server.addressNote}>
+                {server.addressSource === "public"
+                  ? "Public address · forwarding not checked"
+                  : server.addressSource === "custom"
+                    ? "Custom connection address"
+                    : "Local address · public IP unavailable"}
+              </span>
+            )}
           </div>
         </div>
         <div className="server-power">
@@ -1052,17 +1065,19 @@ function ConsolePage({
             <span className="metric-indicator" />
           </div>
           <div className="metric-value">
-            {unavailable ? "—" : (server?.cpu || 0).toFixed(1)}
-            <span>{unavailable ? "" : "%"}</span>
+            {cpuUnavailable ? "—" : (server?.cpu || 0).toFixed(1)}
+            <span>{cpuUnavailable ? "" : "%"}</span>
           </div>
           <div className="metric-subtitle">
-            {unavailable
-              ? "Telemetry not connected"
+            {cpuUnavailable
+              ? server?.metricsMessage || "Waiting for server process…"
               : server?.mode === "demo"
                 ? "Simulated utilization"
-                : "Process utilization"}
+                : server?.status === "offline"
+                  ? "Server offline"
+                  : "Server processes · 100% = one core"}
           </div>
-          {!unavailable && <Sparkline values={history.cpu} />}
+          {!cpuUnavailable && <Sparkline values={history.cpu} />}
         </div>
         <div className="metric-card">
           <div className="metric-label">
@@ -1075,8 +1090,12 @@ function ConsolePage({
           </div>
           <div className="metric-subtitle">
             {unavailable
-              ? "Telemetry not connected"
-              : `of ${formatBytes(server?.memoryLimit || 0)} allocated`}
+              ? server?.metricsMessage || "Waiting for server process…"
+              : server?.mode === "demo"
+                ? `of ${formatBytes(server?.memoryLimit || 0)} allocated`
+                : server?.status === "offline"
+                  ? "Server offline"
+                  : "Physical memory · server processes"}
           </div>
           {!unavailable && (
             <Sparkline values={history.memory} color="#97b9f5" />
@@ -1120,20 +1139,6 @@ function ConsolePage({
               : server?.mode === "demo"
                 ? "Demo player list"
                 : "Connected to your world"}
-          </div>
-          <div className="player-capacity">
-            {Array.from({ length: 20 }, (_, i) => (
-              <span
-                key={i}
-                className={
-                  i <
-                  ((server?.players.length || 0) / (server?.maxPlayers || 20)) *
-                    20
-                    ? "filled"
-                    : ""
-                }
-              />
-            ))}
           </div>
           <div className="metric-footnote">Room for more adventures</div>
         </div>
@@ -1322,7 +1327,13 @@ function ConsolePage({
               </div>
               <div>
                 <dt>Connection</dt>
-                <dd className="lime-text">Localhost</dd>
+                <dd className="lime-text" title={server?.addressNote}>
+                  {server?.addressSource === "public"
+                    ? "Public IP"
+                    : server?.addressSource === "custom"
+                      ? "Custom address"
+                      : "Localhost"}
+                </dd>
               </div>
             </dl>
             <button className="card-link" onClick={() => navigate("files")}>

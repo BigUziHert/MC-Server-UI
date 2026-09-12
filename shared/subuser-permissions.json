@@ -1,0 +1,216 @@
+{
+  "version": 1,
+  "groups": [
+    {
+      "id": "control",
+      "label": "Control",
+      "description": "Console access and server power controls.",
+      "permissions": [
+        {
+          "id": "control.console",
+          "label": "Console",
+          "description": "View server output and send console commands."
+        },
+        {
+          "id": "control.start",
+          "label": "Start",
+          "description": "Start the server when it is offline."
+        },
+        {
+          "id": "control.stop",
+          "label": "Stop",
+          "description": "Stop a running server."
+        },
+        {
+          "id": "control.restart",
+          "label": "Restart",
+          "description": "Restart the server."
+        }
+      ]
+    },
+    {
+      "id": "user",
+      "label": "User",
+      "description": "Manage subuser records and their intended permissions.",
+      "permissions": [
+        {
+          "id": "user.read",
+          "label": "View users",
+          "description": "View the server's subuser records."
+        },
+        {
+          "id": "user.create",
+          "label": "Create users",
+          "description": "Add new subuser records."
+        },
+        {
+          "id": "user.update",
+          "label": "Update users",
+          "description": "Change a subuser's intended permissions."
+        },
+        {
+          "id": "user.delete",
+          "label": "Delete users",
+          "description": "Remove subuser records."
+        }
+      ]
+    },
+    {
+      "id": "file",
+      "label": "Files",
+      "description": "Browse and manage the server's files.",
+      "permissions": [
+        {
+          "id": "file.read",
+          "label": "List files",
+          "description": "View folders and file information."
+        },
+        {
+          "id": "file.read-content",
+          "label": "Read and download files",
+          "description": "Open file contents and download server files."
+        },
+        {
+          "id": "file.create",
+          "label": "Create and upload files",
+          "description": "Create folders and files, and upload new files."
+        },
+        {
+          "id": "file.update",
+          "label": "Edit files",
+          "description": "Change the contents of existing files."
+        },
+        {
+          "id": "file.delete",
+          "label": "Delete files",
+          "description": "Permanently delete files and folders."
+        }
+      ]
+    },
+    {
+      "id": "backup",
+      "label": "Backups",
+      "description": "Manage backup archives and automatic schedules.",
+      "permissions": [
+        {
+          "id": "backup.read",
+          "label": "View backups",
+          "description": "View backup archives and their status."
+        },
+        {
+          "id": "backup.create",
+          "label": "Create backups",
+          "description": "Create a new backup of the server's files."
+        },
+        {
+          "id": "backup.download",
+          "label": "Download backups",
+          "description": "Download existing backup archives."
+        },
+        {
+          "id": "backup.delete",
+          "label": "Delete backups",
+          "description": "Permanently remove backup archives."
+        },
+        {
+          "id": "backup.update",
+          "label": "Manage backup schedules",
+          "description": "Change automatic backup timing and retention."
+        }
+      ]
+    },
+    {
+      "id": "database",
+      "label": "Databases",
+      "description": "Manage the server's local database files.",
+      "permissions": [
+        {
+          "id": "database.read",
+          "label": "View databases",
+          "description": "View database records and file information."
+        },
+        {
+          "id": "database.create",
+          "label": "Create databases",
+          "description": "Create a new database."
+        },
+        {
+          "id": "database.download",
+          "label": "Download databases",
+          "description": "Download database files."
+        },
+        {
+          "id": "database.delete",
+          "label": "Delete databases",
+          "description": "Permanently delete databases."
+        }
+      ]
+    },
+    {
+      "id": "audit",
+      "label": "Audit",
+      "description": "Review server management activity.",
+      "permissions": [
+        {
+          "id": "audit.read",
+          "label": "View audit logs",
+          "description": "Read and search recorded server activity."
+        }
+      ]
+    }
+  ],
+  "roleDefaults": {
+    "admin": [
+      "control.console",
+      "control.start",
+      "control.stop",
+      "control.restart",
+      "user.read",
+      "user.create",
+      "user.update",
+      "user.delete",
+      "file.read",
+      "file.read-content",
+      "file.create",
+      "file.update",
+      "file.delete",
+      "backup.read",
+      "backup.create",
+      "backup.download",
+      "backup.delete",
+      "backup.update",
+      "database.read",
+      "database.create",
+      "database.download",
+      "database.delete",
+      "audit.read"
+    ],
+    "operator": [
+      "control.console",
+      "control.start",
+      "control.stop",
+      "control.restart",
+      "file.read",
+      "file.read-content",
+      "file.create",
+      "file.update",
+      "file.delete",
+      "backup.read",
+      "backup.create",
+      "backup.download",
+      "backup.delete",
+      "backup.update",
+      "database.read",
+      "database.download",
+      "audit.read"
+    ],
+    "viewer": [
+      "file.read",
+      "file.read-content",
+      "backup.read",
+      "backup.download",
+      "database.read",
+      "audit.read"
+    ]
+  }
+}

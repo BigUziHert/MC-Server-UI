@@ -31,6 +31,7 @@ async function fixture(t, options = {}) {
       createDefaultServer: false,
       scheduler: false,
       useEnvironment: false,
+      publicAddress: { resolve: async () => null },
       ...options,
       ...extra,
     });
