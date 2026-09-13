@@ -377,15 +377,51 @@ export async function createLaunchpad(ctx) {
     }
     return rows;
   }
+  async function enrichProjectMetadata(items, warnings) {
+    await Promise.all(
+      providers.map(async (found) => {
+        if (!found.projectMetadata) return;
+        const known = items.filter(
+          (item) => item.platform === found.id && item.projectId,
+        );
+        if (!known.length) return;
+        try {
+          const result = await found.projectMetadata(
+            known.map((item) => item.projectId),
+          );
+          const projects = new Map(
+            result.projects.map((project) => [String(project.id), project]),
+          );
+          for (const item of known) {
+            const project = projects.get(String(item.projectId));
+            if (typeof project?.title === "string" && project.title.trim())
+              item.title = project.title;
+            if (project?.iconUrl) item.iconUrl = project.iconUrl;
+          }
+          warnings.push(
+            ...result.warnings.map(
+              (warning) => `${found.name} project details: ${warning}`,
+            ),
+          );
+        } catch (cause) {
+          warnings.push(`${found.name} project details: ${cause.message}`);
+        }
+      }),
+    );
+  }
   async function installed(input) {
     input = selection(input);
-    if (input.type === "modpack")
+    if (input.type === "modpack") {
+      const items = receipts
+        .filter((item) => item.type === "modpack" && item.pack)
+        .map((item) => ({ ...item }));
+      const warnings = [];
+      await enrichProjectMetadata(items, warnings);
       return {
-        items: receipts
-          .filter((item) => item.type === "modpack" && item.pack)
-          .map((item) => ({ ...item, name: item.title })),
-        warnings: [],
+        items: items.map((item) => ({ ...item, name: item.title })),
+        warnings,
       };
+    }
     const items = await scan(input.type),
       warnings = [];
     const unknown = items.filter((item) => !item.platform);
@@ -462,6 +498,9 @@ export async function createLaunchpad(ctx) {
         }
       }
     }
+    // Names and icons belong to the project, even with All loaders/versions.
+    // Failed metadata requests must not suppress identification or updates.
+    await enrichProjectMetadata(items, warnings);
     const checked = new Map();
     for (const item of items) {
       if (!item.platform || !input.gameVersion || !input.loader) continue;
@@ -607,6 +646,7 @@ export async function createLaunchpad(ctx) {
           versionId: String(value.versionId),
           versionName: result.versionName,
           title: result.title,
+          iconUrl: result.iconUrl,
           type: value.type,
           hosts: found.downloadHosts,
         });
@@ -841,6 +881,7 @@ export async function createLaunchpad(ctx) {
             projectId: input.projectId,
             versionId: input.versionId,
             title: result.title,
+            iconUrl: result.iconUrl,
             versionName: result.versionName,
             type: input.type,
             hosts: file.hosts ?? found.downloadHosts,
@@ -935,6 +976,7 @@ export async function createLaunchpad(ctx) {
         stage,
         files,
         title: result.title,
+        iconUrl: result.iconUrl,
         versionName: result.versionName,
         warnings: [...new Set(result.warnings)],
         loaderInstall: result.loaderInstall,
@@ -1048,6 +1090,7 @@ export async function createLaunchpad(ctx) {
                   versionId: file.versionId,
                   versionName: file.versionName,
                   title: file.title,
+                  iconUrl: file.iconUrl,
                 }),
             type: file.type,
             installedAt: new Date().toISOString(),
@@ -1063,6 +1106,7 @@ export async function createLaunchpad(ctx) {
             projectId: plan.input.projectId,
             versionId: plan.input.versionId,
             title: plan.title,
+            iconUrl: plan.iconUrl,
             versionName: plan.versionName,
             path: "",
             installedAt: new Date().toISOString(),

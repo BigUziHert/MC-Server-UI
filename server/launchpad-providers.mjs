@@ -29,6 +29,99 @@ const fileName = (value) => {
 const fits = (version, input) =>
   (!input.gameVersion || version.gameVersions.includes(input.gameVersion)) &&
   (!input.loader || version.loaders.includes(input.loader));
+const iconUrl = (value) => {
+  try {
+    const url = new URL(value);
+    return url.protocol === "https:" && !url.username && !url.password
+      ? url.href
+      : undefined;
+  } catch {
+    return undefined;
+  }
+};
+// Project identity is independent of the selected Minecraft version or loader.
+// Batch up to 100 IDs, coalesce overlapping callers, and briefly cache failures
+// so polling an unavailable provider does not create a request storm.
+function projectMetadataLookup(loadBatch, normalize) {
+  const cache = new Map(),
+    pending = new Map();
+  let queue = Promise.resolve(),
+    failureUntil = 0,
+    failureWarning = "";
+  return async (projectIds) => {
+    const ids = [...new Set(projectIds.map((value) => id(String(value))))];
+    if (ids.length > 1000)
+      throw launchpadError(400, "Too many projects were requested at once.");
+    const now = Date.now();
+    for (const [key, entry] of cache)
+      if (entry.expiresAt <= now) cache.delete(key);
+    const missing = ids.filter(
+      (value) => !cache.has(value) && !pending.has(value),
+    );
+    for (let offset = 0; offset < missing.length; offset += 100) {
+      const batch = missing.slice(offset, offset + 100);
+      const task = queue.then(async () => {
+        const entries = new Map();
+        const coolingDown = failureUntil > Date.now();
+        try {
+          if (coolingDown) throw new Error(failureWarning);
+          const rows = await loadBatch(batch, AbortSignal.timeout(8000));
+          if (!Array.isArray(rows))
+            throw launchpadError(
+              502,
+              "The provider returned invalid project metadata.",
+            );
+          const projects = new Map(
+            rows.map((row) => [String(row.id), normalize(row)]),
+          );
+          for (const value of batch)
+            entries.set(value, {
+              project: projects.get(value),
+              expiresAt: Date.now() + 10 * 60_000,
+            });
+        } catch (cause) {
+          if (!coolingDown) {
+            failureUntil = Date.now() + 30_000;
+            failureWarning =
+              cause.name === "TimeoutError"
+                ? "Project details took too long to load. Cached details are still available. Try again shortly."
+                : cause.message;
+          }
+          for (const value of batch)
+            entries.set(value, {
+              warning: failureWarning,
+              expiresAt: failureUntil,
+            });
+        }
+        for (const [value, entry] of entries) {
+          cache.delete(value);
+          cache.set(value, entry);
+        }
+        while (cache.size > 2000) cache.delete(cache.keys().next().value);
+        return entries;
+      });
+      queue = task.then(() => {});
+      for (const value of batch) {
+        const lookup = task.then((entries) => entries.get(value));
+        pending.set(value, lookup);
+        void lookup.then(() => pending.delete(value));
+      }
+    }
+    const entries = await Promise.all(
+      ids.map((value) => pending.get(value) ?? cache.get(value)),
+    );
+    return {
+      projects: entries.flatMap((entry) =>
+        entry?.project ? [entry.project] : [],
+      ),
+      warnings: [
+        ...new Set(
+          entries.flatMap((entry) => (entry?.warning ? [entry.warning] : [])),
+        ),
+      ],
+    };
+  };
+}
 function mrVersion(value) {
   return {
     id: String(value.id),
@@ -120,6 +213,47 @@ export function createCoreProviders({
       headers: { "x-api-key": secret, ...(options?.headers ?? {}) },
     });
   };
+  // Official batch endpoints avoid one request per installed JAR:
+  // https://docs.modrinth.com/api/operations/getprojects/
+  // https://docs.curseforge.com/rest-api/#get-mods
+  const mrMetadata = projectMetadataLookup(
+    (ids, signal) =>
+      json(
+        `${mr}/projects?${new URLSearchParams({ ids: JSON.stringify(ids) })}`,
+        { signal },
+      ),
+    (project) => ({
+      id: String(project.id),
+      title: project.title,
+      iconUrl: iconUrl(project.icon_url),
+    }),
+  );
+  const cfMetadata = projectMetadataLookup(
+    async (ids, signal) =>
+      (
+        await curseJson("/mods", {
+          method: "POST",
+          signal,
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            modIds: ids.map((value) => {
+              const number = Number(value);
+              if (!Number.isSafeInteger(number) || number <= 0)
+                throw launchpadError(400, "Choose a valid CurseForge project.");
+              return number;
+            }),
+          }),
+        })
+      ).data,
+    (project) =>
+      project.gameId === 432
+        ? {
+            id: String(project.id),
+            title: project.name,
+            iconUrl: iconUrl(project.logo?.thumbnailUrl ?? project.logo?.url),
+          }
+        : undefined,
+  );
   let categories;
   async function cfClass(type) {
     categories ??= curseJson("/categories?gameId=432&classesOnly=true")
@@ -163,6 +297,7 @@ export function createCoreProviders({
       available: true,
       sortOptions: mrSortOptions,
       downloadHosts: ["cdn.modrinth.com"],
+      projectMetadata: mrMetadata,
       async search(input) {
         const facets = [
           [`all_project_types:${input.type}`],
@@ -255,6 +390,7 @@ export function createCoreProviders({
         if (input.type === "modpack")
           return {
             title: project.title,
+            iconUrl: iconUrl(project.icon_url),
             versionName: value.name,
             archive: { ...download, format: "mrpack" },
             warnings: [],
@@ -274,6 +410,7 @@ export function createCoreProviders({
           );
         return {
           title: project.title,
+          iconUrl: iconUrl(project.icon_url),
           versionName: value.name,
           files: [{ path: fileName(file.filename), ...download }],
           dependencies,
@@ -292,9 +429,16 @@ export function createCoreProviders({
         return json(`${mr}/version/${enc(id(versionId))}`);
       },
       async gameVersions() {
-        return (await json(`${mr}/tag/game_version`))
-          .filter((row) => row.version_type === "release")
-          .map((row) => row.version);
+        // Keep release, snapshot, beta and alpha tags in actual release-date order.
+        // https://docs.modrinth.com/api/operations/versionlist/
+        const versions = (await json(`${mr}/tag/game_version`))
+          .filter(
+            (row) => typeof row?.version === "string" && row.version.trim(),
+          )
+          .sort(
+            (a, b) => (Date.parse(b.date) || 0) - (Date.parse(a.date) || 0),
+          );
+        return [...new Set(versions.map((row) => row.version))];
       },
     },
     {
@@ -309,6 +453,12 @@ export function createCoreProviders({
         "mediafilez.forgecdn.net",
         "media.forgecdn.net",
       ],
+      async projectMetadata(ids) {
+        // A newly configured key should work immediately instead of reusing a
+        // cached missing-key failure from a previous installed-files poll.
+        if (!(await key())) return { projects: [], warnings: [] };
+        return cfMetadata(ids);
+      },
       async search(input) {
         const query = new URLSearchParams({
           gameId: "432",
@@ -413,6 +563,7 @@ export function createCoreProviders({
         if (input.type === "modpack")
           return {
             title: project.name,
+            iconUrl: iconUrl(project.logo?.thumbnailUrl ?? project.logo?.url),
             versionName: file.displayName,
             archive: { ...download, format: "server-zip" },
             warnings: [
@@ -427,6 +578,7 @@ export function createCoreProviders({
           );
         return {
           title: project.name,
+          iconUrl: iconUrl(project.logo?.thumbnailUrl ?? project.logo?.url),
           versionName: file.displayName,
           files: [{ path: fileName(file.fileName), ...download }],
           dependencies: (file.dependencies ?? [])

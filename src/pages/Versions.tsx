@@ -9,7 +9,6 @@ import {
   Info,
   Layers,
   LoaderCircle,
-  Package,
   RefreshCw,
   Search,
   ShieldCheck,
@@ -44,26 +43,44 @@ type Job = {
   progress?: { phase?: string; message?: string };
 };
 
-const marks: Record<string, string> = {
-  vanilla: "V",
-  paper: "P",
-  pufferfish: "Pf",
-  spigot: "S",
-  purpur: "Pu",
-  waterfall: "W",
-  velocity: "Ve",
-  fabric: "F",
-  quilt: "Q",
-  forge: "Fg",
-  neoforge: "N",
-  mohist: "M",
-  arclight: "A",
-  sponge: "Sp",
-  leaves: "L",
-  canvas: "C",
-  magma: "Mg",
-  folia: "Fo",
+const softwareIcons: Record<string, string> = {
+  vanilla: "vanilla.png",
+  paper: "paper.svg",
+  pufferfish: "pufferfish.png",
+  spigot: "spigot.png",
+  purpur: "purpur.svg",
+  waterfall: "waterfall.svg",
+  velocity: "velocity.svg",
+  fabric: "fabric.png",
+  quilt: "quilt.svg",
+  forge: "forge.png",
+  neoforge: "neoforge.svg",
+  mohist: "mohist.png",
+  arclight: "arclight.png",
+  sponge: "sponge.svg",
+  leaves: "leaves.svg",
+  canvas: "canvas.png",
+  magma: "magma.png",
+  folia: "folia.png",
 };
+
+function SoftwareIcon({ software }: { software: string }) {
+  const id = software.trim().toLowerCase();
+  const source = Object.hasOwn(softwareIcons, id) ? softwareIcons[id] : null;
+  const [failed, setFailed] = useState<string | null>(null);
+  return source && failed !== source ? (
+    <img
+      className={`software-logo software-logo-${id}`}
+      src={`/software-icons/${source}`}
+      alt=""
+      aria-hidden="true"
+      draggable={false}
+      onError={() => setFailed(source)}
+    />
+  ) : (
+    <Layers className="software-logo-fallback" size={22} aria-hidden="true" />
+  );
+}
 
 export default function Versions({ notify }: PageProps) {
   const { api, post } = useServerApi();
@@ -297,7 +314,7 @@ export default function Versions({ notify }: PageProps) {
       {current && (
         <section className="versions-current panel">
           <div className="versions-current-icon">
-            <Layers size={21} />
+            <SoftwareIcon software={current.software} />
           </div>
           <div>
             <span className="eyebrow">CURRENT SOFTWARE</span>
@@ -393,7 +410,7 @@ export default function Versions({ notify }: PageProps) {
                   key={provider.id}
                 >
                   <div className="version-provider-mark" aria-hidden="true">
-                    {marks[provider.id] || provider.name.slice(0, 2)}
+                    <SoftwareIcon software={provider.id} />
                   </div>
                   <div className="version-provider-content">
                     <div className="version-provider-top">
@@ -456,7 +473,7 @@ export default function Versions({ notify }: PageProps) {
           <div className="versions-browser">
             <section className="panel versions-releases">
               <div className="panel-title">
-                <Package size={16} />
+                <SoftwareIcon software={selected.id} />
                 <h3>
                   {selected.kind === "proxy"
                     ? "Proxy releases"
@@ -518,7 +535,7 @@ export default function Versions({ notify }: PageProps) {
               </div>
               {!version ? (
                 <div className="versions-empty">
-                  <Layers size={36} />
+                  <SoftwareIcon software={selected.id} />
                   <h3>Find the right version for your world</h3>
                   <p>
                     Select a release to see available builds from{" "}
@@ -535,7 +552,7 @@ export default function Versions({ notify }: PageProps) {
                   {shownBuilds.map((build, index) => (
                     <div className="versions-build" key={build.id}>
                       <div className="versions-build-icon">
-                        <Package size={18} />
+                        <SoftwareIcon software={selected.id} />
                       </div>
                       <div className="versions-build-info">
                         <strong>

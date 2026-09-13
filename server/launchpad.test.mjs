@@ -14,6 +14,7 @@ import { createRecycleBin } from "./recycle-bin.mjs";
 import { containedSourcePath } from "./import.mjs";
 import { unpackProviderZip, safeInstallPath } from "./launchpad-archives.mjs";
 import { downloadVerified } from "./launchpad-network.mjs";
+import { createCoreProviders } from "./launchpad-providers.mjs";
 
 const bytes = (value) => Buffer.from(value);
 const safePath = (root, relative = "") =>
@@ -167,6 +168,14 @@ async function fixture(t, options = {}) {
       return Response.json([{ version: "1.21.1", version_type: "release" }]);
     if (address.pathname === "/v2/version_files")
       return Response.json({ [hashes(old).sha512]: versions.old });
+    if (address.pathname === "/v2/projects")
+      return Response.json(
+        JSON.parse(address.searchParams.get("ids")).map((id) => ({
+          id,
+          title: "Fixture Project",
+          icon_url: `https://cdn.modrinth.com/data/${id}/icon.png`,
+        })),
+      );
     if (address.pathname.startsWith("/v2/version/"))
       return Response.json(versions[address.pathname.split("/").at(-1)]);
     if (address.pathname.endsWith("/version"))
@@ -179,6 +188,7 @@ async function fixture(t, options = {}) {
       return Response.json({
         id: address.pathname.split("/").at(-1),
         title: "Fixture Project",
+        icon_url: "https://cdn.modrinth.com/data/project/icon.png",
         project_type: options.type ?? "mod",
         server_side: "required",
       });
@@ -338,6 +348,11 @@ test("Launchpad hash-identifies installed mods, filters compatibility, confirms 
   const installed = await f.service.installed(selection);
   assert.equal(installed.items[0].projectId, "project");
   assert.equal(installed.items[0].update.id, "new");
+  assert.equal(installed.items[0].title, "Fixture Project");
+  assert.equal(
+    installed.items[0].iconUrl,
+    "https://cdn.modrinth.com/data/project/icon.png",
+  );
   const plan = await f.service.preview({
     ...selection,
     replacePath: "mods/old.jar",
@@ -383,9 +398,346 @@ test("Launchpad hash-identifies installed mods, filters compatibility, confirms 
     f.old,
   );
   const restarted = await f.boot();
+  const saved = JSON.parse(
+    await fs.readFile(
+      path.join(f.dataDir, "launchpad", "installed.json"),
+      "utf8",
+    ),
+  );
+  assert.equal(
+    saved[0].iconUrl,
+    "https://cdn.modrinth.com/data/project/icon.png",
+  );
   assert.equal(
     (await restarted.installed(selection)).items[0].versionId,
     "new",
+  );
+});
+
+test("installed project icons and titles are available with All loaders and All versions", async (t) => {
+  const f = await fixture(t);
+  const result = await f.service.installed({
+    ...selection,
+    gameVersion: "",
+    loader: "",
+  });
+  assert.equal(result.items[0].title, "Fixture Project");
+  assert.equal(result.items[0].versionName, "Existing version");
+  assert.equal(
+    result.items[0].iconUrl,
+    "https://cdn.modrinth.com/data/project/icon.png",
+  );
+  assert.equal(result.items[0].update, undefined);
+  assert.equal(result.warnings.length, 0);
+  assert.equal(
+    f.requests.some(({ url }) => new URL(url).pathname.endsWith("/version")),
+    false,
+  );
+  await f.service.installed({ ...selection, gameVersion: "", loader: "" });
+  assert.equal(
+    f.requests.filter(({ url }) => new URL(url).pathname === "/v2/projects")
+      .length,
+    1,
+  );
+});
+
+test("old mod and modpack receipts are enriched without compatibility filters or filesystem writes", async (t) => {
+  const f = await fixture(t, {
+    request: async (url, init) => {
+      if (new URL(url).pathname !== "/v1/mods") return;
+      assert.equal(init.method, "POST");
+      assert.deepEqual(JSON.parse(init.body), { modIds: [11] });
+      return Response.json({
+        data: [
+          {
+            id: 11,
+            gameId: 432,
+            name: "CurseForge Project",
+            logo: {
+              thumbnailUrl: "https://media.forgecdn.net/avatars/fixture.png",
+            },
+          },
+        ],
+      });
+    },
+  });
+  const receiptPath = path.join(f.dataDir, "launchpad", "installed.json");
+  const legacy = [
+    {
+      path: "mods/old.jar",
+      sha512: hashes(f.old).sha512,
+      platform: "curseforge",
+      projectId: "11",
+      versionId: "21",
+      title: "Old version label",
+      versionName: "1.0",
+      type: "mod",
+    },
+    {
+      path: "",
+      pack: true,
+      platform: "modrinth",
+      projectId: "pack",
+      versionId: "pack-version",
+      title: "Pack version label",
+      type: "modpack",
+    },
+  ];
+  await fs.writeFile(receiptPath, JSON.stringify(legacy));
+  const restarted = await f.boot();
+  await restarted.settings({ curseforgeApiKey: "fixture-key" });
+  const mods = await restarted.installed({
+    ...selection,
+    loader: "",
+    gameVersion: "",
+  });
+  assert.equal(mods.items[0].title, "CurseForge Project");
+  assert.equal(
+    mods.items[0].iconUrl,
+    "https://media.forgecdn.net/avatars/fixture.png",
+  );
+  const packs = await restarted.installed({
+    ...selection,
+    type: "modpack",
+    loader: "",
+    gameVersion: "",
+  });
+  assert.equal(packs.items[0].title, "Fixture Project");
+  assert.equal(packs.items[0].name, "Fixture Project");
+  assert.equal(
+    packs.items[0].iconUrl,
+    "https://cdn.modrinth.com/data/pack/icon.png",
+  );
+  assert.deepEqual(JSON.parse(await fs.readFile(receiptPath, "utf8")), legacy);
+});
+
+test("metadata failures preserve installed files, receipt icons, and compatible update checks with a short retry cache", async (t) => {
+  let now = Date.now();
+  t.mock.method(Date, "now", () => now);
+  const f = await fixture(t, {
+    request: async (url) => {
+      if (new URL(url).pathname === "/v2/projects")
+        return new Response("Unavailable", { status: 503 });
+    },
+  });
+  const receiptPath = path.join(f.dataDir, "launchpad", "installed.json");
+  await fs.writeFile(
+    receiptPath,
+    JSON.stringify([
+      {
+        path: "mods/old.jar",
+        sha512: hashes(f.old).sha512,
+        platform: "modrinth",
+        projectId: "project",
+        versionId: "old",
+        title: "Saved project title",
+        iconUrl: "https://cdn.modrinth.com/saved-icon.png",
+        type: "mod",
+      },
+    ]),
+  );
+  const restarted = await f.boot();
+  for (let count = 0; count < 2; count++) {
+    const result = await restarted.installed(selection);
+    assert.equal(result.items.length, 1);
+    assert.equal(result.items[0].title, "Saved project title");
+    assert.equal(
+      result.items[0].iconUrl,
+      "https://cdn.modrinth.com/saved-icon.png",
+    );
+    assert.equal(result.items[0].update.id, "new");
+    assert.match(result.warnings.join(" "), /Modrinth project details/);
+  }
+  assert.equal(
+    f.requests.filter(({ url }) => new URL(url).pathname === "/v2/projects")
+      .length,
+    1,
+  );
+  now += 30_001;
+  await restarted.installed(selection);
+  assert.equal(
+    f.requests.filter(({ url }) => new URL(url).pathname === "/v2/projects")
+      .length,
+    2,
+  );
+  assert.deepEqual(
+    await fs.readFile(path.join(f.serverDir, "mods", "old.jar")),
+    f.old,
+  );
+});
+
+test("project metadata batching coalesces concurrent overlapping callers and refreshes after its TTL", async (t) => {
+  let now = Date.now(),
+    release;
+  t.mock.method(Date, "now", () => now);
+  const held = new Promise((resolve) => {
+    release = resolve;
+  });
+  const requests = [];
+  const modrinth = createCoreProviders({
+    fetch: async (url) => {
+      const address = new URL(url);
+      assert.equal(address.origin, "https://api.modrinth.com");
+      assert.equal(address.pathname, "/v2/projects");
+      assert.deepEqual([...address.searchParams.keys()], ["ids"]);
+      const ids = JSON.parse(address.searchParams.get("ids"));
+      assert.ok(ids.length <= 100);
+      requests.push(ids);
+      await held;
+      return Response.json(
+        ids.map((id) => ({
+          id,
+          title: `Project ${id}`,
+          icon_url: `https://cdn.modrinth.com/${id}.png`,
+        })),
+      );
+    },
+  }).find(({ id }) => id === "modrinth");
+  const first = modrinth.projectMetadata(
+    Array.from({ length: 205 }, (_, index) => `p${index}`),
+  );
+  const second = modrinth.projectMetadata(
+    Array.from({ length: 205 }, (_, index) => `p${index + 50}`),
+  );
+  release();
+  const results = await Promise.all([first, second]);
+  assert.equal(results[0].projects.length, 205);
+  assert.equal(results[1].projects.length, 205);
+  assert.equal(requests.length, 4);
+  assert.equal(new Set(requests.flat()).size, 255);
+  assert.equal(requests.flat().length, 255, "overlapping IDs are fetched once");
+  await modrinth.projectMetadata(["p0", "p254"]);
+  assert.equal(requests.length, 4);
+  now += 10 * 60_000 + 1;
+  await modrinth.projectMetadata(["p0", "p254"]);
+  assert.equal(requests.length, 5);
+});
+
+test("CurseForge project metadata uses authenticated batches, handles newly configured keys and ignores unsafe icon schemes", async () => {
+  let secret = null;
+  const requests = [];
+  const curseforge = createCoreProviders({
+    key: async () => secret,
+    fetch: async (url, init) => {
+      assert.equal(url, "https://api.curseforge.com/v1/mods");
+      assert.equal(init.method, "POST");
+      assert.equal(init.headers["x-api-key"], "fixture-key");
+      const { modIds } = JSON.parse(init.body);
+      requests.push(modIds);
+      return Response.json({
+        data: modIds.map((id) => ({
+          id,
+          gameId: id === 13 ? 999 : 432,
+          name: `Project ${id}`,
+          logo: {
+            thumbnailUrl:
+              id === 12
+                ? "javascript:alert(1)"
+                : `https://media.forgecdn.net/${id}.png`,
+          },
+        })),
+      });
+    },
+  }).find(({ id }) => id === "curseforge");
+  assert.deepEqual((await curseforge.projectMetadata(["11"])).projects, []);
+  assert.equal(requests.length, 0);
+  secret = "fixture-key";
+  const [first, second] = await Promise.all([
+    curseforge.projectMetadata(["11", "12", "13"]),
+    curseforge.projectMetadata(["11", "12"]),
+  ]);
+  assert.deepEqual(requests, [[11, 12, 13]]);
+  assert.deepEqual(
+    first.projects.map(({ id }) => id),
+    ["11", "12"],
+  );
+  assert.equal(first.projects[0].iconUrl, "https://media.forgecdn.net/11.png");
+  assert.equal(first.projects[1].iconUrl, undefined);
+  assert.deepEqual(first.projects, second.projects);
+});
+
+test("metadata timeout cools down queued batches without hiding cached icons or extending the retry deadline", async (t) => {
+  let now = Date.now(),
+    stalled = false;
+  t.mock.method(Date, "now", () => now);
+  const timeouts = [],
+    requests = [];
+  const timeout = AbortSignal.timeout.bind(AbortSignal);
+  t.mock.method(AbortSignal, "timeout", (milliseconds) => {
+    timeouts.push(milliseconds);
+    return stalled
+      ? AbortSignal.abort(
+          new DOMException("Fixture metadata timeout", "TimeoutError"),
+        )
+      : timeout(milliseconds);
+  });
+  const modrinth = createCoreProviders({
+    fetch: async (url, init) => {
+      const ids = JSON.parse(new URL(url).searchParams.get("ids"));
+      requests.push(ids);
+      init.signal.throwIfAborted();
+      return Response.json(
+        ids.map((id) => ({
+          id,
+          title: `Project ${id}`,
+          icon_url: `https://cdn.modrinth.com/${id}.png`,
+        })),
+      );
+    },
+  }).find(({ id }) => id === "modrinth");
+  await modrinth.projectMetadata(["cached"]);
+  stalled = true;
+  const result = await modrinth.projectMetadata([
+    ...Array.from({ length: 205 }, (_, index) => `mod${index}`),
+    "cached",
+  ]);
+  assert.equal(
+    requests.length,
+    2,
+    "only the first missing batch calls the stalled provider",
+  );
+  assert.deepEqual(
+    timeouts,
+    [8000, 8000],
+    "the optional metadata request uses its own eight-second limit",
+  );
+  assert.deepEqual(result.projects, [
+    {
+      id: "cached",
+      title: "Project cached",
+      iconUrl: "https://cdn.modrinth.com/cached.png",
+    },
+  ]);
+  assert.equal(result.warnings.length, 1);
+  assert.match(result.warnings[0], /took too long/);
+  now += 20_000;
+  const duringCooldown = await modrinth.projectMetadata([
+    "new-during-cooldown",
+    "cached",
+  ]);
+  assert.equal(requests.length, 2);
+  assert.equal(
+    duringCooldown.projects[0].iconUrl,
+    "https://cdn.modrinth.com/cached.png",
+  );
+  now += 10_001;
+  stalled = false;
+  const recovered = await modrinth.projectMetadata([
+    "mod0",
+    "new-during-cooldown",
+    "cached",
+  ]);
+  assert.equal(
+    requests.length,
+    3,
+    "queued fallbacks keep the original cooldown deadline",
+  );
+  assert.deepEqual(requests[2], ["mod0", "new-during-cooldown"]);
+  assert.equal(recovered.projects.length, 3);
+  assert.deepEqual(recovered.warnings, []);
+  assert.equal(
+    recovered.projects[2].iconUrl,
+    "https://cdn.modrinth.com/cached.png",
   );
 });
 
@@ -529,6 +881,16 @@ test("Modrinth packs install server dependencies and overrides without client fi
     (await f.service.installed({ ...selection, type: "modpack" })).items[0]
       .versionId,
     "new",
+  );
+  const saved = JSON.parse(
+    await fs.readFile(
+      path.join(f.dataDir, "launchpad", "installed.json"),
+      "utf8",
+    ),
+  );
+  assert.equal(
+    saved.find((item) => item.pack).iconUrl,
+    "https://cdn.modrinth.com/data/project/icon.png",
   );
 });
 
@@ -675,6 +1037,21 @@ test("existing CurseForge-only mods require matching fingerprints and SHA-1 befo
     request: async (url, init) => {
       const pathname = new URL(url).pathname;
       if (pathname === "/v2/version_files") return Response.json({});
+      if (pathname === "/v1/mods") {
+        assert.deepEqual(JSON.parse(init.body), { modIds: [11] });
+        return Response.json({
+          data: [
+            {
+              id: 11,
+              gameId: 432,
+              name: "Identified CurseForge Project",
+              logo: {
+                thumbnailUrl: "https://media.forgecdn.net/identified.png",
+              },
+            },
+          ],
+        });
+      }
       if (pathname === "/v1/fingerprints/432") {
         assert.deepEqual(JSON.parse(init.body).fingerprints, [fingerprint]);
         return Response.json({
@@ -732,6 +1109,21 @@ test("existing CurseForge-only mods require matching fingerprints and SHA-1 befo
   assert.equal(result.items[0].projectId, "11");
   assert.equal(result.items[0].versionId, "21");
   assert.equal(result.items[0].update.id, "22");
+  result = await f.service.installed({
+    ...selection,
+    loader: "",
+    gameVersion: "",
+  });
+  assert.equal(result.items[0].title, "Identified CurseForge Project");
+  assert.equal(
+    result.items[0].iconUrl,
+    "https://media.forgecdn.net/identified.png",
+  );
+  assert.equal(result.items[0].update, undefined);
+  assert.equal(
+    f.requests.filter(({ url }) => new URL(url).pathname === "/v1/mods").length,
+    1,
+  );
   wrongHash = true;
   result = await f.service.installed(selection);
   assert.equal(result.items[0].platform, null);

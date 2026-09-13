@@ -100,39 +100,38 @@
   margin: 2px 0 8px;
 }
 .version-provider-mark {
-  width: 45px;
-  height: 45px;
-  border-radius: 12px;
+  width: 48px;
+  height: 48px;
+  border-radius: 10px;
   display: grid;
   place-items: center;
-  background: #a8c45a17;
-  border: 1px solid #a8c45a35;
-  color: #bddb80;
-  font-weight: 800;
-  font-size: 21px;
-  letter-spacing: -1px;
+  background: var(--panel);
+  border: 1px solid var(--border);
 }
-.version-provider-neoforge .version-provider-mark {
-  color: #e58a52;
-  background: #de773915;
-  border-color: #de773938;
+.software-logo {
+  display: block;
+  width: 40px;
+  height: 40px;
+  object-fit: contain;
+  flex-shrink: 0;
 }
-.version-provider-quilt .version-provider-mark,
-.version-provider-purpur .version-provider-mark {
-  color: #b699e8;
-  background: #a07ad517;
-  border-color: #a07ad539;
+.software-logo-fallback {
+  color: var(--muted);
 }
-.version-provider-fabric .version-provider-mark,
-.version-provider-forge .version-provider-mark {
-  color: #c7b395;
-  background: #b49a7217;
-  border-color: #b49a7239;
+.versions-current-icon .software-logo {
+  width: 36px;
+  height: 36px;
 }
-.version-provider-velocity .version-provider-mark {
-  color: #79b9dd;
-  background: #79b9dd17;
-  border-color: #79b9dd39;
+.versions-page .panel-title .software-logo {
+  width: 20px;
+  height: 20px;
+}
+.version-provider-folia .version-provider-mark {
+  width: 62px;
+  margin-left: -7px;
+}
+.version-provider-folia .software-logo {
+  width: 58px;
 }
 .version-provider-kind {
   color: var(--muted);
@@ -267,6 +266,10 @@
   flex: 1;
   min-width: 0;
 }
+.versions-build-icon .software-logo {
+  width: 28px;
+  height: 28px;
+}
 .versions-build-info strong {
   font-size: 13px;
   display: flex;
@@ -302,6 +305,9 @@
   color: var(--accent);
   opacity: 0.6;
   margin-bottom: 10px;
+}
+.versions-empty > .software-logo {
+  margin: 0 auto 10px;
 }
 .versions-empty h3 {
   font-size: 15px;

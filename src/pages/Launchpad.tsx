@@ -232,6 +232,16 @@ export default function Launchpad({ notify }: PageProps) {
   const loaders = loadersFor(type).filter(
     (value) => !config?.loaders || config.loaders.includes(value),
   );
+  const minecraftVersions = [
+    ...new Set(
+      [
+        ...(config?.gameVersions ?? []),
+        config?.gameVersion,
+        gameVersion,
+        targetVersion,
+      ].filter((value): value is string => Boolean(value)),
+    ),
+  ];
 
   const loadConfig = useCallback(
     async (initial = false) => {
@@ -488,7 +498,7 @@ export default function Launchpad({ notify }: PageProps) {
     if (!selection || !versionId || pending.current) return;
     if (!targetVersion.trim()) {
       setDialogError(
-        "Enter your server’s Minecraft version before reviewing this installation.",
+        "Choose your server’s Minecraft version before reviewing this installation.",
       );
       return;
     }
@@ -752,17 +762,21 @@ export default function Launchpad({ notify }: PageProps) {
         </label>
         <label>
           Minecraft version
-          <input
+          <select
             aria-label="Minecraft version"
-            list="launchpad-game-versions"
             value={gameVersion}
-            placeholder="All versions"
-            autoComplete="off"
             onChange={(event) => {
               setGameVersion(event.target.value);
               setOffset(0);
             }}
-          />
+          >
+            <option value="">All versions</option>
+            {minecraftVersions.map((value) => (
+              <option key={value} value={value}>
+                {value}
+              </option>
+            ))}
+          </select>
         </label>
         <label>
           Loader
@@ -783,11 +797,6 @@ export default function Launchpad({ notify }: PageProps) {
           </select>
         </label>
       </div>
-      <datalist id="launchpad-game-versions">
-        {(config.gameVersions ?? []).map((value) => (
-          <option key={value} value={value} />
-        ))}
-      </datalist>
       <div
         className="launchpad-tabs"
         role="tablist"
@@ -957,8 +966,11 @@ export default function Launchpad({ notify }: PageProps) {
         <button
           className="btn icon"
           aria-label="Refresh Launchpad and check updates"
-          disabled={searchLoading || scanLoading}
-          onClick={() => setReload((value) => value + 1)}
+          disabled={configLoading || searchLoading || scanLoading}
+          onClick={() => {
+            void loadConfig();
+            setReload((value) => value + 1);
+          }}
         >
           <RefreshCw size={16} className={scanLoading ? "spin" : ""} />
         </button>
@@ -1325,15 +1337,20 @@ export default function Launchpad({ notify }: PageProps) {
                 <label htmlFor="launchpad-target-minecraft">
                   Target Minecraft version
                 </label>
-                <input
+                <select
                   id="launchpad-target-minecraft"
-                  list="launchpad-game-versions"
                   value={targetVersion}
-                  placeholder="Your server’s Minecraft version"
                   required
                   disabled={Boolean(busy)}
                   onChange={(event) => setTargetVersion(event.target.value)}
-                />
+                >
+                  <option value="">Select Minecraft version</option>
+                  {minecraftVersions.map((value) => (
+                    <option key={value} value={value}>
+                      {value}
+                    </option>
+                  ))}
+                </select>
               </div>
               <div className="form-field">
                 <label htmlFor="launchpad-target-loader">Target loader</label>

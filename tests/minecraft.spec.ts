@@ -188,6 +188,13 @@ test("Launchpad exposes six platforms, only four content tabs, and a reviewed in
     publishedAt: "2026-09-01T00:00:00Z",
     downloadable: true,
   };
+  const iconUrl = "https://cdn.modrinth.com/fixture/better-mod.svg";
+  await page.route(iconUrl, (route) =>
+    route.fulfill({
+      contentType: "image/svg+xml",
+      body: '<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64"><rect width="64" height="64" rx="12" fill="#68c985"/><path d="M16 18h32v28H16z" fill="#18231c"/></svg>',
+    }),
+  );
   await page.route("**/api/launchpad", (route) =>
     route.fulfill({
       json: {
@@ -221,6 +228,7 @@ test("Launchpad exposes six platforms, only four content tabs, and a reviewed in
             versionId: "old",
             versionName: "1.0",
             title: "Better Mod",
+            iconUrl,
             update: version,
           },
         ],
@@ -280,6 +288,17 @@ test("Launchpad exposes six platforms, only four content tabs, and a reviewed in
   ]);
   await page.getByRole("tab", { name: "Mods", exact: true }).click();
   await page.getByRole("switch", { name: "Show installed content" }).check();
+  const installedIcon = page
+    .getByRole("article", { name: "Better Mod", exact: true })
+    .locator(".launchpad-project-icon img");
+  await expect(installedIcon).toHaveAttribute("src", iconUrl);
+  await expect
+    .poll(() =>
+      installedIcon.evaluate(
+        (image: HTMLImageElement) => image.complete && image.naturalWidth > 0,
+      ),
+    )
+    .toBe(true);
   await page
     .getByRole("button", { name: /Update/ })
     .first()
@@ -444,14 +463,12 @@ test("Launchpad catalog sorting sends scoped choices and resets pagination with 
     .poll(lastSearch)
     .toMatchObject({ sort: "downloads", offset: "10" });
   await sort.selectOption("updated");
-  await expect
-    .poll(lastSearch)
-    .toMatchObject({
-      platform: "modrinth",
-      sort: "updated",
-      query: "copper",
-      offset: "0",
-    });
+  await expect.poll(lastSearch).toMatchObject({
+    platform: "modrinth",
+    sort: "updated",
+    query: "copper",
+    offset: "0",
+  });
   await expect(page.getByRole("status", { name: "Launchpad page" })).toHaveText(
     "Page 1 of 3",
   );
@@ -471,14 +488,12 @@ test("Launchpad catalog sorting sends scoped choices and resets pagination with 
     "Most downloaded",
     "Name (A–Z)",
   ]);
-  await expect
-    .poll(lastSearch)
-    .toMatchObject({
-      platform: "curseforge",
-      sort: "popular",
-      query: "copper",
-      offset: "0",
-    });
+  await expect.poll(lastSearch).toMatchObject({
+    platform: "curseforge",
+    sort: "popular",
+    query: "copper",
+    offset: "0",
+  });
   await expect(page.getByRole("article").first()).toHaveAccessibleName(
     "popular result 1",
   );
@@ -622,4 +637,295 @@ test("Launchpad installed updates sort before pagination and keep priority when 
   await expect(page.getByRole("status", { name: "Launchpad page" })).toHaveText(
     "Page 1 of 3",
   );
+});
+
+test("Launchpad Minecraft selects include all release channels and scope filters and reviewed targets", async ({
+  page,
+  serverId,
+}) => {
+  const catalog = ["26.3-rc-2", "1.21.1", "b1.7.3", "a1.2.6", "rd-132211"];
+  const custom = "custom-1.21.1";
+  const searches: URL[] = [];
+  await page.route("**/api/launchpad", (route) =>
+    route.fulfill({
+      json: {
+        platforms: [
+          {
+            id: "modrinth",
+            name: "Modrinth",
+            available: true,
+            types: ["mod"],
+            sortOptions: [{ id: "downloads", label: "Most downloaded" }],
+          },
+        ],
+        gameVersion: custom,
+        gameVersions: [...catalog, "1.21.1"],
+        loader: "neoforge",
+        status: "offline",
+        warnings: [],
+      },
+    }),
+  );
+  await page.route("**/api/launchpad/installed?**", (route) =>
+    route.fulfill({ json: { items: [], warnings: [] } }),
+  );
+  await page.route("**/api/launchpad/search?**", (route) => {
+    expect(route.request().headers()["x-server-id"]).toBe(serverId);
+    const url = new URL(route.request().url());
+    searches.push(url);
+    const offset = Number(url.searchParams.get("offset"));
+    const limit = Number(url.searchParams.get("limit"));
+    return route.fulfill({
+      json: {
+        projects: Array.from(
+          { length: Math.min(limit, 12 - offset) },
+          (_, index) => ({
+            id: `catalog-${offset + index}`,
+            platform: "modrinth",
+            title: `Catalog mod ${offset + index + 1}`,
+            description: "Version filter fixture",
+          }),
+        ),
+        total: 12,
+        offset,
+        limit,
+      },
+    });
+  });
+  await page.route("**/api/launchpad/versions?**", (route) =>
+    route.fulfill({
+      json: {
+        versions: [
+          {
+            id: "build",
+            name: "Reviewed build",
+            version: "2.0",
+            gameVersions: catalog,
+            loaders: ["neoforge"],
+            publishedAt: "2026-09-01T00:00:00Z",
+            downloadable: true,
+          },
+        ],
+      },
+    }),
+  );
+  let review: Record<string, unknown> | undefined;
+  await page.route("**/api/launchpad/preview", (route) => {
+    expect(route.request().headers()["x-server-id"]).toBe(serverId);
+    review = route.request().postDataJSON();
+    return route.fulfill({
+      json: {
+        planId: "version-review",
+        title: "Catalog mod 1",
+        versionName: "2.0",
+        files: [{ path: "mods/catalog.jar", size: 1024, action: "install" }],
+        warnings: [],
+        expiresAt: "2099-01-01T00:00:00Z",
+      },
+    });
+  });
+  await page.goto("/#launchpad");
+  const version = page.getByRole("combobox", {
+    name: "Minecraft version",
+    exact: true,
+  });
+  await expect(version).toHaveValue(custom);
+  await expect(version.locator("option")).toHaveText([
+    "All versions",
+    ...catalog,
+    custom,
+  ]);
+  await page
+    .getByRole("button", { name: "Next Launchpad page", exact: true })
+    .click();
+  await expect(page.getByRole("status", { name: "Launchpad page" })).toHaveText(
+    "Page 2 of 2",
+  );
+  await version.selectOption("26.3-rc-2");
+  await expect
+    .poll(() => Object.fromEntries(searches.at(-1)?.searchParams ?? []))
+    .toMatchObject({ gameVersion: "26.3-rc-2", offset: "0" });
+  await expect(page.getByRole("status", { name: "Launchpad page" })).toHaveText(
+    "Page 1 of 2",
+  );
+  await version.selectOption("");
+  await expect
+    .poll(() => searches.at(-1)?.searchParams.has("gameVersion"))
+    .toBe(false);
+  await page
+    .getByRole("button", { name: "Install Catalog mod 1", exact: true })
+    .click();
+  const dialog = page.getByRole("dialog");
+  const target = dialog.getByRole("combobox", {
+    name: "Target Minecraft version",
+    exact: true,
+  });
+  await expect(target).toHaveValue("");
+  await expect(target.locator("option")).toHaveText([
+    "Select Minecraft version",
+    ...catalog,
+    custom,
+  ]);
+  await target.selectOption("1.21.1");
+  await dialog.getByRole("button", { name: /Review/ }).click();
+  await expect
+    .poll(() => review)
+    .toMatchObject({
+      gameVersion: "1.21.1",
+      loader: "neoforge",
+      projectId: "catalog-0",
+      versionId: "build",
+    });
+  await expect(dialog).toContainText("mods/catalog.jar");
+});
+
+test("Launchpad refresh retries a failed Minecraft catalog while preserving configured and selected versions", async ({
+  page,
+}) => {
+  const custom = "custom-1.21.1";
+  const catalog = ["26.3-rc-2", "1.21.1", "b1.7.3", "a1.2.6"];
+  let configRequests = 0;
+  await page.route("**/api/launchpad", (route) => {
+    configRequests++;
+    return route.fulfill({
+      json: {
+        platforms: [
+          { id: "modrinth", name: "Modrinth", available: true, types: ["mod"] },
+        ],
+        gameVersion: custom,
+        gameVersions:
+          configRequests === 1
+            ? []
+            : configRequests === 2
+              ? catalog
+              : catalog.slice(1),
+        loader: "neoforge",
+        status: "offline",
+        warnings:
+          configRequests === 1
+            ? ["Minecraft version catalog: provider temporarily unavailable."]
+            : [],
+      },
+    });
+  });
+  await page.route("**/api/launchpad/search?**", (route) =>
+    route.fulfill({ json: { projects: [], total: 0, offset: 0, limit: 10 } }),
+  );
+  await page.route("**/api/launchpad/installed?**", (route) =>
+    route.fulfill({ json: { items: [], warnings: [] } }),
+  );
+  await page.goto("/#launchpad");
+  const version = page.getByRole("combobox", {
+    name: "Minecraft version",
+    exact: true,
+  });
+  await expect(version).toHaveValue(custom);
+  await expect(version.locator("option")).toHaveText(["All versions", custom]);
+  await expect(
+    page.getByText(
+      "Minecraft version catalog: provider temporarily unavailable.",
+      { exact: true },
+    ),
+  ).toBeVisible();
+  const refresh = page.getByRole("button", {
+    name: "Refresh Launchpad and check updates",
+    exact: true,
+  });
+  await refresh.click();
+  await expect.poll(() => configRequests).toBe(2);
+  await expect(version.locator("option")).toHaveText([
+    "All versions",
+    ...catalog,
+    custom,
+  ]);
+  await expect(version).toHaveValue(custom);
+  await expect(
+    page.getByText(
+      "Minecraft version catalog: provider temporarily unavailable.",
+      { exact: true },
+    ),
+  ).toHaveCount(0);
+  await version.selectOption("26.3-rc-2");
+  await refresh.click();
+  await expect.poll(() => configRequests).toBe(3);
+  await expect(version).toHaveValue("26.3-rc-2");
+  await expect(version.locator("option")).toHaveText([
+    "All versions",
+    ...catalog.slice(1),
+    custom,
+    "26.3-rc-2",
+  ]);
+  await page.setViewportSize({ width: 390, height: 844 });
+  expect(
+    await page.evaluate(
+      () => document.documentElement.scrollWidth <= window.innerWidth,
+    ),
+  ).toBe(true);
+});
+
+test("Versions decodes all eighteen bundled software logos without external image requests", async ({
+  page,
+}, testInfo) => {
+  const assets: Record<string, string> = {
+    vanilla: "vanilla.png",
+    paper: "paper.svg",
+    pufferfish: "pufferfish.png",
+    spigot: "spigot.png",
+    purpur: "purpur.svg",
+    waterfall: "waterfall.svg",
+    velocity: "velocity.svg",
+    fabric: "fabric.png",
+    quilt: "quilt.svg",
+    forge: "forge.png",
+    neoforge: "neoforge.svg",
+    mohist: "mohist.png",
+    arclight: "arclight.png",
+    sponge: "sponge.svg",
+    leaves: "leaves.svg",
+    canvas: "canvas.png",
+    magma: "magma.png",
+    folia: "folia.png",
+  };
+  const externalImages: string[] = [];
+  page.on("request", (request) => {
+    if (
+      request.resourceType() === "image" &&
+      new URL(request.url()).origin !==
+        new URL(testInfo.project.use.baseURL!).origin
+    )
+      externalImages.push(request.url());
+  });
+  await page.goto("/#versions");
+  const logos = page.locator(".version-provider-mark img");
+  await expect(logos).toHaveCount(18);
+  for (const [id, filename] of Object.entries(assets))
+    await expect(
+      page.locator(`.version-provider-${id} .version-provider-mark img`),
+    ).toHaveAttribute("src", `/software-icons/${filename}`);
+  await expect
+    .poll(() =>
+      logos.evaluateAll((images: HTMLImageElement[]) =>
+        images.every(
+          (image) =>
+            image.complete && image.naturalWidth > 0 && image.naturalHeight > 0,
+        ),
+      ),
+    )
+    .toBe(true);
+  expect(externalImages).toEqual([]);
+  await page.screenshot({
+    path: testInfo.outputPath("software-logos-desktop.png"),
+    fullPage: true,
+  });
+  await page.setViewportSize({ width: 390, height: 844 });
+  expect(
+    await page.evaluate(
+      () => document.documentElement.scrollWidth <= window.innerWidth,
+    ),
+  ).toBe(true);
+  await expect(logos).toHaveCount(18);
+  await page.screenshot({
+    path: testInfo.outputPath("software-logos-mobile.png"),
+    fullPage: true,
+  });
 });

@@ -1,0 +1,149 @@
+{
+  "retrieved": "2026-09-13",
+  "assets": [
+    {
+      "id": "vanilla",
+      "file": "vanilla.png",
+      "source": "https://www.minecraft.net/etc.clientlibs/minecraftnet/clientlibs/clientlib-site/resources/android-icon-192x192.png",
+      "sha256": "50696460f0eaea39f5bf34cd451af6ebff1026caa0e4ddb87f60eb6b8a80238f",
+      "bytes": 1126,
+      "width": 192,
+      "height": 192
+    },
+    {
+      "id": "paper",
+      "file": "paper.svg",
+      "source": "https://assets.papermc.io/brand/papermc_logo.min.svg",
+      "sha256": "f3968e5f1a8ff5dfeb5ca214141b1e70e9eaa0ecd91bb93a5c4a76c4901bbec4",
+      "bytes": 4012
+    },
+    {
+      "id": "pufferfish",
+      "file": "pufferfish.png",
+      "source": "https://pufferfish.host/apple-touch-icon.png",
+      "sha256": "2cd2c53a3b7347d7f1e615cde9d7b02454baa4d26ac88e6f964c9ec5206d63b4",
+      "bytes": 22085,
+      "width": 180,
+      "height": 180
+    },
+    {
+      "id": "spigot",
+      "file": "spigot.png",
+      "source": "https://static.spigotmc.org/img/spigot-og.png",
+      "sha256": "223a734a23df0ed4e787b09fc6e82601c1774be5c78a35c5aa0608faa6832a55",
+      "bytes": 15283,
+      "width": 200,
+      "height": 200
+    },
+    {
+      "id": "purpur",
+      "file": "purpur.svg",
+      "source": "https://purpurmc.org/images/purpur.svg",
+      "sha256": "049b218f2b711e421905a1c2d95411b4003af527ddf8a3d36231c1434fde8805",
+      "bytes": 1102
+    },
+    {
+      "id": "waterfall",
+      "file": "waterfall.svg",
+      "source": "https://raw.githubusercontent.com/PaperMC/website/fcba98e5dfb43aebc37fd8134fde3fa772e663b3/src/assets/brand/waterfall-white.svg",
+      "sha256": "21231a16f8f770ae9113e1076acb27d7ccc1ab56697f1aad70b9e16ad6f345e6",
+      "bytes": 188
+    },
+    {
+      "id": "velocity",
+      "file": "velocity.svg",
+      "source": "https://assets.papermc.io/brand/velocity_logo_blue.min.svg",
+      "sha256": "04b550f1795983dc7ff95d728e10ce1b513834c950e85e83161a863290260831",
+      "bytes": 1183
+    },
+    {
+      "id": "fabric",
+      "file": "fabric.png",
+      "source": "https://fabricmc.net/assets/logo.png",
+      "sha256": "a41878c3c4c5790cfc920eabf98d3404103a74a6f3df69d632ceb220c9ec9dc7",
+      "bytes": 5867,
+      "width": 52,
+      "height": 56
+    },
+    {
+      "id": "quilt",
+      "file": "quilt.svg",
+      "source": "https://quiltmc.org/assets/img/logo.svg",
+      "sha256": "8e6ffeba48d8418eb24f226bb75b6b1de3a2fe1e45340b51be198c92189c7fa3",
+      "bytes": 3232
+    },
+    {
+      "id": "forge",
+      "file": "forge.png",
+      "source": "https://files.minecraftforge.net/static/images/apple-touch-icon.png",
+      "sha256": "ee51461b4dca5203d4e23d124abd0434700a4463d6022f481d27e7c0dbe0c594",
+      "bytes": 5403,
+      "width": 180,
+      "height": 180
+    },
+    {
+      "id": "neoforge",
+      "file": "neoforge.svg",
+      "source": "https://raw.githubusercontent.com/NeoForged/Documentation/816c03d31ff7948179c7bd4a58d23bcfda09c18a/static/img/logo.svg",
+      "sha256": "f8c91afd9fd09f2bda67c32dafdb275aebacea999b04884904220a3f766a0d51",
+      "bytes": 12434
+    },
+    {
+      "id": "mohist",
+      "file": "mohist.png",
+      "source": "https://mohistmc.com/img/res/mohist.png",
+      "sha256": "c9f3fe6635d2148749e6bf09d31064bd7f7dee807a527736287f1fa40b0decb8",
+      "bytes": 297256,
+      "width": 500,
+      "height": 500
+    },
+    {
+      "id": "arclight",
+      "file": "arclight.png",
+      "source": "https://arclight.izzel.io/logo32.png",
+      "sha256": "ec55190e47e272adf266b4c482f8d57d328203049342833cf87bc28124ac3c46",
+      "bytes": 1782,
+      "width": 128,
+      "height": 128
+    },
+    {
+      "id": "sponge",
+      "file": "sponge.svg",
+      "source": "https://spongepowered.org/assets/img/icons/spongie-mark.svg",
+      "sha256": "e2930075cc1c339e9b2df11d0eea0ae0fea579317947c037b0171ebd22a6a911",
+      "bytes": 1407
+    },
+    {
+      "id": "leaves",
+      "file": "leaves.svg",
+      "source": "https://raw.githubusercontent.com/LeavesMC/Website/b0a61bfb138ed19cf3ffa3ac7d71bc6f8a307a55/assets/brand/logo.svg",
+      "sha256": "dafa69201647dce4119d1efd991a3e88df8b94c4c7d5d2b8f46e62edd074da2f",
+      "bytes": 11592
+    },
+    {
+      "id": "canvas",
+      "file": "canvas.png",
+      "source": "https://canvasmc.io/logo.png",
+      "sha256": "4c04c0ebb11aabe1bd3e87b06642d2dd905824a76c128e61916aa5c9c1eca15c",
+      "bytes": 147494,
+      "width": 430,
+      "height": 430
+    },
+    {
+      "id": "magma",
+      "file": "magma.png",
+      "source": "https://magmafoundation.org/magma-icon.png",
+      "sha256": "774a91480e149b645d5dfc66d6af6c9ef39e6fd0cfd093ed37308825e4f0c19a",
+      "bytes": 77137,
+      "width": 351,
+      "height": 351
+    },
+    {
+      "id": "folia",
+      "file": "folia.png",
+      "source": "https://raw.githubusercontent.com/PaperMC/Folia/14b7fee5c866fca9a40ede4a58998fb928140f65/folia.png",
+      "sha256": "79be8131cb0c7fcd7ce358d879e3349a6830a4181d88c6fd769be065efbaf5e2",
+      "bytes": 432075
+    }
+  ]
+}

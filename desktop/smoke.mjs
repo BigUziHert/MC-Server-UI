@@ -790,6 +790,20 @@ try {
   await ui(
     page.getByRole("heading", { name: "NeoForge", exact: true }),
   ).toBeVisible();
+  const softwareLogos = page.locator(".version-provider-mark img");
+  await ui(softwareLogos).toHaveCount(18);
+  await ui
+    .poll(() =>
+      softwareLogos.evaluateAll((images) =>
+        images.every(
+          (image) =>
+            image.complete &&
+            image.naturalWidth > 0 &&
+            new URL(image.currentSrc).origin === window.location.origin,
+        ),
+      ),
+    )
+    .toBe(true);
   await page.getByRole("link", { name: "Properties", exact: true }).click();
   await ui(
     page.getByRole("tab", { name: "server.properties", exact: true }),
