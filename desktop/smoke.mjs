@@ -848,31 +848,22 @@ try {
   assert.deepEqual(await expectDownload("desktop-smoke.bin"), uploadBytes);
   await capturePackaged("packaged-file-manager.png");
 
-  step("Creating and downloading SQLite through the bundled Node runtime.");
+  step(
+    "Checking the removed Databases route and preserving legacy SQLite storage.",
+  );
+  const legacyDatabase = await browserApi(page, "/databases", {
+    method: "POST",
+    body: { name: "desktop_smoke" },
+    serverId,
+  });
+  assert.equal(legacyDatabase.status, 201);
   await page.goto(`${currentOrigin}/#databases`);
   await ui(
-    page.getByRole("heading", { name: "Databases", exact: true }),
+    page.getByRole("heading", { name: "Console", exact: true }),
   ).toBeVisible();
-  await page
-    .getByRole("button", { name: "Create database", exact: true })
-    .click();
-  const databaseDialog = page.getByRole("dialog", {
-    name: "Create a database",
-    exact: true,
-  });
-  await databaseDialog
-    .getByLabel("Database name", { exact: true })
-    .fill("desktop_smoke");
-  await databaseDialog
-    .getByRole("button", { name: "Create database", exact: true })
-    .click();
-  await ui(databaseDialog).not.toBeVisible();
-  await page
-    .getByRole("link", { name: "Download desktop_smoke", exact: true })
-    .click();
-  const sqlite = await expectDownload("desktop_smoke.sqlite");
-  assert.equal(sqlite.subarray(0, 16).toString(), "SQLite format 3\0");
-  assert.ok(sqlite.length > 1024);
+  await ui(
+    page.getByRole("link", { name: "Databases", exact: true }),
+  ).toHaveCount(0);
   const databases = await browserApi(page, "/databases", { serverId });
   assert.equal(databases.status, 200);
   assert.ok(

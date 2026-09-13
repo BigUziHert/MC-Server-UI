@@ -242,6 +242,20 @@
   max-height: 620px;
   overflow: auto;
 }
+.versions-filter-notice {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 10px;
+  padding: 12px 20px;
+  border-bottom: 1px solid var(--border);
+  color: var(--muted);
+  font-size: 11px;
+}
+.versions-filter-notice .btn {
+  font-size: 11px;
+}
 .versions-build {
   display: flex;
   align-items: center;

@@ -161,6 +161,7 @@ input:disabled {
 }
 .brand {
   height: 94px;
+  flex-shrink: 0;
   display: flex;
   gap: 11px;
   align-items: center;
@@ -241,14 +242,56 @@ input:disabled {
   margin-left: auto;
 }
 .sidebar nav {
-  padding: 0 14px;
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-width: thin;
+  padding: 4px 14px 8px;
 }
-.nav-label {
-  font-size: 9px;
-  letter-spacing: 1.3px;
-  color: var(--muted);
+.nav-group + .nav-group {
+  margin-top: 12px;
+}
+.nav-group-heading {
+  margin: 0;
+  font-family: inherit;
+}
+.nav-group-toggle {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  width: 100%;
+  min-height: 42px;
+  padding: 10px 12px;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text);
+  text-align: left;
+  font-size: 12px;
+  letter-spacing: 1.15px;
   font-weight: 700;
-  margin: 25px 12px 11px;
+}
+.nav-group-toggle:hover {
+  background: var(--panel);
+}
+.nav-group-toggle > span:first-child {
+  flex: 1;
+}
+.nav-group-toggle > svg {
+  color: var(--muted);
+  transition: transform 0.16s;
+}
+.nav-group-toggle[aria-expanded="true"] > svg {
+  transform: rotate(90deg);
+}
+.nav-group-toggle.contains-active {
+  color: var(--accent);
+}
+.nav-group-active {
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: var(--accent);
 }
 .nav-item {
   display: flex;
@@ -284,6 +327,7 @@ input:disabled {
   margin-left: auto;
 }
 .sidebar-bottom {
+  flex-shrink: 0;
   margin-top: auto;
   padding-top: 35px;
 }

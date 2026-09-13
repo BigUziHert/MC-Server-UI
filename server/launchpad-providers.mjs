@@ -429,11 +429,14 @@ export function createCoreProviders({
         return json(`${mr}/version/${enc(id(versionId))}`);
       },
       async gameVersions() {
-        // Keep release, snapshot, beta and alpha tags in actual release-date order.
+        // Launchpad shows main Minecraft releases, newest first.
         // https://docs.modrinth.com/api/operations/versionlist/
         const versions = (await json(`${mr}/tag/game_version`))
           .filter(
-            (row) => typeof row?.version === "string" && row.version.trim(),
+            (row) =>
+              row?.version_type === "release" &&
+              typeof row.version === "string" &&
+              /^\d+(?:\.\d+)+$/.test(row.version),
           )
           .sort(
             (a, b) => (Date.parse(b.date) || 0) - (Date.parse(a.date) || 0),

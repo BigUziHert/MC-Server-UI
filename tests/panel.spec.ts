@@ -36,7 +36,6 @@ async function openPage(page: Page, hash: string, heading: string) {
       files: "/api/files",
       backups: "/api/backups",
       subusers: "/api/subusers",
-      databases: "/api/databases",
       audit: "/api/audit",
       players: "/api/players",
     } as Record<string, string>
@@ -491,64 +490,43 @@ test("subusers records are clearly local and can be added, searched, and removed
   ).toBe(false);
 });
 
-test("databases create actual SQLite files and support confirmed deletion", async ({
+test("removing the Databases page preserves existing SQLite files", async ({
   page,
   request,
-}, testInfo) => {
-  await openPage(page, "databases", "Databases");
+}) => {
+  // Seed an existing record through the compatibility API, never user data.
+  expect(
+    (
+      await request.post("/api/databases", {
+        data: { name: "e2e_player_stats" },
+      })
+    ).status(),
+  ).toBe(201);
+  const before = (await (await request.get("/api/databases")).json()).databases;
+  const record = before.find(
+    (item: { name: string }) => item.name === "e2e_player_stats",
+  );
+  const download = await request.get(`/api/databases/${record.id}/download`);
+  const original = await download.body();
+  expect(original.subarray(0, 16).toString()).toBe("SQLite format 3\0");
+  await page.goto("/#databases");
   await expect(
-    page.getByText("Local SQLite databases", { exact: true }),
+    page.getByRole("heading", { name: "Console", exact: true }),
   ).toBeVisible();
-  await page
-    .getByRole("button", { name: "Create database", exact: true })
-    .click();
-  let dialog = page.getByRole("dialog", { name: "Create a database" });
-  await dialog.getByLabel("Database name").fill("e2e_player_stats");
-  await dialog
-    .getByRole("button", { name: "Create database", exact: true })
-    .click();
-  await expect(dialog).not.toBeVisible();
-  const row = page.getByRole("row").filter({ hasText: "e2e_player_stats" });
-  await expect(row).toContainText("SQLite");
-  const downloadEvent = page.waitForEvent("download");
-  await row
-    .getByRole("link", { name: "Download e2e_player_stats", exact: true })
-    .click();
-  const download = await downloadEvent;
-  expect(download.suggestedFilename()).toBe("e2e_player_stats.sqlite");
-  const databasePath = testInfo.outputPath("e2e_player_stats.sqlite");
-  await download.saveAs(databasePath);
-  const database = await readFile(databasePath);
-  expect(database.subarray(0, 16).toString()).toBe("SQLite format 3\0");
-  expect(database.length).toBeGreaterThan(1024);
+  await expect(
+    page
+      .getByRole("navigation", { name: "Main navigation" })
+      .getByRole("link", { name: "Databases", exact: true }),
+  ).toHaveCount(0);
+  await expect(
+    page.getByRole("heading", { name: "Databases", exact: true }),
+  ).toHaveCount(0);
   expect(
     (await (await request.get("/api/databases")).json()).databases,
-  ).toEqual(
-    expect.arrayContaining([
-      expect.objectContaining({
-        name: "e2e_player_stats",
-        type: "SQLite",
-        size: database.length,
-      }),
-    ]),
-  );
-  await row
-    .getByRole("button", { name: "Delete database e2e_player_stats" })
-    .click();
-  dialog = page.getByRole("dialog", { name: "Delete database?" });
-  await expect(
-    dialog.getByRole("link", { name: "Download database" }),
-  ).toBeVisible();
-  await dialog
-    .getByRole("button", { name: "Delete database", exact: true })
-    .click();
-  await expect(dialog).not.toBeVisible();
-  await expect(row).toHaveCount(0);
+  ).toEqual(before);
   expect(
-    (await (await request.get("/api/databases")).json()).databases.some(
-      (item: { name: string }) => item.name === "e2e_player_stats",
-    ),
-  ).toBe(false);
+    await (await request.get(`/api/databases/${record.id}/download`)).body(),
+  ).toEqual(original);
 });
 
 test("audit filters distinguish real file and database actions and support search", async ({
@@ -625,7 +603,6 @@ test("all pages fit a mobile viewport and navigation remains usable", async ({
       "/api/subusers",
       { email: "mobile.viewport@example.com", role: "operator" },
     ],
-    ["/api/databases", { name: "mobile_layout_probe" }],
     ["/api/backups", { name: "Mobile layout backup" }],
     ["/api/players/op", { name: "Mobile_Player" }],
   ] as const)
@@ -636,7 +613,6 @@ test("all pages fit a mobile viewport and navigation remains usable", async ({
     { hash: "files", heading: "File Manager" },
     { hash: "subusers", heading: "Subusers" },
     { hash: "players", heading: "Players" },
-    { hash: "databases", heading: "Databases" },
     { hash: "backups", heading: "Backups" },
     { hash: "audit", heading: "Audit logs" },
   ];

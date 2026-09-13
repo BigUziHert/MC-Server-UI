@@ -8,6 +8,13 @@ const fail = (status, message) => Object.assign(new Error(message), { status });
 const agent = "MC-Server-UI/0.1 (https://github.com/BigUziHert/MC-Server-UI)";
 const identifier = (value) =>
   typeof value === "string" && /^[a-z0-9][a-z0-9._+\-]{0,100}$/i.test(value);
+// Mojang's older prerelease IDs contain spaces (for example, 1.14.2 Pre-Release 4).
+// They still must be plain filename components and match an official catalog entry.
+const catalogIdentifier = (provider, value) =>
+  identifier(value) ||
+  (provider === "vanilla" &&
+    typeof value === "string" &&
+    /^[a-z0-9][a-z0-9._+\- ]{0,99}[a-z0-9]$/i.test(value));
 const stable = (version) => !/alpha|beta|snapshot|pre|rc/i.test(version);
 const newest = (a, b) => b.localeCompare(a, "en", { numeric: true });
 const PAPER = "https://fill.papermc.io/v3/projects";
@@ -452,8 +459,16 @@ export function createVersionsService({
       }
       if (id === "vanilla")
         return (await manifest()).versions
-          .filter((entry) => identifier(entry.id) && entry.type === "release")
-          .map((entry) => ({ id: entry.id, label: entry.id, stable: true }));
+          .filter(
+            (entry) =>
+              catalogIdentifier(id, entry.id) &&
+              ["release", "snapshot"].includes(entry.type),
+          )
+          .map((entry) => ({
+            id: entry.id,
+            label: entry.id,
+            stable: entry.type === "release",
+          }));
       if (id === "purpur")
         return (await json(PURPUR)).versions
           .filter(identifier)
@@ -478,7 +493,7 @@ export function createVersionsService({
   async function builds(id, version) {
     const selected = provider(id);
     if (
-      !identifier(version) ||
+      !catalogIdentifier(id, version) ||
       !(await versions(id)).versions.some((item) => item.id === version)
     )
       throw fail(400, "Choose a Minecraft version from the official catalog.");
@@ -531,7 +546,7 @@ export function createVersionsService({
               {
                 id: version,
                 label: "Official server",
-                stable: true,
+                stable: entry.type === "release",
                 javaVersion: data.javaVersion?.majorVersion,
                 artifact: data.downloads.server,
               },
@@ -554,7 +569,15 @@ export function createVersionsService({
         .map((entry) => ({
           id: entry.loader.version,
           label: entry.loader.version,
-          stable: entry.loader.stable ?? stable(entry.loader.version),
+          // Fabric marks only its preferred public loader stable; older releases
+          // have false here too. This is a recommendation, not a prerelease flag.
+          stable:
+            id === "fabric"
+              ? stable(entry.loader.version)
+              : (entry.loader.stable ?? stable(entry.loader.version)),
+          ...(id === "fabric"
+            ? { recommended: entry.loader.stable === true }
+            : {}),
         }))
         .sort((a, b) => newest(a.id, b.id));
     });
@@ -571,7 +594,8 @@ export function createVersionsService({
     signal?.throwIfAborted();
     const { provider: id, version, build } = selection ?? {};
     const selected = provider(id);
-    if (!identifier(build)) throw fail(400, "Choose an official build.");
+    if (!catalogIdentifier(id, build))
+      throw fail(400, "Choose an official build.");
     const listing = await builds(id, version);
     if (!listing.builds.some((entry) => entry.id === build))
       throw fail(

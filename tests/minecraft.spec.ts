@@ -167,6 +167,98 @@ test("Versions shows official builds and requires a reviewed choice before insta
   await expect(dialog.getByRole("button", { name: /Install/ })).toBeDisabled();
   await expect(dialog).toContainText(/worlds|world/i);
 });
+
+test("Versions offers older stable Fabric loaders and requires opting in to experimental builds", async ({
+  page,
+  serverId,
+}, testInfo) => {
+  await page.route("**/api/versions", (route) =>
+    route.fulfill({
+      json: {
+        providers: [
+          {
+            id: "fabric",
+            name: "Fabric",
+            description: "Fabric loader fixture",
+            kind: "server",
+            installable: true,
+            website: "https://fabricmc.net",
+          },
+        ],
+        job: null,
+      },
+    }),
+  );
+  await page.route("**/api/versions/fabric", (route) =>
+    route.fulfill({
+      json: { versions: [{ id: "1.21.11", label: "1.21.11", stable: true }] },
+    }),
+  );
+  await page.route("**/api/versions/fabric/1.21.11", (route) => {
+    expect(route.request().headers()["x-server-id"]).toBe(serverId);
+    return route.fulfill({
+      json: {
+        builds: [
+          {
+            id: "0.19.0-beta.1",
+            label: "0.19.0-beta.1",
+            stable: false,
+            recommended: false,
+          },
+          { id: "0.18.4", label: "0.18.4", stable: true, recommended: true },
+          { id: "0.18.3", label: "0.18.3", stable: true, recommended: false },
+          { id: "0.18.2", label: "0.18.2", stable: true, recommended: false },
+        ],
+      },
+    });
+  });
+  await page.goto("/#versions");
+  await page
+    .getByRole("button", { name: "Choose version", exact: true })
+    .click();
+  await page.getByRole("button", { name: "1.21.11", exact: true }).click();
+  const builds = page.locator(".versions-build");
+  await expect(builds).toHaveCount(3);
+  for (const version of ["0.18.4", "0.18.3", "0.18.2"])
+    await expect(builds.filter({ hasText: version })).toContainText("Stable");
+  await expect(builds.filter({ hasText: "0.18.4" })).toContainText(
+    "Recommended",
+  );
+  await expect(builds.filter({ hasText: "0.18.2" })).not.toContainText(
+    "Recommended",
+  );
+  await expect(builds.filter({ hasText: "0.19.0-beta.1" })).toHaveCount(0);
+  await page.screenshot({
+    path: testInfo.outputPath("fabric-stable-loaders.png"),
+    fullPage: true,
+  });
+  const experimental = page.getByRole("checkbox", {
+    name: "Include experimental releases",
+    exact: true,
+  });
+  await experimental.check();
+  await expect(builds).toHaveCount(4);
+  await expect(builds.filter({ hasText: "0.19.0-beta.1" })).toContainText(
+    "Experimental",
+  );
+  await experimental.uncheck();
+  await expect(builds).toHaveCount(3);
+  await builds
+    .filter({ hasText: "0.18.2" })
+    .getByRole("button", { name: "Install", exact: true })
+    .click();
+  const dialog = page.getByRole("dialog", {
+    name: "Install Fabric",
+    exact: true,
+  });
+  await expect(dialog).toContainText("0.18.2");
+  await expect(dialog).not.toContainText("0.18.4");
+  await expect(
+    dialog.getByRole("button", { name: "Install version", exact: true }),
+  ).toBeDisabled();
+  await dialog.getByRole("button", { name: "Cancel", exact: true }).click();
+  await expect(dialog).not.toBeVisible();
+});
 test("Launchpad exposes six platforms, only four content tabs, and a reviewed installed-mod update", async ({
   page,
   serverId,
@@ -639,12 +731,20 @@ test("Launchpad installed updates sort before pagination and keep priority when 
   );
 });
 
-test("Launchpad Minecraft selects include all release channels and scope filters and reviewed targets", async ({
+test("Launchpad Minecraft selects show stable releases only and scope filters and reviewed targets", async ({
   page,
   serverId,
 }) => {
-  const catalog = ["26.3-rc-2", "1.21.1", "b1.7.3", "a1.2.6", "rd-132211"];
-  const custom = "custom-1.21.1";
+  const catalog = ["26.2", "1.21.11", "1.21.1", "1.20.6", "1.7.10", "1.0"];
+  const experimental = [
+    "26.3-rc-2",
+    "26.3-pre-1",
+    "25w01a",
+    "b1.7.3",
+    "a1.2.6",
+    "rd-132211",
+    "custom-1.21.1",
+  ];
   const searches: URL[] = [];
   await page.route("**/api/launchpad", (route) =>
     route.fulfill({
@@ -658,8 +758,8 @@ test("Launchpad Minecraft selects include all release channels and scope filters
             sortOptions: [{ id: "downloads", label: "Most downloaded" }],
           },
         ],
-        gameVersion: custom,
-        gameVersions: [...catalog, "1.21.1"],
+        gameVersion: experimental[0],
+        gameVersions: [...catalog, ...experimental, "1.21.1"],
         loader: "neoforge",
         status: "offline",
         warnings: [],
@@ -729,22 +829,28 @@ test("Launchpad Minecraft selects include all release channels and scope filters
     name: "Minecraft version",
     exact: true,
   });
-  await expect(version).toHaveValue(custom);
+  await expect(version).toHaveValue("");
   await expect(version.locator("option")).toHaveText([
     "All versions",
     ...catalog,
-    custom,
   ]);
+  await expect
+    .poll(
+      () =>
+        searches.length > 0 &&
+        !searches.at(-1)?.searchParams.has("gameVersion"),
+    )
+    .toBe(true);
   await page
     .getByRole("button", { name: "Next Launchpad page", exact: true })
     .click();
   await expect(page.getByRole("status", { name: "Launchpad page" })).toHaveText(
     "Page 2 of 2",
   );
-  await version.selectOption("26.3-rc-2");
+  await version.selectOption("26.2");
   await expect
     .poll(() => Object.fromEntries(searches.at(-1)?.searchParams ?? []))
-    .toMatchObject({ gameVersion: "26.3-rc-2", offset: "0" });
+    .toMatchObject({ gameVersion: "26.2", offset: "0" });
   await expect(page.getByRole("status", { name: "Launchpad page" })).toHaveText(
     "Page 1 of 2",
   );
@@ -764,7 +870,6 @@ test("Launchpad Minecraft selects include all release channels and scope filters
   await expect(target.locator("option")).toHaveText([
     "Select Minecraft version",
     ...catalog,
-    custom,
   ]);
   await target.selectOption("1.21.1");
   await dialog.getByRole("button", { name: /Review/ }).click();
@@ -779,11 +884,11 @@ test("Launchpad Minecraft selects include all release channels and scope filters
   await expect(dialog).toContainText("mods/catalog.jar");
 });
 
-test("Launchpad refresh retries a failed Minecraft catalog while preserving configured and selected versions", async ({
+test("Launchpad refresh retries a failed stable catalog while preserving configured and selected release versions", async ({
   page,
 }) => {
-  const custom = "custom-1.21.1";
-  const catalog = ["26.3-rc-2", "1.21.1", "b1.7.3", "a1.2.6"];
+  const custom = "1.99.2";
+  const catalog = ["26.2", "1.21.11", "1.21.1", "1.7.10"];
   let configRequests = 0;
   await page.route("**/api/launchpad", (route) => {
     configRequests++;
@@ -797,8 +902,15 @@ test("Launchpad refresh retries a failed Minecraft catalog while preserving conf
           configRequests === 1
             ? []
             : configRequests === 2
-              ? catalog
-              : catalog.slice(1),
+              ? [
+                  ...catalog,
+                  "26.3-rc-2",
+                  "26.3-pre-1",
+                  "25w01a",
+                  "b1.7.3",
+                  "a1.2.6",
+                ]
+              : [...catalog.slice(1), "26.3-rc-2"],
         loader: "neoforge",
         status: "offline",
         warnings:
@@ -845,15 +957,15 @@ test("Launchpad refresh retries a failed Minecraft catalog while preserving conf
       { exact: true },
     ),
   ).toHaveCount(0);
-  await version.selectOption("26.3-rc-2");
+  await version.selectOption("26.2");
   await refresh.click();
   await expect.poll(() => configRequests).toBe(3);
-  await expect(version).toHaveValue("26.3-rc-2");
+  await expect(version).toHaveValue("26.2");
   await expect(version.locator("option")).toHaveText([
     "All versions",
     ...catalog.slice(1),
     custom,
-    "26.3-rc-2",
+    "26.2",
   ]);
   await page.setViewportSize({ width: 390, height: 844 });
   expect(

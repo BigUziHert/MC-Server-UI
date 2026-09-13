@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { createCoreProviders } from "./launchpad-providers.mjs";
 
-test("Launchpad Minecraft version catalog keeps every release channel in newest-first date order", async () => {
+test("Launchpad lists only main Minecraft releases in newest-first date order", async () => {
   const tags = [
     { version: "b1.7.3", version_type: "beta", date: "2011-07-07T22:00:00Z" },
     {
@@ -32,6 +32,10 @@ test("Launchpad Minecraft version catalog keeps every release channel in newest-
     },
     { version: "26.2", version_type: "release", date: "2026-07-01T12:00:00Z" },
     { version: "a1.2.6", version_type: "alpha", date: "2010-12-03T12:00:00Z" },
+    { version: "26.3-pre-1", version_type: "snapshot", date: "2026-09-01" },
+    { version: "26.3-beta", version_type: "release", date: "2026-09-01" },
+    { version: "26.3-snapshot-1", version_type: "release", date: "2026-09-01" },
+    { version: "1.7.10", version_type: "release", date: "2014-06-26" },
   ];
   let requested;
   const [provider] = createCoreProviders({
@@ -40,29 +44,37 @@ test("Launchpad Minecraft version catalog keeps every release channel in newest-
       return Response.json(tags);
     },
   });
-  assert.deepEqual(await provider.gameVersions(), [
-    "26.3-rc-2",
-    "26.3-rc-1",
-    "26.2",
-    "25w01a",
-    "1.21.1",
-    "b1.7.3",
-    "a1.2.6",
-    "rd-132211",
-  ]);
+  assert.deepEqual(await provider.gameVersions(), ["26.2", "1.21.1", "1.7.10"]);
   assert.equal(requested, "https://api.modrinth.com/v2/tag/game_version");
 });
 
-test("Launchpad Minecraft version catalog deduplicates tags without inventing or losing undated versions", async () => {
+test("Launchpad deduplicates releases, retains undated releases and excludes malformed tags", async () => {
   const [provider] = createCoreProviders({
     fetch: async () =>
       Response.json([
-        { version: "same-tag", date: "2026-09-12T10:00:00Z" },
-        { version: "older-offset", date: "2026-09-12T12:15:00+02:00" },
-        { version: "newer-utc", date: "2026-09-12T10:30:00Z" },
-        { version: "same-tag", date: "2026-09-11T10:00:00Z" },
-        { version: "provider-tag-without-date" },
-        { version: "provider-tag-with-invalid-date", date: "unknown" },
+        {
+          version: "26.1",
+          version_type: "release",
+          date: "2026-09-12T10:00:00Z",
+        },
+        {
+          version: "26.1.1",
+          version_type: "release",
+          date: "2026-09-12T12:15:00+02:00",
+        },
+        {
+          version: "26.2",
+          version_type: "release",
+          date: "2026-09-12T10:30:00Z",
+        },
+        {
+          version: "26.1",
+          version_type: "release",
+          date: "2026-09-11T10:00:00Z",
+        },
+        { version: "1.0", version_type: "release" },
+        { version: "1.1", version_type: "release", date: "unknown" },
+        { version: "1.2.3" },
         { version: "" },
         { version: "   " },
         { version: null },
@@ -70,10 +82,10 @@ test("Launchpad Minecraft version catalog deduplicates tags without inventing or
       ]),
   });
   assert.deepEqual(await provider.gameVersions(), [
-    "newer-utc",
-    "older-offset",
-    "same-tag",
-    "provider-tag-without-date",
-    "provider-tag-with-invalid-date",
+    "26.2",
+    "26.1.1",
+    "26.1",
+    "1.0",
+    "1.1",
   ]);
 });

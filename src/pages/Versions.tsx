@@ -28,7 +28,11 @@ type Provider = {
   badge?: string;
 };
 type Release = { id: string; label: string; stable: boolean };
-type Build = Release & { publishedAt?: string; javaVersion?: number };
+type Build = Release & {
+  publishedAt?: string;
+  javaVersion?: number;
+  recommended?: boolean;
+};
 type Current = {
   software: string;
   version: string;
@@ -533,6 +537,26 @@ export default function Versions({ notify }: PageProps) {
                   <span className="count-badge">{shownBuilds.length}</span>
                 )}
               </div>
+              {version &&
+                !loadingBuilds &&
+                !showExperimental &&
+                builds.length > shownBuilds.length && (
+                  <div className="versions-filter-notice">
+                    <span>
+                      {builds.length - shownBuilds.length} experimental
+                      {builds.length - shownBuilds.length === 1
+                        ? " build is"
+                        : " builds are"}{" "}
+                      hidden.
+                    </span>
+                    <button
+                      className="btn"
+                      onClick={() => setShowExperimental(true)}
+                    >
+                      Include experimental builds
+                    </button>
+                  </div>
+                )}
               {!version ? (
                 <div className="versions-empty">
                   <SoftwareIcon software={selected.id} />
@@ -557,8 +581,12 @@ export default function Versions({ notify }: PageProps) {
                       <div className="versions-build-info">
                         <strong>
                           {build.label}{" "}
-                          {index === 0 && (
-                            <span className="tag">Newest shown</span>
+                          {(build.recommended || index === 0) && (
+                            <span className="tag">
+                              {build.recommended
+                                ? "Recommended"
+                                : "Newest shown"}
+                            </span>
                           )}
                         </strong>
                         <span>

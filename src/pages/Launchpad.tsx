@@ -239,7 +239,10 @@ export default function Launchpad({ notify }: PageProps) {
         config?.gameVersion,
         gameVersion,
         targetVersion,
-      ].filter((value): value is string => Boolean(value)),
+      ].filter(
+        (value): value is string =>
+          typeof value === "string" && /^\d+(?:\.\d+)+$/.test(value),
+      ),
     ),
   ];
 
@@ -269,7 +272,11 @@ export default function Launchpad({ notify }: PageProps) {
                 ? "modpack"
                 : (first?.types[0] ?? "modpack");
           setType(initialType);
-          setGameVersion(next.gameVersion ?? "");
+          setGameVersion(
+            next.gameVersion && /^\d+(?:\.\d+)+$/.test(next.gameVersion)
+              ? next.gameVersion
+              : "",
+          );
           setLoader(
             loadersFor(initialType).includes(next.loader ?? "")
               ? next.loader!

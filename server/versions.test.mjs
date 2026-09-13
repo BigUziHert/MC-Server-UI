@@ -328,6 +328,156 @@ test("Vanilla verifies version metadata and server SHA1 from the official manife
   assert.equal(f.runs.length, 0);
 });
 
+test("Vanilla retains snapshot catalogs, including historical IDs with spaces, and stages only verified catalog artifacts", async (t) => {
+  const version = "1.14.2 Pre-Release 4";
+  const metadataUrl =
+    "https://piston-meta.mojang.com/v1/packages/fixture/prerelease.json";
+  const jarUrl = "https://piston-data.mojang.com/v1/objects/fixture/server.jar";
+  const metadata = Buffer.from(
+    JSON.stringify({
+      downloads: { server: { url: jarUrl, sha1: digest("sha1") } },
+    }),
+  );
+  const f = await fixture(t, {
+    "https://piston-meta.mojang.com/mc/game/version_manifest_v2.json": {
+      versions: [
+        { id: "26.2", type: "release" },
+        { id: "26.3-snapshot-1", type: "snapshot" },
+        {
+          id: version,
+          type: "snapshot",
+          url: metadataUrl,
+          sha1: digest("sha1", metadata),
+        },
+        { id: "b1.7.3", type: "old_beta" },
+        { id: "../outside", type: "snapshot" },
+        { id: "1.14.2\\outside", type: "snapshot" },
+        { id: "1.14.2:outside", type: "snapshot" },
+        { id: "1.14.2\noutside", type: "snapshot" },
+      ],
+    },
+    [metadataUrl]: metadata,
+    [jarUrl]: jar,
+  });
+  assert.deepEqual((await f.service.versions("vanilla")).versions, [
+    { id: "26.2", label: "26.2", stable: true },
+    { id: "26.3-snapshot-1", label: "26.3-snapshot-1", stable: false },
+    { id: version, label: version, stable: false },
+  ]);
+  assert.equal(
+    (await f.service.builds("vanilla", version)).builds[0].stable,
+    false,
+  );
+  await assert.rejects(
+    f.service.builds("vanilla", "../outside"),
+    /official catalog/,
+  );
+  await assert.rejects(
+    f.service.builds("vanilla", "1.14.2 Pre-Release 5"),
+    /official catalog/,
+  );
+  await assert.rejects(
+    f.service.stage(
+      { provider: "vanilla", version, build: "../outside" },
+      { stageDir: f.root },
+    ),
+    /official build/,
+  );
+  const result = await f.service.stage(
+    { provider: "vanilla", version, build: version },
+    { stageDir: f.root },
+  );
+  assert.deepEqual(
+    await fs.readFile(path.join(result.stageDir, result.configuration.jar)),
+    jar,
+  );
+  assert.equal(
+    path.dirname(path.join(result.stageDir, result.configuration.jar)),
+    result.stageDir,
+  );
+  assert.equal(result.configuration.version, version);
+  assert.equal(f.runs.length, 0);
+});
+
+test("Fabric's preferred loader marker does not hide older compatible public builds", async (t) => {
+  const meta = "https://meta.fabricmc.net/v2/versions";
+  const f = await fixture(t, {
+    [`${meta}/game`]: [{ version: "1.21.1", stable: true }],
+    [`${meta}/loader/1.21.1`]: [
+      { loader: { version: "0.20.0-beta.1", stable: false } },
+      { loader: { version: "0.19.5", stable: true } },
+      { loader: { version: "0.19.4", stable: false } },
+      { loader: { version: "0.18.2", stable: false } },
+      { loader: { version: "0.10.4+build.212", stable: false } },
+      { loader: { version: "0.3.7.111", stable: false } },
+    ],
+  });
+  const { builds } = await f.service.builds("fabric", "1.21.1");
+  assert.deepEqual(
+    builds.map(({ id, stable, recommended }) => [id, stable, recommended]),
+    [
+      ["0.20.0-beta.1", false, false],
+      ["0.19.5", true, true],
+      ["0.19.4", true, false],
+      ["0.18.2", true, false],
+      ["0.10.4+build.212", true, false],
+      ["0.3.7.111", true, false],
+    ],
+  );
+  assert.equal(builds.filter(({ stable }) => stable).length, 5);
+});
+
+test("Quilt and Paper-family catalogs retain all builds with their actual experimental classification", async (t) => {
+  const meta = "https://meta.quiltmc.org/v3/versions";
+  const records = {
+    [`${meta}/game`]: [{ version: "1.21.1", stable: true }],
+    [`${meta}/loader/1.21.1`]: [
+      { loader: { version: "0.30.0-beta.1" } },
+      { loader: { version: "0.29.3" } },
+      { loader: { version: "0.28.1" } },
+    ],
+  };
+  for (const provider of ["paper", "folia", "velocity"]) {
+    records[`${PAPER}/${provider}`] = { versions: { current: ["1.21.1"] } };
+    records[`${PAPER}/${provider}/versions/1.21.1/builds`] = [
+      { id: 3, channel: "EXPERIMENTAL" },
+      { id: 2, channel: "STABLE" },
+      { id: 1, channel: "STABLE" },
+    ].map((build) => ({
+      ...build,
+      downloads: {
+        "server:default": {
+          url: "https://fill-data.papermc.io/v1/objects/fixture/server.jar",
+          checksums: { sha256: digest("sha256") },
+        },
+      },
+    }));
+  }
+  const f = await fixture(t, records);
+  assert.deepEqual(
+    (await f.service.builds("quilt", "1.21.1")).builds.map(({ id, stable }) => [
+      id,
+      stable,
+    ]),
+    [
+      ["0.30.0-beta.1", false],
+      ["0.29.3", true],
+      ["0.28.1", true],
+    ],
+  );
+  for (const provider of ["paper", "folia", "velocity"])
+    assert.deepEqual(
+      (await f.service.builds(provider, "1.21.1")).builds.map(
+        ({ id, stable }) => [id, stable],
+      ),
+      [
+        ["3", false],
+        ["2", true],
+        ["1", true],
+      ],
+    );
+});
+
 test("Forge uses the exact Maven build and checksum and validates generated Java argument files", async (t) => {
   const build = "1.21.1-52.1.0";
   const f = await fixture(
@@ -363,7 +513,13 @@ for (const provider of ["fabric", "quilt"])
       {
         [`${meta}/game`]: [{ version: "1.21.1", stable: true }],
         [`${meta}/loader/1.21.1`]: [
-          { loader: { version: "0.18.0", stable: true } },
+          { loader: { version: "0.19.5", stable: true } },
+          {
+            loader: {
+              version: "0.18.0",
+              ...(provider === "fabric" ? { stable: false } : {}),
+            },
+          },
         ],
         [`${meta}/installer`]: [
           {

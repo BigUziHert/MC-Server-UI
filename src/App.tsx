@@ -13,7 +13,6 @@ import {
   Cloud,
   Copy,
   Cpu,
-  Database,
   ExternalLink,
   FileText,
   FolderOpen,
@@ -42,7 +41,6 @@ import { api as fleetApi, formatBytes, ServerScope, useServerApi } from "./api";
 import FileManager from "./pages/FileManager";
 import Backups from "./pages/Backups";
 import Subusers from "./pages/Subusers";
-import Databases from "./pages/Databases";
 import AuditLogs from "./pages/AuditLogs";
 import Players from "./pages/Players";
 import Versions from "./pages/Versions";
@@ -65,7 +63,6 @@ type Page =
   | "launchpad"
   | "properties"
   | "subusers"
-  | "databases"
   | "backups"
   | "audit";
 type Server = {
@@ -102,17 +99,42 @@ type LogLine = {
   level: string;
   message: string;
 };
+const navigationGroups = [
+  { id: "server", label: "SERVER" },
+  { id: "minecraft", label: "MINECRAFT" },
+  { id: "management", label: "MANAGEMENT" },
+] as const;
+type NavigationGroup = (typeof navigationGroups)[number]["id"];
+const navigationStorageKey = "mc-panel.navigation-collapsed";
+function readCollapsedNavigation(): Record<NavigationGroup, boolean> {
+  try {
+    const saved = JSON.parse(
+      localStorage.getItem(navigationStorageKey) || "null",
+    );
+    return {
+      server: saved?.server === true,
+      minecraft: saved?.minecraft === true,
+      management: saved?.management === true,
+    };
+  } catch {
+    return { server: false, minecraft: false, management: false };
+  }
+}
 const navigation = [
-  { id: "console", label: "Console", icon: Terminal, group: "SERVER" },
-  { id: "files", label: "File Manager", icon: FolderOpen },
-  { id: "players", label: "Players", icon: ShieldCheck },
-  { id: "versions", label: "Versions", icon: Tags, group: "MINECRAFT" },
-  { id: "launchpad", label: "Launchpad", icon: Puzzle },
-  { id: "properties", label: "Properties", icon: SlidersHorizontal },
-  { id: "subusers", label: "Subusers", icon: Users, group: "MANAGEMENT" },
-  { id: "databases", label: "Databases", icon: Database },
-  { id: "backups", label: "Backups", icon: Cloud },
-  { id: "audit", label: "Audit Logs", icon: FileText },
+  { id: "console", label: "Console", icon: Terminal, group: "server" },
+  { id: "files", label: "File Manager", icon: FolderOpen, group: "server" },
+  { id: "players", label: "Players", icon: ShieldCheck, group: "server" },
+  { id: "versions", label: "Versions", icon: Tags, group: "minecraft" },
+  { id: "launchpad", label: "Launchpad", icon: Puzzle, group: "minecraft" },
+  {
+    id: "properties",
+    label: "Properties",
+    icon: SlidersHorizontal,
+    group: "minecraft",
+  },
+  { id: "subusers", label: "Subusers", icon: Users, group: "management" },
+  { id: "backups", label: "Backups", icon: Cloud, group: "management" },
+  { id: "audit", label: "Audit Logs", icon: FileText, group: "management" },
 ] as const;
 function getPage(): Page {
   const hash = window.location.hash.slice(1);
@@ -538,6 +560,10 @@ function ServerWorkspace({
     error?: boolean;
   } | null>(null);
   const [sidebar, setSidebar] = useState(false);
+  const [collapsedNavigation, setCollapsedNavigation] = useState(
+    readCollapsedNavigation,
+  );
+  const previousPage = useRef(page);
   const [help, setHelp] = useState(false);
   useDialogFocus(help, () => setHelp(false));
   const [history, setHistory] = useState<{ cpu: number[]; memory: number[] }>({
@@ -588,6 +614,25 @@ function ServerWorkspace({
   useEffect(() => {
     document.title = `${navigation.find((n) => n.id === page)?.label} · MC Panel`;
   }, [page]);
+  useEffect(() => {
+    try {
+      localStorage.setItem(
+        navigationStorageKey,
+        JSON.stringify(collapsedNavigation),
+      );
+    } catch {
+      // Navigation still works when browser storage is unavailable.
+    }
+  }, [collapsedNavigation]);
+  useEffect(() => {
+    if (previousPage.current === page) return;
+    previousPage.current = page;
+    const group = navigation.find((item) => item.id === page)?.group;
+    if (group)
+      setCollapsedNavigation((current) =>
+        current[group] ? { ...current, [group]: false } : current,
+      );
+  }, [page]);
   const navigate = (id: Page) => {
     window.location.hash = id;
     setPage(id);
@@ -624,21 +669,60 @@ function ServerWorkspace({
           onSettings={() => onSettings(server?.status)}
         />
         <nav aria-label="Main navigation">
-          {navigation.map((item) => (
-            <div key={item.id}>
-              {"group" in item && <div className="nav-label">{item.group}</div>}
-              <a
-                href={`#${item.id}`}
-                className={`nav-item ${page === item.id ? "active" : ""}`}
-                aria-current={page === item.id ? "page" : undefined}
-                onClick={() => setSidebar(false)}
+          {navigationGroups.map((group) => {
+            const items = navigation.filter((item) => item.group === group.id);
+            const collapsed = collapsedNavigation[group.id];
+            const active = items.find((item) => item.id === page);
+            return (
+              <section
+                className="nav-group"
+                aria-labelledby={`nav-heading-${group.id}`}
+                key={group.id}
               >
-                <item.icon size={19} />
-                <span>{item.label}</span>
-                {page === item.id && <span className="nav-active-dot" />}
-              </a>
-            </div>
-          ))}
+                <h2 className="nav-group-heading">
+                  <button
+                    type="button"
+                    id={`nav-heading-${group.id}`}
+                    className={`nav-group-toggle ${collapsed && active ? "contains-active" : ""}`}
+                    aria-expanded={!collapsed}
+                    aria-controls={`nav-links-${group.id}`}
+                    title={
+                      collapsed && active
+                        ? `${active.label} is currently open`
+                        : undefined
+                    }
+                    onClick={() =>
+                      setCollapsedNavigation((current) => ({
+                        ...current,
+                        [group.id]: !current[group.id],
+                      }))
+                    }
+                  >
+                    <span>{group.label}</span>
+                    {collapsed && active && (
+                      <span className="nav-group-active" aria-hidden="true" />
+                    )}
+                    <ChevronRight size={16} aria-hidden="true" />
+                  </button>
+                </h2>
+                <div id={`nav-links-${group.id}`} hidden={collapsed}>
+                  {items.map((item) => (
+                    <a
+                      key={item.id}
+                      href={`#${item.id}`}
+                      className={`nav-item ${page === item.id ? "active" : ""}`}
+                      aria-current={page === item.id ? "page" : undefined}
+                      onClick={() => setSidebar(false)}
+                    >
+                      <item.icon size={19} aria-hidden="true" />
+                      <span>{item.label}</span>
+                      {page === item.id && <span className="nav-active-dot" />}
+                    </a>
+                  ))}
+                </div>
+              </section>
+            );
+          })}
         </nav>
         <div className="sidebar-bottom">
           <div className="profile">
@@ -716,7 +800,6 @@ function ServerWorkspace({
           {page === "properties" && <Properties notify={notify} />}
           {page === "backups" && <Backups notify={notify} />}
           {page === "subusers" && <Subusers notify={notify} />}
-          {page === "databases" && <Databases notify={notify} />}
           {page === "audit" && <AuditLogs notify={notify} />}
           <footer className="footer">
             <span>
