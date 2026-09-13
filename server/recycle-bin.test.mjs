@@ -766,7 +766,7 @@ test("file APIs expose a protected bin, restore across restart and reject unsupp
     assert.equal(
       (
         await panel.request(`/api/files/recycle-bin/${id}`, {
-          method: "DELETE",
+          method: "PUT",
         })
       ).status,
       404,
@@ -855,6 +855,16 @@ test("fleet recycle data belongs only to its server", async (t) => {
     assert.equal(
       (
         await panel.request(
+          `/api/files/recycle-bin/${id}`,
+          { method: "DELETE" },
+          second,
+        )
+      ).status,
+      404,
+    );
+    assert.equal(
+      (
+        await panel.request(
           `/api/files/recycle-bin/${id}/restore`,
           json("POST"),
           first,
@@ -911,6 +921,14 @@ test("backups block recycling and restoring and exclude protected recovery stora
     assert.equal(
       (await panel.request("/api/files?path=active", { method: "DELETE" }))
         .status,
+      409,
+    );
+    assert.equal(
+      (
+        await panel.request(`/api/files/recycle-bin/${id}`, {
+          method: "DELETE",
+        })
+      ).status,
       409,
     );
     assert.equal(
@@ -1001,6 +1019,14 @@ test("a gated restore excludes other mutations and backups, and graceful shutdow
         409,
         route,
       );
+    assert.equal(
+      (
+        await panel.request(`/api/files/recycle-bin/${id}`, {
+          method: "DELETE",
+        })
+      ).status,
+      409,
+    );
     abort.abort();
     await pending;
     let closed = false;
@@ -1019,6 +1045,215 @@ test("a gated restore excludes other mutations and backups, and graceful shutdow
         .request("/api/files/recycle-bin")
         .then((result) => result.body.items),
       [],
+    );
+  } finally {
+    await f.close();
+  }
+});
+
+test("permanent deletion removes only the chosen recovery entry and supports damaged metadata", async (t) => {
+  const f = await fixture(t);
+  await fs.writeFile(path.join(f.serverDir, "active"), "active server data");
+  await fs.writeFile(
+    path.join(f.serverDir, "first"),
+    "delete this recovery copy",
+  );
+  await fs.mkdir(path.join(f.serverDir, "second"));
+  await fs.writeFile(
+    path.join(f.serverDir, "second", "proof"),
+    "retain this other recovery copy",
+  );
+  const bin = await f.boot();
+  const first = await bin.recycle("first");
+  const second = await bin.recycle("second");
+  await bin.deletePermanently(first.id);
+  await missing(path.join(bin.directory, first.id));
+  assert.equal((await bin.list())[0].id, second.id);
+  assert.equal(
+    await fs.readFile(path.join(f.serverDir, "active"), "utf8"),
+    "active server data",
+  );
+  assert.equal(
+    await fs.readFile(
+      path.join(bin.directory, second.id, "content", "proof"),
+      "utf8",
+    ),
+    "retain this other recovery copy",
+  );
+  const incompleteId = randomUUID();
+  const incomplete = path.join(bin.directory, incompleteId);
+  await fs.mkdir(incomplete);
+  await fs.writeFile(path.join(incomplete, "entry.json"), "[invalid metadata");
+  await fs.writeFile(path.join(incomplete, "content"), "incomplete data");
+  assert.equal(
+    (await bin.list()).find((item) => item.id === incompleteId).status,
+    "incomplete",
+  );
+  await bin.deletePermanently(incompleteId);
+  await missing(incomplete);
+  await assert.rejects(bin.deletePermanently("../server"), { status: 400 });
+  await assert.rejects(bin.deletePermanently(randomUUID()), { status: 404 });
+  await bin.deletePermanently(second.id);
+  assert.deepEqual(await bin.list(), []);
+});
+
+test("permanent deletion refuses private entry junctions and nested symlinks without touching outside files", async (t) => {
+  const f = await fixture(t);
+  const outside = path.join(f.root, "outside");
+  await fs.mkdir(outside);
+  await fs.writeFile(path.join(outside, "proof"), "outside must survive");
+  const bin = await f.boot();
+  const linkId = randomUUID();
+  const link = path.join(bin.directory, linkId);
+  await fs.symlink(
+    outside,
+    link,
+    process.platform === "win32" ? "junction" : "dir",
+  );
+  await assert.rejects(bin.deletePermanently(linkId), /symbolic links/i);
+  await fs.unlink(link);
+  const nestedId = randomUUID();
+  const nested = path.join(bin.directory, nestedId);
+  await fs.mkdir(nested);
+  await fs.writeFile(path.join(nested, "retained"), "unchanged private data");
+  await fs.symlink(
+    outside,
+    path.join(nested, "content"),
+    process.platform === "win32" ? "junction" : "dir",
+  );
+  await assert.rejects(bin.deletePermanently(nestedId), /symbolic links/i);
+  assert.equal(
+    await fs.readFile(path.join(outside, "proof"), "utf8"),
+    "outside must survive",
+  );
+  assert.equal(
+    await fs.readFile(path.join(nested, "retained"), "utf8"),
+    "unchanged private data",
+  );
+  await missing(path.join(nested, ".deleting"));
+  await fs.unlink(path.join(nested, "content"));
+});
+
+test("a failed permanent deletion keeps a retryable incomplete entry and prevents restoring a partial archive", async (t) => {
+  const f = await fixture(t);
+  await fs.mkdir(path.join(f.serverDir, "world"));
+  await fs.writeFile(
+    path.join(f.serverDir, "world", "a"),
+    "locked recovery data",
+  );
+  await fs.writeFile(
+    path.join(f.serverDir, "world", "b"),
+    "permanently deleted part",
+  );
+  const bin = await f.boot();
+  const item = await bin.recycle("world");
+  const locked = path.join(bin.directory, item.id, "content", "a");
+  const failed = await f.boot({
+    fileSystem: {
+      ...fs,
+      unlink: async (target) => {
+        if (target === locked)
+          throw Object.assign(new Error("fixture locked file"), {
+            code: "EPERM",
+          });
+        return fs.unlink(target);
+      },
+    },
+  });
+  await assert.rejects(failed.deletePermanently(item.id), {
+    status: 409,
+    code: "EPERM",
+  });
+  assert.equal(await fs.readFile(locked, "utf8"), "locked recovery data");
+  await missing(path.join(bin.directory, item.id, "content", "b"));
+  const restarted = await f.boot();
+  assert.equal((await restarted.list())[0].status, "incomplete");
+  await assert.rejects(restarted.restore(item.id), /incomplete/);
+  await restarted.deletePermanently(item.id);
+  assert.deepEqual(await restarted.list(), []);
+});
+
+test("permanent-delete API remains locked and shutdown drains its work after client disconnect", async (t) => {
+  const f = await apiFixture(t);
+  const entered = deferred();
+  const release = deferred();
+  f.releases.push(release.resolve);
+  try {
+    const panel = await f.boot();
+    await fs.writeFile(
+      path.join(f.serverDir, "proof"),
+      "delete this private recovery data",
+    );
+    await fs.writeFile(path.join(f.serverDir, "active"), "active data stays");
+    const deleted = await panel.request("/api/files?path=proof", {
+      method: "DELETE",
+    });
+    const id = deleted.body.recycled.id;
+    const target = path.join(f.dataDir, "recycle-bin", id, "content");
+    const unlink = fs.unlink;
+    t.mock.method(fs, "unlink", async (file) => {
+      if (file === target) {
+        entered.resolve();
+        await release.promise;
+      }
+      return unlink(file);
+    });
+    const abort = new AbortController();
+    const pending = panel
+      .request(`/api/files/recycle-bin/${id}`, {
+        method: "DELETE",
+        signal: abort.signal,
+      })
+      .catch((cause) => cause);
+    await Promise.race([
+      entered.promise,
+      pending.then((result) => {
+        throw new Error(
+          `Purge completed before gated unlink: ${JSON.stringify(result)}`,
+        );
+      }),
+    ]);
+    assert.equal(
+      (
+        await panel.request(
+          `/api/files/recycle-bin/${id}/restore`,
+          json("POST"),
+        )
+      ).status,
+      409,
+    );
+    assert.equal(
+      (
+        await panel.request(`/api/files/recycle-bin/${id}`, {
+          method: "DELETE",
+        })
+      ).status,
+      409,
+    );
+    assert.equal(
+      (await panel.request("/api/files?path=active", { method: "DELETE" }))
+        .status,
+      409,
+    );
+    assert.equal(
+      (await panel.request("/api/backups", json("POST", { name: "blocked" })))
+        .status,
+      409,
+    );
+    abort.abort();
+    await pending;
+    let closed = false;
+    const closing = panel.close().then(() => {
+      closed = true;
+    });
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    assert.equal(closed, false);
+    release.resolve();
+    await closing;
+    await missing(path.join(f.dataDir, "recycle-bin", id));
+    assert.equal(
+      await fs.readFile(path.join(f.serverDir, "active"), "utf8"),
+      "active data stays",
     );
   } finally {
     await f.close();

@@ -7,6 +7,7 @@ import { EventEmitter } from "node:events";
 import { randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
+import { availableParallelism } from "node:os";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import permissionsCatalog from "../shared/subuser-permissions.json" with { type: "json" };
 import { createProcessTelemetry } from "./telemetry.mjs";
@@ -24,6 +25,9 @@ import {
   readPlayerRecords,
   moderationCommand,
   validPlayerUuid,
+  whitelistCommand,
+  readWhitelistSettings,
+  samePlayer,
 } from "./player-history.mjs";
 import {
   canonicalExternalDirectory,
@@ -510,6 +514,8 @@ export async function createPanel(options = {}) {
     demoOperators: [],
     playerHistory: [],
     demoPlayerBans: [],
+    demoWhitelist: [],
+    demoWhitelistEnabled: null,
     schedule: { ...defaultSchedule },
   };
   if (await exists(statePath))
@@ -1345,6 +1351,8 @@ export async function createPanel(options = {}) {
         );
       const recycling =
         (req.method === "DELETE" && req.path === "/api/files") ||
+        (req.method === "DELETE" &&
+          /^\/api\/files\/recycle-bin\/[^/]+$/.test(req.path)) ||
         (req.method === "POST" &&
           /^\/api\/files\/recycle-bin\/[^/]+\/restore$/.test(req.path));
       if (recycleBusy || (recycling && activeMutations))
@@ -1406,6 +1414,7 @@ export async function createPanel(options = {}) {
       version: configuration.version,
       software: configuration.software,
       uptime: startedAt ? Math.floor((Date.now() - startedAt) / 1000) : 0,
+      cpuCapacity: availableParallelism() * 100,
       cpu:
         mode === "demo" && active
           ? Number((7.2 + Math.sin(Date.now() / 7000) * 2.6).toFixed(1))
@@ -1469,12 +1478,21 @@ export async function createPanel(options = {}) {
   );
   app.get("/api/console", (_req, res) => res.json({ lines }));
   const loadPlayerHistory = async () => {
-    const [cache, savedBans] = await Promise.all([
-      readPlayerRecords(serverDir, "usercache.json", safePath),
-      readPlayerRecords(serverDir, "banned-players.json", safePath),
-    ]);
+    const [cache, savedBans, operators, savedWhitelist, settings] =
+      await Promise.all([
+        readPlayerRecords(serverDir, "usercache.json", safePath),
+        readPlayerRecords(serverDir, "banned-players.json", safePath),
+        loadOperators(),
+        readPlayerRecords(serverDir, "whitelist.json", safePath),
+        readWhitelistSettings(serverDir, safePath),
+      ]);
     playerHistory.seed(cache.records, "cache");
     playerHistory.seed(savedBans.records, "banned");
+    playerHistory.seed(operators, "operator");
+    const whitelist =
+      mode === "demo" ? (state.demoWhitelist ?? []) : savedWhitelist.records;
+    playerHistory.seed(whitelist, "whitelist");
+    const whitelistAvailable = mode === "demo" || savedWhitelist.available;
     let bans = savedBans.records;
     if (mode === "demo") {
       for (const change of state.demoPlayerBans ?? []) {
@@ -1486,13 +1504,62 @@ export async function createPanel(options = {}) {
         if (change.banned) bans.push(change);
       }
     }
+    const history = playerHistory.snapshot(
+      onlinePlayers,
+      bans,
+      savedBans.available,
+      { operators, whitelist, whitelistAvailable },
+    );
+    // The live roster is one entry per observed connection name. Historical
+    // UUIDs may share a reused username, so filtering history can double-count it.
+    const online = [...onlinePlayers.values()].map((active) => {
+      const matches = history.filter(
+        (player) => player.name.toLowerCase() === active.name.toLowerCase(),
+      );
+      const known = active.uuid
+        ? matches.find((player) => player.uuid === active.uuid)
+        : matches.length === 1
+          ? matches[0]
+          : undefined;
+      return {
+        firstSeen: null,
+        lastSeen: null,
+        source: "observed",
+        banned: null,
+        ...known,
+        ...active,
+        online: true,
+      };
+    });
     return {
-      history: playerHistory.snapshot(onlinePlayers, bans, savedBans.available),
+      operators,
+      history,
+      online,
+      banned: history.filter((player) => player.banned),
+      whitelist: whitelist.map((player) => ({
+        ...player,
+        online: [...onlinePlayers.values()].some((active) =>
+          samePlayer(active, player),
+        ),
+      })),
+      whitelistAvailable,
+      whitelistEnabled:
+        mode === "demo" && typeof state.demoWhitelistEnabled === "boolean"
+          ? state.demoWhitelistEnabled
+          : settings.enabled,
+      whitelistSettingsAvailable:
+        (mode === "demo" && typeof state.demoWhitelistEnabled === "boolean") ||
+        settings.available,
       bansAvailable: savedBans.available,
-      warnings: [cache.warning, savedBans.warning].filter(Boolean),
+      warnings: [
+        cache.warning,
+        savedBans.warning,
+        mode === "live" ? savedWhitelist.warning : null,
+        settings.warning,
+      ].filter(Boolean),
     };
   };
-  app.get("/api/players", async (_req, res) => {
+  const loadOperators = async () => {
     let operators = state.demoOperators;
     if (mode === "live") {
       const target = await safePath(serverDir, "ops.json");
@@ -1540,8 +1607,130 @@ export async function createPanel(options = {}) {
         operators = [];
       }
     }
-    res.json({ operators, mode, status, ...(await loadPlayerHistory()) });
+    return operators;
+  };
+  app.get("/api/players", async (_req, res) => {
+    res.json({
+      mode,
+      status,
+      maxPlayers: configuration.maxPlayers,
+      ...(await loadPlayerHistory()),
+    });
   });
+  const validateKnownIdentity = (snapshot, name, uuid, authoritative) => {
+    if (uuid === undefined) return;
+    if (!validPlayerUuid(uuid))
+      throw error(400, "The player UUID is invalid. Refresh the player list.");
+    const records = authoritative ?? snapshot.history;
+    const matches = records.filter(
+      (player) => player.name.toLowerCase() === name.toLowerCase(),
+    );
+    const known = snapshot.history.filter(
+      (player) => player.name.toLowerCase() === name.toLowerCase(),
+    );
+    if (
+      !matches.some(
+        (player) => player.uuid?.toLowerCase() === uuid.toLowerCase(),
+      ) ||
+      new Set(
+        [...matches, ...known]
+          .filter((player) => player.uuid)
+          .map((player) => player.uuid.toLowerCase()),
+      ).size > 1
+    )
+      throw error(
+        409,
+        "This player's identity changed or is unavailable. Refresh the player list before trying again.",
+      );
+  };
+  for (const action of ["add", "remove", "state"]) {
+    app.post(
+      `/api/players/whitelist/${action}`,
+      trackOperation(async (req, res) => {
+        const command = whitelistCommand(action, req.body);
+        if (status !== "running")
+          throw error(409, "Start this server before changing its whitelist.");
+        const snapshot = await loadPlayerHistory();
+        if (action === "state") {
+          if (!snapshot.whitelistSettingsAvailable)
+            throw error(
+              409,
+              "The whitelist setting is unavailable. Check white-list in server.properties and refresh.",
+            );
+          if (req.body.enabled && !snapshot.whitelistAvailable)
+            throw error(
+              409,
+              "The saved whitelist is unavailable. Fix whitelist.json before enabling it.",
+            );
+        } else {
+          if (!snapshot.whitelistAvailable)
+            throw error(
+              409,
+              "The saved whitelist is unavailable. Fix whitelist.json and refresh before changing it.",
+            );
+          const current = snapshot.whitelist.filter(
+            (player) =>
+              player.name.toLowerCase() === req.body.name.toLowerCase(),
+          );
+          if (
+            action === "remove" &&
+            (!current.length ||
+              new Set(current.map((player) => player.uuid)).size > 1)
+          )
+            throw error(
+              409,
+              "This player is not uniquely identified in the saved whitelist. Refresh the player list.",
+            );
+          validateKnownIdentity(
+            snapshot,
+            req.body.name,
+            req.body.uuid,
+            action === "remove" ? snapshot.whitelist : undefined,
+          );
+        }
+        if (mode === "live") {
+          if (!processHandle?.stdin.writable)
+            throw error(409, "The server is not ready to receive commands.");
+          await writeServer(processHandle, command);
+        } else if (action === "state")
+          state.demoWhitelistEnabled = req.body.enabled;
+        else {
+          state.demoWhitelist = (state.demoWhitelist ?? []).filter(
+            (player) =>
+              player.name.toLowerCase() !== req.body.name.toLowerCase(),
+          );
+          if (action === "add") {
+            const known = snapshot.history.filter(
+              (player) =>
+                player.name.toLowerCase() === req.body.name.toLowerCase(),
+            );
+            const uuid =
+              req.body.uuid?.toLowerCase() ??
+              (known.length === 1 ? known[0].uuid : undefined);
+            state.demoWhitelist.push({
+              name: req.body.name,
+              ...(uuid ? { uuid } : {}),
+            });
+          }
+        }
+        append(
+          `[${mode === "demo" ? "Demo" : "Panel"}] ${mode === "demo" ? "Simulated" : "Requested"}: ${command}`,
+        );
+        await audit(
+          "player",
+          `Whitelist ${action} ${mode === "demo" ? "simulated" : "requested"}`,
+          command,
+        );
+        res.json({
+          simulated: mode === "demo",
+          message:
+            mode === "demo"
+              ? `Demo: ${command} was simulated. No live whitelist or server properties were changed.`
+              : `Requested ${command}. Check Console for Minecraft's confirmation; the whitelist and setting update after the server writes its files.`,
+        });
+      }),
+    );
+  }
   for (const action of ["kick", "ban", "unban"]) {
     app.post(
       `/api/players/${action}`,
@@ -1631,19 +1820,12 @@ export async function createPanel(options = {}) {
               "The player UUID is invalid. Refresh the player list.",
             );
           const snapshot = await loadPlayerHistory();
-          const matches = snapshot.history.filter(
-            (player) => player.name.toLowerCase() === name.toLowerCase(),
+          validateKnownIdentity(
+            snapshot,
+            name,
+            req.body.uuid,
+            action === "deop" ? snapshot.operators : undefined,
           );
-          if (
-            !matches.some(
-              (player) => player.uuid === req.body.uuid.toLowerCase(),
-            ) ||
-            new Set(matches.map((player) => player.uuid)).size > 1
-          )
-            throw error(
-              409,
-              "This player's identity changed or is unavailable. Refresh the player list before trying again.",
-            );
         }
         if (status !== "running")
           throw error(
@@ -1659,7 +1841,12 @@ export async function createPanel(options = {}) {
           state.demoOperators = state.demoOperators.filter(
             (entry) => entry.name.toLowerCase() !== name.toLowerCase(),
           );
-          if (action === "op") state.demoOperators.push({ name, level: 4 });
+          if (action === "op")
+            state.demoOperators.push({
+              name,
+              level: 4,
+              ...(req.body.uuid ? { uuid: req.body.uuid.toLowerCase() } : {}),
+            });
         }
         append(
           `[${mode === "demo" ? "Demo" : "Panel"}] ${mode === "demo" ? "Simulated" : "Requested"}: ${command}`,
@@ -1730,6 +1917,18 @@ export async function createPanel(options = {}) {
   app.get("/api/files/recycle-bin", async (_req, res) => {
     res.json({ items: await recycleBin.list(), protected: true });
   });
+  app.delete(
+    "/api/files/recycle-bin/:id",
+    trackOperation(async (req, res) => {
+      await recycleBin.deletePermanently(req.params.id);
+      await audit(
+        "file",
+        "Recycle Bin item permanently deleted",
+        req.params.id,
+      );
+      res.json({ ok: true, id: req.params.id });
+    }),
+  );
   app.post(
     "/api/files/recycle-bin/:id/restore",
     trackOperation(async (req, res) => {

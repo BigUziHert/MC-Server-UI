@@ -1,4 +1,5 @@
 import fs from "node:fs/promises";
+import { parseProperties } from "./import.mjs";
 
 const fail = (message) => Object.assign(new Error(message), { status: 400 });
 export const validPlayerName = (name) =>
@@ -6,6 +7,51 @@ export const validPlayerName = (name) =>
 export const validPlayerUuid = (uuid) =>
   typeof uuid === "string" &&
   /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i.test(uuid);
+
+export function whitelistCommand(action, input) {
+  if (action === "state") {
+    if (typeof input?.enabled !== "boolean")
+      throw fail("Choose whether the whitelist is enabled.");
+    return `whitelist ${input.enabled ? "on" : "off"}`;
+  }
+  if (!["add", "remove"].includes(action))
+    throw fail("Unknown whitelist action.");
+  if (!validPlayerName(input?.name))
+    throw fail(
+      "Use a Minecraft username with 3–16 letters, numbers, or underscores.",
+    );
+  if (input.uuid !== undefined && !validPlayerUuid(input.uuid))
+    throw fail("The player UUID is invalid. Refresh the player list.");
+  return `whitelist ${action} ${input.name}`;
+}
+
+export const samePlayer = (first, second) =>
+  first.uuid && second.uuid
+    ? first.uuid.toLowerCase() === second.uuid.toLowerCase()
+    : first.name.toLowerCase() === second.name.toLowerCase();
+
+export async function readWhitelistSettings(serverDir, safePath) {
+  try {
+    const target = await safePath(serverDir, "server.properties");
+    const stat = await fs.stat(target);
+    if (!stat.isFile() || stat.size > 1024 * 1024)
+      throw new Error("Invalid properties file");
+    const content = await fs.readFile(target);
+    if (content.includes(0)) throw new Error("Invalid properties encoding");
+    const settings = parseProperties(content.toString("utf8"));
+    const value = settings.get("white-list")?.trim().toLowerCase() ?? "false";
+    if (!["true", "false"].includes(value))
+      throw new Error("Invalid white-list value");
+    return { enabled: value === "true", available: true, warning: null };
+  } catch {
+    return {
+      enabled: null,
+      available: false,
+      warning:
+        "The whitelist setting could not be read. Check white-list in server.properties, then refresh.",
+    };
+  }
+}
 
 export function moderationCommand(action, input) {
   if (!["kick", "ban", "unban"].includes(action))
@@ -52,7 +98,7 @@ export async function readPlayerRecords(serverDir, filename, safePath) {
       warning:
         valid.length === entries.length
           ? null
-          : `${filename} contains invalid player records. Valid records are shown; fix the file to manage bans.`,
+          : `${filename} contains invalid player records. Valid records are shown; fix the file before changing this list.`,
     };
   } catch (cause) {
     if (cause.code === "ENOENT")
@@ -69,6 +115,13 @@ const timestamp = (value) =>
   typeof value === "string" && Number.isFinite(Date.parse(value))
     ? value
     : null;
+const sourcePriority = {
+  banned: 0,
+  whitelist: 1,
+  operator: 2,
+  cache: 3,
+  observed: 4,
+};
 export function createPlayerHistory({
   records = [],
   persist,
@@ -87,12 +140,9 @@ export function createPlayerHistory({
           ...(entry.uuid ? { uuid: entry.uuid.toLowerCase() } : {}),
           firstSeen: timestamp(entry.firstSeen),
           lastSeen: timestamp(entry.lastSeen),
-          source:
-            entry.source === "observed"
-              ? "observed"
-              : entry.source === "banned"
-                ? "banned"
-                : "cache",
+          source: Object.hasOwn(sourcePriority, entry.source)
+            ? entry.source
+            : "cache",
         }))
     : [];
   const byUuid = new Map();
@@ -153,12 +203,10 @@ export function createPlayerHistory({
     const before = JSON.stringify(entry);
     const oldName = entry.name.toLowerCase();
     // Files can lag a newly observed login or retain a banned player's old name.
-    if (
-      source === "observed" ||
-      (source === "cache" && entry.source !== "observed") ||
-      entry.source === "banned"
-    )
+    if (sourcePriority[source] >= sourcePriority[entry.source])
       entry.name = player.name;
+    if (sourcePriority[source] > sourcePriority[entry.source])
+      entry.source = source;
     if (uuid) entry.uuid = uuid;
     if (source === "observed") {
       entry.source = source;
@@ -184,13 +232,38 @@ export function createPlayerHistory({
     identify(player) {
       upsert(player, "observed");
     },
-    snapshot(online, bans, bansAvailable = true) {
+    snapshot(
+      online,
+      bans,
+      bansAvailable = true,
+      { operators = [], whitelist = [], whitelistAvailable = true } = {},
+    ) {
       const bansByUuid = new Map();
       const bansByName = new Map();
       for (const ban of bans) {
         if (ban.uuid) bansByUuid.set(ban.uuid.toLowerCase(), ban);
         bansByName.set(ban.name.toLowerCase(), ban);
       }
+      const membership = (entries) => {
+        const uuids = new Set(
+          entries
+            .filter((entry) => entry.uuid)
+            .map((entry) => entry.uuid.toLowerCase()),
+        );
+        const names = new Set(entries.map((entry) => entry.name.toLowerCase()));
+        const unboundNames = new Set(
+          entries
+            .filter((entry) => !entry.uuid)
+            .map((entry) => entry.name.toLowerCase()),
+        );
+        return (entry) =>
+          entry.uuid
+            ? uuids.has(entry.uuid.toLowerCase()) ||
+              unboundNames.has(entry.name.toLowerCase())
+            : names.has(entry.name.toLowerCase());
+      };
+      const operator = membership(operators);
+      const whitelisted = membership(whitelist);
       return history
         .map((entry) => {
           const active = online.get(entry.name.toLowerCase());
@@ -206,6 +279,8 @@ export function createPlayerHistory({
               (!active.uuid || !entry.uuid || active.uuid === entry.uuid),
             ),
             banned: bansAvailable ? Boolean(ban) : null,
+            operator: operator(entry),
+            whitelisted: whitelistAvailable ? whitelisted(entry) : null,
             ...(ban?.reason ? { banReason: ban.reason } : {}),
           };
         })

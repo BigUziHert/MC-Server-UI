@@ -979,6 +979,16 @@ function RecycleBin({ notify, onBack }: PageProps & { onBack: () => void }) {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
   const [restoring, setRestoring] = useState<string | null>(null);
+  const [selected, setSelected] = useState<Set<string>>(new Set());
+  const [action, setAction] = useState<{
+    type: "restore" | "delete";
+    targets: RecycledItem[];
+    failures?: { item: RecycledItem; message: string }[];
+  } | null>(null);
+  const [actionError, setActionError] = useState("");
+  const [completed, setCompleted] = useState(0);
+  const actionDialog = useRef<HTMLDialogElement>(null);
+  const cancelAction = useRef<HTMLButtonElement>(null);
   const [restoreErrors, setRestoreErrors] = useState<Record<string, string>>(
     {},
   );
@@ -993,7 +1003,14 @@ function RecycleBin({ notify, onBack }: PageProps & { onBack: () => void }) {
       const result = await api<{ items: RecycledItem[]; protected: true }>(
         "/files/recycle-bin",
       );
-      if (id === requestId.current) setItems(result.items);
+      if (id === requestId.current) {
+        setItems(result.items);
+        const available = new Set(result.items.map((item) => item.id));
+        setSelected(
+          (previous) =>
+            new Set([...previous].filter((id) => available.has(id))),
+        );
+      }
     } catch (failure) {
       if (id === requestId.current) setError(messageOf(failure));
     } finally {
@@ -1006,6 +1023,13 @@ function RecycleBin({ notify, onBack }: PageProps & { onBack: () => void }) {
       requestId.current++;
     };
   }, [load]);
+  const actionOpen = !!action;
+  useEffect(() => {
+    if (actionOpen) {
+      actionDialog.current?.showModal();
+      cancelAction.current?.focus();
+    } else actionDialog.current?.close();
+  }, [actionOpen]);
 
   async function restore(item: RecycledItem) {
     if (restorePending.current || item.status !== "ready") return;
@@ -1018,6 +1042,9 @@ function RecycleBin({ notify, onBack }: PageProps & { onBack: () => void }) {
         {},
       );
       setItems((previous) => previous.filter((entry) => entry.id !== item.id));
+      setSelected(
+        (previous) => new Set([...previous].filter((id) => id !== item.id)),
+      );
       notify(`${item.name} restored to /${item.originalPath}.`);
       searchInput.current?.focus();
     } catch (failure) {
@@ -1031,17 +1058,95 @@ function RecycleBin({ notify, onBack }: PageProps & { onBack: () => void }) {
     }
   }
 
+  function openAction(type: "restore" | "delete", targets: RecycledItem[]) {
+    if (!targets.length || restorePending.current) return;
+    setActionError("");
+    setCompleted(0);
+    setAction({ type, targets: [...targets] });
+  }
+  function closeAction() {
+    if (restorePending.current) return;
+    setAction(null);
+    setActionError("");
+    searchInput.current?.focus();
+  }
+  async function submitAction(event: FormEvent) {
+    event.preventDefault();
+    if (!action || restorePending.current) return;
+    restorePending.current = true;
+    const successes = new Set<string>();
+    const failures: { item: RecycledItem; message: string }[] = [];
+    setActionError("");
+    setCompleted(0);
+    try {
+      for (const item of action.targets) {
+        setRestoring(item.id);
+        try {
+          const url = `/files/recycle-bin/${encodeURIComponent(item.id)}`;
+          if (action.type === "restore") await post(`${url}/restore`, {});
+          else await api(url, { method: "DELETE" });
+          successes.add(item.id);
+        } catch (cause) {
+          failures.push({ item, message: messageOf(cause) });
+        }
+        setCompleted(successes.size + failures.length);
+      }
+      setItems((previous) =>
+        previous.filter((item) => !successes.has(item.id)),
+      );
+      setSelected((previous) => {
+        const remaining = new Set(
+          [...previous].filter((id) => !successes.has(id)),
+        );
+        failures.forEach(({ item }) => remaining.add(item.id));
+        return remaining;
+      });
+      const summary = `${successes.size} ${successes.size === 1 ? "item" : "items"} ${action.type === "restore" ? "restored" : "permanently deleted"}.${failures.length ? ` ${failures.length} ${failures.length === 1 ? "item failed and remains" : "items failed and remain"} selected.` : ""}`;
+      notify(summary, failures.length > 0);
+      if (failures.length) {
+        setAction({
+          ...action,
+          targets: failures.map(({ item }) => item),
+          failures,
+        });
+        setActionError(summary);
+      } else {
+        setAction(null);
+        searchInput.current?.focus();
+      }
+      await load();
+    } finally {
+      restorePending.current = false;
+      setRestoring(null);
+    }
+  }
+
   const visible = items.filter((item) =>
     `${item.name} ${item.originalPath}`
       .toLowerCase()
       .includes(query.toLowerCase()),
   );
+  const selectedItems = items.filter((item) => selected.has(item.id));
+  const visibleSelected = visible.filter((item) =>
+    selected.has(item.id),
+  ).length;
+  const allSelected = visible.length > 0 && visibleSelected === visible.length;
+  const hiddenSelected = selectedItems.length - visibleSelected;
+  function toggleVisible() {
+    setSelected((previous) => {
+      const next = new Set(previous);
+      visible.forEach((item) =>
+        allSelected ? next.delete(item.id) : next.add(item.id),
+      );
+      return next;
+    });
+  }
   return (
     <div className="storage-page recycle-bin-page">
       <div className="page-heading">
         <div>
           <h1>Recycle Bin</h1>
-          <p>Recover deleted files and folders for this server.</p>
+          <p>Restore deleted files or permanently remove recovery data.</p>
         </div>
         <button className="btn" onClick={onBack}>
           <Folder size={16} /> Back to files
@@ -1084,7 +1189,8 @@ function RecycleBin({ notify, onBack }: PageProps & { onBack: () => void }) {
           <p>
             Recycle Bin is protected and stored outside your server files.
             Restore returns each item to its original path, including all folder
-            contents. Existing files are never overwritten.
+            contents. Existing files are never overwritten. Incomplete items can
+            be permanently deleted, but cannot be restored.
           </p>
         </div>
         <div className="files-filter">
@@ -1106,6 +1212,73 @@ function RecycleBin({ notify, onBack }: PageProps & { onBack: () => void }) {
           <span className="muted files-count">
             {items.length} {items.length === 1 ? "item" : "items"}
           </span>
+        </div>
+        <div
+          className="recycle-selection-bar"
+          role="region"
+          aria-label="Recycle Bin selection"
+        >
+          <div className="recycle-selection-summary">
+            <label className="recycle-select-all">
+              <input
+                className="file-selection-checkbox"
+                type="checkbox"
+                aria-label="Select all visible recycled items"
+                checked={allSelected}
+                aria-checked={
+                  visibleSelected > 0 && !allSelected ? "mixed" : allSelected
+                }
+                ref={(input) => {
+                  if (input)
+                    input.indeterminate = visibleSelected > 0 && !allSelected;
+                }}
+                onChange={toggleVisible}
+                disabled={!visible.length || !!restoring || loading || !!error}
+              />
+              <span>{selectedItems.length} selected</span>
+            </label>
+            <span className="muted">
+              {hiddenSelected > 0
+                ? `${hiddenSelected} hidden by the filter`
+                : "\u00a0"}
+            </span>
+          </div>
+          <div className="recycle-selection-actions">
+            <button
+              className="btn small"
+              disabled={!selectedItems.length || !!restoring}
+              onClick={() => setSelected(new Set())}
+            >
+              Clear selection
+            </button>
+            <button
+              className="btn small"
+              disabled={
+                !selectedItems.length ||
+                !!restoring ||
+                loading ||
+                !!error ||
+                selectedItems.some((item) => item.status !== "ready")
+              }
+              title={
+                selectedItems.some((item) => item.status !== "ready")
+                  ? "Incomplete items cannot be restored. Deselect them to restore other items."
+                  : "Restore selected items to their original paths"
+              }
+              onClick={() => openAction("restore", selectedItems)}
+            >
+              <Undo2 size={15} /> Restore selected
+            </button>
+            <button
+              className="btn danger small"
+              disabled={
+                !selectedItems.length || !!restoring || loading || !!error
+              }
+              onClick={() => openAction("delete", selectedItems)}
+            >
+              <Trash2 size={15} /> Delete selected permanently
+            </button>
+          </div>
         </div>
         {error ? (
           <div className="empty-state" role="alert">
@@ -1140,6 +1313,21 @@ function RecycleBin({ notify, onBack }: PageProps & { onBack: () => void }) {
                 className="recycle-bin-item"
                 aria-label={`Recycled ${item.originalPath}`}
               >
+                <input
+                  className="file-selection-checkbox recycle-item-checkbox"
+                  type="checkbox"
+                  aria-label={`Select recycled ${item.name}`}
+                  checked={selected.has(item.id)}
+                  disabled={!!restoring}
+                  onChange={() =>
+                    setSelected((previous) => {
+                      const next = new Set(previous);
+                      if (next.has(item.id)) next.delete(item.id);
+                      else next.add(item.id);
+                      return next;
+                    })
+                  }
+                />
                 <div className="recycle-bin-item-icon">
                   {item.type === "directory" ? (
                     <Folder size={22} />
@@ -1150,7 +1338,10 @@ function RecycleBin({ notify, onBack }: PageProps & { onBack: () => void }) {
                 <div className="recycle-bin-item-details">
                   <h2>{item.name}</h2>
                   <p className="recycle-bin-original-path">
-                    <span>Original path</span> /{item.originalPath}
+                    <span>Original path</span>{" "}
+                    {item.originalPath
+                      ? `/${item.originalPath}`
+                      : "Unavailable"}
                   </p>
                   <p className="recycle-bin-item-meta">
                     <span>
@@ -1178,30 +1369,152 @@ function RecycleBin({ notify, onBack }: PageProps & { onBack: () => void }) {
                     </p>
                   )}
                 </div>
-                <button
-                  className="btn small"
-                  aria-label={`Restore ${item.name}`}
-                  disabled={!!restoring || item.status !== "ready"}
-                  onClick={() => void restore(item)}
-                >
-                  {restoring === item.id ? (
-                    <LoaderCircle size={15} className="spin" />
-                  ) : (
-                    <Undo2 size={15} />
-                  )}
-                  {restoring === item.id ? "Restoring…" : "Restore"}
-                </button>
+                <div className="recycle-item-actions">
+                  <button
+                    className="btn small"
+                    aria-label={`Restore ${item.name}`}
+                    disabled={!!restoring || item.status !== "ready"}
+                    onClick={() => void restore(item)}
+                  >
+                    {restoring === item.id ? (
+                      <LoaderCircle size={15} className="spin" />
+                    ) : (
+                      <Undo2 size={15} />
+                    )}
+                    {restoring === item.id ? "Restoring…" : "Restore"}
+                  </button>
+                  <button
+                    className="btn danger small"
+                    aria-label={`Permanently delete ${item.name}`}
+                    disabled={!!restoring}
+                    onClick={() => openAction("delete", [item])}
+                  >
+                    <Trash2 size={15} /> Delete permanently
+                  </button>
+                </div>
               </li>
             ))}
           </ul>
         )}
         <div className="files-footer">
           <span>
-            <LockKeyhole size={12} /> Restore only · Editing and uploads are
-            disabled here
+            <LockKeyhole size={12} /> Permanent deletion cannot be undone
           </span>
         </div>
       </section>
+      <dialog
+        ref={actionDialog}
+        className="modal storage-modal recycle-action-dialog"
+        aria-labelledby="recycle-action-title"
+        onCancel={(event) => {
+          event.preventDefault();
+          closeAction();
+        }}
+      >
+        {action && (
+          <form onSubmit={submitAction}>
+            <div className="storage-modal-heading">
+              <div>
+                <h2 id="recycle-action-title">
+                  {action.type === "delete"
+                    ? "Permanently delete from Recycle Bin?"
+                    : "Restore selected items?"}
+                </h2>
+                <p>
+                  {action.type === "delete"
+                    ? "This permanently removes the recovery data listed below. It cannot be undone."
+                    : "Restore these items to their original server paths. Existing files will not be overwritten."}
+                </p>
+              </div>
+              <button
+                type="button"
+                className="btn icon"
+                aria-label="Close recovery confirmation"
+                disabled={!!restoring}
+                onClick={closeAction}
+              >
+                <X size={18} />
+              </button>
+            </div>
+            <ul
+              className="file-bulk-targets"
+              aria-label="Confirmed recovery items"
+            >
+              {action.targets.map((item) => (
+                <li key={item.id}>
+                  {item.type === "directory" ? (
+                    <Folder size={18} />
+                  ) : (
+                    <FileIcon size={18} />
+                  )}
+                  <div>
+                    <strong>{item.name}</strong>
+                    <span>
+                      {item.originalPath
+                        ? `/${item.originalPath}`
+                        : "Original path unavailable"}
+                    </span>
+                    <small>
+                      {item.type === "directory"
+                        ? "Folder · all remaining contents"
+                        : "File"}{" "}
+                      · {formatBytes(item.size)}
+                    </small>
+                    <small>
+                      Deleted {new Date(item.deletedAt).toLocaleString()}
+                      {!item.originalPath && ` · Recovery item ${item.id}`}
+                    </small>
+                    {item.status !== "ready" && (
+                      <small>Incomplete recovery item</small>
+                    )}
+                  </div>
+                </li>
+              ))}
+            </ul>
+            {actionError && (
+              <p className="storage-form-error" role="alert">
+                {actionError}
+              </p>
+            )}
+            {!!action.failures?.length && (
+              <ul
+                className="file-bulk-errors"
+                aria-label="Recovery action errors"
+              >
+                {action.failures.map(({ item, message }) => (
+                  <li key={item.id}>
+                    <strong>{item.name}:</strong> {message}
+                  </li>
+                ))}
+              </ul>
+            )}
+            <div className="storage-modal-footer">
+              <button
+                ref={cancelAction}
+                className="btn"
+                type="button"
+                disabled={!!restoring}
+                onClick={closeAction}
+              >
+                Cancel
+              </button>
+              <button
+                type="submit"
+                className={`btn ${action.type === "delete" ? "danger" : "primary"}`}
+                disabled={!!restoring}
+              >
+                {restoring
+                  ? `${action.type === "delete" ? "Deleting" : "Restoring"} ${completed} of ${action.targets.length}…`
+                  : action.failures?.length
+                    ? "Retry failed items"
+                    : action.type === "delete"
+                      ? "Delete permanently"
+                      : "Restore selected items"}
+              </button>
+            </div>
+          </form>
+        )}
+      </dialog>
     </div>
   );
 }

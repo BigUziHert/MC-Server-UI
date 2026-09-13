@@ -15,6 +15,7 @@
   --border: #373948;
   --muted: #969bb3;
   --accent: #ffd000;
+  --danger: #dc2040;
 }
 * {
   box-sizing: border-box;
@@ -478,7 +479,7 @@ input:disabled {
 }
 .btn.danger,
 .btn.stop-button {
-  background: #dc2040;
+  background: var(--danger);
   border-color: #ff4d63;
   color: #fff;
 }
@@ -490,6 +491,16 @@ input:disabled {
 .btn.icon {
   width: 33px;
   padding: 7px;
+}
+.btn.restart-button {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #20212b;
+  font-weight: 650;
+}
+.btn.restart-button:hover:not(:disabled) {
+  background: #ffdc40;
+  border-color: #ffdc40;
 }
 .server-banner {
   background: linear-gradient(110deg, #20212b 0%, #20212b 28%, #15151d 65%);
@@ -705,6 +716,15 @@ input:disabled {
   font-size: 12px;
   letter-spacing: 0;
 }
+.cpu-value {
+  flex-wrap: wrap;
+  gap: 2px 6px;
+  font-size: clamp(22px, 1.9vw, 28px);
+}
+.cpu-value > span {
+  white-space: nowrap;
+  font-size: 11px;
+}
 .metric-subtitle {
   font-size: 9px;
   color: var(--muted);
@@ -879,11 +899,11 @@ input:disabled {
   color: #ffd000;
 }
 .log-error .log-level {
-  color: #f3aaaa;
+  color: var(--danger);
   background: #4a2727;
 }
 .log-error .log-message {
-  color: #f3aaaa;
+  color: var(--danger);
 }
 .console-status {
   display: flex;

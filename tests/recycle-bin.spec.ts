@@ -323,7 +323,7 @@ test("Recycle Bin handles loading errors and incomplete entries without exposing
               protected: true,
               items: [
                 {
-                  id: "incomplete-fixture",
+                  id: "986cb8d3-8657-4323-bcb8-97078c86614a",
                   name: "world-archive-with-a-long-name",
                   originalPath:
                     "very-long-existing-folder-name/world-archive-with-a-long-name",
@@ -366,11 +366,38 @@ test("Recycle Bin handles loading errors and incomplete entries without exposing
   ).toBeDisabled();
   await expect(
     page.getByRole("button", {
-      name: /Upload files|New file|New folder|Delete selected/,
+      name: /Upload files|New file|New folder/,
       exact: true,
     }),
   ).toHaveCount(0);
-  await expect(page.getByRole("checkbox", { name: /Select/ })).toHaveCount(0);
+  await expect(page.getByRole("checkbox", { name: /Select/ })).toHaveCount(2);
+  await row.getByRole("checkbox").check();
+  await expect(
+    page.getByRole("button", { name: "Restore selected", exact: true }),
+  ).toBeDisabled();
+  await page
+    .getByRole("button", { name: "Delete selected permanently", exact: true })
+    .click();
+  const confirmation = page.getByRole("dialog", {
+    name: "Permanently delete from Recycle Bin?",
+    exact: true,
+  });
+  await expect(confirmation).toContainText("Incomplete recovery item");
+  await expect(confirmation).toContainText("It cannot be undone.");
+  await expect(
+    confirmation.getByRole("button", {
+      name: "Delete permanently",
+      exact: true,
+    }),
+  ).toBeEnabled();
+  await page.screenshot({
+    path: testInfo.outputPath("recycle-delete-mobile.png"),
+    animations: "disabled",
+    fullPage: true,
+  });
+  await confirmation
+    .getByRole("button", { name: "Cancel", exact: true })
+    .click();
   expect(
     await page.evaluate(
       () => document.documentElement.scrollWidth - window.innerWidth,
@@ -388,4 +415,342 @@ test("Recycle Bin handles loading errors and incomplete entries without exposing
     page.getByText("No matching recycled items", { exact: true }),
   ).toBeVisible();
   expect(restoreCalls).toBe(0);
+});
+
+test("recovery selection stays stationary, selects visible items only, and confirms bulk restore", async ({
+  page,
+  request,
+  bin,
+}, testInfo) => {
+  await recycle(request, bin, "recovery/archive");
+  await recycle(request, bin, "recovery/treasure.txt");
+  await create(
+    request,
+    bin,
+    "recovery",
+    "untouched.txt",
+    "file",
+    "Unselected recovery bytes",
+  );
+  const untouched = await recycle(request, bin, "recovery/untouched.txt");
+  await openFiles(page, bin);
+  await openBin(page);
+  const all = page.getByRole("checkbox", {
+    name: "Select all visible recycled items",
+    exact: true,
+  });
+  // Row clicks may scroll the viewport. Compare the control's document position
+  // so a selection-induced layout shift still fails independently of scrolling.
+  const position = () =>
+    all.evaluate((input) => {
+      const bounds = input.getBoundingClientRect();
+      return {
+        x: bounds.left + window.scrollX,
+        y: bounds.top + window.scrollY,
+      };
+    });
+  const before = await position();
+  const expectStationary = async () => {
+    const current = await position();
+    expect(current.x).toBeCloseTo(before.x, 1);
+    expect(current.y).toBeCloseTo(before.y, 1);
+  };
+  await page
+    .getByRole("checkbox", { name: "Select recycled archive", exact: true })
+    .check();
+  await expect(all).toHaveAttribute("aria-checked", "mixed");
+  expect(
+    await all.evaluate((input: HTMLInputElement) => input.indeterminate),
+  ).toBe(true);
+  await expectStationary();
+  await all.click();
+  await expect(all).toBeChecked();
+  await expectStationary();
+  await all.click();
+  await expect(all).not.toBeChecked();
+  await expectStationary();
+  await page
+    .getByRole("checkbox", { name: "Select recycled archive", exact: true })
+    .check();
+  await expectStationary();
+  const search = page.getByRole("textbox", {
+    name: "Search recycled items",
+    exact: true,
+  });
+  await search.fill("treasure");
+  await all.check();
+  await expect(
+    page.getByRole("region", { name: "Recycle Bin selection" }),
+  ).toContainText("2 selected");
+  await expect(
+    page.getByRole("region", { name: "Recycle Bin selection" }),
+  ).toContainText("1 hidden by the filter");
+  await page
+    .getByRole("button", { name: "Restore selected", exact: true })
+    .click();
+  const dialog = page.getByRole("dialog", {
+    name: "Restore selected items?",
+    exact: true,
+  });
+  const targets = dialog.getByRole("list", {
+    name: "Confirmed recovery items",
+  });
+  await expect(targets.getByRole("listitem")).toHaveCount(2);
+  await expect(targets).toContainText("/recovery/archive");
+  await expect(targets).toContainText("/recovery/treasure.txt");
+  await expect(targets).not.toContainText("untouched.txt");
+  await expect(
+    dialog.getByRole("button", { name: "Cancel", exact: true }),
+  ).toBeFocused();
+  await page.screenshot({
+    path: testInfo.outputPath("recycle-bulk-restore-desktop.png"),
+    animations: "disabled",
+    fullPage: true,
+  });
+  await page.keyboard.press("Escape");
+  await expect(dialog).not.toBeVisible();
+  expect(
+    (
+      await (
+        await request.get("/api/files/recycle-bin", { headers: bin.headers })
+      ).json()
+    ).items,
+  ).toHaveLength(3);
+  await page
+    .getByRole("button", { name: "Restore selected", exact: true })
+    .click();
+  await dialog
+    .getByRole("button", { name: "Restore selected items", exact: true })
+    .click();
+  await expect(dialog).not.toBeVisible();
+  expect(
+    await contents(request, bin, "recovery/archive/nested/world.dat"),
+  ).toBe("Original nested world bytes\n");
+  expect(await contents(request, bin, "recovery/treasure.txt")).toBe(
+    "Original treasure bytes\n",
+  );
+  const remaining = (
+    await (
+      await request.get("/api/files/recycle-bin", { headers: bin.headers })
+    ).json()
+  ).items;
+  expect(remaining.map((item: { id: string }) => item.id)).toEqual([
+    untouched.id,
+  ]);
+  await search.fill("");
+  await all.check();
+  await page
+    .getByRole("button", { name: "Clear selection", exact: true })
+    .click();
+  await expect(all).not.toBeChecked();
+  await all.check();
+  await page
+    .getByRole("button", { name: "Back to files", exact: true })
+    .click();
+  await openBin(page);
+  await expect(all).not.toBeChecked();
+  await expect(
+    page.getByRole("region", { name: "Recycle Bin selection" }),
+  ).toContainText("0 selected");
+});
+
+test("permanent deletion confirms exact targets, retains failed selections, and retries only failures", async ({
+  page,
+  request,
+  bin,
+}, testInfo) => {
+  const folder = await recycle(request, bin, "recovery/archive");
+  const treasure = await recycle(request, bin, "recovery/treasure.txt");
+  await create(
+    request,
+    bin,
+    "recovery",
+    "treasure.txt",
+    "file",
+    "Current live file stays intact",
+  );
+  await create(
+    request,
+    bin,
+    "recovery",
+    "untouched.txt",
+    "file",
+    "Other recovery copy stays intact",
+  );
+  const untouched = await recycle(request, bin, "recovery/untouched.txt");
+  let blocked = true;
+  const purges: string[] = [];
+  await page.route("**/api/files/recycle-bin/*", async (route) => {
+    if (route.request().method() !== "DELETE") return route.continue();
+    expect(route.request().headers()["x-server-id"]).toBe(bin.id);
+    const id = new URL(route.request().url()).pathname.split("/").at(-1)!;
+    purges.push(id);
+    if (id === folder.id && blocked)
+      return route.fulfill({
+        status: 409,
+        json: {
+          error: "Fixture recovery file is locked. Release it and retry.",
+        },
+      });
+    await route.continue();
+  });
+  await openFiles(page, bin);
+  await openBin(page);
+  await page
+    .getByRole("button", {
+      name: "Permanently delete treasure.txt",
+      exact: true,
+    })
+    .click();
+  const dialog = page.getByRole("dialog", {
+    name: "Permanently delete from Recycle Bin?",
+    exact: true,
+  });
+  await expect(
+    dialog
+      .getByRole("list", { name: "Confirmed recovery items" })
+      .getByRole("listitem"),
+  ).toHaveCount(1);
+  await expect(dialog).toContainText(treasure.id);
+  await dialog.getByRole("button", { name: "Cancel", exact: true }).click();
+  expect(purges).toEqual([]);
+  await page
+    .getByRole("checkbox", { name: "Select recycled archive", exact: true })
+    .check();
+  await page
+    .getByRole("checkbox", {
+      name: "Select recycled treasure.txt",
+      exact: true,
+    })
+    .check();
+  await page
+    .getByRole("button", { name: "Delete selected permanently", exact: true })
+    .click();
+  const targets = dialog.getByRole("list", {
+    name: "Confirmed recovery items",
+  });
+  await expect(targets.getByRole("listitem")).toHaveCount(2);
+  await expect(targets).not.toContainText(untouched.id);
+  await expect(dialog).toContainText("It cannot be undone.");
+  await page.screenshot({
+    path: testInfo.outputPath("recycle-permanent-delete-desktop.png"),
+    animations: "disabled",
+    fullPage: true,
+  });
+  await dialog
+    .getByRole("button", { name: "Delete permanently", exact: true })
+    .click();
+  await expect(dialog.getByRole("alert")).toHaveText(
+    "1 item permanently deleted. 1 item failed and remains selected.",
+  );
+  await expect(
+    dialog.getByRole("list", { name: "Recovery action errors" }),
+  ).toContainText("Fixture recovery file is locked");
+  await expect(targets.getByRole("listitem")).toHaveCount(1);
+  await expect(targets).toContainText(folder.id);
+  await expect(targets).not.toContainText(treasure.id);
+  expect(new Set(purges)).toEqual(new Set([folder.id, treasure.id]));
+  expect(purges).toHaveLength(2);
+  blocked = false;
+  await dialog
+    .getByRole("button", { name: "Retry failed items", exact: true })
+    .click();
+  await expect(dialog).not.toBeVisible();
+  expect(purges.filter((id) => id === folder.id)).toHaveLength(2);
+  expect(purges.filter((id) => id === treasure.id)).toHaveLength(1);
+  const remaining = (
+    await (
+      await request.get("/api/files/recycle-bin", { headers: bin.headers })
+    ).json()
+  ).items;
+  expect(remaining.map((item: { id: string }) => item.id)).toEqual([
+    untouched.id,
+  ]);
+  expect(await contents(request, bin, "recovery/treasure.txt")).toBe(
+    "Current live file stays intact",
+  );
+  await expect(
+    page.getByRole("region", { name: "Recycle Bin selection" }),
+  ).toContainText("0 selected");
+  await page
+    .getByRole("checkbox", {
+      name: "Select recycled untouched.txt",
+      exact: true,
+    })
+    .check();
+  await page
+    .getByRole("combobox", { name: "Switch server", exact: true })
+    .selectOption(bin.otherServerId);
+  await openBin(page);
+  await expect(
+    page.getByRole("region", { name: "Recycle Bin selection" }),
+  ).toContainText("0 selected");
+});
+
+test("bulk restore keeps conflicts selected while restoring other entries without overwrite", async ({
+  page,
+  request,
+  bin,
+}) => {
+  const conflict = await recycle(request, bin, "recovery/treasure.txt");
+  await recycle(request, bin, "recovery/archive");
+  await create(
+    request,
+    bin,
+    "recovery",
+    "treasure.txt",
+    "file",
+    "Existing replacement is protected",
+  );
+  await openFiles(page, bin);
+  await openBin(page);
+  await page
+    .getByRole("checkbox", {
+      name: "Select all visible recycled items",
+      exact: true,
+    })
+    .check();
+  await page
+    .getByRole("button", { name: "Restore selected", exact: true })
+    .click();
+  const dialog = page.getByRole("dialog", {
+    name: "Restore selected items?",
+    exact: true,
+  });
+  await dialog
+    .getByRole("button", { name: "Restore selected items", exact: true })
+    .click();
+  await expect(dialog.getByRole("alert")).toHaveText(
+    "1 item restored. 1 item failed and remains selected.",
+  );
+  await expect(
+    dialog.getByRole("list", { name: "Recovery action errors" }),
+  ).toContainText("already exists");
+  await dialog.getByRole("button", { name: "Cancel", exact: true }).click();
+  await expect(
+    page.getByRole("checkbox", {
+      name: "Select recycled treasure.txt",
+      exact: true,
+    }),
+  ).toBeChecked();
+  await expect(
+    page.getByRole("checkbox", {
+      name: "Select recycled archive",
+      exact: true,
+    }),
+  ).toHaveCount(0);
+  expect(await contents(request, bin, "recovery/treasure.txt")).toBe(
+    "Existing replacement is protected",
+  );
+  expect(
+    await contents(request, bin, "recovery/archive/nested/world.dat"),
+  ).toBe("Original nested world bytes\n");
+  const remaining = (
+    await (
+      await request.get("/api/files/recycle-bin", { headers: bin.headers })
+    ).json()
+  ).items;
+  expect(remaining.map((item: { id: string }) => item.id)).toEqual([
+    conflict.id,
+  ]);
 });

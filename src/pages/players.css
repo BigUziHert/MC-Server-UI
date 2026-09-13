@@ -1,6 +1,186 @@
 .players-page {
   min-width: 0;
 }
+.players-online-banner {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 15px 18px;
+  color: var(--accent);
+}
+.players-online-banner strong {
+  color: var(--text);
+  font-size: 16px;
+}
+.players-online-banner strong span {
+  color: var(--muted);
+  font-size: 13px;
+  font-weight: 400;
+}
+.players-online-banner > button {
+  margin-left: auto;
+}
+.players-rosters {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 22px 16px;
+  align-items: start;
+}
+.players-roster {
+  min-width: 0;
+}
+.players-roster-heading {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 34px;
+  padding: 0 1px 10px;
+}
+.players-roster-heading h2 {
+  margin: 0;
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 650;
+}
+.players-roster-heading .management-count {
+  font-size: 10px;
+  padding: 2px 5px;
+  min-width: 20px;
+  text-align: center;
+}
+.players-roster-tools {
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+}
+.players-roster-tools .btn.icon {
+  width: 26px;
+  height: 26px;
+  padding: 4px;
+}
+.players-roster-body {
+  overflow: hidden;
+  border-radius: 6px;
+}
+.players-roster-body > ul {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+  max-height: 320px;
+  overflow-y: auto;
+  scrollbar-color: var(--border) transparent;
+}
+.players-roster-row.players-roster-row {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 12px 10px;
+  flex-wrap: nowrap;
+}
+.players-roster-row + .players-roster-row {
+  border-top: 1px solid var(--border);
+}
+.players-roster-row > strong {
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--text);
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.players-roster-row .player-head {
+  flex: 0 0 30px;
+}
+.players-roster-actions {
+  display: flex;
+  align-items: center;
+  gap: 3px;
+  margin-left: auto;
+  flex-shrink: 0;
+}
+.players-roster-actions .btn.icon {
+  width: 25px;
+  height: 28px;
+  padding: 4px;
+  border-color: transparent;
+  background: transparent;
+}
+.players-roster-actions .btn.icon:hover:enabled {
+  background: #303140;
+  border-color: var(--border);
+  color: var(--accent);
+}
+.players-roster-empty {
+  min-height: 64px;
+  margin: 0;
+  padding: 23px 14px;
+  text-align: center;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.5;
+}
+.players-roster-search {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--border);
+  color: var(--muted);
+}
+.players-roster-search input {
+  min-width: 0;
+  width: 100%;
+  padding: 6px;
+  font-size: 11px;
+}
+.players-whitelist-switch {
+  width: 34px;
+  height: 19px;
+  flex: 0 0 34px;
+  padding: 2px;
+  border-radius: 20px;
+  border: 1px solid #565a70;
+  background: #303140;
+  cursor: pointer;
+}
+.players-whitelist-switch span {
+  display: block;
+  width: 13px;
+  height: 13px;
+  border-radius: 50%;
+  background: #dfe2f1;
+  transform: translateX(0);
+  transition: transform 0.15s;
+}
+.players-whitelist-switch[aria-checked="true"] {
+  border-color: var(--accent);
+  background: var(--accent);
+}
+.players-whitelist-switch[aria-checked="true"] span {
+  transform: translateX(15px);
+  background: #20212b;
+}
+.players-whitelist-switch:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+@media (min-width: 1500px) {
+  .players-rosters {
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+  }
+}
+@media (max-width: 680px) {
+  .players-rosters {
+    grid-template-columns: 1fr;
+    gap: 17px;
+  }
+  .players-roster-actions .btn.icon {
+    width: 30px;
+    height: 32px;
+  }
+}
 .players-history-help,
 .players-history-warning {
   margin: 0;
@@ -90,7 +270,7 @@
   max-height: calc(100dvh - 32px);
   overflow-y: auto;
 }
-@media (max-width: 760px) {
+@media (max-width: 1100px) {
   .players-history-row {
     flex-wrap: wrap;
     gap: 12px;

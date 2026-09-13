@@ -31,15 +31,32 @@ const test = base.extend<{ server: { id: string; other: string } }>({
         ]),
       ],
       ["banned-players.json", JSON.stringify([banned])],
-    ])
-      expect(
-        (
-          await request.post("/api/files", {
-            headers,
-            data: { name, type: "file", content },
-          })
-        ).status(),
-      ).toBe(201);
+      [
+        "whitelist.json",
+        JSON.stringify([
+          {
+            name: "White_Player",
+            uuid: "42345678-1234-1234-1234-123456789abc",
+          },
+        ]),
+      ],
+      ["server.properties", "white-list=false\nmax-players=20\n"],
+    ]) {
+      const added = await request.post("/api/files", {
+        headers,
+        data: { name, type: "file", content },
+      });
+      if (added.status() === 409)
+        expect(
+          (
+            await request.put("/api/files/content", {
+              headers,
+              data: { path: name, content },
+            })
+          ).status(),
+        ).toBe(200);
+      else expect(added.status()).toBe(201);
+    }
     if (
       (await (await request.get("/api/server", { headers })).json()).status !==
       "running"
@@ -444,4 +461,276 @@ test("live row OP preserves pending state until Minecraft saves the operator rec
       exact: true,
     }),
   ).toBeVisible();
+});
+
+test("four compact rosters expose online actions and fit desktop and mobile layouts", async ({
+  page,
+  server,
+}, info) => {
+  const longPlayer = {
+    ...profile,
+    name: "Long_Player_1234",
+    online: true,
+    banned: false,
+    firstSeen: "2026-09-13T10:00:00Z",
+    lastSeen: "2026-09-13T10:00:00Z",
+    source: "observed",
+  };
+  await page.route("**/api/players", async (route) => {
+    const response = await route.fetch();
+    const data = await response.json();
+    await route.fulfill({
+      json: {
+        ...data,
+        online: [longPlayer],
+        maxPlayers: 20,
+        history: [
+          longPlayer,
+          ...data.history.filter(
+            (player: { name: string }) => player.name !== profile.name,
+          ),
+        ],
+        operators: [{ ...longPlayer, level: 4 }],
+      },
+    });
+  });
+  let operatorRequest: unknown;
+  await page.route("**/api/players/deop", async (route) => {
+    operatorRequest = route.request().postDataJSON();
+    await route.fulfill({
+      status: 409,
+      json: {
+        error: "This player's identity changed. Refresh the operator list.",
+      },
+    });
+  });
+  await page.setViewportSize({ width: 1823, height: 1216 });
+  await open(page, server.id);
+  const online = page.getByRole("region", {
+    name: "Online Players",
+    exact: true,
+  });
+  const banList = page.getByRole("region", {
+    name: "Banned Players",
+    exact: true,
+  });
+  const ops = page.getByRole("region", { name: "Operators", exact: true });
+  const whitelist = page.getByRole("region", {
+    name: "Whitelist",
+    exact: true,
+  });
+  await expect(page.locator(".players-online-banner")).toContainText(
+    "1 / 20 players online",
+  );
+  await expect(
+    online.getByRole("button", {
+      name: `Kick online player ${longPlayer.name}`,
+      exact: true,
+    }),
+  ).toBeEnabled();
+  await expect(
+    online.getByRole("button", {
+      name: `Ban online player ${longPlayer.name}`,
+      exact: true,
+    }),
+  ).toBeEnabled();
+  await expect(
+    online.getByRole("button", {
+      name: `Remove OP for online player ${longPlayer.name}`,
+      exact: true,
+    }),
+  ).toBeEnabled();
+  await expect(
+    online.getByRole("button", {
+      name: `Add online player ${longPlayer.name} to whitelist`,
+      exact: true,
+    }),
+  ).toBeEnabled();
+  const boxes = await Promise.all(
+    [online, banList, ops, whitelist].map((panel) => panel.boundingBox()),
+  );
+  expect(new Set(boxes.map((box) => Math.round(box!.y))).size).toBe(1);
+  expect(boxes.every((box) => Math.abs(box!.width - boxes[0]!.width) < 1)).toBe(
+    true,
+  );
+  const visibleName = online.locator(".players-roster-row > strong");
+  expect(
+    await visibleName.evaluate((element) => element.clientWidth),
+  ).toBeGreaterThan(80);
+  await page.screenshot({
+    path: info.outputPath("players-rosters-desktop.png"),
+    fullPage: true,
+    animations: "disabled",
+  });
+  await online
+    .getByRole("button", {
+      name: `Remove OP for online player ${longPlayer.name}`,
+      exact: true,
+    })
+    .click();
+  const remove = page.getByRole("dialog", {
+    name: "Remove operator permissions?",
+    exact: true,
+  });
+  await remove.getByRole("button", { name: "Remove OP", exact: true }).click();
+  await expect(remove.getByRole("alert")).toContainText("identity changed");
+  expect(operatorRequest).toEqual({
+    name: longPlayer.name,
+    uuid: longPlayer.uuid,
+  });
+  await remove.getByRole("button", { name: "Cancel", exact: true }).click();
+  await page.setViewportSize({ width: 390, height: 844 });
+  expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBe(
+    390,
+  );
+  expect(
+    await visibleName.evaluate((element) => element.clientWidth),
+  ).toBeGreaterThan(80);
+  await page.screenshot({
+    path: info.outputPath("players-rosters-mobile.png"),
+    fullPage: true,
+    animations: "disabled",
+  });
+});
+
+test("whitelist membership and enable switch confirm changes and preserve demo source files", async ({
+  page,
+  request,
+  server,
+}) => {
+  await open(page, server.id);
+  const roster = page.getByRole("region", { name: "Whitelist", exact: true });
+  const toggle = roster.getByRole("switch", {
+    name: "Enable whitelist",
+    exact: true,
+  });
+  await expect(toggle).toHaveAttribute("aria-checked", "false");
+  await roster
+    .getByRole("button", { name: "Add player to whitelist", exact: true })
+    .click();
+  let dialog = page.getByRole("dialog", {
+    name: "Add player to whitelist",
+    exact: true,
+  });
+  await dialog
+    .getByLabel("Minecraft username", { exact: true })
+    .fill("New_White_Player");
+  await dialog
+    .getByRole("button", { name: "Add to whitelist", exact: true })
+    .click();
+  await expect(dialog).not.toBeVisible();
+  await expect(
+    roster.getByText("New_White_Player", { exact: true }),
+  ).toBeVisible();
+  await toggle.click();
+  dialog = page.getByRole("dialog", { name: "Enable whitelist?", exact: true });
+  await expect(dialog).toContainText("Only whitelisted players");
+  await dialog.getByRole("button", { name: "Cancel", exact: true }).click();
+  await expect(toggle).toHaveAttribute("aria-checked", "false");
+  await toggle.click();
+  await dialog
+    .getByRole("button", { name: "Enable whitelist", exact: true })
+    .click();
+  await expect(toggle).toHaveAttribute("aria-checked", "true");
+  await page.reload();
+  await expect(toggle).toHaveAttribute("aria-checked", "true");
+  const headers = { "X-Server-Id": server.id };
+  const source = await (
+    await request.get("/api/files/content?path=whitelist.json", { headers })
+  ).json();
+  expect(JSON.parse(source.content)).toEqual([
+    { name: "White_Player", uuid: "42345678-1234-1234-1234-123456789abc" },
+  ]);
+  const properties = await (
+    await request.get("/api/files/content?path=server.properties", { headers })
+  ).json();
+  expect(properties.content).toContain("white-list=false");
+  await roster
+    .getByRole("button", {
+      name: "Remove saved whitelist player New_White_Player",
+      exact: true,
+    })
+    .click();
+  dialog = page.getByRole("dialog", {
+    name: "Remove player from whitelist?",
+    exact: true,
+  });
+  await dialog
+    .getByRole("button", { name: "Remove from whitelist", exact: true })
+    .click();
+  await expect(
+    roster.getByText("New_White_Player", { exact: true }),
+  ).toHaveCount(0);
+  await toggle.click();
+  dialog = page.getByRole("dialog", {
+    name: "Disable whitelist?",
+    exact: true,
+  });
+  await dialog
+    .getByRole("button", { name: "Disable whitelist", exact: true })
+    .click();
+  await expect(toggle).toHaveAttribute("aria-checked", "false");
+});
+
+test("live whitelist requests wait for readback and unavailable settings disable the switch", async ({
+  page,
+  server,
+}) => {
+  let enabled = false;
+  let available = true;
+  await page.route("**/api/players", async (route) => {
+    const response = await route.fetch();
+    const data = await response.json();
+    await route.fulfill({
+      json: {
+        ...data,
+        mode: "live",
+        whitelistEnabled: available ? enabled : null,
+        whitelistSettingsAvailable: available,
+        whitelistAvailable: available,
+        warnings: available
+          ? []
+          : ["whitelist.json could not be read. Fix the file and refresh."],
+      },
+    });
+  });
+  let payload: unknown;
+  await page.route("**/api/players/whitelist/state", async (route) => {
+    payload = route.request().postDataJSON();
+    await route.fulfill({
+      json: {
+        simulated: false,
+        message: "Requested whitelist on. Check Console for confirmation.",
+      },
+    });
+  });
+  await open(page, server.id);
+  const toggle = page.getByRole("switch", {
+    name: "Enable whitelist",
+    exact: true,
+  });
+  await toggle.click();
+  const dialog = page.getByRole("dialog", {
+    name: "Enable whitelist?",
+    exact: true,
+  });
+  await dialog
+    .getByRole("button", { name: "Enable whitelist", exact: true })
+    .click();
+  await expect(dialog).not.toBeVisible();
+  expect(payload).toEqual({ enabled: true });
+  await expect(toggle).toHaveAttribute("aria-checked", "false");
+  enabled = true;
+  await page
+    .getByRole("button", { name: "Refresh players", exact: true })
+    .click();
+  await expect(toggle).toHaveAttribute("aria-checked", "true");
+  available = false;
+  await page
+    .getByRole("button", { name: "Refresh players", exact: true })
+    .click();
+  await expect(toggle).toBeDisabled();
+  await expect(
+    page.getByRole("button", { name: "Add player to whitelist", exact: true }),
+  ).toBeDisabled();
 });

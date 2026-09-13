@@ -162,7 +162,7 @@ test("custom connection hostname persists while running without rewriting bind s
   ).toContainText("localhost:");
 });
 
-test("live telemetry renders measured memory during CPU warmup and explains public address limits", async ({
+test("live telemetry renders memory against its allocation and CPU against whole-processor capacity", async ({
   page,
   request,
   serverId,
@@ -176,6 +176,8 @@ test("live telemetry renders measured memory during CPU warmup and explains publ
     mode: "live",
     metricsAvailable: true,
     cpu: null as number | null,
+    cpuCapacity: 800,
+    memoryLimit: 16 * 1024 ** 3,
     memory: (768 * 1024 ** 2) as number | null,
     metricsMessage: "Measuring CPU usage…",
     address: "203.0.113.10:25565",
@@ -196,19 +198,21 @@ test("live telemetry renders measured memory during CPU warmup and explains publ
   const memory = page.locator(".metric-card").filter({ hasText: "Memory" });
   await expect(cpu).toContainText("Measuring CPU usage");
   await expect(memory).toContainText("0.75");
+  await expect(memory.locator(".metric-value")).toContainText("/ 16 GB");
   await expect(memory).toContainText("Physical memory");
   await expect(
     page.getByRole("button", { name: "Copy server address" }),
   ).toHaveAttribute("title", /not been checked/);
   await expect(page.locator(".players-metric")).toContainText("/ 7");
   await expect(page.locator(".player-capacity")).toHaveCount(0);
+  await expect(page.locator(".address-source")).toHaveCount(0);
   reading = {
     ...reading,
     cpu: 234.5,
     metricsMessage: "Server process telemetry",
   };
-  await expect(cpu).toContainText("234.5");
-  await expect(cpu).toContainText("100% = one core");
+  await expect(cpu.locator(".metric-value")).toHaveText("29.3%/ 100% (800%)");
+  await expect(cpu).toContainText("Whole processor · 8 logical cores");
   await page.screenshot({
     path: testInfo.outputPath("charcoal-console.png"),
     fullPage: true,

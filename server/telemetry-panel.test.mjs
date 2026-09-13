@@ -148,6 +148,7 @@ test("live panel exposes process CPU and resident memory while retaining the con
   panel.setSample(async () => metric());
   const measured = (await panel.request("/api/server", {}, id)).body;
   assert.equal(measured.cpu, 123.4);
+  assert.equal(measured.cpuCapacity, os.availableParallelism() * 100);
   assert.equal(measured.processCount, 2);
   assert.equal(measured.memoryLimit, 4096 * 1024 ** 2);
   assert.deepEqual(panel.calls, [4000, 4000]);

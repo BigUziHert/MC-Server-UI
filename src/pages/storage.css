@@ -90,6 +90,10 @@
 }
 .storage-search:focus-within {
   border-color: #969bb3;
+  box-shadow: 0 0 0 1px #969bb333;
+}
+.storage-search input:focus-visible {
+  outline: none;
 }
 .storage-search input {
   width: 100%;

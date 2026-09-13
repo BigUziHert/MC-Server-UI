@@ -68,6 +68,7 @@ type Server = {
   software: string;
   uptime: number;
   cpu: number | null;
+  cpuCapacity?: number;
   memory: number | null;
   metricsMessage?: string;
   iconVersion?: string | null;
@@ -938,7 +939,10 @@ function ConsolePage({
   }
   const isRunning = server?.status === "running";
   const unavailable = server?.metricsAvailable === false;
-  const cpuUnavailable = unavailable || server?.cpu === null;
+  const cpuCapacity = server?.cpuCapacity || 0;
+  const normalizedCpu = (value: number) =>
+    Math.min(100, Math.max(0, (value / cpuCapacity) * 100));
+  const cpuUnavailable = unavailable || server?.cpu == null || cpuCapacity <= 0;
   const playersUnavailable = server?.playersAvailable === false;
   const hiddenIndex =
     hiddenUntil === null ? -1 : lines.findIndex((l) => l.id === hiddenUntil);
@@ -999,15 +1003,6 @@ function ConsolePage({
               <span>{server?.address || "localhost:25565"}</span>
               <Copy size={12} />
             </button>
-            {server?.mode === "live" && (
-              <span className="address-source" title={server.addressNote}>
-                {server.addressSource === "public"
-                  ? "Public address · forwarding not checked"
-                  : server.addressSource === "custom"
-                    ? "Custom connection address"
-                    : "Local address · public IP unavailable"}
-              </span>
-            )}
           </div>
         </div>
         <div className="server-power">
@@ -1033,7 +1028,7 @@ function ConsolePage({
               Start
             </button>
             <button
-              className="btn"
+              className="btn restart-button"
               disabled={!isRunning || busy}
               onClick={() => setConfirmPower("restart")}
             >
@@ -1058,9 +1053,17 @@ function ConsolePage({
             <span>CPU usage</span>
             <span className="metric-indicator" />
           </div>
-          <div className="metric-value">
-            {cpuUnavailable ? "—" : (server?.cpu || 0).toFixed(1)}
-            <span>{cpuUnavailable ? "" : "%"}</span>
+          <div className="metric-value cpu-value">
+            {cpuUnavailable
+              ? "—"
+              : `${normalizedCpu(server?.cpu || 0).toFixed(1)}%`}
+            {!cpuUnavailable && (
+              <span
+                title={`${cpuCapacity / 100} logical cores · ${cpuCapacity}% combined per-core capacity`}
+              >
+                / 100% ({cpuCapacity}%)
+              </span>
+            )}
           </div>
           <div className="metric-subtitle">
             {cpuUnavailable
@@ -1069,9 +1072,11 @@ function ConsolePage({
                 ? "Simulated utilization"
                 : server?.status === "offline"
                   ? "Server offline"
-                  : "Server processes · 100% = one core"}
+                  : `Whole processor · ${cpuCapacity / 100} logical cores`}
           </div>
-          {!cpuUnavailable && <Sparkline values={history.cpu} />}
+          {!cpuUnavailable && (
+            <Sparkline values={history.cpu.map(normalizedCpu)} />
+          )}
         </div>
         <div className="metric-card">
           <div className="metric-label">
@@ -1080,16 +1085,24 @@ function ConsolePage({
           </div>
           <div className="metric-value">
             {unavailable ? "—" : ((server?.memory || 0) / 1024 ** 3).toFixed(2)}
-            <span>{unavailable ? "" : "GB"}</span>
+            {!unavailable && (
+              <span>
+                /{" "}
+                {server?.memoryLimit
+                  ? Number((server.memoryLimit / 1024 ** 3).toFixed(2))
+                  : "—"}{" "}
+                GB
+              </span>
+            )}
           </div>
           <div className="metric-subtitle">
             {unavailable
               ? server?.metricsMessage || "Waiting for server process…"
               : server?.mode === "demo"
-                ? `of ${formatBytes(server?.memoryLimit || 0)} allocated`
+                ? "Simulated usage · allocated memory"
                 : server?.status === "offline"
                   ? "Server offline"
-                  : "Physical memory · server processes"}
+                  : "Physical memory · configured heap limit"}
           </div>
           {!unavailable && (
             <Sparkline values={history.memory} color="#97b9f5" />
@@ -1457,7 +1470,7 @@ function ConsolePage({
                 Cancel
               </button>
               <button
-                className="btn danger"
+                className={`btn ${confirmPower === "stop" ? "danger" : "restart-button"}`}
                 onClick={() => power(confirmPower)}
               >
                 {confirmPower === "stop" ? "Stop server" : "Restart server"}

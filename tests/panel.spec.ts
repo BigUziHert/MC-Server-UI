@@ -1184,7 +1184,9 @@ test("Players grants and removes simulated OP independently of panel access and 
     .getByRole("textbox", { name: "Search operators", exact: true })
     .fill("no_such_player");
   await expect(
-    page.getByRole("heading", { name: "No matching players", exact: true }),
+    page
+      .getByRole("region", { name: "Operators", exact: true })
+      .getByText("No matching players", { exact: true }),
   ).toBeVisible();
   await page
     .getByRole("textbox", { name: "Search operators", exact: true })
@@ -1484,8 +1486,8 @@ test("Minecraft head images use UUIDs or usernames, while console polling update
   await expect(page.locator(".online-players .players-empty")).toBeVisible();
 
   await openPage(page, "players", "Players");
-  await expectHeadImage(page, "UUID_Player", uuid, 40);
-  await expectHeadImage(page, "Name_Only", "Name_Only", 40);
+  await expectHeadImage(page, "UUID_Player", uuid, 30);
+  await expectHeadImage(page, "Name_Only", "Name_Only", 30);
   await expect(page.locator(".players-operator")).toHaveCount(2);
   await expect(
     page.getByRole("button", {
@@ -1561,7 +1563,7 @@ test("failed skin requests use local Minecraft heads and changing a player ident
       ),
     )
     .toBeGreaterThan(0);
-  await expect(fallback).toHaveAttribute("width", "40");
+  await expect(fallback).toHaveAttribute("width", "30");
   expect(failedRequests).toHaveLength(2);
   await expect(
     page.getByRole("button", {
@@ -1591,7 +1593,7 @@ test("populated Minecraft head lists fit mobile Console and Players layouts", as
   );
   for (const [hash, heading, size, screenshot] of [
     ["console", "Console", 32, "console-player-heads-mobile.png"],
-    ["players", "Players", 40, "operator-heads-mobile.png"],
+    ["players", "Players", 30, "operator-heads-mobile.png"],
   ] as const) {
     await openPage(page, hash, heading);
     await expectHeadImage(page, "Long_Player_1234", uuid, size);

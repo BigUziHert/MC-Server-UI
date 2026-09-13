@@ -4,12 +4,12 @@ import {
   useRef,
   useState,
   type FormEvent,
+  type ReactNode,
 } from "react";
 import {
   AlertCircle,
   ArrowUpRight,
   Check,
-  Gamepad2,
   Info,
   RefreshCw,
   Search,
@@ -22,6 +22,9 @@ import {
   LogOut,
   Ban,
   Undo2,
+  Plus,
+  UserCheck,
+  UserMinus,
 } from "lucide-react";
 import { useServerApi, type PageProps } from "../api";
 import PlayerHead from "../PlayerHead";
@@ -35,7 +38,7 @@ type KnownPlayer = {
   online: boolean;
   firstSeen: string | null;
   lastSeen: string | null;
-  source: "observed" | "cache" | "banned";
+  source: "observed" | "cache" | "banned" | "operator" | "whitelist";
   banned: boolean | null;
   banReason?: string;
 };
@@ -47,8 +50,70 @@ type PlayersResponse = {
   history?: KnownPlayer[];
   warnings?: string[];
   bansAvailable?: boolean;
+  online?: KnownPlayer[];
+  banned?: KnownPlayer[];
+  maxPlayers?: number;
+  whitelist?: Operator[];
+  whitelistEnabled?: boolean | null;
+  whitelistAvailable?: boolean;
+  whitelistSettingsAvailable?: boolean;
 };
 type OperationResponse = { message: string; simulated: boolean };
+type WhitelistAction =
+  | { kind: "add" | "remove"; player?: Operator }
+  | { kind: "state"; enabled: boolean };
+
+function Roster({
+  id,
+  title,
+  players,
+  empty,
+  loading,
+  actions,
+  tools,
+  children,
+}: {
+  id: string;
+  title: string;
+  players: Operator[];
+  empty: string;
+  loading: boolean;
+  actions: (player: Operator) => ReactNode;
+  tools?: ReactNode;
+  children?: ReactNode;
+}) {
+  return (
+    <section className="players-roster" aria-labelledby={`${id}-title`}>
+      <header className="players-roster-heading">
+        <h2 id={`${id}-title`}>{title}</h2>
+        <span className="management-count">{players.length}</span>
+        <div className="players-roster-tools">{tools}</div>
+      </header>
+      <div className="panel players-roster-body">
+        {children}
+        {loading ? (
+          <p className="players-roster-empty">Loading...</p>
+        ) : players.length === 0 ? (
+          <p className="players-roster-empty">{empty}</p>
+        ) : (
+          <ul>
+            {players.map((player) => (
+              <li
+                className={`players-roster-row ${id === "operators" ? "players-operator" : ""}`}
+                aria-label={`${title} ${player.name}`}
+                key={player.uuid || player.name}
+              >
+                <PlayerHead name={player.name} uuid={player.uuid} size={30} />
+                <strong title={player.name}>{player.name}</strong>
+                <div className="players-roster-actions">{actions(player)}</div>
+              </li>
+            ))}
+          </ul>
+        )}
+      </div>
+    </section>
+  );
+}
 
 export default function Players({ notify }: PageProps) {
   const { api, post } = useServerApi();
@@ -64,11 +129,15 @@ export default function Players({ notify }: PageProps) {
   const [removing, setRemoving] = useState<Operator | null>(null);
   const [name, setName] = useState("");
   const [grantUuid, setGrantUuid] = useState<string | undefined>();
+  const [whitelistAction, setWhitelistAction] =
+    useState<WhitelistAction | null>(null);
+  const [whitelistName, setWhitelistName] = useState("");
   const [busy, setBusy] = useState(false);
   const [formError, setFormError] = useState("");
   const [result, setResult] = useState<OperationResponse | null>(null);
   const dialog = useRef<HTMLDialogElement>(null);
   const moderationDialog = useRef<HTMLDialogElement>(null);
+  const whitelistDialog = useRef<HTMLDialogElement>(null);
   const usernameInput = useRef<HTMLInputElement>(null);
   const request = useRef(0);
   const session = useRef(0);
@@ -104,6 +173,7 @@ export default function Players({ notify }: PageProps) {
     setModerating(null);
     setGranting(false);
     setRemoving(null);
+    setWhitelistAction(null);
     void refresh();
     const interval = window.setInterval(() => void refresh(true), 5000);
     return () => {
@@ -123,6 +193,10 @@ export default function Players({ notify }: PageProps) {
     if (moderating) moderationDialog.current?.showModal();
     else moderationDialog.current?.close();
   }, [moderating]);
+  useEffect(() => {
+    if (whitelistAction) whitelistDialog.current?.showModal();
+    else whitelistDialog.current?.close();
+  }, [whitelistAction]);
 
   const simulated = data?.mode === "demo";
   const canManage = Boolean(data && !error && data.status === "running");
@@ -131,6 +205,24 @@ export default function Players({ notify }: PageProps) {
     player.name.toLowerCase().includes(search.trim().toLowerCase()),
   );
   const history = data?.history ?? [];
+  const online = data?.online ?? history.filter((player) => player.online);
+  const banned = data?.banned ?? history.filter((player) => player.banned);
+  const whitelist = data?.whitelist ?? [];
+  const samePlayer = (left: Operator, right: Operator) =>
+    left.uuid && right.uuid
+      ? left.uuid.toLowerCase() === right.uuid.toLowerCase()
+      : left.name.toLowerCase() === right.name.toLowerCase();
+  const isWhitelisted = (player: Operator) =>
+    whitelist.some((entry) => samePlayer(entry, player));
+  const known = (player: Operator): KnownPlayer =>
+    history.find((entry) => samePlayer(entry, player)) ?? {
+      ...player,
+      online: online.some((entry) => samePlayer(entry, player)),
+      banned: banned.some((entry) => samePlayer(entry, player)),
+      firstSeen: null,
+      lastSeen: null,
+      source: "cache",
+    };
   const isOperator = (player: KnownPlayer) =>
     operators.some((operator) =>
       player.uuid && operator.uuid
@@ -207,6 +299,78 @@ export default function Players({ notify }: PageProps) {
     setFormError("");
     setGranting(true);
   }
+  function openRemove(player: Operator) {
+    setFormError("");
+    setRemoving(player);
+  }
+  function openWhitelist(action: WhitelistAction) {
+    setFormError("");
+    setWhitelistName(
+      action.kind === "state" ? "" : (action.player?.name ?? ""),
+    );
+    setWhitelistAction(action);
+  }
+  function closeWhitelist() {
+    if (!busy) {
+      setWhitelistAction(null);
+      setFormError("");
+    }
+  }
+  const whitelistTitle =
+    whitelistAction?.kind === "state"
+      ? `${whitelistAction.enabled ? "Enable" : "Disable"} whitelist?`
+      : whitelistAction?.kind === "remove"
+        ? "Remove player from whitelist?"
+        : "Add player to whitelist";
+  async function submitWhitelist(event: FormEvent) {
+    event.preventDefault();
+    if (!whitelistAction || busy) return;
+    if (!canManage) {
+      setFormError(
+        "Start the server in Console before changing the whitelist.",
+      );
+      return;
+    }
+    if (
+      whitelistAction.kind !== "state" &&
+      !/^[A-Za-z0-9_]{3,16}$/.test(whitelistName)
+    ) {
+      setFormError(
+        "Use a Minecraft username with 3–16 letters, numbers, or underscores.",
+      );
+      return;
+    }
+    const currentSession = session.current;
+    setBusy(true);
+    setFormError("");
+    try {
+      const response = await post<OperationResponse>(
+        `/players/whitelist/${whitelistAction.kind}`,
+        whitelistAction.kind === "state"
+          ? { enabled: whitelistAction.enabled }
+          : {
+              name: whitelistName,
+              ...(whitelistAction.player?.uuid
+                ? { uuid: whitelistAction.player.uuid }
+                : {}),
+            },
+      );
+      if (currentSession !== session.current) return;
+      setResult(response);
+      notify(response.message);
+      setWhitelistAction(null);
+      await refresh(true);
+    } catch (cause) {
+      if (currentSession === session.current)
+        setFormError(
+          cause instanceof Error
+            ? cause.message
+            : "Unable to update the whitelist.",
+        );
+    } finally {
+      if (currentSession === session.current) setBusy(false);
+    }
+  }
 
   function closeDialog() {
     if (busy) return;
@@ -247,7 +411,11 @@ export default function Players({ notify }: PageProps) {
         removing ? "/players/deop" : "/players/op",
         {
           name: username,
-          ...(!removing && grantUuid ? { uuid: grantUuid } : {}),
+          ...(removing?.uuid
+            ? { uuid: removing.uuid }
+            : !removing && grantUuid
+              ? { uuid: grantUuid }
+              : {}),
         },
       );
       if (currentSession !== session.current) return;
@@ -307,31 +475,238 @@ export default function Players({ notify }: PageProps) {
         </div>
       )}
 
-      <div className="players-overview">
-        <div className="panel players-summary">
-          <span className="management-icon">
-            <ShieldCheck size={22} />
-          </span>
-          <div>
-            <span>Server operators</span>
-            <strong>
-              {data ? operators.length : "—"}
-              <small>
-                {simulated ? "simulated operators" : "with in-game permissions"}
-              </small>
-            </strong>
-          </div>
+      <div className="panel players-online-banner">
+        <Users size={19} />
+        <strong>
+          {data ? online.length : "—"}{" "}
+          <span>/ {data?.maxPlayers ?? "—"} players online</span>
+        </strong>
+        <button
+          className="btn icon"
+          aria-label="Refresh players"
+          disabled={loading}
+          onClick={() => void refresh()}
+        >
+          <RefreshCw
+            size={16}
+            className={loading ? "management-spinning" : ""}
+          />
+        </button>
+      </div>
+      {error && (
+        <div className="management-error" role="alert">
+          <AlertCircle size={18} />
+          <span>{error}</span>
+          <button className="btn" onClick={() => void refresh()}>
+            Try again
+          </button>
         </div>
-        <div className="panel players-about">
-          <Gamepad2 size={25} />
-          <div>
-            <strong>A trusted role in your world</strong>
-            <p>
-              Operators can use powerful game commands. Their permissions follow
-              this server’s Minecraft operator level.
-            </p>
-          </div>
-        </div>
+      )}
+
+      <div className="players-rosters">
+        <Roster
+          id="online-players"
+          title="Online Players"
+          players={online}
+          empty="No players online."
+          loading={loading && !data}
+          actions={(player) => (
+            <>
+              <button
+                className="btn icon"
+                aria-label={`Kick online player ${player.name}`}
+                title="Kick player"
+                disabled={!canManage || busy}
+                onClick={() => openModeration("kick", known(player))}
+              >
+                <LogOut size={14} />
+              </button>
+              <button
+                className="btn icon"
+                aria-label={`Ban online player ${player.name}`}
+                title="Ban player"
+                disabled={!canManage || busy || data?.bansAvailable === false}
+                onClick={() => openModeration("ban", known(player))}
+              >
+                <Ban size={14} />
+              </button>
+              <button
+                className="btn icon"
+                aria-label={`${isOperator(known(player)) ? "Remove" : "Grant"} OP for online player ${player.name}`}
+                title={isOperator(known(player)) ? "Remove OP" : "Grant OP"}
+                disabled={!canManage || busy}
+                onClick={() =>
+                  isOperator(known(player))
+                    ? openRemove(
+                        operators.find((entry) => samePlayer(entry, player)) ??
+                          player,
+                      )
+                    : openGrant(known(player))
+                }
+              >
+                {isOperator(known(player)) ? (
+                  <ShieldMinus size={14} />
+                ) : (
+                  <ShieldPlus size={14} />
+                )}
+              </button>
+              <button
+                className="btn icon"
+                aria-label={`${isWhitelisted(player) ? "Remove" : "Add"} online player ${player.name} ${isWhitelisted(player) ? "from" : "to"} whitelist`}
+                title={
+                  isWhitelisted(player)
+                    ? "Remove from whitelist"
+                    : "Add to whitelist"
+                }
+                disabled={
+                  !canManage || busy || data?.whitelistAvailable === false
+                }
+                onClick={() =>
+                  openWhitelist({
+                    kind: isWhitelisted(player) ? "remove" : "add",
+                    player,
+                  })
+                }
+              >
+                {isWhitelisted(player) ? (
+                  <UserMinus size={14} />
+                ) : (
+                  <UserCheck size={14} />
+                )}
+              </button>
+            </>
+          )}
+        />
+        <Roster
+          id="banned-players"
+          title="Banned Players"
+          players={banned}
+          empty={
+            data?.bansAvailable === false
+              ? "Ban list unavailable."
+              : "No banned players."
+          }
+          loading={loading && !data}
+          actions={(player) => (
+            <button
+              className="btn icon"
+              aria-label={`Unban saved player ${player.name}`}
+              title="Unban player"
+              disabled={!canManage || busy || data?.bansAvailable === false}
+              onClick={() => openModeration("unban", known(player))}
+            >
+              <Undo2 size={14} />
+            </button>
+          )}
+        />
+        <Roster
+          id="operators"
+          title="Operators"
+          players={filtered}
+          empty={search ? "No matching players" : "No operators."}
+          loading={loading && !data}
+          tools={
+            <button
+              className="btn icon"
+              aria-label="Refresh operators"
+              disabled={loading}
+              onClick={() => void refresh()}
+            >
+              <RefreshCw size={14} />
+            </button>
+          }
+          actions={(player) => (
+            <button
+              className="btn icon"
+              aria-label={`Remove OP for ${player.name}`}
+              title="Remove OP"
+              disabled={!canManage || busy}
+              onClick={() => openRemove(player)}
+            >
+              <ShieldMinus size={14} />
+            </button>
+          )}
+        >
+          {operators.length > 0 && (
+            <label className="players-roster-search">
+              <Search size={13} />
+              <input
+                aria-label="Search operators"
+                placeholder="Search operators..."
+                value={search}
+                onChange={(event) => setSearch(event.target.value)}
+              />
+            </label>
+          )}
+        </Roster>
+        <Roster
+          id="whitelist"
+          title="Whitelist"
+          players={whitelist}
+          empty={
+            data?.whitelistAvailable === false
+              ? "Whitelist unavailable."
+              : "No whitelisted players."
+          }
+          loading={loading && !data}
+          tools={
+            <>
+              <button
+                className="btn icon"
+                aria-label="Add player to whitelist"
+                title="Add player"
+                disabled={
+                  !canManage || busy || data?.whitelistAvailable === false
+                }
+                onClick={() => openWhitelist({ kind: "add" })}
+              >
+                <Plus size={14} />
+              </button>
+              <button
+                role="switch"
+                aria-label="Enable whitelist"
+                aria-checked={data?.whitelistEnabled ?? false}
+                className="players-whitelist-switch"
+                title={
+                  data?.whitelistEnabled == null
+                    ? "Whitelist setting unavailable"
+                    : data.whitelistEnabled
+                      ? "Whitelist enabled"
+                      : "Whitelist disabled"
+                }
+                disabled={
+                  !canManage ||
+                  busy ||
+                  data?.whitelistSettingsAvailable === false ||
+                  (!data?.whitelistEnabled &&
+                    data?.whitelistAvailable === false) ||
+                  data?.whitelistEnabled == null
+                }
+                onClick={() =>
+                  openWhitelist({
+                    kind: "state",
+                    enabled: !data?.whitelistEnabled,
+                  })
+                }
+              >
+                <span />
+              </button>
+            </>
+          }
+          actions={(player) => (
+            <button
+              className="btn icon"
+              aria-label={`Remove saved whitelist player ${player.name}`}
+              title="Remove from whitelist"
+              disabled={
+                !canManage || busy || data?.whitelistAvailable === false
+              }
+              onClick={() => openWhitelist({ kind: "remove", player })}
+            >
+              <UserMinus size={14} />
+            </button>
+          )}
+        />
       </div>
 
       {result && (
@@ -463,11 +838,35 @@ export default function Players({ notify }: PageProps) {
                     <small>
                       {player.source === "banned"
                         ? "From saved ban list"
-                        : "From server profile cache"}
+                        : player.source === "whitelist"
+                          ? "From saved whitelist"
+                          : player.source === "operator"
+                            ? "From saved operator list"
+                            : "From server profile cache"}
                     </small>
                   )}
                 </div>
                 <div className="players-history-actions">
+                  <button
+                    className="btn"
+                    aria-label={`${isWhitelisted(player) ? "Remove" : "Add"} ${player.name} ${isWhitelisted(player) ? "from" : "to"} whitelist`}
+                    disabled={
+                      !canManage || busy || data?.whitelistAvailable === false
+                    }
+                    onClick={() =>
+                      openWhitelist({
+                        kind: isWhitelisted(player) ? "remove" : "add",
+                        player,
+                      })
+                    }
+                  >
+                    {isWhitelisted(player) ? (
+                      <UserMinus size={14} />
+                    ) : (
+                      <UserCheck size={14} />
+                    )}
+                    {isWhitelisted(player) ? "Remove whitelist" : "Whitelist"}
+                  </button>
                   <button
                     className="btn"
                     aria-label={`Grant OP for ${player.name}`}
@@ -525,104 +924,6 @@ export default function Players({ notify }: PageProps) {
             </button>
           </div>
         )}
-      </section>
-
-      <section
-        className="panel management-list"
-        aria-labelledby="operators-title"
-      >
-        <div className="management-panel-header">
-          <div className="management-section-title">
-            <ShieldCheck size={18} />
-            <h2 id="operators-title">Operators</h2>
-            <span className="management-count">{operators.length}</span>
-          </div>
-          <div className="management-controls">
-            <label className="management-search">
-              <Search size={16} />
-              <input
-                aria-label="Search operators"
-                placeholder="Search players..."
-                value={search}
-                onChange={(e) => setSearch(e.target.value)}
-              />
-            </label>
-            <button
-              className="btn icon"
-              title="Refresh operators"
-              aria-label="Refresh operators"
-              disabled={loading}
-              onClick={() => void refresh()}
-            >
-              <RefreshCw
-                size={16}
-                className={loading ? "management-spinning" : ""}
-              />
-            </button>
-          </div>
-        </div>
-        {error ? (
-          <div className="management-error" role="alert">
-            <AlertCircle size={18} />
-            <span>{error}</span>
-            <button className="btn" onClick={() => void refresh()}>
-              Try again
-            </button>
-          </div>
-        ) : loading ? (
-          <div className="management-loading" role="status">
-            <RefreshCw size={20} className="management-spinning" /> Loading
-            operators...
-          </div>
-        ) : filtered.length === 0 ? (
-          <div className="empty-state management-empty">
-            <div className="management-empty-icon">
-              <ShieldPlus size={27} />
-            </div>
-            <h3>{search.trim() ? "No matching players" : "No operators"}</h3>
-            {search.trim() && <p>Try another Minecraft username.</p>}
-          </div>
-        ) : (
-          <ul className="players-operator-list">
-            {filtered.map((player) => (
-              <li className="players-operator" key={player.uuid || player.name}>
-                <PlayerHead name={player.name} uuid={player.uuid} size={40} />
-                <div className="players-operator-identity">
-                  <strong>{player.name}</strong>
-                  <span>
-                    {simulated ? "Simulated operator" : "Saved in Minecraft"}
-                    {player.level !== undefined
-                      ? ` · Level ${player.level}`
-                      : ""}
-                  </span>
-                </div>
-                <span className="players-op-badge">
-                  <ShieldCheck size={13} /> OP
-                </span>
-                <button
-                  className="btn players-remove"
-                  aria-label={`Remove OP for ${player.name}`}
-                  disabled={!canManage || busy}
-                  onClick={() => {
-                    setFormError("");
-                    setRemoving(player);
-                  }}
-                >
-                  <ShieldMinus size={15} /> Remove OP
-                </button>
-              </li>
-            ))}
-          </ul>
-        )}
-        <div className="management-panel-footer players-list-footer">
-          <ShieldCheck size={14} />
-          <span>
-            {simulated
-              ? "Showing this server’s simulated operators."
-              : "Showing the server’s saved operator list."}{" "}
-            Panel access is managed in <a href="#subusers">Subusers</a>.
-          </span>
-        </div>
       </section>
 
       <dialog
@@ -733,6 +1034,117 @@ export default function Players({ notify }: PageProps) {
               disabled={busy || !canManage}
             >
               {busy ? "Sending..." : removing ? "Remove OP" : "Grant OP"}
+            </button>
+          </div>
+        </form>
+      </dialog>
+      <dialog
+        ref={whitelistDialog}
+        className="modal management-dialog players-dialog"
+        aria-labelledby="whitelist-dialog-title"
+        onCancel={(event) => {
+          event.preventDefault();
+          closeWhitelist();
+        }}
+      >
+        <form onSubmit={submitWhitelist}>
+          <div className="management-dialog-heading">
+            <span className="management-icon">
+              <UserCheck size={22} />
+            </span>
+            <button
+              className="btn icon"
+              type="button"
+              aria-label="Close whitelist dialog"
+              disabled={busy}
+              onClick={closeWhitelist}
+            >
+              <X size={18} />
+            </button>
+          </div>
+          <h2 id="whitelist-dialog-title">{whitelistTitle}</h2>
+          <p className="management-dialog-description">
+            {whitelistAction?.kind === "state" ? (
+              whitelistAction.enabled ? (
+                "Only whitelisted players will be allowed to join this server."
+              ) : (
+                "Players will be able to join without being on the whitelist. Player and IP bans still apply."
+              )
+            ) : whitelistAction?.kind === "remove" ? (
+              <>
+                Remove <strong>{whitelistName}</strong> from the whitelist? They
+                will need to be added again to join while the whitelist is
+                enabled.
+              </>
+            ) : (
+              "Add the Minecraft Java username of a player who should be allowed to join when the whitelist is enabled."
+            )}
+          </p>
+          {whitelistAction?.kind === "add" && (
+            <div className="form-field">
+              <label htmlFor="whitelist-name">Minecraft username</label>
+              <input
+                id="whitelist-name"
+                value={whitelistName}
+                onChange={(event) => setWhitelistName(event.target.value)}
+                readOnly={Boolean(whitelistAction.player)}
+                required
+                minLength={3}
+                maxLength={16}
+                pattern="[A-Za-z0-9_]{3,16}"
+                autoComplete="off"
+                autoCapitalize="none"
+                spellCheck={false}
+                disabled={busy}
+                autoFocus
+              />
+              <small>3–16 letters, numbers, or underscores.</small>
+            </div>
+          )}
+          <div className="players-permission-note">
+            <Info size={18} />
+            <p>
+              {simulated
+                ? "This change is simulated. Minecraft’s whitelist and server settings files will not change."
+                : "The panel sends a Minecraft console command. The roster and switch update when the server saves the result."}
+            </p>
+          </div>
+          {(!canManage || formError) && (
+            <p className="management-form-error" role="alert">
+              <AlertCircle size={15} />
+              {formError ||
+                "Start the server in Console before changing the whitelist."}
+            </p>
+          )}
+          <div className="management-dialog-actions">
+            <button
+              type="button"
+              className="btn"
+              disabled={busy}
+              onClick={closeWhitelist}
+            >
+              Cancel
+            </button>
+            <button
+              type="submit"
+              className={`btn ${whitelistAction?.kind === "remove" ? "danger" : "primary"}`}
+              disabled={
+                busy ||
+                !canManage ||
+                (whitelistAction?.kind === "state"
+                  ? data?.whitelistSettingsAvailable === false ||
+                    (whitelistAction.enabled &&
+                      data?.whitelistAvailable === false)
+                  : data?.whitelistAvailable === false)
+              }
+            >
+              {busy
+                ? "Sending..."
+                : whitelistAction?.kind === "state"
+                  ? `${whitelistAction.enabled ? "Enable" : "Disable"} whitelist`
+                  : whitelistAction?.kind === "remove"
+                    ? "Remove from whitelist"
+                    : "Add to whitelist"}
             </button>
           </div>
         </form>

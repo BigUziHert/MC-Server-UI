@@ -318,10 +318,12 @@ export async function createRecycleBin({
     }
   };
   const view = async (record) => {
-    const { metadata, payload } = record;
+    const { entryDir, metadata, payload } = record;
     const stored = await lstat(payload);
+    const deleting = await lstat(await safePath(entryDir, ".deleting"));
     const ready =
       stored &&
+      !deleting &&
       !stored.isSymbolicLink() &&
       (metadata.type === "file" ? stored.isFile() : stored.isDirectory()) &&
       metadata.phase !== "copying" &&
@@ -344,6 +346,12 @@ export async function createRecycleBin({
         ? {
             message:
               "An interrupted operation left incomplete recovery data. Its files are retained; restore is unavailable until the original operation can be resolved.",
+          }
+        : {}),
+      ...(deleting
+        ? {
+            message:
+              "Permanent deletion was interrupted. Remaining recovery data can be permanently deleted, but cannot be restored.",
           }
         : {}),
     };
@@ -478,14 +486,88 @@ export async function createRecycleBin({
         );
         metadata.phase = "restored";
         await persist(entryDir, metadata);
-        // Restore is the only operation that removes an archived payload, and only
-        // after its destination copy is verified. Interrupted cleanup is harmless.
+        // Restore cleanup removes its archived payload only after the destination
+        // copy is verified. Interrupted cleanup is harmless.
         // A failed cleanup leaves a completed journal, hidden from the list; the
         // verified restored destination is already durable enough for success.
         await io
           .rm(await entryDirectory(id), { recursive: true, force: true })
           .catch(() => {});
         return metadata.originalPath;
+      });
+    },
+    deletePermanently(id) {
+      return exclusive(async () => {
+        // Purge uses the validated private ID only. Damaged metadata or an
+        // unavailable original server path must not prevent removing an entry.
+        const entryDir = await entryDirectory(id);
+        const entry = await lstat(entryDir);
+        if (!entry) throw error(404, "This Recycle Bin item was not found.");
+        if (!entry.isDirectory() || entry.isSymbolicLink())
+          throw error(
+            400,
+            "Choose a directory from this server's Recycle Bin.",
+          );
+        await walk(entryDir); // Reject links/special files before modifying anything.
+        const marker = await safePath(await entryDirectory(id), ".deleting");
+        try {
+          const handle = await io.open(marker, "wx");
+          try {
+            await handle.writeFile(
+              "Permanent deletion requested. Do not restore partial contents.\n",
+            );
+            await handle.sync();
+          } finally {
+            await handle.close();
+          }
+        } catch (cause) {
+          if (cause.code !== "EEXIST") throw cause;
+        }
+        const rows = await walk(await entryDirectory(id));
+        const byPath = new Map(rows.map((row) => [row.path, row]));
+        // Keep the journal and deletion marker until payload deletion succeeds.
+        // A locked file may leave a partial archive, which must never be restored.
+        const ordered = rows
+          .filter(
+            (row) =>
+              row.path && !["entry.json", ".deleting"].includes(row.path),
+          )
+          .reverse();
+        for (const special of ["entry.json", ".deleting", ""])
+          if (byPath.has(special)) ordered.push(byPath.get(special));
+        try {
+          for (const row of ordered) {
+            const target = await safePath(await entryDirectory(id), row.path);
+            const stat = await io.lstat(target);
+            if (
+              stat.isSymbolicLink() ||
+              stat.ino !== row.ino ||
+              stat.dev !== row.dev ||
+              (row.type === "directory" ? !stat.isDirectory() : !stat.isFile())
+            )
+              throw error(
+                409,
+                "This recovery item changed during deletion. Refresh and try again; remaining files have been retained.",
+              );
+            if (row.type === "directory") await io.rmdir(target);
+            else await io.unlink(target);
+          }
+        } catch (cause) {
+          if (
+            ["EPERM", "EACCES", "EBUSY", "ENOTEMPTY", "EEXIST"].includes(
+              cause.code,
+            )
+          )
+            throw Object.assign(
+              error(
+                409,
+                "This recovery item could not be fully deleted. Release files that are in use and retry. Remaining recovery data has been retained.",
+              ),
+              { code: cause.code },
+            );
+          throw cause;
+        }
+        return id;
       });
     },
   };
