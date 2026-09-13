@@ -779,6 +779,33 @@ test("startup parsing preserves quoted Java paths, explicit flags and @files wit
     assert.throws(() => parseJavaScript(script), /commands beyond/);
 });
 
+test("NeoForge nogui joined directly to trailing batch arguments is recognized without accepting arbitrary percent expansion", () => {
+  const files = [
+    "@user_jvm_args.txt",
+    "@libraries/net/neoforged/neoforge/21.1.250/win_args.txt",
+  ];
+  for (const noGui of ["nogui", "--nogui"]) {
+    const parsed = parseJavaScript(
+      `@echo off\r\nREM Keep the installed files\r\njava ${files.join(" ")} ${noGui}%*\r\npause\r\n`,
+    );
+    assert.deepEqual(parsed.args, [...files, noGui]);
+    assert.equal(parsed.software, "NeoForge");
+    assert.equal(parsed.version, "21.1.250");
+  }
+  for (const ending of [
+    "nogui%*extra",
+    "%*nogui",
+    "prefix%*",
+    "--nogui%JAVA%",
+    "nogui%* argument",
+  ]) {
+    assert.throws(
+      () => parseJavaScript(`java ${files.join(" ")} ${ending}`),
+      /commands beyond/,
+    );
+  }
+});
+
 test("Java-argument imports reject missing or escaping launch files and recover when dependencies return", async (t) => {
   const { directory, prepare, boot } = await fixture(t);
   await prepare(directory, { jars: [] });
@@ -1233,14 +1260,31 @@ for (const launchType of ["java-args", "script"]) {
       );
       args[1] = `@${neoArgs}`;
       const jvmFile = path.join(directory, "user_jvm_args.txt");
-      await fs.writeFile(
-        jvmFile,
-        "-Xms6G -Xmx12G\n-XX:+UseZGC\n-XX:+ZGenerational\n",
-      );
-      await fs.writeFile(
-        path.join(directory, "run.bat"),
-        `@echo off\r\njava ${args.slice(0, 2).join(" ")} %*\r\npause\r\n`,
-      );
+      const originalJvm = [
+        "# Xmx and Xms set the maximum and minimum RAM usage, respectively.",
+        "# They can take any number, followed by an M or a G.",
+        "# M means Megabyte, G means Gigabyte.",
+        "# For example, to set the maximum to 3GB: -Xmx3G",
+        "# To set the minimum to 2.5GB: -Xms2500M",
+        "-Xms6G",
+        "-Xmx12G",
+        "-XX:+UseZGC",
+        "-XX:+ZGenerational",
+        "-XX:+DisableExplicitGC",
+        "",
+      ].join("\r\n");
+      await fs.writeFile(jvmFile, originalJvm);
+      const originalScript = [
+        "@echo off",
+        "REM Forge requires a configured set of both JVM and program arguments.",
+        "REM Add custom JVM arguments to the user_jvm_args.txt",
+        "REM Add custom program arguments {such as nogui} to this file in the next line before the %* or",
+        "REM  pass them to this script directly",
+        `java ${args.slice(0, 2).join(" ")} ${launchType === "script" ? "nogui%*" : "%*"}`,
+        "pause",
+        "",
+      ].join("\r\n");
+      await fs.writeFile(path.join(directory, "run.bat"), originalScript);
       await fs.writeFile(path.join(directory, "eula.txt"), "eula=true\n");
       const original = await snapshot(directory);
       const first = await boot();
@@ -1266,6 +1310,8 @@ for (const launchType of ["java-args", "script"]) {
       const id = imported.body.server.id;
       assert.equal(imported.body.server.configuredMemoryLimitMB, 12288);
       assert.equal(imported.body.server.version, "21.1.250");
+      if (launchType === "script")
+        assert.deepEqual(imported.body.server.launchArgs, []);
       assert.deepEqual(await snapshot(directory), original);
       await first.close();
       // Simulate a registration saved by the earlier version of the desktop app.
@@ -1283,6 +1329,7 @@ for (const launchType of ["java-args", "script"]) {
       assert.equal(restored.configuredMemoryLimitMB, 12288);
       assert.equal(restored.software, "NeoForge");
       assert.equal(restored.version, "21.1.250");
+      if (launchType === "script") assert.deepEqual(restored.launchArgs, []);
       assert.equal((await read()).memoryLimit, 12 * 1024 ** 3);
       assert.equal((await read()).memoryLimitState, "configured");
       assert.deepEqual(await snapshot(directory), original);
@@ -1298,6 +1345,20 @@ for (const launchType of ["java-args", "script"]) {
       await eventually(async () => (await read()).status === "running");
       assert.equal((await read()).memoryLimitState, "started");
       assert.equal((await read()).memoryLimitSource, "launch");
+      assert.equal(await fs.readFile(jvmFile, "utf8"), originalJvm);
+      assert.equal(
+        await fs.readFile(path.join(directory, "run.bat"), "utf8"),
+        originalScript,
+      );
+      if (launchType === "script") {
+        const invocation = buildScriptInvocation(
+          path.join(await fs.realpath(directory), "run.bat"),
+          [],
+        );
+        assert.equal(launches[0].executable, invocation.executable);
+        assert.deepEqual(launches[0].args, invocation.args);
+        assert.equal(launches[0].options.cwd, await fs.realpath(directory));
+      }
       await fs.writeFile(jvmFile, "-Xms6G -Xmx16G\n-XX:+UseZGC\n");
       assert.equal((await read()).memoryLimit, 12 * 1024 ** 3);
       assert.equal(
@@ -1330,6 +1391,15 @@ for (const launchType of ["java-args", "script"]) {
       );
       assert.equal((await read()).memoryLimit, 16 * 1024 ** 3);
       assert.equal((await read()).version, "21.1.250");
+      assert.equal(
+        await fs.readFile(path.join(directory, "run.bat"), "utf8"),
+        originalScript,
+      );
+      assert.equal(
+        await fs.readFile(jvmFile, "utf8"),
+        "-Xms6G -Xmx16G\n-XX:+UseZGC\n",
+      );
+      assert.deepEqual(launches[1].args, launches[0].args);
       assert.equal(
         (
           await panel.request(

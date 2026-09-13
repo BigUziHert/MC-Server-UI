@@ -1881,10 +1881,10 @@ async function existingServerFixture({
     files["server.properties"] =
       "# Existing NeoForge server\r\nserver-port=25683\r\nmotd=Original NeoForge world\r\nlevel-name=existing-world\r\nmax-players=37\r\n";
     files["run.bat"] =
-      "@echo off\r\nREM NeoForge requires JVM arguments.\r\njava @user_jvm_args.txt @libraries/net/neoforged/neoforge/21.1.200/win_args.txt %*\r\npause\r\n";
+      "@echo off\r\nREM NeoForge requires JVM arguments.\r\njava @user_jvm_args.txt @libraries/net/neoforged/neoforge/21.1.250/win_args.txt nogui%*\r\npause\r\n";
     files["user_jvm_args.txt"] =
-      "# Keep this original RAM configuration\r\n-Xms2G\r\n-Xmx6G\r\n";
-    files["libraries/net/neoforged/neoforge/21.1.200/win_args.txt"] =
+      "# Keep this original RAM configuration\r\n-Xms6G\r\n-Xmx12G\r\n-XX:+UseZGC\r\n-XX:+ZGenerational\r\n-XX:+DisableExplicitGC\r\n";
+    files["libraries/net/neoforged/neoforge/21.1.250/win_args.txt"] =
       "# Existing generated NeoForge arguments\r\n--launchTarget neoforgeserver\r\n";
   } else if (customLauncher) {
     files["server.properties"] =
@@ -2169,7 +2169,7 @@ test("import review handles canceled folder selection, invalid folders, and mult
   }
 });
 
-test("imports a NeoForge run.bat server without a JAR and preserves its JVM arguments and existing world", async ({
+test("detects NeoForge with joined nogui%* and preserves its script, JVM arguments and existing world", async ({
   page,
   request,
 }, testInfo) => {
@@ -2191,7 +2191,7 @@ test("imports a NeoForge run.bat server without a JAR and preserves its JVM argu
     const inspection = await inspectionResponse.json();
     const launchArgs = [
       "@user_jvm_args.txt",
-      "@libraries/net/neoforged/neoforge/21.1.200/win_args.txt",
+      "@libraries/net/neoforged/neoforge/21.1.250/win_args.txt",
       "nogui",
     ];
     expect(inspection).toMatchObject({
@@ -2200,7 +2200,9 @@ test("imports a NeoForge run.bat server without a JAR and preserves its JVM argu
       launchType: "java-args",
       launchScript: "",
       javaPath: "java",
-      memoryLimitMB: 6144,
+      memoryLimitMB: 12288,
+      software: "NeoForge",
+      version: "21.1.250",
       launchArgs,
     });
     expect(inspection.launches).toEqual(
@@ -2258,7 +2260,9 @@ test("imports a NeoForge run.bat server without a JAR and preserves its JVM argu
       launchType: "java-args",
       launchScript: "",
       launchArgs,
-      memoryLimitMB: 6144,
+      memoryLimitMB: 12288,
+      software: "NeoForge",
+      version: "21.1.250",
       source: "imported",
     });
     expect(server.serverDir).toBe(await realpath(directory));
@@ -2289,9 +2293,24 @@ test("imports a NeoForge run.bat server without a JAR and preserves its JVM argu
       0,
     );
     await dialog
+      .getByLabel("Launch method", { exact: true })
+      .selectOption("script");
+    await dialog.getByLabel("Startup script", { exact: true }).fill("run.bat");
+    await expect(
+      dialog.getByLabel("Startup arguments", { exact: true }),
+    ).toHaveValue("");
+    await dialog
       .getByRole("button", { name: "Save changes", exact: true })
       .click();
     await expect(dialog).not.toBeVisible();
+    await expect(page.locator(".server-details")).toContainText("NeoForge");
+    await expect(page.locator(".server-details")).toContainText("21.1.250");
+    await expect(
+      page
+        .locator(".metric-card")
+        .filter({ hasText: "Memory" })
+        .locator(".metric-value"),
+    ).toContainText("/ 12 GB");
     expect(await snapshotExistingFolder(directory)).toEqual(original);
 
     await page.getByRole("link", { name: "File Manager", exact: true }).click();
@@ -2327,9 +2346,9 @@ test("imports a NeoForge run.bat server without a JAR and preserves its JVM argu
         (item) => item.id === server.id,
       ),
     ).toMatchObject({
-      launchType: "java-args",
-      launchScript: "",
-      launchArgs,
+      launchType: "script",
+      launchScript: "run.bat",
+      launchArgs: [],
       jar: "",
     });
     expect(
@@ -2340,7 +2359,7 @@ test("imports a NeoForge run.bat server without a JAR and preserves its JVM argu
           "/files/content?path=user_jvm_args.txt",
         )
       ).content,
-    ).toContain("-Xmx6G");
+    ).toContain("-Xmx12G");
     expect(
       (await scopedGet(request, server.id, "/files/content?path=eula.txt"))
         .content,

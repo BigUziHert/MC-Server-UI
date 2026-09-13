@@ -273,6 +273,11 @@ export function parseJavaScript(text) {
   )
     throw unsupported();
   if (tokens.at(-1) === "%*") tokens.pop();
+  else if (["nogui%*", "--nogui%*"].includes(tokens.at(-1))) {
+    // With no script arguments, cmd expands this common joined suffix to the
+    // literal nogui flag. Keep the flag when inspecting the installed launcher.
+    tokens[tokens.length - 1] = tokens.at(-1).slice(0, -2);
+  }
   if (tokens.some((value) => /%/.test(value))) throw unsupported();
   if (!tokens.length) throw unsupported();
   const args = tokens.map((value) =>
