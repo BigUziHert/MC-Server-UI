@@ -73,6 +73,7 @@ type InstalledItem = {
   author?: string;
   update?: Version | null;
   updateCheck?: "checked" | "unavailable" | "pending";
+  updateIssue?: string;
 };
 type Job = {
   id: string;
@@ -657,7 +658,11 @@ export default function Launchpad({ notify }: PageProps) {
                 ...snapshot.result,
                 items: snapshot.result.items.map((item) =>
                   item.platform && item.projectId
-                    ? { ...item, updateCheck: "unavailable" }
+                    ? {
+                        ...item,
+                        updateCheck: "unavailable",
+                        updateIssue: messageOf(cause),
+                      }
                     : item,
                 ),
               });
@@ -960,15 +965,15 @@ export default function Launchpad({ notify }: PageProps) {
   const updateFiltersReady = Boolean(
     type !== "modpack" && gameVersion.trim() && loader,
   );
-  const updatesUnavailable =
-    updateFiltersReady &&
-    installed?.items.some(
-      (item) =>
-        item.platform &&
-        item.projectId &&
-        (item.updateCheck === "unavailable" ||
-          (!scanRefreshing && item.updateCheck === "pending")),
-    );
+  const unavailableUpdates = updateFiltersReady
+    ? entries.filter(
+        (item) =>
+          item.platform &&
+          item.projectId &&
+          (item.updateCheck === "unavailable" ||
+            (!scanRefreshing && item.updateCheck === "pending")),
+      )
+    : [];
   const visibleProjects: { project: Project; entry?: InstalledItem }[] =
     installedOnly
       ? entries.slice(currentOffset, currentOffset + limit).map((entry) => ({
@@ -993,7 +998,7 @@ export default function Launchpad({ notify }: PageProps) {
   const warnings = [
     ...new Set([
       ...(config?.warnings ?? []),
-      ...(installed?.warnings ?? []),
+      ...(installedOnly ? (installed?.warnings ?? []) : []),
       ...(!installedOnly ? (results?.warnings ?? []) : []),
     ]),
   ];
@@ -1379,7 +1384,7 @@ export default function Launchpad({ notify }: PageProps) {
           </span>
         </div>
       )}
-      {scanError && (!installedOnly || installed) && (
+      {scanError && installedOnly && installed && (
         <div className="launchpad-error" role="alert">
           <AlertCircle size={16} />
           <span>{scanError}</span>
@@ -1394,10 +1399,13 @@ export default function Launchpad({ notify }: PageProps) {
           </button>
         </div>
       )}
-      {!scanError && updatesUnavailable && (
+      {installedOnly && !scanError && unavailableUpdates.length > 0 && (
         <div className="launchpad-error" role="alert">
           <AlertCircle size={16} />
-          <span>Some installed update checks could not be completed.</span>
+          <span>
+            Could not check updates for {unavailableUpdates.length} installed{" "}
+            {unavailableUpdates.length === 1 ? "item" : "items"}.
+          </span>
           <button
             className="btn"
             disabled={scanRefreshing || scanLoading}
@@ -1569,6 +1577,15 @@ export default function Launchpad({ notify }: PageProps) {
                       </span>
                     )}
                   </div>
+                  {entry?.updateIssue &&
+                    entry.platform &&
+                    entry.projectId &&
+                    entry.updateCheck === "unavailable" &&
+                    updateFiltersReady && (
+                      <div className="launchpad-project-issue">
+                        {entry.updateIssue}
+                      </div>
+                    )}
                 </div>
                 <div className="launchpad-project-action">
                   {(!entry || (entry.platform && entry.projectId)) && (

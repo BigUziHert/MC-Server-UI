@@ -17,10 +17,10 @@ const id = (value) => {
     );
   return value;
 };
+// Optional server installation is supported, even when the client is required.
+// https://modrinth.com/news/article/new-environments/#new-system
 const serverEnvironment = (value) =>
-  !["client_only", "client_only_server_optional", "singleplayer_only"].includes(
-    value,
-  );
+  !["client_only", "singleplayer_only"].includes(value);
 const fileName = (value) => {
   const name = safeInstallPath(value);
   if (name.includes("/"))
@@ -270,9 +270,10 @@ function modrinthUpdates(json) {
       const task = lanes[lane].then(async () => {
         input.signal?.throwIfAborted();
         const updates = {},
+          issues = {},
           warnings = new Set();
         if (failureUntil > Date.now())
-          return { updates, warnings: [failureWarning] };
+          return { updates, issues, warnings: [failureWarning] };
         const timeout = AbortSignal.timeout(8000);
         const signal = input.signal
           ? AbortSignal.any([input.signal, timeout])
@@ -299,36 +300,71 @@ function modrinthUpdates(json) {
           for (const item of batch) {
             const value = result[item.sha512];
             if (!value) {
-              warnings.add(
-                "Modrinth did not return results for some installed files. Their update status could not be checked.",
-              );
+              issues[item.sha512] =
+                "Modrinth did not return an update result for this file checksum.";
               continue;
             }
             try {
               if (
                 !Array.isArray(value.game_versions) ||
                 !Array.isArray(value.loaders) ||
-                !Array.isArray(value.files)
+                !value.game_versions.every(
+                  (entry) => typeof entry === "string",
+                ) ||
+                !value.loaders.every((entry) => typeof entry === "string")
               )
                 throw launchpadError(
                   502,
                   "Modrinth returned invalid update compatibility data.",
                 );
+              if (
+                !Array.isArray(value.files) ||
+                value.files.some((file) => !file || typeof file !== "object")
+              )
+                throw launchpadError(
+                  502,
+                  "Modrinth returned invalid update download metadata.",
+                );
+              if (
+                typeof value.id !== "string" ||
+                !/^[A-Za-z0-9_-]{1,100}$/.test(value.id)
+              )
+                throw launchpadError(
+                  502,
+                  "Modrinth returned an invalid update version ID.",
+                );
               const version = mrVersion(value);
-              id(value.id);
               if (value.project_id !== item.projectId)
                 throw new Error(
                   "Modrinth returned an update for a different project.",
                 );
-              if (!version.downloadable || !fits(version, input))
+              if (!serverEnvironment(value.environment))
                 throw new Error(
-                  "Some Modrinth update results were not compatible server downloads. Their update status could not be checked.",
+                  value.environment === "singleplayer_only"
+                    ? "The returned version is marked singleplayer-only and does not support a dedicated server."
+                    : "The returned version is marked client-only and does not support server installation.",
+                );
+              if (
+                input.gameVersion &&
+                !version.gameVersions.includes(input.gameVersion)
+              )
+                throw new Error(
+                  `The returned version does not support Minecraft ${input.gameVersion}.`,
+                );
+              if (input.loader && !version.loaders.includes(input.loader))
+                throw new Error(
+                  `The returned version does not support the selected ${input.loader} loader.`,
+                );
+              if (!version.downloadable)
+                throw new Error(
+                  "The returned version has no downloadable file with a verification checksum.",
                 );
               if (version.id === item.versionId) {
                 if (
                   !value.files.some(
                     (file) =>
-                      file.hashes?.sha512?.toLowerCase() === item.sha512,
+                      typeof file.hashes?.sha512 === "string" &&
+                      file.hashes.sha512.toLowerCase() === item.sha512,
                   )
                 )
                   throw new Error(
@@ -340,7 +376,7 @@ function modrinthUpdates(json) {
               const file = mrUpdateFile(value, input);
               if (!file)
                 throw new Error(
-                  "Some Modrinth update results did not contain a supported server file. Their update status could not be checked.",
+                  "The returned version does not contain a single supported server download.",
                 );
               if (file.hashes?.sha512?.toLowerCase() === item.sha512) {
                 updates[item.sha512] = null;
@@ -348,7 +384,7 @@ function modrinthUpdates(json) {
               }
               candidates.push({ item, version });
             } catch (cause) {
-              warnings.add(cause.message);
+              issues[item.sha512] = cause.message;
             }
           }
           if (candidates.length) {
@@ -370,17 +406,31 @@ function modrinthUpdates(json) {
               const installed = byId.get(item.versionId);
               const before = Date.parse(installed?.date_published);
               const after = Date.parse(version.publishedAt);
+              if (!installed) {
+                issues[item.sha512] =
+                  "Modrinth did not return metadata for the installed version, so this update could not be verified.";
+                continue;
+              }
+              if (installed.project_id !== item.projectId) {
+                issues[item.sha512] =
+                  "The installed-version metadata belongs to a different project, so this update could not be verified.";
+                continue;
+              }
               if (
-                installed?.project_id !== item.projectId ||
-                !installed.files?.some(
-                  (file) => file.hashes?.sha512?.toLowerCase() === item.sha512,
-                ) ||
-                !Number.isFinite(before) ||
-                !Number.isFinite(after)
+                !Array.isArray(installed.files) ||
+                !installed.files.some(
+                  (file) =>
+                    typeof file?.hashes?.sha512 === "string" &&
+                    file.hashes.sha512.toLowerCase() === item.sha512,
+                )
               ) {
-                warnings.add(
-                  "Some Modrinth updates could not be verified against their installed versions.",
-                );
+                issues[item.sha512] =
+                  "The installed file checksum does not match Modrinth's version metadata, so this update could not be verified.";
+                continue;
+              }
+              if (!Number.isFinite(before) || !Number.isFinite(after)) {
+                issues[item.sha512] =
+                  "Modrinth returned an invalid publication date, so a newer version could not be verified.";
                 continue;
               }
               updates[item.sha512] = after > before ? version : null;
@@ -395,7 +445,7 @@ function modrinthUpdates(json) {
               : cause.message;
           warnings.add(failureWarning);
         }
-        return { updates, warnings: [...warnings] };
+        return { updates, issues, warnings: [...warnings] };
       });
       lanes[lane] = task.catch(() => {});
       tasks.push(task);
@@ -403,6 +453,7 @@ function modrinthUpdates(json) {
     const results = await Promise.all(tasks);
     return {
       updates: Object.assign({}, ...results.map((result) => result.updates)),
+      issues: Object.assign({}, ...results.map((result) => result.issues)),
       warnings: [...new Set(results.flatMap((result) => result.warnings))],
     };
   };

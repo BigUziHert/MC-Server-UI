@@ -44,6 +44,107 @@ const current = (installed, overrides = {}) =>
 const json = (value) => new Response(JSON.stringify(value));
 const provider = (fetch) => createCoreProviders({ fetch })[0];
 
+test("Modrinth environment definitions agree across catalogs, current checks, updates and resolution", async () => {
+  // Modrinth explicitly permits server installation for client_only_server_optional.
+  // https://modrinth.com/news/article/new-environments/#new-system
+  for (const environment of [
+    "client_and_server",
+    "client_only_server_optional",
+    "server_only",
+    "server_only_client_optional",
+    "dedicated_server_only",
+    "client_or_server",
+    "client_or_server_prefers_both",
+    "client_only",
+    "singleplayer_only",
+    "unknown",
+    undefined,
+  ]) {
+    const row = item(0);
+    const allowed = !["client_only", "singleplayer_only"].includes(environment);
+    let candidate = raw(row, { environment });
+    const p = provider(async (url) => {
+      if (url.endsWith("/version_files/update"))
+        return json({ [row.sha512]: candidate });
+      if (new URL(url).pathname === "/v2/versions")
+        return json([current(row, { environment })]);
+      if (new URL(url).pathname === `/v2/project/${row.projectId}/version`)
+        return json([candidate]);
+      if (url.endsWith(`/project/${row.projectId}`))
+        return json({
+          id: row.projectId,
+          title: "Fixture mod",
+          project_type: "mod",
+          server_side: "optional",
+        });
+      if (url.endsWith(`/version/${candidate.id}`)) return json(candidate);
+      assert.fail(`Unexpected metadata request: ${url}`);
+    });
+    const versions = await p.versions({ ...input, projectId: row.projectId });
+    assert.equal(versions[0].downloadable, allowed, environment);
+    const result = await p.updates(input, [row]);
+    assert.deepEqual(result.warnings, [], environment);
+    if (allowed) {
+      assert.equal(result.updates[row.sha512].id, candidate.id, environment);
+      assert.deepEqual(result.issues, {}, environment);
+      const resolved = await p.resolve({
+        ...input,
+        projectId: row.projectId,
+        versionId: candidate.id,
+      });
+      assert.equal(resolved.files[0].path, "mod.jar", environment);
+    } else {
+      assert.equal(
+        Object.hasOwn(result.updates, row.sha512),
+        false,
+        environment,
+      );
+      assert.match(
+        result.issues[row.sha512],
+        environment === "client_only" ? /client-only/ : /singleplayer-only/,
+      );
+      await assert.rejects(
+        p.resolve({
+          ...input,
+          projectId: row.projectId,
+          versionId: candidate.id,
+        }),
+        /intended for clients/,
+      );
+    }
+    candidate = current(row, { environment });
+    const checked = await p.updates(input, [row]);
+    if (allowed) {
+      assert.deepEqual(checked.updates, { [row.sha512]: null }, environment);
+      assert.deepEqual(checked.issues, {}, environment);
+    } else {
+      assert.deepEqual(checked.updates, {}, environment);
+      assert.ok(checked.issues[row.sha512], environment);
+    }
+  }
+});
+
+test("optional-server versions do not bypass an explicit unsupported-server project declaration", async () => {
+  const row = item(0),
+    candidate = raw(row, { environment: "client_only_server_optional" });
+  const p = provider(async (url) =>
+    json(
+      url.includes("/project/")
+        ? {
+            id: row.projectId,
+            title: "Fixture mod",
+            project_type: "mod",
+            server_side: "unsupported",
+          }
+        : candidate,
+    ),
+  );
+  await assert.rejects(
+    p.resolve({ ...input, projectId: row.projectId, versionId: candidate.id }),
+    /intended for clients/,
+  );
+});
+
 test("Modrinth checks hundreds of files in batches of 100 with at most two requests across overlapping callers", async () => {
   const items = Array.from({ length: 302 }, (_, index) => item(index));
   const byHash = new Map(items.map((row) => [row.sha512, row]));
@@ -88,6 +189,7 @@ test("Modrinth checks hundreds of files in batches of 100 with at most two reque
     results.flatMap((result) => result.warnings),
     [],
   );
+  assert.ok(results.every((result) => Object.keys(result.issues).length === 0));
 });
 
 test("batch updates reject current, older, incompatible, wrong-project and unsafe-download candidates", async () => {
@@ -132,8 +234,20 @@ test("batch updates reject current, older, incompatible, wrong-project and unsaf
     assert.equal(result.updates[rows[index].sha512], null);
   for (const index of [4, 5, 6, 7, 9, 10, 11, 12, 13])
     assert.equal(Object.hasOwn(result.updates, rows[index].sha512), false);
-  assert.match(result.warnings.join(" "), /different project/);
-  assert.match(result.warnings.join(" "), /outside the provider/);
+  assert.deepEqual(result.warnings, []);
+  assert.match(result.issues[rows[4].sha512], /selected neoforge loader/);
+  assert.match(result.issues[rows[5].sha512], /Minecraft 1\.21\.1/);
+  assert.match(result.issues[rows[6].sha512], /different project/);
+  assert.match(result.issues[rows[7].sha512], /client-only/);
+  assert.match(result.issues[rows[9].sha512], /outside the provider/);
+  assert.match(result.issues[rows[10].sha512], /no downloadable file/);
+  assert.match(
+    result.issues[rows[11].sha512],
+    /did not return an update result/,
+  );
+  assert.match(result.issues[rows[12].sha512], /invalid update compatibility/);
+  assert.match(result.issues[rows[13].sha512], /file size/);
+  assert.equal(Object.keys(result.issues).length, 9);
 });
 
 test("unverified current identity or publication dates remain unknown instead of becoming update or no-update cache entries", async () => {
@@ -149,8 +263,12 @@ test("unverified current identity or publication dates remain unknown instead of
   );
   const result = await p.updates(input, rows);
   assert.deepEqual(result.updates, {});
-  assert.equal(result.warnings.length, 1);
-  assert.match(result.warnings[0], /could not be verified/);
+  assert.deepEqual(result.warnings, []);
+  assert.equal(Object.keys(result.issues).length, 4);
+  assert.match(result.issues[rows[0].sha512], /different project/);
+  assert.match(result.issues[rows[1].sha512], /checksum does not match/);
+  assert.match(result.issues[rows[2].sha512], /publication date/);
+  assert.match(result.issues[rows[3].sha512], /did not return metadata/);
 });
 
 test("confirmed current hashes become null while omitted hashes remain unknown, and duplicate hashes are coalesced", async () => {
@@ -168,7 +286,12 @@ test("confirmed current hashes become null while omitted hashes remain unknown, 
   });
   const result = await p.updates(input, [row, row, unknown]);
   assert.deepEqual(result.updates, { [row.sha512]: null });
-  assert.match(result.warnings.join(" "), /did not return results/);
+  assert.deepEqual(result.warnings, []);
+  assert.match(
+    result.issues[unknown.sha512],
+    /did not return an update result/,
+  );
+  assert.equal(Object.keys(result.issues).length, 1);
   assert.equal(calls, 1);
   await assert.rejects(
     p.updates(input, [row, { ...row, versionId: "conflicting" }]),
@@ -226,7 +349,8 @@ test("missing or invalid later responses cannot overwrite a previously discovere
     response = value;
     const next = await p.updates(input, [row]);
     assert.deepEqual(next.updates, {});
-    assert.ok(next.warnings.length);
+    assert.deepEqual(next.warnings, []);
+    assert.ok(next.issues[row.sha512]);
     Object.assign(cached, next.updates);
     assert.equal(cached[row.sha512].id, `new${row.versionId}`);
   }
@@ -304,7 +428,11 @@ test("caller cancellation aborts in-flight batch requests, skips queued batches,
   const result = await p.updates(input, [item(0)]);
   assert.equal(calls, 3);
   assert.deepEqual(result.updates, {});
-  assert.match(result.warnings.join(" "), /did not return results/);
+  assert.deepEqual(result.warnings, []);
+  assert.match(
+    result.issues[item(0).sha512],
+    /did not return an update result/,
+  );
 });
 
 for (const stalled of ["request", "response body"])
@@ -363,7 +491,11 @@ for (const stalled of ["request", "response body"])
     now += 30_001;
     const retry = await p.updates(input, [item(201)]);
     assert.deepEqual(retry.updates, {});
-    assert.match(retry.warnings.join(" "), /did not return results/);
+    assert.deepEqual(retry.warnings, []);
+    assert.match(
+      retry.issues[item(201).sha512],
+      /did not return an update result/,
+    );
     assert.equal(calls, 3);
     for (const reject of lateFailures)
       reject(new Error("Late uncooperative network failure"));
@@ -399,7 +531,8 @@ test("caller cancellation releases uncooperative update requests so the next cal
   );
   assert.equal(calls, 4);
   assert.deepEqual(retry.updates, {});
-  assert.match(retry.warnings.join(" "), /did not return results/);
+  assert.deepEqual(retry.warnings, []);
+  assert.equal(Object.keys(retry.issues).length, 101);
 });
 
 test("optional caller signals reach existing Modrinth and CurseForge version and identification helpers", async () => {

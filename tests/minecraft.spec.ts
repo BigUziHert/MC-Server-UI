@@ -1288,8 +1288,7 @@ test("Launchpad preserves known updates and exposes successful-response provider
     publishedAt: "2026-09-01T00:00:00Z",
     downloadable: true,
   };
-  const warning =
-    "Modrinth update checks: provider returned 404. Your installed files are unchanged.";
+  const issue = "Modrinth returned 404 while checking this project's versions.";
   let knownUpdate = false;
   let localReads = 0;
   let reentryResponse: Route | undefined;
@@ -1309,6 +1308,8 @@ test("Launchpad preserves known updates and exposes successful-response provider
       versionName: "1.0",
       update: knownUpdate && compatible ? version : null,
       updateCheck: compatible ? updateCheck : "pending",
+      updateIssue:
+        compatible && updateCheck === "unavailable" ? issue : undefined,
     },
     {
       path: "mods/companion.jar",
@@ -1321,6 +1322,8 @@ test("Launchpad preserves known updates and exposes successful-response provider
       versionName: "3.0",
       update: null,
       updateCheck: compatible ? updateCheck : "pending",
+      updateIssue:
+        compatible && updateCheck === "unavailable" ? issue : undefined,
     },
   ];
   await page.route("**/api/launchpad", (route) =>
@@ -1364,7 +1367,7 @@ test("Launchpad preserves known updates and exposes successful-response provider
       status: 200,
       json: {
         items: inventory(unavailable ? "unavailable" : "checked", compatible),
-        warnings: unavailable ? [warning] : [],
+        warnings: [],
       },
     });
   });
@@ -1397,7 +1400,11 @@ test("Launchpad preserves known updates and exposes successful-response provider
       exact: true,
     })
     .click();
-  await expect(page.getByText(warning, { exact: true })).toBeVisible();
+  await expect(page.getByRole("alert")).toContainText(
+    "Could not check updates for 2 installed items.",
+  );
+  await expect(better.getByText(issue, { exact: true })).toBeVisible();
+  await expect(companion.getByText(issue, { exact: true })).toBeVisible();
   await expect(retry).toBeVisible();
   await expect(update).toBeEnabled();
   await expect(better).toContainText("Available: 2.0");
@@ -1440,9 +1447,13 @@ test("Launchpad preserves known updates and exposes successful-response provider
   ).toBeVisible();
   await reentryResponse!.fulfill({
     status: 200,
-    json: { items: inventory("unavailable"), warnings: [warning] },
+    json: { items: inventory("unavailable"), warnings: [] },
   });
-  await expect(page.getByText(warning, { exact: true })).toBeVisible();
+  await expect(page.getByRole("alert")).toContainText(
+    "Could not check updates for 2 installed items.",
+  );
+  await expect(better.getByText(issue, { exact: true })).toBeVisible();
+  await expect(companion.getByText(issue, { exact: true })).toBeVisible();
   await expect(retry).toBeVisible();
   await expect(update).toBeEnabled();
   await expect(better).toContainText("Available: 2.0");
@@ -1461,7 +1472,8 @@ test("Launchpad preserves known updates and exposes successful-response provider
   ]);
   await retry.click();
   await expect(retry).toHaveCount(0);
-  await expect(page.getByText(warning, { exact: true })).toHaveCount(0);
+  await expect(page.getByText(issue, { exact: true })).toHaveCount(0);
+  await expect(page.getByRole("alert")).toHaveCount(0);
   await expect(update).toBeEnabled();
   await expect(better).toContainText("Available: 2.0");
   await expect(companion).toContainText("mods/companion.jar");
@@ -1497,6 +1509,214 @@ test("Launchpad preserves known updates and exposes successful-response provider
   await expect(
     page.getByText("Update check unavailable", { exact: true }),
   ).toHaveCount(0);
+});
+
+test("Launchpad confines installed update issues to the matching files and platform", async ({
+  page,
+  serverId,
+}) => {
+  const clientIssue =
+    "This Modrinth project is client-only and cannot be installed on a server.";
+  const curseIssue =
+    "CurseForge returned 503 while checking this project's versions.";
+  const identificationNotice =
+    "Modrinth identification: the provider could not identify one local file.";
+  const healthy = {
+    id: "healthy-optional",
+    platform: "modrinth",
+    title: "Healthy Optional Mod",
+    description: "Compatible with dedicated servers.",
+  };
+  const update = {
+    id: "healthy-new",
+    name: "Healthy Optional Mod 2.0",
+    version: "2.0",
+    gameVersions: ["1.21.1"],
+    loaders: ["neoforge"],
+    publishedAt: "2026-09-01T00:00:00Z",
+    downloadable: true,
+  };
+  const items = [
+    {
+      path: "mods/healthy-optional.jar",
+      name: "healthy-optional.jar",
+      title: healthy.title,
+      size: 1024,
+      platform: "modrinth",
+      projectId: healthy.id,
+      versionId: "healthy-old",
+      updateCheck: "checked",
+      update,
+    },
+    {
+      path: "mods/client-renderer.jar",
+      name: "client-renderer.jar",
+      title: "Client Renderer",
+      size: 2048,
+      platform: "modrinth",
+      projectId: "client-renderer",
+      versionId: "client-old",
+      updateCheck: "unavailable",
+      updateIssue: clientIssue,
+    },
+    {
+      path: "mods/local-helper.jar",
+      name: "local-helper.jar",
+      size: 512,
+      platform: null,
+      updateCheck: "unavailable",
+    },
+    {
+      path: "mods/curse-addon.jar",
+      name: "curse-addon.jar",
+      title: "Curse Addon",
+      size: 3072,
+      platform: "curseforge",
+      projectId: "12345",
+      versionId: "123456",
+      updateCheck: "unavailable",
+      updateIssue: curseIssue,
+    },
+  ];
+  await page.route("**/api/launchpad", (route) =>
+    route.fulfill({
+      json: {
+        platforms: [
+          { id: "modrinth", name: "Modrinth", available: true, types: ["mod"] },
+          {
+            id: "curseforge",
+            name: "CurseForge",
+            available: true,
+            types: ["mod"],
+          },
+        ],
+        gameVersion: "1.21.1",
+        gameVersions: ["1.21.1"],
+        loader: "neoforge",
+        status: "offline",
+        warnings: [],
+      },
+    }),
+  );
+  await page.route("**/api/launchpad/search?**", (route) =>
+    route.fulfill({
+      json: { projects: [healthy], total: 1, offset: 0, limit: 10 },
+    }),
+  );
+  let fullReads = 0;
+  await page.route("**/api/launchpad/installed?**", (route) => {
+    expect(route.request().headers()["x-server-id"]).toBe(serverId);
+    const local =
+      new URL(route.request().url()).searchParams.get("local") === "true";
+    if (!local) fullReads++;
+    return route.fulfill({
+      json: {
+        items: local
+          ? items.map((item) => ({
+              ...item,
+              updateCheck: "pending",
+              updateIssue: undefined,
+            }))
+          : items,
+        warnings: local ? [] : [identificationNotice],
+      },
+    });
+  });
+  await page.goto("/#launchpad");
+  await expect.poll(() => fullReads).toBe(1);
+  await expect(
+    page.getByRole("article", { name: healthy.title, exact: true }),
+  ).toBeVisible();
+  const installedToggle = page.getByRole("switch", {
+    name: "Show installed content",
+  });
+  const retry = page.getByRole("button", {
+    name: "Retry updates",
+    exact: true,
+  });
+  await expect(
+    page.getByText(identificationNotice, { exact: true }),
+  ).toHaveCount(0);
+  await expect(retry).toHaveCount(0);
+  await installedToggle.check();
+  const healthyRow = page.getByRole("article", {
+    name: healthy.title,
+    exact: true,
+  });
+  const clientRow = page.getByRole("article", {
+    name: "Client Renderer",
+    exact: true,
+  });
+  const unidentified = page.getByRole("article", {
+    name: "local-helper.jar",
+    exact: true,
+  });
+  const summary = page.getByRole("alert");
+  await expect(summary).toHaveCount(1);
+  await expect(summary).toContainText(
+    "Could not check updates for 1 installed item.",
+  );
+  await expect(retry).toBeEnabled();
+  await expect(clientRow.getByText(clientIssue, { exact: true })).toBeVisible();
+  await expect(page.locator(".launchpad-project-issue")).toHaveCount(1);
+  await expect(healthyRow.locator(".launchpad-project-issue")).toHaveCount(0);
+  await expect(unidentified.locator(".launchpad-project-issue")).toHaveCount(0);
+  await expect(
+    unidentified.getByText("Unidentified file", { exact: true }),
+  ).toBeVisible();
+  await expect(
+    page.getByRole("article", { name: "Curse Addon", exact: true }),
+  ).toHaveCount(0);
+  await expect(page.getByText(curseIssue, { exact: true })).toHaveCount(0);
+  await expect(
+    page.getByRole("button", { name: `Update ${healthy.title}`, exact: true }),
+  ).toBeEnabled();
+  await expect(
+    page.getByText(identificationNotice, { exact: true }),
+  ).toBeVisible();
+  await expect(page.getByText(/Unidentified files stay visible/)).toHaveCount(
+    0,
+  );
+  await expect(
+    page.getByText("Some installed update checks could not be completed.", {
+      exact: true,
+    }),
+  ).toHaveCount(0);
+  const search = page.getByLabel("Search Launchpad", { exact: true });
+  await search.fill("healthy");
+  await expect(healthyRow).toBeVisible();
+  await expect(summary).toHaveCount(0);
+  await expect(retry).toHaveCount(0);
+  await search.fill("local-helper");
+  await expect(unidentified).toBeVisible();
+  await expect(summary).toHaveCount(0);
+  await search.fill("");
+  await expect(summary).toContainText(
+    "Could not check updates for 1 installed item.",
+  );
+  await page.getByLabel("Platform", { exact: true }).selectOption("curseforge");
+  await expect(summary).toContainText(
+    "Could not check updates for 1 installed item.",
+  );
+  await expect(
+    page
+      .getByRole("article", { name: "Curse Addon", exact: true })
+      .getByText(curseIssue, { exact: true }),
+  ).toBeVisible();
+  await expect(page.getByText(clientIssue, { exact: true })).toHaveCount(0);
+  await expect(page.locator(".launchpad-project-issue")).toHaveCount(1);
+  await page.getByLabel("Platform", { exact: true }).selectOption("modrinth");
+  await expect(
+    page.getByRole("button", { name: `Update ${healthy.title}`, exact: true }),
+  ).toBeEnabled();
+  await installedToggle.uncheck();
+  await expect(healthyRow).toBeVisible();
+  await expect(summary).toHaveCount(0);
+  await expect(retry).toHaveCount(0);
+  await expect(
+    page.getByText(identificationNotice, { exact: true }),
+  ).toHaveCount(0);
+  await expect(page.locator(".launchpad-project-issue")).toHaveCount(0);
 });
 
 test("Launchpad requires a fresh acknowledgment before installing with unavailable required dependencies", async ({

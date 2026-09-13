@@ -426,7 +426,7 @@ test("failed or incomplete Modrinth rechecks retain known updates after cache ex
     const next = await f.service.installed(selection);
     assert.equal(next.items[0].update.id, "new", mode);
     assert.equal(next.items[0].updateCheck, "unavailable", mode);
-    assert.ok(next.warnings.length > 0, mode);
+    assert.ok(next.warnings.length > 0 || next.items[0].updateIssue, mode);
     const local = await f.service.installed({ ...selection, local: true });
     assert.equal(
       local.items[0].update.id,
@@ -462,6 +462,58 @@ test("a forced refresh interrupted before update checks cannot reuse a cached up
   const refreshed = await f.service.installed({ ...selection, refresh: true });
   assert.equal(refreshed.items[0].updateCheck, "unavailable");
   assert.match(refreshed.warnings.join(" "), /too long/);
+});
+
+test("update issues belong only to the affected mod while unidentified files stay neutral", async (t) => {
+  const f = await fixture(t);
+  f.versions.dep.environment = "client_only";
+  await fs.writeFile(path.join(f.serverDir, "mods", "dep.jar"), f.dependency);
+  await fs.writeFile(
+    path.join(f.serverDir, "mods", "private.jar"),
+    "mod outside configured catalogs",
+  );
+  await fs.writeFile(
+    path.join(f.dataDir, "launchpad", "installed.json"),
+    JSON.stringify([
+      {
+        path: "mods/dep.jar",
+        sha512: hashes(f.dependency).sha512,
+        platform: "modrinth",
+        projectId: "dependency",
+        versionId: "dep",
+        type: "mod",
+      },
+    ]),
+  );
+  const service = await f.boot();
+  const first = await service.installed(selection);
+  const normal = first.items.find((item) => item.path === "mods/old.jar");
+  const client = first.items.find((item) => item.path === "mods/dep.jar");
+  const unknown = first.items.find((item) => item.path === "mods/private.jar");
+  assert.equal(normal.update.id, "new");
+  assert.equal(normal.updateCheck, "checked");
+  assert.equal(normal.updateIssue, undefined);
+  assert.equal(client.updateCheck, "unavailable");
+  assert.match(client.updateIssue, /client.only/i);
+  assert.equal(unknown.platform, null);
+  assert.equal(unknown.update, undefined);
+  assert.equal(unknown.updateIssue, undefined);
+  assert.deepEqual(
+    first.warnings,
+    [],
+    "per-mod issues and unmatched catalog files do not generate broad warnings",
+  );
+  f.versions.dep.environment = "client_only_server_optional";
+  const recovered = await service.installed({ ...selection, refresh: true });
+  const checked = recovered.items.find((item) => item.path === "mods/dep.jar");
+  assert.equal(checked.updateCheck, "checked");
+  assert.equal(checked.updateIssue, undefined);
+  assert.equal(
+    checked.update,
+    undefined,
+    "verified current optional-server release is up to date",
+  );
+  assert.deepEqual(recovered.warnings, []);
 });
 
 test("an unavailable first update check is never reported as up to date", async (t) => {

@@ -593,6 +593,7 @@ export async function createLaunchpad(ctx) {
       if (value) item.update = value;
       else delete item.update;
       item.updateCheck = "checked";
+      delete item.updateIssue;
     };
     await Promise.all(
       providers.map(async (found) => {
@@ -618,6 +619,7 @@ export async function createLaunchpad(ctx) {
         const cooldown = updateFailures.get(found.id);
         if (cooldown?.until > Date.now()) {
           if (missing.length) warnings.push(cooldown.message);
+          for (const item of missing) item.updateIssue = cooldown.message;
         } else if (missing.length && found.updates) {
           const work = (async () => {
             try {
@@ -638,14 +640,19 @@ export async function createLaunchpad(ctx) {
                 });
                 checked.set(key, normalized);
               }
-              return checked;
+              return { checked, issues: result.issues };
             } catch (cause) {
               fail(found, cause);
+              return { issue: cause.message };
             }
           })();
           for (const item of missing) {
             const key = updateKey(input, item);
-            const value = work.then((checked) => checked?.get(key));
+            const value = work.then((result) =>
+              result.checked?.has(key)
+                ? { value: result.checked.get(key) }
+                : { issue: result.issues?.[item.sha512] ?? result.issue },
+            );
             updateFlights.set(key, value);
             void value.then(
               () => updateFlights.delete(key),
@@ -661,6 +668,7 @@ export async function createLaunchpad(ctx) {
               const cooldown = updateFailures.get(found.id);
               if (cooldown?.until > Date.now()) {
                 warnings.push(cooldown.message);
+                item.updateIssue = cooldown.message;
                 return;
               }
               const key = updateKey(input, item);
@@ -739,9 +747,10 @@ export async function createLaunchpad(ctx) {
                       value,
                       expiresAt: Date.now() + 5 * 60_000,
                     });
-                    return value;
+                    return { value };
                   } catch (cause) {
                     fail(found, cause);
+                    return { issue: cause.message };
                   }
                 })();
                 updateFlights.set(key, work);
@@ -758,8 +767,10 @@ export async function createLaunchpad(ctx) {
         }
         await Promise.all(
           pending.map(async ({ item, work }) => {
-            const value = await abortable(work, input.signal);
-            if (value !== undefined) apply(item, value);
+            const result = await abortable(work, input.signal);
+            if (result && Object.hasOwn(result, "value"))
+              apply(item, result.value);
+            else if (result?.issue) item.updateIssue = result.issue;
           }),
         );
       }),
@@ -945,10 +956,6 @@ export async function createLaunchpad(ctx) {
     await enrichProjectMetadata(items, warnings, input.signal);
     input.signal.throwIfAborted();
     await checkUpdates(input, items, warnings);
-    if (items.some((item) => !item.platform))
-      warnings.push(
-        "Unidentified files are left untouched. Only checksum-identified files or verified Launchpad installations can be updated.",
-      );
   }
   async function config() {
     const current = await getServer();

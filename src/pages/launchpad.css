@@ -226,6 +226,13 @@
   gap: 5px;
   overflow-wrap: anywhere;
 }
+.launchpad-project-issue {
+  margin-top: 10px;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.7;
+  overflow-wrap: anywhere;
+}
 .launchpad-project-action {
   display: flex;
   align-items: flex-end;
