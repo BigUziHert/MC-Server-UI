@@ -1797,7 +1797,7 @@ export default function Launchpad({ notify }: PageProps) {
               </p>
               <ul
                 className="launchpad-review-files"
-                aria-label="Files to install"
+                aria-label="Installation files"
                 tabIndex={0}
               >
                 {plan.files.map((file) => (
@@ -1818,49 +1818,30 @@ export default function Launchpad({ notify }: PageProps) {
                     <span>{formatBytes(file.size)}</span>
                   </li>
                 ))}
+                {plan.bundledDependencies?.map((dependency, index) => (
+                  <li
+                    key={`bundled:${dependency.bundledWith}:${dependency.path}:${index}`}
+                  >
+                    <span>
+                      {dependency.title}
+                      {dependency.version ? ` ${dependency.version}` : ""}
+                      <small className="launchpad-previous-path">
+                        Included in{" "}
+                        {dependency.bundledWith.split(/[\\/]/).pop()}
+                        {dependency.serverCompatible === false
+                          ? " · Not active on the server"
+                          : ""}
+                      </small>
+                    </span>
+                    <span className="launchpad-badge">Included</span>
+                  </li>
+                ))}
               </ul>
               {plan.warnings.map((warning) => (
                 <p className="launchpad-review-warning" key={warning}>
                   {warning}
                 </p>
               ))}
-              {Boolean(plan.bundledDependencies?.length) && (
-                <section
-                  className="launchpad-bundled"
-                  aria-labelledby="launchpad-bundled-title"
-                >
-                  <h3 id="launchpad-bundled-title">
-                    Included with the download
-                  </h3>
-                  <p className="management-dialog-description">
-                    These libraries are already packaged inside the files being
-                    installed.
-                  </p>
-                  <ul
-                    className="launchpad-review-files launchpad-bundled-dependencies"
-                    aria-label="Bundled dependencies"
-                    tabIndex={0}
-                  >
-                    {plan.bundledDependencies!.map((dependency, index) => (
-                      <li
-                        key={`${dependency.bundledWith}:${dependency.path}:${index}`}
-                      >
-                        <strong>
-                          {dependency.title}
-                          {dependency.version ? ` ${dependency.version}` : ""}
-                        </strong>
-                        {dependency.serverCompatible === false && (
-                          <span>Not active on the server</span>
-                        )}
-                        <span>
-                          Included in <code>{dependency.bundledWith}</code>
-                        </span>
-                        <code>{dependency.path}</code>
-                      </li>
-                    ))}
-                  </ul>
-                </section>
-              )}
               {Boolean(plan.unavailableDependencies?.length) && (
                 <div className="launchpad-inline-notice launchpad-dependency-notice">
                   <AlertCircle size={17} />
@@ -1873,8 +1854,9 @@ export default function Launchpad({ notify }: PageProps) {
                     </p>
                     {Boolean(plan.bundledDependencies?.length) && (
                       <p>
-                        The libraries listed above are included, but we couldn’t
-                        match them to the missing catalog entry.
+                        The libraries marked Included are packaged in the
+                        download, but we couldn’t match them to the missing
+                        catalog entry.
                       </p>
                     )}
                     <p>
@@ -1909,7 +1891,11 @@ export default function Launchpad({ notify }: PageProps) {
               )}
               <p className="management-dialog-description">
                 Review {plan.files.length} file
-                {plan.files.length === 1 ? "" : "s"} before continuing.
+                {plan.files.length === 1 ? "" : "s"}
+                {plan.bundledDependencies?.length
+                  ? ` and ${plan.bundledDependencies.length} included ${plan.bundledDependencies.length === 1 ? "library" : "libraries"}`
+                  : ""}{" "}
+                before continuing.
               </p>
             </>
           )}

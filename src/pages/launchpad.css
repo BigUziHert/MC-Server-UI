@@ -427,6 +427,7 @@
   overflow-y: auto;
   border: 1px solid var(--border);
   border-radius: 7px;
+  overscroll-behavior: contain;
 }
 .launchpad-review-files li {
   display: flex;
@@ -457,34 +458,7 @@
   font-size: 12px;
   line-height: 1.7;
 }
-.launchpad-bundled h3 {
-  margin: 20px 0 8px;
-  color: var(--text);
-  font-size: 14px;
-  font-weight: 600;
-}
-.launchpad-bundled-dependencies {
-  overscroll-behavior: contain;
-}
-.launchpad-bundled-dependencies li {
-  display: block;
-  line-height: 1.7;
-  overflow-wrap: anywhere;
-}
-.launchpad-bundled-dependencies strong {
-  display: block;
-  color: var(--text);
-  font-size: 12px;
-}
-.launchpad-bundled-dependencies span,
-.launchpad-bundled-dependencies li > code {
-  display: block;
-}
-.launchpad-bundled-dependencies code {
-  white-space: normal;
-  overflow-wrap: anywhere;
-}
-.launchpad-bundled-dependencies:focus-visible {
+.launchpad-review-files:focus-visible {
   outline: 2px solid var(--accent);
   outline-offset: 3px;
 }

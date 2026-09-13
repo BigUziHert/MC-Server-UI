@@ -2163,7 +2163,7 @@ test("Launchpad requires an explicit Install anyway choice for unchecked require
   });
   await expect(confirm).toBeEnabled();
   await dialog
-    .getByRole("list", { name: "Files to install", exact: true })
+    .getByRole("list", { name: "Installation files", exact: true })
     .focus();
   await page.keyboard.press("Enter");
   await expect(dialog).toBeVisible();
@@ -2323,35 +2323,32 @@ for (const unavailable of [true, false])
       .click();
     const dialog = page.getByRole("dialog");
     await dialog.getByRole("button", { name: /Review/ }).click();
-    await expect(
-      dialog.getByText("Included with the download", { exact: true }),
-    ).toBeVisible();
-    const bundled = dialog.getByRole("list", {
-      name: "Bundled dependencies",
+    const files = dialog.getByRole("list", {
+      name: "Installation files",
       exact: true,
     });
-    await expect(bundled.getByRole("listitem")).toHaveCount(
+    await expect(files.getByRole("listitem")).toHaveCount(unavailable ? 3 : 2);
+    const bundled = files.getByRole("listitem").filter({
+      hasText: "Bundled Library",
+    });
+    await expect(bundled).toContainText("Bundled Library 0.5.6");
+    await expect(bundled).toContainText("Included in example-mod-2.0.jar");
+    await expect(files.getByText("Included", { exact: true })).toHaveCount(
       unavailable ? 2 : 1,
     );
-    await expect(bundled).toContainText("Bundled Library");
-    await expect(bundled).toContainText("0.5.6");
-    await expect(bundled).toContainText(bundledPath);
-    await expect(bundled).toContainText(nextPath);
-    const inactive = bundled.getByText("Not active on the server", {
-      exact: true,
-    });
+    await expect(files).not.toContainText(bundledPath);
+    const inactive = files.getByText("Not active on the server");
     if (unavailable) {
       await expect(inactive).toHaveCount(1);
       await expect(
-        bundled.getByRole("listitem").filter({ hasText: "Client Library" }),
+        files.getByRole("listitem").filter({ hasText: "Client Library" }),
       ).toContainText("Not active on the server");
     } else await expect(inactive).toHaveCount(0);
-    await expect(
-      bundled.getByRole("listitem").filter({ hasText: "Bundled Library" }),
-    ).not.toContainText("Not active on the server");
-    await expect(
-      dialog.getByRole("list", { name: "Files to install", exact: true }),
-    ).toContainText(nextPath);
+    await expect(bundled).not.toContainText("Not active on the server");
+    await expect(files).toContainText(nextPath);
+    await expect(dialog).toContainText(
+      `Review 1 file and ${unavailable ? "2 included libraries" : "1 included library"} before continuing.`,
+    );
     const missing = dialog.getByRole("list", {
       name: "Unavailable required dependencies",
       exact: true,
@@ -2391,6 +2388,28 @@ for (const unavailable of [true, false])
       ),
       animations: "disabled",
     });
+    await page.setViewportSize({ width: 390, height: 844 });
+    await expect(files).toBeVisible();
+    expect(
+      await page.evaluate(
+        () => document.documentElement.scrollWidth <= window.innerWidth,
+      ),
+    ).toBe(true);
+    await dialog.screenshot({
+      path: testInfo.outputPath(
+        `bundled-dependency-${unavailable ? "unresolved-catalog" : "complete"}-mobile.png`,
+      ),
+      animations: "disabled",
+    });
+    await confirm.scrollIntoViewIfNeeded();
+    await expect(confirm).toBeInViewport();
+    if (unavailable)
+      await dialog.screenshot({
+        path: testInfo.outputPath(
+          "bundled-dependency-unresolved-catalog-mobile-actions.png",
+        ),
+        animations: "disabled",
+      });
     await confirm.click();
     await expect(dialog).not.toBeVisible();
     expect(submitted).toEqual({
