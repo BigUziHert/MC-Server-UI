@@ -39,6 +39,37 @@ const iconUrl = (value) => {
     return undefined;
   }
 };
+const authorNames = (values) => {
+  const names = [
+    ...new Set(
+      (values ?? [])
+        .filter((value) => typeof value === "string" && value.trim())
+        .map((value) => value.trim()),
+    ),
+  ];
+  return names.length ? names.join(", ") : undefined;
+};
+const projectAuthors = (project) =>
+  authorNames(
+    Array.isArray(project.authors)
+      ? project.authors.map((author) => author?.name)
+      : [],
+  );
+function teamAuthors(members) {
+  const accepted = members.filter((member) => member.accepted === true);
+  const owners = accepted.filter(
+    (member) =>
+      member.is_owner === true ||
+      (typeof member.is_owner !== "boolean" &&
+        String(member.role).toLowerCase() === "owner"),
+  );
+  return authorNames(
+    (owners.length ? owners : accepted)
+      .map((member) => member.user?.username)
+      .filter((name) => typeof name === "string")
+      .sort((a, b) => a.localeCompare(b, "en", { sensitivity: "base" })),
+  );
+}
 // Project identity is independent of the selected Minecraft version or loader.
 // Batch up to 100 IDs, coalesce overlapping callers, and briefly cache failures
 // so polling an unavailable provider does not create a request storm.
@@ -226,8 +257,64 @@ export function createCoreProviders({
       id: String(project.id),
       title: project.title,
       iconUrl: iconUrl(project.icon_url),
+      teamId: project.team,
     }),
   );
+  // /teams returns members for multiple teams; associate by team_id rather
+  // than response order. Only accepted members are public project credits.
+  // https://docs.modrinth.com/api/operations/getteams/
+  const mrTeams = projectMetadataLookup(
+    async (ids, signal) => {
+      const rows = await json(
+        `${mr}/teams?${new URLSearchParams({ ids: JSON.stringify(ids) })}`,
+        { signal },
+      );
+      if (
+        !Array.isArray(rows) ||
+        rows.some((members) => !Array.isArray(members))
+      )
+        throw launchpadError(
+          502,
+          "Modrinth returned invalid project contributors.",
+        );
+      const groups = new Map();
+      for (const members of rows) {
+        for (const member of members) {
+          if (!member || typeof member.team_id !== "string") continue;
+          if (!groups.has(member.team_id)) groups.set(member.team_id, []);
+          groups.get(member.team_id).push(member);
+        }
+      }
+      return [...groups].map(([id, members]) => ({
+        id,
+        author: teamAuthors(members),
+      }));
+    },
+    (team) => team,
+  );
+  const mrProjectMetadata = async (ids) => {
+    const result = await mrMetadata(ids);
+    const teamIds = result.projects
+      .map((project) => project.teamId)
+      .filter(
+        (value) =>
+          typeof value === "string" && /^[A-Za-z0-9_-]{1,100}$/.test(value),
+      );
+    const teams = await mrTeams(teamIds);
+    const authors = new Map(
+      teams.projects.map((team) => [team.id, team.author]),
+    );
+    return {
+      projects: result.projects.map(({ teamId, ...project }) => ({
+        ...project,
+        ...(authors.get(teamId) ? { author: authors.get(teamId) } : {}),
+      })),
+      warnings: [
+        ...result.warnings,
+        ...teams.warnings.map((warning) => `Project contributors: ${warning}`),
+      ],
+    };
+  };
   const cfMetadata = projectMetadataLookup(
     async (ids, signal) =>
       (
@@ -251,6 +338,7 @@ export function createCoreProviders({
             id: String(project.id),
             title: project.name,
             iconUrl: iconUrl(project.logo?.thumbnailUrl ?? project.logo?.url),
+            author: projectAuthors(project),
           }
         : undefined,
   );
@@ -297,7 +385,7 @@ export function createCoreProviders({
       available: true,
       sortOptions: mrSortOptions,
       downloadHosts: ["cdn.modrinth.com"],
-      projectMetadata: mrMetadata,
+      projectMetadata: mrProjectMetadata,
       async search(input) {
         const facets = [
           [`all_project_types:${input.type}`],
@@ -567,6 +655,7 @@ export function createCoreProviders({
           return {
             title: project.name,
             iconUrl: iconUrl(project.logo?.thumbnailUrl ?? project.logo?.url),
+            author: projectAuthors(project),
             versionName: file.displayName,
             archive: { ...download, format: "server-zip" },
             warnings: [
@@ -582,6 +671,7 @@ export function createCoreProviders({
         return {
           title: project.name,
           iconUrl: iconUrl(project.logo?.thumbnailUrl ?? project.logo?.url),
+          author: projectAuthors(project),
           versionName: file.displayName,
           files: [{ path: fileName(file.fileName), ...download }],
           dependencies: (file.dependencies ?? [])

@@ -397,6 +397,8 @@ export async function createLaunchpad(ctx) {
             if (typeof project?.title === "string" && project.title.trim())
               item.title = project.title;
             if (project?.iconUrl) item.iconUrl = project.iconUrl;
+            if (typeof project?.author === "string" && project.author.trim())
+              item.author = project.author;
           }
           warnings.push(
             ...result.warnings.map(
@@ -647,6 +649,7 @@ export async function createLaunchpad(ctx) {
           versionName: result.versionName,
           title: result.title,
           iconUrl: result.iconUrl,
+          author: result.author,
           type: value.type,
           hosts: found.downloadHosts,
         });
@@ -655,7 +658,15 @@ export async function createLaunchpad(ctx) {
         await visit({ ...input, ...dependency }, depth + 1);
     }
     await visit({ ...input });
-    return { ...rootResult, files, warnings };
+    // Resolve optional project credits in batches for the whole plan, including
+    // dependencies, so new receipts retain authors without per-file lookups.
+    const rootMetadata = {
+      ...rootResult,
+      platform: input.platform,
+      projectId: input.projectId,
+    };
+    await enrichProjectMetadata([rootMetadata, ...files], warnings);
+    return { ...rootResult, author: rootMetadata.author, files, warnings };
   }
   async function unpackPack(result, input, stage) {
     const found = await provider(input.platform);
@@ -882,6 +893,7 @@ export async function createLaunchpad(ctx) {
             versionId: input.versionId,
             title: result.title,
             iconUrl: result.iconUrl,
+            author: result.author,
             versionName: result.versionName,
             type: input.type,
             hosts: file.hosts ?? found.downloadHosts,
@@ -964,6 +976,7 @@ export async function createLaunchpad(ctx) {
           };
         files.push({
           ...file,
+          author: file.author || matches[0]?.author,
           expected,
           previous,
           action: expected || previous ? "replace" : "install",
@@ -977,6 +990,14 @@ export async function createLaunchpad(ctx) {
         files,
         title: result.title,
         iconUrl: result.iconUrl,
+        author:
+          result.author ||
+          receipts.find(
+            (item) =>
+              item.pack &&
+              item.platform === input.platform &&
+              item.projectId === input.projectId,
+          )?.author,
         versionName: result.versionName,
         warnings: [...new Set(result.warnings)],
         loaderInstall: result.loaderInstall,
@@ -1091,6 +1112,7 @@ export async function createLaunchpad(ctx) {
                   versionName: file.versionName,
                   title: file.title,
                   iconUrl: file.iconUrl,
+                  author: file.author,
                 }),
             type: file.type,
             installedAt: new Date().toISOString(),
@@ -1107,6 +1129,7 @@ export async function createLaunchpad(ctx) {
             versionId: plan.input.versionId,
             title: plan.title,
             iconUrl: plan.iconUrl,
+            author: plan.author,
             versionName: plan.versionName,
             path: "",
             installedAt: new Date().toISOString(),

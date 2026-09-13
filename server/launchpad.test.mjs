@@ -174,7 +174,19 @@ async function fixture(t, options = {}) {
           id,
           title: "Fixture Project",
           icon_url: `https://cdn.modrinth.com/data/${id}/icon.png`,
+          team: `team-${id}`,
         })),
+      );
+    if (address.pathname === "/v2/teams")
+      return Response.json(
+        JSON.parse(address.searchParams.get("ids")).map((team_id) => [
+          {
+            team_id,
+            accepted: true,
+            role: "Owner",
+            user: { username: "FixtureAuthor" },
+          },
+        ]),
       );
     if (address.pathname.startsWith("/v2/version/"))
       return Response.json(versions[address.pathname.split("/").at(-1)]);
@@ -348,6 +360,7 @@ test("Launchpad hash-identifies installed mods, filters compatibility, confirms 
   const installed = await f.service.installed(selection);
   assert.equal(installed.items[0].projectId, "project");
   assert.equal(installed.items[0].update.id, "new");
+  assert.equal(installed.items[0].author, "FixtureAuthor");
   assert.equal(installed.items[0].title, "Fixture Project");
   assert.equal(
     installed.items[0].iconUrl,
@@ -408,6 +421,7 @@ test("Launchpad hash-identifies installed mods, filters compatibility, confirms 
     saved[0].iconUrl,
     "https://cdn.modrinth.com/data/project/icon.png",
   );
+  assert.equal(saved[0].author, "FixtureAuthor");
   assert.equal(
     (await restarted.installed(selection)).items[0].versionId,
     "new",
@@ -423,6 +437,7 @@ test("installed project icons and titles are available with All loaders and All 
   });
   assert.equal(result.items[0].title, "Fixture Project");
   assert.equal(result.items[0].versionName, "Existing version");
+  assert.equal(result.items[0].author, "FixtureAuthor");
   assert.equal(
     result.items[0].iconUrl,
     "https://cdn.modrinth.com/data/project/icon.png",
@@ -441,6 +456,187 @@ test("installed project icons and titles are available with All loaders and All 
   );
 });
 
+test("Modrinth authors use accepted owners or sorted accepted contributors and match teams by ID", async () => {
+  const requests = [];
+  const projects = [
+    { id: "one", team: "owned" },
+    { id: "two", team: "owned" },
+    { id: "three", team: "shared" },
+    { id: "four", team: "unaccepted" },
+  ];
+  const member = (team_id, username, role, accepted = true) => ({
+    team_id,
+    role,
+    accepted,
+    user: { username },
+  });
+  const modrinth = createCoreProviders({
+    fetch: async (url) => {
+      const address = new URL(url);
+      requests.push(address.pathname);
+      if (address.pathname === "/v2/projects")
+        return Response.json(
+          projects.map((project) => ({
+            ...project,
+            title: project.id,
+            icon_url: `https://cdn.modrinth.com/${project.id}.png`,
+          })),
+        );
+      assert.equal(address.pathname, "/v2/teams");
+      assert.deepEqual(JSON.parse(address.searchParams.get("ids")), [
+        "owned",
+        "shared",
+        "unaccepted",
+      ]);
+      return Response.json([
+        [
+          member("shared", "zulu", "Maintainer"),
+          member("shared", "Alpha", "Contributor"),
+          member("shared", "Excluded", "Owner", false),
+        ],
+        [member("unaccepted", "Invited", "Owner", false)],
+        [
+          member("owned", "Member", "Member"),
+          member("owned", "LegacyOwner", "Owner"),
+          member("owned", "BlockedOwner", "Owner", false),
+        ],
+      ]);
+    },
+  }).find(({ id }) => id === "modrinth");
+  const [first, repeated] = await Promise.all([
+    modrinth.projectMetadata(["one", "two", "three", "four"]),
+    modrinth.projectMetadata(["one", "two", "three", "four"]),
+  ]);
+  const second = await modrinth.projectMetadata(["two", "three"]);
+  assert.deepEqual(first, repeated);
+  assert.deepEqual(
+    first.projects.map(({ author }) => author),
+    ["LegacyOwner", "LegacyOwner", "Alpha, zulu", undefined],
+  );
+  assert.deepEqual(
+    second.projects.map(({ author }) => author),
+    ["LegacyOwner", "Alpha, zulu"],
+  );
+  assert.deepEqual(requests, ["/v2/projects", "/v2/teams"]);
+  assert.equal(first.projects[2].iconUrl, "https://cdn.modrinth.com/three.png");
+  await modrinth.projectMetadata(["one", "three"]);
+  assert.equal(requests.length, 2);
+});
+
+test("Modrinth contributor batching is bounded and coalesced for a large installed collection", async () => {
+  const requests = [];
+  const modrinth = createCoreProviders({
+    fetch: async (url, init) => {
+      const address = new URL(url);
+      const ids = JSON.parse(address.searchParams.get("ids"));
+      assert.ok(ids.length <= 100);
+      assert.ok(init.signal instanceof AbortSignal);
+      requests.push({ path: address.pathname, ids });
+      if (address.pathname === "/v2/projects")
+        return Response.json(
+          ids.map((id) => ({ id, team: `team-${id}`, title: `Project ${id}` })),
+        );
+      assert.equal(address.pathname, "/v2/teams");
+      return Response.json(
+        ids.map((team_id) => [
+          {
+            team_id,
+            is_owner: true,
+            accepted: true,
+            role: "Project Lead",
+            user: { username: team_id },
+          },
+        ]),
+      );
+    },
+  }).find(({ id }) => id === "modrinth");
+  const ids = Array.from({ length: 205 }, (_, index) => `project${index}`);
+  const [result, subset] = await Promise.all([
+    modrinth.projectMetadata(ids),
+    modrinth.projectMetadata(ids.slice(0, 120)),
+  ]);
+  assert.equal(result.projects.length, 205);
+  assert.equal(subset.projects.length, 120);
+  assert.equal(result.projects[204].author, "team-project204");
+  const teams = requests.filter(({ path }) => path === "/v2/teams");
+  assert.equal(teams.length, 3);
+  assert.equal(teams.flatMap(({ ids }) => ids).length, 205);
+  assert.equal(new Set(teams.flatMap(({ ids }) => ids)).size, 205);
+});
+
+test("failed contributor lookups preserve titles, icons, updates and saved authors through an update", async (t) => {
+  let fail = true,
+    now = Date.now();
+  t.mock.method(Date, "now", () => now);
+  const f = await fixture(t, {
+    request: async (url) => {
+      if (fail && new URL(url).pathname === "/v2/teams")
+        return new Response("Unavailable", { status: 503 });
+    },
+  });
+  const receiptPath = path.join(f.dataDir, "launchpad", "installed.json");
+  await fs.writeFile(
+    receiptPath,
+    JSON.stringify([
+      {
+        path: "mods/old.jar",
+        sha512: hashes(f.old).sha512,
+        platform: "modrinth",
+        projectId: "project",
+        versionId: "old",
+        title: "Saved title",
+        author: "Saved Author",
+        type: "mod",
+      },
+    ]),
+  );
+  const restarted = await f.boot();
+  const installed = await restarted.installed(selection);
+  assert.equal(installed.items[0].title, "Fixture Project");
+  assert.equal(
+    installed.items[0].iconUrl,
+    "https://cdn.modrinth.com/data/project/icon.png",
+  );
+  assert.equal(installed.items[0].author, "Saved Author");
+  assert.equal(installed.items[0].update.id, "new");
+  assert.match(installed.warnings.join(" "), /contributors/i);
+  const plan = await restarted.preview({
+    ...selection,
+    replacePath: "mods/old.jar",
+  });
+  assert.equal(
+    (await finish(restarted, { planId: plan.planId, confirmed: true })).status,
+    "completed",
+  );
+  const receipts = JSON.parse(await fs.readFile(receiptPath, "utf8"));
+  assert.equal(receipts[0].author, "Saved Author");
+  assert.equal(
+    f.requests.filter(({ url }) => new URL(url).pathname === "/v2/teams")
+      .length,
+    1,
+  );
+  const cached = await restarted.installed({
+    ...selection,
+    gameVersion: "",
+    loader: "",
+  });
+  assert.equal(cached.items[0].author, "Saved Author");
+  fail = false;
+  now += 30_001;
+  const recovered = await restarted.installed({
+    ...selection,
+    gameVersion: "",
+    loader: "",
+  });
+  assert.equal(recovered.items[0].author, "FixtureAuthor");
+  assert.equal(
+    f.requests.filter(({ url }) => new URL(url).pathname === "/v2/projects")
+      .length,
+    1,
+    "a team retry does not discard cached project icons",
+  );
+});
+
 test("old mod and modpack receipts are enriched without compatibility filters or filesystem writes", async (t) => {
   const f = await fixture(t, {
     request: async (url, init) => {
@@ -453,6 +649,13 @@ test("old mod and modpack receipts are enriched without compatibility filters or
             id: 11,
             gameId: 432,
             name: "CurseForge Project",
+            authors: [
+              { name: "Creator" },
+              { name: "Contributor" },
+              { name: "Creator" },
+              null,
+              { name: " " },
+            ],
             logo: {
               thumbnailUrl: "https://media.forgecdn.net/avatars/fixture.png",
             },
@@ -492,6 +695,7 @@ test("old mod and modpack receipts are enriched without compatibility filters or
     gameVersion: "",
   });
   assert.equal(mods.items[0].title, "CurseForge Project");
+  assert.equal(mods.items[0].author, "Creator, Contributor");
   assert.equal(
     mods.items[0].iconUrl,
     "https://media.forgecdn.net/avatars/fixture.png",
@@ -503,6 +707,7 @@ test("old mod and modpack receipts are enriched without compatibility filters or
     gameVersion: "",
   });
   assert.equal(packs.items[0].title, "Fixture Project");
+  assert.equal(packs.items[0].author, "FixtureAuthor");
   assert.equal(packs.items[0].name, "Fixture Project");
   assert.equal(
     packs.items[0].iconUrl,
@@ -892,6 +1097,13 @@ test("Modrinth packs install server dependencies and overrides without client fi
     saved.find((item) => item.pack).iconUrl,
     "https://cdn.modrinth.com/data/project/icon.png",
   );
+  assert.equal(saved.find((item) => item.pack).author, "FixtureAuthor");
+  assert.ok(
+    saved
+      .filter((item) => !item.pack && item.type === "modpack")
+      .every((item) => !item.author),
+    "pack authors are not falsely assigned to bundled mods",
+  );
 });
 
 test("ZIP traversal, Windows aliases, links and duplicate entries are rejected inside private staging", async (t) => {
@@ -1045,6 +1257,7 @@ test("existing CurseForge-only mods require matching fingerprints and SHA-1 befo
               id: 11,
               gameId: 432,
               name: "Identified CurseForge Project",
+              authors: [{ name: "VerifiedCreator" }],
               logo: {
                 thumbnailUrl: "https://media.forgecdn.net/identified.png",
               },
@@ -1115,6 +1328,7 @@ test("existing CurseForge-only mods require matching fingerprints and SHA-1 befo
     gameVersion: "",
   });
   assert.equal(result.items[0].title, "Identified CurseForge Project");
+  assert.equal(result.items[0].author, "VerifiedCreator");
   assert.equal(
     result.items[0].iconUrl,
     "https://media.forgecdn.net/identified.png",

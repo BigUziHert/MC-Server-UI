@@ -8,7 +8,6 @@ import {
 import {
   AlertCircle,
   ArrowRight,
-  ArrowDownWideNarrow,
   Check,
   ChevronLeft,
   ChevronRight,
@@ -70,6 +69,7 @@ type InstalledItem = {
   versionName?: string;
   title?: string;
   iconUrl?: string;
+  author?: string;
   update?: Version | null;
 };
 type Job = {
@@ -119,6 +119,41 @@ const kinds = [
   { id: "plugin", label: "Plugins", icon: Package },
 ] as const;
 const rowsOptions = [5, 10, 25, 50, 75, 100];
+const installedSortOptions = [
+  { id: "updates", label: "Updates first" },
+  { id: "name", label: "Name (A–Z)" },
+  { id: "size", label: "Size (largest first)" },
+  { id: "author", label: "Mod author (A–Z)" },
+] as const;
+type InstalledSort = (typeof installedSortOptions)[number]["id"];
+function compareInstalled(
+  a: InstalledItem,
+  b: InstalledItem,
+  sort: InstalledSort,
+) {
+  const alphabetical = (left: string, right: string) =>
+    left.localeCompare(right, undefined, {
+      sensitivity: "base",
+      numeric: true,
+    });
+  let order = 0;
+  if (sort === "updates") {
+    order = Number(Boolean(b.update)) - Number(Boolean(a.update));
+  } else if (sort === "size") {
+    const size = (item: InstalledItem) =>
+      Number.isFinite(item.size) && item.size >= 0 ? item.size : -1;
+    order = size(b) - size(a);
+  } else if (sort === "author") {
+    const left = a.author?.trim() ?? "";
+    const right = b.author?.trim() ?? "";
+    order = Number(!left) - Number(!right) || alphabetical(left, right);
+  }
+  return (
+    order ||
+    alphabetical(a.title?.trim() || a.name, b.title?.trim() || b.name) ||
+    a.path.localeCompare(b.path)
+  );
+}
 const modLoaders = ["fabric", "forge", "neoforge", "quilt"];
 const pluginLoaders = [
   "paper",
@@ -179,6 +214,7 @@ export default function Launchpad({ notify }: PageProps) {
   const [status, setStatus] = useState<string | null>(null);
   const [query, setQuery] = useState("");
   const [sort, setSort] = useState("downloads");
+  const [installedSort, setInstalledSort] = useState<InstalledSort>("updates");
   const [installedOnly, setInstalledOnly] = useState(false);
   const [offset, setOffset] = useState(0);
   const [limit, setLimit] = useState(() => {
@@ -306,6 +342,7 @@ export default function Launchpad({ notify }: PageProps) {
     setApiKey("");
     setQuery("");
     setSort("downloads");
+    setInstalledSort("updates");
     setOffset(0);
     setInstalledOnly(false);
     setBusy(null);
@@ -645,19 +682,11 @@ export default function Launchpad({ notify }: PageProps) {
     .filter(
       (entry) =>
         (!entry.platform || entry.platform === platform) &&
-        `${entry.title ?? ""} ${entry.name} ${entry.path}`
+        `${entry.title ?? ""} ${entry.name} ${entry.path} ${entry.author ?? ""}`
           .toLowerCase()
           .includes(query.trim().toLowerCase()),
     )
-    .sort(
-      (a, b) =>
-        Number(Boolean(b.update)) - Number(Boolean(a.update)) ||
-        (a.title ?? a.name).localeCompare(b.title ?? b.name, undefined, {
-          sensitivity: "base",
-          numeric: true,
-        }) ||
-        a.path.localeCompare(b.path),
-    );
+    .sort((a, b) => compareInstalled(a, b, installedSort));
   const total = installedOnly ? entries.length : (results?.total ?? 0);
   const currentOffset = Math.min(
     offset,
@@ -681,6 +710,7 @@ export default function Launchpad({ notify }: PageProps) {
             title: entry.title ?? entry.name,
             description: entry.path,
             iconUrl: entry.iconUrl,
+            author: entry.author,
           },
           entry,
         }))
@@ -934,10 +964,23 @@ export default function Launchpad({ notify }: PageProps) {
           />
         </label>
         {installedOnly ? (
-          <span className="launchpad-sort-info">
-            <ArrowDownWideNarrow size={16} aria-hidden="true" />
-            Updates first
-          </span>
+          <label className="launchpad-sort">
+            Sort by
+            <select
+              aria-label="Sort installed content"
+              value={installedSort}
+              onChange={(event) => {
+                setInstalledSort(event.target.value as InstalledSort);
+                setOffset(0);
+              }}
+            >
+              {installedSortOptions.map((item) => (
+                <option key={item.id} value={item.id}>
+                  {item.label}
+                </option>
+              ))}
+            </select>
+          </label>
         ) : sortOptions.length > 0 ? (
           <label className="launchpad-sort">
             Sort by

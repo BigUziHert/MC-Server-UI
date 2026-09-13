@@ -677,7 +677,9 @@ test("Launchpad installed updates sort before pagination and keep priority when 
   await expect(page.getByLabel("Sort Launchpad", { exact: true })).toHaveCount(
     0,
   );
-  await expect(page.getByText("Updates first", { exact: true })).toBeVisible();
+  await expect(
+    page.getByLabel("Sort installed content", { exact: true }),
+  ).toHaveValue("updates");
   await page
     .getByLabel("Launchpad rows per page", { exact: true })
     .selectOption("5");
@@ -729,6 +731,267 @@ test("Launchpad installed updates sort before pagination and keep priority when 
   await expect(page.getByRole("status", { name: "Launchpad page" })).toHaveText(
     "Page 1 of 3",
   );
+});
+
+test("Launchpad installed sorts order the entire list before paging and retain independent catalog choices", async ({
+  page,
+  serverId,
+}, testInfo) => {
+  const rows = [
+    { path: "mods/twin-z.jar", title: "Twin", size: 500, author: "Gamma" },
+    { path: "mods/alpha10.jar", title: "alpha 10", size: 300, author: "Beta" },
+    { path: "mods/unknown-a.jar", title: "Unknown A", size: 900 },
+    {
+      path: "mods/zulu.jar",
+      title: "Zulu",
+      size: 100,
+      author: "Alpha",
+      update: true,
+    },
+    { path: "mods/twin-a.jar", title: "Twin", size: 500, author: "Gamma" },
+    {
+      path: "mods/alpha2.jar",
+      title: "Alpha 2",
+      size: 300,
+      author: "Beta",
+      update: true,
+    },
+    { path: "mods/unknown-b.jar", title: "Unknown B", size: 900, author: "" },
+    { path: "mods/beta.jar", title: "Beta", size: 1000, author: "alpha" },
+    { path: "mods/alpha1.jar", title: "alpha 1", size: 700, author: "Zeta" },
+    {
+      path: "mods/omega.jar",
+      title: "Omega",
+      size: 200,
+      author: "Beta",
+      update: true,
+    },
+    { path: "mods/echo.jar", title: "Echo", size: 800, author: "Delta" },
+    { path: "mods/delta.jar", title: "Delta", size: 400, author: "Beta" },
+  ];
+  const update = {
+    id: "new",
+    name: "New version",
+    version: "2.0",
+    gameVersions: ["1.21.1"],
+    loaders: ["neoforge"],
+    publishedAt: "2026-09-01T00:00:00Z",
+    downloadable: true,
+  };
+  const searches: URL[] = [];
+  await page.route("**/api/launchpad", (route) =>
+    route.fulfill({
+      json: {
+        platforms: [
+          {
+            id: "modrinth",
+            name: "Modrinth",
+            available: true,
+            types: ["mod"],
+            sortOptions: [
+              { id: "downloads", label: "Most downloaded" },
+              { id: "updated", label: "Recently updated" },
+            ],
+          },
+        ],
+        gameVersion: "1.21.1",
+        gameVersions: ["1.21.1"],
+        loader: "neoforge",
+        status: "offline",
+        warnings: [],
+      },
+    }),
+  );
+  await page.route("**/api/launchpad/search?**", (route) => {
+    expect(route.request().headers()["x-server-id"]).toBe(serverId);
+    searches.push(new URL(route.request().url()));
+    return route.fulfill({
+      json: { projects: [], total: 0, offset: 0, limit: 10 },
+    });
+  });
+  await page.route("**/api/launchpad/installed?**", (route) => {
+    expect(route.request().headers()["x-server-id"]).toBe(serverId);
+    return route.fulfill({
+      json: {
+        items: rows.map((row, index) => ({
+          ...row,
+          name: row.path.slice(5),
+          platform: "modrinth",
+          projectId: `sort-${index}`,
+          versionId: "old",
+          versionName: "1.0",
+          update: row.update ? update : null,
+        })),
+        warnings: [],
+      },
+    });
+  });
+  await page.goto("/#launchpad");
+  const catalogSort = page.getByLabel("Sort Launchpad", { exact: true });
+  await catalogSort.selectOption("updated");
+  await expect
+    .poll(() => searches.at(-1)?.searchParams.get("sort"))
+    .toBe("updated");
+  const installedToggle = page.getByRole("switch", {
+    name: "Show installed content",
+  });
+  await installedToggle.check();
+  const sort = page.getByLabel("Sort installed content", { exact: true });
+  await expect(sort).toHaveValue("updates");
+  await expect(sort.locator("option")).toHaveText([
+    "Updates first",
+    "Name (A–Z)",
+    "Size (largest first)",
+    "Mod author (A–Z)",
+  ]);
+  await page
+    .getByLabel("Launchpad rows per page", { exact: true })
+    .selectOption("5");
+  const paths = page.locator(".launchpad-project-body > p");
+  const pagination = page.getByRole("status", { name: "Launchpad page" });
+  const next = page.getByRole("button", {
+    name: "Next Launchpad page",
+    exact: true,
+  });
+  const orders = [
+    {
+      sort: "updates",
+      paths: [
+        "alpha2",
+        "omega",
+        "zulu",
+        "alpha1",
+        "alpha10",
+        "beta",
+        "delta",
+        "echo",
+        "twin-a",
+        "twin-z",
+        "unknown-a",
+        "unknown-b",
+      ],
+    },
+    {
+      sort: "name",
+      paths: [
+        "alpha1",
+        "alpha2",
+        "alpha10",
+        "beta",
+        "delta",
+        "echo",
+        "omega",
+        "twin-a",
+        "twin-z",
+        "unknown-a",
+        "unknown-b",
+        "zulu",
+      ],
+    },
+    {
+      sort: "size",
+      paths: [
+        "beta",
+        "unknown-a",
+        "unknown-b",
+        "echo",
+        "alpha1",
+        "twin-a",
+        "twin-z",
+        "delta",
+        "alpha2",
+        "alpha10",
+        "omega",
+        "zulu",
+      ],
+    },
+    {
+      sort: "author",
+      paths: [
+        "beta",
+        "zulu",
+        "alpha2",
+        "alpha10",
+        "delta",
+        "omega",
+        "echo",
+        "twin-a",
+        "twin-z",
+        "alpha1",
+        "unknown-a",
+        "unknown-b",
+      ],
+    },
+  ];
+  for (const order of orders) {
+    await sort.selectOption(order.sort);
+    for (let index = 0; index < 3; index++) {
+      await expect(pagination).toHaveText(`Page ${index + 1} of 3`);
+      await expect(paths).toHaveText(
+        order.paths
+          .slice(index * 5, index * 5 + 5)
+          .map((name) => `mods/${name}.jar`),
+      );
+      if (index < 2) await next.click();
+    }
+    await expect(next).toBeDisabled();
+  }
+  await expect(page.getByRole("article").getByText(/^By /)).toHaveCount(0);
+  await installedToggle.uncheck();
+  await expect(catalogSort).toHaveValue("updated");
+  await expect(sort).toHaveCount(0);
+  await installedToggle.check();
+  await expect(sort).toHaveValue("author");
+  await expect(pagination).toHaveText("Page 1 of 3");
+  await expect(paths).toHaveText(
+    orders[3].paths.slice(0, 5).map((name) => `mods/${name}.jar`),
+  );
+  await page.screenshot({
+    path: testInfo.outputPath("installed-author-sort-desktop.png"),
+    fullPage: true,
+    animations: "disabled",
+  });
+  await sort.selectOption("name");
+  await installedToggle.uncheck();
+  await catalogSort.selectOption("downloads");
+  await expect
+    .poll(() => searches.at(-1)?.searchParams.get("sort"))
+    .toBe("downloads");
+  await installedToggle.check();
+  await expect(sort).toHaveValue("name");
+  await expect(paths).toHaveText(
+    orders[1].paths.slice(0, 5).map((name) => `mods/${name}.jar`),
+  );
+  await sort.selectOption("author");
+  await next.click();
+  await page.setViewportSize({ width: 390, height: 844 });
+  const sidebar = page.locator(".sidebar");
+  await expect(sidebar).not.toHaveClass(/is-open/);
+  await expect
+    .poll(() =>
+      sidebar.evaluate((element) => element.getBoundingClientRect().right),
+    )
+    .toBeLessThanOrEqual(1);
+  await page.getByLabel("Search Launchpad", { exact: true }).fill("gAmMa");
+  await expect(pagination).toHaveText("Page 1 of 1");
+  await expect(paths).toHaveText(["mods/twin-a.jar", "mods/twin-z.jar"]);
+  await expect(
+    page.getByRole("article").getByText("By Gamma", { exact: true }),
+  ).toHaveCount(2);
+  await sort.selectOption("size");
+  await expect(sort).toHaveValue("size");
+  await sort.selectOption("author");
+  await expect(sort).toHaveValue("author");
+  expect(
+    await page.evaluate(
+      () => document.documentElement.scrollWidth <= window.innerWidth,
+    ),
+  ).toBe(true);
+  await page.screenshot({
+    path: testInfo.outputPath("installed-author-sort-mobile.png"),
+    fullPage: true,
+    animations: "disabled",
+  });
 });
 
 test("Launchpad Minecraft selects show stable releases only and scope filters and reviewed targets", async ({
