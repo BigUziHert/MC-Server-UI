@@ -476,10 +476,16 @@ input:disabled {
 .btn.primary:hover:not(:disabled) {
   background: #ffd000;
 }
-.btn.danger {
-  background: #442425;
-  border-color: #663134;
-  color: #f2a7a9;
+.btn.danger,
+.btn.stop-button {
+  background: #dc2040;
+  border-color: #ff4d63;
+  color: #fff;
+}
+.btn.danger:hover:not(:disabled),
+.btn.stop-button:hover:not(:disabled) {
+  background: #e12541;
+  border-color: #ff7081;
 }
 .btn.icon {
   width: 33px;
@@ -640,19 +646,14 @@ input:disabled {
   display: flex;
   gap: 7px;
 }
-.start-button {
-  color: #d4d8e9;
-  background: #272833;
-  border-color: #404356;
-}
-.stop-button {
-  background: #dc2040;
-  border-color: #ff4d63;
+.btn.start-button {
+  background: #15803d;
+  border-color: #34b363;
   color: #fff;
 }
-.stop-button:hover:not(:disabled) {
-  background: #e12541;
-  border-color: #ff7081;
+.btn.start-button:hover:not(:disabled) {
+  background: #188641;
+  border-color: #4ade80;
 }
 .metrics-grid {
   display: grid;

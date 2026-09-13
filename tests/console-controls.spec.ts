@@ -1,4 +1,5 @@
 import { test as base, expect } from "@playwright/test";
+import { removeTestServer } from "./server-fixtures";
 
 const test = base.extend<{ serverId: string }>({
   serverId: async ({ request }, use) => {
@@ -27,11 +28,7 @@ const test = base.extend<{ serverId: string }>({
     try {
       await use(server.id);
     } finally {
-      await request.post("/api/server/power", {
-        headers,
-        data: { action: "stop" },
-      });
-      await request.delete(`/api/servers/${server.id}`);
+      await removeTestServer(request, server.id);
     }
   },
 });

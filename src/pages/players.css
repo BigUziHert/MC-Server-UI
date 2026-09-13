@@ -62,6 +62,7 @@
 }
 .players-history-actions {
   display: flex;
+  flex-wrap: wrap;
   gap: 8px;
   margin-left: 14px;
   flex-shrink: 0;
@@ -103,7 +104,8 @@
     flex: 1;
   }
   .players-history-actions {
-    margin-left: 0;
+    margin-left: 52px;
+    flex-basis: calc(100% - 52px);
   }
   .players-history-actions .btn {
     padding: 8px 10px;

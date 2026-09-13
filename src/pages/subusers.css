@@ -46,18 +46,6 @@
   background: #ffdd44;
   border-color: #ffdd44;
 }
-.subusers-local-notice {
-  display: flex;
-  gap: 9px;
-  align-items: flex-start;
-  font-size: 12px;
-  line-height: 1.75;
-  margin: 0 0 22px;
-  color: var(--muted);
-}
-.subusers-local-notice > svg {
-  margin-top: 2px;
-}
 .subusers-list {
   background: var(--panel);
   border: 1px solid var(--border);

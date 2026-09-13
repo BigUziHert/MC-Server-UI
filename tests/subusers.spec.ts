@@ -5,6 +5,7 @@ import {
   type Page,
 } from "@playwright/test";
 import catalog from "../shared/subuser-permissions.json" with { type: "json" };
+import { removeTestServer } from "./server-fixtures";
 
 const permissionIds = catalog.groups.flatMap((group) =>
   group.permissions.map((permission) => permission.id),
@@ -31,9 +32,7 @@ const test = base.extend<{ server: Fixture }>({
     try {
       await use({ id: server.id, otherServerId: fleet.defaultServerId });
     } finally {
-      expect((await request.delete(`/api/servers/${server.id}`)).ok()).toBe(
-        true,
-      );
+      await removeTestServer(request, server.id);
     }
   },
 });
@@ -45,9 +44,6 @@ async function openSubusers(page: Page, id: string) {
     .selectOption(id);
   await expect(
     page.getByRole("heading", { name: "Subusers", exact: true }),
-  ).toBeVisible();
-  await expect(
-    page.getByText("Local records only.", { exact: false }),
   ).toBeVisible();
 }
 

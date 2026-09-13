@@ -312,7 +312,7 @@ export default function App() {
     setError("");
     setManager(null);
     setNotice(
-      "Demo removed from the panel. Its files and backups are still on disk.",
+      "Server removed from the panel. Its files and backups are still on disk.",
     );
     void loadServers();
   };

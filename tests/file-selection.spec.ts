@@ -4,6 +4,7 @@ import {
   type APIRequestContext,
   type Page,
 } from "@playwright/test";
+import { removeTestServer } from "./server-fixtures";
 
 type FileFixture = { id: string; folder: string; otherServerId: string };
 const test = base.extend<{ files: FileFixture }>({
@@ -51,10 +52,7 @@ const test = base.extend<{ files: FileFixture }>({
       });
     } finally {
       // This ID belongs to the demo created by this fixture in the isolated E2E runtime.
-      const response = await request.delete(
-        `/api/servers/${encodeURIComponent(server.id)}`,
-      );
-      expect(response.ok()).toBe(true);
+      await removeTestServer(request, server.id);
     }
   },
 });

@@ -8,6 +8,20 @@ import { PassThrough, Writable } from "node:stream";
 import { createFleet, createPanel } from "./index.mjs";
 
 const json = (method, body) => ({ method, body: JSON.stringify(body) });
+async function stopAndWait(panel, id) {
+  const response = await panel.request(
+    "/api/server/power",
+    json("POST", { action: "stop" }),
+    id,
+  );
+  assert.equal(response.status, 200);
+  for (let attempt = 0; attempt < 100; attempt++) {
+    if ((await panel.request("/api/server", {}, id)).body.status === "offline")
+      return;
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  assert.fail("Fixture server did not stop");
+}
 async function fixture(t, settings = {}) {
   const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), "mc-fleet-test-"));
   const fleets = [];
@@ -609,6 +623,11 @@ test("removing the last demo preserves its files and backups and leaves an empty
     "/api/backups",
     json("POST", { name: "Retained backup" }),
   );
+  assert.equal(
+    (await first.request(`/api/servers/${id}`, { method: "DELETE" })).status,
+    409,
+  );
+  await stopAndWait(first, id);
   const removed = await first.request(`/api/servers/${id}`, {
     method: "DELETE",
   });
@@ -656,7 +675,7 @@ test("removing the last demo preserves its files and backups and leaves an empty
         method: "DELETE",
       })
     ).status,
-    409,
+    200,
   );
 });
 
@@ -698,6 +717,7 @@ test("removing a legacy default retains another server's instance storage across
   for (const entry of oldRegistry.servers) delete entry.storage;
   await fs.writeFile(registryPath, JSON.stringify(oldRegistry));
   const upgraded = await boot({ createDefaultServer: false });
+  await stopAndWait(upgraded, legacyId);
   assert.equal(
     (await upgraded.request(`/api/servers/${legacyId}`, { method: "DELETE" }))
       .status,
@@ -761,5 +781,169 @@ test("clean-start option imports recognizable pre-registry workspaces without de
     (await imported.request("/api/audit")).body.entries.some(
       (entry) => entry.action === "Existing world",
     ),
+  );
+});
+
+test("removing an imported live server preserves its original world, backups and recycled files across restart", async (t) => {
+  const { boot } = await fixture(t);
+  const sourceRoot = await fs.mkdtemp(
+    path.join(os.tmpdir(), "mc-removal-source-"),
+  );
+  const directory = path.join(sourceRoot, "Existing world");
+  t.after(async () => {
+    assert.equal(
+      path.dirname(path.resolve(sourceRoot)),
+      path.resolve(os.tmpdir()),
+    );
+    assert.ok(path.basename(sourceRoot).startsWith("mc-removal-source-"));
+    assert.equal((await fs.lstat(sourceRoot)).isSymbolicLink(), false);
+    await fs.rm(sourceRoot, { recursive: true, force: true });
+  });
+  await fs.mkdir(path.join(directory, "world"), { recursive: true });
+  const originals = {
+    "server.properties":
+      "server-port=25575\nmotd=Keep this world\nlevel-name=world\n",
+    "eula.txt": "# Original decision\neula=false\n",
+    "server.jar": "An inert test fixture, never executed",
+    "world/level.dat": "Original world bytes",
+  };
+  for (const [name, contents] of Object.entries(originals))
+    await fs.writeFile(path.join(directory, name), contents);
+  const panel = await boot({ createDefaultServer: false });
+  const imported = await panel.request(
+    "/api/server-import",
+    json("POST", {
+      directory,
+      name: "Imported world",
+      jar: "server.jar",
+      port: 25575,
+      memoryLimitMB: 1024,
+      javaPath: "java",
+    }),
+  );
+  assert.equal(imported.status, 201);
+  const id = imported.body.server.id;
+  const runtime = panel.runtimes.get(id);
+  await panel.request(
+    "/api/files",
+    json("POST", { name: "recycled.txt", type: "file", content: "recover me" }),
+    id,
+  );
+  const recycled = await panel.request(
+    "/api/files?path=recycled.txt",
+    { method: "DELETE" },
+    id,
+  );
+  assert.equal(recycled.status, 200);
+  const backup = await panel.request(
+    "/api/backups",
+    json("POST", { name: "Retain this archive" }),
+    id,
+  );
+  assert.equal(backup.status, 201);
+  await panel.request(
+    "/api/backups/schedule",
+    json("PUT", {
+      enabled: true,
+      type: "interval",
+      intervalHours: 1,
+      time: "03:00",
+      dayOfWeek: 0,
+      retention: 7,
+    }),
+    id,
+  );
+  const removed = await panel.request(`/api/servers/${id}`, {
+    method: "DELETE",
+  });
+  assert.equal(removed.status, 200);
+  assert.equal(removed.body.filesPreserved, true);
+  assert.equal(panel.runtimes.size, 0);
+  for (const [name, contents] of Object.entries(originals))
+    assert.equal(
+      await fs.readFile(path.join(directory, name), "utf8"),
+      contents,
+    );
+  assert.ok(
+    (
+      await fs.stat(
+        path.join(runtime.dataDir, "backups", `${backup.body.id}.tar.gz`),
+      )
+    ).size > 0,
+  );
+  assert.equal(
+    await fs.readFile(
+      path.join(
+        runtime.dataDir,
+        "recycle-bin",
+        recycled.body.recycled.id,
+        "content",
+      ),
+      "utf8",
+    ),
+    "recover me",
+  );
+  await panel.tick(new Date(Date.now() + 2 * 60 * 60 * 1000));
+  assert.equal(
+    (await fs.readdir(path.join(runtime.dataDir, "backups"))).length,
+    1,
+  );
+  await panel.close();
+  const restarted = await boot({ createDefaultServer: false });
+  assert.deepEqual((await restarted.request("/api/servers")).body, {
+    servers: [],
+    defaultServerId: null,
+  });
+  assert.equal((await restarted.request("/api/server", {}, id)).status, 404);
+  assert.equal(
+    await fs.readFile(path.join(directory, "world", "level.dat"), "utf8"),
+    originals["world/level.dat"],
+  );
+});
+
+test("server removal rejects ongoing configuration work without closing the server runtime", async (t) => {
+  const { boot } = await fixture(t);
+  const panel = await boot({ createDefaultServer: false });
+  const created = await panel.request(
+    "/api/servers",
+    json("POST", { name: "Busy offline server", mode: "live", port: 25576 }),
+  );
+  const id = created.body.server.id;
+  const runtime = panel.runtimes.get(id);
+  let entered;
+  let release;
+  const reached = new Promise((resolve) => {
+    entered = resolve;
+  });
+  const gate = new Promise((resolve) => {
+    release = resolve;
+  });
+  const saving = runtime.updateConfiguration(
+    { ...runtime.descriptor(), name: "Pending rename" },
+    async () => {
+      entered();
+      await gate;
+    },
+  );
+  try {
+    await reached;
+    const rejected = await panel.request(`/api/servers/${id}`, {
+      method: "DELETE",
+    });
+    assert.equal(rejected.status, 409);
+    assert.match(rejected.body.error, /current operation/);
+    assert.equal(panel.runtimes.get(id), runtime);
+    assert.equal((await panel.request("/api/server", {}, id)).status, 200);
+  } finally {
+    release();
+    await saving;
+  }
+  assert.equal(
+    (await panel.request(`/api/servers/${id}`, { method: "DELETE" })).status,
+    200,
+  );
+  assert.equal(
+    (await panel.request(`/api/servers/${id}`, { method: "DELETE" })).status,
+    404,
   );
 });

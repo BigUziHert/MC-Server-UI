@@ -63,6 +63,26 @@ const test = base.extend<{ server: { id: string; other: string } }>({
     try {
       await use({ id: server.id, other: fleet.defaultServerId });
     } finally {
+      const current = await (
+        await request.get("/api/server", { headers })
+      ).json();
+      if (current.status !== "offline") {
+        expect(
+          (
+            await request.post("/api/server/power", {
+              headers,
+              data: { action: "stop" },
+            })
+          ).ok(),
+        ).toBe(true);
+        await expect
+          .poll(
+            async () =>
+              (await (await request.get("/api/server", { headers })).json())
+                .status,
+          )
+          .toBe("offline");
+      }
       expect((await request.delete(`/api/servers/${server.id}`)).ok()).toBe(
         true,
       );
@@ -282,17 +302,146 @@ test("offline and unreadable ban states retain history but disable unsafe player
     row.getByRole("button", { name: "Ban History_Player" }),
   ).toBeDisabled();
   await expect(
-    page.getByRole("button", { name: "Grant OP", exact: true }),
+    row.getByRole("button", {
+      name: "Grant OP for History_Player",
+      exact: true,
+    }),
   ).toBeDisabled();
   offline = false;
   await page.getByRole("button", { name: "Refresh player history" }).click();
   await expect(
-    page.getByRole("button", { name: "Grant OP", exact: true }),
+    row.getByRole("button", {
+      name: "Grant OP for History_Player",
+      exact: true,
+    }),
   ).toBeEnabled();
   await expect(
     row.getByRole("button", { name: "Ban History_Player" }),
   ).toBeDisabled();
   await expect(
     page.getByText(/banned-players.json could not be read/),
+  ).toBeVisible();
+});
+
+test("Grant OP belongs to a known-player row and guards the selected identity and existing operator", async ({
+  page,
+  request,
+  server,
+}, info) => {
+  await open(page, server.id);
+  await expect(page.locator(".page-heading").getByRole("button")).toHaveCount(
+    0,
+  );
+  await expect(page.locator(".page-heading p")).toHaveCount(0);
+  await expect(
+    page.getByRole("button", { name: "Grant your first OP" }),
+  ).toHaveCount(0);
+  const row = page.getByRole("listitem", {
+    name: "Player History_Player",
+    exact: true,
+  });
+  const grant = row.getByRole("button", {
+    name: "Grant OP for History_Player",
+    exact: true,
+  });
+  await grant.click();
+  const dialog = page.getByRole("dialog", {
+    name: "Grant operator permissions",
+    exact: true,
+  });
+  await expect(
+    dialog.getByLabel("Minecraft username", { exact: true }),
+  ).toHaveValue(profile.name);
+  await expect(
+    dialog.getByLabel("Minecraft username", { exact: true }),
+  ).toHaveAttribute("readonly", "");
+  await dialog.getByRole("button", { name: "Cancel", exact: true }).click();
+  const headers = { "X-Server-Id": server.id };
+  expect(
+    (await (await request.get("/api/players", { headers })).json()).operators,
+  ).toEqual([]);
+  await grant.click();
+  await dialog.getByRole("button", { name: "Grant OP", exact: true }).click();
+  await expect(dialog).not.toBeVisible();
+  await expect(grant).toBeDisabled();
+  await expect(grant).toHaveText("Already OP");
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.screenshot({
+    path: info.outputPath("player-row-op-mobile.png"),
+    fullPage: true,
+    animations: "disabled",
+  });
+  expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBe(
+    390,
+  );
+  await page
+    .getByRole("button", { name: "Remove OP for History_Player", exact: true })
+    .click();
+  await page
+    .getByRole("dialog", { name: "Remove operator permissions?", exact: true })
+    .getByRole("button", { name: "Remove OP", exact: true })
+    .click();
+  await expect(grant).toBeEnabled();
+});
+
+test("live row OP preserves pending state until Minecraft saves the operator record", async ({
+  page,
+  server,
+}) => {
+  let confirmed = false;
+  await page.route("**/api/players", async (route) => {
+    const response = await route.fetch();
+    const data = await response.json();
+    await route.fulfill({
+      json: {
+        ...data,
+        mode: "live",
+        status: "running",
+        operators: confirmed ? [{ ...profile, level: 4 }] : [],
+      },
+    });
+  });
+  let command: unknown;
+  await page.route("**/api/players/op", async (route) => {
+    command = route.request().postDataJSON();
+    await route.fulfill({
+      json: {
+        simulated: false,
+        message: "Requested op History_Player. Check Console for confirmation.",
+      },
+    });
+  });
+  await open(page, server.id);
+  const grant = page.getByRole("button", {
+    name: "Grant OP for History_Player",
+    exact: true,
+  });
+  await grant.click();
+  const dialog = page.getByRole("dialog", {
+    name: "Grant operator permissions",
+    exact: true,
+  });
+  await dialog.getByRole("button", { name: "Grant OP", exact: true }).click();
+  await expect(dialog).not.toBeVisible();
+  expect(command).toEqual(profile);
+  await expect(
+    page.getByText("Player command requested", { exact: true }),
+  ).toBeVisible();
+  await expect(
+    page.getByRole("button", {
+      name: "Remove OP for History_Player",
+      exact: true,
+    }),
+  ).toHaveCount(0);
+  confirmed = true;
+  await page
+    .getByRole("button", { name: "Refresh operators", exact: true })
+    .click();
+  await expect(grant).toBeDisabled();
+  await expect(
+    page.getByRole("button", {
+      name: "Remove OP for History_Player",
+      exact: true,
+    }),
   ).toBeVisible();
 });

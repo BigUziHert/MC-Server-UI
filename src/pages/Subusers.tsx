@@ -8,7 +8,6 @@ import {
 } from "react";
 import {
   AlertCircle,
-  Info,
   Pencil,
   Plus,
   RefreshCw,
@@ -207,13 +206,6 @@ export default function Subusers({ notify }: PageProps) {
           New user
         </button>
       </header>
-      <p className="subusers-local-notice">
-        <Info size={16} />
-        <span>
-          Local records only. Adding a record does not grant access. Permissions
-          are not enforced, and no invitation is sent.
-        </span>
-      </p>
       <section className="subusers-list" aria-label="Subuser records">
         <div className="subusers-toolbar">
           <div className="subusers-list-title">

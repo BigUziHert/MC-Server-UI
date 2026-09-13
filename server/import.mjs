@@ -241,7 +241,7 @@ export function parseJavaScript(text) {
   const unsupported = () =>
     error(
       400,
-      "This launcher contains commands beyond a single Java invocation. Select Startup script to run it as configured, or enter the Java arguments explicitly. Scripts must keep the server in the foreground without pause, automatic restart loops, or detached launch commands.",
+      "This launcher contains commands beyond a single Java invocation. Select Startup script to run it as configured, or enter the Java arguments explicitly. Scripts must keep the server in the foreground without automatic restart loops or detached launch commands.",
     );
   const lines = text
     .replace(/^\uFEFF/, "")

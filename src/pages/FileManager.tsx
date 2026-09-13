@@ -412,7 +412,6 @@ export default function FileManager({ notify }: PageProps) {
       <div className="page-heading">
         <div>
           <h1>File Manager</h1>
-          <p>Your world, plugins, and configuration. All in one place.</p>
         </div>
         <button
           className="btn primary"
@@ -535,45 +534,42 @@ export default function FileManager({ notify }: PageProps) {
               </button>
             )}
           </label>
-          <span className="muted files-count">{entries.length} items</span>
-        </div>
-        <div className="file-selection-slot">
-          {!selectedEntries.length && (
-            <p className="file-selection-placeholder">
-              Select files or folders to move them to Recycle Bin.
-            </p>
-          )}
-          <div
-            className="file-selection-bar"
-            role="region"
-            aria-label="Selected files and folders"
-            style={{
-              visibility: selectedEntries.length ? "visible" : "hidden",
-            }}
-          >
-            <div className="file-selection-summary" aria-live="polite">
-              <strong>{selectedEntries.length} selected</strong>
-              <span>
-                {hiddenSelectedCount > 0
-                  ? `${hiddenSelectedCount} hidden by the filter`
-                  : "\u00a0"}
-              </span>
-            </div>
-            <div className="file-selection-actions">
-              <button
-                className="btn small"
-                onClick={() => setSelected(new Set())}
-                disabled={saving}
-              >
-                Clear selection
-              </button>
-              <button
-                className="btn danger small"
-                onClick={openDeleteSelected}
-                disabled={saving || loading || !!error}
-              >
-                <Trash2 size={15} /> Delete selected
-              </button>
+          <div className="file-selection-slot">
+            {!selectedEntries.length && (
+              <span className="muted files-count">{entries.length} items</span>
+            )}
+            <div
+              className="file-selection-bar"
+              role="region"
+              aria-label="Selected files and folders"
+              style={{
+                visibility: selectedEntries.length ? "visible" : "hidden",
+              }}
+            >
+              <div className="file-selection-summary" aria-live="polite">
+                <strong>{selectedEntries.length} selected</strong>
+                <span>
+                  {hiddenSelectedCount > 0
+                    ? `${hiddenSelectedCount} hidden by the filter`
+                    : "\u00a0"}
+                </span>
+              </div>
+              <div className="file-selection-actions">
+                <button
+                  className="btn small"
+                  onClick={() => setSelected(new Set())}
+                  disabled={saving}
+                >
+                  Clear selection
+                </button>
+                <button
+                  className="btn danger small"
+                  onClick={openDeleteSelected}
+                  disabled={saving || loading || !!error}
+                >
+                  <Trash2 size={15} /> Delete selected
+                </button>
+              </div>
             </div>
           </div>
         </div>

@@ -4,6 +4,7 @@ import {
   type APIRequestContext,
   type Page,
 } from "@playwright/test";
+import { removeTestServer } from "./server-fixtures";
 
 type BinFixture = {
   id: string;
@@ -56,7 +57,7 @@ const test = base.extend<{ bin: BinFixture }>({
       await use(bin);
     } finally {
       // Only the fresh demo registered by this fixture in the isolated E2E runtime is removed.
-      expect((await request.delete(`/api/servers/${bin.id}`)).ok()).toBe(true);
+      await removeTestServer(request, bin.id);
     }
   },
 });

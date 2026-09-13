@@ -163,6 +163,7 @@ function ServerSettings({
   const [confirmingRemoval, setConfirmingRemoval] = useState(false);
   const dialog = useRef<HTMLDialogElement>(null);
   const removalCancel = useRef<HTMLButtonElement>(null);
+  const errorMessage = useRef<HTMLDivElement>(null);
   const running = !!editing && editing.status !== "offline";
   useEffect(() => {
     const element = dialog.current;
@@ -172,6 +173,9 @@ function ServerSettings({
   useEffect(() => {
     if (confirmingRemoval) removalCancel.current?.focus();
   }, [confirmingRemoval]);
+  useEffect(() => {
+    if (error) errorMessage.current?.scrollIntoView({ block: "nearest" });
+  }, [error]);
 
   async function submit(event: FormEvent) {
     event.preventDefault();
@@ -211,8 +215,8 @@ function ServerSettings({
     }
   }
 
-  async function removeDemo() {
-    if (!editing || editing.mode !== "demo" || busy) return;
+  async function removeServer() {
+    if (!editing || running || busy || !confirmingRemoval) return;
     setBusy(true);
     setError("");
     try {
@@ -224,7 +228,7 @@ function ServerSettings({
       setError(
         cause instanceof Error
           ? cause.message
-          : "Unable to remove this demo server.",
+          : "Unable to remove this server from the panel.",
       );
     } finally {
       setBusy(false);
@@ -414,7 +418,7 @@ function ServerSettings({
           </p>
         </div>
         {error && (
-          <div className="server-form-error" role="alert">
+          <div ref={errorMessage} className="server-form-error" role="alert">
             <AlertCircle size={16} />
             {error}
           </div>
@@ -437,15 +441,19 @@ function ServerSettings({
             {busy ? "Saving…" : editing ? "Save changes" : "Create server"}
           </button>
         </div>
-        {editing?.mode === "demo" && (
+        {editing && (
           <div className="server-remove-demo">
             {confirmingRemoval ? (
-              <div role="group" aria-labelledby="remove-demo-title">
-                <h3 id="remove-demo-title">Remove this demo server?</h3>
+              <div role="group" aria-labelledby="remove-server-title">
+                <h3 id="remove-server-title">
+                  Remove this server from the panel?
+                </h3>
                 <p>
-                  <strong>{editing.name}</strong> and its backup schedule will
-                  stop, and the demo will disappear from your server list. Its
-                  files and backups will stay on your computer.
+                  <strong>{editing.name}</strong> will disappear from your
+                  server list, and its scheduled backups will stop. Its
+                  Minecraft server files, worlds, backups, and Recycle Bin data
+                  will stay on your computer. You can import the server folder
+                  again later.
                 </p>
                 <div className="server-remove-actions">
                   <button
@@ -463,26 +471,31 @@ function ServerSettings({
                   <button
                     className="btn danger"
                     type="button"
-                    disabled={busy}
-                    onClick={() => void removeDemo()}
+                    disabled={busy || running}
+                    onClick={() => void removeServer()}
                   >
                     <Trash2 size={15} />
-                    {busy ? "Removing…" : "Remove demo server"}
+                    {busy ? "Removing…" : "Remove server"}
                   </button>
                 </div>
               </div>
             ) : (
-              <button
-                className="server-remove-link"
-                type="button"
-                disabled={busy}
-                onClick={() => {
-                  setConfirmingRemoval(true);
-                  setError("");
-                }}
-              >
-                <Trash2 size={14} /> Remove demo server
-              </button>
+              <div>
+                <button
+                  className="server-remove-link"
+                  type="button"
+                  disabled={busy || running}
+                  onClick={() => {
+                    setConfirmingRemoval(true);
+                    setError("");
+                  }}
+                >
+                  <Trash2 size={14} /> Remove server
+                </button>
+                {running && (
+                  <p>Stop this server from Console before removing it.</p>
+                )}
+              </div>
             )}
           </div>
         )}

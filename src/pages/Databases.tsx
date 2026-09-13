@@ -113,7 +113,6 @@ export default function Databases({ notify }: PageProps) {
         <div>
           <div className="management-eyebrow">SERVER MANAGEMENT</div>
           <h1>Databases</h1>
-          <p>A home for your server's persistent data.</p>
         </div>
         <button className="btn primary" onClick={openCreate}>
           <Plus size={16} /> Create database

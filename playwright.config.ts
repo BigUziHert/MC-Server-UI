@@ -30,6 +30,7 @@ export default defineConfig({
     "console-controls.spec.ts",
     "players-history.spec.ts",
     "recycle-bin.spec.ts",
+    "server-removal.spec.ts",
   ],
   fullyParallel: false,
   workers: 1,

@@ -26,18 +26,14 @@
 }
 .file-selection-slot {
   position: relative;
+  flex: 1;
 }
-.file-selection-placeholder {
+.file-selection-slot .files-count {
   position: absolute;
   inset: 0;
   display: flex;
   align-items: center;
-  padding: 12px 23px;
-  margin: 0;
-  color: var(--muted, #969bb3);
-  font-size: 11px;
-  line-height: 1.6;
-  pointer-events: none;
+  justify-content: flex-end;
 }
 .file-table tbody tr.file-row-selected {
   background: color-mix(
@@ -51,16 +47,9 @@
   align-items: center;
   justify-content: space-between;
   gap: 16px;
-  padding: 12px 23px;
-  min-height: 68px;
+  padding: 0;
+  min-height: 44px;
   box-sizing: border-box;
-  border-top: 1px solid var(--border, #373948);
-  border-bottom: 1px solid var(--border, #373948);
-  background: color-mix(
-    in srgb,
-    var(--accent, #ffd000) 4%,
-    var(--panel, #20212b)
-  );
 }
 .file-selection-summary {
   display: grid;
@@ -132,21 +121,32 @@
   line-height: 1.6;
   overflow-wrap: anywhere;
 }
+@media (max-width: 1100px) {
+  .files-filter:has(.file-selection-slot) {
+    align-items: stretch;
+    flex-direction: column;
+    gap: 10px;
+  }
+  .files-filter:has(.file-selection-slot) .storage-search {
+    width: 100%;
+  }
+}
 @media (max-width: 600px) {
-  .file-selection-placeholder {
-    padding: 12px;
+  .file-selection-summary {
+    font-size: 11px;
+    min-width: 0;
   }
   .file-selection-name {
     gap: 8px;
   }
   .file-selection-bar {
-    align-items: flex-start;
-    flex-direction: column;
-    gap: 10px;
-    padding: 12px;
-    min-height: 108px;
+    gap: 8px;
+    min-height: 52px;
   }
   .file-selection-actions {
-    flex-wrap: wrap;
+    gap: 6px;
+  }
+  .file-selection-actions .btn.small {
+    padding: 6px 8px;
   }
 }

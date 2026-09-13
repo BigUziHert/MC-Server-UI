@@ -17,6 +17,7 @@ import {
 import { tmpdir } from "node:os";
 import path from "node:path";
 import * as tar from "tar";
+import { stopTestServer } from "./server-fixtures";
 
 const minecraftHeadFixture =
   '<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 8 8"><path fill="#70513d" d="M0 0h8v8H0z"/><path fill="#c99777" d="M1 3h6v4H1z"/><path fill="#284c78" d="M1 3h2v1H1zm4 0h2v1H5z"/><path fill="#452c20" d="M2 6h4v1H2z"/></svg>';
@@ -440,9 +441,6 @@ test("subusers records are clearly local and can be added, searched, and removed
   request,
 }) => {
   await openPage(page, "subusers", "Subusers");
-  await expect(
-    page.getByText(/Adding a record does not grant access/),
-  ).toBeVisible();
   await page.getByRole("button", { name: "New user", exact: true }).click();
   let dialog = page.getByRole("dialog", { name: "Create new subuser" });
   await expect(dialog.getByText(/No invitation will be sent/)).toBeVisible();
@@ -1087,6 +1085,23 @@ test("Players grants and removes simulated OP independently of panel access and 
   );
   expect(
     (
+      await request.post("/api/files", {
+        headers: serverHeaders(secondary.id),
+        data: {
+          name: "usercache.json",
+          type: "file",
+          content: JSON.stringify([
+            {
+              name: "E2E_Builder",
+              uuid: "12345678-1234-1234-1234-123456789abc",
+            },
+          ]),
+        },
+      })
+    ).status(),
+  ).toBe(201);
+  expect(
+    (
       await request.post("/api/players/op", {
         headers: serverHeaders(defaultServerId),
         data: { name: "PrimaryGuard" },
@@ -1107,25 +1122,22 @@ test("Players grants and removes simulated OP independently of panel access and 
       exact: true,
     }),
   ).toHaveCount(0);
-  await page.getByRole("button", { name: "Grant OP", exact: true }).click();
+  const grantButton = page.getByRole("button", {
+    name: "Grant OP for E2E_Builder",
+    exact: true,
+  });
+  await grantButton.click();
   let dialog = page.getByRole("dialog", {
     name: "Grant operator permissions",
     exact: true,
   });
   const username = dialog.getByLabel("Minecraft username", { exact: true });
   await expect(username).toBeFocused();
-  await username.fill("bad name!");
-  await dialog.getByRole("button", { name: "Grant OP", exact: true }).click();
-  await expect(dialog).toBeVisible();
-  expect(
-    await username.evaluate(
-      (input) => (input as HTMLInputElement).validity.valid,
-    ),
-  ).toBe(false);
+  await expect(username).toHaveValue("E2E_Builder");
+  await expect(username).toHaveAttribute("readonly", "");
   expect(
     (await scopedGet(request, secondary.id, "/players")).operators,
   ).toEqual([]);
-  await username.fill("E2E_Builder");
   await dialog.getByRole("button", { name: "Grant OP", exact: true }).click();
   await expect(dialog).not.toBeVisible();
   let removeButton = page.getByRole("button", {
@@ -1147,18 +1159,8 @@ test("Players grants and removes simulated OP independently of panel access and 
     (await scopedGet(request, secondary.id, "/subusers")).users,
   ).toHaveLength(0);
 
-  await page.getByRole("button", { name: "Grant OP", exact: true }).click();
-  dialog = page.getByRole("dialog", {
-    name: "Grant operator permissions",
-    exact: true,
-  });
-  await dialog
-    .getByLabel("Minecraft username", { exact: true })
-    .fill("e2e_builder");
-  await dialog.getByRole("button", { name: "Grant OP", exact: true }).click();
-  await expect(dialog.getByRole("alert")).toContainText("already an operator");
-  await page.keyboard.press("Escape");
-  await expect(dialog).not.toBeVisible();
+  await expect(grantButton).toBeDisabled();
+  await expect(grantButton).toHaveText("Already OP");
   expect(
     (await scopedGet(request, secondary.id, "/players")).operators,
   ).toHaveLength(1);
@@ -1235,18 +1237,14 @@ test("Players grants and removes simulated OP independently of panel access and 
   await expect(
     page.getByText("Start the server to manage operators", { exact: true }),
   ).toBeVisible();
-  await expect(
-    page.getByRole("button", { name: "Grant OP", exact: true }),
-  ).toBeDisabled();
+  await expect(grantButton).toBeDisabled();
   await page.getByRole("link", { name: "Go to Console", exact: false }).click();
   await page.getByRole("button", { name: "Start", exact: true }).click();
   await expect(
     page.getByRole("button", { name: "Stop", exact: true }),
   ).toBeEnabled();
   await openPage(page, "players", "Players");
-  await expect(
-    page.getByRole("button", { name: "Grant OP", exact: true }),
-  ).toBeEnabled();
+  await expect(grantButton).toBeEnabled();
 });
 
 test("mobile navigation exposes server controls and the Players page without horizontal overflow", async ({
@@ -1258,6 +1256,23 @@ test("mobile navigation exposes server controls and the Players page without hor
     "Mobile Creative Workshop",
     25674,
   );
+  expect(
+    (
+      await request.post("/api/files", {
+        headers: serverHeaders(secondary.id),
+        data: {
+          name: "usercache.json",
+          type: "file",
+          content: JSON.stringify([
+            {
+              name: "Mobile_Builder01",
+              uuid: "22345678-1234-1234-1234-123456789abc",
+            },
+          ]),
+        },
+      })
+    ).status(),
+  ).toBe(201);
   await page.setViewportSize({ width: 390, height: 844 });
   await page.goto("/");
   await expect(
@@ -1332,14 +1347,16 @@ test("mobile navigation exposes server controls and the Players page without hor
     page.getByRole("heading", { level: 1, name: "Players", exact: true }),
   ).toBeVisible();
   await expect(closeNavigation).not.toBeVisible();
-  await page.getByRole("button", { name: "Grant OP", exact: true }).click();
+  await page
+    .getByRole("button", { name: "Grant OP for Mobile_Builder01", exact: true })
+    .click();
   dialog = page.getByRole("dialog", {
     name: "Grant operator permissions",
     exact: true,
   });
-  await dialog
-    .getByLabel("Minecraft username", { exact: true })
-    .fill("Mobile_Builder01");
+  await expect(
+    dialog.getByLabel("Minecraft username", { exact: true }),
+  ).toHaveValue("Mobile_Builder01");
   await assertFits("Grant OP dialog");
   await dialog.getByRole("button", { name: "Grant OP", exact: true }).click();
   await expect(dialog).not.toBeVisible();
@@ -1762,6 +1779,8 @@ test("removing the last listed demo returns to onboarding and preserves its file
   );
   expect(await readFile(markerPath, "utf8")).toBe(marker);
   const archiveBefore = await readFile(backupPath);
+  await stopTestServer(request, demo.id);
+  demo.status = "offline";
   let removed = false;
   let removalResult: { filesPreserved: boolean } | undefined;
   await page.route("**/api/servers", (route) => {
@@ -1797,26 +1816,24 @@ test("removing the last listed demo returns to onboarding and preserves its file
     exact: true,
   });
   await dialog
-    .getByRole("button", { name: "Remove demo server", exact: true })
+    .getByRole("button", { name: "Remove server", exact: true })
     .click();
   const confirmation = dialog.getByRole("group", {
-    name: "Remove this demo server?",
+    name: "Remove this server from the panel?",
     exact: true,
   });
   await expect(confirmation).toContainText("E2E Demo To Remove");
-  await expect(confirmation).toContainText(
-    "files and backups will stay on your computer",
-  );
+  await expect(confirmation).toContainText("will stay on your computer");
   await confirmation
     .getByRole("button", { name: "Cancel removal", exact: true })
     .click();
   await expect(confirmation).not.toBeVisible();
   expect(removed).toBe(false);
   await dialog
-    .getByRole("button", { name: "Remove demo server", exact: true })
+    .getByRole("button", { name: "Remove server", exact: true })
     .click();
   await confirmation
-    .getByRole("button", { name: "Remove demo server", exact: true })
+    .getByRole("button", { name: "Remove server", exact: true })
     .click();
   await expect(dialog).not.toBeVisible();
   const welcome = page.getByRole("heading", {

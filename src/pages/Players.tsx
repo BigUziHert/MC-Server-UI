@@ -11,7 +11,6 @@ import {
   Check,
   Gamepad2,
   Info,
-  Plus,
   RefreshCw,
   Search,
   ShieldCheck,
@@ -64,6 +63,7 @@ export default function Players({ notify }: PageProps) {
   const [granting, setGranting] = useState(false);
   const [removing, setRemoving] = useState<Operator | null>(null);
   const [name, setName] = useState("");
+  const [grantUuid, setGrantUuid] = useState<string | undefined>();
   const [busy, setBusy] = useState(false);
   const [formError, setFormError] = useState("");
   const [result, setResult] = useState<OperationResponse | null>(null);
@@ -131,6 +131,12 @@ export default function Players({ notify }: PageProps) {
     player.name.toLowerCase().includes(search.trim().toLowerCase()),
   );
   const history = data?.history ?? [];
+  const isOperator = (player: KnownPlayer) =>
+    operators.some((operator) =>
+      player.uuid && operator.uuid
+        ? player.uuid.toLowerCase() === operator.uuid.toLowerCase()
+        : player.name.toLowerCase() === operator.name.toLowerCase(),
+    );
   const filteredHistory = history.filter((player) =>
     player.name.toLowerCase().includes(historySearch.trim().toLowerCase()),
   );
@@ -195,8 +201,9 @@ export default function Players({ notify }: PageProps) {
     }
   }
 
-  function openGrant() {
-    setName("");
+  function openGrant(player: KnownPlayer) {
+    setName(player.name);
+    setGrantUuid(player.uuid);
     setFormError("");
     setGranting(true);
   }
@@ -238,7 +245,10 @@ export default function Players({ notify }: PageProps) {
     try {
       const response = await post<OperationResponse>(
         removing ? "/players/deop" : "/players/op",
-        { name: username },
+        {
+          name: username,
+          ...(!removing && grantUuid ? { uuid: grantUuid } : {}),
+        },
       );
       if (currentSession !== session.current) return;
       setResult(response);
@@ -264,15 +274,7 @@ export default function Players({ notify }: PageProps) {
         <div>
           <div className="management-eyebrow">IN-GAME MANAGEMENT</div>
           <h1>Players</h1>
-          <p>View known players, manage bans, and assign operators.</p>
         </div>
-        <button
-          className="btn primary"
-          onClick={openGrant}
-          disabled={!canManage || loading}
-        >
-          <Plus size={16} /> Grant OP
-        </button>
       </div>
 
       {data && simulated && (
@@ -468,6 +470,20 @@ export default function Players({ notify }: PageProps) {
                 <div className="players-history-actions">
                   <button
                     className="btn"
+                    aria-label={`Grant OP for ${player.name}`}
+                    disabled={!canManage || busy || isOperator(player)}
+                    title={
+                      isOperator(player)
+                        ? "This player is already an operator"
+                        : "Grant operator permissions"
+                    }
+                    onClick={() => openGrant(player)}
+                  >
+                    <ShieldPlus size={14} />
+                    {isOperator(player) ? "Already OP" : "Grant OP"}
+                  </button>
+                  <button
+                    className="btn"
                     aria-label={`Kick ${player.name}`}
                     disabled={!canManage || !player.online || busy}
                     title={
@@ -563,21 +579,8 @@ export default function Players({ notify }: PageProps) {
             <div className="management-empty-icon">
               <ShieldPlus size={27} />
             </div>
-            <h3>
-              {search.trim()
-                ? "No matching players"
-                : "Your world, your trusted players"}
-            </h3>
-            <p>
-              {search.trim()
-                ? "Try another Minecraft username."
-                : "Grant OP to a player who helps run your world. You can remove their operator permissions here at any time."}
-            </p>
-            {!search.trim() && (
-              <button className="btn" onClick={openGrant} disabled={!canManage}>
-                <Plus size={15} /> Grant your first OP
-              </button>
-            )}
+            <h3>{search.trim() ? "No matching players" : "No operators"}</h3>
+            {search.trim() && <p>Try another Minecraft username.</p>}
           </div>
         ) : (
           <ul className="players-operator-list">
@@ -662,7 +665,9 @@ export default function Players({ notify }: PageProps) {
                 They can continue playing with normal player permissions.
               </>
             ) : (
-              "Enter the exact Minecraft Java username of the player you want to make an operator on this server."
+              <>
+                Grant OP to <strong>{name}</strong> on this server?
+              </>
             )}
           </p>
           {!removing && (
@@ -682,7 +687,7 @@ export default function Players({ notify }: PageProps) {
                 spellCheck={false}
                 placeholder="Player_username"
                 value={name}
-                onChange={(event) => setName(event.target.value)}
+                readOnly
                 disabled={busy}
                 aria-describedby="operator-username-hint"
               />

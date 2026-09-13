@@ -265,6 +265,58 @@ test("demo cache history and ban overrides persist across restart without touchi
   );
 });
 
+test("operator requests from a known-player row validate its UUID and remain isolated demo changes", async (t) => {
+  const panel = await fixture(t);
+  await fs.writeFile(
+    path.join(panel.serverDir, "usercache.json"),
+    JSON.stringify([profile]),
+  );
+  await fs.writeFile(path.join(panel.serverDir, "ops.json"), "[]\n");
+  assert.equal(
+    (
+      await panel.request(
+        "/api/players/op",
+        json("POST", { ...profile, uuid: "bad" }),
+      )
+    ).status,
+    400,
+  );
+  assert.equal(
+    (
+      await panel.request(
+        "/api/players/op",
+        json("POST", {
+          ...profile,
+          uuid: "22345678-1234-1234-1234-123456789abc",
+        }),
+      )
+    ).status,
+    409,
+  );
+  const grant = await panel.request("/api/players/op", json("POST", profile));
+  assert.equal(grant.status, 200);
+  assert.equal(grant.body.simulated, true);
+  assert.equal(
+    (await panel.request("/api/players")).body.operators[0].name,
+    profile.name,
+  );
+  assert.equal(
+    await fs.readFile(path.join(panel.serverDir, "ops.json"), "utf8"),
+    "[]\n",
+  );
+  await fs.writeFile(
+    path.join(panel.serverDir, "usercache.json"),
+    JSON.stringify([
+      { ...profile, uuid: "32345678-1234-1234-1234-123456789abc" },
+    ]),
+  );
+  assert.equal(
+    (await panel.request("/api/players/op", json("POST", profile))).status,
+    409,
+    "a reassigned username cannot grant permissions to a stale row identity",
+  );
+});
+
 test("live logger history ignores chat, supports Forge prefixes, and live moderation waits for authoritative files", async (t) => {
   const panel = await fixture(t, "live");
   await panel.start();

@@ -1,4 +1,5 @@
 import { test as base, expect } from "@playwright/test";
+import { removeTestServer } from "./server-fixtures";
 
 const test = base.extend<{ serverId: string }>({
   serverId: async ({ request }, use) => {
@@ -16,7 +17,7 @@ const test = base.extend<{ serverId: string }>({
     try {
       await use(server.id);
     } finally {
-      await request.delete(`/api/servers/${server.id}`);
+      await removeTestServer(request, server.id);
     }
   },
 });
@@ -63,6 +64,14 @@ test("a server icon is cropped to Minecraft size, saved, shown after reload, and
     exact: true,
   });
   await expect(icons).toHaveCount(2);
+  const bannerIcon = page.getByRole("button", {
+    name: "Edit server icon",
+    exact: true,
+  });
+  const box = await bannerIcon.boundingBox();
+  const picture = await bannerIcon.locator("img").boundingBox();
+  expect(picture!.width).toBeGreaterThanOrEqual(box!.width - 2);
+  expect(picture!.height).toBeGreaterThanOrEqual(box!.height - 2);
   await expect
     .poll(() =>
       icons

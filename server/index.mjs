@@ -18,10 +18,12 @@ import {
 } from "./connection.mjs";
 import { decodeIcon, readServerIcon, writeServerIcon } from "./server-icon.mjs";
 import { createRecycleBin } from "./recycle-bin.mjs";
+import { createLauncherStop } from "./launcher-stop.mjs";
 import {
   createPlayerHistory,
   readPlayerRecords,
   moderationCommand,
+  validPlayerUuid,
 } from "./player-history.mjs";
 import {
   canonicalExternalDirectory,
@@ -579,6 +581,7 @@ export async function createPanel(options = {}) {
   let configBusy = false;
   let startedAt = mode === "demo" ? Date.now() - 3_600_000 : null;
   let processHandle = null;
+  let processStop;
   let stopTimer;
   let terminationPromise;
   let restartRequested = false;
@@ -920,6 +923,27 @@ export async function createPanel(options = {}) {
         stdio: ["pipe", "pipe", "pipe"],
       });
       processHandle = child;
+      const stop = createLauncherStop({
+        child,
+        windowsBatch:
+          process.platform === "win32" &&
+          configuration.launchType === "script" &&
+          /\.(?:bat|cmd)$/i.test(configuration.launchScript),
+        onShutdownStarted: () => {
+          if (processHandle !== child) return;
+          clearTimeout(stopTimer);
+          status = "stopping";
+          clearPlayers();
+        },
+        onInputClosed: (reason) =>
+          append(
+            reason === "shutdown"
+              ? "[Panel] Closing launcher input while Minecraft finishes saving."
+              : "[Panel] Continuing past the launcher's pause prompt.",
+            "info",
+          ),
+      });
+      processStop = stop;
       telemetry.reset(child.pid);
       startedAt = Date.now();
       const bindOutput = (stream, defaultLevel) => {
@@ -927,6 +951,7 @@ export async function createPanel(options = {}) {
         stream.setEncoding("utf8");
         stream.on("data", (chunk) => {
           buffer += chunk;
+          if (processHandle === child) stop.observe(buffer);
           const chunks = buffer.split(/\r?\n/);
           buffer = chunks.pop().slice(-32768);
           for (const text of chunks) {
@@ -962,6 +987,7 @@ export async function createPanel(options = {}) {
         telemetry.reset(child.pid);
         clearTimeout(stopTimer);
         processHandle = null;
+        processStop = undefined;
         status = terminationPromise ? "stopping" : "offline";
         startedAt = null;
         clearPlayers();
@@ -1023,11 +1049,12 @@ export async function createPanel(options = {}) {
         demoTimer.unref();
       } else {
         const child = processHandle;
-        // A foreground script may fail to pass stop through or wait after Java
-        // exits. Bound that wait and terminate the owned tree before restarting.
+        const stop = processStop;
+        // Bound an unresponsive wrapper, but never interrupt Minecraft after it
+        // confirms graceful shutdown. A trailing batch pause is handled on stdout.
         if (["script", "executable"].includes(configuration.launchType)) {
           stopTimer = setTimeout(() => {
-            if (processHandle !== child) return;
+            if (processHandle !== child || stop.shutdownStarted) return;
             append(
               "[Panel] The launcher did not exit after stop. Terminating its process tree…",
               "warn",
@@ -1045,7 +1072,7 @@ export async function createPanel(options = {}) {
           }, options.stopTimeoutMs ?? 15000);
           stopTimer.unref();
         }
-        child.stdin.write("stop\n");
+        stop.requestStop();
       }
     }
     await audit(
@@ -1598,6 +1625,27 @@ export async function createPanel(options = {}) {
       `/api/players/${action}`,
       trackOperation(async (req, res) => {
         const name = validatePlayerName(req.body?.name);
+        if (req.body.uuid !== undefined) {
+          if (!validPlayerUuid(req.body.uuid))
+            throw error(
+              400,
+              "The player UUID is invalid. Refresh the player list.",
+            );
+          const snapshot = await loadPlayerHistory();
+          const matches = snapshot.history.filter(
+            (player) => player.name.toLowerCase() === name.toLowerCase(),
+          );
+          if (
+            !matches.some(
+              (player) => player.uuid === req.body.uuid.toLowerCase(),
+            ) ||
+            new Set(matches.map((player) => player.uuid)).size > 1
+          )
+            throw error(
+              409,
+              "This player's identity changed or is unavailable. Refresh the player list before trying again.",
+            );
+        }
         if (status !== "running")
           throw error(
             409,
@@ -2057,6 +2105,16 @@ export async function createPanel(options = {}) {
     serverDir,
     tick,
     descriptor,
+    assertRemovable: () => {
+      if (closed) throw error(409, "This server is already shutting down.");
+      if (status !== "offline" || processHandle || terminationPromise)
+        throw error(409, "Stop this server before removing it from the panel.");
+      if (configBusy || backupBusy || activeMutations || inFlightTasks.size)
+        throw error(
+          409,
+          "Wait for this server's current operation to finish before removing it.",
+        );
+    },
     updateConfiguration: (...args) => {
       if (closed)
         return Promise.reject(error(503, "The panel is shutting down."));
@@ -2081,48 +2139,51 @@ export async function createPanel(options = {}) {
           if (terminationPromise) await terminationPromise;
           if (processHandle) {
             const child = processHandle;
+            const stop = processStop;
             const exited = new Promise((resolve) =>
               child.once("close", resolve),
             );
-            child.stdin.write("stop\n");
+            stop.requestStop();
             let timeout;
             try {
-              if (gracefulOnly) await exited;
+              if (gracefulOnly || stop.shutdownStarted) await exited;
               else
                 await Promise.race([
                   exited,
                   new Promise((resolve) => {
-                    timeout = setTimeout(
-                      resolve,
-                      options.stopTimeoutMs ?? 15000,
-                    );
+                    timeout = setTimeout(() => {
+                      if (!stop.shutdownStarted) resolve();
+                    }, options.stopTimeoutMs ?? 15000);
                   }),
                 ]);
               if (processHandle === child) {
-                await terminateProcessTree(child, {
-                  tree: ["script", "executable"].includes(
-                    configuration.launchType,
-                  ),
-                  spawnProcess: options.spawnProcess,
-                });
-                let killTimeout;
-                try {
-                  await Promise.race([
-                    exited,
-                    new Promise((_resolve, reject) => {
-                      killTimeout = setTimeout(
-                        () =>
-                          reject(
-                            new Error(
-                              "The server process did not exit after termination. Close it before restarting the panel.",
+                if (stop.shutdownStarted) await exited;
+                else {
+                  await terminateProcessTree(child, {
+                    tree: ["script", "executable"].includes(
+                      configuration.launchType,
+                    ),
+                    spawnProcess: options.spawnProcess,
+                  });
+                  let killTimeout;
+                  try {
+                    await Promise.race([
+                      exited,
+                      new Promise((_resolve, reject) => {
+                        killTimeout = setTimeout(
+                          () =>
+                            reject(
+                              new Error(
+                                "The server process did not exit after termination. Close it before restarting the panel.",
+                              ),
                             ),
-                          ),
-                        5000,
-                      );
-                    }),
-                  ]);
-                } finally {
-                  clearTimeout(killTimeout);
+                          5000,
+                        );
+                      }),
+                    ]);
+                  } finally {
+                    clearTimeout(killTimeout);
+                  }
                 }
               }
             } finally {
@@ -2745,28 +2806,28 @@ export async function createFleet(options = {}) {
     const result = await serialize(async () => {
       const entry = registry.servers.find((item) => item.id === req.params.id);
       if (!entry) throw error(404, "Server not found.");
-      if (entry.mode !== "demo")
-        throw error(
-          409,
-          "Only demo servers can be removed here. Live servers and their worlds are protected.",
-        );
       const runtime = runtimes.get(entry.id);
-      await runtime.audit(
-        "server",
-        "Demo removal requested",
-        "Remove this demo from the panel registry and preserve all of its files and backups on disk.",
-      );
-      await runtime.close();
+      // Missing imported folders are represented by an offline, inactive
+      // placeholder and can still be removed without recreating their source.
+      runtime.assertRemovable?.();
       const servers = registry.servers.filter((item) => item.id !== entry.id);
       const defaultServerId =
         registry.defaultServerId === entry.id
           ? (servers[0]?.id ?? null)
           : registry.defaultServerId;
       try {
+        // close() blocks new work synchronously, before any await can let a
+        // concurrent start or file write slip past the removal guard.
+        await runtime.close();
+        await runtime.audit?.(
+          "server",
+          "Server removal requested",
+          "Remove this server from the panel registry. Preserve its Minecraft files, worlds, backups, and Recycle Bin data on disk.",
+        );
         await persist({ ...registry, servers, defaultServerId });
       } catch (cause) {
         runtimes.delete(entry.id);
-        await makeRuntime(entry);
+        await makeRuntime(entry, true);
         throw cause;
       }
       runtimes.delete(entry.id);
