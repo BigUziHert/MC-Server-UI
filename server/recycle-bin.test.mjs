@@ -22,13 +22,17 @@ const exdev = () =>
   Object.assign(new Error("fixture crosses volumes"), { code: "EXDEV" });
 
 async function fixture(t) {
-  const root = await fs.mkdtemp(path.join(os.tmpdir(), "mc-recycle-test-"));
+  // Windows CI can expose TEMP through an 8.3 alias. Fault injection and
+  // imported-folder identities must compare the same canonical paths as the API.
+  const root = await fs.realpath(
+    await fs.mkdtemp(path.join(os.tmpdir(), "mc-recycle-test-")),
+  );
   const dataDir = path.join(root, "panel");
   const serverDir = path.join(root, "existing-minecraft");
   await fs.mkdir(dataDir);
   await fs.mkdir(serverDir);
   t.after(async () => {
-    assert.equal(path.dirname(root), path.resolve(os.tmpdir()));
+    assert.equal(path.dirname(root), await fs.realpath(os.tmpdir()));
     assert.ok(path.basename(root).startsWith("mc-recycle-test-"));
     await fs.rm(root, { recursive: true, force: true });
   });
