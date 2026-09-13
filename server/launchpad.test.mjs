@@ -168,6 +168,21 @@ async function fixture(t, options = {}) {
       return Response.json([{ version: "1.21.1", version_type: "release" }]);
     if (address.pathname === "/v2/version_files")
       return Response.json({ [hashes(old).sha512]: versions.old });
+    if (address.pathname === "/v2/version_files/update")
+      return Response.json(
+        Object.fromEntries(
+          JSON.parse(init.body).hashes.map((hash) => [
+            hash,
+            hash === hashes(dependency).sha512 ? versions.dep : versions.new,
+          ]),
+        ),
+      );
+    if (address.pathname === "/v2/versions")
+      return Response.json(
+        JSON.parse(address.searchParams.get("ids"))
+          .map((id) => versions[id])
+          .filter(Boolean),
+      );
     if (address.pathname === "/v2/projects")
       return Response.json(
         JSON.parse(address.searchParams.get("ids")).map((id) => ({
@@ -284,6 +299,343 @@ async function waitForJob(service, id) {
     await new Promise((resolve) => setTimeout(resolve, 5));
   }
   assert.fail("Fixture install did not complete");
+}
+
+test("local inventory needs no provider, reuses unchanged hashes and notices same-size edits with restored mtime", async (t) => {
+  const f = await fixture(t);
+  const open = fs.open.bind(fs),
+    reads = [];
+  t.mock.method(fs, "open", async (target, mode, ...rest) => {
+    if (mode === "r" && String(target).includes(`${path.sep}mods${path.sep}`))
+      reads.push(String(target));
+    return open(target, mode, ...rest);
+  });
+  const first = await f.service.installed({ ...selection, local: true });
+  assert.equal(first.items.length, 1);
+  assert.equal(first.items[0].platform, null);
+  assert.equal(f.requests.length, 0);
+  assert.equal(reads.length, 1);
+  await f.service.installed({ ...selection, local: "true" });
+  assert.equal(
+    reads.length,
+    1,
+    "the local refresh does not read unchanged JAR bytes again",
+  );
+  await f.service.installed(selection);
+  const known = await f.service.installed({ ...selection, local: true });
+  assert.equal(known.items[0].author, "FixtureAuthor");
+  assert.equal(known.items[0].update.id, "new");
+  assert.equal(reads.length, 1);
+  const target = path.join(f.serverDir, "mods", "old.jar"),
+    stat = await fs.stat(target);
+  await fs.writeFile(target, Buffer.alloc(f.old.length, 120));
+  await fs.utimes(target, stat.atime, stat.mtime);
+  const changed = await f.service.installed({ ...selection, local: true });
+  assert.equal(reads.length, 2);
+  assert.equal(changed.items[0].platform, null);
+  assert.equal(changed.items[0].update, undefined);
+  assert.notEqual(changed.items[0].sha512, first.items[0].sha512);
+});
+
+test("updating one mod keeps unrelated results cached and immediately publishes the new local filename", async (t) => {
+  const f = await fixture(t);
+  await fs.writeFile(path.join(f.serverDir, "mods", "dep.jar"), f.dependency);
+  await fs.writeFile(
+    path.join(f.dataDir, "launchpad", "installed.json"),
+    JSON.stringify([
+      {
+        path: "mods/dep.jar",
+        sha512: hashes(f.dependency).sha512,
+        platform: "modrinth",
+        projectId: "dependency",
+        versionId: "dep",
+        title: "Dependency",
+        versionName: "1.0",
+        type: "mod",
+      },
+    ]),
+  );
+  const service = await f.boot();
+  await service.installed(selection);
+  const batches = () =>
+    f.requests.filter(
+      ({ url }) => new URL(url).pathname === "/v2/version_files/update",
+    );
+  assert.equal(batches().length, 1);
+  await service.installed(selection);
+  assert.equal(
+    batches().length,
+    1,
+    "unchanged compatible update results have a short cache",
+  );
+  const plan = await service.preview({
+    ...selection,
+    replacePath: "mods/old.jar",
+  });
+  assert.equal(
+    batches().length,
+    1,
+    "reviewing an update does not check every installed project's releases",
+  );
+  assert.equal(
+    (await finish(service, { planId: plan.planId, confirmed: true })).status,
+    "completed",
+  );
+  const beforeLocal = f.requests.length;
+  const local = await service.installed({ ...selection, local: true });
+  assert.equal(f.requests.length, beforeLocal);
+  assert.deepEqual(local.items.map(({ path }) => path).sort(), [
+    "mods/dep.jar",
+    "mods/new.jar",
+  ]);
+  assert.equal(
+    local.items.find(({ path }) => path === "mods/new.jar").versionId,
+    "new",
+  );
+  await service.installed(selection);
+  assert.equal(batches().length, 2);
+  assert.deepEqual(JSON.parse(batches().at(-1).body).hashes, [
+    hashes(f.newer).sha512,
+  ]);
+  await service.installed({ ...selection, refresh: "true" });
+  assert.equal(
+    batches().length,
+    3,
+    "the user's Refresh explicitly checks again",
+  );
+  assert.equal(JSON.parse(batches().at(-1).body).hashes.length, 2);
+});
+
+test("one unreadable package does not hide the remaining installed mods", async (t) => {
+  const f = await fixture(t);
+  const blocked = path.join(f.serverDir, "mods", "locked.jar");
+  await fs.writeFile(blocked, "unreadable fixture");
+  const open = fs.open.bind(fs);
+  t.mock.method(fs, "open", async (target, ...args) => {
+    if (target === blocked)
+      throw Object.assign(new Error("File is locked"), { code: "EACCES" });
+    return open(target, ...args);
+  });
+  const local = await f.service.installed({ ...selection, local: true });
+  assert.equal(local.items.length, 2);
+  assert.match(local.warnings.join(" "), /locked.jar could not be read/);
+  assert.equal(f.requests.length, 0);
+  const full = await f.service.installed(selection);
+  assert.equal(
+    full.items.find((item) => item.path === "mods/old.jar").update.id,
+    "new",
+  );
+  assert.equal(
+    full.items.find((item) => item.path === "mods/locked.jar").platform,
+    null,
+  );
+  assert.match(full.warnings.join(" "), /locked.jar could not be read/);
+});
+
+test("overlapping installed scans share remote work while another local read remains available", async (t) => {
+  let release, started;
+  const held = new Promise((resolve) => {
+    release = resolve;
+  });
+  const began = new Promise((resolve) => {
+    started = resolve;
+  });
+  const f = await fixture(t, {
+    request: async (url) => {
+      if (new URL(url).pathname === "/v2/version_files/update") {
+        started();
+        await held;
+      }
+    },
+  });
+  const first = f.service.installed(selection);
+  await began;
+  const second = f.service.installed(selection);
+  const local = await f.service.installed({ ...selection, local: true });
+  assert.equal(local.items.length, 1);
+  release();
+  const [a, b] = await Promise.all([first, second]);
+  assert.equal(a.items[0].update.id, "new");
+  assert.deepEqual(a, b);
+  a.items[0].title = "Modified caller copy";
+  assert.notEqual(a.items[0].title, b.items[0].title);
+  assert.equal(
+    f.requests.filter(
+      ({ url }) => new URL(url).pathname === "/v2/version_files/update",
+    ).length,
+    1,
+  );
+});
+
+test("an unresponsive provider cannot hold installed rows past the overall remote deadline", async (t) => {
+  const timeout = AbortSignal.timeout.bind(AbortSignal),
+    deadline = new AbortController();
+  t.mock.method(AbortSignal, "timeout", (duration) =>
+    duration === 30000 ? deadline.signal : timeout(duration),
+  );
+  let started;
+  const began = new Promise((resolve) => {
+    started = resolve;
+  });
+  const f = await fixture(t, {
+    request: async (url) => {
+      if (new URL(url).pathname === "/v2/version_files/update") {
+        started();
+        return new Promise(() => {}); // Deliberately ignores AbortSignal.
+      }
+    },
+  });
+  const pending = f.service.installed(selection);
+  await began;
+  deadline.abort(new DOMException("Timed out", "TimeoutError"));
+  const result = await pending;
+  assert.equal(result.items.length, 1);
+  assert.equal(result.items[0].title, "Fixture Project");
+  assert.match(result.warnings.join(" "), /too long/);
+  assert.equal(
+    (await f.service.installed({ ...selection, local: true })).items[0].author,
+    "FixtureAuthor",
+  );
+});
+
+test("fallback update checks share six slots across overlapping filters and cache each project", async (t) => {
+  const f = await fixture(t);
+  await fs.unlink(path.join(f.serverDir, "mods", "old.jar"));
+  const receipts = [];
+  for (let index = 0; index < 14; index++) {
+    const name = `mod-${index}.jar`,
+      data = bytes(`fixture-${index}`);
+    await fs.writeFile(path.join(f.serverDir, "mods", name), data);
+    receipts.push({
+      path: `mods/${name}`,
+      sha512: hashes(data).sha512,
+      platform: "fixture",
+      projectId: `project-${index}`,
+      versionId: "old",
+      title: name,
+      type: "mod",
+    });
+  }
+  await fs.writeFile(
+    path.join(f.dataDir, "launchpad", "installed.json"),
+    JSON.stringify(receipts),
+  );
+  let active = 0,
+    peak = 0,
+    calls = 0,
+    release,
+    started;
+  const held = new Promise((resolve) => {
+    release = resolve;
+  });
+  const began = new Promise((resolve) => {
+    started = resolve;
+  });
+  let scans = 0,
+    twoScans;
+  const bothScanning = new Promise((resolve) => {
+    twoScans = resolve;
+  });
+  const service = await f.boot({
+    extraProviders: [
+      {
+        id: "fixture",
+        name: "Fixture",
+        types: ["mod"],
+        async projectMetadata() {
+          if (++scans === 2) twoScans();
+          return { projects: [], warnings: [] };
+        },
+        async versions(input) {
+          assert.ok(input.signal instanceof AbortSignal);
+          calls++;
+          active++;
+          peak = Math.max(peak, active);
+          if (active === 6) started();
+          await held;
+          active--;
+          return [
+            {
+              id: "new",
+              name: "New",
+              version: "2",
+              publishedAt: "2026-02-01",
+              downloadable: true,
+            },
+            {
+              id: "old",
+              name: "Old",
+              version: "1",
+              publishedAt: "2026-01-01",
+              downloadable: true,
+            },
+          ];
+        },
+      },
+    ],
+  });
+  const pending = service.installed(selection);
+  await began;
+  const overlapping = service.installed({
+    ...selection,
+    gameVersion: "1.21.2",
+  });
+  await bothScanning;
+  await new Promise(setImmediate);
+  assert.equal(
+    calls,
+    6,
+    "requests start together but the whole collection is not fired at once",
+  );
+  release();
+  const [result] = await Promise.all([pending, overlapping]);
+  assert.equal(peak, 6);
+  assert.equal(calls, 28);
+  assert.ok(result.items.every((item) => item.update?.id === "new"));
+  await service.installed(selection);
+  assert.equal(calls, 28);
+  await service.installed({ ...selection, refresh: true });
+  assert.equal(calls, 42);
+});
+
+for (const sameName of [false, true]) {
+  test(`preview rejects a file changed after cached identity lookup (${sameName ? "same" : "different"} filename)`, async (t) => {
+    const f = await fixture(t);
+    if (sameName) f.versions.new.files[0].filename = "old.jar";
+    const changed = bytes("a different project's mod");
+    let armed = false,
+      matches = 0;
+    const service = await f.boot({
+      safePath: async (root, relative = "") => {
+        const result = await safePath(root, relative);
+        if (
+          armed &&
+          root === f.serverDir &&
+          relative === (sameName ? "mods/old.jar" : "mods/new.jar")
+        ) {
+          if (!sameName || ++matches === 2) {
+            armed = false;
+            await fs.writeFile(
+              path.join(f.serverDir, "mods", "old.jar"),
+              changed,
+            );
+          }
+        }
+        return result;
+      },
+    });
+    await service.installed(selection);
+    armed = true;
+    await assert.rejects(
+      service.preview({ ...selection, replacePath: "mods/old.jar" }),
+      /changed after identification/,
+    );
+    assert.equal(f.mutations, 0);
+    assert.deepEqual(
+      await fs.readFile(path.join(f.serverDir, "mods", "old.jar")),
+      changed,
+    );
+  });
 }
 
 for (const fails of [false, true]) {
@@ -1242,6 +1594,8 @@ test("CurseForge packs require author server packs and honor restricted download
 });
 
 test("existing CurseForge-only mods require matching fingerprints and SHA-1 before offering compatible updates", async (t) => {
+  let now = Date.now();
+  t.mock.method(Date, "now", () => now);
   let fingerprint,
     sha1,
     wrongHash = false;
@@ -1339,6 +1693,7 @@ test("existing CurseForge-only mods require matching fingerprints and SHA-1 befo
     1,
   );
   wrongHash = true;
+  now += 10 * 60_000 + 1;
   result = await f.service.installed(selection);
   assert.equal(result.items[0].platform, null);
   assert.equal(result.items[0].update, undefined);

@@ -1,4 +1,4 @@
-import { test as base, expect } from "@playwright/test";
+import { test as base, expect, type Route } from "@playwright/test";
 import { removeTestServer, stopTestServer } from "./server-fixtures";
 
 const test = base.extend<{ serverId: string }>({
@@ -992,6 +992,408 @@ test("Launchpad installed sorts order the entire list before paging and retain i
     fullPage: true,
     animations: "disabled",
   });
+});
+
+test("Launchpad keeps refreshed local files usable after installation while remote details fail and retry", async ({
+  page,
+  serverId,
+}) => {
+  await page.clock.install();
+  const version = {
+    id: "new",
+    name: "Better Mod 2.0",
+    version: "2.0",
+    gameVersions: ["1.21.1"],
+    loaders: ["neoforge"],
+    publishedAt: "2026-09-01T00:00:00Z",
+    downloadable: true,
+  };
+  const config = {
+    platforms: [
+      { id: "modrinth", name: "Modrinth", available: true, types: ["mod"] },
+    ],
+    gameVersion: "1.21.1",
+    gameVersions: ["1.21.1"],
+    loader: "neoforge",
+    status: "offline",
+    warnings: [],
+  };
+  let replaced = false,
+    configRequests = 0,
+    localRequests = 0;
+  let holdConfig = false;
+  let delayedFull: Route | undefined,
+    delayedConfig: Route | undefined,
+    timedOutFull: Route | undefined;
+  const fullRequests: URL[] = [];
+  const inventory = (remote: boolean) => [
+    {
+      path: replaced ? "mods/better-2.jar" : "mods/better-1.jar",
+      name: replaced ? "better-2.jar" : "better-1.jar",
+      title: "Better Mod",
+      size: replaced ? 2048 : 1024,
+      platform: "modrinth",
+      projectId: "better",
+      versionId: replaced ? "new" : "old",
+      versionName: replaced ? "2.0" : "1.0",
+      ...(remote
+        ? {
+            author: replaced ? "Recovered author" : "Original author",
+            update: replaced ? null : version,
+          }
+        : {}),
+    },
+    {
+      path: "mods/alpha.jar",
+      name: "alpha.jar",
+      title: "Alpha",
+      size: 512,
+      platform: "modrinth",
+      projectId: "alpha",
+      versionId: "old",
+    },
+    {
+      path: "mods/zeta.jar",
+      name: "zeta.jar",
+      title: "Zeta",
+      size: 4096,
+      platform: "modrinth",
+      projectId: "zeta",
+      versionId: "old",
+    },
+  ];
+  await page.route("**/api/launchpad", (route) => {
+    configRequests++;
+    if (holdConfig) {
+      delayedConfig = route;
+      return;
+    }
+    return route.fulfill({ json: config });
+  });
+  await page.route("**/api/launchpad/search?**", (route) =>
+    route.fulfill({ json: { projects: [], total: 0, offset: 0, limit: 10 } }),
+  );
+  await page.route("**/api/launchpad/installed?**", (route) => {
+    expect(route.request().headers()["x-server-id"]).toBe(serverId);
+    const url = new URL(route.request().url());
+    if (url.searchParams.get("local") === "true") {
+      localRequests++;
+      return route.fulfill({ json: { items: inventory(false), warnings: [] } });
+    }
+    fullRequests.push(url);
+    if (fullRequests.length === 2) {
+      delayedFull = route;
+      return;
+    }
+    if (fullRequests.length === 5) {
+      timedOutFull = route;
+      return;
+    }
+    return route.fulfill({ json: { items: inventory(true), warnings: [] } });
+  });
+  await page.route("**/api/launchpad/versions?**", (route) =>
+    route.fulfill({ json: { versions: [version] } }),
+  );
+  await page.route("**/api/launchpad/preview", (route) => {
+    expect(route.request().postDataJSON()).toMatchObject({
+      replacePath: "mods/better-1.jar",
+      versionId: "new",
+    });
+    return route.fulfill({
+      json: {
+        planId: "local-refresh-plan",
+        title: "Better Mod",
+        versionName: "2.0",
+        files: [
+          {
+            path: "mods/better-2.jar",
+            previousPath: "mods/better-1.jar",
+            size: 2048,
+            action: "replace",
+          },
+        ],
+        warnings: [],
+        expiresAt: "2099-01-01T00:00:00Z",
+      },
+    });
+  });
+  await page.route("**/api/launchpad/install", (route) =>
+    route.fulfill({
+      json: {
+        job: {
+          id: "local-refresh-job",
+          status: "running",
+          message: "Installing fixture",
+          completed: 0,
+          total: 1,
+        },
+      },
+    }),
+  );
+  await page.route("**/api/launchpad/jobs/local-refresh-job", (route) => {
+    replaced = true;
+    return route.fulfill({
+      json: {
+        job: {
+          id: "local-refresh-job",
+          status: "completed",
+          message: "Better Mod updated",
+          completed: 1,
+          total: 1,
+        },
+      },
+    });
+  });
+  await page.goto("/#launchpad");
+  await page.getByRole("switch", { name: "Show installed content" }).check();
+  await expect(
+    page.getByRole("button", { name: "Update Better Mod", exact: true }),
+  ).toBeVisible();
+  const sort = page.getByLabel("Sort installed content", { exact: true });
+  await sort.selectOption("size");
+  await page
+    .getByRole("button", { name: "Update Better Mod", exact: true })
+    .click();
+  const dialog = page.getByRole("dialog");
+  await dialog.getByRole("button", { name: /Review/ }).click();
+  await dialog
+    .getByRole("button", { name: "Confirm installation", exact: true })
+    .click();
+  await expect.poll(() => Boolean(delayedFull)).toBe(true);
+  const paths = page.locator(".launchpad-project-body > p");
+  const refreshing = page.getByRole("status", {
+    name: "Installed content refresh",
+    exact: true,
+  });
+  await expect(refreshing).toBeVisible();
+  await expect(paths).toHaveText([
+    "mods/zeta.jar",
+    "mods/better-2.jar",
+    "mods/alpha.jar",
+  ]);
+  await expect(
+    page.getByText("mods/better-1.jar", { exact: true }),
+  ).toHaveCount(0);
+  await expect(
+    page.getByRole("button", {
+      name: "Choose version for Better Mod",
+      exact: true,
+    }),
+  ).toBeEnabled();
+  await sort.selectOption("name");
+  await expect(paths).toHaveText([
+    "mods/alpha.jar",
+    "mods/better-2.jar",
+    "mods/zeta.jar",
+  ]);
+  await page.getByLabel("Search Launchpad", { exact: true }).fill("better");
+  await expect(paths).toHaveText(["mods/better-2.jar"]);
+  await page.getByLabel("Search Launchpad", { exact: true }).fill("");
+  await delayedFull!.fulfill({
+    status: 503,
+    json: { error: "Provider fixture is unavailable." },
+  });
+  await expect(page.getByRole("alert")).toContainText(
+    "Provider fixture is unavailable.",
+  );
+  await expect(paths).toHaveText([
+    "mods/alpha.jar",
+    "mods/better-2.jar",
+    "mods/zeta.jar",
+  ]);
+  await page
+    .getByRole("button", { name: "Retry installed refresh", exact: true })
+    .click();
+  await expect(
+    page.getByRole("article", { name: "Better Mod", exact: true }),
+  ).toContainText("By Recovered author");
+  await expect(refreshing).toHaveCount(0);
+  await expect(
+    page.getByRole("button", { name: "Retry installed refresh", exact: true }),
+  ).toHaveCount(0);
+  expect(localRequests).toBe(3);
+  expect(
+    fullRequests.map((url) => url.searchParams.get("refresh") === "true"),
+  ).toEqual([false, false, true]);
+  holdConfig = true;
+  await page
+    .getByRole("button", {
+      name: "Refresh Launchpad and check updates",
+      exact: true,
+    })
+    .click();
+  await expect.poll(() => Boolean(delayedConfig)).toBe(true);
+  await expect.poll(() => fullRequests.length).toBe(4);
+  await expect(refreshing).toHaveCount(0);
+  await delayedConfig!.fulfill({ json: { ...config } });
+  holdConfig = false;
+  await expect(
+    page.getByRole("button", {
+      name: "Refresh Launchpad and check updates",
+      exact: true,
+    }),
+  ).toBeEnabled();
+  // Advance the scan debounce after the new config object arrives, without a wall-clock sleep.
+  await page.clock.runFor(1000);
+  expect(configRequests).toBe(2);
+  expect(localRequests).toBe(4);
+  expect(fullRequests.length).toBe(4);
+  expect(fullRequests[3].searchParams.get("refresh")).toBe("true");
+  await expect(paths).toHaveText([
+    "mods/alpha.jar",
+    "mods/better-2.jar",
+    "mods/zeta.jar",
+  ]);
+  await page
+    .getByRole("button", {
+      name: "Refresh Launchpad and check updates",
+      exact: true,
+    })
+    .click();
+  await expect.poll(() => Boolean(timedOutFull)).toBe(true);
+  await expect(refreshing).toBeVisible();
+  await page.clock.runFor(45_001);
+  await expect(page.getByRole("alert")).toContainText(
+    "The online check took too long. Please try again shortly.",
+  );
+  await expect(paths).toHaveText([
+    "mods/alpha.jar",
+    "mods/better-2.jar",
+    "mods/zeta.jar",
+  ]);
+  await expect(sort).toBeEnabled();
+  await page
+    .getByRole("button", { name: "Retry installed refresh", exact: true })
+    .click();
+  await expect(
+    page.getByRole("article", { name: "Better Mod", exact: true }),
+  ).toContainText("By Recovered author");
+  await expect(refreshing).toHaveCount(0);
+  await expect(page.getByRole("alert")).toHaveCount(0);
+  expect(localRequests).toBe(6);
+  expect(fullRequests.length).toBe(6);
+  expect(fullRequests[5].searchParams.get("refresh")).toBe("true");
+});
+
+test("Launchpad ignores delayed installed metadata after loader, version, type and server changes", async ({
+  page,
+  request,
+  serverId,
+}) => {
+  await page.clock.install();
+  const fleet = await (await request.get("/api/servers")).json();
+  let port = 29910;
+  while (fleet.servers.some((server: { port: number }) => server.port === port))
+    port++;
+  const created = await request.post("/api/servers", {
+    data: { name: "Launchpad second scope", mode: "demo", port },
+  });
+  expect(created.status()).toBe(201);
+  const second = (await created.json()).server;
+  await stopTestServer(request, second.id);
+  try {
+    const delayed: {
+      route: Route;
+      title: string;
+      item: Record<string, unknown>;
+    }[] = [];
+    await page.route("**/api/launchpad", (route) =>
+      route.fulfill({
+        json: {
+          platforms: [
+            {
+              id: "modrinth",
+              name: "Modrinth",
+              available: true,
+              types: ["mod", "datapack"],
+            },
+          ],
+          gameVersion: "1.21.1",
+          gameVersions: ["1.21.1", "1.20.1"],
+          loader: "neoforge",
+          status: "offline",
+          warnings: [],
+        },
+      }),
+    );
+    await page.route("**/api/launchpad/search?**", (route) =>
+      route.fulfill({ json: { projects: [], total: 0, offset: 0, limit: 10 } }),
+    );
+    await page.route("**/api/launchpad/installed?**", (route) => {
+      const id = route.request().headers()["x-server-id"];
+      expect([serverId, second.id]).toContain(id);
+      const params = new URL(route.request().url()).searchParams;
+      const title = `${id === serverId ? "First" : "Second"} ${params.get("type")} ${params.get("loader")} ${params.get("gameVersion")}`;
+      const datapack = params.get("type") === "datapack";
+      const item = {
+        path: `${datapack ? "world/datapacks" : "mods"}/${title.replaceAll(" ", "-")}.${datapack ? "zip" : "jar"}`,
+        name: datapack ? "scoped.zip" : "scoped.jar",
+        title,
+        size: 1024,
+        platform: "modrinth",
+        projectId: title.replaceAll(" ", "-"),
+        versionId: "old",
+      };
+      if (params.get("local") === "true")
+        return route.fulfill({ json: { items: [item], warnings: [] } });
+      delayed.push({ route, title, item });
+    });
+    await page.goto("/#launchpad");
+    const toggle = page.getByRole("switch", { name: "Show installed content" });
+    await toggle.check();
+    const names = page.getByRole("article").getByRole("heading", { level: 3 });
+    const expectScope = async (title: string) => {
+      await expect(names).toHaveText([title]);
+      await expect
+        .poll(() => delayed.some((entry) => entry.title === title))
+        .toBe(true);
+    };
+    await expectScope("First mod neoforge 1.21.1");
+    await page.getByLabel("Loader", { exact: true }).selectOption("fabric");
+    await expectScope("First mod fabric 1.21.1");
+    await page
+      .getByLabel("Minecraft version", { exact: true })
+      .selectOption("1.20.1");
+    await expectScope("First mod fabric 1.20.1");
+    await page.getByRole("tab", { name: "Datapacks", exact: true }).click();
+    await expectScope("First datapack datapack 1.20.1");
+    await page
+      .getByLabel("Switch server", { exact: true })
+      .selectOption(second.id);
+    await expect(page.getByLabel("Loader", { exact: true })).toHaveValue(
+      "neoforge",
+    );
+    await toggle.check();
+    const current = "Second mod neoforge 1.21.1";
+    await expectScope(current);
+    const latest = delayed.find((entry) => entry.title === current)!;
+    await latest.route.fulfill({
+      json: {
+        items: [{ ...latest.item, author: "Current scope author" }],
+        warnings: [],
+      },
+    });
+    await expect(page.getByRole("article")).toContainText(
+      "By Current scope author",
+    );
+    for (const stale of delayed.filter((entry) => entry !== latest).reverse())
+      await stale.route
+        .fulfill({
+          json: {
+            items: [{ ...stale.item, title: `STALE ${stale.title}` }],
+            warnings: [],
+          },
+        })
+        .catch(() => {});
+    await page.clock.runFor(500);
+    await expect(names).toHaveText([current]);
+    await expect(page.getByRole("article")).toContainText(
+      "By Current scope author",
+    );
+    await expect(page.getByText(/^STALE /)).toHaveCount(0);
+  } finally {
+    await removeTestServer(request, second.id);
+  }
 });
 
 test("Launchpad Minecraft selects show stable releases only and scope filters and reviewed targets", async ({

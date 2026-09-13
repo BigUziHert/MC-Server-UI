@@ -37,6 +37,76 @@ const loaders = [
   "datapack",
 ];
 const missing = (cause) => cause.code === "ENOENT" || cause.code === "ENOTDIR";
+const enabled = (value) => value === true || value === "true";
+const fileStamp = (stat) =>
+  [
+    stat.dev,
+    stat.ino,
+    stat.size,
+    stat.mtimeMs,
+    stat.ctimeMs,
+    stat.birthtimeMs,
+  ].join(":");
+function abortable(work, signal) {
+  if (!signal) return work;
+  return new Promise((resolve, reject) => {
+    const stop = () => reject(signal.reason);
+    signal.addEventListener("abort", stop, { once: true });
+    if (signal.aborted) stop();
+    Promise.resolve(work)
+      .then(resolve, reject)
+      .finally(() => signal.removeEventListener("abort", stop));
+  });
+}
+async function parallel(items, count, work, signal) {
+  let next = 0;
+  await Promise.all(
+    Array.from({ length: Math.min(count, items.length) }, async () => {
+      while (next < items.length && !signal?.aborted) {
+        const index = next++;
+        await work(items[index]);
+      }
+    }),
+  );
+}
+function requestLimiter(limit) {
+  let active = 0;
+  const queue = [];
+  const drain = () => {
+    while (active < limit && queue.length) {
+      const entry = queue.shift();
+      entry.signal?.removeEventListener("abort", entry.cancel);
+      if (entry.signal?.aborted) {
+        entry.reject(entry.signal.reason);
+        continue;
+      }
+      active++;
+      Promise.resolve()
+        .then(entry.work)
+        .then(entry.resolve, entry.reject)
+        .finally(() => {
+          active--;
+          drain();
+        });
+    }
+  };
+  return (work, signal) =>
+    new Promise((resolve, reject) => {
+      const entry = { work, signal, resolve, reject, cancel: null };
+      entry.cancel = () => {
+        const index = queue.indexOf(entry);
+        if (index >= 0) queue.splice(index, 1);
+        reject(signal.reason);
+      };
+      if (signal?.aborted) {
+        reject(signal.reason);
+        return;
+      }
+      signal?.addEventListener("abort", entry.cancel, { once: true });
+      queue.push(entry);
+      drain();
+    });
+}
 async function statOrNull(target) {
   try {
     return await fs.lstat(target);
@@ -171,6 +241,47 @@ export async function createLaunchpad(ctx) {
   const plans = new Map();
   const jobs = new Map();
   const previews = new Set();
+  // These caches accelerate display only. Preview and installation still hash
+  // destination bytes afresh before allowing any replacement.
+  const fileCache = new Map(),
+    hashFlights = new Map(),
+    identities = new Map();
+  const updateCache = new Map(),
+    updateFlights = new Map(),
+    updateFailures = new Map();
+  const versionCache = new Map(),
+    versionFlights = new Map();
+  const fallbackRequest = requestLimiter(6);
+  const inventoryFlights = new Map();
+  const remember = (cache, key, value) => {
+    cache.delete(key);
+    cache.set(key, value);
+    while (cache.size > 4000) cache.delete(cache.keys().next().value);
+  };
+  const identityFields = (item) =>
+    Object.fromEntries(
+      [
+        "platform",
+        "projectId",
+        "versionId",
+        "versionName",
+        "title",
+        "iconUrl",
+        "author",
+      ]
+        .filter((key) => item[key] !== undefined)
+        .map((key) => [key, item[key]]),
+    );
+  const updateKey = (input, item) =>
+    JSON.stringify([
+      input.type,
+      input.gameVersion,
+      input.loader,
+      item.platform,
+      item.projectId,
+      item.versionId,
+      item.sha512,
+    ]);
   let active = null,
     activeController = null,
     preparingInstall = false,
@@ -236,7 +347,10 @@ export async function createLaunchpad(ctx) {
     const limit = Math.min(100, Math.max(1, Number(input.limit) || 20));
     return {
       ...input,
-      signal: lifetime.signal,
+      signal:
+        input.signal instanceof AbortSignal
+          ? AbortSignal.any([lifetime.signal, input.signal])
+          : lifetime.signal,
       gameVersion,
       loader,
       query,
@@ -336,7 +450,7 @@ export async function createLaunchpad(ctx) {
       )
     );
   }
-  async function scan(type) {
+  async function scan(type, signal = lifetime.signal, warnings = []) {
     if (type === "modpack") return [];
     const relative = await destination(type);
     const directory = await safePath(serverDir, relative);
@@ -359,25 +473,72 @@ export async function createLaunchpad(ctx) {
       );
     const rows = [];
     for (const file of files) {
+      signal.throwIfAborted();
       const relativePath = `${relative}/${safeInstallPath(file.name)}`;
-      const target = await safePath(serverDir, relativePath);
-      const stat = await fs.lstat(target);
-      const sha512 = await fileHash(target);
+      let target, stat, sha512;
+      try {
+        target = await safePath(serverDir, relativePath);
+        stat = await fs.lstat(target);
+        if (!stat.isFile() || stat.isSymbolicLink()) continue;
+        const stamp = fileStamp(stat);
+        const cached = fileCache.get(relativePath);
+        if (cached?.stamp === stamp) sha512 = cached.sha512;
+        else {
+          const flightKey = `${relativePath}:${stamp}`;
+          let task = hashFlights.get(flightKey);
+          if (!task) {
+            task = fileHash(target).then(async (hash) => {
+              if (fileStamp(await fs.lstat(target)) !== stamp)
+                throw error(
+                  409,
+                  `${file.name} changed while it was being checked. Refresh and try again.`,
+                );
+              remember(fileCache, relativePath, { stamp, sha512: hash });
+              return hash;
+            });
+            hashFlights.set(flightKey, task);
+            void task.then(
+              () => hashFlights.delete(flightKey),
+              () => hashFlights.delete(flightKey),
+            );
+          }
+          sha512 = await abortable(task, signal);
+        }
+      } catch (cause) {
+        signal.throwIfAborted();
+        // A just-updated/deleted JAR can disappear between readdir and stat.
+        if (missing(cause)) continue;
+        fileCache.delete(relativePath);
+        warnings.push(`${file.name} could not be read: ${cause.message}`);
+        rows.push({
+          path: relativePath,
+          name: file.name,
+          size: stat?.size ?? 0,
+          platform: null,
+        });
+        continue;
+      }
       const receipt = receipts.find(
         (item) => item.path === relativePath && item.sha512 === sha512,
       );
+      const known = identities.get(sha512);
       rows.push({
         path: relativePath,
         name: file.name,
         size: stat.size,
         sha512,
         platform: null,
+        ...(known?.expiresAt > Date.now() ? known.value : {}),
         ...receipt,
       });
     }
     return rows;
   }
-  async function enrichProjectMetadata(items, warnings) {
+  async function enrichProjectMetadata(
+    items,
+    warnings,
+    signal = lifetime.signal,
+  ) {
     await Promise.all(
       providers.map(async (found) => {
         if (!found.projectMetadata) return;
@@ -386,9 +547,11 @@ export async function createLaunchpad(ctx) {
         );
         if (!known.length) return;
         try {
-          const result = await found.projectMetadata(
-            known.map((item) => item.projectId),
+          const result = await abortable(
+            found.projectMetadata(known.map((item) => item.projectId)),
+            signal,
           );
+          signal.throwIfAborted();
           const projects = new Map(
             result.projects.map((project) => [String(project.id), project]),
           );
@@ -411,27 +574,277 @@ export async function createLaunchpad(ctx) {
       }),
     );
   }
+  async function checkUpdates(input, items, warnings) {
+    if (!input.gameVersion || !input.loader) return;
+    const fail = (found, cause) => {
+      if (cause.cachedUpdateFailure) {
+        warnings.push(cause.message);
+        return;
+      }
+      const message = `${found.name} update checks: ${cause.message}`;
+      warnings.push(message);
+      if (cause.status !== 404)
+        updateFailures.set(found.id, {
+          message,
+          until: Date.now() + (cause.status === 429 ? 60_000 : 30_000),
+        });
+    };
+    const apply = (item, value) => {
+      if (value) item.update = value;
+      else delete item.update;
+    };
+    await Promise.all(
+      providers.map(async (found) => {
+        const known = items.filter(
+          (item) => item.platform === found.id && item.projectId,
+        );
+        if (!known.length) return;
+        const pending = [],
+          missing = [];
+        for (const item of known) {
+          const key = updateKey(input, item),
+            cached = updateCache.get(key);
+          if (!enabled(input.refresh) && cached?.expiresAt > Date.now())
+            apply(item, cached.value);
+          else if (updateFlights.has(key))
+            pending.push({ item, work: updateFlights.get(key) });
+          else missing.push(item);
+        }
+        const cooldown = updateFailures.get(found.id);
+        if (cooldown?.until > Date.now()) {
+          if (missing.length) warnings.push(cooldown.message);
+        } else if (missing.length && found.updates) {
+          const work = (async () => {
+            try {
+              const result = await abortable(
+                found.updates(input, missing),
+                input.signal,
+              );
+              warnings.push(...(result.warnings ?? []));
+              for (const item of missing) {
+                if (!Object.hasOwn(result.updates, item.sha512)) continue;
+                const value = result.updates[item.sha512];
+                remember(updateCache, updateKey(input, item), {
+                  value: value ? publicVersion(value) : null,
+                  expiresAt: Date.now() + 5 * 60_000,
+                });
+              }
+            } catch (cause) {
+              fail(found, cause);
+            }
+          })();
+          for (const item of missing) {
+            const key = updateKey(input, item);
+            const value = work.then(() => updateCache.get(key)?.value);
+            updateFlights.set(key, value);
+            void value.then(
+              () => updateFlights.delete(key),
+              () => updateFlights.delete(key),
+            );
+            pending.push({ item, work: value });
+          }
+        } else {
+          await parallel(
+            missing,
+            6,
+            async (item) => {
+              const cooldown = updateFailures.get(found.id);
+              if (cooldown?.until > Date.now()) {
+                warnings.push(cooldown.message);
+                return;
+              }
+              const key = updateKey(input, item);
+              let work = updateFlights.get(key);
+              if (!work) {
+                work = (async () => {
+                  try {
+                    const versionKey = JSON.stringify([
+                      found.id,
+                      input.type,
+                      input.gameVersion,
+                      input.loader,
+                      item.projectId,
+                    ]);
+                    let cached = versionCache.get(versionKey);
+                    if (
+                      enabled(input.refresh) ||
+                      !(cached?.expiresAt > Date.now())
+                    ) {
+                      let versionWork = versionFlights.get(versionKey);
+                      if (!versionWork) {
+                        versionWork = fallbackRequest(() => {
+                          const cooldown = updateFailures.get(found.id);
+                          if (cooldown?.until > Date.now())
+                            throw Object.assign(new Error(cooldown.message), {
+                              cachedUpdateFailure: true,
+                            });
+                          const signal = AbortSignal.any([
+                            input.signal,
+                            AbortSignal.timeout(8000),
+                          ]);
+                          return abortable(
+                            found.versions({
+                              ...input,
+                              projectId: item.projectId,
+                              signal,
+                            }),
+                            signal,
+                          );
+                        }, input.signal).then((versions) => {
+                          const entry = {
+                            versions,
+                            expiresAt: Date.now() + 5 * 60_000,
+                          };
+                          remember(versionCache, versionKey, entry);
+                          return entry;
+                        });
+                        versionFlights.set(versionKey, versionWork);
+                        void versionWork.then(
+                          () => versionFlights.delete(versionKey),
+                          () => versionFlights.delete(versionKey),
+                        );
+                      }
+                      cached = await abortable(versionWork, input.signal);
+                    }
+                    const versions = cached.versions
+                      .filter((value) => value.downloadable !== false)
+                      .sort((a, b) =>
+                        (b.publishedAt ?? "").localeCompare(
+                          a.publishedAt ?? "",
+                        ),
+                      );
+                    const current = versions.find(
+                        (value) => String(value.id) === item.versionId,
+                      ),
+                      newest = versions[0];
+                    const value =
+                      newest &&
+                      String(newest.id) !== item.versionId &&
+                      (!current ||
+                        (newest.publishedAt ?? "") >
+                          (current.publishedAt ?? ""))
+                        ? publicVersion(newest)
+                        : null;
+                    remember(updateCache, key, {
+                      value,
+                      expiresAt: Date.now() + 5 * 60_000,
+                    });
+                    return value;
+                  } catch (cause) {
+                    fail(found, cause);
+                  }
+                })();
+                updateFlights.set(key, work);
+                void work.then(
+                  () => updateFlights.delete(key),
+                  () => updateFlights.delete(key),
+                );
+              }
+              pending.push({ item, work });
+              await work;
+            },
+            input.signal,
+          );
+        }
+        await Promise.all(
+          pending.map(async ({ item, work }) => {
+            const value = await abortable(work, input.signal);
+            if (value !== undefined) apply(item, value);
+          }),
+        );
+      }),
+    );
+    input.signal.throwIfAborted();
+  }
   async function installed(input) {
     input = selection(input);
-    if (input.type === "modpack") {
-      const items = receipts
-        .filter((item) => item.type === "modpack" && item.pack)
-        .map((item) => ({ ...item }));
-      const warnings = [];
-      await enrichProjectMetadata(items, warnings);
-      return {
-        items: items.map((item) => ({ ...item, name: item.title })),
-        warnings,
-      };
+    const scanWarnings = [];
+    const items =
+      input.type === "modpack"
+        ? receipts
+            .filter((item) => item.type === "modpack" && item.pack)
+            .map((item) => ({ ...item, name: item.title }))
+        : await scan(input.type, input.signal, scanWarnings);
+    for (const item of items) {
+      const cached = updateCache.get(updateKey(input, item));
+      if (cached?.expiresAt > Date.now() && cached.value)
+        item.update = cached.value;
     }
-    const items = await scan(input.type),
-      warnings = [];
-    const unknown = items.filter((item) => !item.platform);
+    if (enabled(input.local)) return { items, warnings: scanWarnings };
+    const flightKey = JSON.stringify([
+      input.type,
+      input.gameVersion,
+      input.loader,
+      enabled(input.refresh),
+      Boolean(input.identityOnly),
+      items.map((item) => [
+        item.path,
+        item.sha512,
+        item.platform,
+        item.projectId,
+        item.versionId,
+      ]),
+    ]);
+    let task = inventoryFlights.get(flightKey);
+    if (!task) {
+      task = (async () => {
+        const warnings = [...scanWarnings];
+        const signal = AbortSignal.any([
+          lifetime.signal,
+          AbortSignal.timeout(30000),
+        ]);
+        try {
+          await installedDetails({ ...input, signal }, items, warnings);
+        } catch (cause) {
+          warnings.push(
+            signal.aborted
+              ? "Some mod details or update checks took too long. Your installed files are still shown. Refresh to retry."
+              : cause.message,
+          );
+        }
+        for (const item of items) {
+          if (!item.sha512) continue;
+          if (
+            item.platform ||
+            (!signal.aborted &&
+              !warnings.some((message) => /identification:/i.test(message)))
+          )
+            remember(identities, item.sha512, {
+              value: identityFields(item),
+              expiresAt: Date.now() + (item.platform ? 10 * 60_000 : 60_000),
+            });
+        }
+        return { items, warnings: [...new Set(warnings)] };
+      })();
+      inventoryFlights.set(flightKey, task);
+      void task.then(
+        () => inventoryFlights.delete(flightKey),
+        () => inventoryFlights.delete(flightKey),
+      );
+    }
+    return structuredClone(await abortable(task, input.signal));
+  }
+  async function installedDetails(input, items, warnings) {
+    if (input.type === "modpack") {
+      await enrichProjectMetadata(items, warnings, input.signal);
+      for (const item of items) item.name = item.title;
+      return;
+    }
+    const unknown = items.filter(
+      (item) =>
+        item.sha512 &&
+        !item.platform &&
+        !(identities.get(item.sha512)?.expiresAt > Date.now()),
+    );
     const modrinth = providers.find((value) => value.id === "modrinth");
     if (unknown.length) {
       try {
-        const matches = await modrinth.identify(
-          unknown.map((item) => item.sha512),
+        const matches = await abortable(
+          modrinth.identify(
+            unknown.map((item) => item.sha512),
+            { signal: input.signal },
+          ),
+          input.signal,
         );
         for (const item of unknown) {
           const version = matches[item.sha512];
@@ -448,14 +861,19 @@ export async function createLaunchpad(ctx) {
         warnings.push(`Modrinth identification: ${cause.message}`);
       }
     }
+    input.signal.throwIfAborted();
     if (await key()) {
       const candidates = items.filter(
-        (item) => !item.platform && item.size <= 128 * 1024 ** 2,
+        (item) =>
+          unknown.includes(item) &&
+          !item.platform &&
+          item.size <= 128 * 1024 ** 2,
       );
       if (candidates.length) {
         try {
           const fingerprints = new Map();
           for (const item of candidates) {
+            input.signal.throwIfAborted();
             const bytes = await fs.readFile(
               await safePath(serverDir, item.path),
             );
@@ -471,11 +889,15 @@ export async function createLaunchpad(ctx) {
               sha1: createHash("sha1").update(bytes).digest("hex"),
             });
           }
-          const result = await providers
-            .find((value) => value.id === "curseforge")
-            .identifyFingerprints(
-              [...fingerprints.values()].map((value) => value.fingerprint),
-            );
+          const result = await abortable(
+            providers
+              .find((value) => value.id === "curseforge")
+              .identifyFingerprints(
+                [...fingerprints.values()].map((value) => value.fingerprint),
+                { signal: input.signal },
+              ),
+            input.signal,
+          );
           for (const [item, digest] of fingerprints) {
             const match = result.exactMatches?.find(
               (value) =>
@@ -500,45 +922,17 @@ export async function createLaunchpad(ctx) {
         }
       }
     }
+    input.signal.throwIfAborted();
+    if (input.identityOnly) return;
     // Names and icons belong to the project, even with All loaders/versions.
     // Failed metadata requests must not suppress identification or updates.
-    await enrichProjectMetadata(items, warnings);
-    const checked = new Map();
-    for (const item of items) {
-      if (!item.platform || !input.gameVersion || !input.loader) continue;
-      try {
-        const found = await provider(item.platform);
-        const key = `${item.platform}:${item.projectId}`;
-        if (!checked.has(key))
-          checked.set(
-            key,
-            await found.versions({ ...input, projectId: item.projectId }),
-          );
-        const versions = checked
-          .get(key)
-          .filter((value) => value.downloadable !== false)
-          .sort((a, b) =>
-            (b.publishedAt ?? "").localeCompare(a.publishedAt ?? ""),
-          );
-        const current = versions.find(
-          (value) => String(value.id) === item.versionId,
-        );
-        const newest = versions[0];
-        if (
-          newest &&
-          String(newest.id) !== item.versionId &&
-          (!current || (newest.publishedAt ?? "") > (current.publishedAt ?? ""))
-        )
-          item.update = publicVersion(newest);
-      } catch (cause) {
-        warnings.push(`${item.name}: ${cause.message}`);
-      }
-    }
+    await enrichProjectMetadata(items, warnings, input.signal);
+    input.signal.throwIfAborted();
+    await checkUpdates(input, items, warnings);
     if (items.some((item) => !item.platform))
       warnings.push(
         "Unidentified files are left untouched. Only checksum-identified files or verified Launchpad installations can be updated.",
       );
-    return { items, warnings: [...new Set(warnings)] };
   }
   async function config() {
     const current = await getServer();
@@ -920,7 +1314,9 @@ export async function createLaunchpad(ctx) {
       const paths = new Set();
       const files = [];
       const local =
-        input.type === "modpack" ? [] : (await installed(input)).items;
+        input.type === "modpack"
+          ? []
+          : (await installed({ ...input, identityOnly: true })).items;
       for (const file of result.files) {
         file.path = safeInstallPath(file.path);
         const folded = file.path.toLowerCase();
@@ -974,6 +1370,11 @@ export async function createLaunchpad(ctx) {
             path: oldPath,
             sha512: await fileHash(await safePath(serverDir, oldPath)),
           };
+        if (matches[0] && (previous?.sha512 ?? expected) !== matches[0].sha512)
+          throw error(
+            409,
+            "The installed file changed after identification. Refresh installed files and review the update again.",
+          );
         files.push({
           ...file,
           author: file.author || matches[0]?.author,
@@ -1117,6 +1518,16 @@ export async function createLaunchpad(ctx) {
             type: file.type,
             installedAt: new Date().toISOString(),
           });
+          const receipt = receipts.at(-1);
+          if (receipt.platform)
+            remember(identities, sha512, {
+              value: identityFields(receipt),
+              expiresAt: Date.now() + 10 * 60_000,
+            });
+          else identities.delete(sha512);
+          // The next inventory hashes this changed file once. Do not attach a
+          // post-verification stat to bytes that an external editor may change.
+          fileCache.delete(file.path);
           job.completed++;
         }
         if (plan.input.type === "modpack") {
@@ -1285,6 +1696,10 @@ export async function createLaunchpad(ctx) {
       if (!ctx.platformConfig?.set)
         throw error(400, "Provider key storage is unavailable.");
       await ctx.platformConfig.set({ curseforgeApiKey: value.trim() || null });
+      identities.clear();
+      updateCache.clear();
+      versionCache.clear();
+      updateFailures.clear();
       return config();
     },
     async search(input) {

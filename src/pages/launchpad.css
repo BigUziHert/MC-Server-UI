@@ -139,6 +139,18 @@
   color: var(--muted);
   font-size: 11px;
 }
+.launchpad-scan-status {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  min-width: 0;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.5;
+}
+.launchpad-scan-status span {
+  overflow-wrap: anywhere;
+}
 .launchpad-project {
   display: flex;
   gap: 18px;

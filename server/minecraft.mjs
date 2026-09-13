@@ -403,9 +403,22 @@ export async function createMinecraft(ctx) {
     for (const method of ["search", "versions", "installed"])
       app.get(
         `/api/launchpad/${method}`,
-        endpoint(async (req, res) =>
-          res.json(await launchpad[method](req.query)),
-        ),
+        endpoint(async (req, res) => {
+          const controller = new AbortController();
+          const disconnected = () => {
+            if (!res.writableEnded) controller.abort();
+          };
+          res.once("close", disconnected);
+          try {
+            const result = await launchpad[method]({
+              ...req.query,
+              signal: controller.signal,
+            });
+            if (!controller.signal.aborted) res.json(result);
+          } finally {
+            res.off("close", disconnected);
+          }
+        }),
       );
     app.put(
       "/api/launchpad/settings",

@@ -1,4 +1,5 @@
 import {
+  checkedProviderUrl,
   launchpadError,
   providerJson,
   strongestHash,
@@ -169,6 +170,228 @@ function mrVersion(value) {
       ),
   };
 }
+function mrUpdateFile(value, input) {
+  const extension =
+    input.type === "modpack"
+      ? /\.mrpack$/i
+      : input.type === "datapack"
+        ? /\.zip$/i
+        : /\.jar$/i;
+  const files = value.files.filter((file) => extension.test(file.filename));
+  const file =
+    files.find((file) => file.primary) ??
+    (files.length === 1 ? files[0] : null);
+  if (!file) return null;
+  const limit = input.type === "modpack" ? 2 * 1024 ** 3 : 512 * 1024 ** 2;
+  if (
+    file.size != null &&
+    (!Number.isSafeInteger(file.size) || file.size < 0 || file.size > limit)
+  )
+    throw launchpadError(400, "This update exceeds the supported file size.");
+  fileName(file.filename);
+  strongestHash(file.hashes);
+  checkedProviderUrl(file.url, ["cdn.modrinth.com"]);
+  return file;
+}
+// Batch updates avoid a full release-history request per installed file. Current
+// versions are fetched in a second batch only when the API suggests a different
+// version, so its publication date can be checked before offering an update.
+// https://docs.modrinth.com/api/operations/getlatestversionsfromhashes/
+// https://docs.modrinth.com/api/operations/getversions/
+function modrinthUpdates(json) {
+  // Releasing a queue lane must not depend on a fetch implementation or response
+  // reader honoring abort. The same signal still cancels cooperative network I/O.
+  const request = (url, options) =>
+    new Promise((resolve, reject) => {
+      const { signal } = options;
+      let settled = false;
+      const finish = (complete, value) => {
+        if (settled) return;
+        settled = true;
+        signal.removeEventListener("abort", aborted);
+        complete(value);
+      };
+      const aborted = () => finish(reject, signal.reason);
+      signal.addEventListener("abort", aborted, { once: true });
+      if (signal.aborted) {
+        aborted();
+        return;
+      }
+      Promise.resolve()
+        .then(() => {
+          signal.throwIfAborted();
+          return json(url, options);
+        })
+        .then(
+          (value) => finish(resolve, value),
+          (cause) => finish(reject, cause),
+        );
+    });
+  const lanes = [Promise.resolve(), Promise.resolve()];
+  let nextLane = 0,
+    failureUntil = 0,
+    failureWarning = "";
+  return async (input, items) => {
+    input.signal?.throwIfAborted();
+    if (!Array.isArray(items) || items.length > 5000)
+      throw launchpadError(
+        400,
+        "Request updates for at most 5000 installed files.",
+      );
+    const distinct = new Map();
+    for (const item of items) {
+      if (!/^[a-f0-9]{128}$/i.test(item?.sha512 ?? ""))
+        throw launchpadError(
+          400,
+          "Installed files need a valid SHA512 checksum.",
+        );
+      const normalized = {
+        sha512: item.sha512.toLowerCase(),
+        projectId: id(item.projectId),
+        versionId: id(item.versionId),
+      };
+      const prior = distinct.get(normalized.sha512);
+      if (
+        prior &&
+        (prior.projectId !== normalized.projectId ||
+          prior.versionId !== normalized.versionId)
+      )
+        throw launchpadError(
+          400,
+          "The same installed file has conflicting version identities.",
+        );
+      distinct.set(normalized.sha512, normalized);
+    }
+    const rows = [...distinct.values()];
+    const tasks = [];
+    for (let offset = 0; offset < rows.length; offset += 100) {
+      const batch = rows.slice(offset, offset + 100);
+      const lane = nextLane++ % lanes.length;
+      const task = lanes[lane].then(async () => {
+        input.signal?.throwIfAborted();
+        const updates = {},
+          warnings = new Set();
+        if (failureUntil > Date.now())
+          return { updates, warnings: [failureWarning] };
+        const timeout = AbortSignal.timeout(8000);
+        const signal = input.signal
+          ? AbortSignal.any([input.signal, timeout])
+          : timeout;
+        try {
+          const result = await request(`${mr}/version_files/update`, {
+            method: "POST",
+            signal,
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              hashes: batch.map((item) => item.sha512),
+              algorithm: "sha512",
+              loaders: input.loader ? [input.loader] : [],
+              game_versions: input.gameVersion ? [input.gameVersion] : [],
+            }),
+          });
+          signal.throwIfAborted();
+          if (!result || typeof result !== "object" || Array.isArray(result))
+            throw launchpadError(
+              502,
+              "Modrinth returned invalid update metadata.",
+            );
+          const candidates = [];
+          for (const item of batch) {
+            const value = result[item.sha512];
+            if (!value) {
+              updates[item.sha512] = null;
+              continue;
+            }
+            try {
+              if (
+                !Array.isArray(value.game_versions) ||
+                !Array.isArray(value.loaders) ||
+                !Array.isArray(value.files)
+              )
+                throw launchpadError(
+                  502,
+                  "Modrinth returned invalid update compatibility data.",
+                );
+              const version = mrVersion(value);
+              id(value.id);
+              if (value.project_id !== item.projectId)
+                throw new Error(
+                  "Modrinth returned an update for a different project.",
+                );
+              if (
+                version.id === item.versionId ||
+                !version.downloadable ||
+                !fits(version, input)
+              ) {
+                updates[item.sha512] = null;
+                continue;
+              }
+              const file = mrUpdateFile(value, input);
+              if (!file || file.hashes?.sha512?.toLowerCase() === item.sha512) {
+                updates[item.sha512] = null;
+                continue;
+              }
+              candidates.push({ item, version });
+            } catch (cause) {
+              warnings.add(cause.message);
+            }
+          }
+          if (candidates.length) {
+            const ids = [
+              ...new Set(candidates.map(({ item }) => item.versionId)),
+            ];
+            const current = await request(
+              `${mr}/versions?${new URLSearchParams({ ids: JSON.stringify(ids) })}`,
+              { signal },
+            );
+            signal.throwIfAborted();
+            if (!Array.isArray(current))
+              throw launchpadError(
+                502,
+                "Modrinth returned invalid installed-version metadata.",
+              );
+            const byId = new Map(current.map((value) => [value?.id, value]));
+            for (const { item, version } of candidates) {
+              const installed = byId.get(item.versionId);
+              const before = Date.parse(installed?.date_published);
+              const after = Date.parse(version.publishedAt);
+              if (
+                installed?.project_id !== item.projectId ||
+                !installed.files?.some(
+                  (file) => file.hashes?.sha512?.toLowerCase() === item.sha512,
+                ) ||
+                !Number.isFinite(before) ||
+                !Number.isFinite(after)
+              ) {
+                warnings.add(
+                  "Some Modrinth updates could not be verified against their installed versions.",
+                );
+                continue;
+              }
+              updates[item.sha512] = after > before ? version : null;
+            }
+          }
+        } catch (cause) {
+          if (input.signal?.aborted) throw input.signal.reason;
+          failureUntil = Date.now() + (cause.status === 429 ? 60_000 : 30_000);
+          failureWarning =
+            timeout.aborted || cause.name === "TimeoutError"
+              ? "Modrinth update checks took too long. Try again shortly."
+              : cause.message;
+          warnings.add(failureWarning);
+        }
+        return { updates, warnings: [...warnings] };
+      });
+      lanes[lane] = task.catch(() => {});
+      tasks.push(task);
+    }
+    const results = await Promise.all(tasks);
+    return {
+      updates: Object.assign({}, ...results.map((result) => result.updates)),
+      warnings: [...new Set(results.flatMap((result) => result.warnings))],
+    };
+  };
+}
 const cfLoaders = { forge: 1, fabric: 4, quilt: 5, neoforge: 6 };
 // Provider sorting is sent with the upstream request, before its pagination.
 // https://docs.modrinth.com/api/operations/searchprojects/
@@ -230,7 +453,9 @@ export function createCoreProviders({
     if (input.gameVersion)
       query.set("game_versions", JSON.stringify([input.gameVersion]));
     if (input.loader) query.set("loaders", JSON.stringify([input.loader]));
-    return json(`${mr}/project/${enc(id(input.projectId))}/version?${query}`);
+    return json(`${mr}/project/${enc(id(input.projectId))}/version?${query}`, {
+      signal: input.signal,
+    });
   };
   const curseJson = async (route, options) => {
     const secret = await key();
@@ -374,8 +599,11 @@ export function createCoreProviders({
     if (input.gameVersion) query.set("gameVersion", input.gameVersion);
     if (cfLoaders[input.loader])
       query.set("modLoaderType", String(cfLoaders[input.loader]));
-    return (await curseJson(`/mods/${enc(id(input.projectId))}/files?${query}`))
-      .data;
+    return (
+      await curseJson(`/mods/${enc(id(input.projectId))}/files?${query}`, {
+        signal: input.signal,
+      })
+    ).data;
   };
   return [
     {
@@ -386,6 +614,7 @@ export function createCoreProviders({
       sortOptions: mrSortOptions,
       downloadHosts: ["cdn.modrinth.com"],
       projectMetadata: mrProjectMetadata,
+      updates: modrinthUpdates(json),
       async search(input) {
         const facets = [
           [`all_project_types:${input.type}`],
@@ -505,9 +734,10 @@ export function createCoreProviders({
           warnings: [],
         };
       },
-      async identify(hashes) {
+      async identify(hashes, { signal } = {}) {
         return json(`${mr}/version_files`, {
           method: "POST",
+          signal,
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ hashes, algorithm: "sha512" }),
         });
@@ -591,10 +821,11 @@ export function createCoreProviders({
           .map((file) => cfVersion(file, input.type))
           .filter((version) => fits(version, input));
       },
-      async identifyFingerprints(fingerprints) {
+      async identifyFingerprints(fingerprints, { signal } = {}) {
         return (
           await curseJson("/fingerprints/432", {
             method: "POST",
+            signal,
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ fingerprints }),
           })

@@ -228,10 +228,27 @@ export default function Launchpad({ notify }: PageProps) {
   const [results, setResults] = useState<SearchResult | null>(null);
   const [searchLoading, setSearchLoading] = useState(false);
   const [searchError, setSearchError] = useState("");
-  const [installed, setInstalled] = useState<InstalledResult | null>(null);
+  const inventoryScope = JSON.stringify([type, gameVersion.trim(), loader]);
+  const [inventory, setInventory] = useState<{
+    api: typeof api;
+    scope: string;
+    result: InstalledResult;
+  } | null>(null);
+  const inventoryRef = useRef<typeof inventory>(null);
+  const installed =
+    inventory?.api === api && inventory.scope === inventoryScope
+      ? inventory.result
+      : null;
   const [scanLoading, setScanLoading] = useState(false);
+  const [scanRefreshing, setScanRefreshing] = useState(false);
   const [scanError, setScanError] = useState("");
   const [reload, setReload] = useState(0);
+  const scanEpoch = useRef(0);
+  const forceScan = useRef<{ api: typeof api; scope: string } | null>(null);
+  const reloadContent = useCallback(() => {
+    forceScan.current = null;
+    setReload((value) => value + 1);
+  }, []);
   const [selection, setSelection] = useState<Selection | null>(null);
   const [versions, setVersions] = useState<Version[]>([]);
   const [versionId, setVersionId] = useState("");
@@ -258,6 +275,7 @@ export default function Launchpad({ notify }: PageProps) {
   const settingsDialog = useRef<HTMLDialogElement>(null);
   const tabs = useRef<HTMLDivElement>(null);
   const source = config?.platforms.find((item) => item.id === platform);
+  const inventoryReady = Boolean(config);
   const sortOptions = source?.sortOptions ?? [];
   const catalogSort = sortOptions.some((item) => item.id === sort)
     ? sort
@@ -335,7 +353,9 @@ export default function Launchpad({ notify }: PageProps) {
     session.current++;
     setConfig(null);
     setResults(null);
-    setInstalled(null);
+    setInventory(null);
+    inventoryRef.current = null;
+    forceScan.current = null;
     setJob(null);
     setSelection(null);
     setSettingsOpen(false);
@@ -415,31 +435,117 @@ export default function Launchpad({ notify }: PageProps) {
   ]);
 
   useEffect(() => {
-    if (!config) return;
+    if (!inventoryReady) return;
+    const epoch = ++scanEpoch.current;
+    const currentSession = session.current;
     const controller = new AbortController();
-    setScanLoading(true);
+    const current = () =>
+      !controller.signal.aborted &&
+      epoch === scanEpoch.current &&
+      currentSession === session.current;
+    let hasSnapshot =
+      inventoryRef.current?.api === api &&
+      inventoryRef.current.scope === inventoryScope;
+    setScanLoading(!hasSnapshot);
+    setScanRefreshing(true);
     setScanError("");
-    setInstalled(null);
+    if (!hasSnapshot) {
+      inventoryRef.current = null;
+      setInventory(null);
+    }
+    const publish = (result: InstalledResult) => {
+      if (!current()) return;
+      const next = { api, scope: inventoryScope, result };
+      inventoryRef.current = next;
+      setInventory(next);
+      hasSnapshot = true;
+    };
+    async function readStage(local: boolean, force: boolean) {
+      const stage = new AbortController();
+      let timer: number;
+      let abort: () => void = () => {};
+      const cancelled = new Promise<never>((_, reject) => {
+        abort = () => {
+          stage.abort();
+          reject(new DOMException("Installed refresh cancelled", "AbortError"));
+        };
+        controller.signal.addEventListener("abort", abort, { once: true });
+        timer = window.setTimeout(
+          () => {
+            stage.abort();
+            reject(
+              new Error(
+                local
+                  ? "Reading installed files took too long. Please try again."
+                  : "The online check took too long. Please try again shortly.",
+              ),
+            );
+          },
+          local ? 30_000 : 45_000,
+        );
+      });
+      try {
+        return await Promise.race([
+          api<InstalledResult>(
+            `/launchpad/installed?${queryString({
+              type,
+              gameVersion: gameVersion.trim(),
+              loader,
+              local: local ? "true" : undefined,
+              refresh: !local && force ? "true" : undefined,
+            })}`,
+            { signal: stage.signal },
+          ),
+          cancelled,
+        ]);
+      } finally {
+        window.clearTimeout(timer!);
+        controller.signal.removeEventListener("abort", abort);
+      }
+    }
     const timer = window.setTimeout(() => {
-      void api<InstalledResult>(
-        `/launchpad/installed?${queryString({ type, gameVersion: gameVersion.trim(), loader })}`,
-        { signal: controller.signal },
-      )
-        .then((next) => {
-          if (!controller.signal.aborted) setInstalled(next);
-        })
-        .catch((cause) => {
-          if (!controller.signal.aborted) setScanError(messageOf(cause));
-        })
-        .finally(() => {
-          if (!controller.signal.aborted) setScanLoading(false);
-        });
+      const force =
+        forceScan.current?.api === api &&
+        forceScan.current.scope === inventoryScope;
+      forceScan.current = null;
+      void (async () => {
+        try {
+          publish(await readStage(true, false));
+        } catch (cause) {
+          if (!current()) return;
+          setScanError(
+            `Unable to read local installed files. ${messageOf(cause)}`,
+          );
+        } finally {
+          if (current()) setScanLoading(false);
+        }
+        if (!current()) return;
+        try {
+          publish(await readStage(false, force));
+          if (current()) setScanError("");
+        } catch (cause) {
+          if (current())
+            setScanError(
+              `${
+                hasSnapshot
+                  ? "Installed files are available, but online details could not be refreshed."
+                  : "Unable to refresh installed content."
+              } ${messageOf(cause)}`,
+            );
+        } finally {
+          if (current()) {
+            setScanLoading(false);
+            setScanRefreshing(false);
+          }
+        }
+      })();
     }, 300);
     return () => {
       window.clearTimeout(timer);
       controller.abort();
+      scanEpoch.current++;
     };
-  }, [api, config, type, gameVersion, loader, reload]);
+  }, [api, inventoryReady, inventoryScope, type, gameVersion, loader, reload]);
 
   useEffect(() => {
     if (selection) dialog.current?.showModal();
@@ -499,7 +605,7 @@ export default function Launchpad({ notify }: PageProps) {
         setJob(next.job);
         setJobError("");
         if (next.job.status === "completed") {
-          setReload((value) => value + 1);
+          reloadContent();
           notify(next.job.message || "Installation completed.");
         }
         if (next.job.status === "failed")
@@ -518,7 +624,7 @@ export default function Launchpad({ notify }: PageProps) {
       controller.abort();
       window.clearTimeout(timer);
     };
-  }, [api, job?.id, job?.status, jobReload, notify]);
+  }, [api, job?.id, job?.status, jobReload, notify, reloadContent]);
 
   function chooseProject(project: Project, entry?: InstalledItem) {
     operation.current++;
@@ -616,7 +722,7 @@ export default function Launchpad({ notify }: PageProps) {
       setSelection(null);
       setPlan(null);
       if (next.job.status === "completed") {
-        setReload((value) => value + 1);
+        reloadContent();
         notify(next.job.message);
       }
     } catch (cause) {
@@ -650,7 +756,7 @@ export default function Launchpad({ notify }: PageProps) {
       setConfig(next);
       setApiKey("");
       setSettingsOpen(false);
-      setReload((value) => value + 1);
+      reloadContent();
       notify(
         value.trim()
           ? "CurseForge API key saved."
@@ -698,8 +804,8 @@ export default function Launchpad({ notify }: PageProps) {
   }, [installedOnly, installed, offset, currentOffset]);
   const pageCount = Math.max(1, Math.ceil(total / limit));
   const selectedVersion = versions.find((version) => version.id === versionId);
-  const loading = installedOnly ? scanLoading : searchLoading;
-  const failed = installedOnly ? scanError : searchError;
+  const loading = installedOnly ? !installed && scanLoading : searchLoading;
+  const failed = installedOnly ? !installed && scanError : searchError;
   const keySource = config?.platforms.find((item) => item.id === "curseforge");
   const visibleProjects: { project: Project; entry?: InstalledItem }[] =
     installedOnly
@@ -1016,13 +1122,16 @@ export default function Launchpad({ notify }: PageProps) {
         <button
           className="btn icon"
           aria-label="Refresh Launchpad and check updates"
-          disabled={configLoading || searchLoading || scanLoading}
+          disabled={
+            configLoading || searchLoading || scanLoading || scanRefreshing
+          }
           onClick={() => {
+            forceScan.current = { api, scope: inventoryScope };
             void loadConfig();
             setReload((value) => value + 1);
           }}
         >
-          <RefreshCw size={16} className={scanLoading ? "spin" : ""} />
+          <RefreshCw size={16} className={scanRefreshing ? "spin" : ""} />
         </button>
       </div>
       {job && (
@@ -1094,21 +1203,32 @@ export default function Launchpad({ notify }: PageProps) {
           <div>{warning}</div>
         </div>
       ))}
-      {!installedOnly && scanLoading && (
-        <div className="launchpad-result-count" role="status">
-          <LoaderCircle size={14} className="spin" /> Identifying installed
-          files and checking for updates...
+      {scanRefreshing && (!installedOnly || installed) && (
+        <div
+          className="launchpad-scan-status"
+          role="status"
+          aria-label="Installed content refresh"
+        >
+          <LoaderCircle size={14} className="spin" />
+          <span>
+            {scanLoading
+              ? "Reading installed files..."
+              : "Refreshing installed details and checking updates..."}
+          </span>
         </div>
       )}
-      {!installedOnly && scanError && (
+      {scanError && (!installedOnly || installed) && (
         <div className="launchpad-error" role="alert">
           <AlertCircle size={16} />
-          <span>Installed content could not be checked. {scanError}</span>
+          <span>{scanError}</span>
           <button
             className="btn"
-            onClick={() => setReload((value) => value + 1)}
+            onClick={() => {
+              forceScan.current = { api, scope: inventoryScope };
+              setReload((value) => value + 1);
+            }}
           >
-            Retry scan
+            Retry installed refresh
           </button>
         </div>
       )}
@@ -1147,7 +1267,7 @@ export default function Launchpad({ notify }: PageProps) {
             <LoaderCircle className="spin" size={25} />
             <p role="status">
               {installedOnly
-                ? "Identifying installed files and checking updates..."
+                ? "Reading installed files..."
                 : "Loading projects..."}
             </p>
           </div>
@@ -1160,7 +1280,12 @@ export default function Launchpad({ notify }: PageProps) {
             <p role="alert">{failed}</p>
             <button
               className="btn"
-              onClick={() => setReload((value) => value + 1)}
+              onClick={() => {
+                if (installedOnly) {
+                  forceScan.current = { api, scope: inventoryScope };
+                  setReload((value) => value + 1);
+                } else reloadContent();
+              }}
             >
               Try again
             </button>
@@ -1246,7 +1371,9 @@ export default function Launchpad({ notify }: PageProps) {
                     {entry && <span>{formatBytes(entry.size)}</span>}
                     {!entry?.platform && entry && (
                       <span>
-                        Could not identify this file for automatic updates.
+                        {scanRefreshing
+                          ? "Checking this file’s project details..."
+                          : "Could not identify this file for automatic updates."}
                       </span>
                     )}
                   </div>
