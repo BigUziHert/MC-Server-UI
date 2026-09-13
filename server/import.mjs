@@ -274,20 +274,24 @@ export function parseJavaScript(text) {
     throw unsupported();
   if (tokens.at(-1) === "%*") tokens.pop();
   if (tokens.some((value) => /%/.test(value))) throw unsupported();
-  const argFiles = tokens
-    .filter((value) => value.startsWith("@"))
-    .map((value) => value.slice(1).replace(/\\/g, "/"));
   if (!tokens.length) throw unsupported();
   const args = tokens.map((value) =>
     value.startsWith("@") ? `@${value.slice(1).replace(/\\/g, "/")}` : value,
   );
   if (!args.includes("nogui") && !args.includes("--nogui")) args.push("nogui");
+  return { javaPath, args, ...describeJavaArguments(args) };
+}
+
+function describeJavaArguments(args) {
+  const argFiles = args
+    .filter((value) => value.startsWith("@"))
+    .map((value) => value.slice(1).replace(/\\/g, "/").replace(/^\.\//, ""));
   const forgeArgs = argFiles.find((file) =>
-    /^libraries\/(?:net\/neoforged\/neoforge|net\/minecraftforge\/forge)\/[^/]+\/(?:win|unix)_args\.txt$/.test(
+    /^libraries\/(?:net\/neoforged\/neoforge|net\/minecraftforge\/forge)\/[^/]+\/(?:win|unix)_args\.txt$/i.test(
       file,
     ),
   );
-  const software = forgeArgs?.includes("neoforged")
+  const software = forgeArgs?.toLowerCase().includes("neoforged")
     ? "NeoForge"
     : forgeArgs
       ? "Forge"
@@ -297,21 +301,99 @@ export function parseJavaScript(text) {
           ? "Quilt"
           : "Java";
   return {
-    javaPath,
-    args,
     argFiles,
     software,
-    version: forgeArgs?.split("/").at(-2) ?? "Configured launch",
+    version: forgeArgs?.split("/").at(-2) ?? "Unknown",
   };
 }
 
+// Read advisory metadata with Java's whitespace, comment and quote boundaries.
+// The original files still go directly to Java; no launcher contents are rewritten.
+function javaFileArguments(text) {
+  const tokens = [];
+  let token = "";
+  let quote = null;
+  for (let index = 0; index < text.length; index++) {
+    const char = text[index];
+    if (!quote && char === "#") {
+      while (index < text.length && !/[\r\n]/.test(text[index])) index++;
+      if (token) tokens.push(token);
+      token = "";
+    } else if (char === quote) quote = null;
+    else if (!quote && /["']/.test(char)) quote = char;
+    else if (quote && char === "\\") {
+      const next = text[++index];
+      if (/[\r\n]/.test(next ?? "")) {
+        while (/\s/.test(text[index + 1] ?? "")) index++;
+      } else
+        token += { n: "\n", r: "\r", t: "\t", f: "\f" }[next] ?? next ?? "";
+    } else if (!quote && /\s/.test(char)) {
+      if (token) tokens.push(token);
+      token = "";
+    } else token += char;
+  }
+  if (token) tokens.push(token);
+  return tokens;
+}
+
+function javaHeapLimit(args) {
+  let memoryLimitMB = null;
+  const valueOptions = new Set([
+    "-cp",
+    "-classpath",
+    "--class-path",
+    "-p",
+    "--module-path",
+    "--upgrade-module-path",
+    "--add-modules",
+    "--limit-modules",
+    "--add-exports",
+    "--add-opens",
+    "--add-reads",
+    "--patch-module",
+    "--enable-native-access",
+    "--source",
+  ]);
+  for (let index = 0; index < args.length; index++) {
+    const arg = args[index];
+    // Everything following the entry point is a game argument, not a JVM flag.
+    if (
+      ["-jar", "-m", "--module"].includes(arg) ||
+      arg.startsWith("--module=") ||
+      !arg.startsWith("-")
+    )
+      break;
+    if (valueOptions.has(arg)) {
+      index++;
+      continue;
+    }
+    const match = /^(?:-Xmx|-XX:MaxHeapSize=)(\d+)([kKmMgG]?)$/.exec(arg);
+    if (match) {
+      const bytes =
+        Number(match[1]) *
+        { "": 1, k: 1024, m: 1024 ** 2, g: 1024 ** 3 }[match[2].toLowerCase()];
+      memoryLimitMB =
+        Number.isSafeInteger(bytes) && bytes > 0 ? bytes / 1024 ** 2 : null;
+    }
+  }
+  return memoryLimitMB;
+}
+
 export async function inspectJavaArguments(directory, args) {
-  const contents = [];
+  const expanded = [];
+  let expandFiles = true;
   for (const argument of args) {
-    if (!argument.startsWith("@")) continue;
-    contents.push(
-      await readLaunchFile(directory, argument.slice(1).replace(/\\/g, "/")),
-    );
+    const tokens =
+      expandFiles && argument.startsWith("@") && !argument.startsWith("@@")
+        ? javaFileArguments(
+            await readLaunchFile(
+              directory,
+              argument.slice(1).replace(/\\/g, "/"),
+            ),
+          )
+        : [argument];
+    for (const token of tokens) expanded.push(token);
+    if (tokens.includes("--disable-@files")) expandFiles = false;
   }
   const jarIndex = args.indexOf("-jar");
   if (jarIndex !== -1) {
@@ -338,25 +420,10 @@ export async function inspectJavaArguments(directory, args) {
         `Startup requires ${jar}. Restore the selected server JAR before importing or starting.`,
       );
   }
-  // Memory metadata is advisory; the original argument file is passed to Java intact.
-  const expanded = args
-    .map((argument) => (argument.startsWith("@") ? contents.shift() : argument))
-    .join("\n");
-  const memoryArgs = [
-    ...expanded
-      .replace(/#.*$/gm, "")
-      .matchAll(/(?:^|\s)["']?-Xmx(\d+)([kmg])(?:["']?)(?=\s|$)/gi),
-  ];
-  const memory = memoryArgs.at(-1);
-  const memoryLimitMB = memory
-    ? Number(memory[1]) *
-      { k: 1 / 1024, m: 1, g: 1024 }[memory[2].toLowerCase()]
-    : undefined;
-  return Number.isInteger(memoryLimitMB) &&
-    memoryLimitMB >= 256 &&
-    memoryLimitMB <= 262144
-    ? { memoryLimitMB }
-    : {};
+  return {
+    ...describeJavaArguments(args),
+    memoryLimitMB: javaHeapLimit(expanded),
+  };
 }
 
 export async function inspectJavaLauncher(directory, launchScript) {
@@ -372,7 +439,19 @@ export async function validateStartupFiles(directory, config) {
   if (config.launchType === "java-args")
     return inspectJavaArguments(directory, config.launchArgs);
   if (config.launchType === "script") {
-    await readLaunchFile(directory, config.launchScript);
+    const text = await readLaunchFile(directory, config.launchScript);
+    // Unsupported wrappers may set variables, branch, or launch another program.
+    // Do not guess their heap or version from unrelated files in the directory.
+    let launch;
+    try {
+      launch = parseJavaScript(text);
+    } catch {
+      return {};
+    }
+    return inspectJavaArguments(directory, [
+      ...launch.args,
+      ...(config.launchArgs ?? []),
+    ]);
   }
   return {};
 }
@@ -513,6 +592,7 @@ export async function inspectServerDirectory(
           launchArgs: java.args,
           javaPath: java.javaPath,
           software: java.software,
+          version: java.version,
         };
         launches.push(candidate);
         detected.set(candidate, java);
@@ -606,6 +686,9 @@ export async function inspectServerDirectory(
     launchExecutable: "",
     launchArgs: detectedJava?.args ?? [],
     javaPath: detectedJava?.javaPath ?? "java",
+    ...(detectedJava
+      ? { software: detectedJava.software, version: detectedJava.version }
+      : {}),
     ...(detectedJava?.memoryLimitMB
       ? { memoryLimitMB: detectedJava.memoryLimitMB }
       : {}),

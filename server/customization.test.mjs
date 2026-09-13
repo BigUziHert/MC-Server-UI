@@ -269,7 +269,7 @@ test("server connection overrides, IPv6 and reset-to-auto persist without rewrit
   assert.deepEqual(await fs.readFile(propertiesPath), before);
 });
 
-test("valid server icons upload, replace, persist and remove within their selected server", async (t) => {
+test("server icon display preferences persist per server without deleting Minecraft icon bytes", async (t) => {
   const { boot } = await fixture(t);
   const panel = await boot();
   const first = await panel.create();
@@ -322,6 +322,15 @@ test("valid server icons upload, replace, persist and remove within their select
     (await restarted.request("/api/server/icon", {}, first)).bytes,
     blue,
   );
+  const iconPath = path.join(
+    restarted.runtimes.get(first).serverDir,
+    "server-icon.png",
+  );
+  await restarted.request(
+    "/api/server/icon",
+    json("POST", { image: dataUrl(green) }),
+    second,
+  );
   assert.equal(
     (await restarted.request("/api/server/icon", { method: "DELETE" }, first))
       .status,
@@ -331,16 +340,78 @@ test("valid server icons upload, replace, persist and remove within their select
     (await restarted.request("/api/server", {}, first)).body.iconVersion,
     null,
   );
-  assert.equal(
-    (await restarted.request("/api/server/icon", {}, first)).status,
-    404,
+  assert.deepEqual(
+    (await restarted.request("/api/server/icon", {}, first)).bytes,
+    blue,
   );
-  const audit = (await restarted.request("/api/audit", {}, first)).body.entries;
+  assert.deepEqual(await fs.readFile(iconPath), blue);
+  let displayed = (await restarted.request("/api/server", {}, first)).body;
+  assert.equal(displayed.iconPreference, "default");
+  assert.ok(displayed.serverIconVersion);
+  assert.equal(
+    (await restarted.request("/api/server", {}, second)).body.iconPreference,
+    "server",
+  );
+  assert.ok(
+    (await restarted.request("/api/server", {}, second)).body.iconVersion,
+  );
+  await restarted.close();
+  const reopened = await boot();
+  displayed = (await reopened.request("/api/server", {}, first)).body;
+  assert.equal(displayed.iconPreference, "default");
+  assert.equal(displayed.iconVersion, null);
+  assert.ok(displayed.serverIconVersion);
+  assert.deepEqual(await fs.readFile(iconPath), blue);
+  assert.equal(
+    (
+      await reopened.request(
+        "/api/server/icon",
+        json("PUT", { preference: "invalid" }),
+        first,
+      )
+    ).status,
+    400,
+  );
+  assert.equal(
+    (await reopened.request("/api/server", {}, first)).body.iconPreference,
+    "default",
+  );
+  assert.equal(
+    (
+      await reopened.request(
+        "/api/server/icon",
+        json("PUT", { preference: "server" }),
+        first,
+      )
+    ).status,
+    200,
+  );
+  displayed = (await reopened.request("/api/server", {}, first)).body;
+  assert.equal(displayed.iconPreference, "server");
+  assert.equal(displayed.iconVersion, displayed.serverIconVersion);
+  assert.deepEqual(await fs.readFile(iconPath), blue);
+  await reopened.request("/api/server/icon", { method: "DELETE" }, first);
+  await reopened.request(
+    "/api/server/icon",
+    json("POST", { image: dataUrl(green) }),
+    first,
+  );
+  assert.equal(
+    (await reopened.request("/api/server", {}, first)).body.iconPreference,
+    "server",
+  );
+  assert.deepEqual(await fs.readFile(iconPath), green);
+  const audit = (await reopened.request("/api/audit", {}, first)).body.entries;
   assert.equal(
     audit.filter((entry) => entry.action === "Server icon updated").length,
-    2,
+    3,
   );
-  assert.ok(audit.some((entry) => entry.action === "Server icon removed"));
+  assert.ok(
+    audit.some((entry) => entry.action === "Default panel icon selected"),
+  );
+  assert.ok(
+    audit.some((entry) => entry.action === "Server icon display selected"),
+  );
 });
 
 test("icon validation rejects invalid size, truncated data, CRC corruption and undecodable image data", () => {
@@ -404,6 +475,12 @@ test("bad icon requests leave the previous image intact and cannot follow juncti
     green,
   );
   await panel.request("/api/server/icon", { method: "DELETE" }, id);
+  assert.deepEqual(
+    await fs.readFile(path.join(serverDir, "server-icon.png")),
+    green,
+  );
+  // Replace only this test fixture's file to exercise path protection.
+  await fs.unlink(path.join(serverDir, "server-icon.png"));
   const outside = path.join(root, "outside");
   await fs.mkdir(outside);
   await fs.writeFile(path.join(outside, "proof.txt"), "unchanged");
@@ -425,7 +502,11 @@ test("bad icon requests leave the previous image intact and cannot follow juncti
   );
   assert.equal(
     (await panel.request("/api/server/icon", { method: "DELETE" }, id)).status,
-    400,
+    200,
+  );
+  assert.equal(
+    (await fs.lstat(path.join(serverDir, "server-icon.png"))).isSymbolicLink(),
+    true,
   );
   assert.equal(
     await fs.readFile(path.join(outside, "proof.txt"), "utf8"),

@@ -69,7 +69,45 @@
   margin: 0;
   max-height: 320px;
   overflow-y: auto;
+  overscroll-behavior-y: contain;
   scrollbar-color: var(--border) transparent;
+}
+.players-pagination {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  min-height: 47px;
+  padding: 8px 10px;
+  border-top: 1px solid var(--border);
+  color: var(--muted);
+  font-size: 10px;
+}
+.players-pagination > label,
+.players-pagination > div {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+}
+.players-pagination select {
+  width: 53px;
+  min-height: 29px;
+  padding: 4px;
+  font-size: 11px;
+}
+.players-pagination > span {
+  margin-left: auto;
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+.players-pagination .btn.icon {
+  width: 28px;
+  height: 29px;
+  padding: 4px;
+}
+.players-history-panel > .players-pagination {
+  padding: 12px 23px;
+  font-size: 12px;
 }
 .players-roster-row.players-roster-row {
   display: flex;
@@ -203,6 +241,10 @@
   list-style: none;
   padding: 0;
   margin: 0;
+  max-height: min(540px, 70dvh);
+  overflow-y: auto;
+  overscroll-behavior-y: contain;
+  scrollbar-color: var(--border) transparent;
 }
 .players-history-row {
   display: flex;

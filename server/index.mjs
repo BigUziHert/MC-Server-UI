@@ -516,10 +516,13 @@ export async function createPanel(options = {}) {
     demoPlayerBans: [],
     demoWhitelist: [],
     demoWhitelistEnabled: null,
+    iconPreference: "server",
     schedule: { ...defaultSchedule },
   };
   if (await exists(statePath))
     state = { ...state, ...JSON.parse(await fs.readFile(statePath, "utf8")) };
+  state.iconPreference =
+    state.iconPreference === "default" ? "default" : "server";
   const timezone = Intl.DateTimeFormat().resolvedOptions().timeZone;
   state.schedule = { ...defaultSchedule, ...state.schedule, timezone };
   const events = new EventEmitter();
@@ -592,6 +595,62 @@ export async function createPanel(options = {}) {
   let restartRequested = false;
   let closed = false;
   let closePromise;
+  let startupMetadata = {};
+  let startupMetadataAt = 0;
+  let startupMetadataRead;
+  const metadataFor = (config, detected = {}) =>
+    config.mode === "demo" || config.launchType === "jar"
+      ? {
+          memoryLimitMB: config.memoryLimitMB,
+          software: config.software,
+          version: config.version,
+          memoryLimitSource: "panel",
+        }
+      : {
+          memoryLimitMB: detected.memoryLimitMB ?? null,
+          software:
+            detected.software ??
+            (config.launchType === "executable" ? "Custom" : "Java"),
+          version: detected.version ?? "Unknown",
+          memoryLimitSource:
+            detected.memoryLimitMB == null ? "unknown" : "launch",
+        };
+  async function refreshStartupMetadata(force = false) {
+    // Once launched, these values describe that process. Editing @files while it
+    // runs changes the next launch, not the heap/version of the running JVM.
+    if (processHandle || (mode === "live" && status !== "offline")) return;
+    if (
+      !force &&
+      Date.now() - startupMetadataAt < (options.startupMetadataTtlMs ?? 3000)
+    )
+      return;
+    if (startupMetadataRead) return startupMetadataRead;
+    const current = configuration;
+    startupMetadataRead = (async () => {
+      let detected = {};
+      if (current.mode === "live" && current.launchType !== "jar") {
+        try {
+          detected = await validateStartupFiles(serverDir, current);
+        } catch {
+          /* Missing startup files are reported on Start; metadata stays unknown. */
+        }
+      }
+      if (
+        configuration === current &&
+        !processHandle &&
+        (mode === "demo" || status === "offline")
+      ) {
+        startupMetadata = metadataFor(current, detected);
+        startupMetadataAt = Date.now();
+      }
+    })();
+    try {
+      await startupMetadataRead;
+    } finally {
+      startupMetadataRead = undefined;
+    }
+  }
+  await refreshStartupMetadata(true);
   const inFlightTasks = new Set();
   const trackTask = (work) => {
     const task = Promise.resolve().then(work);
@@ -775,8 +834,7 @@ export async function createPanel(options = {}) {
     try {
       if (next.launchType === "jar") await safePath(serverDir, next.jar);
       else if (options.existingServerDir) {
-        const startup = await validateStartupFiles(serverDir, next);
-        if (startup.memoryLimitMB) next.memoryLimitMB = startup.memoryLimitMB;
+        await validateStartupFiles(serverDir, next);
       }
       const updates = {};
       if (next.port !== configuration.port) updates["server-port"] = next.port;
@@ -804,6 +862,9 @@ export async function createPanel(options = {}) {
       }
       const oldName = configuration.name;
       const oldMode = configuration.mode;
+      const changedJar =
+        next.launchType === "jar" &&
+        (configuration.launchType !== "jar" || next.jar !== configuration.jar);
       configuration = {
         ...configuration,
         ...Object.fromEntries(
@@ -816,13 +877,16 @@ export async function createPanel(options = {}) {
       mode = configuration.mode;
       memoryLimit = configuration.memoryLimitMB;
       configuredJar = configuration.jar;
-      if (oldMode !== mode) {
+      if (oldMode !== mode || changedJar) {
         configuration.version = mode === "demo" ? "1.21.4" : "Configured JAR";
         configuration.software = mode === "demo" ? "Paper" : "Java";
+      }
+      if (oldMode !== mode) {
         append(
           `[Panel] ${mode === "demo" ? "Demo mode — activity is simulated" : "Live Java mode configured"}.`,
         );
       }
+      await refreshStartupMetadata(true);
       if (oldName !== configuration.name)
         await audit(
           "server",
@@ -843,6 +907,11 @@ export async function createPanel(options = {}) {
 
   const descriptor = () => ({
     ...configuration,
+    version: startupMetadata.version,
+    software: startupMetadata.software,
+    configuredMemoryLimitMB: startupMetadata.memoryLimitMB,
+    memoryLimitSource: startupMetadata.memoryLimitSource,
+    memoryLimitState: processHandle ? "started" : "configured",
     id: options.id,
     status,
     ...(options.source === "imported" ? { source: "imported", serverDir } : {}),
@@ -871,13 +940,10 @@ export async function createPanel(options = {}) {
       let launchArgs;
       let executable = configuration.javaPath;
       let windowsVerbatimArguments = false;
+      let detectedStartup = {};
       if (configuration.launchType !== "jar") {
-        const startup = await validateStartupFiles(serverDir, configuration);
+        detectedStartup = await validateStartupFiles(serverDir, configuration);
         launchArgs = configuration.launchArgs;
-        if (startup.memoryLimitMB) {
-          memoryLimit = startup.memoryLimitMB;
-          configuration.memoryLimitMB = memoryLimit;
-        }
         if (configuration.launchType === "script") {
           const script = await safePath(serverDir, configuration.launchScript);
           const invocation = buildScriptInvocation(script, launchArgs);
@@ -928,6 +994,7 @@ export async function createPanel(options = {}) {
         stdio: ["pipe", "pipe", "pipe"],
       });
       processHandle = child;
+      startupMetadata = metadataFor(configuration, detectedStartup);
       const stop = createLauncherStop({
         child,
         windowsBatch:
@@ -992,6 +1059,7 @@ export async function createPanel(options = {}) {
         telemetry.reset(child.pid);
         clearTimeout(stopTimer);
         processHandle = null;
+        startupMetadataAt = 0;
         processStop = undefined;
         status = terminationPromise ? "stopping" : "offline";
         startedAt = null;
@@ -1384,6 +1452,7 @@ export async function createPanel(options = {}) {
 
   let diskCache = { value: 0, at: 0 };
   app.get("/api/server", async (_req, res) => {
+    await refreshStartupMetadata();
     if (Date.now() - diskCache.at > 10000)
       diskCache = { value: await directorySize(serverDir), at: Date.now() };
     const active = status === "running";
@@ -1408,11 +1477,14 @@ export async function createPanel(options = {}) {
       name: configuration.name,
       address: configuration.address,
       ...connection,
-      iconVersion: icon?.version ?? null,
+      iconVersion:
+        state.iconPreference === "default" ? null : (icon?.version ?? null),
+      serverIconVersion: icon?.version ?? null,
+      iconPreference: state.iconPreference,
       status,
       mode,
-      version: configuration.version,
-      software: configuration.software,
+      version: startupMetadata.version,
+      software: startupMetadata.software,
       uptime: startedAt ? Math.floor((Date.now() - startedAt) / 1000) : 0,
       cpuCapacity: availableParallelism() * 100,
       cpu:
@@ -1427,7 +1499,12 @@ export async function createPanel(options = {}) {
           : mode === "demo" || liveIdle
             ? 0
             : (currentSample?.memory ?? null),
-      memoryLimit: memoryLimit * 1024 ** 2,
+      memoryLimit:
+        startupMetadata.memoryLimitMB == null
+          ? null
+          : startupMetadata.memoryLimitMB * 1024 ** 2,
+      memoryLimitSource: startupMetadata.memoryLimitSource,
+      memoryLimitState: processHandle ? "started" : "configured",
       disk: diskCache.value,
       diskLimit: storage.blocks * storage.bsize,
       diskAvailable: storage.bavail * storage.bsize,
@@ -1458,6 +1535,7 @@ export async function createPanel(options = {}) {
     "/api/server/icon",
     trackOperation(async (req, res) => {
       await writeServerIcon(serverDir, decodeIcon(req.body?.image), safePath);
+      state.iconPreference = "server";
       await audit(
         "file",
         "Server icon updated",
@@ -1469,11 +1547,27 @@ export async function createPanel(options = {}) {
   app.delete(
     "/api/server/icon",
     trackOperation(async (_req, res) => {
-      await fs.rm(await safePath(serverDir, "server-icon.png"), {
-        force: true,
-      });
-      await audit("file", "Server icon removed", "server-icon.png");
-      res.json({ ok: true });
+      state.iconPreference = "default";
+      await audit(
+        "server",
+        "Default panel icon selected",
+        "Panel display preference saved. server-icon.png is unchanged.",
+      );
+      res.json({ ok: true, iconPreference: state.iconPreference });
+    }),
+  );
+  app.put(
+    "/api/server/icon",
+    trackOperation(async (req, res) => {
+      if (req.body?.preference !== "server")
+        throw error(400, "Choose the server icon display preference.");
+      state.iconPreference = "server";
+      await audit(
+        "server",
+        "Server icon display selected",
+        "Panel display preference saved. server-icon.png is unchanged.",
+      );
+      res.json({ ok: true, iconPreference: state.iconPreference });
     }),
   );
   app.get("/api/console", (_req, res) => res.json({ lines }));
@@ -2303,6 +2397,7 @@ export async function createPanel(options = {}) {
     serverDir,
     tick,
     descriptor,
+    refreshStartupMetadata,
     assertRemovable: () => {
       if (closed) throw error(409, "This server is already shutting down.");
       if (status !== "offline" || processHandle || terminationPromise)
@@ -2578,6 +2673,7 @@ export async function createFleet(options = {}) {
       backupFlushTimeoutMs: options.backupFlushTimeoutMs,
       telemetry,
       publicAddress,
+      startupMetadataTtlMs: options.startupMetadataTtlMs,
     });
     runtimes.set(entry.id, runtime);
     return runtime;
@@ -2843,7 +2939,12 @@ export async function createFleet(options = {}) {
         true,
       );
       const startup = await validateStartupFiles(inspected.directory, config);
-      if (startup.memoryLimitMB) config.memoryLimitMB = startup.memoryLimitMB;
+      if (
+        Number.isInteger(startup.memoryLimitMB) &&
+        startup.memoryLimitMB >= 256 &&
+        startup.memoryLimitMB <= 262144
+      )
+        config.memoryLimitMB = startup.memoryLimitMB;
       const candidate = inspected.launches.find(
         (candidate) =>
           candidate.type === launchType &&
@@ -2862,8 +2963,12 @@ export async function createFleet(options = {}) {
         serverDir: inspected.directory,
         address: inspected.address.replace(/:\d+$/, `:${config.port}`),
         maxPlayers: inspected.maxPlayers,
-        version: launchType === "jar" ? "Configured JAR" : "Configured launch",
+        version:
+          launchType === "jar"
+            ? "Configured JAR"
+            : (startup.version ?? "Unknown"),
         software:
+          startup.software ??
           candidate?.software ??
           (launchType === "executable" ? "Custom" : "Java"),
       };
@@ -2888,12 +2993,17 @@ export async function createFleet(options = {}) {
     });
     res.status(201).json({ server });
   });
-  app.get("/api/servers", (_req, res) =>
+  app.get("/api/servers", async (_req, res) => {
+    await Promise.all(
+      [...runtimes.values()].map((runtime) =>
+        runtime.refreshStartupMetadata?.(),
+      ),
+    );
     res.json({
       servers: registry.servers.map(descriptor),
       defaultServerId: registry.defaultServerId,
-    }),
-  );
+    });
+  });
   app.post("/api/servers", async (req, res) => {
     const server = await serialize(async () => {
       const config = validateServerConfiguration(req.body);
@@ -2985,7 +3095,11 @@ export async function createFleet(options = {}) {
       checkPort(config.port, entry.id);
       const next = { ...entry, ...config };
       if (config.port !== entry.port) next.address = `localhost:${config.port}`;
-      if (config.mode !== entry.mode) {
+      if (
+        config.mode !== entry.mode ||
+        (config.launchType === "jar" &&
+          (entry.launchType !== "jar" || config.jar !== entry.jar))
+      ) {
         next.version = config.mode === "demo" ? "1.21.4" : "Configured JAR";
         next.software = config.mode === "demo" ? "Paper" : "Java";
       }

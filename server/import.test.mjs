@@ -16,6 +16,8 @@ import {
   parseProperties,
   parseJavaScript,
   buildScriptInvocation,
+  inspectJavaArguments,
+  validateStartupFiles,
 } from "./import.mjs";
 
 const json = (method, body) => ({ method, body: JSON.stringify(body) });
@@ -1157,3 +1159,273 @@ test("an imported folder disappearing during the session does not block unrelate
   );
   await assert.rejects(fs.access(directory));
 });
+
+test("Java metadata reads the last actual heap option and NeoForge version without mistaking comments or game arguments", async (t) => {
+  const { directory, prepare } = await fixture(t);
+  await prepare(directory, { jars: [] });
+  const args = await prepareForge(directory);
+  const jvmFile = path.join(directory, "user_jvm_args.txt");
+  await fs.writeFile(
+    jvmFile,
+    '# -Xmx1G is only an example\n-Xms6G -Xmx12G\n-XX:+UseZGC\n-XX:+ZGenerational\n-Dnote="Example # -Xmx99G"\n',
+  );
+  const before = await snapshot(directory);
+  const metadata = await inspectJavaArguments(directory, [...args, "-Xmx99G"]);
+  assert.equal(metadata.memoryLimitMB, 12 * 1024);
+  assert.equal(metadata.software, "NeoForge");
+  assert.equal(metadata.version, "21.1.200");
+  assert.equal(
+    (
+      await inspectJavaArguments(directory, [
+        args[0],
+        "-Xmx14G",
+        ...args.slice(1),
+      ])
+    ).memoryLimitMB,
+    14336,
+  );
+  assert.deepEqual(await snapshot(directory), before);
+  const variants = [
+    ['-Xmx3G\n"-Xmx12288M"\n', 12288],
+    ["-Xmx12884901888\n", 12288],
+    ["-Xmx1G -XX:MaxHeapSize=12G\n", 12288],
+    ["# -Xmx12G\n-Xms6G\n-XX:MaxRAMPercentage=60\n", null],
+    ['-Xmx2G -cp "libraries with spaces/*" Main -Xmx12G\n', 2048],
+  ];
+  for (const [contents, expected] of variants) {
+    await fs.writeFile(jvmFile, contents);
+    assert.equal(
+      (await inspectJavaArguments(directory, args)).memoryLimitMB,
+      expected,
+    );
+  }
+});
+
+for (const launchType of ["java-args", "script"]) {
+  test(
+    `${launchType} metadata repairs existing registrations and preserves the running launch snapshot until restart`,
+    { skip: launchType === "script" && process.platform !== "win32" },
+    async (t) => {
+      const launches = [];
+      const { directory, dataDir, prepare, boot } = await fixture(t, {
+        startupMetadataTtlMs: 0,
+        spawnServer(executable, args, options) {
+          const child = mockServer();
+          launches.push({ executable, args, options, child });
+          setImmediate(() =>
+            child.stdout.write(
+              '[Server thread/INFO]: Done (1s)! For help, type "help"\n',
+            ),
+          );
+          return child;
+        },
+      });
+      await prepare(directory, { jars: [] });
+      const args = await prepareForge(directory);
+      const neoArgs = "libraries/net/neoforged/neoforge/21.1.250/win_args.txt";
+      await fs.mkdir(path.dirname(path.join(directory, neoArgs)), {
+        recursive: true,
+      });
+      await fs.rename(
+        path.join(directory, args[1].slice(1)),
+        path.join(directory, neoArgs),
+      );
+      args[1] = `@${neoArgs}`;
+      const jvmFile = path.join(directory, "user_jvm_args.txt");
+      await fs.writeFile(
+        jvmFile,
+        "-Xms6G -Xmx12G\n-XX:+UseZGC\n-XX:+ZGenerational\n",
+      );
+      await fs.writeFile(
+        path.join(directory, "run.bat"),
+        `@echo off\r\njava ${args.slice(0, 2).join(" ")} %*\r\npause\r\n`,
+      );
+      await fs.writeFile(path.join(directory, "eula.txt"), "eula=true\n");
+      const original = await snapshot(directory);
+      const first = await boot();
+      const inspected = (
+        await first.request(
+          "/api/server-import/inspect",
+          json("POST", { directory }),
+        )
+      ).body;
+      assert.equal(inspected.version, "21.1.250");
+      assert.equal(inspected.memoryLimitMB, 12288);
+      const imported = await first.request(
+        "/api/server-import",
+        json("POST", {
+          directory,
+          launchType,
+          ...(launchType === "script"
+            ? { launchScript: "run.bat" }
+            : { launchArgs: args }),
+        }),
+      );
+      assert.equal(imported.status, 201, JSON.stringify(imported.body));
+      const id = imported.body.server.id;
+      assert.equal(imported.body.server.configuredMemoryLimitMB, 12288);
+      assert.equal(imported.body.server.version, "21.1.250");
+      assert.deepEqual(await snapshot(directory), original);
+      await first.close();
+      // Simulate a registration saved by the earlier version of the desktop app.
+      const registryFile = path.join(dataDir, "servers.json");
+      const registry = JSON.parse(await fs.readFile(registryFile, "utf8"));
+      Object.assign(registry.servers[0], {
+        memoryLimitMB: 4096,
+        version: "Configured launch",
+        software: "Java",
+      });
+      await fs.writeFile(registryFile, JSON.stringify(registry));
+      const panel = await boot();
+      const read = async () => (await panel.request("/api/server")).body;
+      const restored = (await panel.request("/api/servers")).body.servers[0];
+      assert.equal(restored.configuredMemoryLimitMB, 12288);
+      assert.equal(restored.software, "NeoForge");
+      assert.equal(restored.version, "21.1.250");
+      assert.equal((await read()).memoryLimit, 12 * 1024 ** 3);
+      assert.equal((await read()).memoryLimitState, "configured");
+      assert.deepEqual(await snapshot(directory), original);
+      assert.equal(
+        (
+          await panel.request(
+            "/api/server/power",
+            json("POST", { action: "start" }),
+          )
+        ).status,
+        200,
+      );
+      await eventually(async () => (await read()).status === "running");
+      assert.equal((await read()).memoryLimitState, "started");
+      assert.equal((await read()).memoryLimitSource, "launch");
+      await fs.writeFile(jvmFile, "-Xms6G -Xmx16G\n-XX:+UseZGC\n");
+      assert.equal((await read()).memoryLimit, 12 * 1024 ** 3);
+      assert.equal(
+        (await panel.request("/api/servers")).body.servers[0]
+          .configuredMemoryLimitMB,
+        12288,
+      );
+      assert.equal(
+        (
+          await panel.request(
+            `/api/servers/${id}`,
+            json("PATCH", { name: "Safe rename" }),
+          )
+        ).status,
+        200,
+      );
+      assert.equal((await read()).memoryLimit, 12 * 1024 ** 3);
+      assert.equal(
+        (
+          await panel.request(
+            "/api/server/power",
+            json("POST", { action: "restart" }),
+          )
+        ).status,
+        200,
+      );
+      await eventually(
+        async () =>
+          launches.length === 2 && (await read()).status === "running",
+      );
+      assert.equal((await read()).memoryLimit, 16 * 1024 ** 3);
+      assert.equal((await read()).version, "21.1.250");
+      assert.equal(
+        (
+          await panel.request(
+            "/api/server/power",
+            json("POST", { action: "stop" }),
+          )
+        ).status,
+        200,
+      );
+      await eventually(async () => (await read()).status === "offline");
+      await fs.writeFile(jvmFile, "-Xms6G\n-XX:MaxRAMPercentage=60\n");
+      assert.equal((await read()).memoryLimit, null);
+      assert.equal((await read()).memoryLimitSource, "unknown");
+      assert.equal((await read()).version, "21.1.250");
+    },
+  );
+}
+
+test("generic wrappers report unknown heap and version instead of borrowing unrelated JVM files", async (t) => {
+  const { directory, prepare, boot } = await fixture(t, {
+    startupMetadataTtlMs: 0,
+  });
+  await prepare(directory, { jars: [] });
+  await prepareForge(directory);
+  await fs.writeFile(
+    path.join(directory, "run.bat"),
+    "@echo off\nset JAVA=java\n%JAVA% @user_jvm_args.txt\npause\n",
+  );
+  assert.deepEqual(
+    await validateStartupFiles(directory, {
+      launchType: "script",
+      launchScript: "run.bat",
+    }),
+    {},
+  );
+  const panel = await boot();
+  const response = await panel.request(
+    "/api/server-import",
+    json("POST", { directory, launchType: "script", launchScript: "run.bat" }),
+  );
+  assert.equal(response.status, 201);
+  const server = (await panel.request("/api/server")).body;
+  assert.equal(server.memoryLimit, null);
+  assert.equal(server.memoryLimitSource, "unknown");
+  assert.equal(server.version, "Unknown");
+  assert.equal(response.body.server.configuredMemoryLimitMB, null);
+});
+
+for (const initialLaunch of ["java-args", "jar"]) {
+  test(`selecting a new server JAR clears the previous ${initialLaunch} build labels and persists them`, async (t) => {
+    const { directory, dataDir, prepare, boot } = await fixture(t);
+    await prepare(directory, { jars: ["server.jar", "replacement.jar"] });
+    const args = await prepareForge(directory);
+    const before = await snapshot(directory);
+    const first = await boot();
+    const imported = await first.request(
+      "/api/server-import",
+      json("POST", {
+        directory,
+        launchType: initialLaunch,
+        ...(initialLaunch === "java-args"
+          ? { launchArgs: args }
+          : { jar: "server.jar" }),
+      }),
+    );
+    assert.equal(imported.status, 201);
+    const id = imported.body.server.id;
+    await first.close();
+    // A previous build may have retained a detected label on its registration.
+    const registryFile = path.join(dataDir, "servers.json");
+    const registry = JSON.parse(await fs.readFile(registryFile, "utf8"));
+    Object.assign(registry.servers[0], {
+      software: "NeoForge",
+      version: "21.1.200",
+    });
+    await fs.writeFile(registryFile, JSON.stringify(registry));
+    const panel = await boot();
+    assert.equal(
+      (await panel.request("/api/server")).body.software,
+      "NeoForge",
+    );
+    const changed = await panel.request(
+      `/api/servers/${id}`,
+      json("PATCH", {
+        launchType: "jar",
+        jar: "replacement.jar",
+      }),
+    );
+    assert.equal(changed.status, 200, JSON.stringify(changed.body));
+    assert.equal(changed.body.server.software, "Java");
+    assert.equal(changed.body.server.version, "Configured JAR");
+    assert.equal((await panel.request("/api/server")).body.software, "Java");
+    assert.deepEqual(await snapshot(directory), before);
+    await panel.close();
+    const restored = await boot();
+    const server = (await restored.request("/api/server")).body;
+    assert.equal(server.software, "Java");
+    assert.equal(server.version, "Configured JAR");
+  });
+}

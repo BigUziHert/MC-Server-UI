@@ -64,7 +64,7 @@ type Server = {
   address: string;
   status: "running" | "offline" | "starting" | "stopping";
   mode: "demo" | "live";
-  version: string;
+  version: string | null;
   software: string;
   uptime: number;
   cpu: number | null;
@@ -72,9 +72,13 @@ type Server = {
   memory: number | null;
   metricsMessage?: string;
   iconVersion?: string | null;
+  serverIconVersion?: string | null;
+  iconPreference?: "server" | "default";
   addressSource?: "public" | "custom" | "local";
   addressNote?: string;
-  memoryLimit: number;
+  memoryLimit: number | null;
+  memoryLimitSource?: "panel" | "launch" | "unknown";
+  memoryLimitState?: "configured" | "started";
   disk: number;
   diskLimit: number;
   diskAvailable?: number;
@@ -973,6 +977,7 @@ function ConsolePage({
         <div className="server-identity">
           <ServerIcon
             version={server?.iconVersion}
+            serverVersion={server?.serverIconVersion}
             name={server?.name || "Minecraft server"}
             onSaved={refresh}
           />
@@ -1086,7 +1091,13 @@ function ConsolePage({
           <div className="metric-value">
             {unavailable ? "—" : ((server?.memory || 0) / 1024 ** 3).toFixed(2)}
             {!unavailable && (
-              <span>
+              <span
+                title={
+                  server?.memoryLimitState === "started"
+                    ? "Maximum JVM heap when this server started"
+                    : "Maximum JVM heap configured for the next launch"
+                }
+              >
                 /{" "}
                 {server?.memoryLimit
                   ? Number((server.memoryLimit / 1024 ** 3).toFixed(2))
@@ -1100,9 +1111,13 @@ function ConsolePage({
               ? server?.metricsMessage || "Waiting for server process…"
               : server?.mode === "demo"
                 ? "Simulated usage · allocated memory"
-                : server?.status === "offline"
-                  ? "Server offline"
-                  : "Physical memory · configured heap limit"}
+                : !server?.memoryLimit
+                  ? "Physical memory · heap limit unknown"
+                  : server?.status === "offline"
+                    ? "Server offline · next launch allocation"
+                    : server?.memoryLimitState === "started"
+                      ? "Physical memory · startup heap limit"
+                      : "Physical memory · configured heap limit"}
           </div>
           {!unavailable && (
             <Sparkline values={history.memory} color="#97b9f5" />
@@ -1353,7 +1368,7 @@ function ConsolePage({
                 <dt>Software</dt>
                 <dd>
                   <span className="software-dot" />
-                  {server?.software || "Paper"}
+                  {server?.software || "—"}
                 </dd>
               </div>
               <div>

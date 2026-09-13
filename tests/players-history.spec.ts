@@ -734,3 +734,332 @@ test("live whitelist requests wait for readback and unavailable settings disable
     page.getByRole("button", { name: "Add player to whitelist", exact: true }),
   ).toBeDisabled();
 });
+
+const pagedLists = [
+  "Online Players",
+  "Banned Players",
+  "Operators",
+  "Whitelist",
+  "Player history",
+];
+
+function pagingProfiles(count: number, prefix = "Paging") {
+  return Array.from({ length: count }, (_, index) => ({
+    name: `${prefix}_${String(index + 1).padStart(3, "0")}`,
+    uuid: `12345678-1234-1234-1234-${String(index + 1).padStart(12, "0")}`,
+    source: "observed",
+    online: true,
+    banned: false,
+    firstSeen: "2026-09-13T10:00:00Z",
+    lastSeen: "2026-09-13T10:00:00Z",
+  }));
+}
+
+function pagingResponse(players: ReturnType<typeof pagingProfiles>) {
+  return {
+    mode: "demo",
+    status: "running",
+    maxPlayers: 150,
+    online: players,
+    banned: players.map((player) => ({ ...player, banned: true })),
+    operators: players.map((player) => ({ ...player, level: 4 })),
+    whitelist: players,
+    history: players,
+    whitelistEnabled: false,
+    whitelistAvailable: true,
+    whitelistSettingsAvailable: true,
+    bansAvailable: true,
+    warnings: [],
+  };
+}
+
+test("all five player lists page independently, remember row counts, and reset searches and server changes", async ({
+  page,
+  server,
+}) => {
+  await page.setViewportSize({ width: 1823, height: 1216 });
+  await page.route("**/api/players", (route) =>
+    route.fulfill({
+      json: pagingResponse(
+        pagingProfiles(
+          13,
+          route.request().headers()["x-server-id"] === server.id
+            ? "Paging"
+            : "Other",
+        ),
+      ),
+    }),
+  );
+  await open(page, server.id);
+  for (const title of pagedLists) {
+    const region = page.getByRole("region", { name: title, exact: true });
+    const size = region.getByRole("combobox", {
+      name: `${title} rows per page`,
+      exact: true,
+    });
+    const status = region.getByRole("status", {
+      name: `${title} page`,
+      exact: true,
+    });
+    const next = region.getByRole("button", {
+      name: `${title} next page`,
+      exact: true,
+    });
+    const previous = region.getByRole("button", {
+      name: `${title} previous page`,
+      exact: true,
+    });
+    await expect(size).toHaveValue("5");
+    await expect(size.locator("option")).toHaveText([
+      "5",
+      "10",
+      "25",
+      "50",
+      "75",
+      "100",
+    ]);
+    await expect(region.getByRole("listitem")).toHaveCount(5);
+    await expect(status).toHaveText("Page 1 of 3");
+    await expect(previous).toBeDisabled();
+    await next.click();
+    await expect(status).toHaveText("Page 2 of 3");
+    await expect(region.getByRole("listitem").first()).toContainText(
+      "Paging_006",
+    );
+    await next.click();
+    await expect(region.getByRole("listitem")).toHaveCount(3);
+    await expect(status).toHaveText("Page 3 of 3");
+    await expect(next).toBeDisabled();
+    await previous.click();
+    await expect(region.getByRole("listitem").first()).toContainText(
+      "Paging_006",
+    );
+  }
+
+  for (const [title, search] of [
+    ["Operators", "Search operators"],
+    ["Player history", "Search player history"],
+  ]) {
+    const region = page.getByRole("region", { name: title, exact: true });
+    await page.getByLabel(search, { exact: true }).fill("Paging_013");
+    await expect(region.getByRole("listitem")).toHaveCount(1);
+    await expect(
+      region.getByRole("status", { name: `${title} page`, exact: true }),
+    ).toHaveText("Page 1 of 1");
+    await page.getByLabel(search, { exact: true }).fill("");
+    await expect(region.getByRole("listitem").first()).toContainText(
+      "Paging_001",
+    );
+    await expect(
+      region.getByRole("status", { name: `${title} page`, exact: true }),
+    ).toHaveText("Page 1 of 3");
+  }
+  await page
+    .getByRole("combobox", {
+      name: "Online Players rows per page",
+      exact: true,
+    })
+    .selectOption("10");
+  await page
+    .getByRole("combobox", { name: "Whitelist rows per page", exact: true })
+    .selectOption("25");
+  await expect(
+    page
+      .getByRole("region", { name: "Online Players", exact: true })
+      .getByRole("listitem"),
+  ).toHaveCount(10);
+  await expect(
+    page
+      .getByRole("region", { name: "Whitelist", exact: true })
+      .getByRole("listitem"),
+  ).toHaveCount(13);
+  await page.reload();
+  for (const title of pagedLists) {
+    const selected =
+      title === "Online Players" ? "10" : title === "Whitelist" ? "25" : "5";
+    await expect(
+      page.getByRole("combobox", {
+        name: `${title} rows per page`,
+        exact: true,
+      }),
+    ).toHaveValue(selected);
+  }
+  await page
+    .getByRole("button", { name: "Operators next page", exact: true })
+    .click();
+  await page
+    .getByRole("button", { name: "Player history next page", exact: true })
+    .click();
+  await page
+    .getByRole("combobox", { name: "Switch server", exact: true })
+    .selectOption(server.other);
+  for (const title of pagedLists) {
+    const region = page.getByRole("region", { name: title, exact: true });
+    await expect(region.getByRole("listitem").first()).toContainText(
+      "Other_001",
+    );
+    await expect(
+      region.getByRole("button", {
+        name: `${title} previous page`,
+        exact: true,
+      }),
+    ).toBeDisabled();
+    await expect(region.getByText(/Paging_/)).toHaveCount(0);
+  }
+});
+
+test("removing the last player on a page clamps the roster and refreshed smaller lists keep valid pages", async ({
+  page,
+  server,
+}) => {
+  let players = pagingProfiles(11);
+  let whitelisted = [...players];
+  let removed: unknown;
+  await page.route("**/api/players", (route) =>
+    route.fulfill({
+      json: { ...pagingResponse(players), whitelist: whitelisted },
+    }),
+  );
+  await page.route("**/api/players/whitelist/remove", async (route) => {
+    removed = route.request().postDataJSON();
+    whitelisted = whitelisted.filter(
+      (player) => player.name !== route.request().postDataJSON().name,
+    );
+    await route.fulfill({
+      json: { simulated: true, message: "Demo whitelist entry removed." },
+    });
+  });
+  await open(page, server.id);
+  for (const title of pagedLists) {
+    const next = page.getByRole("button", {
+      name: `${title} next page`,
+      exact: true,
+    });
+    await next.click();
+    await next.click();
+    await expect(
+      page.getByRole("status", { name: `${title} page`, exact: true }),
+    ).toHaveText("Page 3 of 3");
+  }
+  await page
+    .getByRole("button", {
+      name: "Remove saved whitelist player Paging_011",
+      exact: true,
+    })
+    .click();
+  const dialog = page.getByRole("dialog", {
+    name: "Remove player from whitelist?",
+    exact: true,
+  });
+  await expect(dialog).toContainText("Paging_011");
+  await dialog
+    .getByRole("button", { name: "Remove from whitelist", exact: true })
+    .click();
+  await expect(dialog).not.toBeVisible();
+  expect(removed).toEqual({ name: players[10].name, uuid: players[10].uuid });
+  await expect(
+    page.getByRole("status", { name: "Whitelist page", exact: true }),
+  ).toHaveText("Page 2 of 2");
+  await expect(
+    page
+      .getByRole("region", { name: "Whitelist", exact: true })
+      .getByRole("listitem"),
+  ).toHaveCount(5);
+
+  players = players.slice(0, 6);
+  whitelisted = whitelisted.slice(0, 6);
+  await page
+    .getByRole("button", { name: "Refresh players", exact: true })
+    .click();
+  for (const title of pagedLists) {
+    const region = page.getByRole("region", { name: title, exact: true });
+    await expect(
+      region.getByRole("status", { name: `${title} page`, exact: true }),
+    ).toHaveText("Page 2 of 2");
+    await expect(region.getByRole("listitem")).toHaveCount(1);
+    await expect(region.getByRole("listitem")).toContainText("Paging_006");
+  }
+  players = [];
+  whitelisted = [];
+  await page
+    .getByRole("button", { name: "Refresh players", exact: true })
+    .click();
+  for (const title of pagedLists) {
+    const region = page.getByRole("region", { name: title, exact: true });
+    await expect(region.getByRole("listitem")).toHaveCount(0);
+    await expect(
+      region.getByRole("status", { name: `${title} page`, exact: true }),
+    ).toHaveText("Page 1 of 1");
+    await expect(
+      region.getByRole("button", {
+        name: `${title} previous page`,
+        exact: true,
+      }),
+    ).toBeDisabled();
+    await expect(
+      region.getByRole("button", { name: `${title} next page`, exact: true }),
+    ).toBeDisabled();
+  }
+});
+
+test("large selected player pages scroll internally and keep every paging control usable on desktop and mobile", async ({
+  page,
+  server,
+}, info) => {
+  await page.route("**/api/players", (route) =>
+    route.fulfill({ json: pagingResponse(pagingProfiles(101)) }),
+  );
+  await page.setViewportSize({ width: 1823, height: 1216 });
+  await open(page, server.id);
+  for (const title of pagedLists) {
+    const region = page.getByRole("region", { name: title, exact: true });
+    for (const size of [10, 25, 50, 75, 100]) {
+      await region
+        .getByRole("combobox", { name: `${title} rows per page`, exact: true })
+        .selectOption(String(size));
+      await expect(region.getByRole("listitem")).toHaveCount(size);
+    }
+  }
+  for (const viewport of [
+    { width: 1823, height: 1216 },
+    { width: 390, height: 844 },
+  ]) {
+    await page.setViewportSize(viewport);
+    for (const title of pagedLists) {
+      const region = page.getByRole("region", { name: title, exact: true });
+      const list = region.getByRole("list", {
+        name: `${title} list`,
+        exact: true,
+      });
+      const bounds = await list.evaluate((element) => ({
+        height: element.clientHeight,
+        content: element.scrollHeight,
+      }));
+      expect(bounds.height).toBeLessThanOrEqual(
+        title === "Player history" ? 540 : 320,
+      );
+      expect(bounds.content).toBeGreaterThan(bounds.height);
+      await list.evaluate((element) => {
+        element.scrollTop = element.scrollHeight;
+      });
+      await region
+        .getByRole("button", { name: `${title} next page`, exact: true })
+        .click();
+      await expect(region.getByRole("listitem")).toHaveCount(1);
+      await expect(region.getByRole("listitem")).toContainText("Paging_101");
+      await region
+        .getByRole("button", { name: `${title} previous page`, exact: true })
+        .click();
+      await expect(region.getByRole("listitem")).toHaveCount(100);
+      expect(await list.evaluate((element) => element.scrollTop)).toBe(0);
+    }
+    expect(
+      await page.evaluate(() => document.documentElement.scrollWidth),
+    ).toBe(viewport.width);
+    await page.screenshot({
+      path: info.outputPath(`players-pagination-${viewport.width}.png`),
+      fullPage: true,
+      animations: "disabled",
+    });
+  }
+});

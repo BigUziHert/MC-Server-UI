@@ -33,10 +33,12 @@ export function ServerIconImage({
 
 export default function ServerIcon({
   version,
+  serverVersion,
   name,
   onSaved,
 }: {
   version?: string | null;
+  serverVersion?: string | null;
   name: string;
   onSaved: () => Promise<void>;
 }) {
@@ -46,7 +48,16 @@ export default function ServerIcon({
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
   const [reading, setReading] = useState(false);
-  const [remove, setRemove] = useState(false);
+  const [preference, setPreference] = useState<"default" | "server" | null>(
+    null,
+  );
+  const availableVersion = serverVersion ?? version;
+  const previewVersion =
+    preference === "default"
+      ? null
+      : preference === "server"
+        ? availableVersion
+        : version;
   const dialog = useRef<HTMLDialogElement>(null);
   const request = useRef(0);
   useEffect(() => {
@@ -98,7 +109,7 @@ export default function ServerIcon({
         );
         if (id === request.current) {
           setDraft(canvas.toDataURL("image/png"));
-          setRemove(false);
+          setPreference(null);
         }
       } finally {
         bitmap.close();
@@ -114,8 +125,14 @@ export default function ServerIcon({
     setBusy(true);
     setError("");
     try {
-      if (remove) await api("/server/icon", { method: "DELETE" });
+      if (preference === "default")
+        await api("/server/icon", { method: "DELETE" });
       else if (draft) await post("/server/icon", { image: draft });
+      else if (preference === "server")
+        await api("/server/icon", {
+          method: "PUT",
+          body: JSON.stringify({ preference: "server" }),
+        });
       await onSaved();
       setOpen(false);
     } catch (cause) {
@@ -135,7 +152,7 @@ export default function ServerIcon({
         onClick={() => {
           setDraft(null);
           setError("");
-          setRemove(false);
+          setPreference(null);
           setOpen(true);
         }}
       >
@@ -167,11 +184,13 @@ export default function ServerIcon({
           resized to 64 × 64.
         </p>
         <div className="icon-editor-preview">
-          {!remove && (draft || version) ? (
+          {draft || previewVersion ? (
             <img
               src={
                 draft ||
-                downloadUrl(`/server/icon?v=${encodeURIComponent(version!)}`)
+                downloadUrl(
+                  `/server/icon?v=${encodeURIComponent(previewVersion!)}`,
+                )
               }
               alt="Server icon preview"
             />
@@ -192,13 +211,13 @@ export default function ServerIcon({
         </label>
         {reading && <p role="status">Preparing image…</p>}
         <p className="icon-save-note">
-          Saved as server-icon.png in this server’s folder. Minecraft’s server
-          list uses the new icon after a server restart.
+          Uploaded images replace server-icon.png in this server’s folder.
+          Minecraft’s server list uses an uploaded icon after a server restart.
         </p>
-        {remove && (
+        {preference === "default" && (
           <p className="icon-save-note">
-            Saving will remove server-icon.png and restore the default panel
-            icon.
+            Saving changes only the panel display. Your server-icon.png file is
+            kept, and Minecraft continues using it.
           </p>
         )}
         {error && (
@@ -207,21 +226,34 @@ export default function ServerIcon({
           </p>
         )}
         <div className="icon-dialog-actions">
-          {version && (
+          {(availableVersion || draft) && (
             <button
               className="btn"
               disabled={busy || reading}
               onClick={() => {
-                setRemove(true);
+                setPreference("default");
                 setDraft(null);
               }}
             >
               Use default icon
             </button>
           )}
+          {availableVersion &&
+            (!version || preference === "default" || draft) && (
+              <button
+                className="btn"
+                disabled={busy || reading}
+                onClick={() => {
+                  setPreference("server");
+                  setDraft(null);
+                }}
+              >
+                Use server icon
+              </button>
+            )}
           <button
             className="btn primary"
-            disabled={busy || reading || (!draft && !remove)}
+            disabled={busy || reading || (!draft && !preference)}
             onClick={() => void save()}
           >
             {busy ? "Saving…" : "Save icon"}

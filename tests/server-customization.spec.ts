@@ -22,7 +22,7 @@ const test = base.extend<{ serverId: string }>({
   },
 });
 
-test("a server icon is cropped to Minecraft size, saved, shown after reload, and reset only on Save", async ({
+test("a server icon is cropped, saved, and hidden by a persistent panel preference without deleting its file", async ({
   page,
   request,
   serverId,
@@ -91,6 +91,7 @@ test("a server icon is cropped to Minecraft size, saved, shown after reload, and
   ).toHaveCount(2);
   await page.getByRole("button", { name: "Edit server icon" }).click();
   await dialog.getByRole("button", { name: "Use default icon" }).click();
+  await expect(dialog).toContainText("Your server-icon.png file is kept");
   expect(
     (
       await request.get("/api/server/icon", {
@@ -103,13 +104,70 @@ test("a server icon is cropped to Minecraft size, saved, shown after reload, and
   await expect(
     page.getByRole("img", { name: "Custom world server icon", exact: true }),
   ).toHaveCount(0);
-  expect(
-    (
-      await request.get("/api/server/icon", {
-        headers: { "X-Server-Id": serverId },
-      })
-    ).status(),
-  ).toBe(404);
+  const savedIcon = () =>
+    request.get("/api/server/icon", { headers: { "X-Server-Id": serverId } });
+  expect(await (await savedIcon()).body()).toEqual(bytes);
+  const fileDownload = await request.get(
+    "/api/files/download?path=server-icon.png",
+    { headers: { "X-Server-Id": serverId } },
+  );
+  expect(fileDownload.status()).toBe(200);
+  expect(await fileDownload.body()).toEqual(bytes);
+  await page.reload();
+  await expect(
+    page.getByRole("button", { name: "Edit server icon", exact: true }),
+  ).toBeVisible();
+  await expect(icons).toHaveCount(0);
+  const state = await (
+    await request.get("/api/server", { headers: { "X-Server-Id": serverId } })
+  ).json();
+  expect(state.iconPreference).toBe("default");
+  expect(state.iconVersion).toBeNull();
+  expect(state.serverIconVersion).toBeTruthy();
+  const fleet = await (await request.get("/api/servers")).json();
+  const other = fleet.servers.find(
+    (server: { id: string }) => server.id !== serverId,
+  );
+  if (other) {
+    await page
+      .getByRole("combobox", { name: "Switch server", exact: true })
+      .selectOption(other.id);
+    await expect(
+      page.getByRole("button", { name: "Edit server icon", exact: true }),
+    ).toBeVisible();
+    await page
+      .getByRole("combobox", { name: "Switch server", exact: true })
+      .selectOption(serverId);
+    await expect(
+      page.getByRole("button", { name: "Edit server icon", exact: true }),
+    ).toBeVisible();
+    await expect(icons).toHaveCount(0);
+  }
+  await page
+    .getByRole("button", { name: "Edit server icon", exact: true })
+    .click();
+  await dialog
+    .getByRole("button", { name: "Use server icon", exact: true })
+    .click();
+  await expect(
+    dialog.getByRole("img", { name: "Server icon preview" }),
+  ).toBeVisible();
+  await dialog
+    .getByRole("button", { name: "Close server icon", exact: true })
+    .click();
+  await expect(icons).toHaveCount(0);
+  await page
+    .getByRole("button", { name: "Edit server icon", exact: true })
+    .click();
+  await dialog
+    .getByRole("button", { name: "Use server icon", exact: true })
+    .click();
+  await dialog.getByRole("button", { name: "Save icon", exact: true }).click();
+  await expect(dialog).not.toBeVisible();
+  await expect(icons).toHaveCount(2);
+  expect(await (await savedIcon()).body()).toEqual(bytes);
+  await page.reload();
+  await expect(icons).toHaveCount(2);
 });
 
 test("custom connection hostname persists while running without rewriting bind settings", async ({
@@ -228,4 +286,63 @@ test("live telemetry renders memory against its allocation and CPU against whole
   await expect(memory).toContainText("Process counters unavailable");
   await expect(cpu.locator(".metric-value")).toHaveText("—");
   await expect(memory.locator(".metric-value")).toHaveText("—");
+});
+
+test("console shows detected NeoForge heap and version without substituting a default for unknown limits", async ({
+  page,
+  request,
+  serverId,
+}) => {
+  const seed = await (
+    await request.get("/api/server", { headers: { "X-Server-Id": serverId } })
+  ).json();
+  let reading = {
+    ...seed,
+    mode: "live",
+    status: "running",
+    metricsAvailable: true,
+    memory: 11.2 * 1024 ** 3,
+    memoryLimit: (12 * 1024 ** 3) as number | null,
+    memoryLimitSource: "launch",
+    memoryLimitState: "started",
+    software: "NeoForge",
+    version: "21.1.250",
+  };
+  await page.route("**/api/server", (route) =>
+    route.fulfill({ json: reading }),
+  );
+  await page.addInitScript(
+    (id) => localStorage.setItem("mc-panel.active-server", id),
+    serverId,
+  );
+  await page.goto("/#console");
+  const memory = page.locator(".metric-card").filter({ hasText: "Memory" });
+  await expect(memory.locator(".metric-value")).toHaveText("11.20/ 12 GB");
+  await expect(memory).toContainText("startup heap limit");
+  await expect(page.locator(".server-details")).toContainText("NeoForge");
+  await expect(page.locator(".server-details")).toContainText("21.1.250");
+
+  reading = {
+    ...reading,
+    status: "offline",
+    memory: 0,
+    memoryLimit: 16 * 1024 ** 3,
+    memoryLimitState: "configured",
+  };
+  await expect(memory.locator(".metric-value")).toHaveText("0.00/ 16 GB");
+  await expect(memory).toContainText("next launch allocation");
+
+  reading = {
+    ...reading,
+    status: "running",
+    memory: 11.2 * 1024 ** 3,
+    memoryLimit: null,
+    memoryLimitSource: "unknown",
+    software: "Java",
+    version: "Unknown",
+  };
+  await expect(memory.locator(".metric-value")).toHaveText("11.20/ — GB");
+  await expect(memory).toContainText("heap limit unknown");
+  await expect(page.locator(".server-details")).toContainText("Unknown");
+  await expect(page.locator(".server-details")).not.toContainText("21.1.250");
 });

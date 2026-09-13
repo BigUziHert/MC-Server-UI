@@ -1,5 +1,6 @@
 import {
   useCallback,
+  useContext,
   useEffect,
   useRef,
   useState,
@@ -25,8 +26,10 @@ import {
   Plus,
   UserCheck,
   UserMinus,
+  ChevronLeft,
+  ChevronRight,
 } from "lucide-react";
-import { useServerApi, type PageProps } from "../api";
+import { ServerScope, useServerApi, type PageProps } from "../api";
 import PlayerHead from "../PlayerHead";
 import "./management.css";
 import "./players.css";
@@ -63,6 +66,106 @@ type WhitelistAction =
   | { kind: "add" | "remove"; player?: Operator }
   | { kind: "state"; enabled: boolean };
 
+const pageSizes = [5, 10, 25, 50, 75, 100];
+
+function usePlayerPagination<T>(id: string, players: T[], filter = "") {
+  const serverId = useContext(ServerScope);
+  const resetKey = `${serverId ?? ""}\0${filter}`;
+  const storageKey = `mc-panel.players.rows.${id}`;
+  const [pageSize, setPageSize] = useState(() => {
+    try {
+      const saved = Number(localStorage.getItem(storageKey));
+      return pageSizes.includes(saved) ? saved : 5;
+    } catch {
+      return 5;
+    }
+  });
+  const [position, setPosition] = useState({ resetKey, page: 0 });
+  const pages = Math.max(1, Math.ceil(players.length / pageSize));
+  const page =
+    position.resetKey === resetKey ? Math.min(position.page, pages - 1) : 0;
+
+  useEffect(() => {
+    setPosition((current) =>
+      current.resetKey === resetKey && current.page === page
+        ? current
+        : { resetKey, page },
+    );
+  }, [resetKey, page]);
+
+  function changeSize(value: number) {
+    if (!pageSizes.includes(value)) return;
+    setPageSize(value);
+    setPosition({ resetKey, page: 0 });
+    try {
+      localStorage.setItem(storageKey, String(value));
+    } catch {
+      // Pagination still works when browser storage is unavailable.
+    }
+  }
+
+  return {
+    rows: players.slice(page * pageSize, (page + 1) * pageSize),
+    page,
+    pages,
+    pageSize,
+    changeSize,
+    changePage: (value: number) =>
+      setPosition({ resetKey, page: Math.max(0, Math.min(value, pages - 1)) }),
+    scrollKey: `${resetKey}\0${pageSize}\0${page}`,
+  };
+}
+
+function Pagination({
+  title,
+  paging,
+  disabled,
+}: {
+  title: string;
+  paging: ReturnType<typeof usePlayerPagination>;
+  disabled: boolean;
+}) {
+  return (
+    <footer className="players-pagination">
+      <label>
+        Rows
+        <select
+          aria-label={`${title} rows per page`}
+          value={paging.pageSize}
+          onChange={(event) => paging.changeSize(Number(event.target.value))}
+        >
+          {pageSizes.map((size) => (
+            <option key={size} value={size}>
+              {size}
+            </option>
+          ))}
+        </select>
+      </label>
+      <span role="status" aria-label={`${title} page`}>
+        Page {paging.page + 1} of {paging.pages}
+      </span>
+      <div>
+        <button
+          className="btn icon"
+          aria-label={`${title} previous page`}
+          disabled={disabled || paging.page === 0}
+          onClick={() => paging.changePage(paging.page - 1)}
+        >
+          <ChevronLeft size={15} />
+        </button>
+        <button
+          className="btn icon"
+          aria-label={`${title} next page`}
+          disabled={disabled || paging.page === paging.pages - 1}
+          onClick={() => paging.changePage(paging.page + 1)}
+        >
+          <ChevronRight size={15} />
+        </button>
+      </div>
+    </footer>
+  );
+}
+
 function Roster({
   id,
   title,
@@ -72,6 +175,7 @@ function Roster({
   actions,
   tools,
   children,
+  filter,
 }: {
   id: string;
   title: string;
@@ -81,7 +185,13 @@ function Roster({
   actions: (player: Operator) => ReactNode;
   tools?: ReactNode;
   children?: ReactNode;
+  filter?: string;
 }) {
+  const paging = usePlayerPagination(id, players, filter);
+  const list = useRef<HTMLUListElement>(null);
+  useEffect(() => {
+    if (list.current) list.current.scrollTop = 0;
+  }, [paging.scrollKey]);
   return (
     <section className="players-roster" aria-labelledby={`${id}-title`}>
       <header className="players-roster-heading">
@@ -96,8 +206,8 @@ function Roster({
         ) : players.length === 0 ? (
           <p className="players-roster-empty">{empty}</p>
         ) : (
-          <ul>
-            {players.map((player) => (
+          <ul ref={list} aria-label={`${title} list`} tabIndex={0}>
+            {paging.rows.map((player) => (
               <li
                 className={`players-roster-row ${id === "operators" ? "players-operator" : ""}`}
                 aria-label={`${title} ${player.name}`}
@@ -110,6 +220,7 @@ function Roster({
             ))}
           </ul>
         )}
+        <Pagination title={title} paging={paging} disabled={loading} />
       </div>
     </section>
   );
@@ -122,7 +233,6 @@ export default function Players({ notify }: PageProps) {
   const [error, setError] = useState("");
   const [search, setSearch] = useState("");
   const [historySearch, setHistorySearch] = useState("");
-  const [historyLimit, setHistoryLimit] = useState(50);
   const [moderating, setModerating] = useState<Moderation | null>(null);
   const [reason, setReason] = useState("");
   const [granting, setGranting] = useState(false);
@@ -141,6 +251,7 @@ export default function Players({ notify }: PageProps) {
   const usernameInput = useRef<HTMLInputElement>(null);
   const request = useRef(0);
   const session = useRef(0);
+  const historyList = useRef<HTMLUListElement>(null);
 
   const refresh = useCallback(
     async (silent = false) => {
@@ -169,7 +280,6 @@ export default function Players({ notify }: PageProps) {
     setFormError("");
     setSearch("");
     setHistorySearch("");
-    setHistoryLimit(50);
     setModerating(null);
     setGranting(false);
     setRemoving(null);
@@ -232,6 +342,14 @@ export default function Players({ notify }: PageProps) {
   const filteredHistory = history.filter((player) =>
     player.name.toLowerCase().includes(historySearch.trim().toLowerCase()),
   );
+  const historyPaging = usePlayerPagination(
+    "history",
+    filteredHistory,
+    historySearch,
+  );
+  useEffect(() => {
+    if (historyList.current) historyList.current.scrollTop = 0;
+  }, [historyPaging.scrollKey]);
   const actionLabel =
     moderating?.action === "kick"
       ? "Kick player"
@@ -603,6 +721,7 @@ export default function Players({ notify }: PageProps) {
           id="operators"
           title="Operators"
           players={filtered}
+          filter={search}
           empty={search ? "No matching players" : "No operators."}
           loading={loading && !data}
           tools={
@@ -753,7 +872,6 @@ export default function Players({ notify }: PageProps) {
                 value={historySearch}
                 onChange={(event) => {
                   setHistorySearch(event.target.value);
-                  setHistoryLimit(50);
                 }}
               />
             </label>
@@ -798,8 +916,13 @@ export default function Players({ notify }: PageProps) {
             </p>
           </div>
         ) : (
-          <ul className="players-history-list">
-            {filteredHistory.slice(0, historyLimit).map((player) => (
+          <ul
+            className="players-history-list"
+            ref={historyList}
+            aria-label="Player history list"
+            tabIndex={0}
+          >
+            {historyPaging.rows.map((player) => (
               <li
                 aria-label={`Player ${player.name}`}
                 className="players-history-row"
@@ -911,19 +1034,11 @@ export default function Players({ notify }: PageProps) {
             ))}
           </ul>
         )}
-        {!loading && !error && filteredHistory.length > historyLimit && (
-          <div className="management-panel-footer">
-            <span>
-              Showing {historyLimit} of {filteredHistory.length} players
-            </span>
-            <button
-              className="btn"
-              onClick={() => setHistoryLimit((value) => value + 50)}
-            >
-              Show more players
-            </button>
-          </div>
-        )}
+        <Pagination
+          title="Player history"
+          paging={historyPaging}
+          disabled={loading || Boolean(error)}
+        />
       </section>
 
       <dialog
