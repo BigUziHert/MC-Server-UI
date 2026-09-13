@@ -119,6 +119,13 @@ type Plan = {
     versionId?: string | null;
     requiredBy: string;
   }[];
+  bundledDependencies?: {
+    title: string;
+    version?: string;
+    path: string;
+    bundledWith: string;
+    serverCompatible?: boolean;
+  }[];
 };
 type Selection = { project: Project; installed?: InstalledItem };
 const kinds = [
@@ -846,7 +853,7 @@ export default function Launchpad({ notify }: PageProps) {
     if (!plan || pending.current) return;
     if (plan.unavailableDependencies?.length && !acknowledgedDependencies) {
       setDialogError(
-        "Confirm that you will manage the unavailable dependencies before installing.",
+        "Confirm that you have reviewed the unavailable catalog dependencies before installing.",
       );
       return;
     }
@@ -1400,12 +1407,32 @@ export default function Launchpad({ notify }: PageProps) {
         </div>
       )}
       {installedOnly && !scanError && unavailableUpdates.length > 0 && (
-        <div className="launchpad-error" role="alert">
+        <div className="launchpad-error launchpad-update-warning" role="alert">
           <AlertCircle size={16} />
-          <span>
-            Could not check updates for {unavailableUpdates.length} installed{" "}
-            {unavailableUpdates.length === 1 ? "item" : "items"}.
-          </span>
+          <div className="launchpad-update-warning-body">
+            <span>
+              Could not check updates for {unavailableUpdates.length} installed{" "}
+              {unavailableUpdates.length === 1 ? "item" : "items"}.
+            </span>
+            <details className="launchpad-update-issues">
+              <summary>View affected files</summary>
+              <ul
+                aria-label="Files with unavailable update checks"
+                tabIndex={0}
+              >
+                {unavailableUpdates.map((item) => (
+                  <li key={item.path}>
+                    <strong>{item.title?.trim() || item.name}</strong>
+                    <code>{item.path}</code>
+                    <p>
+                      {item.updateIssue ||
+                        "No verified update result is available for this file. Retry the check."}
+                    </p>
+                  </li>
+                ))}
+              </ul>
+            </details>
+          </div>
           <button
             className="btn"
             disabled={scanRefreshing || scanLoading}
@@ -1790,6 +1817,43 @@ export default function Launchpad({ notify }: PageProps) {
                   {warning}
                 </p>
               ))}
+              {Boolean(plan.bundledDependencies?.length) && (
+                <section
+                  className="launchpad-bundled"
+                  aria-labelledby="launchpad-bundled-title"
+                >
+                  <h3 id="launchpad-bundled-title">
+                    Included with the download
+                  </h3>
+                  <p className="management-dialog-description">
+                    These libraries are already packaged inside the files being
+                    installed.
+                  </p>
+                  <ul
+                    className="launchpad-review-files launchpad-bundled-dependencies"
+                    aria-label="Bundled dependencies"
+                    tabIndex={0}
+                  >
+                    {plan.bundledDependencies!.map((dependency, index) => (
+                      <li
+                        key={`${dependency.bundledWith}:${dependency.path}:${index}`}
+                      >
+                        <strong>
+                          {dependency.title}
+                          {dependency.version ? ` ${dependency.version}` : ""}
+                        </strong>
+                        {dependency.serverCompatible === false && (
+                          <span>Not active on the server</span>
+                        )}
+                        <span>
+                          Included in <code>{dependency.bundledWith}</code>
+                        </span>
+                        <code>{dependency.path}</code>
+                      </li>
+                    ))}
+                  </ul>
+                </section>
+              )}
               {Boolean(plan.unavailableDependencies?.length) && (
                 <>
                   <div className="launchpad-inline-notice">
@@ -1797,9 +1861,10 @@ export default function Launchpad({ notify }: PageProps) {
                     <div>
                       <strong>Required dependencies unavailable</strong>
                       <p>
-                        These dependencies could not be downloaded. This content
-                        may not work until you install compatible copies
-                        yourself.
+                        The catalog lists these dependencies, but their project
+                        or version could not be found. Review the included
+                        libraries and the mod author’s requirements before
+                        continuing.
                       </p>
                       <ul aria-label="Unavailable required dependencies">
                         {plan.unavailableDependencies!.map(
@@ -1833,7 +1898,9 @@ export default function Launchpad({ notify }: PageProps) {
                       }
                       style={{ flexShrink: 0 }}
                     />
-                    <span>I will manage these dependencies myself</span>
+                    <span>
+                      I have reviewed the unavailable catalog dependencies
+                    </span>
                   </label>
                 </>
               )}

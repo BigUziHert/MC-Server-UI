@@ -3,6 +3,7 @@ import path from "node:path";
 import { createHash, randomUUID } from "node:crypto";
 import { createCoreProviders } from "./launchpad-providers.mjs";
 import { safeInstallPath, unpackProviderZip } from "./launchpad-archives.mjs";
+import { inspectBundledDependencies } from "./launchpad-bundled.mjs";
 import {
   checkedProviderUrl,
   downloadVerified,
@@ -1127,6 +1128,143 @@ export async function createLaunchpad(ctx) {
       unavailableDependencies,
     };
   }
+  async function inspectUnavailableDependencies(result, input, stage) {
+    result.bundledDependencies = [];
+    if (input.type !== "mod" || !result.unavailableDependencies.length) return;
+    const parents = new Set(
+      result.unavailableDependencies.map((item) => item.requiredBy),
+    );
+    const bundles = [];
+    let inspected = 0,
+      total = 0;
+    for (const [index, file] of result.files.entries()) {
+      if (!parents.has(file.title) || !/\.jar$/i.test(file.path)) continue;
+      if (
+        ++inspected > 16 ||
+        !Number.isSafeInteger(file.size) ||
+        file.size > 64 * 1024 ** 2 ||
+        (total += file.size) > 128 * 1024 ** 2
+      ) {
+        result.warnings.push(
+          `Bundled libraries in ${file.path} could not be checked within the inspection limits.`,
+        );
+        continue;
+      }
+      const target = path.join(stage, `dependency-inspection-${index}.jar`);
+      await downloadVerified(file, target, file.hosts, request, {
+        signal: input.signal,
+      });
+      // Keep the verified download for installation instead of fetching it twice.
+      file.stagedPath = target;
+      try {
+        for (const bundled of await inspectBundledDependencies(target, {
+          signal: input.signal,
+          loader: input.loader,
+          fingerprint: curseFingerprint,
+        }))
+          bundles.push({ ...bundled, bundledWith: file.path });
+      } catch (cause) {
+        input.signal?.throwIfAborted();
+        result.warnings.push(
+          `Bundled libraries in ${file.path} could not be verified: ${cause.message}`,
+        );
+      }
+    }
+    result.bundledDependencies = bundles.map(
+      ({ title, version, path, bundledWith, serverCompatible }) => ({
+        title,
+        version,
+        path,
+        bundledWith,
+        ...(serverCompatible === false ? { serverCompatible: false } : {}),
+      }),
+    );
+    if (!bundles.length) return;
+    const identities = [];
+    for (const platform of new Set(
+      result.unavailableDependencies.map((item) => item.platform),
+    )) {
+      const found = await provider(platform);
+      const signal = AbortSignal.any(
+        [input.signal, AbortSignal.timeout(8000)].filter(Boolean),
+      );
+      try {
+        for (let offset = 0; offset < bundles.length; offset += 100) {
+          const batch = bundles
+            .slice(offset, offset + 100)
+            .filter((item) => item.serverCompatible === true);
+          if (!batch.length) continue;
+          if (found.identify) {
+            const matches = await abortable(
+              found.identify([...new Set(batch.map((item) => item.sha512))], {
+                signal,
+              }),
+              signal,
+            );
+            for (const item of batch) {
+              const match = matches?.[item.sha512];
+              if (
+                match?.project_id &&
+                match.id &&
+                found.compatibleBundledVersion?.(match, input) === true &&
+                match.files?.some(
+                  (file) => file.hashes?.sha512?.toLowerCase() === item.sha512,
+                )
+              )
+                identities.push({
+                  platform,
+                  projectId: String(match.project_id),
+                  versionId: String(match.id),
+                });
+            }
+          } else if (found.identifyFingerprints) {
+            const matches = await abortable(
+              found.identifyFingerprints(
+                [...new Set(batch.map((item) => item.fingerprint))],
+                { signal },
+              ),
+              signal,
+            );
+            for (const item of batch) {
+              for (const match of matches?.exactMatches ?? []) {
+                if (
+                  match.file?.fileFingerprint === item.fingerprint &&
+                  match.file.hashes?.some(
+                    (hash) =>
+                      hash.algo === 1 &&
+                      hash.value?.toLowerCase() === item.sha1,
+                  ) &&
+                  match.file.modId &&
+                  match.file.id &&
+                  found.compatibleBundledVersion?.(match.file, input) === true
+                )
+                  identities.push({
+                    platform,
+                    projectId: String(match.file.modId),
+                    versionId: String(match.file.id),
+                  });
+              }
+            }
+          }
+        }
+      } catch {
+        input.signal?.throwIfAborted();
+        // A failed or absent identity leaves the catalog requirement unresolved.
+      }
+    }
+    result.unavailableDependencies = result.unavailableDependencies.filter(
+      (dependency) =>
+        !identities.some(
+          (identity) =>
+            identity.platform === dependency.platform &&
+            (!dependency.projectId ||
+              identity.projectId === dependency.projectId) &&
+            (!dependency.versionId ||
+              identity.versionId === dependency.versionId) &&
+            (dependency.projectId || dependency.versionId),
+        ),
+    );
+  }
   async function unpackPack(result, input, stage) {
     const found = await provider(input.platform);
     const archive = path.join(stage, "package.zip");
@@ -1342,6 +1480,7 @@ export async function createLaunchpad(ctx) {
     const stage = await privatePath(planId);
     await fs.mkdir(stage);
     try {
+      await inspectUnavailableDependencies(result, input, stage);
       if (result.archive) {
         const pack = await unpackPack(result, input, stage);
         result.files.push(
@@ -1467,6 +1606,7 @@ export async function createLaunchpad(ctx) {
         versionName: result.versionName,
         warnings: [...new Set(result.warnings)],
         unavailableDependencies: result.unavailableDependencies,
+        bundledDependencies: result.bundledDependencies,
         loaderInstall: result.loaderInstall,
         expiresAt,
       };
@@ -1484,6 +1624,7 @@ export async function createLaunchpad(ctx) {
         })),
         warnings: plan.warnings,
         unavailableDependencies: plan.unavailableDependencies,
+        bundledDependencies: plan.bundledDependencies,
         expiresAt,
       };
     } catch (cause) {
@@ -1711,19 +1852,37 @@ export async function createLaunchpad(ctx) {
         for (const [index, file] of plan.files.entries()) {
           controller.signal.throwIfAborted();
           job.message = `Verifying ${file.path}`;
+          const alreadyStaged = Boolean(file.stagedPath);
           if (!file.stagedPath) {
             file.stagedPath = path.join(plan.stage, `download-${index}`);
             await downloadVerified(file, file.stagedPath, file.hosts, request, {
               signal: controller.signal,
             });
           }
-          downloaded += (await fs.stat(file.stagedPath)).size;
+          const stagedSize = (await fs.stat(file.stagedPath)).size;
+          const [algorithm, expectedHash] = strongestHash(file.hashes);
+          const stagedHash = alreadyStaged
+            ? await fileHash(file.stagedPath, algorithm)
+            : null;
+          if (
+            alreadyStaged &&
+            ((file.size != null && stagedSize !== file.size) ||
+              stagedHash !== expectedHash)
+          )
+            throw error(
+              502,
+              "A staged download failed its size or checksum check. No server files were changed.",
+            );
+          downloaded += stagedSize;
           if (downloaded > (plan.input.type === "modpack" ? 4 : 2) * 1024 ** 3)
             throw error(
               400,
               `This installation exceeds the ${plan.input.type === "modpack" ? 4 : 2} GB total size limit.`,
             );
-          file.sha512 = await fileHash(file.stagedPath);
+          file.sha512 =
+            algorithm === "sha512" && stagedHash
+              ? stagedHash
+              : await fileHash(file.stagedPath);
         }
         controller.signal.throwIfAborted();
         await promote(plan, job);

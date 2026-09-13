@@ -1452,6 +1452,263 @@ test("checksum failures and changed reviewed files never mutate existing server 
   );
 });
 
+test("bundled libraries satisfy only checksum-identified catalog requirements and reuse the reviewed download", async (t) => {
+  for (const mode of [
+    "identified",
+    "unknown",
+    "wrong-hash",
+    "pinned-other",
+    "tampered-stage",
+    "other-loader",
+    "catalog-other-loader",
+    "catalog-other-minecraft",
+    "catalog-client-only",
+  ]) {
+    await t.test(mode, async (t) => {
+      const nested = zip([
+        [
+          "META-INF/neoforge.mods.toml",
+          '[[mods]]\nmodId="bundled_library"\nversion="1.2.3"\ndisplayName="Bundled Library"\n',
+        ],
+      ]);
+      const nestedHash = hashes(nested).sha512;
+      const embeddedPath = "META-INF/jarjar/library.jar";
+      const parent = zip([
+        [
+          "META-INF/jarjar/metadata.json",
+          JSON.stringify({
+            jars: [
+              {
+                identifier: { group: "example", artifact: "library" },
+                version: { range: "[1,2)", artifactVersion: "1.2.3" },
+                path: embeddedPath,
+              },
+            ],
+          }),
+        ],
+        [embeddedPath, nested],
+      ]);
+      const f = await fixture(t, {
+        request: async (url, init) => {
+          const pathname = new URL(url).pathname;
+          if (pathname.startsWith("/v2/project/bundledProject"))
+            return new Response(null, { status: 404 });
+          if (
+            pathname === "/v2/version_files" &&
+            JSON.parse(init.body).hashes.includes(nestedHash)
+          ) {
+            if (mode === "unknown") return Response.json({});
+            return Response.json({
+              [nestedHash]: {
+                id: "embedded-version",
+                project_id: "bundledProject",
+                game_versions: [
+                  mode === "catalog-other-minecraft" ? "1.20.1" : "1.21.1",
+                ],
+                loaders: [
+                  mode === "catalog-other-loader" ? "fabric" : "neoforge",
+                ],
+                environment:
+                  mode === "catalog-client-only"
+                    ? "client_only"
+                    : "server_only",
+                files: [
+                  {
+                    hashes: {
+                      sha512:
+                        mode === "wrong-hash"
+                          ? hashes("different").sha512
+                          : nestedHash,
+                    },
+                  },
+                ],
+              },
+            });
+          }
+        },
+      });
+      f.downloads.set("https://cdn.modrinth.com/new.jar", parent);
+      f.versions.new.files[0].size = parent.length;
+      f.versions.new.files[0].hashes = hashes(parent);
+      f.versions.new.dependencies = [
+        {
+          project_id: "bundledProject",
+          version_id: mode === "pinned-other" ? "other-version" : null,
+          dependency_type: "required",
+        },
+      ];
+      if (mode === "other-loader") {
+        f.setServer({ loader: "fabric" });
+        f.versions.new.loaders = ["fabric"];
+      }
+      const plan = await f.service.preview({
+        ...selection,
+        ...(mode === "other-loader" ? { loader: "fabric" } : {}),
+        replacePath: "mods/old.jar",
+      });
+      assert.deepEqual(
+        plan.bundledDependencies,
+        mode === "other-loader"
+          ? []
+          : [
+              {
+                title: "Bundled Library",
+                version: "1.2.3",
+                path: embeddedPath,
+                bundledWith: "mods/new.jar",
+              },
+            ],
+      );
+      const resolved = ["identified", "tampered-stage"].includes(mode);
+      assert.equal(plan.unavailableDependencies.length, resolved ? 0 : 1);
+      if (!resolved)
+        await assert.rejects(
+          f.service.install({ planId: plan.planId, confirmed: true }),
+          /unavailable required dependencies/,
+        );
+      if (mode === "tampered-stage") {
+        const stage = path.join(
+          f.dataDir,
+          "launchpad",
+          plan.planId,
+          "dependency-inspection-0.jar",
+        );
+        await fs.writeFile(stage, Buffer.alloc(parent.length));
+      }
+      const job = await finish(f.service, {
+        planId: plan.planId,
+        confirmed: true,
+        ...(!resolved ? { acknowledgedUnavailableDependencies: true } : {}),
+      });
+      if (mode === "tampered-stage") {
+        assert.equal(job.status, "failed");
+        assert.match(job.error, /checksum/);
+        assert.equal(f.mutations, 0);
+        assert.deepEqual(
+          await fs.readFile(path.join(f.serverDir, "mods", "old.jar")),
+          f.old,
+        );
+        assert.deepEqual(await f.bin.list(), []);
+      } else {
+        assert.equal(job.status, "completed");
+        assert.deepEqual(await fs.readdir(path.join(f.serverDir, "mods")), [
+          "new.jar",
+        ]);
+        assert.deepEqual(
+          await fs.readFile(path.join(f.serverDir, "mods", "new.jar")),
+          parent,
+        );
+      }
+      assert.equal(
+        f.requests.filter(
+          (item) => item.url === "https://cdn.modrinth.com/new.jar",
+        ).length,
+        1,
+      );
+    });
+  }
+});
+test("bundled dependency fingerprint matches also require an exact SHA-1 identity", async (t) => {
+  const f = await fixture(t);
+  f.setServer({ loader: "fabric" });
+  const nested = zip([
+    [
+      "fabric.mod.json",
+      JSON.stringify({
+        schemaVersion: 1,
+        id: "embedded",
+        name: "Embedded Library",
+        version: "2.0",
+      }),
+    ],
+  ]);
+  const parent = zip([
+    [
+      "fabric.mod.json",
+      JSON.stringify({
+        schemaVersion: 1,
+        id: "parent",
+        jars: [{ file: "libs/embedded.jar" }],
+      }),
+    ],
+    ["libs/embedded.jar", nested],
+  ]);
+  f.downloads.set("https://cdn.modrinth.com/parent.jar", parent);
+  let mode = "valid";
+  const service = await f.boot({
+    extraProviders: [
+      {
+        id: "fingerprint-fixture",
+        name: "Fingerprint catalog",
+        types: ["mod"],
+        available: true,
+        downloadHosts: ["cdn.modrinth.com"],
+        versions: async () => {
+          throw Object.assign(new Error("Not found"), { status: 404 });
+        },
+        resolve: async () => ({
+          title: "Parent Mod",
+          versionName: "1.0",
+          files: [
+            {
+              path: "parent.jar",
+              url: "https://cdn.modrinth.com/parent.jar",
+              size: parent.length,
+              hashes: hashes(parent),
+            },
+          ],
+          dependencies: [
+            { platform: "fingerprint-fixture", projectId: "44", type: "mod" },
+          ],
+        }),
+        identifyFingerprints: async (values) => {
+          assert.deepEqual(values, [curseFingerprint(nested)]);
+          return {
+            exactMatches: [
+              {
+                id: 44,
+                file: {
+                  modId: 44,
+                  id: 55,
+                  fileFingerprint:
+                    mode === "wrong-fingerprint"
+                      ? curseFingerprint(nested) ^ 1
+                      : curseFingerprint(nested),
+                  hashes: [
+                    {
+                      algo: 1,
+                      value:
+                        mode === "wrong-sha1"
+                          ? "0".repeat(40)
+                          : hashes(nested).sha1,
+                    },
+                  ],
+                },
+              },
+            ],
+          };
+        },
+        compatibleBundledVersion: () => true,
+      },
+    ],
+  });
+  for (mode of ["valid", "wrong-sha1", "wrong-fingerprint"]) {
+    const plan = await service.preview({
+      ...selection,
+      loader: "fabric",
+      platform: "fingerprint-fixture",
+      projectId: "parent",
+      versionId: "new",
+    });
+    assert.equal(plan.bundledDependencies[0].title, "Embedded Library");
+    assert.equal(
+      plan.unavailableDependencies.length,
+      mode === "valid" ? 0 : 1,
+      mode,
+    );
+  }
+});
+
 test("JEI-style missing Modrinth dependencies require explicit acknowledgement of the reviewed omissions", async (t) => {
   const f = await fixture(t, {
     request: async (url) => {

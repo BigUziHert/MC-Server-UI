@@ -808,6 +808,11 @@ export function createCoreProviders({
           body: JSON.stringify({ hashes, algorithm: "sha512" }),
         });
       },
+      compatibleBundledVersion(value, input) {
+        return (
+          fits(mrVersion(value), input) && serverEnvironment(value.environment)
+        );
+      },
       project: mrProject,
       async version(versionId) {
         return json(`${mr}/version/${enc(id(versionId))}`);
@@ -896,6 +901,9 @@ export function createCoreProviders({
             body: JSON.stringify({ fingerprints }),
           })
         ).data;
+      },
+      compatibleBundledVersion(value, input) {
+        return fits(cfVersion(value, input.type), input);
       },
       async resolve(input) {
         const project = (await curseJson(`/mods/${enc(id(input.projectId))}`))

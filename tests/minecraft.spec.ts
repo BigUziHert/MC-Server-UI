@@ -1719,6 +1719,230 @@ test("Launchpad confines installed update issues to the matching files and platf
   await expect(page.locator(".launchpad-project-issue")).toHaveCount(0);
 });
 
+test("Launchpad lists every affected file and reason beyond the current installed page", async ({
+  page,
+  serverId,
+}, testInfo) => {
+  const update = {
+    id: "jei-new",
+    name: "JEI 19.0",
+    version: "19.0",
+    gameVersions: ["1.21.1"],
+    loaders: ["neoforge"],
+    publishedAt: "2026-09-01T00:00:00Z",
+    downloadable: true,
+  };
+  const failures = [
+    {
+      title: "Zulu Client Renderer",
+      reason:
+        "This project is client-only and cannot be installed on a server.",
+    },
+    {
+      title: "Zulu Missing Project",
+      reason: "Modrinth returned 404 for this installed project's versions.",
+    },
+    {
+      title: "Zulu Offline Provider",
+      reason: "The provider could not be reached. Retry this update check.",
+    },
+    { title: "Zulu Unknown Result", reason: undefined },
+  ].map((item, index) => ({
+    ...item,
+    path: `mods/zulu-${index + 1}.jar`,
+    name: `zulu-${index + 1}.jar`,
+    size: 2048,
+    platform: "modrinth",
+    projectId: `failed-${index + 1}`,
+    versionId: "old",
+    updateCheck: "unavailable",
+    updateIssue: item.reason,
+  }));
+  const healthy = Array.from({ length: 9 }, (_, index) => ({
+    title: `Alpha Healthy ${index + 1}`,
+    path: `mods/alpha-${index + 1}.jar`,
+    name: `alpha-${index + 1}.jar`,
+    size: 1024,
+    platform: "modrinth",
+    projectId: `healthy-${index + 1}`,
+    versionId: "current",
+    updateCheck: "checked",
+  }));
+  const items = [
+    ...failures,
+    {
+      title: "JEI",
+      path: "mods/jei-old.jar",
+      name: "jei-old.jar",
+      size: 4096,
+      platform: "modrinth",
+      projectId: "jei",
+      versionId: "old",
+      updateCheck: "checked",
+      update,
+    },
+    ...healthy,
+    {
+      path: "mods/local-helper.jar",
+      name: "local-helper.jar",
+      size: 512,
+      platform: null,
+      updateCheck: "unavailable",
+    },
+    {
+      title: "Other Provider Failure",
+      path: "mods/other-provider.jar",
+      name: "other-provider.jar",
+      size: 1024,
+      platform: "curseforge",
+      projectId: "12345",
+      updateCheck: "unavailable",
+      updateIssue: "A separate provider is unavailable.",
+    },
+  ];
+  await page.route("**/api/launchpad", (route) =>
+    route.fulfill({
+      json: {
+        platforms: [
+          { id: "modrinth", name: "Modrinth", available: true, types: ["mod"] },
+          {
+            id: "curseforge",
+            name: "CurseForge",
+            available: true,
+            types: ["mod"],
+          },
+        ],
+        gameVersion: "1.21.1",
+        gameVersions: ["1.21.1"],
+        loader: "neoforge",
+        status: "offline",
+        warnings: [],
+      },
+    }),
+  );
+  await page.route("**/api/launchpad/search?**", (route) =>
+    route.fulfill({ json: { projects: [], total: 0, offset: 0, limit: 10 } }),
+  );
+  await page.route("**/api/launchpad/installed?**", (route) => {
+    expect(route.request().headers()["x-server-id"]).toBe(serverId);
+    const local =
+      new URL(route.request().url()).searchParams.get("local") === "true";
+    return route.fulfill({
+      json: {
+        items: local
+          ? items.map((item) => ({
+              ...item,
+              updateCheck: "pending",
+              updateIssue: undefined,
+            }))
+          : items,
+        warnings: [],
+      },
+    });
+  });
+  await page.goto("/#launchpad");
+  await page.getByRole("switch", { name: "Show installed content" }).check();
+  await expect(
+    page.getByLabel("Launchpad rows per page", { exact: true }),
+  ).toHaveValue("10");
+  const names = page.getByRole("article").getByRole("heading", { level: 3 });
+  await expect(names).toHaveText(["JEI", ...healthy.map((item) => item.title)]);
+  await expect(
+    page.getByRole("button", { name: "Update JEI", exact: true }),
+  ).toBeEnabled();
+  const summary = page.getByRole("alert");
+  await expect(summary).toContainText(
+    "Could not check updates for 4 installed items.",
+  );
+  const affected = summary.getByRole("list", {
+    name: "Files with unavailable update checks",
+    exact: true,
+  });
+  await expect(affected).toBeHidden();
+  await summary.getByText("View affected files", { exact: true }).focus();
+  await page.keyboard.press("Enter");
+  await expect(affected).toBeVisible();
+  await expect(affected.getByRole("listitem")).toHaveCount(4);
+  for (const item of failures) {
+    const entry = affected
+      .getByRole("listitem")
+      .filter({ has: page.getByText(item.title, { exact: true }) });
+    await expect(entry).toContainText(item.path);
+    await expect(entry).toContainText(
+      item.reason ??
+        "No verified update result is available for this file. Retry the check.",
+    );
+    await expect(
+      page.getByRole("article", { name: item.title, exact: true }),
+    ).toHaveCount(0);
+  }
+  await expect(affected).not.toContainText("local-helper.jar");
+  await expect(affected).not.toContainText("Other Provider Failure");
+  await expect(affected).not.toContainText("JEI");
+  await summary.screenshot({
+    path: testInfo.outputPath("all-unavailable-files-desktop.png"),
+    animations: "disabled",
+  });
+  await page
+    .getByRole("button", { name: "Next Launchpad page", exact: true })
+    .click();
+  await expect(
+    page.getByRole("status", { name: "Launchpad page", exact: true }),
+  ).toHaveText("Page 2 of 2");
+  await expect(names).toHaveText([
+    "local-helper.jar",
+    ...failures.map((item) => item.title),
+  ]);
+  await expect(affected).toBeVisible();
+  await expect(affected.getByRole("listitem")).toHaveCount(4);
+  const search = page.getByLabel("Search Launchpad", { exact: true });
+  await search.fill("Missing Project");
+  await expect(summary).toContainText(
+    "Could not check updates for 1 installed item.",
+  );
+  await expect(affected.getByRole("listitem")).toHaveCount(1);
+  await expect(affected).toContainText(failures[1].reason!);
+  await search.fill("JEI");
+  await expect(summary).toHaveCount(0);
+  await expect(
+    page.getByRole("button", { name: "Update JEI", exact: true }),
+  ).toBeEnabled();
+  await search.fill("local-helper");
+  await expect(summary).toHaveCount(0);
+  await search.fill("");
+  await expect(summary).toContainText(
+    "Could not check updates for 4 installed items.",
+  );
+  await summary.getByText("View affected files", { exact: true }).click();
+  await page.setViewportSize({ width: 390, height: 844 });
+  await expect
+    .poll(() =>
+      page
+        .locator(".sidebar")
+        .evaluate((element) => element.getBoundingClientRect().right),
+    )
+    .toBeLessThanOrEqual(1);
+  await expect(affected).toBeVisible();
+  await expect(affected.getByRole("listitem")).toHaveCount(4);
+  await expect
+    .poll(() =>
+      affected.evaluate((element) => element.getBoundingClientRect().width),
+    )
+    .toBeGreaterThan(270);
+  await affected.getByRole("listitem").last().scrollIntoViewIfNeeded();
+  await expect(affected.getByRole("listitem").last()).toBeInViewport();
+  await affected.getByRole("listitem").first().scrollIntoViewIfNeeded();
+  expect(
+    await page.evaluate(
+      () => document.documentElement.scrollWidth <= window.innerWidth,
+    ),
+  ).toBe(true);
+  await summary.screenshot({
+    path: testInfo.outputPath("all-unavailable-files-mobile.png"),
+    animations: "disabled",
+  });
+});
+
 test("Launchpad requires a fresh acknowledgment before installing with unavailable required dependencies", async ({
   page,
   serverId,
@@ -1830,7 +2054,7 @@ test("Launchpad requires a fresh acknowledgment before installing with unavailab
     dialog.getByRole("list", { name: "Unavailable required dependencies" }),
   ).toHaveText("Modrinth project 7tEfOcA7 · required by JEI");
   const acknowledgment = dialog.getByRole("checkbox", {
-    name: "I will manage these dependencies myself",
+    name: "I have reviewed the unavailable catalog dependencies",
     exact: true,
   });
   const confirm = dialog.getByRole("button", {
@@ -1861,6 +2085,220 @@ test("Launchpad requires a fresh acknowledgment before installing with unavailab
     page.getByRole("status", { name: "Installation status", exact: true }),
   ).toContainText("JEI updated with the reviewed dependency choice");
 });
+
+for (const unavailable of [true, false])
+  test(`Launchpad reviews bundled libraries ${unavailable ? "alongside unresolved catalog dependencies" : "without an unnecessary catalog acknowledgment"}`, async ({
+    page,
+    serverId,
+  }, testInfo) => {
+    await page.setViewportSize({ width: 1280, height: 1200 });
+    const version = {
+      id: "example-mod-new",
+      name: "Example Mod 2.0",
+      version: "2.0",
+      gameVersions: ["1.21.1"],
+      loaders: ["neoforge"],
+      publishedAt: "2026-09-01T00:00:00Z",
+      downloadable: true,
+    };
+    const previousPath = "mods/example-mod-1.0.jar";
+    const nextPath = "mods/example-mod-2.0.jar";
+    const bundledPath = "META-INF/jarjar/bundled-library-0.5.6.jar";
+    await page.route("**/api/launchpad", (route) =>
+      route.fulfill({
+        json: {
+          platforms: [
+            {
+              id: "modrinth",
+              name: "Modrinth",
+              available: true,
+              types: ["mod"],
+            },
+          ],
+          gameVersion: "1.21.1",
+          gameVersions: ["1.21.1"],
+          loader: "neoforge",
+          status: "offline",
+          warnings: [],
+        },
+      }),
+    );
+    await page.route("**/api/launchpad/search?**", (route) =>
+      route.fulfill({ json: { projects: [], total: 0, offset: 0, limit: 10 } }),
+    );
+    await page.route("**/api/launchpad/installed?**", (route) =>
+      route.fulfill({
+        json: {
+          items: [
+            {
+              path: previousPath,
+              name: previousPath.split("/").pop(),
+              title: "Example Mod",
+              size: 1024,
+              platform: "modrinth",
+              projectId: "example-mod",
+              versionId: "example-mod-old",
+              updateCheck: "checked",
+              update: version,
+            },
+          ],
+          warnings: [],
+        },
+      }),
+    );
+    await page.route("**/api/launchpad/versions?**", (route) =>
+      route.fulfill({ json: { versions: [version] } }),
+    );
+    await page.route("**/api/launchpad/preview", (route) => {
+      expect(route.request().headers()["x-server-id"]).toBe(serverId);
+      expect(route.request().postDataJSON()).toMatchObject({
+        platform: "modrinth",
+        projectId: "example-mod",
+        versionId: version.id,
+        replacePath: previousPath,
+      });
+      return route.fulfill({
+        json: {
+          planId: "bundled-example-mod",
+          title: "Example Mod",
+          versionName: version.version,
+          files: [
+            { path: nextPath, previousPath, size: 2048, action: "replace" },
+          ],
+          warnings: [],
+          bundledDependencies: [
+            {
+              title: "Bundled Library",
+              version: "0.5.6",
+              path: bundledPath,
+              bundledWith: nextPath,
+              serverCompatible: true,
+            },
+            ...(unavailable
+              ? [
+                  {
+                    title: "Client Library",
+                    version: "1.0",
+                    path: "META-INF/jarjar/client-library-1.0.jar",
+                    bundledWith: nextPath,
+                    serverCompatible: false,
+                  },
+                ]
+              : []),
+          ],
+          unavailableDependencies: unavailable
+            ? [
+                {
+                  platform: "modrinth",
+                  projectId: "unresolved-catalog-project",
+                  requiredBy: "Example Mod",
+                },
+              ]
+            : [],
+          expiresAt: "2099-01-01T00:00:00Z",
+        },
+      });
+    });
+    let submitted: Record<string, unknown> | undefined;
+    await page.route("**/api/launchpad/install", (route) => {
+      expect(route.request().headers()["x-server-id"]).toBe(serverId);
+      submitted = route.request().postDataJSON();
+      return route.fulfill({
+        json: {
+          job: {
+            id: "example-mod-job",
+            status: "completed",
+            message: "Example Mod 2.0 updated",
+            completed: 1,
+            total: 1,
+          },
+        },
+      });
+    });
+    await page.goto("/#launchpad");
+    await page.getByRole("switch", { name: "Show installed content" }).check();
+    await page
+      .getByRole("button", { name: "Update Example Mod", exact: true })
+      .click();
+    const dialog = page.getByRole("dialog");
+    await dialog.getByRole("button", { name: /Review/ }).click();
+    await expect(
+      dialog.getByText("Included with the download", { exact: true }),
+    ).toBeVisible();
+    const bundled = dialog.getByRole("list", {
+      name: "Bundled dependencies",
+      exact: true,
+    });
+    await expect(bundled.getByRole("listitem")).toHaveCount(
+      unavailable ? 2 : 1,
+    );
+    await expect(bundled).toContainText("Bundled Library");
+    await expect(bundled).toContainText("0.5.6");
+    await expect(bundled).toContainText(bundledPath);
+    await expect(bundled).toContainText(nextPath);
+    const inactive = bundled.getByText("Not active on the server", {
+      exact: true,
+    });
+    if (unavailable) {
+      await expect(inactive).toHaveCount(1);
+      await expect(
+        bundled.getByRole("listitem").filter({ hasText: "Client Library" }),
+      ).toContainText("Not active on the server");
+    } else await expect(inactive).toHaveCount(0);
+    await expect(
+      bundled.getByRole("listitem").filter({ hasText: "Bundled Library" }),
+    ).not.toContainText("Not active on the server");
+    await expect(
+      dialog.getByRole("list", { name: "Files to install", exact: true }),
+    ).toContainText(nextPath);
+    const missing = dialog.getByRole("list", {
+      name: "Unavailable required dependencies",
+      exact: true,
+    });
+    const acknowledgment = dialog.getByRole("checkbox", {
+      name: "I have reviewed the unavailable catalog dependencies",
+      exact: true,
+    });
+    const confirm = dialog.getByRole("button", {
+      name: "Confirm installation",
+      exact: true,
+    });
+    if (unavailable) {
+      await expect(missing).toContainText("unresolved-catalog-project");
+      await expect(acknowledgment).not.toBeChecked();
+      await expect(confirm).toBeDisabled();
+      await expect(
+        dialog.getByText(
+          "The catalog lists these dependencies, but their project or version could not be found. Review the included libraries and the mod author’s requirements before continuing.",
+          { exact: true },
+        ),
+      ).toBeVisible();
+    } else {
+      await expect(missing).toHaveCount(0);
+      await expect(acknowledgment).toHaveCount(0);
+      await expect(
+        dialog.getByText("Required dependencies unavailable", { exact: true }),
+      ).toHaveCount(0);
+      await expect(confirm).toBeEnabled();
+    }
+    await dialog.screenshot({
+      path: testInfo.outputPath(
+        `bundled-dependency-${unavailable ? "unresolved-catalog" : "complete"}.png`,
+      ),
+      animations: "disabled",
+    });
+    if (unavailable) await acknowledgment.check();
+    await confirm.click();
+    await expect(dialog).not.toBeVisible();
+    expect(submitted).toEqual({
+      planId: "bundled-example-mod",
+      confirmed: true,
+      ...(unavailable ? { acknowledgedUnavailableDependencies: true } : {}),
+    });
+    await expect(
+      page.getByRole("status", { name: "Installation status", exact: true }),
+    ).toContainText("Example Mod 2.0 updated");
+  });
 
 test("Launchpad ignores delayed installed metadata after loader, version, type and server changes", async ({
   page,

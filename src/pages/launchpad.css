@@ -289,6 +289,59 @@
 .launchpad-error .btn {
   flex-shrink: 0;
 }
+.launchpad-update-warning-body {
+  flex: 1;
+  min-width: 0;
+  width: 100%;
+}
+.launchpad-update-issues {
+  margin-top: 8px;
+}
+.launchpad-update-issues summary {
+  width: fit-content;
+  color: var(--text);
+  cursor: pointer;
+  border-radius: 3px;
+}
+.launchpad-update-issues summary:focus-visible,
+.launchpad-update-issues ul:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 3px;
+}
+.launchpad-update-issues ul {
+  max-height: min(320px, 45vh);
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  list-style: none;
+  margin: 10px 0 0;
+  padding: 0;
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  background: var(--panel);
+}
+.launchpad-update-issues li {
+  padding: 10px 12px;
+  overflow-wrap: anywhere;
+}
+.launchpad-update-issues li + li {
+  border-top: 1px solid var(--border);
+}
+.launchpad-update-issues strong,
+.launchpad-update-issues code {
+  display: block;
+}
+.launchpad-update-issues strong {
+  color: var(--text);
+  font-weight: 600;
+}
+.launchpad-update-issues code {
+  color: var(--muted);
+  font-size: 11px;
+  white-space: normal;
+}
+.launchpad-update-issues p {
+  margin: 5px 0 0;
+}
 .launchpad-empty {
   display: grid;
   justify-items: center;
@@ -404,6 +457,37 @@
   font-size: 12px;
   line-height: 1.7;
 }
+.launchpad-bundled h3 {
+  margin: 20px 0 8px;
+  color: var(--text);
+  font-size: 14px;
+  font-weight: 600;
+}
+.launchpad-bundled-dependencies {
+  overscroll-behavior: contain;
+}
+.launchpad-bundled-dependencies li {
+  display: block;
+  line-height: 1.7;
+  overflow-wrap: anywhere;
+}
+.launchpad-bundled-dependencies strong {
+  display: block;
+  color: var(--text);
+  font-size: 12px;
+}
+.launchpad-bundled-dependencies span,
+.launchpad-bundled-dependencies li > code {
+  display: block;
+}
+.launchpad-bundled-dependencies code {
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+.launchpad-bundled-dependencies:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 3px;
+}
 @media (max-width: 1000px) {
   .launchpad-project {
     flex-wrap: wrap;
@@ -474,6 +558,17 @@
   .launchpad-error,
   .launchpad-inline-notice {
     flex-wrap: wrap;
+  }
+  .launchpad-update-warning {
+    display: grid;
+    grid-template-columns: 16px minmax(0, 1fr);
+  }
+  .launchpad-update-warning-body {
+    grid-column: 2;
+  }
+  .launchpad-update-warning > .btn {
+    grid-column: 2;
+    justify-self: start;
   }
   .launchpad-dialog .management-dialog-actions {
     flex-wrap: wrap;
