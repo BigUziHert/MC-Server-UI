@@ -231,20 +231,30 @@ export default function Properties({ notify }: PageProps) {
                 <label className="panel property-field" key={field.key}>
                   <span>{field.label}</span>
                   {field.type === "boolean" ? (
-                    <select
-                      aria-label={field.label}
-                      value={String(values[field.key])}
-                      disabled={saving}
-                      onChange={(event) =>
-                        setValues((current) => ({
-                          ...current,
-                          [field.key]: event.target.value === "true",
-                        }))
-                      }
-                    >
-                      <option value="true">true</option>
-                      <option value="false">false</option>
-                    </select>
+                    <span className="property-switch">
+                      <button
+                        type="button"
+                        role="switch"
+                        className="property-toggle"
+                        aria-label={field.label}
+                        aria-checked={values[field.key] === true}
+                        disabled={saving}
+                        onClick={() =>
+                          setValues((current) => ({
+                            ...current,
+                            [field.key]: current[field.key] !== true,
+                          }))
+                        }
+                      >
+                        <span aria-hidden="true" />
+                      </button>
+                      <span
+                        className="property-switch-status"
+                        aria-hidden="true"
+                      >
+                        {values[field.key] === true ? "On" : "Off"}
+                      </span>
+                    </span>
                   ) : field.options ? (
                     <select
                       aria-label={field.label}

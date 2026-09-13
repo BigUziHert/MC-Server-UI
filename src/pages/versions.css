@@ -19,6 +19,7 @@
   margin-bottom: 24px;
 }
 .versions-current-icon {
+  --software-logo-size: 36px;
   width: 46px;
   height: 46px;
   display: grid;
@@ -27,6 +28,7 @@
   border-radius: 12px;
   color: var(--accent);
   background: var(--panel);
+  flex-shrink: 0;
 }
 .versions-current .eyebrow {
   display: block;
@@ -107,24 +109,33 @@
   place-items: center;
   background: var(--panel);
   border: 1px solid var(--border);
+  flex-shrink: 0;
 }
 .software-logo {
+  box-sizing: border-box;
   display: block;
-  width: 40px;
-  height: 40px;
+  width: var(--software-logo-size, 40px);
+  height: var(--software-logo-size, 40px);
+  max-width: 100%;
+  max-height: 100%;
+  padding: var(--software-logo-inset, 0);
   object-fit: contain;
+  object-position: center;
   flex-shrink: 0;
+}
+.software-logo-vanilla,
+.software-logo-pufferfish,
+.software-logo-forge,
+.software-logo-neoforge,
+.software-logo-sponge,
+.software-logo-magma {
+  --software-logo-inset: calc(var(--software-logo-size, 40px) * 0.08);
 }
 .software-logo-fallback {
   color: var(--muted);
 }
-.versions-current-icon .software-logo {
-  width: 36px;
-  height: 36px;
-}
 .versions-page .panel-title .software-logo {
-  width: 20px;
-  height: 20px;
+  --software-logo-size: 20px;
 }
 .version-provider-folia .version-provider-mark {
   width: 62px;
@@ -267,6 +278,7 @@
   border-bottom: 0;
 }
 .versions-build-icon {
+  --software-logo-size: 28px;
   display: grid;
   place-items: center;
   width: 36px;
@@ -279,10 +291,6 @@
 .versions-build-info {
   flex: 1;
   min-width: 0;
-}
-.versions-build-icon .software-logo {
-  width: 28px;
-  height: 28px;
 }
 .versions-build-info strong {
   font-size: 13px;

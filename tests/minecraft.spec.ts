@@ -32,7 +32,7 @@ test("Minecraft navigation sits between server and management and Properties sav
   page,
   request,
   serverId,
-}) => {
+}, testInfo) => {
   const headers = { "X-Server-Id": serverId };
   expect(
     (
@@ -58,12 +58,47 @@ test("Minecraft navigation sits between server and management and Properties sav
   expect(links.findIndex((value) => value.includes("Properties"))).toBeLessThan(
     links.findIndex((value) => value.includes("Subusers")),
   );
+  const onlineMode = page.getByRole("switch", {
+    name: "online mode",
+    exact: true,
+  });
+  await expect(onlineMode).toBeChecked();
+  await onlineMode.focus();
+  await page.keyboard.press("Space");
+  await expect(onlineMode).not.toBeChecked();
+  await page
+    .getByRole("button", { name: "Save changes (1)", exact: true })
+    .click();
+  await expect(
+    page.getByRole("button", { name: "Save changes", exact: true }),
+  ).toBeDisabled();
+  expect(
+    (
+      await (
+        await request.get("/api/files/content?path=server.properties", {
+          headers,
+        })
+      ).json()
+    ).content,
+  ).toContain("online-mode=false");
   await page.getByRole("tab", { name: "bukkit.yml", exact: true }).click();
+  const allowEnd = page.getByRole("switch", {
+    name: "settings / allow end",
+    exact: true,
+  });
+  await expect(allowEnd).toBeChecked();
+  await page.screenshot({
+    path: testInfo.outputPath("properties-boolean-on.png"),
+    fullPage: true,
+    animations: "disabled",
+  });
+  await allowEnd.click();
+  await expect(allowEnd).not.toBeChecked();
   await page
     .getByLabel("settings / connection throttle", { exact: true })
     .fill("2000");
   await page
-    .getByRole("button", { name: "Save changes (1)", exact: true })
+    .getByRole("button", { name: "Save changes (2)", exact: true })
     .click();
   await expect(
     page.getByRole("button", { name: "Save changes", exact: true }),
@@ -72,7 +107,20 @@ test("Minecraft navigation sits between server and management and Properties sav
     await request.get("/api/files/content?path=bukkit.yml", { headers })
   ).json();
   expect(saved.content).toContain("# Keep comment");
+  expect(saved.content).toContain("allow-end: false");
   expect(saved.content).toContain("connection-throttle: 2000");
+  await page.reload();
+  await expect(onlineMode).not.toBeChecked();
+  await page.screenshot({
+    path: testInfo.outputPath("properties-boolean-saved.png"),
+    fullPage: true,
+    animations: "disabled",
+  });
+  await page.getByRole("tab", { name: "bukkit.yml", exact: true }).click();
+  await expect(allowEnd).not.toBeChecked();
+  await expect(
+    page.getByLabel("settings / connection throttle", { exact: true }),
+  ).toHaveValue("2000");
   await page
     .getByLabel("settings / connection throttle", { exact: true })
     .fill("3000");
@@ -86,6 +134,24 @@ test("Minecraft navigation sits between server and management and Properties sav
   await expect(
     page.getByLabel("settings / connection throttle", { exact: true }),
   ).toHaveValue("3000");
+  await page.setViewportSize({ width: 390, height: 844 });
+  await expect
+    .poll(() =>
+      page
+        .locator(".sidebar")
+        .evaluate((element) => element.getBoundingClientRect().right),
+    )
+    .toBeLessThanOrEqual(1);
+  expect(
+    await page.evaluate(
+      () => document.documentElement.scrollWidth <= window.innerWidth,
+    ),
+  ).toBe(true);
+  await page.screenshot({
+    path: testInfo.outputPath("properties-boolean-mobile.png"),
+    fullPage: true,
+    animations: "disabled",
+  });
 });
 test("Properties reports external file changes without overwriting them", async ({
   page,
@@ -125,7 +191,19 @@ test("Properties reports external file changes without overwriting them", async 
 });
 test("Versions shows official builds and requires a reviewed choice before installation", async ({
   page,
-}) => {
+}, testInfo) => {
+  await page.route("**/api/server", async (route) => {
+    const response = await route.fetch();
+    const server = await response.json();
+    await route.fulfill({
+      json: {
+        ...server,
+        software: "NeoForge",
+        version: "21.1.200",
+        minecraftVersion: "1.21.1",
+      },
+    });
+  });
   await page.route("**/api/versions", (route) =>
     route.fulfill({
       json: {
@@ -160,6 +238,15 @@ test("Versions shows official builds and requires a reviewed choice before insta
   await page.goto("/#versions");
   await page.getByRole("button", { name: "Choose version" }).click();
   await page.getByRole("button", { name: "1.21.1", exact: true }).click();
+  await expect(page.locator(".versions-build-icon img")).toHaveAttribute(
+    "src",
+    "/software-icons/neoforge.svg",
+  );
+  await page.screenshot({
+    path: testInfo.outputPath("neoforge-current-and-build-icons.png"),
+    fullPage: true,
+    animations: "disabled",
+  });
   await page.getByRole("button", { name: "Install", exact: true }).click();
   const dialog = page.getByRole("dialog");
   await expect(dialog).toBeVisible();
@@ -457,8 +544,14 @@ test("Launchpad separates mod and plugin loaders and defaults Paper to Plugins",
     .getByLabel("Loader", { exact: true })
     .locator("option")
     .allTextContents();
-  expect(choices).toContain("neoforge");
-  expect(choices).not.toContain("paper");
+  expect(choices).toEqual([
+    "All loaders",
+    "Fabric",
+    "Forge",
+    "NeoForge",
+    "Quilt",
+  ]);
+  expect(choices).not.toContain("Paper");
   await page.getByRole("tab", { name: "Datapacks", exact: true }).click();
   await expect(page.getByLabel("Loader", { exact: true })).toHaveValue(
     "datapack",
@@ -1943,7 +2036,7 @@ test("Launchpad lists every affected file and reason beyond the current installe
   });
 });
 
-test("Launchpad requires a fresh acknowledgment before installing with unavailable required dependencies", async ({
+test("Launchpad requires an explicit Install anyway choice for unchecked requirements", async ({
   page,
   serverId,
 }) => {
@@ -2048,30 +2141,38 @@ test("Launchpad requires a fresh acknowledgment before installing with unavailab
   const dialog = page.getByRole("dialog");
   await dialog.getByRole("button", { name: /Review/ }).click();
   await expect(
-    dialog.getByText("Required dependencies unavailable", { exact: true }),
+    dialog.getByText("Some requirements couldn’t be checked", { exact: true }),
   ).toBeVisible();
+  const technical = dialog.getByText("Technical details", { exact: true });
+  const missing = dialog.getByRole("list", {
+    name: "Unavailable required dependencies",
+  });
+  await expect(missing).toBeHidden();
+  await technical.click();
+  await expect(missing).toHaveText(
+    "Modrinth project 7tEfOcA7 · required by JEI",
+  );
+  await technical.click();
+  await expect(dialog.getByRole("checkbox")).toHaveCount(0);
   await expect(
-    dialog.getByRole("list", { name: "Unavailable required dependencies" }),
-  ).toHaveText("Modrinth project 7tEfOcA7 · required by JEI");
-  const acknowledgment = dialog.getByRole("checkbox", {
-    name: "I have reviewed the unavailable catalog dependencies",
-    exact: true,
-  });
+    dialog.getByRole("button", { name: "Confirm installation", exact: true }),
+  ).toHaveCount(0);
   const confirm = dialog.getByRole("button", {
-    name: "Confirm installation",
+    name: "Install anyway",
     exact: true,
   });
-  await expect(acknowledgment).not.toBeChecked();
-  await expect(confirm).toBeDisabled();
-  expect(installations).toHaveLength(0);
-  await acknowledgment.check();
   await expect(confirm).toBeEnabled();
+  await dialog
+    .getByRole("list", { name: "Files to install", exact: true })
+    .focus();
+  await page.keyboard.press("Enter");
+  await expect(dialog).toBeVisible();
+  expect(installations).toHaveLength(0);
   await dialog.getByRole("button", { name: "Back", exact: true }).click();
   await dialog.getByRole("button", { name: /Review/ }).click();
-  await expect(acknowledgment).not.toBeChecked();
-  await expect(confirm).toBeDisabled();
+  await expect(confirm).toBeEnabled();
+  await expect(missing).toBeHidden();
   expect(installations).toHaveLength(0);
-  await acknowledgment.check();
   await confirm.click();
   await expect(dialog).not.toBeVisible();
   expect(installations).toEqual([
@@ -2255,29 +2356,32 @@ for (const unavailable of [true, false])
       name: "Unavailable required dependencies",
       exact: true,
     });
-    const acknowledgment = dialog.getByRole("checkbox", {
-      name: "I have reviewed the unavailable catalog dependencies",
-      exact: true,
-    });
+    await expect(dialog.getByRole("checkbox")).toHaveCount(0);
     const confirm = dialog.getByRole("button", {
-      name: "Confirm installation",
+      name: unavailable ? "Install anyway" : "Confirm installation",
       exact: true,
     });
     if (unavailable) {
+      await expect(missing).toBeHidden();
+      const technical = dialog.getByText("Technical details", { exact: true });
+      await technical.click();
       await expect(missing).toContainText("unresolved-catalog-project");
-      await expect(acknowledgment).not.toBeChecked();
-      await expect(confirm).toBeDisabled();
+      await technical.click();
+      await expect(confirm).toBeEnabled();
       await expect(
-        dialog.getByText(
-          "The catalog lists these dependencies, but their project or version could not be found. Review the included libraries and the mod author’s requirements before continuing.",
-          { exact: true },
-        ),
+        dialog.getByText("Some requirements couldn’t be checked", {
+          exact: true,
+        }),
       ).toBeVisible();
     } else {
       await expect(missing).toHaveCount(0);
-      await expect(acknowledgment).toHaveCount(0);
       await expect(
-        dialog.getByText("Required dependencies unavailable", { exact: true }),
+        dialog.getByText("Some requirements couldn’t be checked", {
+          exact: true,
+        }),
+      ).toHaveCount(0);
+      await expect(
+        dialog.getByText("Technical details", { exact: true }),
       ).toHaveCount(0);
       await expect(confirm).toBeEnabled();
     }
@@ -2287,7 +2391,6 @@ for (const unavailable of [true, false])
       ),
       animations: "disabled",
     });
-    if (unavailable) await acknowledgment.check();
     await confirm.click();
     await expect(dialog).not.toBeVisible();
     expect(submitted).toEqual({
@@ -2718,8 +2821,16 @@ test("Versions decodes all eighteen bundled software logos without external imag
   await page.screenshot({
     path: testInfo.outputPath("software-logos-desktop.png"),
     fullPage: true,
+    animations: "disabled",
   });
   await page.setViewportSize({ width: 390, height: 844 });
+  await expect
+    .poll(() =>
+      page
+        .locator(".sidebar")
+        .evaluate((element) => element.getBoundingClientRect().right),
+    )
+    .toBeLessThanOrEqual(1);
   expect(
     await page.evaluate(
       () => document.documentElement.scrollWidth <= window.innerWidth,
@@ -2729,5 +2840,6 @@ test("Versions decodes all eighteen bundled software logos without external imag
   await page.screenshot({
     path: testInfo.outputPath("software-logos-mobile.png"),
     fullPage: true,
+    animations: "disabled",
   });
 });

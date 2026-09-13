@@ -66,6 +66,59 @@
   font: inherit;
   font-size: 13px;
 }
+.property-switch {
+  display: flex;
+  align-items: center;
+  gap: 11px;
+  min-height: 40px;
+}
+.property-toggle {
+  width: 44px;
+  height: 24px;
+  flex: 0 0 44px;
+  padding: 3px;
+  border: 1px solid #565a70;
+  border-radius: 20px;
+  background: #303140;
+  cursor: pointer;
+}
+.property-toggle > span {
+  display: block;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: var(--text);
+  transform: translateX(0);
+  transition: transform 0.15s;
+}
+.property-toggle[aria-checked="true"] {
+  background: var(--accent);
+  border-color: var(--accent);
+}
+.property-toggle[aria-checked="true"] > span {
+  transform: translateX(20px);
+  background: #20212b;
+}
+.property-toggle:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 4px;
+}
+.property-toggle:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+.property-switch-status {
+  color: var(--muted);
+  font-weight: 400;
+}
+.property-toggle[aria-checked="true"] + .property-switch-status {
+  color: var(--text);
+}
+@media (prefers-reduced-motion: reduce) {
+  .property-toggle > span {
+    transition: none;
+  }
+}
 .properties-empty {
   padding: 45px;
   text-align: center;

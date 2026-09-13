@@ -244,6 +244,23 @@ const loadersFor = (type: ContentType) =>
     : type === "plugin"
       ? pluginLoaders
       : modLoaders;
+const loaderNames: Record<string, string> = {
+  fabric: "Fabric",
+  forge: "Forge",
+  neoforge: "NeoForge",
+  quilt: "Quilt",
+  paper: "Paper",
+  purpur: "Purpur",
+  spigot: "Spigot",
+  bukkit: "Bukkit",
+  folia: "Folia",
+  velocity: "Velocity",
+  waterfall: "Waterfall",
+  bungeecord: "BungeeCord",
+  sponge: "Sponge",
+  datapack: "Datapack",
+};
+const loaderName = (value: string) => loaderNames[value] ?? value;
 const messageOf = (cause: unknown) =>
   cause instanceof Error
     ? cause.message
@@ -333,8 +350,6 @@ export default function Launchpad({ notify }: PageProps) {
   const [targetVersion, setTargetVersion] = useState("");
   const [targetLoader, setTargetLoader] = useState("");
   const [plan, setPlan] = useState<Plan | null>(null);
-  const [acknowledgedDependencies, setAcknowledgedDependencies] =
-    useState(false);
   const [dialogError, setDialogError] = useState("");
   const [busy, setBusy] = useState<"preview" | "install" | "settings" | null>(
     null,
@@ -455,7 +470,6 @@ export default function Launchpad({ notify }: PageProps) {
     forceScan.current = null;
     setJob(null);
     setSelection(null);
-    setAcknowledgedDependencies(false);
     setSettingsOpen(false);
     setApiKey("");
     setQuery("");
@@ -780,7 +794,6 @@ export default function Launchpad({ notify }: PageProps) {
     operation.current++;
     setDialogError("");
     setPlan(null);
-    setAcknowledgedDependencies(false);
     setTargetVersion(gameVersion);
     setTargetLoader(loader);
     setSelection({ project, installed: entry });
@@ -790,7 +803,6 @@ export default function Launchpad({ notify }: PageProps) {
     operation.current++;
     setSelection(null);
     setPlan(null);
-    setAcknowledgedDependencies(false);
     setDialogError("");
     pending.current = false;
     setBusy(null);
@@ -815,7 +827,6 @@ export default function Launchpad({ notify }: PageProps) {
     pending.current = true;
     setBusy("preview");
     setDialogError("");
-    setAcknowledgedDependencies(false);
     try {
       const next = await post<Plan>("/launchpad/preview", {
         platform: selection.project.platform,
@@ -851,12 +862,6 @@ export default function Launchpad({ notify }: PageProps) {
   }
   async function install() {
     if (!plan || pending.current) return;
-    if (plan.unavailableDependencies?.length && !acknowledgedDependencies) {
-      setDialogError(
-        "Confirm that you have reviewed the unavailable catalog dependencies before installing.",
-      );
-      return;
-    }
     if (!canInstall) {
       setDialogError("Stop the server in Console before installing.");
       return;
@@ -870,7 +875,7 @@ export default function Launchpad({ notify }: PageProps) {
       const next = await post<{ job: Job }>("/launchpad/install", {
         planId: plan.planId,
         confirmed: true,
-        ...(plan.unavailableDependencies?.length && acknowledgedDependencies
+        ...(plan.unavailableDependencies?.length
           ? { acknowledgedUnavailableDependencies: true }
           : {}),
       });
@@ -1108,7 +1113,7 @@ export default function Launchpad({ notify }: PageProps) {
             <option value="">All loaders</option>
             {loaders.map((value) => (
               <option key={value} value={value}>
-                {value}
+                {loaderName(value)}
               </option>
             ))}
           </select>
@@ -1523,7 +1528,7 @@ export default function Launchpad({ notify }: PageProps) {
               {total.toLocaleString()}{" "}
               {installedOnly ? "installed items" : "projects"}
               {gameVersion ? ` · Minecraft ${gameVersion}` : ""}
-              {loader ? ` · ${loader}` : ""}
+              {loader ? ` · ${loaderName(loader)}` : ""}
             </div>
             {visibleProjects.map(({ project, entry }) => (
               <article
@@ -1735,7 +1740,9 @@ export default function Launchpad({ notify }: PageProps) {
               {selectedVersion && (
                 <div className="launchpad-version-details">
                   <span>{selectedVersion.gameVersions.join(", ")}</span>
-                  <span>{selectedVersion.loaders.join(", ")}</span>
+                  <span>
+                    {selectedVersion.loaders.map(loaderName).join(", ")}
+                  </span>
                   {selectedVersion.publishedAt && (
                     <span>
                       Published{" "}
@@ -1776,7 +1783,7 @@ export default function Launchpad({ notify }: PageProps) {
                   <option value="">Not selected</option>
                   {loaders.map((value) => (
                     <option key={value} value={value}>
-                      {value}
+                      {loaderName(value)}
                     </option>
                   ))}
                 </select>
@@ -1855,17 +1862,27 @@ export default function Launchpad({ notify }: PageProps) {
                 </section>
               )}
               {Boolean(plan.unavailableDependencies?.length) && (
-                <>
-                  <div className="launchpad-inline-notice">
-                    <AlertCircle size={17} />
-                    <div>
-                      <strong>Required dependencies unavailable</strong>
+                <div className="launchpad-inline-notice launchpad-dependency-notice">
+                  <AlertCircle size={17} />
+                  <div>
+                    <strong>Some requirements couldn’t be checked</strong>
+                    <p>
+                      The catalog couldn’t provide details for one or more extra
+                      mods. We couldn’t verify whether you need another download
+                      for this installation to work.
+                    </p>
+                    {Boolean(plan.bundledDependencies?.length) && (
                       <p>
-                        The catalog lists these dependencies, but their project
-                        or version could not be found. Review the included
-                        libraries and the mod author’s requirements before
-                        continuing.
+                        The libraries listed above are included, but we couldn’t
+                        match them to the missing catalog entry.
                       </p>
+                    )}
+                    <p>
+                      Choose Install anyway to install the files listed above,
+                      or Cancel to check the mod author’s requirements first.
+                    </p>
+                    <details className="launchpad-dependency-details">
+                      <summary>Technical details</summary>
                       <ul aria-label="Unavailable required dependencies">
                         {plan.unavailableDependencies!.map(
                           (dependency, index) => (
@@ -1886,23 +1903,9 @@ export default function Launchpad({ notify }: PageProps) {
                           ),
                         )}
                       </ul>
-                    </div>
+                    </details>
                   </div>
-                  <label className="launchpad-inline-notice">
-                    <input
-                      type="checkbox"
-                      checked={acknowledgedDependencies}
-                      disabled={Boolean(busy)}
-                      onChange={(event) =>
-                        setAcknowledgedDependencies(event.target.checked)
-                      }
-                      style={{ flexShrink: 0 }}
-                    />
-                    <span>
-                      I have reviewed the unavailable catalog dependencies
-                    </span>
-                  </label>
-                </>
+                </div>
               )}
               <p className="management-dialog-description">
                 Review {plan.files.length} file
@@ -1940,7 +1943,6 @@ export default function Launchpad({ notify }: PageProps) {
                   disabled={Boolean(busy)}
                   onClick={() => {
                     setPlan(null);
-                    setAcknowledgedDependencies(false);
                     setDialogError("");
                   }}
                 >
@@ -1950,13 +1952,7 @@ export default function Launchpad({ notify }: PageProps) {
                   type="button"
                   className="btn primary"
                   disabled={
-                    Boolean(busy) ||
-                    !canInstall ||
-                    plan.files.length === 0 ||
-                    Boolean(
-                      plan.unavailableDependencies?.length &&
-                      !acknowledgedDependencies,
-                    )
+                    Boolean(busy) || !canInstall || plan.files.length === 0
                   }
                   onClick={() => void install()}
                 >
@@ -1967,7 +1963,9 @@ export default function Launchpad({ notify }: PageProps) {
                   )}
                   {busy === "install"
                     ? "Starting installation..."
-                    : "Confirm installation"}
+                    : plan.unavailableDependencies?.length
+                      ? "Install anyway"
+                      : "Confirm installation"}
                 </button>
               </>
             ) : (
