@@ -22,7 +22,8 @@ import {
 
 const json = (method, body) => ({ method, body: JSON.stringify(body) });
 async function fixture(t, options = {}) {
-  const root = await fs.mkdtemp(path.join(os.tmpdir(), "mc-import-test-"));
+  const tempRoot = await fs.realpath(os.tmpdir());
+  const root = await fs.mkdtemp(path.join(tempRoot, "mc-import-test-"));
   const dataDir = path.join(root, "panel");
   const directory = path.join(root, "Existing World");
   const launched = [];
@@ -87,7 +88,7 @@ async function fixture(t, options = {}) {
       listener.closeAllConnections();
       await new Promise((resolve) => listener.close(resolve));
     }
-    assert.equal(path.dirname(root), path.resolve(os.tmpdir()));
+    assert.equal(path.dirname(root), tempRoot);
     assert.ok(path.basename(root).startsWith("mc-import-test-"));
     await fs.rm(root, { recursive: true, force: true });
   });
