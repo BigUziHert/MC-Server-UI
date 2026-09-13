@@ -299,7 +299,9 @@ function modrinthUpdates(json) {
           for (const item of batch) {
             const value = result[item.sha512];
             if (!value) {
-              updates[item.sha512] = null;
+              warnings.add(
+                "Modrinth did not return results for some installed files. Their update status could not be checked.",
+              );
               continue;
             }
             try {
@@ -318,16 +320,29 @@ function modrinthUpdates(json) {
                 throw new Error(
                   "Modrinth returned an update for a different project.",
                 );
-              if (
-                version.id === item.versionId ||
-                !version.downloadable ||
-                !fits(version, input)
-              ) {
+              if (!version.downloadable || !fits(version, input))
+                throw new Error(
+                  "Some Modrinth update results were not compatible server downloads. Their update status could not be checked.",
+                );
+              if (version.id === item.versionId) {
+                if (
+                  !value.files.some(
+                    (file) =>
+                      file.hashes?.sha512?.toLowerCase() === item.sha512,
+                  )
+                )
+                  throw new Error(
+                    "Modrinth returned an installed version with a different file checksum.",
+                  );
                 updates[item.sha512] = null;
                 continue;
               }
               const file = mrUpdateFile(value, input);
-              if (!file || file.hashes?.sha512?.toLowerCase() === item.sha512) {
+              if (!file)
+                throw new Error(
+                  "Some Modrinth update results did not contain a supported server file. Their update status could not be checked.",
+                );
+              if (file.hashes?.sha512?.toLowerCase() === item.sha512) {
                 updates[item.sha512] = null;
                 continue;
               }

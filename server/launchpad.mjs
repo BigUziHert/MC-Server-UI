@@ -592,6 +592,7 @@ export async function createLaunchpad(ctx) {
     const apply = (item, value) => {
       if (value) item.update = value;
       else delete item.update;
+      item.updateCheck = "checked";
     };
     await Promise.all(
       providers.map(async (found) => {
@@ -604,11 +605,15 @@ export async function createLaunchpad(ctx) {
         for (const item of known) {
           const key = updateKey(input, item),
             cached = updateCache.get(key);
+          if (cached?.value) item.update = cached.value;
           if (!enabled(input.refresh) && cached?.expiresAt > Date.now())
             apply(item, cached.value);
-          else if (updateFlights.has(key))
-            pending.push({ item, work: updateFlights.get(key) });
-          else missing.push(item);
+          else {
+            item.updateCheck = "pending";
+            if (updateFlights.has(key))
+              pending.push({ item, work: updateFlights.get(key) });
+            else missing.push(item);
+          }
         }
         const cooldown = updateFailures.get(found.id);
         if (cooldown?.until > Date.now()) {
@@ -621,21 +626,26 @@ export async function createLaunchpad(ctx) {
                 input.signal,
               );
               warnings.push(...(result.warnings ?? []));
+              const checked = new Map();
               for (const item of missing) {
                 if (!Object.hasOwn(result.updates, item.sha512)) continue;
                 const value = result.updates[item.sha512];
-                remember(updateCache, updateKey(input, item), {
-                  value: value ? publicVersion(value) : null,
+                const key = updateKey(input, item);
+                const normalized = value ? publicVersion(value) : null;
+                remember(updateCache, key, {
+                  value: normalized,
                   expiresAt: Date.now() + 5 * 60_000,
                 });
+                checked.set(key, normalized);
               }
+              return checked;
             } catch (cause) {
               fail(found, cause);
             }
           })();
           for (const item of missing) {
             const key = updateKey(input, item);
-            const value = work.then(() => updateCache.get(key)?.value);
+            const value = work.then((checked) => checked?.get(key));
             updateFlights.set(key, value);
             void value.then(
               () => updateFlights.delete(key),
@@ -767,8 +777,13 @@ export async function createLaunchpad(ctx) {
         : await scan(input.type, input.signal, scanWarnings);
     for (const item of items) {
       const cached = updateCache.get(updateKey(input, item));
-      if (cached?.expiresAt > Date.now() && cached.value)
-        item.update = cached.value;
+      // Keep the last verified update visible if the provider is temporarily
+      // unavailable. Its expiry controls rechecking, not erasing known updates.
+      if (cached?.value) item.update = cached.value;
+      item.updateCheck =
+        !enabled(input.refresh) && cached?.expiresAt > Date.now()
+          ? "checked"
+          : "pending";
     }
     if (enabled(input.local)) return { items, warnings: scanWarnings };
     const flightKey = JSON.stringify([
@@ -803,6 +818,7 @@ export async function createLaunchpad(ctx) {
           );
         }
         for (const item of items) {
+          if (item.updateCheck !== "checked") item.updateCheck = "unavailable";
           if (!item.sha512) continue;
           if (
             item.platform ||
@@ -976,48 +992,73 @@ export async function createLaunchpad(ctx) {
   async function resolveTree(input) {
     const files = [],
       warnings = [],
+      unavailableDependencies = [],
+      attempted = new Set(),
       visited = new Map();
     let rootResult;
-    async function visit(value, depth = 0) {
-      if (depth > 20 || visited.size >= 100)
+    async function visit(value, depth = 0, requiredBy) {
+      const attemptKey = `${value.platform}:${value.projectId ?? ""}:${value.versionId ?? ""}`;
+      if (attempted.has(attemptKey)) return;
+      if (depth > 20 || attempted.size >= 100)
         throw error(
           400,
           "This dependency graph is too large to install automatically.",
         );
+      // Missing projects count toward the budget too, before any network work.
+      attempted.add(attemptKey);
       const found = await provider(value.platform);
       if (!found.types.includes(value.type))
         throw error(
           400,
           "This provider does not support the selected content type.",
         );
-      if (!value.projectId && value.versionId && found.version)
-        value.projectId = String(
-          (await found.version(value.versionId)).project_id,
-        );
-      if (!value.versionId) {
-        const versions = (await found.versions(value)).filter(
-          (version) => version.downloadable !== false,
-        );
-        value.versionId = versions.sort((a, b) =>
-          (b.publishedAt ?? "").localeCompare(a.publishedAt ?? ""),
-        )[0]?.id;
-        if (!value.versionId)
-          throw error(
-            400,
-            "A required dependency has no compatible downloadable version. Install the dependency manually before continuing.",
+      let result;
+      try {
+        if (!value.projectId && value.versionId && found.version)
+          value.projectId = String(
+            (await found.version(value.versionId)).project_id,
           );
-      }
-      const key = `${value.platform}:${value.projectId}`;
-      if (visited.has(key)) {
-        if (visited.get(key) !== String(value.versionId))
-          throw error(
-            409,
-            "Required dependencies request conflicting versions of the same project. Resolve them manually before installing.",
+        if (!value.versionId) {
+          const versions = (await found.versions(value)).filter(
+            (version) => version.downloadable !== false,
           );
+          value.versionId = versions.sort((a, b) =>
+            (b.publishedAt ?? "").localeCompare(a.publishedAt ?? ""),
+          )[0]?.id;
+          if (!value.versionId)
+            throw error(
+              400,
+              "A required dependency has no compatible downloadable version. Install the dependency manually before continuing.",
+            );
+        }
+        const key = `${value.platform}:${value.projectId}`;
+        if (visited.has(key)) {
+          if (visited.get(key) !== String(value.versionId))
+            throw error(
+              409,
+              "Required dependencies request conflicting versions of the same project. Resolve them manually before installing.",
+            );
+          return;
+        }
+        visited.set(key, String(value.versionId));
+        result = await found.resolve(value);
+      } catch (cause) {
+        if (cause.status !== 404) throw cause;
+        if (!depth)
+          throw error(
+            404,
+            `${found.name} could not find the selected project or version. Refresh its versions and choose another release.`,
+          );
+        // A broken upstream requirement must be visible in the review. The
+        // install endpoint requires a separate acknowledgement of this list.
+        unavailableDependencies.push({
+          platform: value.platform,
+          projectId: value.projectId,
+          versionId: value.versionId,
+          requiredBy,
+        });
         return;
       }
-      visited.set(key, String(value.versionId));
-      const result = await found.resolve(value);
       if (!rootResult) rootResult = result;
       warnings.push(...(result.warnings ?? []));
       if (result.archive) {
@@ -1049,7 +1090,18 @@ export async function createLaunchpad(ctx) {
         });
       }
       for (const dependency of result.dependencies ?? [])
-        await visit({ ...input, ...dependency }, depth + 1);
+        await visit(
+          {
+            gameVersion: input.gameVersion,
+            loader: input.loader,
+            signal: input.signal,
+            platform: value.platform,
+            type: value.type,
+            ...dependency,
+          },
+          depth + 1,
+          result.title,
+        );
     }
     await visit({ ...input });
     // Resolve optional project credits in batches for the whole plan, including
@@ -1060,7 +1112,13 @@ export async function createLaunchpad(ctx) {
       projectId: input.projectId,
     };
     await enrichProjectMetadata([rootMetadata, ...files], warnings);
-    return { ...rootResult, author: rootMetadata.author, files, warnings };
+    return {
+      ...rootResult,
+      author: rootMetadata.author,
+      files,
+      warnings,
+      unavailableDependencies,
+    };
   }
   async function unpackPack(result, input, stage) {
     const found = await provider(input.platform);
@@ -1401,6 +1459,7 @@ export async function createLaunchpad(ctx) {
           )?.author,
         versionName: result.versionName,
         warnings: [...new Set(result.warnings)],
+        unavailableDependencies: result.unavailableDependencies,
         loaderInstall: result.loaderInstall,
         expiresAt,
       };
@@ -1417,6 +1476,7 @@ export async function createLaunchpad(ctx) {
           previousPath: file.previous?.path,
         })),
         warnings: plan.warnings,
+        unavailableDependencies: plan.unavailableDependencies,
         expiresAt,
       };
     } catch (cause) {
@@ -1605,6 +1665,14 @@ export async function createLaunchpad(ctx) {
       throw error(
         409,
         "This review expired. Review the version again before installing.",
+      );
+    if (
+      plan.unavailableDependencies?.length &&
+      input.acknowledgedUnavailableDependencies !== true
+    )
+      throw error(
+        400,
+        "Review the unavailable required dependencies and confirm that you will manage them yourself before installing.",
       );
     preparingInstall = true;
     try {

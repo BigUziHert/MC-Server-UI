@@ -1,5 +1,6 @@
 import {
   useCallback,
+  useContext,
   useEffect,
   useRef,
   useState,
@@ -25,7 +26,7 @@ import {
   ExternalLink,
   X,
 } from "lucide-react";
-import { formatBytes, useServerApi, type PageProps } from "../api";
+import { formatBytes, ServerScope, useServerApi, type PageProps } from "../api";
 import "./management.css";
 import "./launchpad.css";
 
@@ -71,6 +72,7 @@ type InstalledItem = {
   iconUrl?: string;
   author?: string;
   update?: Version | null;
+  updateCheck?: "checked" | "unavailable" | "pending";
 };
 type Job = {
   id: string;
@@ -110,6 +112,12 @@ type Plan = {
     previousPath?: string;
   }[];
   warnings: string[];
+  unavailableDependencies?: {
+    platform: string;
+    projectId?: string;
+    versionId?: string | null;
+    requiredBy: string;
+  }[];
 };
 type Selection = { project: Project; installed?: InstalledItem };
 const kinds = [
@@ -126,6 +134,50 @@ const installedSortOptions = [
   { id: "author", label: "Mod author (A–Z)" },
 ] as const;
 type InstalledSort = (typeof installedSortOptions)[number]["id"];
+type SavedView = {
+  platform?: string;
+  type?: ContentType;
+  gameVersion?: string;
+  loader?: string;
+  installedOnly?: boolean;
+  sort?: string;
+  installedSort?: InstalledSort;
+};
+function readSavedView(key: string): SavedView {
+  try {
+    const raw = sessionStorage.getItem(key);
+    if (!raw || raw.length > 4096) return {};
+    const saved: unknown = JSON.parse(raw);
+    if (!saved || typeof saved !== "object" || Array.isArray(saved)) return {};
+    const values = saved as Record<string, unknown>;
+    return {
+      platform:
+        typeof values.platform === "string" ? values.platform : undefined,
+      type: kinds.some((kind) => kind.id === values.type)
+        ? (values.type as ContentType)
+        : undefined,
+      gameVersion:
+        typeof values.gameVersion === "string" &&
+        (values.gameVersion === "" ||
+          /^\d+(?:\.\d+)+$/.test(values.gameVersion))
+          ? values.gameVersion
+          : undefined,
+      loader: typeof values.loader === "string" ? values.loader : undefined,
+      installedOnly:
+        typeof values.installedOnly === "boolean"
+          ? values.installedOnly
+          : undefined,
+      sort: typeof values.sort === "string" ? values.sort : undefined,
+      installedSort: installedSortOptions.some(
+        (item) => item.id === values.installedSort,
+      )
+        ? (values.installedSort as InstalledSort)
+        : undefined,
+    };
+  } catch {
+    return {};
+  }
+}
 function compareInstalled(
   a: InstalledItem,
   b: InstalledItem,
@@ -153,6 +205,18 @@ function compareInstalled(
     alphabetical(a.title?.trim() || a.name, b.title?.trim() || b.name) ||
     a.path.localeCompare(b.path)
   );
+}
+function updateCheckLabel(
+  entry: InstalledItem,
+  enabled: boolean,
+  refreshing: boolean,
+) {
+  if (!enabled || !entry.platform || !entry.projectId) return null;
+  if (entry.updateCheck === "unavailable") return "Update check unavailable";
+  if (entry.updateCheck === "pending")
+    return refreshing ? "Checking updates…" : "Update check unavailable";
+  if (entry.updateCheck === "checked" && !entry.update) return "Up to date";
+  return null;
 }
 const modLoaders = ["fabric", "forge", "neoforge", "quilt"];
 const pluginLoaders = [
@@ -204,6 +268,9 @@ function ProjectIcon({ url }: { url?: string | null }) {
 
 export default function Launchpad({ notify }: PageProps) {
   const { api, post } = useServerApi();
+  const serverId = useContext(ServerScope);
+  const viewKey = `mc-panel.launchpad.view.${serverId ?? "default"}`;
+  const [viewReady, setViewReady] = useState<string | null>(null);
   const [config, setConfig] = useState<Config | null>(null);
   const [configError, setConfigError] = useState("");
   const [configLoading, setConfigLoading] = useState(true);
@@ -258,6 +325,8 @@ export default function Launchpad({ notify }: PageProps) {
   const [targetVersion, setTargetVersion] = useState("");
   const [targetLoader, setTargetLoader] = useState("");
   const [plan, setPlan] = useState<Plan | null>(null);
+  const [acknowledgedDependencies, setAcknowledgedDependencies] =
+    useState(false);
   const [dialogError, setDialogError] = useState("");
   const [busy, setBusy] = useState<"preview" | "install" | "settings" | null>(
     null,
@@ -311,7 +380,9 @@ export default function Launchpad({ notify }: PageProps) {
         setConfig(next);
         setStatus(next.status);
         if (initial) {
+          const saved = readSavedView(viewKey);
           const first =
+            next.platforms.find((item) => item.id === saved.platform) ??
             next.platforms.find(
               (item) => item.id === "modrinth" && item.available,
             ) ??
@@ -319,25 +390,42 @@ export default function Launchpad({ notify }: PageProps) {
             next.platforms[0];
           setPlatform(first?.id ?? "modrinth");
           const initialType =
-            pluginLoaders.includes(next.loader ?? "") &&
-            first?.types.includes("plugin")
-              ? "plugin"
-              : first?.types.includes("modpack")
-                ? "modpack"
-                : (first?.types[0] ?? "modpack");
+            saved.type && first?.types.includes(saved.type)
+              ? saved.type
+              : pluginLoaders.includes(next.loader ?? "") &&
+                  first?.types.includes("plugin")
+                ? "plugin"
+                : first?.types.includes("modpack")
+                  ? "modpack"
+                  : (first?.types[0] ?? "modpack");
           setType(initialType);
           setGameVersion(
-            next.gameVersion && /^\d+(?:\.\d+)+$/.test(next.gameVersion)
-              ? next.gameVersion
-              : "",
-          );
-          setLoader(
-            loadersFor(initialType).includes(next.loader ?? "")
-              ? next.loader!
-              : initialType === "datapack"
-                ? "datapack"
+            saved.gameVersion !== undefined
+              ? saved.gameVersion
+              : next.gameVersion && /^\d+(?:\.\d+)+$/.test(next.gameVersion)
+                ? next.gameVersion
                 : "",
           );
+          const validLoaders = loadersFor(initialType).filter(
+            (value) => !next.loaders || next.loaders.includes(value),
+          );
+          setLoader(
+            saved.loader === "" || validLoaders.includes(saved.loader ?? "")
+              ? saved.loader!
+              : validLoaders.includes(next.loader ?? "")
+                ? next.loader!
+                : initialType === "datapack"
+                  ? "datapack"
+                  : "",
+          );
+          setInstalledOnly(saved.installedOnly ?? false);
+          setSort(
+            first?.sortOptions?.some((item) => item.id === saved.sort)
+              ? saved.sort!
+              : (first?.sortOptions?.[0]?.id ?? "downloads"),
+          );
+          setInstalledSort(saved.installedSort ?? "updates");
+          setViewReady(viewKey);
           setJob(next.job ?? null);
         }
       } catch (cause) {
@@ -346,11 +434,12 @@ export default function Launchpad({ notify }: PageProps) {
         if (current === session.current) setConfigLoading(false);
       }
     },
-    [api],
+    [api, viewKey],
   );
 
   useEffect(() => {
     session.current++;
+    setViewReady(null);
     setConfig(null);
     setResults(null);
     setInventory(null);
@@ -358,6 +447,7 @@ export default function Launchpad({ notify }: PageProps) {
     forceScan.current = null;
     setJob(null);
     setSelection(null);
+    setAcknowledgedDependencies(false);
     setSettingsOpen(false);
     setApiKey("");
     setQuery("");
@@ -384,6 +474,37 @@ export default function Launchpad({ notify }: PageProps) {
       window.clearInterval(timer);
     };
   }, [api, loadConfig]);
+
+  useEffect(() => {
+    if (!config || viewReady !== viewKey) return;
+    try {
+      sessionStorage.setItem(
+        viewKey,
+        JSON.stringify({
+          platform,
+          type,
+          gameVersion,
+          loader,
+          installedOnly,
+          sort,
+          installedSort,
+        }),
+      );
+    } catch {
+      // Navigation still works when browser storage is unavailable.
+    }
+  }, [
+    config,
+    viewReady,
+    viewKey,
+    platform,
+    type,
+    gameVersion,
+    loader,
+    installedOnly,
+    sort,
+    installedSort,
+  ]);
 
   useEffect(() => {
     if (!config || installedOnly || !source?.available || !supported) {
@@ -524,7 +645,23 @@ export default function Launchpad({ notify }: PageProps) {
           publish(await readStage(false, force));
           if (current()) setScanError("");
         } catch (cause) {
-          if (current())
+          if (current()) {
+            const snapshot = inventoryRef.current;
+            if (
+              gameVersion.trim() &&
+              loader &&
+              snapshot?.api === api &&
+              snapshot.scope === inventoryScope
+            ) {
+              publish({
+                ...snapshot.result,
+                items: snapshot.result.items.map((item) =>
+                  item.platform && item.projectId
+                    ? { ...item, updateCheck: "unavailable" }
+                    : item,
+                ),
+              });
+            }
             setScanError(
               `${
                 hasSnapshot
@@ -532,6 +669,7 @@ export default function Launchpad({ notify }: PageProps) {
                   : "Unable to refresh installed content."
               } ${messageOf(cause)}`,
             );
+          }
         } finally {
           if (current()) {
             setScanLoading(false);
@@ -630,6 +768,7 @@ export default function Launchpad({ notify }: PageProps) {
     operation.current++;
     setDialogError("");
     setPlan(null);
+    setAcknowledgedDependencies(false);
     setTargetVersion(gameVersion);
     setTargetLoader(loader);
     setSelection({ project, installed: entry });
@@ -639,13 +778,14 @@ export default function Launchpad({ notify }: PageProps) {
     operation.current++;
     setSelection(null);
     setPlan(null);
+    setAcknowledgedDependencies(false);
     setDialogError("");
     pending.current = false;
     setBusy(null);
   }
   async function preview(event: FormEvent) {
     event.preventDefault();
-    if (!selection || !versionId || pending.current) return;
+    if (plan || !selection || !versionId || pending.current) return;
     if (!targetVersion.trim()) {
       setDialogError(
         "Choose your server’s Minecraft version before reviewing this installation.",
@@ -663,6 +803,7 @@ export default function Launchpad({ notify }: PageProps) {
     pending.current = true;
     setBusy("preview");
     setDialogError("");
+    setAcknowledgedDependencies(false);
     try {
       const next = await post<Plan>("/launchpad/preview", {
         platform: selection.project.platform,
@@ -698,6 +839,12 @@ export default function Launchpad({ notify }: PageProps) {
   }
   async function install() {
     if (!plan || pending.current) return;
+    if (plan.unavailableDependencies?.length && !acknowledgedDependencies) {
+      setDialogError(
+        "Confirm that you will manage the unavailable dependencies before installing.",
+      );
+      return;
+    }
     if (!canInstall) {
       setDialogError("Stop the server in Console before installing.");
       return;
@@ -711,6 +858,9 @@ export default function Launchpad({ notify }: PageProps) {
       const next = await post<{ job: Job }>("/launchpad/install", {
         planId: plan.planId,
         confirmed: true,
+        ...(plan.unavailableDependencies?.length && acknowledgedDependencies
+          ? { acknowledgedUnavailableDependencies: true }
+          : {}),
       });
       if (
         currentSession !== session.current ||
@@ -807,6 +957,18 @@ export default function Launchpad({ notify }: PageProps) {
   const loading = installedOnly ? !installed && scanLoading : searchLoading;
   const failed = installedOnly ? !installed && scanError : searchError;
   const keySource = config?.platforms.find((item) => item.id === "curseforge");
+  const updateFiltersReady = Boolean(
+    type !== "modpack" && gameVersion.trim() && loader,
+  );
+  const updatesUnavailable =
+    updateFiltersReady &&
+    installed?.items.some(
+      (item) =>
+        item.platform &&
+        item.projectId &&
+        (item.updateCheck === "unavailable" ||
+          (!scanRefreshing && item.updateCheck === "pending")),
+    );
   const visibleProjects: { project: Project; entry?: InstalledItem }[] =
     installedOnly
       ? entries.slice(currentOffset, currentOffset + limit).map((entry) => ({
@@ -1232,6 +1394,22 @@ export default function Launchpad({ notify }: PageProps) {
           </button>
         </div>
       )}
+      {!scanError && updatesUnavailable && (
+        <div className="launchpad-error" role="alert">
+          <AlertCircle size={16} />
+          <span>Some installed update checks could not be completed.</span>
+          <button
+            className="btn"
+            disabled={scanRefreshing || scanLoading}
+            onClick={() => {
+              forceScan.current = { api, scope: inventoryScope };
+              setReload((value) => value + 1);
+            }}
+          >
+            Retry updates
+          </button>
+        </div>
+      )}
       <section
         id="launchpad-results"
         className="launchpad-results"
@@ -1369,6 +1547,20 @@ export default function Launchpad({ notify }: PageProps) {
                       </span>
                     )}
                     {entry && <span>{formatBytes(entry.size)}</span>}
+                    {entry &&
+                      updateCheckLabel(
+                        entry,
+                        updateFiltersReady,
+                        scanRefreshing,
+                      ) && (
+                        <span>
+                          {updateCheckLabel(
+                            entry,
+                            updateFiltersReady,
+                            scanRefreshing,
+                          )}
+                        </span>
+                      )}
                     {!entry?.platform && entry && (
                       <span>
                         {scanRefreshing
@@ -1581,6 +1773,53 @@ export default function Launchpad({ notify }: PageProps) {
                   {warning}
                 </p>
               ))}
+              {Boolean(plan.unavailableDependencies?.length) && (
+                <>
+                  <div className="launchpad-inline-notice">
+                    <AlertCircle size={17} />
+                    <div>
+                      <strong>Required dependencies unavailable</strong>
+                      <p>
+                        These dependencies could not be downloaded. This content
+                        may not work until you install compatible copies
+                        yourself.
+                      </p>
+                      <ul aria-label="Unavailable required dependencies">
+                        {plan.unavailableDependencies!.map(
+                          (dependency, index) => (
+                            <li
+                              key={`${dependency.platform}:${dependency.projectId ?? ""}:${dependency.versionId ?? ""}:${index}`}
+                            >
+                              {config.platforms.find(
+                                (item) => item.id === dependency.platform,
+                              )?.name ?? dependency.platform}
+                              {dependency.projectId
+                                ? ` project ${dependency.projectId}`
+                                : ""}
+                              {dependency.versionId
+                                ? ` · version ${dependency.versionId}`
+                                : ""}
+                              {` · required by ${dependency.requiredBy}`}
+                            </li>
+                          ),
+                        )}
+                      </ul>
+                    </div>
+                  </div>
+                  <label className="launchpad-inline-notice">
+                    <input
+                      type="checkbox"
+                      checked={acknowledgedDependencies}
+                      disabled={Boolean(busy)}
+                      onChange={(event) =>
+                        setAcknowledgedDependencies(event.target.checked)
+                      }
+                      style={{ flexShrink: 0 }}
+                    />
+                    <span>I will manage these dependencies myself</span>
+                  </label>
+                </>
+              )}
               <p className="management-dialog-description">
                 Review {plan.files.length} file
                 {plan.files.length === 1 ? "" : "s"} before continuing.
@@ -1617,6 +1856,7 @@ export default function Launchpad({ notify }: PageProps) {
                   disabled={Boolean(busy)}
                   onClick={() => {
                     setPlan(null);
+                    setAcknowledgedDependencies(false);
                     setDialogError("");
                   }}
                 >
@@ -1626,7 +1866,13 @@ export default function Launchpad({ notify }: PageProps) {
                   type="button"
                   className="btn primary"
                   disabled={
-                    Boolean(busy) || !canInstall || plan.files.length === 0
+                    Boolean(busy) ||
+                    !canInstall ||
+                    plan.files.length === 0 ||
+                    Boolean(
+                      plan.unavailableDependencies?.length &&
+                      !acknowledgedDependencies,
+                    )
                   }
                   onClick={() => void install()}
                 >

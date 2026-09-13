@@ -406,6 +406,77 @@ test("updating one mod keeps unrelated results cached and immediately publishes 
   assert.equal(JSON.parse(batches().at(-1).body).hashes.length, 2);
 });
 
+test("failed or incomplete Modrinth rechecks retain known updates after cache expiry and recover", async (t) => {
+  let now = Date.now(),
+    failure;
+  t.mock.method(Date, "now", () => now);
+  const f = await fixture(t, {
+    request: async (url) => {
+      if (new URL(url).pathname !== "/v2/version_files/update") return;
+      if (failure === "404") return new Response(null, { status: 404 });
+      if (failure === "missing") return Response.json({});
+    },
+  });
+  const first = await f.service.installed(selection);
+  assert.equal(first.items[0].update.id, "new");
+  assert.equal(first.items[0].updateCheck, "checked");
+  for (const mode of ["404", "missing"]) {
+    failure = mode;
+    now += 11 * 60_000;
+    const next = await f.service.installed(selection);
+    assert.equal(next.items[0].update.id, "new", mode);
+    assert.equal(next.items[0].updateCheck, "unavailable", mode);
+    assert.ok(next.warnings.length > 0, mode);
+    const local = await f.service.installed({ ...selection, local: true });
+    assert.equal(
+      local.items[0].update.id,
+      "new",
+      "reopening retains the update",
+    );
+    assert.equal(local.items[0].updateCheck, "pending");
+  }
+  failure = undefined;
+  now += 60_000;
+  const recovered = await f.service.installed({ ...selection, refresh: true });
+  assert.equal(recovered.items[0].update.id, "new");
+  assert.equal(recovered.items[0].updateCheck, "checked");
+  assert.deepEqual(recovered.warnings, []);
+});
+
+test("a forced refresh interrupted before update checks cannot reuse a cached up-to-date status", async (t) => {
+  const f = await fixture(t, {
+    request: async (url) => {
+      if (new URL(url).pathname === "/v2/version_files/update")
+        return Response.json({ [hashes(f.old).sha512]: f.versions.old });
+    },
+  });
+  const first = await f.service.installed(selection);
+  assert.equal(first.items[0].updateCheck, "checked");
+  assert.equal(first.items[0].update, undefined);
+  const deadline = new AbortController(),
+    timeout = AbortSignal.timeout.bind(AbortSignal);
+  deadline.abort(new DOMException("Fixture refresh deadline", "TimeoutError"));
+  t.mock.method(AbortSignal, "timeout", (duration) =>
+    duration === 30000 ? deadline.signal : timeout(duration),
+  );
+  const refreshed = await f.service.installed({ ...selection, refresh: true });
+  assert.equal(refreshed.items[0].updateCheck, "unavailable");
+  assert.match(refreshed.warnings.join(" "), /too long/);
+});
+
+test("an unavailable first update check is never reported as up to date", async (t) => {
+  const f = await fixture(t, {
+    request: async (url) => {
+      if (new URL(url).pathname === "/v2/version_files/update")
+        return new Response(null, { status: 404 });
+    },
+  });
+  const result = await f.service.installed(selection);
+  assert.equal(result.items[0].update, undefined);
+  assert.equal(result.items[0].updateCheck, "unavailable");
+  assert.ok(result.warnings.length);
+});
+
 test("one unreadable package does not hide the remaining installed mods", async (t) => {
   const f = await fixture(t);
   const blocked = path.join(f.serverDir, "mods", "locked.jar");
@@ -1329,6 +1400,136 @@ test("checksum failures and changed reviewed files never mutate existing server 
   );
 });
 
+test("JEI-style missing Modrinth dependencies require explicit acknowledgement of the reviewed omissions", async (t) => {
+  const f = await fixture(t, {
+    request: async (url) => {
+      const pathname = new URL(url).pathname;
+      if (pathname === "/v2/project/7tEfOcA7/version")
+        return new Response(null, { status: 404 });
+      if (pathname === "/v2/project/project")
+        return Response.json({
+          id: "project",
+          title: "Just Enough Items (JEI)",
+          project_type: "mod",
+          server_side: "optional",
+        });
+    },
+  });
+  // This is the dependency shape returned for JEI's NeoForge 1.21.1 releases.
+  f.versions.new.dependencies = [
+    { project_id: "7tEfOcA7", version_id: null, dependency_type: "required" },
+  ];
+  const plan = await f.service.preview({
+    ...selection,
+    replacePath: "mods/old.jar",
+  });
+  assert.deepEqual(plan.unavailableDependencies, [
+    {
+      platform: "modrinth",
+      projectId: "7tEfOcA7",
+      versionId: null,
+      requiredBy: "Just Enough Items (JEI)",
+    },
+  ]);
+  assert.deepEqual(
+    plan.files.map((file) => file.path),
+    ["mods/new.jar"],
+  );
+  for (const acknowledgedUnavailableDependencies of [
+    undefined,
+    false,
+    "true",
+  ]) {
+    await assert.rejects(
+      f.service.install({
+        planId: plan.planId,
+        confirmed: true,
+        acknowledgedUnavailableDependencies,
+      }),
+      /unavailable required dependencies/,
+    );
+    assert.equal(f.mutations, 0);
+    assert.deepEqual(
+      await fs.readFile(path.join(f.serverDir, "mods", "old.jar")),
+      f.old,
+    );
+  }
+  const job = await finish(f.service, {
+    planId: plan.planId,
+    confirmed: true,
+    acknowledgedUnavailableDependencies: true,
+  });
+  assert.equal(job.status, "completed");
+  assert.deepEqual(
+    await fs.readFile(path.join(f.serverDir, "mods", "new.jar")),
+    f.newer,
+  );
+  assert.deepEqual(
+    (await f.bin.list()).map((item) => item.originalPath),
+    ["mods/old.jar"],
+  );
+});
+
+test("unavailable dependencies are deduplicated and count toward the resolution budget", async (t) => {
+  let requests = 0;
+  const f = await fixture(t, {
+    request: async (url) => {
+      if (new URL(url).pathname.startsWith("/v2/project/missing")) {
+        requests++;
+        return new Response(null, { status: 404 });
+      }
+    },
+  });
+  const required = (project_id) => ({
+    project_id,
+    version_id: null,
+    dependency_type: "required",
+  });
+  f.versions.new.dependencies = Array.from({ length: 500 }, () =>
+    required("missing"),
+  );
+  const plan = await f.service.preview(selection);
+  assert.equal(plan.unavailableDependencies.length, 1);
+  assert.equal(requests, 1);
+  requests = 0;
+  f.versions.new.dependencies = Array.from({ length: 101 }, (_, i) =>
+    required(`missing${i}`),
+  );
+  await assert.rejects(
+    f.service.preview(selection),
+    /dependency graph is too large/,
+  );
+  assert.equal(
+    requests,
+    99,
+    "root and missing nodes share the 100-node network budget",
+  );
+  assert.equal(f.mutations, 0);
+});
+
+test("missing selected versions and transient dependency errors cannot be bypassed as missing requirements", async (t) => {
+  let rootMissing = true;
+  const f = await fixture(t, {
+    request: async (url) => {
+      const pathname = new URL(url).pathname;
+      if (rootMissing && pathname === "/v2/version/new")
+        return new Response(null, { status: 404 });
+      if (pathname === "/v2/project/dependency/version")
+        return new Response(null, { status: 503 });
+    },
+  });
+  await assert.rejects(
+    f.service.preview(selection),
+    /could not find the selected project or version/,
+  );
+  rootMissing = false;
+  f.versions.new.dependencies = [
+    { project_id: "dependency", version_id: null, dependency_type: "required" },
+  ];
+  await assert.rejects(f.service.preview(selection), /503/);
+  assert.equal(f.mutations, 0);
+});
+
 test("partial promotion failure rolls back only newly installed files and restores replaced originals", async (t) => {
   const f = await fixture(t);
   f.versions.new.dependencies = [
@@ -1546,6 +1747,152 @@ test("plans and jobs are server-scoped and the configured runtime must match ins
   assert.equal(
     curseFingerprint(bytes("a b\r\nc\td")),
     curseFingerprint(bytes("abcd")),
+  );
+});
+
+test("sequential CurseForge updates resolve each required dependency's own compatible file", async (t) => {
+  const files = new Map(),
+    contents = new Map();
+  const addFile = (
+    projectId,
+    versionId,
+    filename,
+    value,
+    dependencies = [],
+  ) => {
+    const data = bytes(value);
+    const file = {
+      id: versionId,
+      modId: projectId,
+      displayName: filename,
+      fileName: filename,
+      gameVersions: ["1.21.1", "NeoForge"],
+      fileDate: `2026-02-${(versionId % 10) + 10}`,
+      downloadUrl: `https://edge.forgecdn.net/${filename}`,
+      fileLength: data.length,
+      isAvailable: true,
+      hashes: [{ algo: 1, value: hashes(data).sha1 }],
+      dependencies: dependencies.map((modId) => ({ modId, relationType: 3 })),
+    };
+    files.set(`${projectId}/${versionId}`, file);
+    contents.set(file.downloadUrl, data);
+    return data;
+  };
+  const firstOld = addFile(11, 21, "old.jar", "existing server mod");
+  const secondOld = addFile(33, 31, "second-old.jar", "second installed mod");
+  addFile(11, 22, "first-new.jar", "first compatible update");
+  addFile(33, 32, "second-new.jar", "second compatible update", [55]);
+  addFile(55, 52, "dependency-new.jar", "required dependency", [77]);
+  addFile(77, 72, "nested-new.jar", "nested required dependency");
+  const projects = [11, 33, 55, 77].map((id) => ({
+    id,
+    gameId: 432,
+    classId: 6,
+    name: `Fixture mod ${id}`,
+  }));
+  const f = await fixture(t, {
+    request: async (url, init) => {
+      if (contents.has(String(url)))
+        return new Response(contents.get(String(url)));
+      const address = new URL(url),
+        parts = address.pathname.split("/");
+      if (address.hostname !== "api.curseforge.com") return;
+      if (address.pathname === "/v1/categories")
+        return Response.json({
+          data: [{ id: 6, slug: "mc-mods", name: "Mods" }],
+        });
+      if (address.pathname === "/v1/mods")
+        return Response.json({
+          data: projects.filter((p) =>
+            JSON.parse(init.body).modIds.includes(p.id),
+          ),
+        });
+      if (parts[2] === "mods") {
+        const projectId = Number(parts[3]);
+        if (parts.length === 4)
+          return Response.json({
+            data: projects.find((p) => p.id === projectId),
+          });
+        if (parts.length === 5) {
+          assert.equal(address.searchParams.get("gameVersion"), "1.21.1");
+          assert.equal(address.searchParams.get("modLoaderType"), "6");
+          return Response.json({
+            data: [...files.values()].filter((f) => f.modId === projectId),
+          });
+        }
+        const file = files.get(`${projectId}/${parts[5]}`);
+        return file
+          ? Response.json({ data: file })
+          : new Response(null, { status: 404 });
+      }
+      throw new Error(`Unexpected CurseForge fixture request ${url}`);
+    },
+  });
+  await fs.writeFile(
+    path.join(f.serverDir, "mods", "second-old.jar"),
+    secondOld,
+  );
+  await fs.writeFile(
+    path.join(f.dataDir, "launchpad", "installed.json"),
+    JSON.stringify([
+      {
+        path: "mods/old.jar",
+        sha512: hashes(firstOld).sha512,
+        platform: "curseforge",
+        projectId: "11",
+        versionId: "21",
+        type: "mod",
+      },
+      {
+        path: "mods/second-old.jar",
+        sha512: hashes(secondOld).sha512,
+        platform: "curseforge",
+        projectId: "33",
+        versionId: "31",
+        type: "mod",
+      },
+    ]),
+  );
+  const service = await f.boot();
+  await service.settings({ curseforgeApiKey: "fixture-key" });
+  for (const [projectId, versionId, replacePath] of [
+    ["11", "22", "mods/old.jar"],
+    ["33", "32", "mods/second-old.jar"],
+  ]) {
+    const installed = await service.installed(selection);
+    assert.equal(
+      installed.items.find((item) => item.projectId === projectId).update.id,
+      versionId,
+    );
+    const plan = await service.preview({
+      ...selection,
+      platform: "curseforge",
+      projectId,
+      versionId,
+      replacePath,
+    });
+    assert.equal(
+      (await finish(service, { planId: plan.planId, confirmed: true })).status,
+      "completed",
+    );
+  }
+  const final = await service.installed({ ...selection, local: true });
+  assert.deepEqual(
+    final.items.map((item) => [item.projectId, item.versionId]).sort(),
+    [
+      ["11", "22"],
+      ["33", "32"],
+      ["55", "52"],
+      ["77", "72"],
+    ],
+  );
+  assert.deepEqual(
+    (await f.bin.list()).map((item) => item.originalPath).sort(),
+    ["mods/old.jar", "mods/second-old.jar"],
+  );
+  assert.ok(
+    !f.requests.some(({ url }) => /\/mods\/(55|77)\/files\/32$/.test(url)),
+    "root version IDs never leak into dependencies",
   );
 });
 

@@ -1275,6 +1275,373 @@ test("Launchpad keeps refreshed local files usable after installation while remo
   expect(fullRequests[5].searchParams.get("refresh")).toBe("true");
 });
 
+test("Launchpad preserves known updates and exposes successful-response provider failures after reentry", async ({
+  page,
+  serverId,
+}) => {
+  const version = {
+    id: "better-new",
+    name: "Better Mod 2.0",
+    version: "2.0",
+    gameVersions: ["1.21.1"],
+    loaders: ["neoforge"],
+    publishedAt: "2026-09-01T00:00:00Z",
+    downloadable: true,
+  };
+  const warning =
+    "Modrinth update checks: provider returned 404. Your installed files are unchanged.";
+  let knownUpdate = false;
+  let localReads = 0;
+  let reentryResponse: Route | undefined;
+  const fullRequests: URL[] = [];
+  const inventory = (
+    updateCheck: "checked" | "pending" | "unavailable",
+    compatible = true,
+  ) => [
+    {
+      path: "mods/better-1.jar",
+      name: "better-1.jar",
+      title: "Better Mod",
+      size: 1024,
+      platform: "modrinth",
+      projectId: "better",
+      versionId: "better-old",
+      versionName: "1.0",
+      update: knownUpdate && compatible ? version : null,
+      updateCheck: compatible ? updateCheck : "pending",
+    },
+    {
+      path: "mods/companion.jar",
+      name: "companion.jar",
+      title: "Companion Mod",
+      size: 2048,
+      platform: "modrinth",
+      projectId: "companion",
+      versionId: "companion-current",
+      versionName: "3.0",
+      update: null,
+      updateCheck: compatible ? updateCheck : "pending",
+    },
+  ];
+  await page.route("**/api/launchpad", (route) =>
+    route.fulfill({
+      json: {
+        platforms: [
+          { id: "modrinth", name: "Modrinth", available: true, types: ["mod"] },
+        ],
+        gameVersion: "1.21.1",
+        gameVersions: ["1.21.1"],
+        loader: "neoforge",
+        status: "offline",
+        warnings: [],
+      },
+    }),
+  );
+  await page.route("**/api/launchpad/search?**", (route) =>
+    route.fulfill({ json: { projects: [], total: 0, offset: 0, limit: 10 } }),
+  );
+  await page.route("**/api/launchpad/installed?**", (route) => {
+    expect(route.request().headers()["x-server-id"]).toBe(serverId);
+    const url = new URL(route.request().url());
+    const compatible = Boolean(
+      url.searchParams.get("gameVersion") && url.searchParams.get("loader"),
+    );
+    if (url.searchParams.get("local") === "true") {
+      localReads++;
+      expect(url.searchParams.has("refresh")).toBe(false);
+      return route.fulfill({
+        json: { items: inventory("pending", compatible), warnings: [] },
+      });
+    }
+    fullRequests.push(url);
+    if (fullRequests.length === 3) {
+      reentryResponse = route;
+      return;
+    }
+    knownUpdate = true;
+    const unavailable = fullRequests.length === 2;
+    return route.fulfill({
+      status: 200,
+      json: {
+        items: inventory(unavailable ? "unavailable" : "checked", compatible),
+        warnings: unavailable ? [warning] : [],
+      },
+    });
+  });
+  await page.goto("/#launchpad");
+  const installedToggle = page.getByRole("switch", {
+    name: "Show installed content",
+  });
+  await installedToggle.check();
+  const better = page.getByRole("article", { name: "Better Mod", exact: true });
+  const companion = page.getByRole("article", {
+    name: "Companion Mod",
+    exact: true,
+  });
+  const update = page.getByRole("button", {
+    name: "Update Better Mod",
+    exact: true,
+  });
+  const retry = page.getByRole("button", {
+    name: "Retry updates",
+    exact: true,
+  });
+  await expect(update).toBeEnabled();
+  await expect(better).toContainText("Available: 2.0");
+  await expect(
+    companion.getByText("Up to date", { exact: true }),
+  ).toBeVisible();
+  await page
+    .getByRole("button", {
+      name: "Refresh Launchpad and check updates",
+      exact: true,
+    })
+    .click();
+  await expect(page.getByText(warning, { exact: true })).toBeVisible();
+  await expect(retry).toBeVisible();
+  await expect(update).toBeEnabled();
+  await expect(better).toContainText("Available: 2.0");
+  await expect(companion).toContainText("mods/companion.jar");
+  await expect(
+    better.getByText("Update check unavailable", { exact: true }),
+  ).toBeVisible();
+  await expect(
+    companion.getByText("Update check unavailable", { exact: true }),
+  ).toBeVisible();
+  await expect(companion.getByText("Up to date", { exact: true })).toHaveCount(
+    0,
+  );
+  await page.getByRole("link", { name: "Console", exact: true }).click();
+  await expect(
+    page.getByRole("heading", { name: "Console", exact: true }),
+  ).toBeVisible();
+  await page.getByRole("link", { name: "Launchpad", exact: true }).click();
+  await expect(installedToggle).toBeChecked();
+  await expect(
+    page.getByRole("tab", { name: "Mods", exact: true }),
+  ).toHaveAttribute("aria-selected", "true");
+  await expect(page.getByLabel("Loader", { exact: true })).toHaveValue(
+    "neoforge",
+  );
+  await expect.poll(() => Boolean(reentryResponse)).toBe(true);
+  await expect(update).toBeEnabled();
+  await expect(companion).toContainText("mods/companion.jar");
+  await expect(
+    companion.getByText("Checking updates…", { exact: true }),
+  ).toBeVisible();
+  await expect(companion.getByText("Up to date", { exact: true })).toHaveCount(
+    0,
+  );
+  await expect(
+    page.getByRole("status", {
+      name: "Installed content refresh",
+      exact: true,
+    }),
+  ).toBeVisible();
+  await reentryResponse!.fulfill({
+    status: 200,
+    json: { items: inventory("unavailable"), warnings: [warning] },
+  });
+  await expect(page.getByText(warning, { exact: true })).toBeVisible();
+  await expect(retry).toBeVisible();
+  await expect(update).toBeEnabled();
+  await expect(better).toContainText("Available: 2.0");
+  await expect(
+    better.getByText("Update check unavailable", { exact: true }),
+  ).toBeVisible();
+  await expect(
+    companion.getByText("Update check unavailable", { exact: true }),
+  ).toBeVisible();
+  await expect(companion.getByText("Up to date", { exact: true })).toHaveCount(
+    0,
+  );
+  await expect(page.locator(".launchpad-project-body > p")).toHaveText([
+    "mods/better-1.jar",
+    "mods/companion.jar",
+  ]);
+  await retry.click();
+  await expect(retry).toHaveCount(0);
+  await expect(page.getByText(warning, { exact: true })).toHaveCount(0);
+  await expect(update).toBeEnabled();
+  await expect(better).toContainText("Available: 2.0");
+  await expect(companion).toContainText("mods/companion.jar");
+  await expect(
+    companion.getByText("Up to date", { exact: true }),
+  ).toBeVisible();
+  await expect(
+    page.getByText("Update check unavailable", { exact: true }),
+  ).toHaveCount(0);
+  expect(localReads).toBe(4);
+  expect(
+    fullRequests.map((url) => url.searchParams.get("refresh") === "true"),
+  ).toEqual([false, true, false, true]);
+  // An intentional "All loaders" selection must survive reentry as well.
+  await page.getByLabel("Loader", { exact: true }).selectOption("");
+  await expect.poll(() => fullRequests.length).toBe(5);
+  await expect(companion.getByText("Up to date", { exact: true })).toHaveCount(
+    0,
+  );
+  await page.getByRole("link", { name: "Console", exact: true }).click();
+  await expect(
+    page.getByRole("heading", { name: "Console", exact: true }),
+  ).toBeVisible();
+  await page.getByRole("link", { name: "Launchpad", exact: true }).click();
+  await expect(installedToggle).toBeChecked();
+  await expect(page.getByLabel("Loader", { exact: true })).toHaveValue("");
+  await expect.poll(() => fullRequests.length).toBe(6);
+  expect(fullRequests[5].searchParams.has("loader")).toBe(false);
+  await expect(companion).toContainText("mods/companion.jar");
+  await expect(companion.getByText("Up to date", { exact: true })).toHaveCount(
+    0,
+  );
+  await expect(
+    page.getByText("Update check unavailable", { exact: true }),
+  ).toHaveCount(0);
+});
+
+test("Launchpad requires a fresh acknowledgment before installing with unavailable required dependencies", async ({
+  page,
+  serverId,
+}) => {
+  const version = {
+    id: "jei-new",
+    name: "JEI 19.0",
+    version: "19.0",
+    gameVersions: ["1.21.1"],
+    loaders: ["neoforge"],
+    publishedAt: "2026-09-01T00:00:00Z",
+    downloadable: true,
+  };
+  await page.route("**/api/launchpad", (route) =>
+    route.fulfill({
+      json: {
+        platforms: [
+          { id: "modrinth", name: "Modrinth", available: true, types: ["mod"] },
+        ],
+        gameVersion: "1.21.1",
+        gameVersions: ["1.21.1"],
+        loader: "neoforge",
+        status: "offline",
+        warnings: [],
+      },
+    }),
+  );
+  await page.route("**/api/launchpad/search?**", (route) =>
+    route.fulfill({ json: { projects: [], total: 0, offset: 0, limit: 10 } }),
+  );
+  await page.route("**/api/launchpad/installed?**", (route) =>
+    route.fulfill({
+      json: {
+        items: [
+          {
+            path: "mods/jei-old.jar",
+            name: "jei-old.jar",
+            title: "JEI",
+            size: 1024,
+            platform: "modrinth",
+            projectId: "jei",
+            versionId: "jei-old",
+            updateCheck: "checked",
+            update: version,
+          },
+        ],
+        warnings: [],
+      },
+    }),
+  );
+  await page.route("**/api/launchpad/versions?**", (route) =>
+    route.fulfill({ json: { versions: [version] } }),
+  );
+  let reviews = 0;
+  await page.route("**/api/launchpad/preview", (route) => {
+    expect(route.request().headers()["x-server-id"]).toBe(serverId);
+    expect(route.request().postDataJSON()).toMatchObject({
+      platform: "modrinth",
+      projectId: "jei",
+      versionId: "jei-new",
+      replacePath: "mods/jei-old.jar",
+    });
+    return route.fulfill({
+      json: {
+        planId: `jei-review-${++reviews}`,
+        title: "JEI",
+        versionName: "19.0",
+        files: [
+          {
+            path: "mods/jei-new.jar",
+            previousPath: "mods/jei-old.jar",
+            size: 2048,
+            action: "replace",
+          },
+        ],
+        unavailableDependencies: [
+          { platform: "modrinth", projectId: "7tEfOcA7", requiredBy: "JEI" },
+        ],
+        warnings: [],
+        expiresAt: "2099-01-01T00:00:00Z",
+      },
+    });
+  });
+  const installations: unknown[] = [];
+  await page.route("**/api/launchpad/install", (route) => {
+    expect(route.request().headers()["x-server-id"]).toBe(serverId);
+    installations.push(route.request().postDataJSON());
+    return route.fulfill({
+      json: {
+        job: {
+          id: "jei-job",
+          status: "completed",
+          message: "JEI updated with the reviewed dependency choice",
+          completed: 1,
+          total: 1,
+        },
+      },
+    });
+  });
+  await page.goto("/#launchpad");
+  await page.getByRole("switch", { name: "Show installed content" }).check();
+  await page.getByRole("button", { name: "Update JEI", exact: true }).click();
+  const dialog = page.getByRole("dialog");
+  await dialog.getByRole("button", { name: /Review/ }).click();
+  await expect(
+    dialog.getByText("Required dependencies unavailable", { exact: true }),
+  ).toBeVisible();
+  await expect(
+    dialog.getByRole("list", { name: "Unavailable required dependencies" }),
+  ).toHaveText("Modrinth project 7tEfOcA7 · required by JEI");
+  const acknowledgment = dialog.getByRole("checkbox", {
+    name: "I will manage these dependencies myself",
+    exact: true,
+  });
+  const confirm = dialog.getByRole("button", {
+    name: "Confirm installation",
+    exact: true,
+  });
+  await expect(acknowledgment).not.toBeChecked();
+  await expect(confirm).toBeDisabled();
+  expect(installations).toHaveLength(0);
+  await acknowledgment.check();
+  await expect(confirm).toBeEnabled();
+  await dialog.getByRole("button", { name: "Back", exact: true }).click();
+  await dialog.getByRole("button", { name: /Review/ }).click();
+  await expect(acknowledgment).not.toBeChecked();
+  await expect(confirm).toBeDisabled();
+  expect(installations).toHaveLength(0);
+  await acknowledgment.check();
+  await confirm.click();
+  await expect(dialog).not.toBeVisible();
+  expect(installations).toEqual([
+    {
+      planId: "jei-review-2",
+      confirmed: true,
+      acknowledgedUnavailableDependencies: true,
+    },
+  ]);
+  await expect(
+    page.getByRole("status", { name: "Installation status", exact: true }),
+  ).toContainText("JEI updated with the reviewed dependency choice");
+});
+
 test("Launchpad ignores delayed installed metadata after loader, version, type and server changes", async ({
   page,
   request,

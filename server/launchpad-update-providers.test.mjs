@@ -36,7 +36,9 @@ const current = (installed, overrides = {}) =>
   raw(installed, {
     id: installed.versionId,
     date_published: "2026-07-01T00:00:00Z",
-    files: [{ hashes: { sha512: installed.sha512 } }],
+    files: [
+      { ...raw(installed).files[0], hashes: { sha512: installed.sha512 } },
+    ],
     ...overrides,
   });
 const json = (value) => new Response(JSON.stringify(value));
@@ -93,7 +95,7 @@ test("batch updates reject current, older, incompatible, wrong-project and unsaf
   const newer = rows[0];
   const candidates = [
     raw(newer),
-    raw(rows[1], { id: rows[1].versionId }),
+    current(rows[1]),
     raw(rows[2], { date_published: "2026-06-01T00:00:00Z" }),
     raw(rows[3], { date_published: "2026-07-01T00:00:00Z" }),
     raw(rows[4], { loaders: ["fabric"] }),
@@ -126,9 +128,9 @@ test("batch updates reject current, older, incompatible, wrong-project and unsaf
   );
   const result = await p.updates(input, rows);
   assert.equal(result.updates[newer.sha512].id, `new${newer.versionId}`);
-  for (const index of [1, 2, 3, 4, 5, 7, 8, 10, 11])
+  for (const index of [1, 2, 3, 8])
     assert.equal(result.updates[rows[index].sha512], null);
-  for (const index of [6, 9, 12, 13])
+  for (const index of [4, 5, 6, 7, 9, 10, 11, 12, 13])
     assert.equal(Object.hasOwn(result.updates, rows[index].sha512), false);
   assert.match(result.warnings.join(" "), /different project/);
   assert.match(result.warnings.join(" "), /outside the provider/);
@@ -151,7 +153,7 @@ test("unverified current identity or publication dates remain unknown instead of
   assert.match(result.warnings[0], /could not be verified/);
 });
 
-test("current and unknown hashes need no secondary version request, and duplicate hashes are coalesced", async () => {
+test("confirmed current hashes become null while omitted hashes remain unknown, and duplicate hashes are coalesced", async () => {
   const row = item(0),
     unknown = item(1);
   let calls = 0;
@@ -164,10 +166,9 @@ test("current and unknown hashes need no secondary version request, and duplicat
     ]);
     return json({ [row.sha512]: current(row) });
   });
-  assert.deepEqual(await p.updates(input, [row, row, unknown]), {
-    updates: { [row.sha512]: null, [unknown.sha512]: null },
-    warnings: [],
-  });
+  const result = await p.updates(input, [row, row, unknown]);
+  assert.deepEqual(result.updates, { [row.sha512]: null });
+  assert.match(result.warnings.join(" "), /did not return results/);
   assert.equal(calls, 1);
   await assert.rejects(
     p.updates(input, [row, { ...row, versionId: "conflicting" }]),
@@ -200,6 +201,40 @@ test("rate limits stop queued batches and cool down subsequent callers without c
   now += 60_001;
   await p.updates(input, [rows[0]]);
   assert.equal(calls, before + 1);
+});
+
+test("missing or invalid later responses cannot overwrite a previously discovered update with a false no-update result", async () => {
+  const row = item(0);
+  let response = raw(row),
+    currentFails = false;
+  const p = provider(async (url) => {
+    if (url.endsWith("/update"))
+      return json(response ? { [row.sha512]: response } : {});
+    return currentFails
+      ? new Response("", { status: 404 })
+      : json([current(row)]);
+  });
+  const cached = { ...(await p.updates(input, [row])).updates };
+  assert.equal(cached[row.sha512].id, `new${row.versionId}`);
+  for (const value of [
+    null,
+    raw(row, { loaders: ["fabric"] }),
+    raw(row, { environment: "client_only" }),
+    raw(row, { files: [] }),
+    current(row, { files: raw(row).files }),
+  ]) {
+    response = value;
+    const next = await p.updates(input, [row]);
+    assert.deepEqual(next.updates, {});
+    assert.ok(next.warnings.length);
+    Object.assign(cached, next.updates);
+    assert.equal(cached[row.sha512].id, `new${row.versionId}`);
+  }
+  response = raw(row);
+  currentFails = true;
+  const missingCurrent = await p.updates(input, [row]);
+  assert.deepEqual(missingCurrent.updates, {});
+  assert.match(missingCurrent.warnings.join(" "), /404/);
 });
 
 test("an eight-second batch budget covers both update and current-version requests and failures cool down", async (t) => {
@@ -268,10 +303,8 @@ test("caller cancellation aborts in-flight batch requests, skips queued batches,
   await assert.rejects(operation, /caller cancelled/);
   const result = await p.updates(input, [item(0)]);
   assert.equal(calls, 3);
-  assert.deepEqual(result, {
-    updates: { [item(0).sha512]: null },
-    warnings: [],
-  });
+  assert.deepEqual(result.updates, {});
+  assert.match(result.warnings.join(" "), /did not return results/);
 });
 
 for (const stalled of ["request", "response body"])
@@ -329,10 +362,8 @@ for (const stalled of ["request", "response body"])
     failing = false;
     now += 30_001;
     const retry = await p.updates(input, [item(201)]);
-    assert.deepEqual(retry, {
-      updates: { [item(201).sha512]: null },
-      warnings: [],
-    });
+    assert.deepEqual(retry.updates, {});
+    assert.match(retry.warnings.join(" "), /did not return results/);
     assert.equal(calls, 3);
     for (const reject of lateFailures)
       reject(new Error("Late uncooperative network failure"));
@@ -367,8 +398,8 @@ test("caller cancellation releases uncooperative update requests so the next cal
     Array.from({ length: 101 }, (_, index) => item(index)),
   );
   assert.equal(calls, 4);
-  assert.equal(Object.keys(retry.updates).length, 101);
-  assert.deepEqual(retry.warnings, []);
+  assert.deepEqual(retry.updates, {});
+  assert.match(retry.warnings.join(" "), /did not return results/);
 });
 
 test("optional caller signals reach existing Modrinth and CurseForge version and identification helpers", async () => {
