@@ -773,6 +773,29 @@ try {
   await assertDesktopUpdates(page);
   serverId = await createSmokeDemo(page);
 
+  step(
+    "Checking bundled Minecraft management pages and configuration modules.",
+  );
+  const versions = await browserApi(page, "/versions", { serverId });
+  assert.equal(versions.status, 200);
+  assert.ok(
+    versions.data.providers.some(
+      (provider) => provider.id === "neoforge" && provider.installable,
+    ),
+  );
+  await page.getByRole("link", { name: "Versions", exact: true }).click();
+  await ui(
+    page.getByRole("heading", { name: "Versions", exact: true }),
+  ).toBeVisible();
+  await ui(
+    page.getByRole("heading", { name: "NeoForge", exact: true }),
+  ).toBeVisible();
+  await page.getByRole("link", { name: "Properties", exact: true }).click();
+  await ui(
+    page.getByRole("tab", { name: "server.properties", exact: true }),
+  ).toBeVisible();
+  await ui(page.getByLabel("max players", { exact: true })).toBeVisible();
+
   step("Creating and uploading files through the packaged File Manager.");
   await page.goto(`${currentOrigin}/#files`);
   await ui(

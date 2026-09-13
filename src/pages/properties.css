@@ -1,0 +1,117 @@
+.properties-page {
+  min-width: 0;
+}
+.properties-tabs {
+  display: flex;
+  gap: 3px;
+  overflow-x: auto;
+  padding: 13px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  margin-bottom: 18px;
+}
+.properties-tabs button {
+  background: none;
+  color: var(--muted);
+  border: 0;
+  border-right: 1px solid var(--border);
+  padding: 7px 12px;
+  white-space: nowrap;
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+.properties-tabs button.selected {
+  color: var(--accent);
+  font-weight: 650;
+}
+.properties-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 18px;
+}
+.properties-toolbar > span {
+  margin-left: auto;
+  font-size: 12px;
+  color: var(--muted);
+}
+.properties-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 16px;
+}
+.property-field {
+  display: flex;
+  flex-direction: column;
+  gap: 13px;
+  padding: 21px;
+  min-width: 0;
+}
+.property-field > span {
+  font-size: 13px;
+  font-weight: 550;
+  overflow-wrap: anywhere;
+}
+.property-field input,
+.property-field select {
+  width: 100%;
+  min-height: 40px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  padding: 10px 12px;
+  color: var(--text);
+  font: inherit;
+  font-size: 13px;
+}
+.properties-empty {
+  padding: 45px;
+  text-align: center;
+  color: var(--muted);
+}
+.properties-empty h2 {
+  font-size: 17px;
+  color: var(--text);
+}
+.properties-empty p {
+  font-size: 13px;
+}
+.properties-note {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--muted);
+  font-size: 12px;
+  margin-top: 22px;
+  flex-wrap: wrap;
+}
+.properties-note a {
+  color: var(--text);
+}
+.properties-discard {
+  max-width: 460px;
+}
+.properties-discard::backdrop {
+  background: #0009;
+}
+@media (max-width: 650px) {
+  .properties-grid {
+    grid-template-columns: 1fr;
+  }
+  .property-field {
+    padding: 17px;
+  }
+  .properties-toolbar {
+    flex-wrap: wrap;
+  }
+  .properties-toolbar .storage-search {
+    min-width: 0;
+    flex: 1;
+  }
+  .properties-page .page-heading {
+    gap: 18px;
+    flex-wrap: wrap;
+  }
+}

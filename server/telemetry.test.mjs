@@ -251,6 +251,39 @@ test("Windows collector uses hidden PowerShell CIM with numeric counters and no 
   telemetry.close();
 });
 
+test("Windows CIM query deadline follows the configured overall timeout while reserving startup time", async () => {
+  for (const [timeoutMs, seconds] of [
+    [undefined, 3],
+    [10000, 8],
+    [1000, 1],
+  ]) {
+    const telemetry = createProcessTelemetry({
+      platform: "win32",
+      timeoutMs,
+      spawnProcess: (_executable, args) => {
+        const query = Buffer.from(args.at(-1), "base64").toString("utf16le");
+        assert.equal(
+          Number(query.match(/-OperationTimeoutSec (\d+)/)?.[1]),
+          seconds,
+        );
+        const child = new EventEmitter();
+        child.stdout = new PassThrough();
+        child.stderr = new PassThrough();
+        setImmediate(() => {
+          child.stdout.write(JSON.stringify([row(10, 1, 10, 100)]));
+          child.emit("close", 0);
+        });
+        return child;
+      },
+    });
+    try {
+      assert.equal((await telemetry.sample(10)).available, true);
+    } finally {
+      telemetry.close();
+    }
+  }
+});
+
 test(
   "Windows samples a real benign child tree and releases the collector cleanly",
   { skip: process.platform !== "win32" },

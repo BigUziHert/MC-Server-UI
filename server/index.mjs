@@ -19,6 +19,7 @@ import {
 } from "./connection.mjs";
 import { decodeIcon, readServerIcon, writeServerIcon } from "./server-icon.mjs";
 import { createRecycleBin } from "./recycle-bin.mjs";
+import { createMinecraft } from "./minecraft.mjs";
 import { createLauncherStop } from "./launcher-stop.mjs";
 import {
   createPlayerHistory,
@@ -35,6 +36,7 @@ import {
   inspectServerDirectory,
   validateStartupFiles,
   buildScriptInvocation,
+  parseProperties,
 } from "./import.mjs";
 
 const projectDir = path.resolve(
@@ -466,6 +468,7 @@ export async function createPanel(options = {}) {
       env.MC_SOFTWARE ??
       (mode === "demo" ? "Paper" : "Java"),
     maxPlayers: Number(options.maxPlayers ?? env.MC_MAX_PLAYERS ?? 20),
+    minecraftVersion: options.minecraftVersion ?? null,
     motd: options.motd ?? "Welcome to the Overworld",
   };
   if (
@@ -878,6 +881,7 @@ export async function createPanel(options = {}) {
       memoryLimit = configuration.memoryLimitMB;
       configuredJar = configuration.jar;
       if (oldMode !== mode || changedJar) {
+        configuration.minecraftVersion = null;
         configuration.version = mode === "demo" ? "1.21.4" : "Configured JAR";
         configuration.software = mode === "demo" ? "Paper" : "Java";
       }
@@ -1158,6 +1162,114 @@ export async function createPanel(options = {}) {
   let backupBusy = false;
   let activeMutations = 0;
   let recycleBusy = false;
+  let minecraftBusy = false;
+  function withMinecraftMutation(work, { requireStopped = true } = {}) {
+    if (closed) throw error(503, "The panel is shutting down.");
+    if (minecraftBusy || configBusy || backupBusy || activeMutations)
+      throw error(409, "Wait for the current server operation to finish.");
+    if (requireStopped && status !== "offline")
+      throw error(
+        409,
+        "Stop the server before installing Minecraft software or content.",
+      );
+    minecraftBusy = true;
+    activeMutations++;
+    return trackTask(work).finally(() => {
+      minecraftBusy = false;
+      activeMutations--;
+    });
+  }
+  async function applyMinecraftConfiguration(patch) {
+    const { software, version, minecraftVersion, maxPlayers, ...settings } =
+      patch;
+    const next = {
+      ...validateServerConfiguration(settings, configuration, true),
+      ...(software !== undefined ? { software } : {}),
+      ...(version !== undefined ? { version } : {}),
+      ...(minecraftVersion !== undefined ? { minecraftVersion } : {}),
+      ...(maxPlayers !== undefined ? { maxPlayers } : {}),
+    };
+    if (next.launchType === "jar") await safePath(serverDir, next.jar);
+    else await validateStartupFiles(serverDir, next);
+    await options.persistMinecraftConfiguration?.(next);
+    configuration = next;
+    mode = next.mode;
+    memoryLimit = next.memoryLimitMB;
+    configuredJar = next.jar;
+    await refreshStartupMetadata(true);
+  }
+  const minecraft = await createMinecraft({
+    serverDir,
+    dataDir,
+    safePath,
+    withMinecraftMutation,
+    versionsService: options.versionsService,
+    versionsOptions: options.versionsOptions,
+    fetch: options.catalogFetch,
+    extraProviders: options.extraProviders,
+    getConfiguration: () => ({ ...configuration, status }),
+    getServer: async () => {
+      await refreshStartupMetadata();
+      const software = startupMetadata.software,
+        version = startupMetadata.version;
+      const loader =
+        /^(neoforge|forge|fabric|quilt|paper|purpur|spigot|folia|velocity|waterfall|bukkit)$/i.test(
+          software ?? "",
+        )
+          ? software.toLowerCase()
+          : null;
+      let gameVersion = configuration.minecraftVersion;
+      if (loader === "neoforge") {
+        const parts = /^(\d+)\.(\d+)\.(\d+)/.exec(version ?? "");
+        if (parts)
+          gameVersion =
+            Number(parts[1]) < 26
+              ? `1.${parts[1]}${parts[2] === "0" ? "" : "." + parts[2]}`
+              : `${parts[1]}.${parts[2]}${parts[3] === "0" ? "" : "." + parts[3]}`;
+      } else if (loader === "forge")
+        gameVersion =
+          /^(1\.\d+(?:\.\d+)?)-/.exec(version ?? "")?.[1] ?? gameVersion;
+      else if (
+        ["Paper", "Purpur", "Vanilla", "Spigot", "Folia"].includes(software)
+      )
+        gameVersion = /^\d+\.\d+(?:\.\d+)?$/.test(version ?? "")
+          ? version
+          : gameVersion;
+      let world = "world";
+      try {
+        world =
+          parseProperties(
+            await fs.readFile(
+              await safePath(serverDir, "server.properties"),
+              "utf8",
+            ),
+          ).get("level-name") || world;
+      } catch (cause) {
+        if (cause.code !== "ENOENT") throw cause;
+      }
+      const loaderVersion =
+        loader === "forge"
+          ? version?.replace(/^\d+\.\d+(?:\.\d+)?-/, "")
+          : ["neoforge", "fabric", "quilt"].includes(loader)
+            ? version
+            : null;
+      return {
+        status,
+        mode,
+        software,
+        version,
+        gameVersion,
+        loader,
+        loaderVersion,
+        world,
+        launchScript: configuration.launchScript,
+      };
+    },
+    applyConfiguration: applyMinecraftConfiguration,
+    recycle: (relative) => recycleBin.recycle(relative),
+    restore: (id) => recycleBin.restore(id),
+    audit,
+  });
   const writeServer = (child, command) =>
     new Promise((resolve, reject) => {
       if (child !== processHandle || !child.stdin.writable)
@@ -1406,6 +1518,13 @@ export async function createPanel(options = {}) {
         req.path === "/api/server/icon" ||
         req.path === "/api/console/command");
     if (protectedMutation) {
+      if (minecraftBusy)
+        return next(
+          error(
+            409,
+            "Wait for the Minecraft installation or configuration change to finish.",
+          ),
+        );
       if (configBusy)
         return next(
           error(409, "Wait for the server settings to finish saving."),
@@ -2363,6 +2482,7 @@ export async function createPanel(options = {}) {
     }),
   );
   app.get("/api/audit", (_req, res) => res.json({ entries: state.audit }));
+  minecraft.mount(app);
   app.use("/api", (_req, _res, next) =>
     next(error(404, "API endpoint not found.")),
   );
@@ -2423,6 +2543,7 @@ export async function createPanel(options = {}) {
         clearTimeout(demoTimer);
         clearTimeout(stopTimer);
         closePromise = (async () => {
+          await minecraft.close();
           // An HTTP client can leave before its disk writes or backup finish.
           // Wait for the handler itself, including save-on and its audit write.
           while (inFlightTasks.size)
@@ -2674,6 +2795,23 @@ export async function createFleet(options = {}) {
       telemetry,
       publicAddress,
       startupMetadataTtlMs: options.startupMetadataTtlMs,
+      versionsService: options.versionsService,
+      versionsOptions: options.versionsOptions,
+      catalogFetch: options.catalogFetch,
+      extraProviders: options.extraProviders,
+      persistMinecraftConfiguration: (next) =>
+        serialize(async () => {
+          checkPort(next.port, entry.id);
+          const { status: _status, ...saved } = next;
+          await persist({
+            ...registry,
+            servers: registry.servers.map((item) =>
+              item.id === entry.id
+                ? { ...item, ...saved, address: `localhost:${saved.port}` }
+                : item,
+            ),
+          });
+        }),
     });
     runtimes.set(entry.id, runtime);
     return runtime;
@@ -3100,6 +3238,7 @@ export async function createFleet(options = {}) {
         (config.launchType === "jar" &&
           (entry.launchType !== "jar" || config.jar !== entry.jar))
       ) {
+        next.minecraftVersion = null;
         next.version = config.mode === "demo" ? "1.21.4" : "Configured JAR";
         next.software = config.mode === "demo" ? "Paper" : "Java";
       }

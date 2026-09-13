@@ -14,6 +14,14 @@ files:
   - server/telemetry.mjs
   - server/recycle-bin.mjs
   - server/player-history.mjs
+  - server/minecraft.mjs
+  - server/properties.mjs
+  - server/versions.mjs
+  - server/launchpad.mjs
+  - server/launchpad-network.mjs
+  - server/launchpad-archives.mjs
+  - server/launchpad-providers.mjs
+  - server/launchpad-extra.mjs
   - shared/subuser-permissions.json
   - desktop/main.mjs
   - desktop/runtime.mjs

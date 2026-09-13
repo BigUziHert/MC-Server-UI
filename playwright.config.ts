@@ -31,6 +31,7 @@ export default defineConfig({
     "players-history.spec.ts",
     "recycle-bin.spec.ts",
     "server-removal.spec.ts",
+    "minecraft.spec.ts",
   ],
   fullyParallel: false,
   workers: 1,

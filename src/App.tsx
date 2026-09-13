@@ -24,6 +24,9 @@ import {
   MessageSquare,
   MemoryStick,
   Pencil,
+  Puzzle,
+  Tags,
+  SlidersHorizontal,
   Play,
   Plus,
   RotateCw,
@@ -42,6 +45,9 @@ import Subusers from "./pages/Subusers";
 import Databases from "./pages/Databases";
 import AuditLogs from "./pages/AuditLogs";
 import Players from "./pages/Players";
+import Versions from "./pages/Versions";
+import Launchpad from "./pages/Launchpad";
+import Properties from "./pages/Properties";
 import PlayerHead from "./PlayerHead";
 import DesktopUpdates from "./DesktopUpdates";
 import ServerIcon from "./ServerIcon";
@@ -55,6 +61,9 @@ type Page =
   | "console"
   | "files"
   | "players"
+  | "versions"
+  | "launchpad"
+  | "properties"
   | "subusers"
   | "databases"
   | "backups"
@@ -97,6 +106,9 @@ const navigation = [
   { id: "console", label: "Console", icon: Terminal, group: "SERVER" },
   { id: "files", label: "File Manager", icon: FolderOpen },
   { id: "players", label: "Players", icon: ShieldCheck },
+  { id: "versions", label: "Versions", icon: Tags, group: "MINECRAFT" },
+  { id: "launchpad", label: "Launchpad", icon: Puzzle },
+  { id: "properties", label: "Properties", icon: SlidersHorizontal },
   { id: "subusers", label: "Subusers", icon: Users, group: "MANAGEMENT" },
   { id: "databases", label: "Databases", icon: Database },
   { id: "backups", label: "Backups", icon: Cloud },
@@ -699,6 +711,9 @@ function ServerWorkspace({
           )}
           {page === "files" && <FileManager notify={notify} />}
           {page === "players" && <Players notify={notify} />}
+          {page === "versions" && <Versions notify={notify} />}
+          {page === "launchpad" && <Launchpad notify={notify} />}
+          {page === "properties" && <Properties notify={notify} />}
           {page === "backups" && <Backups notify={notify} />}
           {page === "subusers" && <Subusers notify={notify} />}
           {page === "databases" && <Databases notify={notify} />}

@@ -7,10 +7,13 @@ import { performance } from "node:perf_hooks";
 // core, and a multithreaded server can exceed 100%. Memory is summed resident
 // memory (working sets on Windows), not Java heap usage or its configured limit.
 // Shared resident pages may occur in more than one process's working set.
-const windowsQuery = String.raw`
+// Leave the same two-second allowance for PowerShell startup and serialization
+// as the default 5s collector / 3s CIM query. Longer caller budgets must also
+// extend the CIM deadline; the outer abort still enforces the overall timeout.
+const windowsQuery = (timeoutMs) => String.raw`
 $ErrorActionPreference = 'Stop'
 [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false)
-$rows = @(Get-CimInstance -ClassName Win32_Process -Property ProcessId,ParentProcessId,CreationDate,UserModeTime,KernelModeTime,WorkingSetSize -OperationTimeoutSec 3 | Where-Object { $_.ProcessId -gt 0 -and $null -ne $_.CreationDate -and $null -ne $_.UserModeTime -and $null -ne $_.KernelModeTime -and $null -ne $_.WorkingSetSize } | ForEach-Object {
+$rows = @(Get-CimInstance -ClassName Win32_Process -Property ProcessId,ParentProcessId,CreationDate,UserModeTime,KernelModeTime,WorkingSetSize -OperationTimeoutSec ${Math.max(1, Math.floor((timeoutMs - 2000) / 1000))} | Where-Object { $_.ProcessId -gt 0 -and $null -ne $_.CreationDate -and $null -ne $_.UserModeTime -and $null -ne $_.KernelModeTime -and $null -ne $_.WorkingSetSize } | ForEach-Object {
   [pscustomobject]@{
     pid = [int]$_.ProcessId
     ppid = [int]$_.ParentProcessId
@@ -124,7 +127,12 @@ export function parsePsSnapshot(text) {
     });
 }
 
-function createSnapshotReader({ platform, spawnProcess, fileSystem = fs }) {
+function createSnapshotReader({
+  platform,
+  timeoutMs,
+  spawnProcess,
+  fileSystem = fs,
+}) {
   let linuxUnits;
   return async ({ signal }) => {
     if (platform === "win32") {
@@ -143,7 +151,7 @@ function createSnapshotReader({ platform, spawnProcess, fileSystem = fs }) {
             "-NoProfile",
             "-NonInteractive",
             "-EncodedCommand",
-            Buffer.from(windowsQuery, "utf16le").toString("base64"),
+            Buffer.from(windowsQuery(timeoutMs), "utf16le").toString("base64"),
           ],
           { signal, spawnProcess },
         ),
@@ -276,7 +284,7 @@ export function createProcessTelemetry({
 } = {}) {
   const read =
     readSnapshot ??
-    createSnapshotReader({ platform, spawnProcess, fileSystem });
+    createSnapshotReader({ platform, timeoutMs, spawnProcess, fileSystem });
   const states = new Map();
   let epoch = 0;
   let sequence = 0;
