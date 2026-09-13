@@ -501,7 +501,6 @@ export async function createPanel(options = {}) {
     dataDir,
     serverDir,
     safePath,
-    allowCrossVolume: () => mode !== "live" || status === "offline",
   });
   let state = {
     users: [],

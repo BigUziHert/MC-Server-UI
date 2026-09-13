@@ -784,8 +784,8 @@ export default function FileManager({ notify }: PageProps) {
       <div className="storage-hint">
         <HardDrive size={16} />
         <p>
-          Changes are saved directly to your server. Stop the server before
-          changing world files.
+          File changes apply immediately. Deleted files can be restored from
+          Recycle Bin while the server is running.
         </p>
       </div>
 

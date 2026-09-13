@@ -4,6 +4,8 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
+import { EventEmitter } from "node:events";
+import { PassThrough, Writable } from "node:stream";
 import * as tar from "tar";
 import { createRecycleBin } from "./recycle-bin.mjs";
 import { createPanel, createFleet, safePath } from "./index.mjs";
@@ -299,17 +301,174 @@ test("cross-volume recycle verifies copies before source removal and restores ex
   assert.ok(Math.abs(restored.mtimeMs - stat.mtimeMs) < 2);
 });
 
-test("a live cross-drive recycle is refused while preserving the original", async (t) => {
+test("cross-drive recycle and restore preserve unused configuration and unrelated server files", async (t) => {
   const f = await fixture(t);
-  const source = path.join(f.serverDir, "file.txt");
-  await fs.writeFile(source, "running server file");
+  await fs.mkdir(path.join(f.serverDir, "config"));
+  const source = path.join(f.serverDir, "config", "unused-mod.toml");
+  const unrelated = path.join(f.serverDir, "config", "active-mod.toml");
+  const contents = Buffer.from("# Unused mod configuration\nenabled = false\n");
+  await fs.writeFile(source, contents);
+  await fs.writeFile(unrelated, "# Active configuration stays untouched\n");
   const bin = await f.boot({
     fileSystem: crossVolume(source),
-    allowCrossVolume: () => false,
   });
-  await assert.rejects(bin.recycle("file.txt"), /Stop this server/);
-  assert.equal(await fs.readFile(source, "utf8"), "running server file");
+  const item = await bin.recycle("config/unused-mod.toml");
+  assert.equal(item.status, "ready");
+  await missing(source);
+  assert.deepEqual(
+    await fs.readFile(path.join(bin.directory, item.id, "content")),
+    contents,
+  );
+  assert.equal(
+    await fs.readFile(unrelated, "utf8"),
+    "# Active configuration stays untouched\n",
+  );
+  await bin.restore(item.id);
+  assert.deepEqual(await fs.readFile(source), contents);
+  assert.equal(
+    await fs.readFile(unrelated, "utf8"),
+    "# Active configuration stays untouched\n",
+  );
   assert.deepEqual(await bin.list(), []);
+});
+
+test("a running live server recycles and restores unused configuration across drives without stopping or changing unrelated files", async (t) => {
+  const commands = [];
+  let starts = 0;
+  let exits = 0;
+  const f = await apiFixture(t, {
+    mode: "live",
+    existingServerDir: true,
+    jar: "server.jar",
+    spawnServer: () => {
+      starts++;
+      const child = new EventEmitter();
+      child.stdout = new PassThrough();
+      child.stderr = new PassThrough();
+      const finish = () => {
+        exits++;
+        child.emit("close", 0);
+      };
+      child.kill = () => {
+        setImmediate(finish);
+        return true;
+      };
+      child.stdin = new Writable({
+        write(chunk, _encoding, done) {
+          const command = chunk.toString();
+          commands.push(command);
+          if (command === "stop\n") setImmediate(finish);
+          done();
+        },
+      });
+      setImmediate(() =>
+        child.stdout.write(
+          '[Server thread/INFO]: Done (0.5s)! For help, type "help"\n',
+        ),
+      );
+      return child;
+    },
+  });
+  try {
+    const configDir = path.join(f.serverDir, "config");
+    await fs.mkdir(configDir);
+    const source = path.join(configDir, "unused-mod.toml");
+    const unrelated = path.join(configDir, "active-mod.toml");
+    const original = "# Safe unused configuration\nenabled = false\n";
+    await fs.writeFile(source, original);
+    await fs.writeFile(unrelated, "preserved unrelated configuration\n");
+    await fs.writeFile(
+      path.join(f.serverDir, "server.jar"),
+      "inert fixture, never executed",
+    );
+    await fs.writeFile(path.join(f.serverDir, "eula.txt"), "eula=true\n");
+    const panel = await f.boot();
+    assert.equal(
+      (
+        await panel.request(
+          "/api/server/power",
+          json("POST", { action: "start" }),
+        )
+      ).status,
+      200,
+    );
+    assert.equal((await panel.request("/api/server")).body.status, "running");
+    let crossedDrive = 0;
+    let recycleCopies = 0;
+    let restoreCopies = 0;
+    const rename = fs.rename;
+    const copyFile = fs.copyFile;
+    t.mock.method(fs, "rename", async (from, to) => {
+      if (from === source && path.basename(to) === "content") {
+        crossedDrive++;
+        throw exdev();
+      }
+      return rename(from, to);
+    });
+    t.mock.method(fs, "copyFile", async (from, to, flags) => {
+      if (from === source || to === source) {
+        assert.equal(
+          (await panel.request("/api/server")).body.status,
+          "running",
+        );
+        assert.equal(
+          flags,
+          1,
+          "exclusive copies cannot overwrite existing files",
+        );
+        if (from === source) recycleCopies++;
+        else restoreCopies++;
+      }
+      return copyFile(from, to, flags);
+    });
+    const recycled = await panel.request(
+      "/api/files?path=config%2Funused-mod.toml",
+      { method: "DELETE" },
+    );
+    assert.equal(recycled.status, 200, JSON.stringify(recycled));
+    assert.equal(recycled.body.recycled.status, "ready");
+    await missing(source);
+    const id = recycled.body.recycled.id;
+    assert.equal(
+      await fs.readFile(
+        path.join(f.dataDir, "recycle-bin", id, "content"),
+        "utf8",
+      ),
+      original,
+    );
+    assert.equal((await panel.request("/api/server")).body.status, "running");
+    assert.equal(
+      await fs.readFile(unrelated, "utf8"),
+      "preserved unrelated configuration\n",
+    );
+    const restored = await panel.request(
+      `/api/files/recycle-bin/${id}/restore`,
+      json("POST"),
+    );
+    assert.equal(restored.status, 200, JSON.stringify(restored));
+    assert.equal(await fs.readFile(source, "utf8"), original);
+    assert.equal(
+      await fs.readFile(unrelated, "utf8"),
+      "preserved unrelated configuration\n",
+    );
+    assert.deepEqual(
+      (await panel.request("/api/files/recycle-bin")).body.items,
+      [],
+    );
+    assert.equal((await panel.request("/api/server")).body.status, "running");
+    assert.equal(crossedDrive, 1);
+    assert.equal(recycleCopies, 1);
+    assert.equal(restoreCopies, 1);
+    assert.equal(starts, 1);
+    assert.equal(exits, 0);
+    assert.deepEqual(
+      commands,
+      [],
+      "file recovery must not stop, restart, or send commands to Java",
+    );
+  } finally {
+    await f.close();
+  }
 });
 
 test("read-only files keep their original mode after cross-volume recovery", async (t) => {
@@ -325,20 +484,22 @@ test("read-only files keep their original mode after cross-volume recovery", asy
   assert.equal((await fs.stat(source)).mode & 0o777, originalMode);
 });
 
-test("failed source removal retains both source and a usable verified recovery copy", async (t) => {
+test("a locked source file retains both source and a usable verified recovery copy", async (t) => {
   const f = await fixture(t);
   const source = path.join(f.serverDir, "proof");
   await fs.writeFile(source, "still recoverable");
   const bin = await f.boot({
     fileSystem: crossVolume(source, {
-      rm: async (target, options) => {
+      unlink: async (target) => {
         if (path.resolve(target) === path.resolve(source))
-          throw new Error("injected source removal failure");
-        return fs.rm(target, options);
+          throw Object.assign(new Error("injected locked source file"), {
+            code: "EPERM",
+          });
+        return fs.unlink(target);
       },
     }),
   });
-  await assert.rejects(bin.recycle("proof"), /removal failure/);
+  await assert.rejects(bin.recycle("proof"), { status: 409, code: "EPERM" });
   assert.equal(await fs.readFile(source, "utf8"), "still recoverable");
   const [item] = await (await f.boot()).list();
   assert.equal(item.status, "ready");
@@ -347,6 +508,109 @@ test("failed source removal retains both source and a usable verified recovery c
     "still recoverable",
   );
 });
+
+test("a new file arriving during source removal is neither deleted nor claimed as archived", async (t) => {
+  const f = await fixture(t);
+  const source = path.join(f.serverDir, "world");
+  await fs.mkdir(source);
+  const known = path.join(source, "a");
+  const late = path.join(source, "late.txt");
+  await fs.writeFile(known, "verified original snapshot");
+  let inserted = false;
+  const bin = await f.boot({
+    fileSystem: crossVolume(source, {
+      unlink: async (target) => {
+        if (target === known && !inserted) {
+          // The verified snapshot is already complete. Simulate an external
+          // server write at the final unlink boundary, after all copy checks.
+          inserted = true;
+          await fs.writeFile(
+            late,
+            "new live-server data, absent from the archive",
+          );
+        }
+        return fs.unlink(target);
+      },
+    }),
+  });
+  await assert.rejects(
+    bin.recycle("world"),
+    (cause) =>
+      cause.status === 409 &&
+      ["ENOTEMPTY", "EEXIST"].includes(cause.code) &&
+      /no longer empty/i.test(cause.message),
+  );
+  assert.equal(inserted, true);
+  assert.equal(
+    await fs.readFile(late, "utf8"),
+    "new live-server data, absent from the archive",
+  );
+  const [item] = await bin.list();
+  assert.equal(item.status, "ready");
+  const payload = path.join(bin.directory, item.id, "content");
+  assert.equal(
+    await fs.readFile(path.join(payload, "a"), "utf8"),
+    "verified original snapshot",
+  );
+  await missing(path.join(payload, "late.txt"));
+  await assert.rejects(bin.restore(item.id), /already exists/);
+});
+
+for (const change of [
+  "same-size-and-mtime edit",
+  "file identity replacement",
+]) {
+  test(`a ${change} after global verification is retained by the per-file removal check`, async (t) => {
+    const f = await fixture(t);
+    const source = path.join(f.serverDir, "world");
+    await fs.mkdir(source);
+    const first = path.join(source, "a");
+    const second = path.join(source, "b");
+    const parked = path.join(f.root, "parked-original-a");
+    await fs.writeFile(first, "first");
+    await fs.writeFile(second, "second");
+    const original = await fs.stat(first);
+    let changed = false;
+    const bin = await f.boot({
+      fileSystem: crossVolume(source, {
+        unlink: async (target) => {
+          if (target === second && !changed) {
+            // Reverse traversal removes b first. All global checks have passed;
+            // this change must be caught by the subsequent per-file check of a.
+            changed = true;
+            if (change === "file identity replacement")
+              await fs.rename(first, parked);
+            await fs.writeFile(
+              first,
+              change === "same-size-and-mtime edit" ? "other" : "first",
+            );
+            await fs.chmod(first, original.mode & 0o777);
+            await fs.utimes(first, original.atime, original.mtime);
+          }
+          return fs.unlink(target);
+        },
+      }),
+    });
+    await assert.rejects(
+      bin.recycle("world"),
+      (cause) =>
+        cause.status === 409 &&
+        /source changed during removal/i.test(cause.message),
+    );
+    assert.equal(changed, true);
+    assert.equal(
+      await fs.readFile(first, "utf8"),
+      change === "same-size-and-mtime edit" ? "other" : "first",
+    );
+    if (change === "file identity replacement")
+      assert.equal(await fs.readFile(parked, "utf8"), "first");
+    const [item] = await bin.list();
+    assert.equal(item.status, "ready");
+    const payload = path.join(bin.directory, item.id, "content");
+    assert.equal(await fs.readFile(path.join(payload, "a"), "utf8"), "first");
+    assert.equal(await fs.readFile(path.join(payload, "b"), "utf8"), "second");
+  });
+}
 
 test("interrupted cross-drive copying preserves originals and marks partial recovery as incomplete", async (t) => {
   const f = await fixture(t);

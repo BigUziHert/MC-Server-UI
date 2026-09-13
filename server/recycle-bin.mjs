@@ -25,7 +25,6 @@ export async function createRecycleBin({
   serverDir,
   safePath,
   fileSystem = fs,
-  allowCrossVolume = () => true,
   now = () => new Date(),
   newId = randomUUID,
 } = {}) {
@@ -145,6 +144,8 @@ export async function createRecycleBin({
       size: type === "file" ? stat.size : 0,
       mtimeMs: stat.mtimeMs,
       mode: stat.mode & 0o777,
+      ino: stat.ino,
+      dev: stat.dev,
     });
     if (type === "directory") {
       const names = (await io.readdir(target)).sort();
@@ -247,6 +248,74 @@ export async function createRecycleBin({
         409,
         "The source changed before removal. The original and recovery data have been retained.",
       );
+  };
+  const removeVerifiedSource = async (originalPath, snapshot) => {
+    const changed = (relative) =>
+      error(
+        409,
+        `The source changed during removal at “${relative}”. Remaining original files and the recovery copy have been retained.`,
+      );
+    const removalFailure = (cause, relative) => {
+      if (["EPERM", "EACCES", "EBUSY"].includes(cause.code))
+        return Object.assign(
+          error(
+            409,
+            `Could not remove “${relative}”. It may be in use or its permissions may prevent deletion. Release this file and retry; remaining original files and the recovery copy have been retained.`,
+          ),
+          { code: cause.code },
+        );
+      if (cause.code === "ENOTEMPTY" || cause.code === "EEXIST")
+        return Object.assign(
+          error(
+            409,
+            `“${relative}” is no longer empty. Newly created files and the recovery copy have been retained.`,
+          ),
+          { code: cause.code },
+        );
+      return cause;
+    };
+    const sameIdentity = (stat, row) =>
+      !stat.isSymbolicLink() &&
+      stat.ino === row.ino &&
+      stat.dev === row.dev &&
+      (row.type === "file" ? stat.isFile() : stat.isDirectory());
+    const sameFile = (stat, row) =>
+      sameIdentity(stat, row) &&
+      stat.size === row.size &&
+      stat.mtimeMs === row.mtimeMs &&
+      (stat.mode & 0o777) === row.mode;
+    // walk() records parents before children. Reverse that order so rmdir only
+    // sees directories after known descendants have been removed. Never recurse
+    // here: a live server may have created new, unarchived files since verification.
+    for (const row of [...snapshot.rows].reverse()) {
+      const relative = [originalPath, row.path].filter(Boolean).join("/");
+      const target = await safePath(serverDir, relative);
+      const stat = await io.lstat(target);
+      if (!sameIdentity(stat, row)) throw changed(relative);
+      if (row.type === "file") {
+        if (
+          !sameFile(stat, row) ||
+          (await hashFile(target)) !== snapshot.hashes.get(row.path)
+        )
+          throw changed(relative);
+        const checked = await safePath(serverDir, relative);
+        if (!sameFile(await io.lstat(checked), row)) throw changed(relative);
+        try {
+          await io.unlink(checked);
+        } catch (cause) {
+          throw removalFailure(cause, relative);
+        }
+      } else {
+        const checked = await safePath(serverDir, relative);
+        if (!sameIdentity(await io.lstat(checked), row))
+          throw changed(relative);
+        try {
+          await io.rmdir(checked);
+        } catch (cause) {
+          throw removalFailure(cause, relative);
+        }
+      }
+    }
   };
   const view = async (record) => {
     const { metadata, payload } = record;
@@ -351,11 +420,6 @@ export async function createRecycleBin({
             await io.rename(source, payload);
           } catch (cause) {
             if (cause.code !== "EXDEV") throw cause;
-            if (!allowCrossVolume())
-              throw error(
-                409,
-                "Stop this server before moving files to the Recycle Bin across drives.",
-              );
             metadata.phase = "copying";
             await persist(entryDir, metadata);
             const snapshot = await copyVerified(source, async (relative) =>
@@ -368,9 +432,7 @@ export async function createRecycleBin({
             await persist(entryDir, metadata);
             await safePath(serverDir, originalPath);
             await verifySource(source, snapshot);
-            await io.rm(await safePath(serverDir, originalPath), {
-              recursive: true,
-            });
+            await removeVerifiedSource(originalPath, snapshot);
           }
           metadata.phase = "ready";
           await persist(entryDir, metadata);
