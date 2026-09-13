@@ -17,10 +17,12 @@ import {
   FolderPlus,
   HardDrive,
   LoaderCircle,
+  LockKeyhole,
   Pencil,
   RefreshCw,
   Search,
   Trash2,
+  Undo2,
   Upload,
   X,
 } from "lucide-react";
@@ -32,6 +34,7 @@ import {
 } from "../api";
 import "./storage.css";
 import "./file-selection.css";
+import "./recycle-bin.css";
 
 type Entry = {
   name: string;
@@ -41,6 +44,16 @@ type Entry = {
   modified: string;
 };
 type FileResult = { path: string; entries: Entry[] };
+type RecycledItem = {
+  id: string;
+  name: string;
+  originalPath: string;
+  type: "file" | "directory";
+  size: number;
+  deletedAt: string;
+  status: "ready" | "incomplete";
+  message?: string;
+};
 type FileDialog =
   | { type: "create"; kind: "file" | "directory" }
   | { type: "edit"; entry: Entry }
@@ -72,6 +85,7 @@ function EntryIcon({ entry }: { entry: Entry }) {
 export default function FileManager({ notify }: PageProps) {
   const { api, post, downloadUrl } = useServerApi();
   const [path, setPath] = useState("");
+  const [showingBin, setShowingBin] = useState(false);
   const [entries, setEntries] = useState<Entry[]>([]);
   const [query, setQuery] = useState("");
   const [loading, setLoading] = useState(true);
@@ -122,14 +136,14 @@ export default function FileManager({ notify }: PageProps) {
   }, [path, api]);
 
   useEffect(() => {
-    void load();
+    if (!showingBin) void load();
     return () => {
       requestId.current++;
     };
-  }, [load]);
+  }, [load, showingBin]);
   useEffect(() => {
     setSelected(new Set());
-  }, [path, api]);
+  }, [path, api, showingBin]);
   useEffect(() => {
     if (!dialog) return;
     const previous = document.activeElement as HTMLElement | null;
@@ -310,7 +324,7 @@ export default function FileManager({ notify }: PageProps) {
         setEntries((previous) =>
           previous.filter((entry) => !deleted.has(entry.path)),
         );
-        const summary = `${deleted.size} ${deleted.size === 1 ? "item" : "items"} deleted.${failures.length ? ` ${failures.length} ${failures.length === 1 ? "item could not be deleted and remains" : "items could not be deleted and remain"} selected.` : ""}`;
+        const summary = `${deleted.size} ${deleted.size === 1 ? "item" : "items"} moved to Recycle Bin.${failures.length ? ` ${failures.length} ${failures.length === 1 ? "item could not be moved and remains" : "items could not be moved and remain"} selected.` : ""}`;
         notify(summary, failures.length > 0);
         if (failures.length) {
           setDialog({
@@ -340,7 +354,7 @@ export default function FileManager({ notify }: PageProps) {
         await api(`/files?path=${encodeURIComponent(dialog.entry.path)}`, {
           method: "DELETE",
         });
-        notify(`${dialog.entry.name} deleted.`);
+        notify(`${dialog.entry.name} moved to Recycle Bin.`);
       }
       closeDialog();
       await load();
@@ -383,6 +397,16 @@ export default function FileManager({ notify }: PageProps) {
     (sum, entry) => sum + (entry.type === "file" ? entry.size : 0),
     0,
   );
+  if (showingBin)
+    return (
+      <RecycleBin
+        notify={notify}
+        onBack={() => {
+          setQuery("");
+          setShowingBin(false);
+        }}
+      />
+    );
   return (
     <div className="storage-page">
       <div className="page-heading">
@@ -513,17 +537,27 @@ export default function FileManager({ notify }: PageProps) {
           </label>
           <span className="muted files-count">{entries.length} items</span>
         </div>
-        {selectedEntries.length > 0 && (
+        <div className="file-selection-slot">
+          {!selectedEntries.length && (
+            <p className="file-selection-placeholder">
+              Select files or folders to move them to Recycle Bin.
+            </p>
+          )}
           <div
             className="file-selection-bar"
             role="region"
             aria-label="Selected files and folders"
+            style={{
+              visibility: selectedEntries.length ? "visible" : "hidden",
+            }}
           >
             <div className="file-selection-summary" aria-live="polite">
               <strong>{selectedEntries.length} selected</strong>
-              {hiddenSelectedCount > 0 && (
-                <span>{hiddenSelectedCount} hidden by the filter</span>
-              )}
+              <span>
+                {hiddenSelectedCount > 0
+                  ? `${hiddenSelectedCount} hidden by the filter`
+                  : "\u00a0"}
+              </span>
             </div>
             <div className="file-selection-actions">
               <button
@@ -542,7 +576,7 @@ export default function FileManager({ notify }: PageProps) {
               </button>
             </div>
           </div>
-        )}
+        </div>
         {error ? (
           <div className="empty-state">
             <strong>Unable to load files</strong>
@@ -592,6 +626,33 @@ export default function FileManager({ notify }: PageProps) {
                 </tr>
               </thead>
               <tbody>
+                {!path && (
+                  <tr
+                    className="recycle-bin-entry"
+                    aria-label="Protected Recycle Bin"
+                  >
+                    <td colSpan={4}>
+                      <div className="recycle-bin-entry-content">
+                        <LockKeyhole size={16} aria-label="Protected folder" />
+                        <button
+                          className="file-name"
+                          aria-label="Open Recycle Bin"
+                          onClick={() => {
+                            setSelected(new Set());
+                            setShowingBin(true);
+                          }}
+                        >
+                          <Trash2 size={19} />
+                          <span>Recycle Bin</span>
+                          <ChevronRight size={13} />
+                        </button>
+                        <span className="recycle-bin-entry-note">
+                          Protected · Restore deleted items
+                        </span>
+                      </div>
+                    </td>
+                  </tr>
+                )}
                 {path && !query && (
                   <tr className="parent-directory">
                     <td colSpan={4}>
@@ -682,7 +743,7 @@ export default function FileManager({ notify }: PageProps) {
                         <button
                           className="btn icon delete-action"
                           aria-label={`Delete ${entry.name}`}
-                          title="Delete"
+                          title="Move to Recycle Bin"
                           onClick={() => openDelete(entry)}
                         >
                           <Trash2 size={14} />
@@ -756,15 +817,15 @@ export default function FileManager({ notify }: PageProps) {
                       : dialog.type === "edit"
                         ? dialog.entry.name
                         : dialog.type === "delete-many"
-                          ? "Delete selected items?"
-                          : "Delete this item?"}
+                          ? "Move selected items to Recycle Bin?"
+                          : "Move this item to Recycle Bin?"}
                   </h2>
                   <p>
                     {dialog.type === "create"
                       ? `Create in /${path || "server"}`
                       : dialog.type === "edit"
                         ? `/${dialog.entry.path}`
-                        : "This action cannot be undone."}
+                        : "You can restore these items from Recycle Bin."}
                   </p>
                 </div>
                 <button
@@ -820,31 +881,32 @@ export default function FileManager({ notify }: PageProps) {
               )}
               {dialog.type === "delete" && (
                 <p className="delete-description">
-                  Delete <strong>{dialog.entry.name}</strong>
+                  Move <strong>{dialog.entry.name}</strong>
                   {dialog.entry.type === "directory"
                     ? " and everything inside it"
                     : ""}{" "}
-                  from your server?
+                  to Recycle Bin? It will be removed from your server files
+                  until restored.
                 </p>
               )}
               {dialog.type === "delete-many" && (
                 <div className="file-bulk-confirmation">
                   <p>
-                    Permanently delete these {dialog.entries.length}{" "}
-                    {dialog.entries.length === 1 ? "item" : "items"} from your
-                    server?
+                    Move these {dialog.entries.length}{" "}
+                    {dialog.entries.length === 1 ? "item" : "items"} to Recycle
+                    Bin?
                   </p>
                   {dialog.entries.some(
                     (entry) => entry.type === "directory",
                   ) && (
                     <p className="file-bulk-folder-warning">
-                      Selected folders and everything inside them will be
-                      deleted, including nested files and folders.
+                      Selected folders and everything inside them will be moved
+                      together, including nested files and folders.
                     </p>
                   )}
                   <ul
                     className="file-bulk-targets"
-                    aria-label="Items to delete"
+                    aria-label="Items to recycle"
                   >
                     {dialog.entries.map((entry) => (
                       <li key={entry.path}>
@@ -860,10 +922,7 @@ export default function FileManager({ notify }: PageProps) {
                     ))}
                   </ul>
                   {!!dialog.failures?.length && (
-                    <ul
-                      className="file-bulk-errors"
-                      aria-label="Deletion errors"
-                    >
+                    <ul className="file-bulk-errors" aria-label="Move errors">
                       {dialog.failures.map(({ entry, message }) => (
                         <li key={entry.path}>
                           <strong>{entry.name}:</strong> {message}
@@ -898,12 +957,12 @@ export default function FileManager({ notify }: PageProps) {
                   {saving && <LoaderCircle size={15} className="spin" />}
                   {dialog.type === "delete-many"
                     ? saving && deleteProgress !== null
-                      ? `Deleting ${deleteProgress} of ${dialog.entries.length}…`
+                      ? `Moving ${deleteProgress} of ${dialog.entries.length}…`
                       : dialog.failures?.length
-                        ? "Retry failed deletions"
-                        : "Delete selected permanently"
+                        ? "Retry failed moves"
+                        : "Move to Recycle Bin"
                     : dialog.type === "delete"
-                      ? "Delete permanently"
+                      ? "Move to Recycle Bin"
                       : dialog.type === "edit"
                         ? "Save changes"
                         : `Create ${dialog.kind === "directory" ? "folder" : "file"}`}
@@ -913,6 +972,240 @@ export default function FileManager({ notify }: PageProps) {
           </div>
         </div>
       )}
+    </div>
+  );
+}
+
+function RecycleBin({ notify, onBack }: PageProps & { onBack: () => void }) {
+  const { api, post } = useServerApi();
+  const [items, setItems] = useState<RecycledItem[]>([]);
+  const [query, setQuery] = useState("");
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState("");
+  const [restoring, setRestoring] = useState<string | null>(null);
+  const [restoreErrors, setRestoreErrors] = useState<Record<string, string>>(
+    {},
+  );
+  const requestId = useRef(0);
+  const restorePending = useRef(false);
+  const searchInput = useRef<HTMLInputElement>(null);
+  const load = useCallback(async () => {
+    const id = ++requestId.current;
+    setLoading(true);
+    setError("");
+    try {
+      const result = await api<{ items: RecycledItem[]; protected: true }>(
+        "/files/recycle-bin",
+      );
+      if (id === requestId.current) setItems(result.items);
+    } catch (failure) {
+      if (id === requestId.current) setError(messageOf(failure));
+    } finally {
+      if (id === requestId.current) setLoading(false);
+    }
+  }, [api]);
+  useEffect(() => {
+    void load();
+    return () => {
+      requestId.current++;
+    };
+  }, [load]);
+
+  async function restore(item: RecycledItem) {
+    if (restorePending.current || item.status !== "ready") return;
+    restorePending.current = true;
+    setRestoring(item.id);
+    setRestoreErrors((previous) => ({ ...previous, [item.id]: "" }));
+    try {
+      await post(
+        `/files/recycle-bin/${encodeURIComponent(item.id)}/restore`,
+        {},
+      );
+      setItems((previous) => previous.filter((entry) => entry.id !== item.id));
+      notify(`${item.name} restored to /${item.originalPath}.`);
+      searchInput.current?.focus();
+    } catch (failure) {
+      setRestoreErrors((previous) => ({
+        ...previous,
+        [item.id]: messageOf(failure),
+      }));
+    } finally {
+      restorePending.current = false;
+      setRestoring(null);
+    }
+  }
+
+  const visible = items.filter((item) =>
+    `${item.name} ${item.originalPath}`
+      .toLowerCase()
+      .includes(query.toLowerCase()),
+  );
+  return (
+    <div className="storage-page recycle-bin-page">
+      <div className="page-heading">
+        <div>
+          <h1>Recycle Bin</h1>
+          <p>Recover deleted files and folders for this server.</p>
+        </div>
+        <button className="btn" onClick={onBack}>
+          <Folder size={16} /> Back to files
+        </button>
+      </div>
+      <section
+        className="panel files-panel"
+        aria-label="Recycled server files"
+        onDragOver={(event) => event.preventDefault()}
+        onDrop={(event) => event.preventDefault()}
+      >
+        <div className="files-toolbar">
+          <nav className="file-breadcrumb" aria-label="File path">
+            <HardDrive size={16} />
+            <button onClick={onBack} aria-label="Server root">
+              server
+            </button>
+            <span>
+              <ChevronRight size={13} />
+              <span aria-current="location">Recycle Bin</span>
+            </span>
+          </nav>
+          <div className="recycle-bin-tools">
+            <span className="recycle-bin-protected">
+              <LockKeyhole size={13} /> Protected
+            </span>
+            <button
+              className="btn icon"
+              aria-label="Refresh Recycle Bin"
+              title="Refresh Recycle Bin"
+              disabled={loading || !!restoring}
+              onClick={() => void load()}
+            >
+              <RefreshCw size={15} className={loading ? "spin" : ""} />
+            </button>
+          </div>
+        </div>
+        <div className="recycle-bin-notice">
+          <LockKeyhole size={18} />
+          <p>
+            Recycle Bin is protected and stored outside your server files.
+            Restore returns each item to its original path, including all folder
+            contents. Existing files are never overwritten.
+          </p>
+        </div>
+        <div className="files-filter">
+          <label className="storage-search">
+            <Search size={16} />
+            <input
+              ref={searchInput}
+              aria-label="Search recycled items"
+              placeholder="Search recycled items…"
+              value={query}
+              onChange={(event) => setQuery(event.target.value)}
+            />
+            {query && (
+              <button aria-label="Clear search" onClick={() => setQuery("")}>
+                <X size={14} />
+              </button>
+            )}
+          </label>
+          <span className="muted files-count">
+            {items.length} {items.length === 1 ? "item" : "items"}
+          </span>
+        </div>
+        {error ? (
+          <div className="empty-state" role="alert">
+            <strong>Unable to load Recycle Bin</strong>
+            <p>{error}</p>
+            <button className="btn" onClick={() => void load()}>
+              Try again
+            </button>
+          </div>
+        ) : loading ? (
+          <div className="empty-state">
+            <LoaderCircle size={24} className="spin" />
+            <p>Loading recycled items…</p>
+          </div>
+        ) : !visible.length ? (
+          <div className="empty-state">
+            <Trash2 size={30} />
+            <strong>
+              {query ? "No matching recycled items" : "Recycle Bin is empty"}
+            </strong>
+            <p>
+              {query
+                ? "Try a different name or original path."
+                : "Deleted files and folders appear here so you can restore them."}
+            </p>
+          </div>
+        ) : (
+          <ul className="recycle-bin-items" aria-label="Recycled items">
+            {visible.map((item) => (
+              <li
+                key={item.id}
+                className="recycle-bin-item"
+                aria-label={`Recycled ${item.originalPath}`}
+              >
+                <div className="recycle-bin-item-icon">
+                  {item.type === "directory" ? (
+                    <Folder size={22} />
+                  ) : (
+                    <FileIcon size={22} />
+                  )}
+                </div>
+                <div className="recycle-bin-item-details">
+                  <h2>{item.name}</h2>
+                  <p className="recycle-bin-original-path">
+                    <span>Original path</span> /{item.originalPath}
+                  </p>
+                  <p className="recycle-bin-item-meta">
+                    <span>
+                      {item.type === "directory"
+                        ? "Folder · includes all contents"
+                        : "File"}
+                    </span>
+                    <span>{formatBytes(item.size)}</span>
+                    <time
+                      dateTime={item.deletedAt}
+                      title={new Date(item.deletedAt).toLocaleString()}
+                    >
+                      Deleted {relativeTime(item.deletedAt)}
+                    </time>
+                  </p>
+                  {item.status !== "ready" && (
+                    <p className="recycle-bin-incomplete">
+                      {item.message ||
+                        "This item is incomplete and cannot be restored yet. Its retained data is protected."}
+                    </p>
+                  )}
+                  {restoreErrors[item.id] && (
+                    <p className="storage-form-error" role="alert">
+                      {restoreErrors[item.id]}
+                    </p>
+                  )}
+                </div>
+                <button
+                  className="btn small"
+                  aria-label={`Restore ${item.name}`}
+                  disabled={!!restoring || item.status !== "ready"}
+                  onClick={() => void restore(item)}
+                >
+                  {restoring === item.id ? (
+                    <LoaderCircle size={15} className="spin" />
+                  ) : (
+                    <Undo2 size={15} />
+                  )}
+                  {restoring === item.id ? "Restoring…" : "Restore"}
+                </button>
+              </li>
+            ))}
+          </ul>
+        )}
+        <div className="files-footer">
+          <span>
+            <LockKeyhole size={12} /> Restore only · Editing and uploads are
+            disabled here
+          </span>
+        </div>
+      </section>
     </div>
   );
 }

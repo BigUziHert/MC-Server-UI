@@ -11,6 +11,8 @@ files:
   - server/connection.mjs
   - server/server-icon.mjs
   - server/telemetry.mjs
+  - server/recycle-bin.mjs
+  - server/player-history.mjs
   - shared/subuser-permissions.json
   - desktop/main.mjs
   - desktop/runtime.mjs

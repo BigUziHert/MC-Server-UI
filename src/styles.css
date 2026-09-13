@@ -646,9 +646,13 @@ input:disabled {
   border-color: #404356;
 }
 .stop-button {
-  background: #352323;
-  border-color: #573030;
-  color: #e1a0a0;
+  background: #dc2040;
+  border-color: #ff4d63;
+  color: #fff;
+}
+.stop-button:hover:not(:disabled) {
+  background: #e12541;
+  border-color: #ff7081;
 }
 .metrics-grid {
   display: grid;
@@ -867,11 +871,11 @@ input:disabled {
   color: #d4d8e9;
 }
 .log-warn .log-level {
-  color: #d5bb7c;
-  background: #3d3420;
+  color: #ffd000;
+  background: #3b3218;
 }
 .log-warn .log-message {
-  color: #c7b681;
+  color: #ffd000;
 }
 .log-error .log-level {
   color: #f3aaaa;
@@ -882,6 +886,9 @@ input:disabled {
 }
 .console-status {
   display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px;
   justify-content: space-between;
   padding: 9px 17px;
   border-top: 1px solid #272833;
@@ -913,6 +920,46 @@ input:disabled {
 }
 .autoscroll.active {
   color: #b1b6ce;
+}
+.console-options {
+  display: flex;
+  align-items: center;
+  gap: 18px;
+  margin-left: auto;
+}
+.message-toggle {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  padding: 0;
+  background: none;
+  color: var(--muted);
+  font-size: 9px;
+}
+.message-toggle.active {
+  color: var(--accent);
+}
+.message-toggle-track {
+  display: flex;
+  align-items: center;
+  width: 24px;
+  height: 14px;
+  padding: 2px;
+  border-radius: 8px;
+  background: #404356;
+}
+.message-toggle-track > span {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: #dfe2f1;
+}
+.message-toggle.active .message-toggle-track {
+  background: var(--accent);
+  justify-content: flex-end;
+}
+.message-toggle.active .message-toggle-track > span {
+  background: #20212b;
 }
 .command-form {
   display: flex;
@@ -972,6 +1019,11 @@ input:disabled {
   display: flex;
   flex-direction: column;
   gap: 16px;
+  min-height: 0;
+  position: relative;
+}
+.console-side .server-details {
+  flex: 0 0 auto;
 }
 .server-details dl {
   padding: 1px 18px;
@@ -1026,7 +1078,13 @@ input:disabled {
   background: #272833;
 }
 .online-players {
-  flex: 1;
+  flex: 1 1 0;
+  min-height: 170px;
+  display: flex;
+  flex-direction: column;
+}
+.online-players > .panel-heading {
+  flex-shrink: 0;
 }
 .count-badge {
   background: #303140;
@@ -1038,6 +1096,14 @@ input:disabled {
 }
 .players-list {
   padding: 4px 17px;
+  min-height: 0;
+  overflow: auto;
+  scrollbar-width: thin;
+  flex: 1;
+}
+.players-list:has(.players-empty) {
+  display: grid;
+  place-items: center;
 }
 .players-empty {
   display: flex;
@@ -1463,6 +1529,10 @@ input:disabled {
   .console-side {
     display: grid;
     grid-template-columns: 1fr 1fr;
+  }
+  .online-players {
+    height: 300px;
+    max-height: 300px;
   }
   .backup-nudge {
     grid-column: 1/-1;

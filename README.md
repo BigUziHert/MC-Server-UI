@@ -37,7 +37,7 @@ Choose **Import an existing server**, then browse to the folder containing its `
 
 The panel detects the server port, MOTD, player limit, world folder, EULA status, top-level JAR files, and supported NeoForge startup configuration. Review the name and startup method. For a JAR server, select the JAR used to start it; if there are multiple JARs, choose one explicitly. Java and memory settings are available for review. Stop any separately running copy before starting it through MC Panel.
 
-Import registers the existing folder **in place**. It does not copy, move, overwrite, or start the server, and it preserves the existing EULA decision. Worlds, plugins, and configuration stay in the selected folder. File Manager and Console subsequently operate on that folder; backups and panel metadata go under `data/instances/<server-id>/`. Any port override is applied when you next start the server through the panel. Resetting MC Panel's app data removes the registration and panel backups, but leaves that external server folder intact.
+Import registers the existing folder **in place**. It does not copy, move, overwrite, or start the server, and it preserves the existing EULA decision. Worlds, plugins, and configuration stay in the selected folder. File Manager and Console subsequently operate on that folder; backups, recycled files, and panel metadata go under `data/instances/<server-id>/`. Any port override is applied when you next start the server through the panel. Resetting MC Panel's app data removes the registration, panel backups, and Recycle Bin contents, but leaves files still in that external server folder intact.
 
 Startup is configurable for different Minecraft Java distributions and modpacks: **Server JAR**, **Java arguments**, **Startup script**, or **Custom executable**. Standard Windows Forge, NeoForge, Fabric, and other simple Java launch scripts are detected when possible. For custom packs, select their script or enter the executable and its arguments; each argument gets its own line, preserving spaces without shell quoting. Windows supports `.bat`, `.cmd`, and `.ps1`; `.sh` requires a Unix shell. Scripts must keep the server in the foreground without `pause`, detached windows, or automatic restart loops so the panel can track and stop it. OS-specific launchers still need their required runtime and libraries.
 
@@ -111,9 +111,9 @@ Open **http://127.0.0.1:3001**. `npm run preview` previews only the built fronte
 ## What works
 
 - **Multiple servers:** create independent demo or live Java servers, switch between them, and rename them. Each server has its own console, files, backups, schedule, access records, databases, in-game operators, and audit logs. Servers can run concurrently on distinct ports.
-- **Console:** start, stop, restart, timestamped output, command entry, resource charts, and server status. In live mode commands go directly to the Java process's standard input, never to an operating system shell.
-- **Players:** grant or remove Minecraft operator access using a Java username. Live actions send `op <name>` or `deop <name>` to the running server and report that the command was requested; check the console for Minecraft's result. The operator list reads the server's `ops.json`, so it can lag behind a command. Demo operator changes are clearly simulated and saved separately from `ops.json`.
-- **File Manager:** browse folders, create files and directories, edit text files up to 1 MB, delete files or folders, and upload/download original files. Row checkboxes support bulk deletion; select-all affects visible rows, the confirmation lists every selected path, and failed deletions stay selected for retry. Folder contents are deleted recursively only after confirmation. Upload up to 20 files per request, 256 MB per file. Existing names are protected from accidental upload overwrites. Paths and symbolic links are checked to keep operations inside the configured server directory.
+- **Console:** start, stop, restart, timestamped output, command entry, resource charts, and server status. Turn on **Server messaging** beside Autoscroll to broadcast text to all players without typing `say`; command and message drafts/history stay separate. In live mode commands go directly to the server process's standard input, never to an operating system shell.
+- **Players:** keep the operator list alongside player history with Minecraft heads, online status, and observed login times. Grant/remove OP, kick an online player, or ban/unban a known player with a confirmation and optional reason. Live actions send Minecraft commands to the running server; check Console for the result. OP and ban status read `ops.json` and `banned-players.json`, so they can lag behind a command. History persists observed joins/leaves and includes profiles from `usercache.json` and the ban list. Cached profiles may never have joined, and their cache expiry is never presented as a login date. Demo moderation is simulated and does not modify live Minecraft permission or ban files.
+- **File Manager:** browse folders, create files and directories, edit text files up to 1 MB, and upload/download original files. Deletion moves files or whole folders to a protected, per-server **Recycle Bin** outside the Minecraft folder. Restore returns an item to its original path and refuses to overwrite anything already there. Items remain until restored; there is no automatic expiry or permanent-delete control. Row checkboxes support bulk moves, select-all affects visible rows without moving the checkbox, and failed moves stay selected for retry. Upload up to 20 files per request, 256 MB per file. Existing names are protected from accidental upload overwrites. Paths and symbolic links are checked to keep operations inside the configured server directory.
 - **Backups:** create and download real `.tar.gz` archives; configure interval, daily, or weekly schedules and retention. Manual backups are kept until deleted. Retention applies only to scheduled backups, after a new archive succeeds. Symbolic links are excluded.
 - **Subusers:** store email and intended permission selections locally, with grouped Control, User, Files, Backups, Databases, and Audit controls. Existing role records receive equivalent default selections and can be edited. These records do **not** create authenticated accounts, enforce permissions, or send invitations. All access to this local panel has administrator capabilities.
 - **Databases:** create, download, and delete actual SQLite files. This is local SQLite storage, not a hosted MySQL service or automatic Minecraft plugin configuration.
@@ -180,6 +180,7 @@ data/
   backups/      that legacy server's gzip-compressed tar archives
   databases/    that legacy server's SQLite files
   uploads/      that legacy server's temporary upload storage
+  recycle-bin/  that legacy server's recoverable deleted files and journals
   panel.json    that legacy server's schedules, metadata, and audit events
   servers.json  server registry and saved configurations
   instances/
@@ -188,10 +189,13 @@ data/
       backups/      that server's archives
       databases/    that server's SQLite files
       uploads/      that server's temporary uploads
-      panel.json    that server's schedule, records, demo operators, and audit
+      recycle-bin/  that server's recoverable deleted files and journals
+      panel.json    that server's schedule, player history, records, and audit
 ```
 
 An empty desktop workspace contains only `servers.json`. Servers created through the panel use their own `instances/<server-id>/` directory, including the first server. Imported servers use that directory for panel metadata and backups while keeping Minecraft files in the selected external folder. Existing storage locations are preserved when switching the default server or removing a demo.
+
+The Recycle Bin is a protected virtual folder in File Manager, with no upload, edit, or delete controls. Recovery data remains in the panel's data directory across restarts and updates. Moving files across drives requires a stopped live server and a verified copy before the source is removed. Incomplete recovery data is retained when a move is interrupted. Restore creates missing parent directories, preserves copied file modes and modification times, and leaves both versions intact if the original path is occupied. The bin does not include files deleted before this feature was installed or files deleted outside MC Panel.
 
 `PANEL_DATA_DIR` changes the panel's data directory. Keep it outside a custom server directory so backups never archive themselves. Use only one API process per data directory. There is no background service installer; scheduling runs within the API process.
 

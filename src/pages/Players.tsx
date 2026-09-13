@@ -19,6 +19,10 @@ import {
   ShieldPlus,
   Terminal,
   X,
+  Users,
+  LogOut,
+  Ban,
+  Undo2,
 } from "lucide-react";
 import { useServerApi, type PageProps } from "../api";
 import PlayerHead from "../PlayerHead";
@@ -26,10 +30,24 @@ import "./management.css";
 import "./players.css";
 
 type Operator = { name: string; uuid?: string; level?: number };
+type KnownPlayer = {
+  name: string;
+  uuid?: string;
+  online: boolean;
+  firstSeen: string | null;
+  lastSeen: string | null;
+  source: "observed" | "cache" | "banned";
+  banned: boolean | null;
+  banReason?: string;
+};
+type Moderation = { action: "kick" | "ban" | "unban"; player: KnownPlayer };
 type PlayersResponse = {
   operators: Operator[];
   mode: "demo" | "live";
   status: "running" | "offline" | "starting" | "stopping";
+  history?: KnownPlayer[];
+  warnings?: string[];
+  bansAvailable?: boolean;
 };
 type OperationResponse = { message: string; simulated: boolean };
 
@@ -39,6 +57,10 @@ export default function Players({ notify }: PageProps) {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
   const [search, setSearch] = useState("");
+  const [historySearch, setHistorySearch] = useState("");
+  const [historyLimit, setHistoryLimit] = useState(50);
+  const [moderating, setModerating] = useState<Moderation | null>(null);
+  const [reason, setReason] = useState("");
   const [granting, setGranting] = useState(false);
   const [removing, setRemoving] = useState<Operator | null>(null);
   const [name, setName] = useState("");
@@ -46,6 +68,7 @@ export default function Players({ notify }: PageProps) {
   const [formError, setFormError] = useState("");
   const [result, setResult] = useState<OperationResponse | null>(null);
   const dialog = useRef<HTMLDialogElement>(null);
+  const moderationDialog = useRef<HTMLDialogElement>(null);
   const usernameInput = useRef<HTMLInputElement>(null);
   const request = useRef(0);
   const session = useRef(0);
@@ -76,6 +99,9 @@ export default function Players({ notify }: PageProps) {
     setBusy(false);
     setFormError("");
     setSearch("");
+    setHistorySearch("");
+    setHistoryLimit(50);
+    setModerating(null);
     setGranting(false);
     setRemoving(null);
     void refresh();
@@ -93,6 +119,10 @@ export default function Players({ notify }: PageProps) {
       if (granting) usernameInput.current?.focus();
     } else dialog.current?.close();
   }, [granting, removing]);
+  useEffect(() => {
+    if (moderating) moderationDialog.current?.showModal();
+    else moderationDialog.current?.close();
+  }, [moderating]);
 
   const simulated = data?.mode === "demo";
   const canManage = Boolean(data && !error && data.status === "running");
@@ -100,6 +130,70 @@ export default function Players({ notify }: PageProps) {
   const filtered = operators.filter((player) =>
     player.name.toLowerCase().includes(search.trim().toLowerCase()),
   );
+  const history = data?.history ?? [];
+  const filteredHistory = history.filter((player) =>
+    player.name.toLowerCase().includes(historySearch.trim().toLowerCase()),
+  );
+  const actionLabel =
+    moderating?.action === "kick"
+      ? "Kick player"
+      : moderating?.action === "ban"
+        ? "Ban player"
+        : "Unban player";
+
+  function openModeration(action: Moderation["action"], player: KnownPlayer) {
+    setReason("");
+    setFormError("");
+    setModerating({ action, player });
+  }
+  function closeModeration() {
+    if (!busy) {
+      setModerating(null);
+      setFormError("");
+    }
+  }
+  async function submitModeration(event: FormEvent) {
+    event.preventDefault();
+    if (!moderating || busy) return;
+    if (!canManage) {
+      setFormError("Start the server in Console before managing players.");
+      return;
+    }
+    if (
+      reason.length > 200 ||
+      /[\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(reason)
+    ) {
+      setFormError("Use a single-line reason of at most 200 characters.");
+      return;
+    }
+    const currentSession = session.current;
+    setBusy(true);
+    setFormError("");
+    try {
+      const response = await post<OperationResponse>(
+        `/players/${moderating.action}`,
+        {
+          name: moderating.player.name,
+          ...(moderating.player.uuid ? { uuid: moderating.player.uuid } : {}),
+          ...(moderating.action !== "unban" ? { reason: reason.trim() } : {}),
+        },
+      );
+      if (currentSession !== session.current) return;
+      setResult(response);
+      notify(response.message);
+      setModerating(null);
+      await refresh(true);
+    } catch (cause) {
+      if (currentSession === session.current)
+        setFormError(
+          cause instanceof Error
+            ? cause.message
+            : "Unable to manage this player.",
+        );
+    } finally {
+      if (currentSession === session.current) setBusy(false);
+    }
+  }
 
   function openGrant() {
     setName("");
@@ -170,7 +264,7 @@ export default function Players({ notify }: PageProps) {
         <div>
           <div className="management-eyebrow">IN-GAME MANAGEMENT</div>
           <h1>Players</h1>
-          <p>Manage operator permissions in your Minecraft world.</p>
+          <p>View known players, manage bans, and assign operators.</p>
         </div>
         <button
           className="btn primary"
@@ -187,8 +281,8 @@ export default function Players({ notify }: PageProps) {
           <div>
             <strong>Demo mode · Simulated operators</strong>
             <p>
-              Changes are saved to this server’s demo operator list. No
-              permissions are changed in a live Minecraft game.
+              Operator and moderation actions are simulated in this workspace.
+              No live players or Minecraft ban files are changed.
             </p>
           </div>
         </div>
@@ -201,8 +295,8 @@ export default function Players({ notify }: PageProps) {
             <p>
               {simulated ? "The demo server" : "The server"} is {data.status}.
               {simulated
-                ? " Start it in Console to try simulated operator commands."
-                : " You can view its saved operators now and change permissions once it is running."}
+                ? " Start it in Console to try simulated player commands."
+                : " You can view saved players and operators now. Start it before changing permissions, kicking, or managing bans."}
             </p>
             <a href="#console">
               Go to Console <ArrowUpRight size={14} />
@@ -244,13 +338,13 @@ export default function Players({ notify }: PageProps) {
           <div>
             <strong>
               {result.simulated
-                ? "Demo operator list updated"
-                : "Operator command requested"}
+                ? "Demo player action completed"
+                : "Player command requested"}
             </strong>
             <p>
               {result.message}
               {!result.simulated &&
-                " The list refreshes as Minecraft saves its operators. Check Console for the command result."}
+                " Check Console for the command result. The list refreshes as Minecraft saves its player files."}
             </p>
           </div>
           <button
@@ -262,6 +356,160 @@ export default function Players({ notify }: PageProps) {
           </button>
         </div>
       )}
+
+      <section
+        className="panel management-list players-history-panel"
+        aria-labelledby="history-title"
+      >
+        <div className="management-panel-header">
+          <div className="management-section-title">
+            <Users size={18} />
+            <h2 id="history-title">Player history</h2>
+            <span className="management-count">{history.length}</span>
+          </div>
+          <div className="management-controls">
+            <label className="management-search">
+              <Search size={16} />
+              <input
+                aria-label="Search player history"
+                placeholder="Search known players..."
+                value={historySearch}
+                onChange={(event) => {
+                  setHistorySearch(event.target.value);
+                  setHistoryLimit(50);
+                }}
+              />
+            </label>
+            <button
+              className="btn icon"
+              aria-label="Refresh player history"
+              disabled={loading}
+              onClick={() => void refresh()}
+            >
+              <RefreshCw size={16} />
+            </button>
+          </div>
+        </div>
+        <p className="players-history-help">
+          Players seen by this panel and profiles saved by the server. Login
+          times are shown only when observed.
+        </p>
+        {data?.warnings?.map((warning) => (
+          <p className="players-history-warning" role="status" key={warning}>
+            <AlertCircle size={16} />
+            {warning}
+          </p>
+        ))}
+        {error ? (
+          <p className="players-history-empty">
+            Player history is unavailable. Refresh to try again.
+          </p>
+        ) : loading ? (
+          <p className="players-history-empty" role="status">
+            Loading player history...
+          </p>
+        ) : filteredHistory.length === 0 ? (
+          <div className="players-history-empty">
+            <Users size={27} />
+            <h3>
+              {historySearch ? "No matching history" : "No known players yet"}
+            </h3>
+            <p>
+              {historySearch
+                ? "Try another Minecraft username."
+                : "Players will appear when they join while this panel is running, or when their profiles are available in the server’s saved files."}
+            </p>
+          </div>
+        ) : (
+          <ul className="players-history-list">
+            {filteredHistory.slice(0, historyLimit).map((player) => (
+              <li
+                aria-label={`Player ${player.name}`}
+                className="players-history-row"
+                key={player.uuid || player.name}
+              >
+                <PlayerHead name={player.name} uuid={player.uuid} size={40} />
+                <div className="players-history-identity">
+                  <strong>{player.name}</strong>
+                  <span>
+                    {player.online ? "Online" : "Offline"}
+                    {player.banned
+                      ? " · Banned"
+                      : player.banned === null
+                        ? " · Ban status unavailable"
+                        : ""}
+                    {simulated && player.banned ? " (simulated)" : ""}
+                  </span>
+                  {player.banReason && (
+                    <span className="players-ban-reason">
+                      Reason: {player.banReason}
+                    </span>
+                  )}
+                </div>
+                <div className="players-history-time">
+                  <span>
+                    {player.lastSeen ? "Last observed" : "Login time unknown"}
+                  </span>
+                  {player.lastSeen ? (
+                    <time
+                      dateTime={player.lastSeen}
+                      title={`First observed: ${player.firstSeen ? new Date(player.firstSeen).toLocaleString() : "unknown"}`}
+                    >
+                      {new Date(player.lastSeen).toLocaleString()}
+                    </time>
+                  ) : (
+                    <small>
+                      {player.source === "banned"
+                        ? "From saved ban list"
+                        : "From server profile cache"}
+                    </small>
+                  )}
+                </div>
+                <div className="players-history-actions">
+                  <button
+                    className="btn"
+                    aria-label={`Kick ${player.name}`}
+                    disabled={!canManage || !player.online || busy}
+                    title={
+                      !player.online
+                        ? "Only online players can be kicked"
+                        : "Disconnect this player"
+                    }
+                    onClick={() => openModeration("kick", player)}
+                  >
+                    <LogOut size={14} />
+                    Kick
+                  </button>
+                  <button
+                    className="btn players-remove"
+                    aria-label={`${player.banned ? "Unban" : "Ban"} ${player.name}`}
+                    disabled={!canManage || player.banned === null || busy}
+                    onClick={() =>
+                      openModeration(player.banned ? "unban" : "ban", player)
+                    }
+                  >
+                    {player.banned ? <Undo2 size={14} /> : <Ban size={14} />}
+                    {player.banned ? "Unban" : "Ban"}
+                  </button>
+                </div>
+              </li>
+            ))}
+          </ul>
+        )}
+        {!loading && !error && filteredHistory.length > historyLimit && (
+          <div className="management-panel-footer">
+            <span>
+              Showing {historyLimit} of {filteredHistory.length} players
+            </span>
+            <button
+              className="btn"
+              onClick={() => setHistoryLimit((value) => value + 50)}
+            >
+              Show more players
+            </button>
+          </div>
+        )}
+      </section>
 
       <section
         className="panel management-list"
@@ -480,6 +728,106 @@ export default function Players({ notify }: PageProps) {
               disabled={busy || !canManage}
             >
               {busy ? "Sending..." : removing ? "Remove OP" : "Grant OP"}
+            </button>
+          </div>
+        </form>
+      </dialog>
+      <dialog
+        ref={moderationDialog}
+        className="modal management-dialog players-dialog"
+        aria-labelledby="moderation-title"
+        onCancel={(event) => {
+          event.preventDefault();
+          closeModeration();
+        }}
+      >
+        <form onSubmit={submitModeration}>
+          <div className="management-dialog-heading">
+            <span className="management-icon">
+              {moderating?.action === "kick" ? (
+                <LogOut size={22} />
+              ) : (
+                <Ban size={22} />
+              )}
+            </span>
+            <button
+              type="button"
+              className="btn icon"
+              aria-label="Close player action"
+              disabled={busy}
+              onClick={closeModeration}
+            >
+              <X size={18} />
+            </button>
+          </div>
+          <h2 id="moderation-title">{actionLabel}?</h2>
+          <p className="management-dialog-description">
+            {moderating?.action === "kick" ? (
+              <>
+                Disconnect <strong>{moderating.player.name}</strong> now? They
+                can reconnect unless banned.
+              </>
+            ) : moderating?.action === "ban" ? (
+              <>
+                Ban <strong>{moderating.player.name}</strong> from this server?
+                Minecraft will disconnect them and prevent them from joining
+                until unbanned.
+              </>
+            ) : (
+              <>
+                Allow <strong>{moderating?.player.name}</strong> to join again?
+                This removes their player ban; IP bans are separate.
+              </>
+            )}
+          </p>
+          {moderating?.action !== "unban" && (
+            <div className="form-field">
+              <label htmlFor="moderation-reason">Reason (optional)</label>
+              <input
+                id="moderation-reason"
+                value={reason}
+                onChange={(event) => setReason(event.target.value)}
+                maxLength={200}
+                disabled={busy}
+                autoComplete="off"
+                placeholder="A short explanation for the player"
+              />
+              <small>
+                Up to 200 characters on one line. The player can see this
+                reason.
+              </small>
+            </div>
+          )}
+          <div className="players-permission-note">
+            <Info size={18} />
+            <p>
+              {simulated
+                ? "This action is simulated. No live player or Minecraft ban file will change."
+                : "The panel sends a Minecraft console command. Check Console for confirmation; plugins may handle commands differently."}
+            </p>
+          </div>
+          {(!canManage || formError) && (
+            <p className="management-form-error" role="alert">
+              <AlertCircle size={15} />
+              {formError ||
+                "Start the server in Console before managing players."}
+            </p>
+          )}
+          <div className="management-dialog-actions">
+            <button
+              type="button"
+              className="btn"
+              onClick={closeModeration}
+              disabled={busy}
+            >
+              Cancel
+            </button>
+            <button
+              type="submit"
+              className={`btn ${moderating?.action === "unban" ? "primary" : "danger"}`}
+              disabled={busy || !canManage}
+            >
+              {busy ? "Sending..." : actionLabel}
             </button>
           </div>
         </form>

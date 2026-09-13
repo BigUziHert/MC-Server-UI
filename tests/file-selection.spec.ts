@@ -89,6 +89,12 @@ test("selected file and folder deletion confirms exact targets and preserves uns
   files,
 }, testInfo) => {
   await openFiles(page, files);
+  const headerBefore = await page
+    .getByRole("checkbox", {
+      name: "Select all visible files and folders",
+      exact: true,
+    })
+    .boundingBox();
   const deletes: { path: string; serverId: string | undefined }[] = [];
   page.on("request", (request) => {
     if (
@@ -111,6 +117,7 @@ test("selected file and folder deletion confirms exact targets and preserves uns
     exact: true,
   });
   await expect(all).toHaveAttribute("aria-checked", "mixed");
+  expect(await all.boundingBox()).toEqual(headerBefore);
   expect(
     await all.evaluate(
       (element) => (element as HTMLInputElement).indeterminate,
@@ -123,11 +130,11 @@ test("selected file and folder deletion confirms exact targets and preserves uns
     .getByRole("button", { name: "Delete selected", exact: true })
     .click();
   let dialog = page.getByRole("dialog", {
-    name: "Delete selected items?",
+    name: "Move selected items to Recycle Bin?",
     exact: true,
   });
   const targets = dialog.getByRole("list", {
-    name: "Items to delete",
+    name: "Items to recycle",
     exact: true,
   });
   await expect(targets.getByRole("listitem")).toHaveCount(2);
@@ -137,6 +144,7 @@ test("selected file and folder deletion confirms exact targets and preserves uns
   await expect(dialog).toContainText("including nested files and folders");
   await page.screenshot({
     path: testInfo.outputPath("file-selection-confirmation.png"),
+    animations: "disabled",
     fullPage: true,
   });
   await dialog.getByRole("button", { name: "Cancel", exact: true }).click();
@@ -154,11 +162,11 @@ test("selected file and folder deletion confirms exact targets and preserves uns
     .getByRole("button", { name: "Delete selected", exact: true })
     .click();
   dialog = page.getByRole("dialog", {
-    name: "Delete selected items?",
+    name: "Move selected items to Recycle Bin?",
     exact: true,
   });
   await dialog
-    .getByRole("button", { name: "Delete selected permanently", exact: true })
+    .getByRole("button", { name: "Move to Recycle Bin", exact: true })
     .click();
   await expect(dialog).not.toBeVisible();
   expect(await fileNames(request, files)).toEqual([
@@ -175,6 +183,16 @@ test("selected file and folder deletion confirms exact targets and preserves uns
     { headers: { "X-Server-Id": files.id } },
   );
   expect(nested.status()).toBe(404);
+  const recycled = await (
+    await request.get("/api/files/recycle-bin", {
+      headers: { "X-Server-Id": files.id },
+    })
+  ).json();
+  expect(
+    recycled.items
+      .map((item: { originalPath: string }) => item.originalPath)
+      .sort(),
+  ).toEqual([`${files.folder}/alpha.txt`, `${files.folder}/archive`]);
   await expect(
     page.getByRole("region", { name: "Selected files and folders" }),
   ).toHaveCount(0);
@@ -232,15 +250,18 @@ test("select visible all respects filters and selection clears on directory and 
   ).toBeLessThanOrEqual(1);
   await page.screenshot({
     path: testInfo.outputPath("file-selection-mobile.png"),
+    animations: "disabled",
     fullPage: true,
   });
   await page
     .getByRole("button", { name: "Clear selection", exact: true })
     .click();
   await expect(selection).toHaveCount(0);
+  const mobileHeaderBefore = await all.boundingBox();
   await page
     .getByRole("checkbox", { name: "Select beta.txt", exact: true })
     .check();
+  expect(await all.boundingBox()).toEqual(mobileHeaderBefore);
   await page.getByRole("button", { name: "archive", exact: true }).click();
   await expect(selection).toHaveCount(0);
   await page
@@ -298,20 +319,22 @@ test("partial deletion failures retain only failed targets and retry sequentiall
     .getByRole("button", { name: "Delete selected", exact: true })
     .click();
   const dialog = page.getByRole("dialog", {
-    name: "Delete selected items?",
+    name: "Move selected items to Recycle Bin?",
     exact: true,
   });
   await dialog
-    .getByRole("button", { name: "Delete selected permanently", exact: true })
+    .getByRole("button", { name: "Move to Recycle Bin", exact: true })
     .click();
   await expect(dialog.getByRole("alert")).toContainText(
-    "2 items deleted. 1 item could not be deleted and remains selected.",
+    "2 items moved to Recycle Bin. 1 item could not be moved and remains selected.",
+  );
+  await expect(dialog.getByRole("list", { name: "Move errors" })).toContainText(
+    "alpha.txt: Fixture permission denied.",
   );
   await expect(
-    dialog.getByRole("list", { name: "Deletion errors" }),
-  ).toContainText("alpha.txt: Fixture permission denied.");
-  await expect(
-    dialog.getByRole("list", { name: "Items to delete" }).getByRole("listitem"),
+    dialog
+      .getByRole("list", { name: "Items to recycle" })
+      .getByRole("listitem"),
   ).toHaveCount(1);
   await expect(
     page.getByRole("checkbox", { name: "Select alpha.txt", exact: true }),
@@ -323,7 +346,7 @@ test("partial deletion failures retain only failed targets and retry sequentiall
   expect(maximumActive).toBe(1);
   deny = false;
   await dialog
-    .getByRole("button", { name: "Retry failed deletions", exact: true })
+    .getByRole("button", { name: "Retry failed moves", exact: true })
     .click();
   await expect(dialog).not.toBeVisible();
   expect(await fileNames(request, files)).toEqual(["archive"]);

@@ -1,0 +1,130 @@
+.recycle-bin-entry-content {
+  display: flex;
+  align-items: center;
+  gap: 13px;
+  min-width: 0;
+}
+.recycle-bin-entry-content > svg {
+  flex-shrink: 0;
+  color: var(--muted, #969bb3);
+}
+.recycle-bin-entry-content .file-name {
+  width: auto;
+  flex: 0 1 auto;
+}
+.recycle-bin-entry-content .file-name > svg:first-child {
+  color: var(--accent, #ffd000);
+}
+.recycle-bin-entry-note {
+  margin-left: auto;
+  color: var(--muted, #969bb3);
+  font-size: 11px;
+}
+.recycle-bin-tools,
+.recycle-bin-protected {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.recycle-bin-protected {
+  gap: 6px;
+  color: var(--muted, #969bb3);
+  font-size: 11px;
+}
+.recycle-bin-notice {
+  display: flex;
+  align-items: flex-start;
+  gap: 11px;
+  margin: 20px 23px 0;
+  padding: 14px;
+  border: 1px solid var(--border, #373948);
+  border-radius: 8px;
+  color: var(--muted, #969bb3);
+}
+.recycle-bin-notice > svg {
+  flex-shrink: 0;
+  margin-top: 2px;
+  color: var(--accent, #ffd000);
+}
+.recycle-bin-notice p {
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.7;
+}
+.recycle-bin-items {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+.recycle-bin-item {
+  display: flex;
+  align-items: flex-start;
+  gap: 16px;
+  padding: 23px;
+  border-top: 1px solid var(--storage-border, #272833);
+}
+.recycle-bin-item-icon {
+  color: var(--muted, #969bb3);
+  flex-shrink: 0;
+  padding-top: 3px;
+}
+.recycle-bin-item-details {
+  flex: 1;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.recycle-bin-item h2 {
+  font-size: 13px;
+  font-weight: 600;
+  margin: 0 0 9px;
+}
+.recycle-bin-original-path,
+.recycle-bin-item-meta,
+.recycle-bin-incomplete {
+  color: var(--muted, #969bb3);
+  font-size: 11px;
+  margin: 0 0 8px;
+  line-height: 1.6;
+}
+.recycle-bin-original-path > span {
+  margin-right: 5px;
+}
+.recycle-bin-item-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px 16px;
+  margin-bottom: 0;
+}
+.recycle-bin-incomplete {
+  margin-top: 12px;
+  color: #f3c482;
+}
+.recycle-bin-item .btn {
+  flex-shrink: 0;
+  font-size: 11px;
+}
+@media (max-width: 600px) {
+  .recycle-bin-entry-note {
+    display: none;
+  }
+  .recycle-bin-entry-content {
+    gap: 8px;
+  }
+  .recycle-bin-notice {
+    margin: 16px 12px 0;
+    padding: 12px;
+  }
+  .recycle-bin-item {
+    display: grid;
+    grid-template-columns: 20px minmax(0, 1fr);
+    gap: 10px;
+    padding: 18px 12px;
+  }
+  .recycle-bin-item > .btn {
+    grid-column: 2;
+    justify-self: start;
+  }
+  .recycle-bin-item-details .storage-form-error {
+    margin-bottom: 0;
+  }
+}

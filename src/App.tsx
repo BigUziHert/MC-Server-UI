@@ -21,6 +21,7 @@ import {
   Layers3,
   ListFilter,
   Menu,
+  MessageSquare,
   MemoryStick,
   Pencil,
   Play,
@@ -623,20 +624,6 @@ function ServerWorkspace({
           ))}
         </nav>
         <div className="sidebar-bottom">
-          <div className="workspace-note">
-            <div className="workspace-note-title">
-              <ShieldCheck size={16} />
-              <strong>Made for your world</strong>
-            </div>
-            <p>
-              Your files, your server.
-              <br />
-              Everything in one place.
-            </p>
-            <button onClick={() => setHelp(true)}>
-              Getting started <ArrowRight size={14} />
-            </button>
-          </div>
           <div className="profile">
             <div className="avatar">C</div>
             <div>
@@ -833,7 +820,11 @@ function ConsolePage({
 }) {
   const { api, post } = useServerApi();
   const [lines, setLines] = useState<LogLine[]>([]);
-  const [command, setCommand] = useState("");
+  const [inputMode, setInputMode] = useState<"command" | "message">("command");
+  const [drafts, setDrafts] = useState({ command: "", message: "" });
+  const command = drafts[inputMode];
+  const setCommand = (value: string) =>
+    setDrafts((previous) => ({ ...previous, [inputMode]: value }));
   const [search, setSearch] = useState("");
   const [showSearch, setShowSearch] = useState(false);
   const [autoScroll, setAutoScroll] = useState(true);
@@ -846,7 +837,10 @@ function ConsolePage({
   const [logError, setLogError] = useState(false);
   const commandInput = useRef<HTMLInputElement>(null);
   const logContainer = useRef<HTMLDivElement>(null);
-  const commandHistory = useRef<string[]>([]);
+  const commandHistory = useRef<Record<"command" | "message", string[]>>({
+    command: [],
+    message: [],
+  });
   const historyIndex = useRef(-1);
   const loadLogs = useCallback(async () => {
     try {
@@ -898,8 +892,11 @@ function ConsolePage({
     if (!command.trim() || busy) return;
     setBusy(true);
     try {
-      await post("/console/command", { command: command.trim() });
-      commandHistory.current.unshift(command);
+      await post("/console/command", {
+        command:
+          inputMode === "message" ? `say ${command.trim()}` : command.trim(),
+      });
+      commandHistory.current[inputMode].unshift(command);
       historyIndex.current = -1;
       setCommand("");
       await loadLogs();
@@ -958,9 +955,6 @@ function ConsolePage({
         <div>
           <div className="eyebrow">SERVER OVERVIEW</div>
           <h1>Console</h1>
-          <p>
-            A front-row seat to your world. Keep everything running smoothly.
-          </p>
         </div>
         <div className="heading-meta">
           <Clock3 size={14} />
@@ -1140,7 +1134,6 @@ function ConsolePage({
                 ? "Demo player list"
                 : "Connected to your world"}
           </div>
-          <div className="metric-footnote">Room for more adventures</div>
         </div>
       </section>
       <div className="console-layout">
@@ -1246,24 +1239,57 @@ function ConsolePage({
               {logError ? "Reconnecting" : "Console connected"}
               <span className="console-status-separator">•</span>UTF-8
             </span>
-            <button
-              onClick={() => setAutoScroll((v) => !v)}
-              className={autoScroll ? "autoscroll active" : "autoscroll"}
-            >
-              {autoScroll ? <Check size={12} /> : <ArrowDown size={12} />}
-              Autoscroll
-            </button>
+            <div className="console-options">
+              <button
+                type="button"
+                role="switch"
+                aria-label="Server messaging"
+                aria-checked={inputMode === "message"}
+                className={`message-toggle ${inputMode === "message" ? "active" : ""}`}
+                disabled={busy}
+                title="Send messages to every player without typing say"
+                onClick={() => {
+                  setInputMode((previous) =>
+                    previous === "message" ? "command" : "message",
+                  );
+                  historyIndex.current = -1;
+                  commandInput.current?.focus();
+                }}
+              >
+                <MessageSquare size={12} />
+                Server messaging
+                <span className="message-toggle-track" aria-hidden="true">
+                  <span />
+                </span>
+              </button>
+              <button
+                onClick={() => setAutoScroll((v) => !v)}
+                className={autoScroll ? "autoscroll active" : "autoscroll"}
+              >
+                {autoScroll ? <Check size={12} /> : <ArrowDown size={12} />}
+                Autoscroll
+              </button>
+            </div>
           </div>
           <form className="command-form" onSubmit={sendCommand}>
-            <ChevronRight size={18} />
+            {inputMode === "message" ? (
+              <MessageSquare size={18} />
+            ) : (
+              <ChevronRight size={18} />
+            )}
             <input
               ref={commandInput}
-              aria-label="Server command"
+              aria-label={
+                inputMode === "message" ? "Server message" : "Server command"
+              }
               placeholder={
                 isRunning
-                  ? "Type a command…"
-                  : "Start your server to send a command…"
+                  ? inputMode === "message"
+                    ? "Message all players…"
+                    : "Type a command…"
+                  : `Start your server to send a ${inputMode}…`
               }
+              maxLength={inputMode === "message" ? 2044 : 2048}
               value={command}
               disabled={!isRunning}
               onChange={(e) => setCommand(e.target.value)}
@@ -1272,17 +1298,19 @@ function ConsolePage({
                   e.preventDefault();
                   historyIndex.current = Math.min(
                     historyIndex.current + 1,
-                    commandHistory.current.length - 1,
+                    commandHistory.current[inputMode].length - 1,
                   );
                   setCommand(
-                    commandHistory.current[historyIndex.current] || "",
+                    commandHistory.current[inputMode][historyIndex.current] ||
+                      "",
                   );
                 }
                 if (e.key === "ArrowDown") {
                   e.preventDefault();
                   historyIndex.current = Math.max(-1, historyIndex.current - 1);
                   setCommand(
-                    commandHistory.current[historyIndex.current] || "",
+                    commandHistory.current[inputMode][historyIndex.current] ||
+                      "",
                   );
                 }
               }}
@@ -1290,7 +1318,9 @@ function ConsolePage({
             <kbd>Ctrl K</kbd>
             <button
               type="submit"
-              aria-label="Send command"
+              aria-label={
+                inputMode === "message" ? "Send message" : "Send command"
+              }
               disabled={!isRunning || !command.trim() || busy}
             >
               <Send size={16} />
@@ -1393,18 +1423,6 @@ function ConsolePage({
               )}
             </div>
           </section>
-          <div className="backup-nudge">
-            <span className="backup-nudge-icon">
-              <Cloud size={21} />
-            </span>
-            <div>
-              <strong>Keep your world safe.</strong>
-              <p>Set it. Save it. Get back to playing.</p>
-              <button onClick={() => navigate("backups")}>
-                Configure backups <ArrowRight size={13} />
-              </button>
-            </div>
-          </div>
         </aside>
       </div>
       <div className="console-bottom-note">

@@ -17,6 +17,12 @@ import {
   legacyConnectionHost,
 } from "./connection.mjs";
 import { decodeIcon, readServerIcon, writeServerIcon } from "./server-icon.mjs";
+import { createRecycleBin } from "./recycle-bin.mjs";
+import {
+  createPlayerHistory,
+  readPlayerRecords,
+  moderationCommand,
+} from "./player-history.mjs";
 import {
   canonicalExternalDirectory,
   containedSourcePath,
@@ -489,12 +495,20 @@ export async function createPanel(options = {}) {
     throw new Error(
       "The panel data and backup directories must be outside MC_SERVER_DIR.",
     );
+  const recycleBin = await createRecycleBin({
+    dataDir,
+    serverDir,
+    safePath,
+    allowCrossVolume: () => mode !== "live" || status === "offline",
+  });
   let state = {
     users: [],
     databases: [],
     backups: [],
     audit: [],
     demoOperators: [],
+    playerHistory: [],
+    demoPlayerBans: [],
     schedule: { ...defaultSchedule },
   };
   if (await exists(statePath))
@@ -598,7 +612,15 @@ export async function createPanel(options = {}) {
   const lines = [];
   const onlinePlayers = new Map();
   const playerUuids = new Map();
+  const playerHistory = createPlayerHistory({
+    records: state.playerHistory,
+    persist: async (records) => {
+      state.playerHistory = records;
+      await save();
+    },
+  });
   const clearPlayers = () => {
+    for (const player of onlinePlayers.values()) playerHistory.observe(player);
     onlinePlayers.clear();
     playerUuids.clear();
   };
@@ -613,7 +635,7 @@ export async function createPanel(options = {}) {
     const clean = text.replace(/\x1b\[[0-9;]*m/g, "");
     if (clean.length > 2048) return;
     const vanilla = clean.match(
-      /^(?:\[\d{2}:\d{2}:\d{2}\] )?\[(Server thread|User Authenticator #\d+)\/INFO\]: (.+)$/,
+      /^(?:\[\d{2}:\d{2}:\d{2}\] )?\[(Server thread|User Authenticator #\d+)\/INFO\](?: \[[^\]\r\n]{1,120}\])?: (.+)$/,
     );
     const paper = clean.match(/^\[\d{2}:\d{2}:\d{2} INFO\]: (.+)$/);
     if (!vanilla && !paper) return;
@@ -630,7 +652,10 @@ export async function createPanel(options = {}) {
       if (playerUuids.size > 4096)
         playerUuids.delete(playerUuids.keys().next().value);
       const player = onlinePlayers.get(key);
-      if (player) player.uuid = value;
+      if (player) {
+        player.uuid = value;
+        playerHistory.identify(player);
+      }
       return;
     }
     if (vanilla && vanilla[1] !== "Server thread") return;
@@ -639,10 +664,15 @@ export async function createPanel(options = {}) {
     );
     if (!event) return;
     const key = event[1].toLowerCase();
-    if (event[2] === "left") onlinePlayers.delete(key);
-    else {
+    if (event[2] === "left") {
+      const player = onlinePlayers.get(key);
+      if (player) playerHistory.observe(player);
+      onlinePlayers.delete(key);
+    } else {
       const uuid = playerUuids.get(key);
-      onlinePlayers.set(key, { name: event[1], ...(uuid ? { uuid } : {}) });
+      const player = { name: event[1], ...(uuid ? { uuid } : {}) };
+      onlinePlayers.set(key, player);
+      playerHistory.observe(player);
     }
   };
   const append = (message, level = "info") => {
@@ -1027,6 +1057,7 @@ export async function createPanel(options = {}) {
 
   let backupBusy = false;
   let activeMutations = 0;
+  let recycleBusy = false;
   const writeServer = (child, command) =>
     new Promise((resolve, reject) => {
       if (child !== processHandle || !child.stdin.writable)
@@ -1286,12 +1317,25 @@ export async function createPanel(options = {}) {
             "A backup is in progress. Wait before changing files, server power, or console commands.",
           ),
         );
+      const recycling =
+        (req.method === "DELETE" && req.path === "/api/files") ||
+        (req.method === "POST" &&
+          /^\/api\/files\/recycle-bin\/[^/]+\/restore$/.test(req.path));
+      if (recycleBusy || (recycling && activeMutations))
+        return next(
+          error(
+            409,
+            "Wait for the current file or Recycle Bin operation to finish.",
+          ),
+        );
+      if (recycling) recycleBusy = true;
       activeMutations++;
       let completed = false;
       const done = () => {
         if (!completed) {
           completed = true;
           activeMutations--;
+          if (recycling) recycleBusy = false;
         }
       };
       req.panelMutationDone = done;
@@ -1398,6 +1442,30 @@ export async function createPanel(options = {}) {
     }),
   );
   app.get("/api/console", (_req, res) => res.json({ lines }));
+  const loadPlayerHistory = async () => {
+    const [cache, savedBans] = await Promise.all([
+      readPlayerRecords(serverDir, "usercache.json", safePath),
+      readPlayerRecords(serverDir, "banned-players.json", safePath),
+    ]);
+    playerHistory.seed(cache.records, "cache");
+    playerHistory.seed(savedBans.records, "banned");
+    let bans = savedBans.records;
+    if (mode === "demo") {
+      for (const change of state.demoPlayerBans ?? []) {
+        bans = bans.filter((entry) =>
+          change.uuid && entry.uuid
+            ? change.uuid !== entry.uuid
+            : change.name.toLowerCase() !== entry.name.toLowerCase(),
+        );
+        if (change.banned) bans.push(change);
+      }
+    }
+    return {
+      history: playerHistory.snapshot(onlinePlayers, bans, savedBans.available),
+      bansAvailable: savedBans.available,
+      warnings: [cache.warning, savedBans.warning].filter(Boolean),
+    };
+  };
   app.get("/api/players", async (_req, res) => {
     let operators = state.demoOperators;
     if (mode === "live") {
@@ -1446,8 +1514,85 @@ export async function createPanel(options = {}) {
         operators = [];
       }
     }
-    res.json({ operators, mode, status });
+    res.json({ operators, mode, status, ...(await loadPlayerHistory()) });
   });
+  for (const action of ["kick", "ban", "unban"]) {
+    app.post(
+      `/api/players/${action}`,
+      trackOperation(async (req, res) => {
+        const command = moderationCommand(action, req.body);
+        const name = req.body.name;
+        if (status !== "running")
+          throw error(409, "Start this server before managing players.");
+        const snapshot = await loadPlayerHistory();
+        const matches = snapshot.history.filter(
+          (entry) => entry.name.toLowerCase() === name.toLowerCase(),
+        );
+        const player = matches.find(
+          (entry) =>
+            !req.body.uuid || entry.uuid === req.body.uuid.toLowerCase(),
+        );
+        if (
+          !player ||
+          (matches.length > 1 &&
+            new Set(matches.map((entry) => entry.uuid)).size > 1)
+        )
+          throw error(
+            409,
+            "This player's identity changed or is unavailable. Refresh the player list before trying again.",
+          );
+        if (action === "kick" && !player.online)
+          throw error(
+            409,
+            "This player is no longer online. Refresh the player list.",
+          );
+        if (action !== "kick" && !snapshot.bansAvailable)
+          throw error(
+            409,
+            "The saved ban list is unavailable. Fix banned-players.json and refresh before managing bans.",
+          );
+        if (action === "unban" && !player.banned)
+          throw error(
+            409,
+            "This player is not in the saved ban list. Refresh the player list.",
+          );
+        if (mode === "live") {
+          if (!processHandle?.stdin.writable)
+            throw error(409, "The server is not ready to receive commands.");
+          await writeServer(processHandle, command);
+        } else if (action === "kick") {
+          onlinePlayers.delete(name.toLowerCase());
+          playerHistory.observe(player);
+        } else {
+          state.demoPlayerBans = (state.demoPlayerBans ?? []).filter(
+            (entry) => entry.name.toLowerCase() !== name.toLowerCase(),
+          );
+          state.demoPlayerBans.push({
+            name,
+            ...(player.uuid ? { uuid: player.uuid } : {}),
+            banned: action === "ban",
+            reason: req.body.reason?.trim() ?? "",
+          });
+          if (action === "ban") onlinePlayers.delete(name.toLowerCase());
+        }
+        append(
+          `[${mode === "demo" ? "Demo" : "Panel"}] ${mode === "demo" ? "Simulated" : "Requested"}: ${command}`,
+        );
+        await audit(
+          "player",
+          `${action === "unban" ? "Player unban" : action === "ban" ? "Player ban" : "Player kick"} ${mode === "demo" ? "simulated" : "requested"}`,
+          command,
+        );
+        res.json({
+          simulated: mode === "demo",
+          message:
+            mode === "demo"
+              ? `Demo: ${action} for ${name} was simulated. No live player or Minecraft ban file was changed.`
+              : `Requested ${command}. Check Console for Minecraft's confirmation; the saved player list updates after the server writes it.`,
+        });
+      }),
+    );
+  }
   for (const action of ["op", "deop"]) {
     app.post(
       `/api/players/${action}`,
@@ -1535,6 +1680,18 @@ export async function createPanel(options = {}) {
     }),
   );
 
+  app.get("/api/files/recycle-bin", async (_req, res) => {
+    res.json({ items: await recycleBin.list(), protected: true });
+  });
+  app.post(
+    "/api/files/recycle-bin/:id/restore",
+    trackOperation(async (req, res) => {
+      const restoredPath = await recycleBin.restore(req.params.id);
+      await audit("file", "File restored from Recycle Bin", restoredPath);
+      diskCache.at = 0;
+      res.json({ ok: true, path: restoredPath });
+    }),
+  );
   app.get("/api/files", async (req, res) => {
     const relative = req.query.path ?? "";
     const target = await safePath(serverDir, relative);
@@ -1675,10 +1832,10 @@ export async function createPanel(options = {}) {
       const target = await safePath(serverDir, relative);
       if (!(await exists(target)))
         throw error(404, "File or directory not found.");
-      await fs.rm(target, { recursive: true });
-      await audit("file", "File deleted", relative);
+      const recycled = await recycleBin.recycle(relative);
+      await audit("file", "Moved to Recycle Bin", relative);
       diskCache.at = 0;
-      res.json({ ok: true });
+      res.json({ ok: true, recycled });
     }),
   );
 
@@ -1972,6 +2129,7 @@ export async function createPanel(options = {}) {
               clearTimeout(timeout);
             }
           }
+          await playerHistory.flush();
           await saveChain;
         })();
       }

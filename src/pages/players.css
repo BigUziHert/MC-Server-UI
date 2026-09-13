@@ -1,6 +1,124 @@
 .players-page {
   min-width: 0;
 }
+.players-history-help,
+.players-history-warning {
+  margin: 0;
+  padding: 16px 23px;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.7;
+  border-bottom: 1px solid var(--border);
+}
+.players-history-warning {
+  display: flex;
+  gap: 9px;
+  color: #e1bb7c;
+}
+.players-history-warning svg {
+  flex-shrink: 0;
+  margin-top: 3px;
+}
+.players-history-list {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+}
+.players-history-row {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  padding: 20px 23px;
+}
+.players-history-row + .players-history-row {
+  border-top: 1px solid var(--border);
+}
+.players-history-identity {
+  min-width: 0;
+  flex: 1;
+  display: grid;
+  gap: 6px;
+  overflow-wrap: anywhere;
+}
+.players-history-identity strong {
+  font-size: 13px;
+  color: var(--text);
+}
+.players-history-identity span,
+.players-history-time {
+  font-size: 11px;
+  color: var(--muted);
+}
+.players-history-time {
+  display: grid;
+  gap: 5px;
+  margin-left: auto;
+}
+.players-history-time time {
+  color: var(--text);
+}
+.players-history-time small {
+  font-size: inherit;
+}
+.players-history-actions {
+  display: flex;
+  gap: 8px;
+  margin-left: 14px;
+  flex-shrink: 0;
+}
+.players-history-actions .players-remove {
+  margin-left: 0;
+}
+.players-history-empty {
+  padding: 36px 23px;
+  color: var(--muted);
+  text-align: center;
+  font-size: 12px;
+}
+.players-history-empty h3 {
+  color: var(--text);
+  font-size: 15px;
+  margin-bottom: 10px;
+}
+.players-history-empty p {
+  max-width: 520px;
+  margin: 0 auto;
+  line-height: 1.8;
+}
+.players-dialog {
+  max-height: calc(100dvh - 32px);
+  overflow-y: auto;
+}
+@media (max-width: 760px) {
+  .players-history-row {
+    flex-wrap: wrap;
+    gap: 12px;
+    padding: 18px 17px;
+  }
+  .players-history-identity {
+    flex-basis: calc(100% - 60px);
+  }
+  .players-history-time {
+    margin-left: 52px;
+    flex: 1;
+  }
+  .players-history-actions {
+    margin-left: 0;
+  }
+  .players-history-actions .btn {
+    padding: 8px 10px;
+  }
+  .players-history-help,
+  .players-history-warning {
+    padding: 14px 17px;
+  }
+}
+@media (max-width: 420px) {
+  .players-history-actions {
+    margin-left: 52px;
+    flex-basis: calc(100% - 52px);
+  }
+}
 .players-overview {
   display: grid;
   grid-template-columns: minmax(260px, 0.9fr) minmax(0, 1.5fr);

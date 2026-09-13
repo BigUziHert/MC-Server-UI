@@ -308,7 +308,7 @@ test("file manager creates and edits nested files and preserves upload/download 
     .click();
   await page
     .getByRole("dialog")
-    .getByRole("button", { name: "Delete permanently" })
+    .getByRole("button", { name: "Move to Recycle Bin", exact: true })
     .click();
   await expect(
     page.getByRole("button", { name: "uploaded.bin", exact: true }),
