@@ -611,7 +611,7 @@ test("permanent deletion confirms exact targets, retains failed selections, and 
       .getByRole("list", { name: "Confirmed recovery items" })
       .getByRole("listitem"),
   ).toHaveCount(1);
-  await expect(dialog).toContainText(treasure.id);
+  await expect(dialog).toContainText("/recovery/treasure.txt");
   await dialog.getByRole("button", { name: "Cancel", exact: true }).click();
   expect(purges).toEqual([]);
   await page
@@ -630,7 +630,7 @@ test("permanent deletion confirms exact targets, retains failed selections, and 
     name: "Confirmed recovery items",
   });
   await expect(targets.getByRole("listitem")).toHaveCount(2);
-  await expect(targets).not.toContainText(untouched.id);
+  await expect(targets).not.toContainText("/recovery/untouched.txt");
   await expect(dialog).toContainText("It cannot be undone.");
   await page.screenshot({
     path: testInfo.outputPath("recycle-permanent-delete-desktop.png"),
@@ -647,8 +647,8 @@ test("permanent deletion confirms exact targets, retains failed selections, and 
     dialog.getByRole("list", { name: "Recovery action errors" }),
   ).toContainText("Fixture recovery file is locked");
   await expect(targets.getByRole("listitem")).toHaveCount(1);
-  await expect(targets).toContainText(folder.id);
-  await expect(targets).not.toContainText(treasure.id);
+  await expect(targets).toContainText("/recovery/archive");
+  await expect(targets).not.toContainText("/recovery/treasure.txt");
   expect(new Set(purges)).toEqual(new Set([folder.id, treasure.id]));
   expect(purges).toHaveLength(2);
   blocked = false;
