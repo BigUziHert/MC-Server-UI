@@ -13,6 +13,14 @@ import {
 export { providerJson };
 
 const types = ["mod", "modpack", "datapack", "plugin"];
+const sorts = new Set([
+  "relevance",
+  "downloads",
+  "popular",
+  "updated",
+  "newest",
+  "name",
+]);
 const loaders = [
   "fabric",
   "forge",
@@ -507,6 +515,10 @@ export async function createLaunchpad(ctx) {
         id: value.id,
         name: value.name,
         types: value.types,
+        sortOptions: (value.sortOptions ?? []).map(({ id, label }) => ({
+          id,
+          label,
+        })),
         available:
           value.available !== false && (!value.requiresKey || !!secret),
         requiresKey: !!value.requiresKey,
@@ -1213,6 +1225,15 @@ export async function createLaunchpad(ctx) {
       const found = await provider(input.platform);
       if (!found.types.includes(input.type))
         throw error(400, "This provider does not support this content type.");
+      if (
+        input.sort !== undefined &&
+        input.sort !== "" &&
+        (typeof input.sort !== "string" ||
+          !sorts.has(input.sort) ||
+          !found.sortOptions?.some((option) => option.id === input.sort))
+      )
+        throw error(400, "Choose a sort order supported by this provider.");
+      input.sort ||= undefined;
       return found.search(input);
     },
     async versions(input) {

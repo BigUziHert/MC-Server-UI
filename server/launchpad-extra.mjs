@@ -74,6 +74,44 @@ const text = (value) =>
 const compatible = (version, input) =>
   (!input.gameVersion || version.gameVersions.includes(input.gameVersion)) &&
   (!input.loader || version.loaders.includes(input.loader));
+const sortNumber = (value) =>
+  value !== null &&
+  value !== undefined &&
+  value !== "" &&
+  Number.isFinite(Number(value)) &&
+  Number(value) >= 0
+    ? Number(value)
+    : -Infinity;
+const latestTimestamp = (values) =>
+  values.reduce(
+    (latest, value) => Math.max(latest, sortNumber(value)),
+    -Infinity,
+  );
+// Decorate the complete matching catalog before paging, without changing cached
+// provider order. Names and IDs break ties so page boundaries remain stable.
+function sortCatalog(entries, sort, numericValues = {}) {
+  if (!sort) return entries;
+  if (sort !== "name" && !numericValues[sort]) return entries;
+  return entries
+    .map((entry) => ({
+      entry,
+      name: text(entry.name ?? entry.title),
+      value: sort === "name" ? 0 : sortNumber(numericValues[sort](entry)),
+    }))
+    .sort(
+      (a, b) =>
+        b.value - a.value ||
+        a.name.localeCompare(b.name, "en", {
+          sensitivity: "base",
+          numeric: true,
+        }) ||
+        String(a.entry.id ?? a.entry.safeName).localeCompare(
+          String(b.entry.id ?? b.entry.safeName),
+          "en",
+        ),
+    )
+    .map(({ entry }) => entry);
+}
 const resultPage = (projects, input, warnings = []) => ({
   projects: projects.slice(input.offset, input.offset + input.limit),
   total: projects.length,
@@ -288,6 +326,13 @@ export function createExtraProviders({ fetch: request = fetch, json } = {}) {
     name: "Feed The Beast",
     types: ["modpack"],
     available: true,
+    sortOptions: [
+      { id: "downloads", label: "Most installed" },
+      { id: "popular", label: "Most played" },
+      { id: "updated", label: "Recently updated" },
+      { id: "newest", label: "Newest" },
+      { id: "name", label: "Name (A–Z)" },
+    ],
     downloadHosts: ftbHosts,
     async search(input) {
       requiredType(input, "modpack");
@@ -301,24 +346,34 @@ export function createExtraProviders({ fetch: request = fetch, json } = {}) {
       const packs = await pooled(index.packs.slice(0, 500), (id) =>
         ftbPack(String(id)),
       );
-      const projects = packs
-        .filter(
-          (pack) =>
-            !pack.private &&
-            (pack.versions ?? []).some((version) =>
-              compatible(ftbVersion(version), input),
-            ),
-        )
-        .map((pack) => ({
-          id: String(pack.id),
-          platform: "ftb",
-          title: pack.name,
-          description: text(pack.synopsis),
-          iconUrl: pack.art?.find((art) => art.type === "square")?.url,
-          downloads: pack.installs,
-          author: pack.authors?.map((author) => author.name).join(", "),
-          url: `https://www.feed-the-beast.com/modpacks/${pack.id}`,
-        }));
+      const matching = packs.filter(
+        (pack) =>
+          !pack.private &&
+          (pack.versions ?? []).some((version) =>
+            compatible(ftbVersion(version), input),
+          ),
+      );
+      const projects = sortCatalog(matching, input.sort, {
+        downloads: (pack) => pack.installs,
+        popular: (pack) => pack.plays,
+        updated: (pack) =>
+          latestTimestamp([
+            pack.updated,
+            ...(pack.versions ?? [])
+              .filter((version) => !version.private)
+              .flatMap((version) => [version.updated, version.released]),
+          ]),
+        newest: (pack) => pack.released,
+      }).map((pack) => ({
+        id: String(pack.id),
+        platform: "ftb",
+        title: pack.name,
+        description: text(pack.synopsis),
+        iconUrl: pack.art?.find((art) => art.type === "square")?.url,
+        downloads: pack.installs,
+        author: pack.authors?.map((author) => author.name).join(", "),
+        url: `https://www.feed-the-beast.com/modpacks/${pack.id}`,
+      }));
       return resultPage(projects, input);
     },
     async versions(input) {
@@ -426,6 +481,10 @@ export function createExtraProviders({ fetch: request = fetch, json } = {}) {
     name: "ATLauncher",
     types: ["modpack"],
     available: true,
+    sortOptions: [
+      { id: "updated", label: "Recently updated" },
+      { id: "name", label: "Name (A–Z)" },
+    ],
     downloadHosts: atHosts,
     async search(input) {
       requiredType(input, "modpack");
@@ -439,7 +498,12 @@ export function createExtraProviders({ fetch: request = fetch, json } = {}) {
               !input.gameVersion || version.minecraft === input.gameVersion,
           ),
       );
-      const projects = packs.map((pack) => ({
+      const projects = sortCatalog(packs, input.sort, {
+        updated: (pack) =>
+          latestTimestamp(
+            (pack.versions ?? []).map((version) => version.published),
+          ),
+      }).map((pack) => ({
         id: pack.safeName,
         platform: "atlauncher",
         title: pack.name,
@@ -607,6 +671,12 @@ export function createExtraProviders({ fetch: request = fetch, json } = {}) {
     name: "Spigot",
     types: ["plugin"],
     available: true,
+    sortOptions: [
+      { id: "downloads", label: "Most downloaded" },
+      { id: "updated", label: "Recently updated" },
+      { id: "newest", label: "Newest" },
+      { id: "name", label: "Name (A–Z)" },
+    ],
     downloadHosts: spigotHosts,
     async search(input) {
       requiredType(input, "plugin");
@@ -619,7 +689,14 @@ export function createExtraProviders({ fetch: request = fetch, json } = {}) {
         : input.gameVersion
           ? `/resources/for/${enc(input.gameVersion)}?method=any`
           : "/resources/free?";
-      const url = `${SPIGOT}${route}${route.endsWith("?") ? "" : "&"}size=${input.limit}&page=${Math.floor(input.offset / input.limit) + 1}&sort=-downloads&fields=${enc(fields)}`;
+      const sort =
+        {
+          downloads: "-downloads",
+          updated: "-updateDate",
+          newest: "-releaseDate",
+          name: "name",
+        }[input.sort] ?? "-downloads";
+      const url = `${SPIGOT}${route}${route.endsWith("?") ? "" : "&"}size=${input.limit}&page=${Math.floor(input.offset / input.limit) + 1}&sort=${sort}&fields=${enc(fields)}`;
       const loaded = await remember(url, async () => {
         const reply = await read(url, ["api.spiget.org"]);
         try {
@@ -849,6 +926,7 @@ export function createExtraProviders({ fetch: request = fetch, json } = {}) {
     name: "Voids Wrath",
     types: ["modpack"],
     available: true,
+    sortOptions: [{ id: "name", label: "Name (A–Z)" }],
     downloadHosts: voidHosts,
     async search(input) {
       requiredType(input, "modpack");
@@ -858,7 +936,7 @@ export function createExtraProviders({ fetch: request = fetch, json } = {}) {
           (!input.gameVersion || input.gameVersion === pack.gameVersion) &&
           (!input.loader || input.loader === "forge"),
       );
-      return resultPage(packs, input);
+      return resultPage(sortCatalog(packs, input.sort), input);
     },
     async versions(input) {
       requiredType(input, "modpack");

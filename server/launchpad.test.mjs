@@ -780,6 +780,218 @@ test("CurseForge pagination supports 100 rows without skipping its 50-row API pa
   assert.equal(result.limit, 100);
 });
 
+test("Launchpad advertises only supported provider sorts and rejects unsupported or malformed choices before searching", async (t) => {
+  const f = await fixture(t);
+  const config = await f.service.config();
+  assert.deepEqual(
+    config.platforms.find((value) => value.id === "modrinth").sortOptions,
+    [
+      { id: "downloads", label: "Most downloaded" },
+      { id: "relevance", label: "Relevance" },
+      { id: "popular", label: "Most followed" },
+      { id: "updated", label: "Recently updated" },
+      { id: "newest", label: "Newest" },
+    ],
+  );
+  assert.deepEqual(
+    config.platforms
+      .find((value) => value.id === "curseforge")
+      .sortOptions.map((value) => value.id),
+    ["popular", "downloads", "updated", "newest", "name"],
+  );
+  let requests = f.requests.length;
+  for (const sort of ["name", "random", null, [], {}, 1, "downloads&offset=0"])
+    await assert.rejects(f.service.search({ ...selection, sort }), {
+      status: 400,
+    });
+  assert.equal(f.requests.length, requests);
+  await f.service.settings({ curseforgeApiKey: "fixture-key" });
+  requests = f.requests.length;
+  await assert.rejects(
+    f.service.search({
+      ...selection,
+      platform: "curseforge",
+      sort: "relevance",
+    }),
+    { status: 400 },
+  );
+  assert.equal(f.requests.length, requests);
+  let selected;
+  const extra = await f.boot({
+    extraProviders: [
+      {
+        id: "fixturecatalog",
+        name: "Fixture catalog",
+        types: ["mod"],
+        available: true,
+        sortOptions: [{ id: "updated", label: "Recently updated" }],
+        search: async (input) => {
+          selected = input;
+          return { projects: [] };
+        },
+      },
+    ],
+  });
+  assert.deepEqual(
+    (await extra.config()).platforms.find(
+      (value) => value.id === "fixturecatalog",
+    ).sortOptions,
+    [{ id: "updated", label: "Recently updated" }],
+  );
+  await extra.search({
+    ...selection,
+    platform: "fixturecatalog",
+    sort: "updated",
+    offset: 40,
+  });
+  assert.equal(selected.sort, "updated");
+  assert.equal(selected.offset, 40);
+  await assert.rejects(
+    extra.search({
+      ...selection,
+      platform: "fixturecatalog",
+      sort: "downloads",
+    }),
+    { status: 400 },
+  );
+});
+
+test("Modrinth sorting is applied upstream before pagination and explicit sorts override query relevance", async (t) => {
+  const requested = [];
+  const f = await fixture(t, {
+    request: async (url) => {
+      const address = new URL(url);
+      if (address.pathname !== "/v2/search") return;
+      const query = address.searchParams;
+      requested.push(Object.fromEntries(query));
+      const start = Number(query.get("offset")),
+        count = Number(query.get("limit"));
+      // The provider's whole-catalog ordering intentionally disagrees with title
+      // order, so the panel must preserve the returned page without re-sorting.
+      const globallySorted = Array.from({ length: 100 }, (_, index) => ({
+        project_id: `${query.get("index")}-${99 - index}`,
+        title: `Project ${99 - index}`,
+        downloads: index,
+      }));
+      return Response.json({
+        hits: globallySorted.slice(start, start + count),
+        total_hits: 100,
+        offset: start,
+        limit: count,
+      });
+    },
+  });
+  for (const [sort, expected] of [
+    ["relevance", "relevance"],
+    ["downloads", "downloads"],
+    ["popular", "follows"],
+    ["updated", "updated"],
+    ["newest", "newest"],
+  ]) {
+    const result = await f.service.search({
+      ...selection,
+      query: "camera",
+      sort,
+      offset: 40,
+      limit: 20,
+    });
+    assert.equal(requested.at(-1).index, expected);
+    assert.equal(requested.at(-1).query, "camera");
+    assert.deepEqual(JSON.parse(requested.at(-1).facets), [
+      ["all_project_types:mod"],
+      ["server_side!=unsupported"],
+      ["versions:1.21.1"],
+      ["categories:neoforge"],
+    ]);
+    assert.equal(result.total, 100);
+    assert.equal(result.offset, 40);
+    assert.deepEqual(
+      result.projects.map((value) => value.id),
+      Array.from({ length: 20 }, (_, index) => `${expected}-${59 - index}`),
+    );
+  }
+  await f.service.search({ ...selection, query: "camera" });
+  assert.equal(requested.at(-1).index, "relevance");
+  await f.service.search({ ...selection, query: "" });
+  assert.equal(requested.at(-1).index, "downloads");
+  await f.service.search({ ...selection, query: "camera", sort: "" });
+  assert.equal(requested.at(-1).index, "relevance");
+});
+
+test("CurseForge applies each supported sort to both upstream pages including alphabetical direction", async (t) => {
+  const pages = [];
+  const f = await fixture(t, {
+    request: async (url) => {
+      const address = new URL(url);
+      if (address.pathname === "/v1/categories")
+        return Response.json({
+          data: [{ id: 6, slug: "mc-mods", name: "Mods" }],
+        });
+      if (address.pathname !== "/v1/mods/search") return;
+      const query = Object.fromEntries(address.searchParams);
+      pages.push(query);
+      const start = Number(query.index),
+        count = Number(query.pageSize),
+        field = Number(query.sortField);
+      const globallySorted = Array.from({ length: 300 }, (_, index) => ({
+        id: field * 1000 + 299 - index,
+        name: `Project ${299 - index}`,
+      }));
+      return Response.json({
+        data: globallySorted.slice(start, start + count),
+        pagination: { totalCount: 300 },
+      });
+    },
+  });
+  await f.service.settings({ curseforgeApiKey: "fixture-key" });
+  for (const [sort, field, order] of [
+    ["popular", 2, "desc"],
+    ["downloads", 6, "desc"],
+    ["updated", 3, "desc"],
+    ["newest", 11, "desc"],
+    ["name", 4, "asc"],
+    [undefined, 2, "desc"],
+  ]) {
+    pages.length = 0;
+    const result = await f.service.search({
+      ...selection,
+      platform: "curseforge",
+      query: "camera",
+      sort,
+      offset: 100,
+      limit: 100,
+    });
+    assert.deepEqual(
+      pages.map((value) => [
+        value.index,
+        value.pageSize,
+        value.sortField,
+        value.sortOrder,
+      ]),
+      [
+        ["100", "50", String(field), order],
+        ["150", "50", String(field), order],
+      ],
+    );
+    assert.ok(
+      pages.every(
+        (value) =>
+          value.searchFilter === "camera" &&
+          value.gameVersion === "1.21.1" &&
+          value.modLoaderType === "6",
+      ),
+    );
+    assert.equal(result.total, 300);
+    assert.equal(result.offset, 100);
+    assert.deepEqual(
+      result.projects.map((value) => value.id),
+      Array.from({ length: 100 }, (_, index) =>
+        String(field * 1000 + 199 - index),
+      ),
+    );
+  }
+});
+
 test("direct pack files merge with server ZIP overrides and preserve worlds, EULA, RAM and existing startup files", async (t) => {
   const f = await fixture(t);
   const archive = zip([

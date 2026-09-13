@@ -46,6 +46,30 @@ function mrVersion(value) {
   };
 }
 const cfLoaders = { forge: 1, fabric: 4, quilt: 5, neoforge: 6 };
+// Provider sorting is sent with the upstream request, before its pagination.
+// https://docs.modrinth.com/api/operations/searchprojects/
+const mrSortOptions = [
+  { id: "downloads", label: "Most downloaded" },
+  { id: "relevance", label: "Relevance" },
+  { id: "popular", label: "Most followed" },
+  { id: "updated", label: "Recently updated" },
+  { id: "newest", label: "Newest" },
+];
+// https://docs.curseforge.com/rest-api/#modssearchsortfield
+const cfSortOptions = [
+  { id: "popular", label: "Most popular" },
+  { id: "downloads", label: "Most downloaded" },
+  { id: "updated", label: "Recently updated" },
+  { id: "newest", label: "Newest" },
+  { id: "name", label: "Name (A–Z)" },
+];
+const cfSortFields = {
+  popular: 2,
+  downloads: 6,
+  updated: 3,
+  newest: 11,
+  name: 4,
+};
 function cfVersion(value, type) {
   const versions = value.gameVersions ?? [];
   return {
@@ -137,6 +161,7 @@ export function createCoreProviders({
       name: "Modrinth",
       types: ["mod", "modpack", "datapack", "plugin"],
       available: true,
+      sortOptions: mrSortOptions,
       downloadHosts: ["cdn.modrinth.com"],
       async search(input) {
         const facets = [
@@ -150,7 +175,10 @@ export function createCoreProviders({
           facets: JSON.stringify(facets),
           offset: String(input.offset),
           limit: String(input.limit),
-          index: input.query ? "relevance" : "downloads",
+          index:
+            input.sort === "popular"
+              ? "follows"
+              : input.sort || (input.query ? "relevance" : "downloads"),
         });
         const result = await json(`${mr}/search?${query}`);
         return {
@@ -275,6 +303,7 @@ export function createCoreProviders({
       types: ["mod", "modpack", "datapack", "plugin"],
       available: true,
       requiresKey: true,
+      sortOptions: cfSortOptions,
       downloadHosts: [
         "edge.forgecdn.net",
         "mediafilez.forgecdn.net",
@@ -287,8 +316,8 @@ export function createCoreProviders({
           searchFilter: input.query,
           index: String(input.offset),
           pageSize: String(Math.min(input.limit, 50)),
-          sortField: "2",
-          sortOrder: "desc",
+          sortField: String(cfSortFields[input.sort || "popular"]),
+          sortOrder: input.sort === "name" ? "asc" : "desc",
         });
         if (input.gameVersion) query.set("gameVersion", input.gameVersion);
         if (cfLoaders[input.loader])

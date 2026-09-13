@@ -353,3 +353,273 @@ test("Launchpad separates mod and plugin loaders and defaults Paper to Plugins",
     "datapack",
   );
 });
+
+test("Launchpad catalog sorting sends scoped choices and resets pagination with platform-specific fallbacks", async ({
+  page,
+  serverId,
+}) => {
+  const searches: URL[] = [];
+  await page.route("**/api/launchpad", (route) =>
+    route.fulfill({
+      json: {
+        platforms: [
+          {
+            id: "modrinth",
+            name: "Modrinth",
+            available: true,
+            types: ["mod"],
+            sortOptions: [
+              { id: "downloads", label: "Most downloaded" },
+              { id: "updated", label: "Recently updated" },
+              { id: "newest", label: "Newest" },
+            ],
+          },
+          {
+            id: "curseforge",
+            name: "CurseForge",
+            available: true,
+            types: ["mod"],
+            sortOptions: [
+              { id: "popular", label: "Most popular" },
+              { id: "downloads", label: "Most downloaded" },
+              { id: "name", label: "Name (A–Z)" },
+            ],
+          },
+        ],
+        gameVersion: "1.21.1",
+        gameVersions: ["1.21.1"],
+        loader: "neoforge",
+        status: "offline",
+        warnings: [],
+      },
+    }),
+  );
+  await page.route("**/api/launchpad/installed?**", (route) =>
+    route.fulfill({ json: { items: [], warnings: [] } }),
+  );
+  await page.route("**/api/launchpad/search?**", (route) => {
+    expect(route.request().headers()["x-server-id"]).toBe(serverId);
+    const url = new URL(route.request().url());
+    searches.push(url);
+    const offset = Number(url.searchParams.get("offset"));
+    const limit = Number(url.searchParams.get("limit"));
+    const sort = url.searchParams.get("sort");
+    const platform = url.searchParams.get("platform")!;
+    return route.fulfill({
+      json: {
+        projects: Array.from(
+          { length: Math.min(limit, 23 - offset) },
+          (_, index) => ({
+            id: `${platform}-${sort}-${offset + index}`,
+            platform,
+            title: `${sort} result ${offset + index + 1}`,
+            description: "Deterministic catalog fixture",
+          }),
+        ),
+        total: 23,
+        offset,
+        limit,
+      },
+    });
+  });
+  const lastSearch = () =>
+    Object.fromEntries(searches.at(-1)?.searchParams ?? []);
+  await page.goto("/#launchpad");
+  const sort = page.getByLabel("Sort Launchpad", { exact: true });
+  await expect(sort).toHaveValue("downloads");
+  await expect(page.getByRole("article").first()).toHaveAccessibleName(
+    "downloads result 1",
+  );
+  await page.getByLabel("Search Launchpad", { exact: true }).fill("copper");
+  await expect
+    .poll(lastSearch)
+    .toMatchObject({ sort: "downloads", query: "copper", offset: "0" });
+  await page
+    .getByRole("button", { name: "Next Launchpad page", exact: true })
+    .click();
+  await expect(page.getByRole("status", { name: "Launchpad page" })).toHaveText(
+    "Page 2 of 3",
+  );
+  await expect
+    .poll(lastSearch)
+    .toMatchObject({ sort: "downloads", offset: "10" });
+  await sort.selectOption("updated");
+  await expect
+    .poll(lastSearch)
+    .toMatchObject({
+      platform: "modrinth",
+      sort: "updated",
+      query: "copper",
+      offset: "0",
+    });
+  await expect(page.getByRole("status", { name: "Launchpad page" })).toHaveText(
+    "Page 1 of 3",
+  );
+  await expect(page.getByRole("article").first()).toHaveAccessibleName(
+    "updated result 1",
+  );
+  await page
+    .getByRole("button", { name: "Next Launchpad page", exact: true })
+    .click();
+  await expect(page.getByRole("status", { name: "Launchpad page" })).toHaveText(
+    "Page 2 of 3",
+  );
+  await page.getByLabel("Platform", { exact: true }).selectOption("curseforge");
+  await expect(sort).toHaveValue("popular");
+  await expect(sort.locator("option")).toHaveText([
+    "Most popular",
+    "Most downloaded",
+    "Name (A–Z)",
+  ]);
+  await expect
+    .poll(lastSearch)
+    .toMatchObject({
+      platform: "curseforge",
+      sort: "popular",
+      query: "copper",
+      offset: "0",
+    });
+  await expect(page.getByRole("article").first()).toHaveAccessibleName(
+    "popular result 1",
+  );
+  await sort.selectOption("downloads");
+  await page.getByLabel("Platform", { exact: true }).selectOption("modrinth");
+  await expect(sort).toHaveValue("downloads");
+  await expect
+    .poll(lastSearch)
+    .toMatchObject({ platform: "modrinth", sort: "downloads", offset: "0" });
+});
+
+test("Launchpad installed updates sort before pagination and keep priority when searched on mobile", async ({
+  page,
+}) => {
+  const current = [
+    "Alpha Mod 10",
+    "alpha Mod 2",
+    "Alpha Mod 1",
+    "Bravo Mod 1",
+    "Delta Mod 1",
+    "Echo Mod 1",
+    "Foxtrot Mod 1",
+    "Golf Mod 1",
+  ];
+  const updates = [
+    "Zeta Mod 10",
+    "Zeta Mod 2",
+    "zeta Mod 1",
+    "Beta Mod 1",
+    "Alpha Mod 9",
+    "Gamma Mod 2",
+    "Gamma Mod 1",
+  ];
+  const version = {
+    id: "new",
+    name: "New version",
+    version: "2.0",
+    gameVersions: ["1.21.1"],
+    loaders: ["neoforge"],
+    publishedAt: "2026-09-01T00:00:00Z",
+    downloadable: true,
+  };
+  await page.route("**/api/launchpad", (route) =>
+    route.fulfill({
+      json: {
+        platforms: [
+          {
+            id: "modrinth",
+            name: "Modrinth",
+            available: true,
+            types: ["mod"],
+            sortOptions: [{ id: "downloads", label: "Most downloaded" }],
+          },
+        ],
+        gameVersion: "1.21.1",
+        gameVersions: ["1.21.1"],
+        loader: "neoforge",
+        status: "offline",
+        warnings: [],
+      },
+    }),
+  );
+  await page.route("**/api/launchpad/search?**", (route) =>
+    route.fulfill({ json: { projects: [], total: 0, offset: 0, limit: 10 } }),
+  );
+  await page.route("**/api/launchpad/installed?**", (route) =>
+    route.fulfill({
+      json: {
+        items: [...current, ...updates].map((title, index) => ({
+          path: `mods/fixture-${index}.jar`,
+          name: `fixture-${index}.jar`,
+          size: 1024,
+          platform: "modrinth",
+          projectId: `project-${index}`,
+          versionId: "old",
+          versionName: "1.0",
+          title,
+          ...(index >= current.length ? { update: version } : {}),
+        })),
+        warnings: [],
+      },
+    }),
+  );
+  await page.goto("/#launchpad");
+  await expect(
+    page.getByLabel("Sort Launchpad", { exact: true }),
+  ).toBeVisible();
+  await page.getByRole("switch", { name: "Show installed content" }).check();
+  await expect(page.getByLabel("Sort Launchpad", { exact: true })).toHaveCount(
+    0,
+  );
+  await expect(page.getByText("Updates first", { exact: true })).toBeVisible();
+  await page
+    .getByLabel("Launchpad rows per page", { exact: true })
+    .selectOption("5");
+  const names = page.getByRole("article").getByRole("heading", { level: 3 });
+  const first = [
+    "Alpha Mod 9",
+    "Beta Mod 1",
+    "Gamma Mod 1",
+    "Gamma Mod 2",
+    "zeta Mod 1",
+  ];
+  await expect(names).toHaveText(first);
+  await expect(page.getByRole("button", { name: /^Update / })).toHaveCount(5);
+  await expect(page.getByRole("status", { name: "Launchpad page" })).toHaveText(
+    "Page 1 of 3",
+  );
+  await page
+    .getByRole("button", { name: "Next Launchpad page", exact: true })
+    .click();
+  await expect(names).toHaveText([
+    "Zeta Mod 2",
+    "Zeta Mod 10",
+    "Alpha Mod 1",
+    "alpha Mod 2",
+    "Alpha Mod 10",
+  ]);
+  await expect(page.getByRole("button", { name: /^Update / })).toHaveCount(2);
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.getByLabel("Search Launchpad", { exact: true }).fill("alpha");
+  await expect(names).toHaveText([
+    "Alpha Mod 9",
+    "Alpha Mod 1",
+    "alpha Mod 2",
+    "Alpha Mod 10",
+  ]);
+  await expect(page.getByRole("status", { name: "Launchpad page" })).toHaveText(
+    "Page 1 of 1",
+  );
+  await expect(
+    page.getByRole("button", { name: "Next Launchpad page", exact: true }),
+  ).toBeDisabled();
+  expect(
+    await page.evaluate(
+      () => document.documentElement.scrollWidth <= window.innerWidth,
+    ),
+  ).toBe(true);
+  await page.getByLabel("Search Launchpad", { exact: true }).fill("");
+  await expect(names).toHaveText(first);
+  await expect(page.getByRole("status", { name: "Launchpad page" })).toHaveText(
+    "Page 1 of 3",
+  );
+});

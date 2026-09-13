@@ -8,6 +8,7 @@ import {
 import {
   AlertCircle,
   ArrowRight,
+  ArrowDownWideNarrow,
   Check,
   ChevronLeft,
   ChevronRight,
@@ -38,6 +39,7 @@ type Platform = {
   types: ContentType[];
   requiresKey?: boolean;
   keyConfigured?: boolean;
+  sortOptions?: { id: string; label: string }[];
 };
 type Version = {
   id: string;
@@ -176,6 +178,7 @@ export default function Launchpad({ notify }: PageProps) {
   const [loader, setLoader] = useState("");
   const [status, setStatus] = useState<string | null>(null);
   const [query, setQuery] = useState("");
+  const [sort, setSort] = useState("downloads");
   const [installedOnly, setInstalledOnly] = useState(false);
   const [offset, setOffset] = useState(0);
   const [limit, setLimit] = useState(() => {
@@ -219,6 +222,10 @@ export default function Launchpad({ notify }: PageProps) {
   const settingsDialog = useRef<HTMLDialogElement>(null);
   const tabs = useRef<HTMLDivElement>(null);
   const source = config?.platforms.find((item) => item.id === platform);
+  const sortOptions = source?.sortOptions ?? [];
+  const catalogSort = sortOptions.some((item) => item.id === sort)
+    ? sort
+    : (sortOptions[0]?.id ?? "");
   const supported = Boolean(source?.types.includes(type));
   const working = Boolean(job && ["queued", "running"].includes(job.status));
   const canInstall = status === "offline" && !working;
@@ -281,6 +288,7 @@ export default function Launchpad({ notify }: PageProps) {
     setSettingsOpen(false);
     setApiKey("");
     setQuery("");
+    setSort("downloads");
     setOffset(0);
     setInstalledOnly(false);
     setBusy(null);
@@ -315,7 +323,7 @@ export default function Launchpad({ notify }: PageProps) {
     setSearchError("");
     const timer = window.setTimeout(() => {
       void api<SearchResult>(
-        `/launchpad/search?${queryString({ platform, type, query: query.trim(), gameVersion: gameVersion.trim(), loader, offset, limit })}`,
+        `/launchpad/search?${queryString({ platform, type, query: query.trim(), gameVersion: gameVersion.trim(), loader, sort: catalogSort, offset, limit })}`,
         { signal: controller.signal },
       )
         .then((next) => {
@@ -344,6 +352,7 @@ export default function Launchpad({ notify }: PageProps) {
     platform,
     type,
     query,
+    catalogSort,
     gameVersion,
     loader,
     offset,
@@ -615,13 +624,23 @@ export default function Launchpad({ notify }: PageProps) {
     setQuery("");
     setOffset(0);
   }
-  const entries = (installed?.items ?? []).filter(
-    (entry) =>
-      (!entry.platform || entry.platform === platform) &&
-      `${entry.title ?? ""} ${entry.name} ${entry.path}`
-        .toLowerCase()
-        .includes(query.trim().toLowerCase()),
-  );
+  const entries = (installed?.items ?? [])
+    .filter(
+      (entry) =>
+        (!entry.platform || entry.platform === platform) &&
+        `${entry.title ?? ""} ${entry.name} ${entry.path}`
+          .toLowerCase()
+          .includes(query.trim().toLowerCase()),
+    )
+    .sort(
+      (a, b) =>
+        Number(Boolean(b.update)) - Number(Boolean(a.update)) ||
+        (a.title ?? a.name).localeCompare(b.title ?? b.name, undefined, {
+          sensitivity: "base",
+          numeric: true,
+        }) ||
+        a.path.localeCompare(b.path),
+    );
   const total = installedOnly ? entries.length : (results?.total ?? 0);
   const currentOffset = Math.min(
     offset,
@@ -898,6 +917,30 @@ export default function Launchpad({ notify }: PageProps) {
             }}
           />
         </label>
+        {installedOnly ? (
+          <span className="launchpad-sort-info">
+            <ArrowDownWideNarrow size={16} aria-hidden="true" />
+            Updates first
+          </span>
+        ) : sortOptions.length > 0 ? (
+          <label className="launchpad-sort">
+            Sort by
+            <select
+              aria-label="Sort Launchpad"
+              value={catalogSort}
+              onChange={(event) => {
+                setSort(event.target.value);
+                setOffset(0);
+              }}
+            >
+              {sortOptions.map((item) => (
+                <option key={item.id} value={item.id}>
+                  {item.label}
+                </option>
+              ))}
+            </select>
+          </label>
+        ) : null}
         <label className="launchpad-installed-toggle">
           <input
             type="checkbox"

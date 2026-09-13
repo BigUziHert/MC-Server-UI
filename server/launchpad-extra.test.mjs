@@ -67,6 +67,169 @@ test("extra source capabilities expose only supported content types", () => {
       { id: "voidswrath", types: ["modpack"], available: true },
     ],
   );
+  assert.deepEqual(
+    Object.fromEntries(
+      providers.map(({ id, sortOptions }) => [
+        id,
+        sortOptions.map((option) => option.id),
+      ]),
+    ),
+    {
+      spigot: ["downloads", "updated", "newest", "name"],
+      ftb: ["downloads", "popular", "updated", "newest", "name"],
+      atlauncher: ["updated", "name"],
+      voidswrath: ["name"],
+    },
+  );
+  assert.equal(
+    providers.find(({ id }) => id === "ftb").sortOptions[1].label,
+    "Most played",
+  );
+});
+
+test("FTB sorts every matching pack before paging and preserves the default cached order", async () => {
+  const names = [
+    "Golf",
+    "Alpha",
+    "Echo",
+    "Charlie",
+    "Foxtrot",
+    "Bravo",
+    "Delta",
+    "Hotel",
+  ];
+  const installs = [10, 70, 30, 50, 20, 60, 40];
+  const plays = [70, 10, 60, 20, 50, 30, 40];
+  const released = [100, 300, 200, 700, 400, 500, 600];
+  const updated = [80, 30, 10, 70, 20, 60, 50];
+  const packs = names.map((name, index) => ({
+    id: index + 1,
+    name,
+    installs: installs[index],
+    plays: plays[index],
+    released: released[index],
+    updated: updated[index],
+    versions: [
+      { ...version, released: 1 },
+      ...(index === 3 ? [{ ...version, released: 99 }] : []),
+    ],
+  }));
+  packs.push({ ...packs[0], id: 9, private: true, installs: 1000 });
+  packs.push({ ...packs[0], id: 10, installs: 1000, versions: [] });
+  const data = Object.fromEntries(
+    packs.map((pack) => [`${FTB}/${pack.id}`, pack]),
+  );
+  data[`${FTB}/search/500?term=fixture`] = {
+    packs: packs.map((pack) => pack.id),
+  };
+  const { provider, requests } = fixture(data);
+  const input = { ...ftbSelection, query: "fixture", offset: 0, limit: 3 };
+  const expected = {
+    downloads: [2, 6, 4, 7, 3, 5, 1, 8],
+    popular: [1, 3, 5, 7, 6, 4, 2, 8],
+    updated: [4, 1, 6, 7, 2, 5, 3, 8],
+    newest: [4, 7, 6, 5, 2, 3, 1, 8],
+    name: [2, 6, 4, 7, 3, 5, 1, 8],
+  };
+  for (const [sort, order] of Object.entries(expected)) {
+    const pages = [];
+    for (const offset of [0, 3, 6]) {
+      const result = await provider("ftb").search({ ...input, sort, offset });
+      assert.equal(result.total, 8);
+      pages.push(...result.projects.map((project) => Number(project.id)));
+    }
+    assert.deepEqual(pages, order, sort);
+  }
+  const unchanged = await provider("ftb").search(input);
+  assert.deepEqual(
+    unchanged.projects.map(({ id }) => id),
+    ["1", "2", "3"],
+  );
+  assert.equal(
+    requests.length,
+    11,
+    "catalog and pack metadata remain cached across sorts",
+  );
+});
+
+test("ATLauncher sorts the complete filtered catalog by latest published version or name", async () => {
+  const data = [
+    ["Golf", [10, 80]],
+    ["Alpha", [30]],
+    ["Echo", [10]],
+    ["Charlie", [70]],
+    ["Foxtrot", [20]],
+    ["Bravo", [60]],
+    ["Delta", [50]],
+    ["Hotel", [null]],
+  ].map(([name, published]) => ({
+    name,
+    safeName: name,
+    description: "Fixture",
+    versions: published.map((time, index) => ({
+      version: String(index),
+      minecraft: "1.21.1",
+      published: time,
+    })),
+  }));
+  data.push({
+    name: "Excluded",
+    safeName: "Excluded",
+    description: "Fixture",
+    versions: [{ minecraft: "1.20.1", published: 1000 }],
+  });
+  const { provider, requests } = fixture({
+    [`${ATL}/packs/full/public`]: { data },
+  });
+  const input = {
+    type: "modpack",
+    query: "fixture",
+    gameVersion: "1.21.1",
+    loader: "",
+    offset: 0,
+    limit: 3,
+  };
+  for (const [sort, expected] of Object.entries({
+    updated: [
+      "Golf",
+      "Charlie",
+      "Bravo",
+      "Delta",
+      "Alpha",
+      "Foxtrot",
+      "Echo",
+      "Hotel",
+    ],
+    name: [
+      "Alpha",
+      "Bravo",
+      "Charlie",
+      "Delta",
+      "Echo",
+      "Foxtrot",
+      "Golf",
+      "Hotel",
+    ],
+  })) {
+    const titles = [];
+    for (const offset of [0, 3, 6]) {
+      const result = await provider("atlauncher").search({
+        ...input,
+        sort,
+        offset,
+      });
+      assert.equal(result.total, 8);
+      titles.push(...result.projects.map(({ title }) => title));
+    }
+    assert.deepEqual(titles, expected, sort);
+  }
+  assert.deepEqual(
+    (await provider("atlauncher").search(input)).projects.map(
+      ({ title }) => title,
+    ),
+    ["Golf", "Alpha", "Echo"],
+  );
+  assert.equal(requests.length, 1);
 });
 
 test("FTB search applies compatibility and resolves required server files with publisher hashes", async () => {
@@ -355,10 +518,113 @@ test("Spigot project paging uses provider totals and never fabricates download c
   assert.equal(result.offset, 10);
   assert.equal(result.projects[0].downloads, undefined);
   assert.match(requests[0], /page=3/);
+  assert.equal(new URL(requests[0]).searchParams.get("sort"), "-downloads");
+});
+
+test("Spigot delegates each advertised sort to the upstream catalog before pagination on every search route", async () => {
+  const { provider, requests } = fixture(
+    {},
+    () =>
+      new Response(
+        JSON.stringify([
+          { id: 8, name: "Zulu" },
+          { id: 3, name: "Alpha" },
+        ]),
+        { headers: { "x-total": "24" } },
+      ),
+  );
+  for (const [query, gameVersion, route] of [
+    ["", "", "/resources/free"],
+    ["", "1.21", "/resources/for/1.21"],
+    ["Fixture", "1.21", "/search/resources/Fixture"],
+  ]) {
+    for (const [sort, expected] of Object.entries({
+      downloads: "-downloads",
+      updated: "-updateDate",
+      newest: "-releaseDate",
+      name: "name",
+    })) {
+      const result = await provider("spigot").search({
+        type: "plugin",
+        query,
+        gameVersion,
+        loader: "paper",
+        offset: 10,
+        limit: 5,
+        sort,
+      });
+      const url = new URL(requests.at(-1));
+      assert.equal(url.pathname, `/v2${route}`);
+      assert.equal(url.searchParams.get("sort"), expected);
+      assert.equal(url.searchParams.get("page"), "3");
+      assert.equal(url.searchParams.get("size"), "5");
+      assert.equal(result.total, 24);
+      assert.deepEqual(
+        result.projects.map(({ id }) => id),
+        ["8", "3"],
+        "the upstream page order is retained",
+      );
+    }
+  }
 });
 
 const voidCatalog =
   '<a href="https://voidswrath.com/modpacks/fixture-pack/"><div class="mod-pack-thumb" style="background-image:url(\'https://voidswrath.com/icon.png\');"><div class="mod-pack-title-list">Fixture &amp; Pack</div><ul><li>Version: 1.0</li><li>Minecraft: 1.7.10</li></ul></div></a>';
+test("Voids Wrath sorts all matching names before pagination without inventing catalog dates", async () => {
+  const names = [
+    "Golf",
+    "Alpha",
+    "Echo",
+    "Charlie",
+    "Foxtrot",
+    "Bravo",
+    "Delta",
+  ];
+  const body = names
+    .map((name) =>
+      voidCatalog
+        .replace("fixture-pack", name.toLowerCase())
+        .replace("Fixture &amp; Pack", `${name} Pack`),
+    )
+    .join("");
+  const { provider, requests } = fixture({}, () => new Response(body));
+  const input = {
+    type: "modpack",
+    query: "Pack",
+    gameVersion: "1.7.10",
+    loader: "forge",
+    offset: 0,
+    limit: 3,
+  };
+  const sorted = [];
+  for (const offset of [0, 3, 6]) {
+    const result = await provider("voidswrath").search({
+      ...input,
+      sort: "name",
+      offset,
+    });
+    assert.equal(result.total, 7);
+    sorted.push(...result.projects.map(({ title }) => title));
+  }
+  assert.deepEqual(sorted, [
+    "Alpha Pack",
+    "Bravo Pack",
+    "Charlie Pack",
+    "Delta Pack",
+    "Echo Pack",
+    "Foxtrot Pack",
+    "Golf Pack",
+  ]);
+  const original = await provider("voidswrath").search(input);
+  assert.deepEqual(
+    original.projects.map(({ title }) => title),
+    ["Golf Pack", "Alpha Pack", "Echo Pack"],
+  );
+  assert.equal(original.projects[0].publishedAt, undefined);
+  assert.equal(original.projects[0].downloads, undefined);
+  assert.equal(requests.length, 1);
+});
+
 test("Voids Wrath discovers current official packs and verifies direct server archives", async () => {
   const { provider } = fixture({}, (url, options) => {
     if (url.endsWith("/mod-packs/")) return new Response(voidCatalog);

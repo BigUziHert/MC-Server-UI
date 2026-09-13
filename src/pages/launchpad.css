@@ -75,6 +75,28 @@
   font-size: 12px;
   white-space: nowrap;
 }
+.launchpad-sort,
+.launchpad-sort-info {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--muted);
+  font-size: 12px;
+  white-space: nowrap;
+}
+.launchpad-sort {
+  flex: 0 1 200px;
+  min-width: 0;
+}
+.launchpad-sort select {
+  width: 100%;
+  min-width: 0;
+  min-height: 37px;
+  font-size: 12px;
+}
+.launchpad-sort-info svg {
+  color: var(--accent);
+}
 .launchpad-installed-toggle input {
   width: 30px;
   height: 17px;
@@ -409,6 +431,9 @@
   .launchpad-pagination {
     flex-wrap: wrap;
     width: 100%;
+  }
+  .launchpad-sort {
+    flex-basis: 100%;
   }
   .launchpad-pagination > span {
     margin-left: auto;
