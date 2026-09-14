@@ -1002,6 +1002,7 @@ export async function createLaunchpad(ctx) {
     const files = [],
       warnings = [],
       unavailableDependencies = [],
+      recoveredDependencies = new Set(),
       attempted = new Set(),
       visited = new Map();
     let rootResult;
@@ -1022,6 +1023,7 @@ export async function createLaunchpad(ctx) {
           "This provider does not support the selected content type.",
         );
       let result;
+      let recoveringDependency = false;
       try {
         if (!value.projectId && value.versionId && found.version)
           value.projectId = String(
@@ -1041,6 +1043,33 @@ export async function createLaunchpad(ctx) {
             );
         }
         const key = `${value.platform}:${value.projectId}`;
+        if (visited.get(key) === String(value.versionId)) return;
+        try {
+          result = await found.resolve(value);
+        } catch (cause) {
+          if (
+            !depth ||
+            cause.code !== "INCOMPATIBLE_VERSION" ||
+            !found.compatibleDependencyVersion
+          )
+            throw cause;
+          recoveringDependency = true;
+          const compatible = await found.compatibleDependencyVersion(value);
+          if (!compatible)
+            throw error(
+              400,
+              `${cause.message} A matching release for this required dependency could not be verified. Choose another project version or correct the dependency before installing.`,
+            );
+          value.versionId = String(compatible.id);
+          // Resolve the actual target-loader artifact and its dependencies.
+          // The publisher's incorrect pin must never enter the install plan.
+          result = await found.resolve({
+            ...value,
+            expectedVersionNumber: compatible.version,
+          });
+          if (key !== `${input.platform}:${input.projectId}`)
+            recoveredDependencies.add(key);
+        }
         if (visited.has(key)) {
           if (visited.get(key) !== String(value.versionId))
             throw error(
@@ -1050,25 +1079,31 @@ export async function createLaunchpad(ctx) {
           return;
         }
         visited.set(key, String(value.versionId));
-        result = await found.resolve(value);
       } catch (cause) {
-        const incompatibleDependency =
-          depth > 0 && cause.code === "INCOMPATIBLE_VERSION";
-        if (cause.status !== 404 && !incompatibleDependency) throw cause;
+        if (cause.status !== 404) throw cause;
+        const key = `${value.platform}:${value.projectId}`;
+        if (visited.has(key) && visited.get(key) !== String(value.versionId))
+          throw error(
+            409,
+            "Required dependencies request conflicting versions of the same project. Resolve them manually before installing.",
+          );
+        if (recoveringDependency)
+          throw error(
+            400,
+            "A compatible release for a required dependency could not be verified. Choose another project version or correct the dependency before installing.",
+          );
         if (!depth)
           throw error(
             404,
             `${found.name} could not find the selected project or version. Refresh its versions and choose another release.`,
           );
-        // Missing or incompatible upstream dependency pins remain visible in
-        // the review. Never substitute a release or download an incompatible
-        // file; continuing requires explicit acknowledgement at installation.
+        // Missing catalog entries can be checked for bundled dependencies.
+        // Known incompatible dependencies must be resolved or block the plan.
         unavailableDependencies.push({
           platform: value.platform,
           projectId: value.projectId,
           versionId: value.versionId,
           requiredBy,
-          ...(incompatibleDependency ? { issue: cause.message } : {}),
         });
         return;
       }
@@ -1131,6 +1166,7 @@ export async function createLaunchpad(ctx) {
       files,
       warnings,
       unavailableDependencies,
+      recoveredDependencies,
     };
   }
   async function inspectUnavailableDependencies(result, input, stage) {
@@ -1595,6 +1631,17 @@ export async function createLaunchpad(ctx) {
           throw error(
             409,
             "Multiple installed files match this project. Use File Manager to resolve duplicates before updating.",
+          );
+        if (
+          matches[0] &&
+          result.recoveredDependencies.has(
+            `${file.platform}:${file.projectId}`,
+          ) &&
+          matches[0].versionId !== file.versionId
+        )
+          throw error(
+            409,
+            `${file.title} is already installed at a different version. This project's dependency link needs correction; Launchpad cannot safely replace the installed dependency automatically.`,
           );
         let oldPath = matches[0]?.path;
         if (raw.replacePath && file.projectId === input.projectId) {

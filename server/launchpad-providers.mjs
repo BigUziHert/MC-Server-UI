@@ -720,6 +720,72 @@ export function createCoreProviders({
           .map(mrVersion)
           .filter((version) => fits(version, input));
       },
+      async compatibleDependencyVersion(input) {
+        if (
+          input.type !== "mod" ||
+          !input.gameVersion ||
+          !["fabric", "forge", "neoforge", "quilt"].includes(input.loader)
+        )
+          return null;
+        const pinned = await json(`${mr}/version/${enc(id(input.versionId))}`, {
+          signal: input.signal,
+        });
+        const tags = (value) =>
+          Array.isArray(value) && value.every((tag) => typeof tag === "string");
+        if (
+          !pinned ||
+          pinned.id !== input.versionId ||
+          pinned.project_id !== input.projectId ||
+          typeof pinned.version_number !== "string" ||
+          !pinned.version_number.trim() ||
+          !tags(pinned.game_versions) ||
+          !pinned.game_versions.includes(input.gameVersion) ||
+          !tags(pinned.loaders) ||
+          !pinned.loaders.length ||
+          pinned.loaders.includes(input.loader)
+        )
+          return null;
+        const rows = await mrVersions(input);
+        if (!Array.isArray(rows)) return null;
+        const distinct = new Map();
+        for (const row of rows) {
+          if (
+            !row ||
+            typeof row.id !== "string" ||
+            !/^[A-Za-z0-9_-]{1,100}$/.test(row.id)
+          )
+            continue;
+          // Conflicting representations of one ID are ambiguous, even when
+          // only one representation would pass the compatibility filters.
+          const prior = distinct.get(row.id);
+          if (prior && JSON.stringify(prior) !== JSON.stringify(row))
+            return null;
+          distinct.set(row.id, row);
+        }
+        const candidates = [];
+        for (const row of distinct.values()) {
+          if (
+            row.id === pinned.id ||
+            row.project_id !== input.projectId ||
+            row.version_number !== pinned.version_number ||
+            !tags(row.game_versions) ||
+            !tags(row.loaders) ||
+            !Array.isArray(row.files) ||
+            row.files.some((file) => !file || typeof file !== "object")
+          )
+            continue;
+          const version = mrVersion(row);
+          if (!fits(version, input) || !version.downloadable) continue;
+          try {
+            if (mrUpdateFile(row, input)) candidates.push(version);
+          } catch {
+            // A manual-only or invalid download is not an automatic recovery.
+          }
+        }
+        // Version numbers are opaque provider labels. Never parse names,
+        // choose a newer release, or guess between same-release variants.
+        return candidates.length === 1 ? candidates[0] : null;
+      },
       async resolve(input) {
         const project = await mrProject(input.projectId);
         const value = await json(`${mr}/version/${enc(id(input.versionId))}`);
@@ -734,6 +800,15 @@ export function createCoreProviders({
           throw launchpadError(
             400,
             "This version does not match the selected project, Minecraft version, or loader.",
+          );
+        if (
+          input.expectedVersionNumber !== undefined &&
+          (typeof input.expectedVersionNumber !== "string" ||
+            value.version_number !== input.expectedVersionNumber)
+        )
+          throw launchpadError(
+            400,
+            "The required dependency's release metadata changed while it was being checked. Review the installation again.",
           );
         const version = mrVersion(value);
         if (!fits(version, input))

@@ -2311,182 +2311,173 @@ test("Launchpad lists every affected file and reason beyond the current installe
   });
 });
 
-for (const issue of [
-  undefined,
-  "The pinned Sable 2.0.3 release supports Fabric, but this installation requires NeoForge.",
-])
-  test(`Launchpad requires an explicit Install anyway choice for ${issue ? "incompatible requirements" : "unchecked requirements"}`, async ({
-    page,
-    serverId,
-  }) => {
-    const version = {
-      id: "jei-new",
-      name: "JEI 19.0",
-      version: "19.0",
-      gameVersions: ["1.21.1"],
-      loaders: ["neoforge"],
-      publishedAt: "2026-09-01T00:00:00Z",
-      downloadable: true,
-    };
-    await page.route("**/api/launchpad", (route) =>
-      route.fulfill({
-        json: {
-          platforms: [
-            {
-              id: "modrinth",
-              name: "Modrinth",
-              available: true,
-              types: ["mod"],
-            },
-          ],
-          gameVersion: "1.21.1",
-          gameVersions: ["1.21.1"],
-          loader: "neoforge",
-          status: "offline",
-          warnings: [],
-        },
-      }),
-    );
-    await page.route("**/api/launchpad/search?**", (route) =>
-      route.fulfill({ json: { projects: [], total: 0, offset: 0, limit: 10 } }),
-    );
-    await page.route("**/api/launchpad/installed?**", (route) =>
-      route.fulfill({
-        json: {
-          items: [
-            {
-              path: "mods/jei-old.jar",
-              name: "jei-old.jar",
-              title: "JEI",
-              size: 1024,
-              platform: "modrinth",
-              projectId: "jei",
-              versionId: "jei-old",
-              updateCheck: "checked",
-              update: version,
-            },
-          ],
-          warnings: [],
-        },
-      }),
-    );
-    await page.route("**/api/launchpad/versions?**", (route) =>
-      route.fulfill({ json: { versions: [version] } }),
-    );
-    let reviews = 0;
-    await page.route("**/api/launchpad/preview", (route) => {
-      expect(route.request().headers()["x-server-id"]).toBe(serverId);
-      expect(route.request().postDataJSON()).toMatchObject({
-        platform: "modrinth",
-        projectId: "jei",
-        versionId: "jei-new",
-        replacePath: "mods/jei-old.jar",
-      });
-      return route.fulfill({
-        json: {
-          planId: `jei-review-${++reviews}`,
-          title: "JEI",
-          versionName: "19.0",
-          files: [
-            {
-              path: "mods/jei-new.jar",
-              previousPath: "mods/jei-old.jar",
-              size: 2048,
-              action: "replace",
-            },
-          ],
-          unavailableDependencies: [
-            {
-              platform: "modrinth",
-              projectId: "7tEfOcA7",
-              requiredBy: "JEI",
-              ...(issue ? { issue } : {}),
-            },
-          ],
-          warnings: [],
-          expiresAt: "2099-01-01T00:00:00Z",
-        },
-      });
-    });
-    const installations: unknown[] = [];
-    await page.route("**/api/launchpad/install", (route) => {
-      expect(route.request().headers()["x-server-id"]).toBe(serverId);
-      installations.push(route.request().postDataJSON());
-      return route.fulfill({
-        json: {
-          job: {
-            id: "jei-job",
-            status: "completed",
-            message: "JEI updated with the reviewed dependency choice",
-            completed: 1,
-            total: 1,
+test("Launchpad requires an explicit Install anyway choice for unchecked requirements", async ({
+  page,
+  serverId,
+}) => {
+  const version = {
+    id: "jei-new",
+    name: "JEI 19.0",
+    version: "19.0",
+    gameVersions: ["1.21.1"],
+    loaders: ["neoforge"],
+    publishedAt: "2026-09-01T00:00:00Z",
+    downloadable: true,
+  };
+  await page.route("**/api/launchpad", (route) =>
+    route.fulfill({
+      json: {
+        platforms: [
+          {
+            id: "modrinth",
+            name: "Modrinth",
+            available: true,
+            types: ["mod"],
           },
-        },
-      });
-    });
-    await page.goto("/#launchpad");
-    await page.getByRole("switch", { name: "Show installed content" }).check();
-    await page.getByRole("button", { name: "Update JEI", exact: true }).click();
-    const dialog = page.getByRole("dialog");
-    await dialog.getByRole("button", { name: /Review/ }).click();
-    await expect(
-      dialog.getByText("Some requirements couldn’t be checked", {
-        exact: true,
-      }),
-    ).toBeVisible();
-    await expect(
-      dialog
-        .getByRole("list", { name: "Installation files", exact: true })
-        .getByRole("listitem"),
-    ).toHaveCount(1);
-    await expect(dialog).toContainText("mods/jei-new.jar");
-    if (issue)
-      await expect(dialog.getByText(issue, { exact: true })).toBeVisible();
-    const technical = dialog.getByText("Technical details", { exact: true });
-    const missing = dialog.getByRole("list", {
-      name: "Unavailable required dependencies",
-    });
-    await expect(missing).toBeHidden();
-    await technical.click();
-    await expect(missing).toHaveText(
-      "Modrinth project 7tEfOcA7 · required by JEI",
-    );
-    await technical.click();
-    await expect(dialog.getByRole("checkbox")).toHaveCount(0);
-    await expect(
-      dialog.getByRole("button", { name: "Confirm installation", exact: true }),
-    ).toHaveCount(0);
-    const confirm = dialog.getByRole("button", {
-      name: "Install anyway",
-      exact: true,
-    });
-    await expect(confirm).toBeEnabled();
-    await dialog
-      .getByRole("list", { name: "Installation files", exact: true })
-      .focus();
-    await page.keyboard.press("Enter");
-    await expect(dialog).toBeVisible();
-    expect(installations).toHaveLength(0);
-    await dialog.getByRole("button", { name: "Back", exact: true }).click();
-    await dialog.getByRole("button", { name: /Review/ }).click();
-    await expect(confirm).toBeEnabled();
-    await expect(missing).toBeHidden();
-    if (issue)
-      await expect(dialog.getByText(issue, { exact: true })).toBeVisible();
-    expect(installations).toHaveLength(0);
-    await confirm.click();
-    await expect(dialog).not.toBeVisible();
-    expect(installations).toEqual([
-      {
-        planId: "jei-review-2",
-        confirmed: true,
-        acknowledgedUnavailableDependencies: true,
+        ],
+        gameVersion: "1.21.1",
+        gameVersions: ["1.21.1"],
+        loader: "neoforge",
+        status: "offline",
+        warnings: [],
       },
-    ]);
-    await expect(
-      page.getByRole("status", { name: "Installation status", exact: true }),
-    ).toContainText("JEI updated with the reviewed dependency choice");
+    }),
+  );
+  await page.route("**/api/launchpad/search?**", (route) =>
+    route.fulfill({ json: { projects: [], total: 0, offset: 0, limit: 10 } }),
+  );
+  await page.route("**/api/launchpad/installed?**", (route) =>
+    route.fulfill({
+      json: {
+        items: [
+          {
+            path: "mods/jei-old.jar",
+            name: "jei-old.jar",
+            title: "JEI",
+            size: 1024,
+            platform: "modrinth",
+            projectId: "jei",
+            versionId: "jei-old",
+            updateCheck: "checked",
+            update: version,
+          },
+        ],
+        warnings: [],
+      },
+    }),
+  );
+  await page.route("**/api/launchpad/versions?**", (route) =>
+    route.fulfill({ json: { versions: [version] } }),
+  );
+  let reviews = 0;
+  await page.route("**/api/launchpad/preview", (route) => {
+    expect(route.request().headers()["x-server-id"]).toBe(serverId);
+    expect(route.request().postDataJSON()).toMatchObject({
+      platform: "modrinth",
+      projectId: "jei",
+      versionId: "jei-new",
+      replacePath: "mods/jei-old.jar",
+    });
+    return route.fulfill({
+      json: {
+        planId: `jei-review-${++reviews}`,
+        title: "JEI",
+        versionName: "19.0",
+        files: [
+          {
+            path: "mods/jei-new.jar",
+            previousPath: "mods/jei-old.jar",
+            size: 2048,
+            action: "replace",
+          },
+        ],
+        unavailableDependencies: [
+          {
+            platform: "modrinth",
+            projectId: "7tEfOcA7",
+            requiredBy: "JEI",
+          },
+        ],
+        warnings: [],
+        expiresAt: "2099-01-01T00:00:00Z",
+      },
+    });
   });
+  const installations: unknown[] = [];
+  await page.route("**/api/launchpad/install", (route) => {
+    expect(route.request().headers()["x-server-id"]).toBe(serverId);
+    installations.push(route.request().postDataJSON());
+    return route.fulfill({
+      json: {
+        job: {
+          id: "jei-job",
+          status: "completed",
+          message: "JEI updated with the reviewed dependency choice",
+          completed: 1,
+          total: 1,
+        },
+      },
+    });
+  });
+  await page.goto("/#launchpad");
+  await page.getByRole("switch", { name: "Show installed content" }).check();
+  await page.getByRole("button", { name: "Update JEI", exact: true }).click();
+  const dialog = page.getByRole("dialog");
+  await dialog.getByRole("button", { name: /Review/ }).click();
+  await expect(
+    dialog.getByText("Some requirements couldn’t be checked", {
+      exact: true,
+    }),
+  ).toBeVisible();
+  await expect(
+    dialog
+      .getByRole("list", { name: "Installation files", exact: true })
+      .getByRole("listitem"),
+  ).toHaveCount(1);
+  await expect(dialog).toContainText("mods/jei-new.jar");
+  const technical = dialog.getByText("Technical details", { exact: true });
+  const missing = dialog.getByRole("list", {
+    name: "Unavailable required dependencies",
+  });
+  await expect(missing).toBeHidden();
+  await technical.click();
+  await expect(missing).toHaveText(
+    "Modrinth project 7tEfOcA7 · required by JEI",
+  );
+  await technical.click();
+  await expect(dialog.getByRole("checkbox")).toHaveCount(0);
+  await expect(
+    dialog.getByRole("button", { name: "Confirm installation", exact: true }),
+  ).toHaveCount(0);
+  const confirm = dialog.getByRole("button", {
+    name: "Install anyway",
+    exact: true,
+  });
+  await expect(confirm).toBeEnabled();
+  await dialog
+    .getByRole("list", { name: "Installation files", exact: true })
+    .focus();
+  await page.keyboard.press("Enter");
+  await expect(dialog).toBeVisible();
+  expect(installations).toHaveLength(0);
+  await dialog.getByRole("button", { name: "Back", exact: true }).click();
+  await dialog.getByRole("button", { name: /Review/ }).click();
+  await expect(confirm).toBeEnabled();
+  await expect(missing).toBeHidden();
+  expect(installations).toHaveLength(0);
+  await confirm.click();
+  await expect(dialog).not.toBeVisible();
+  expect(installations).toEqual([
+    {
+      planId: "jei-review-2",
+      confirmed: true,
+      acknowledgedUnavailableDependencies: true,
+    },
+  ]);
+  await expect(
+    page.getByRole("status", { name: "Installation status", exact: true }),
+  ).toContainText("JEI updated with the reviewed dependency choice");
+});
 
 for (const unavailable of [true, false])
   test(`Launchpad reviews bundled libraries ${unavailable ? "alongside unresolved catalog dependencies" : "without an unnecessary catalog acknowledgment"}`, async ({

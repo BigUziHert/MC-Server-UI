@@ -2133,102 +2133,395 @@ test("JEI-style missing Modrinth dependencies require explicit acknowledgement o
   );
 });
 
-for (const mismatch of ["loader", "minecraft"]) {
-  test(`an incompatible pinned dependency (${mismatch}) is reviewed explicitly without replacing an existing compatible dependency`, async (t) => {
-    const f = await fixture(t);
-    f.versions.new.dependencies = [
+async function pinnedLoaderFixture(t) {
+  const catalog = [],
+    identities = new Map();
+  const f = await fixture(t, {
+    request: async (url, init) => {
+      const pathname = new URL(url).pathname;
+      if (pathname === "/v2/project/dependency/version")
+        return Response.json(catalog);
+      if (pathname === "/v2/version_files")
+        return Response.json(
+          Object.fromEntries(
+            JSON.parse(init.body)
+              .hashes.filter((hash) => identities.has(hash))
+              .map((hash) => [hash, identities.get(hash)]),
+          ),
+        );
+    },
+  });
+  f.versions.new.dependencies = [
+    {
+      project_id: "dependency",
+      version_id: "dep",
+      dependency_type: "required",
+    },
+  ];
+  f.versions.dep.name = "Sable 2.0.3 Fabric";
+  f.versions.dep.version_number = "2.0.3";
+  f.versions.dep.loaders = ["fabric"];
+  const fabricUrl = "https://cdn.modrinth.com/sable-fabric-2.0.3.jar";
+  f.versions.dep.files[0].filename = "sable-fabric-2.0.3.jar";
+  f.versions.dep.files[0].url = fabricUrl;
+  f.downloads.set(fabricUrl, f.dependency);
+  const compatibleBytes = bytes("verified Sable NeoForge 2.0.3");
+  const compatible = {
+    ...structuredClone(f.versions.dep),
+    id: "dep-neoforge",
+    name: "Sable 2.0.3 NeoForge",
+    loaders: ["neoforge"],
+    files: [
       {
-        project_id: "dependency",
-        version_id: "dep",
-        dependency_type: "required",
+        filename: "sable-neoforge-2.0.3.jar",
+        url: "https://cdn.modrinth.com/sable-neoforge-2.0.3.jar",
+        size: compatibleBytes.length,
+        hashes: hashes(compatibleBytes),
+        primary: true,
       },
-    ];
-    f.versions.dep.name = "Sable 2.0.3";
-    f.versions.dep.version_number = "2.0.3";
-    if (mismatch === "loader") f.versions.dep.loaders = ["fabric"];
+    ],
+  };
+  // Only the incompatible Fabric variant needs Fabric API. Recovery must
+  // traverse the selected NeoForge variant's dependency graph instead.
+  f.versions.dep.dependencies = [
+    {
+      project_id: "fabric-api",
+      version_id: "fabric-api",
+      dependency_type: "required",
+    },
+  ];
+  f.versions[compatible.id] = compatible;
+  f.downloads.set(compatible.files[0].url, compatibleBytes);
+  catalog.push(compatible);
+  identities.set(hashes(f.old).sha512, f.versions.old);
+  identities.set(hashes(compatibleBytes).sha512, compatible);
+  return { f, catalog, identities, compatible, compatibleBytes, fabricUrl };
+}
+
+test("a fresh server installs the exact same-release loader sibling of a wrongly pinned required dependency", async (t) => {
+  const { f, compatible, compatibleBytes, fabricUrl } =
+    await pinnedLoaderFixture(t);
+  await fs.unlink(path.join(f.serverDir, "mods", "old.jar"));
+  assert.deepEqual(await fs.readdir(path.join(f.serverDir, "mods")), []);
+  const plan = await f.service.preview(selection);
+  assert.deepEqual(
+    plan.files.map((file) => [file.path, file.action]),
+    [
+      ["mods/new.jar", "install"],
+      ["mods/sable-neoforge-2.0.3.jar", "install"],
+    ],
+  );
+  assert.deepEqual(plan.unavailableDependencies, []);
+  const job = await finish(f.service, { planId: plan.planId, confirmed: true });
+  assert.equal(job.status, "completed", job.error);
+  assert.equal(job.total, 2);
+  assert.equal(job.completed, 2);
+  assert.deepEqual(
+    await fs.readFile(path.join(f.serverDir, "mods", "new.jar")),
+    f.newer,
+  );
+  assert.deepEqual(
+    await fs.readFile(
+      path.join(f.serverDir, "mods", compatible.files[0].filename),
+    ),
+    compatibleBytes,
+  );
+  const receipts = JSON.parse(
+    await fs.readFile(
+      path.join(f.dataDir, "launchpad", "installed.json"),
+      "utf8",
+    ),
+  );
+  assert.deepEqual(
+    receipts.map(({ projectId, versionId }) => [projectId, versionId]),
+    [
+      ["project", "new"],
+      ["dependency", compatible.id],
+    ],
+  );
+  assert.equal(
+    f.requests.filter(({ url }) => url === compatible.files[0].url).length,
+    1,
+  );
+  assert.equal(
+    f.requests.some(({ url }) => url === fabricUrl),
+    false,
+  );
+  assert.equal(
+    f.requests.some(({ url }) =>
+      /^\/v2\/(?:project|version)\/fabric-api(?:\/|$)/.test(
+        new URL(url).pathname,
+      ),
+    ),
+    false,
+    "the incompatible Fabric variant's dependency graph must not be resolved",
+  );
+  await assert.rejects(
+    fs.stat(path.join(f.serverDir, "mods", "sable-fabric-2.0.3.jar")),
+    { code: "ENOENT" },
+  );
+  assert.deepEqual(await f.bin.list(), []);
+});
+
+for (const unavailable of [
+  "missing",
+  "ambiguous",
+  "different-release",
+  "wrong-minecraft",
+]) {
+  test(`a wrongly pinned required dependency stays blocked when its loader sibling is ${unavailable}`, async (t) => {
+    const { f, catalog, compatible } = await pinnedLoaderFixture(t);
+    if (unavailable === "missing") catalog.length = 0;
+    else if (unavailable === "ambiguous")
+      catalog.push({
+        ...structuredClone(compatible),
+        id: "dep-neoforge-other",
+      });
+    else if (unavailable === "different-release")
+      compatible.version_number = "2.0.5";
     else f.versions.dep.game_versions = ["1.20.1"];
-    const existing = bytes("installed Sable NeoForge 2.0.5");
-    const dependencyPath = path.join(
-      f.serverDir,
-      "mods",
-      "sable-neoforge-2.0.5.jar",
+    await assert.rejects(
+      f.service.preview({
+        ...selection,
+        acknowledgedUnavailableDependencies: true,
+      }),
+      { status: 400 },
     );
-    await fs.writeFile(dependencyPath, existing);
-    const before = await fs.stat(dependencyPath);
-    const plan = await f.service.preview({
-      ...selection,
-      replacePath: "mods/old.jar",
-    });
-    assert.deepEqual(
-      plan.files.map((file) => file.path),
-      ["mods/new.jar"],
-    );
-    assert.equal(plan.unavailableDependencies.length, 1);
-    const { issue, ...requirement } = plan.unavailableDependencies[0];
-    assert.deepEqual(requirement, {
-      platform: "modrinth",
-      projectId: "dependency",
-      versionId: "dep",
-      requiredBy: "Fixture Project",
-    });
-    assert.match(issue, /Sable 2\.0\.3/);
-    assert.match(issue, /1\.21\.1/);
-    assert.match(issue, mismatch === "loader" ? /fabric/i : /1\.20\.1/);
-    assert.match(issue, /neoforge/i);
-    for (const acknowledgedUnavailableDependencies of [
-      undefined,
+    assert.equal(f.mutations, 0);
+    assert.equal(
+      f.requests.some(({ url }) => url.startsWith("https://cdn.modrinth.com/")),
       false,
-      "true",
-    ]) {
-      await assert.rejects(
-        f.service.install({
-          planId: plan.planId,
-          confirmed: true,
-          acknowledgedUnavailableDependencies,
-        }),
-        /unavailable required dependencies/,
-      );
-      assert.equal(f.mutations, 0);
-      assert.deepEqual(
-        await fs.readFile(path.join(f.serverDir, "mods", "old.jar")),
-        f.old,
-      );
-    }
+    );
+    assert.deepEqual(await fs.readdir(path.join(f.serverDir, "mods")), [
+      "old.jar",
+    ]);
+    assert.deepEqual(
+      await fs.readFile(path.join(f.serverDir, "mods", "old.jar")),
+      f.old,
+    );
+    assert.deepEqual(await f.bin.list(), []);
+  });
+}
+
+test("recovering a wrong-loader pin cannot downgrade a different installed dependency release", async (t) => {
+  const { f, identities, compatible } = await pinnedLoaderFixture(t);
+  const existingBytes = bytes("installed Sable NeoForge 2.0.5");
+  const existing = {
+    ...structuredClone(compatible),
+    id: "dep-newer",
+    name: "Sable 2.0.5 NeoForge",
+    version_number: "2.0.5",
+    files: [
+      {
+        ...compatible.files[0],
+        hashes: hashes(existingBytes),
+        size: existingBytes.length,
+      },
+    ],
+  };
+  f.versions[existing.id] = existing;
+  identities.set(hashes(existingBytes).sha512, existing);
+  const target = path.join(f.serverDir, "mods", "sable-neoforge-2.0.5.jar");
+  await fs.writeFile(target, existingBytes);
+  const before = await fs.stat(target);
+  await assert.rejects(
+    f.service.preview({
+      ...selection,
+      acknowledgedUnavailableDependencies: true,
+    }),
+    { status: 409 },
+  );
+  assert.deepEqual(await fs.readFile(target), existingBytes);
+  const after = await fs.stat(target);
+  for (const field of ["ino", "size", "mtimeMs", "ctimeMs", "birthtimeMs"])
+    assert.equal(after[field], before[field], field);
+  assert.equal(f.mutations, 0);
+  assert.equal(
+    f.requests.some(({ url }) => url.startsWith("https://cdn.modrinth.com/")),
+    false,
+  );
+  assert.deepEqual(
+    await fs.readFile(path.join(f.serverDir, "mods", "old.jar")),
+    f.old,
+  );
+  assert.deepEqual(await f.bin.list(), []);
+});
+
+test("an installed exact recovered loader sibling is omitted without redownloading or replacing it", async (t) => {
+  const { f, compatible, compatibleBytes, fabricUrl } =
+    await pinnedLoaderFixture(t);
+  const target = path.join(f.serverDir, "mods", compatible.files[0].filename);
+  await fs.writeFile(target, compatibleBytes);
+  const before = await fs.stat(target);
+  const plan = await f.service.preview(selection);
+  assert.deepEqual(
+    plan.files.map(({ path }) => path),
+    ["mods/new.jar"],
+  );
+  assert.deepEqual(plan.unavailableDependencies, []);
+  const job = await finish(f.service, { planId: plan.planId, confirmed: true });
+  assert.equal(job.status, "completed", job.error);
+  assert.equal(job.total, 1);
+  assert.deepEqual(await fs.readFile(target), compatibleBytes);
+  const after = await fs.stat(target);
+  for (const field of ["ino", "size", "mtimeMs", "ctimeMs", "birthtimeMs"])
+    assert.equal(after[field], before[field], field);
+  assert.equal(
+    f.requests.some(
+      ({ url }) => url === compatible.files[0].url || url === fabricUrl,
+    ),
+    false,
+  );
+  assert.deepEqual(
+    (await f.bin.list()).map(({ originalPath }) => originalPath),
+    ["mods/old.jar"],
+  );
+});
+
+for (const correctFirst of [false, true]) {
+  test(`recovered dependency identity deduplicates an explicit correct loader sibling (${correctFirst ? "correct first" : "wrong pin first"})`, async (t) => {
+    const { f, compatible, fabricUrl } = await pinnedLoaderFixture(t);
+    const direct = {
+      project_id: "dependency",
+      version_id: compatible.id,
+      dependency_type: "required",
+    };
+    if (correctFirst) f.versions.new.dependencies.unshift(direct);
+    else f.versions.new.dependencies.push(direct);
+    const plan = await f.service.preview(selection);
+    assert.deepEqual(
+      plan.files.map(({ path }) => path),
+      ["mods/new.jar", "mods/sable-neoforge-2.0.3.jar"],
+    );
+    assert.deepEqual(plan.unavailableDependencies, []);
     const job = await finish(f.service, {
       planId: plan.planId,
       confirmed: true,
-      acknowledgedUnavailableDependencies: true,
     });
     assert.equal(job.status, "completed", job.error);
-    assert.equal(job.total, 1);
-    assert.deepEqual(
-      await fs.readFile(path.join(f.serverDir, "mods", "new.jar")),
-      f.newer,
-    );
-    assert.deepEqual(await fs.readFile(dependencyPath), existing);
-    const after = await fs.stat(dependencyPath);
-    for (const field of ["ino", "size", "mtimeMs", "ctimeMs", "birthtimeMs"])
-      assert.equal(after[field], before[field], field);
-    assert.deepEqual(
-      (await f.bin.list()).map((item) => item.originalPath),
-      ["mods/old.jar"],
+    assert.equal(job.total, 2);
+    assert.equal(
+      f.requests.filter(({ url }) => url === compatible.files[0].url).length,
+      1,
     );
     assert.equal(
-      f.requests.some(({ url }) => url === "https://cdn.modrinth.com/dep.jar"),
+      f.requests.some(({ url }) => url === fabricUrl),
       false,
     );
-    assert.equal(
-      f.requests.some(
-        ({ url }) => new URL(url).pathname === "/v2/project/dependency/version",
+    const receipts = JSON.parse(
+      await fs.readFile(
+        path.join(f.dataDir, "launchpad", "installed.json"),
+        "utf8",
       ),
-      false,
-      "an incompatible pinned version must not be replaced with a guessed compatible release",
     );
-    await assert.rejects(fs.stat(path.join(f.serverDir, "mods", "dep.jar")), {
-      code: "ENOENT",
-    });
+    assert.deepEqual(
+      receipts
+        .filter(({ projectId }) => projectId === "dependency")
+        .map(({ versionId }) => versionId),
+      [compatible.id],
+    );
   });
 }
+
+test("a missing conflicting pin cannot bypass a resolved dependency's version conflict", async (t) => {
+  const f = await fixture(t, {
+    request: async (url) => {
+      if (new URL(url).pathname === "/v2/version/missing-dep")
+        return new Response(null, { status: 404 });
+    },
+  });
+  f.versions.new.dependencies = ["dep", "missing-dep"].map((version_id) => ({
+    project_id: "dependency",
+    version_id,
+    dependency_type: "required",
+  }));
+  await assert.rejects(
+    f.service.preview({
+      ...selection,
+      acknowledgedUnavailableDependencies: true,
+    }),
+    { status: 409 },
+  );
+  assert.equal(f.mutations, 0);
+  assert.equal(
+    f.requests.some(({ url }) => url.startsWith("https://cdn.modrinth.com/")),
+    false,
+  );
+  assert.deepEqual(
+    await fs.readFile(path.join(f.serverDir, "mods", "old.jar")),
+    f.old,
+  );
+  assert.deepEqual(await f.bin.list(), []);
+});
+
+test("a recovered back-reference to the selected root does not block updating that root", async (t) => {
+  const f = await fixture(t);
+  f.versions.new.dependencies = [
+    {
+      project_id: "dependency",
+      version_id: "dep",
+      dependency_type: "required",
+    },
+  ];
+  f.versions.dep.dependencies = [
+    {
+      project_id: "project",
+      version_id: "root-fabric",
+      dependency_type: "required",
+    },
+  ];
+  const fabricUrl = "https://cdn.modrinth.com/root-fabric.jar";
+  f.versions["root-fabric"] = {
+    ...structuredClone(f.versions.new),
+    id: "root-fabric",
+    name: "New version Fabric",
+    loaders: ["fabric"],
+    files: [
+      {
+        ...f.versions.new.files[0],
+        filename: "root-fabric.jar",
+        url: fabricUrl,
+      },
+    ],
+  };
+  f.downloads.set(fabricUrl, f.newer);
+  const plan = await f.service.preview({
+    ...selection,
+    replacePath: "mods/old.jar",
+  });
+  assert.deepEqual(
+    plan.files.map(({ path }) => path),
+    ["mods/new.jar", "mods/dep.jar"],
+  );
+  assert.deepEqual(plan.unavailableDependencies, []);
+  const job = await finish(f.service, { planId: plan.planId, confirmed: true });
+  assert.equal(job.status, "completed", job.error);
+  assert.equal(job.total, 2);
+  assert.deepEqual(
+    await fs.readFile(path.join(f.serverDir, "mods", "new.jar")),
+    f.newer,
+  );
+  assert.equal(
+    f.requests.some(({ url }) => url === fabricUrl),
+    false,
+  );
+  const receipts = JSON.parse(
+    await fs.readFile(
+      path.join(f.dataDir, "launchpad", "installed.json"),
+      "utf8",
+    ),
+  );
+  assert.deepEqual(
+    receipts
+      .filter(({ projectId }) => projectId === "project")
+      .map(({ versionId }) => versionId),
+    ["new"],
+  );
+  assert.deepEqual(
+    (await f.bin.list()).map(({ originalPath }) => originalPath),
+    ["mods/old.jar"],
+  );
+});
 
 for (const invalid of [
   "selected-loader",
