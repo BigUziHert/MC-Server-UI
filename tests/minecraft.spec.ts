@@ -1614,10 +1614,10 @@ test("Launchpad preserves known updates and exposes successful-response provider
   ).toEqual([false, true, false, true]);
   // An intentional "All loaders" selection must survive reentry as well.
   await page.getByLabel("Loader", { exact: true }).selectOption("");
-  await expect.poll(() => fullRequests.length).toBe(5);
-  await expect(companion.getByText("Up to date", { exact: true })).toHaveCount(
-    0,
-  );
+  await expect(update).toBeEnabled();
+  await expect(
+    companion.getByText("Up to date", { exact: true }),
+  ).toBeVisible();
   await page.getByRole("link", { name: "Console", exact: true }).click();
   await expect(
     page.getByRole("heading", { name: "Console", exact: true }),
@@ -1625,16 +1625,259 @@ test("Launchpad preserves known updates and exposes successful-response provider
   await page.getByRole("link", { name: "Launchpad", exact: true }).click();
   await expect(installedToggle).toBeChecked();
   await expect(page.getByLabel("Loader", { exact: true })).toHaveValue("");
-  await expect.poll(() => fullRequests.length).toBe(6);
-  expect(fullRequests[5].searchParams.has("loader")).toBe(false);
+  await expect.poll(() => fullRequests.length).toBe(5);
+  expect(Object.fromEntries(fullRequests[4].searchParams)).toMatchObject({
+    gameVersion: "1.21.1",
+    loader: "neoforge",
+  });
+  await expect(update).toBeEnabled();
+  await expect(better).toContainText("Available: 2.0");
   await expect(companion).toContainText("mods/companion.jar");
-  await expect(companion.getByText("Up to date", { exact: true })).toHaveCount(
-    0,
-  );
+  await expect(
+    companion.getByText("Up to date", { exact: true }),
+  ).toBeVisible();
   await expect(
     page.getByText("Update check unavailable", { exact: true }),
   ).toHaveCount(0);
 });
+
+for (const browse of [
+  { name: "All", gameVersion: "", loader: "" },
+  { name: "conflicting", gameVersion: "26.2", loader: "fabric" },
+]) {
+  test(`Launchpad finds updates after installing older JEI and returning from File Manager with ${browse.name} filters`, async ({
+    page,
+    serverId,
+  }) => {
+    const latest = {
+      id: "jei-latest",
+      name: "JEI 19.56.0.439",
+      version: "19.56.0.439",
+      gameVersions: ["1.21.1"],
+      loaders: ["neoforge"],
+      publishedAt: "2026-09-01T00:00:00Z",
+      downloadable: true,
+    };
+    const older = {
+      ...latest,
+      id: "jei-older",
+      name: "JEI 19.54.0.429",
+      version: "19.54.0.429",
+      publishedAt: "2026-08-01T00:00:00Z",
+    };
+    let installedOlder = false;
+    const installedRequests: URL[] = [];
+    await page.addInitScript(
+      ({ id, gameVersion, loader }) => {
+        sessionStorage.setItem(
+          `mc-panel.launchpad.view.${id}`,
+          JSON.stringify({
+            platform: "modrinth",
+            type: "mod",
+            gameVersion,
+            loader,
+            installedOnly: true,
+          }),
+        );
+      },
+      { id: serverId, gameVersion: browse.gameVersion, loader: browse.loader },
+    );
+    await page.route("**/api/launchpad", (route) =>
+      route.fulfill({
+        json: {
+          platforms: [
+            {
+              id: "modrinth",
+              name: "Modrinth",
+              available: true,
+              types: ["mod"],
+            },
+          ],
+          gameVersion: "1.21.1",
+          gameVersions: ["26.2", "1.21.1"],
+          loader: "neoforge",
+          status: "offline",
+          warnings: [],
+        },
+      }),
+    );
+    await page.route("**/api/launchpad/search?**", (route) =>
+      route.fulfill({
+        json: { projects: [], total: 0, offset: 0, limit: 10 },
+      }),
+    );
+    await page.route("**/api/launchpad/installed?**", (route) => {
+      expect(route.request().headers()["x-server-id"]).toBe(serverId);
+      const url = new URL(route.request().url());
+      installedRequests.push(url);
+      const compatible =
+        url.searchParams.get("gameVersion") === "1.21.1" &&
+        url.searchParams.get("loader") === "neoforge";
+      const local = url.searchParams.get("local") === "true";
+      const version = installedOlder ? older : latest;
+      return route.fulfill({
+        json: {
+          items: [
+            {
+              path: `mods/${version.id}.jar`,
+              name: `${version.id}.jar`,
+              title: "JEI",
+              size: 1024,
+              platform: "modrinth",
+              projectId: "jei",
+              versionId: version.id,
+              versionName: version.version,
+              update: installedOlder && compatible && !local ? latest : null,
+              updateCheck: compatible && !local ? "checked" : "pending",
+            },
+            {
+              path: "mods/companion.jar",
+              name: "companion.jar",
+              title: "Companion Mod",
+              size: 2048,
+              platform: "modrinth",
+              projectId: "companion",
+              versionId: "companion-current",
+              versionName: "3.0",
+              update: null,
+              updateCheck: compatible && !local ? "checked" : "pending",
+            },
+          ],
+          warnings: [],
+        },
+      });
+    });
+    await page.route("**/api/launchpad/versions?**", (route) => {
+      expect(
+        Object.fromEntries(new URL(route.request().url()).searchParams),
+      ).toMatchObject({
+        gameVersion: "1.21.1",
+        loader: "neoforge",
+        projectId: "jei",
+      });
+      return route.fulfill({ json: { versions: [latest, older] } });
+    });
+    await page.route("**/api/launchpad/preview", (route) => {
+      expect(route.request().postDataJSON()).toMatchObject({
+        gameVersion: "1.21.1",
+        loader: "neoforge",
+        projectId: "jei",
+        versionId: older.id,
+        replacePath: "mods/jei-latest.jar",
+      });
+      return route.fulfill({
+        json: {
+          planId: "jei-downgrade",
+          title: "JEI",
+          versionName: older.version,
+          files: [
+            {
+              path: "mods/jei-older.jar",
+              previousPath: "mods/jei-latest.jar",
+              size: 1024,
+              action: "replace",
+            },
+          ],
+          warnings: [],
+          expiresAt: "2099-01-01T00:00:00Z",
+        },
+      });
+    });
+    await page.route("**/api/launchpad/install", (route) => {
+      expect(route.request().postDataJSON()).toMatchObject({
+        planId: "jei-downgrade",
+        confirmed: true,
+      });
+      installedOlder = true;
+      return route.fulfill({
+        json: {
+          job: {
+            id: "jei-downgrade-job",
+            status: "completed",
+            message: "Older JEI installed",
+            completed: 1,
+            total: 1,
+          },
+        },
+      });
+    });
+
+    await page.goto("/#launchpad");
+    const installedToggle = page.getByRole("switch", {
+      name: "Show installed content",
+    });
+    const browseVersion = page.getByLabel("Minecraft version", { exact: true });
+    const browseLoader = page.getByLabel("Loader", { exact: true });
+    await expect(installedToggle).toBeChecked();
+    await expect(browseVersion).toHaveValue(browse.gameVersion);
+    await expect(browseLoader).toHaveValue(browse.loader);
+    const jei = page.getByRole("article", { name: "JEI", exact: true });
+    const companion = page.getByRole("article", {
+      name: "Companion Mod",
+      exact: true,
+    });
+    await expect(jei.getByText("Up to date", { exact: true })).toBeVisible();
+    await page
+      .getByRole("button", { name: "Choose version for JEI", exact: true })
+      .click();
+    const dialog = page.getByRole("dialog");
+    await dialog
+      .getByLabel("Project version", { exact: true })
+      .selectOption(older.id);
+    await dialog.getByRole("button", { name: /Review/ }).click();
+    await expect(dialog).toContainText("mods/jei-older.jar");
+    await dialog
+      .getByRole("button", { name: "Confirm installation", exact: true })
+      .click();
+    await expect(dialog).not.toBeVisible();
+    await expect(jei).toContainText("Installed: 19.54.0.429");
+    const update = page.getByRole("button", {
+      name: "Update JEI",
+      exact: true,
+    });
+    await expect(update).toBeEnabled();
+
+    await page.getByRole("link", { name: "File Manager", exact: true }).click();
+    await expect(page).toHaveURL(/#files$/);
+    await page.getByRole("link", { name: "Launchpad", exact: true }).click();
+    await expect(installedToggle).toBeChecked();
+    await expect(browseVersion).toHaveValue(browse.gameVersion);
+    await expect(browseLoader).toHaveValue(browse.loader);
+    await expect(jei).toContainText("mods/jei-older.jar");
+    await expect(jei).toContainText("Available: 19.56.0.439");
+    await expect(update).toBeEnabled();
+    await expect(
+      companion.getByText("Up to date", { exact: true }),
+    ).toBeVisible();
+    await expect(
+      companion.getByText("Update available", { exact: true }),
+    ).toHaveCount(0);
+    const fullCount = () =>
+      installedRequests.filter(
+        (url) => url.searchParams.get("local") !== "true",
+      ).length;
+    const beforeRefresh = fullCount();
+    await page
+      .getByRole("button", {
+        name: "Refresh Launchpad and check updates",
+        exact: true,
+      })
+      .click();
+    await expect.poll(fullCount).toBeGreaterThan(beforeRefresh);
+    await expect(update).toBeEnabled();
+    await expect(jei).toContainText("Installed: 19.54.0.429");
+    await expect(
+      companion.getByText("Up to date", { exact: true }),
+    ).toBeVisible();
+    expect(installedRequests.at(-1)!.searchParams.get("refresh")).toBe("true");
+    for (const url of installedRequests)
+      expect(Object.fromEntries(url.searchParams)).toMatchObject({
+        type: "mod",
+        gameVersion: "1.21.1",
+        loader: "neoforge",
+      });
+  });
+}
 
 test("Launchpad confines installed update issues to the matching files and platform", async ({
   page,
@@ -2471,6 +2714,19 @@ test("Launchpad ignores delayed installed metadata after loader, version, type a
   const second = (await created.json()).server;
   await stopTestServer(request, second.id);
   try {
+    // An unknown runtime still uses the saved browse targets and must cancel
+    // metadata belonging to an earlier manual target or content type.
+    await page.addInitScript((id) => {
+      sessionStorage.setItem(
+        `mc-panel.launchpad.view.${id}`,
+        JSON.stringify({
+          platform: "modrinth",
+          type: "mod",
+          gameVersion: "1.21.1",
+          loader: "neoforge",
+        }),
+      );
+    }, serverId);
     const delayed: {
       route: Route;
       title: string;
@@ -2487,9 +2743,15 @@ test("Launchpad ignores delayed installed metadata after loader, version, type a
               types: ["mod", "datapack"],
             },
           ],
-          gameVersion: "1.21.1",
+          gameVersion:
+            route.request().headers()["x-server-id"] === serverId
+              ? null
+              : "1.21.1",
           gameVersions: ["1.21.1", "1.20.1"],
-          loader: "neoforge",
+          loader:
+            route.request().headers()["x-server-id"] === serverId
+              ? null
+              : "neoforge",
           status: "offline",
           warnings: [],
         },

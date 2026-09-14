@@ -320,7 +320,26 @@ export default function Launchpad({ notify }: PageProps) {
   const [results, setResults] = useState<SearchResult | null>(null);
   const [searchLoading, setSearchLoading] = useState(false);
   const [searchError, setSearchError] = useState("");
-  const inventoryScope = JSON.stringify([type, gameVersion.trim(), loader]);
+  const loaders = loadersFor(type).filter(
+    (value) => !config?.loaders || config.loaders.includes(value),
+  );
+  // Installed updates and installation defaults target this server, even when
+  // the catalog filters are broad or set to another Minecraft version/loader.
+  const contentGameVersion =
+    config?.gameVersion && /^\d+(?:\.\d+)+$/.test(config.gameVersion)
+      ? config.gameVersion
+      : gameVersion.trim();
+  const contentLoader =
+    config?.loader && loaders.includes(config.loader)
+      ? config.loader
+      : type === "datapack"
+        ? "datapack"
+        : loader;
+  const inventoryScope = JSON.stringify([
+    type,
+    contentGameVersion,
+    contentLoader,
+  ]);
   const [inventory, setInventory] = useState<{
     api: typeof api;
     scope: string;
@@ -375,9 +394,6 @@ export default function Launchpad({ notify }: PageProps) {
   const supported = Boolean(source?.types.includes(type));
   const working = Boolean(job && ["queued", "running"].includes(job.status));
   const canInstall = status === "offline" && !working;
-  const loaders = loadersFor(type).filter(
-    (value) => !config?.loaders || config.loaders.includes(value),
-  );
   const minecraftVersions = [
     ...new Set(
       [
@@ -632,8 +648,8 @@ export default function Launchpad({ notify }: PageProps) {
           api<InstalledResult>(
             `/launchpad/installed?${queryString({
               type,
-              gameVersion: gameVersion.trim(),
-              loader,
+              gameVersion: contentGameVersion,
+              loader: contentLoader,
               local: local ? "true" : undefined,
               refresh: !local && force ? "true" : undefined,
             })}`,
@@ -670,8 +686,8 @@ export default function Launchpad({ notify }: PageProps) {
           if (current()) {
             const snapshot = inventoryRef.current;
             if (
-              gameVersion.trim() &&
-              loader &&
+              contentGameVersion &&
+              contentLoader &&
               snapshot?.api === api &&
               snapshot.scope === inventoryScope
             ) {
@@ -709,7 +725,15 @@ export default function Launchpad({ notify }: PageProps) {
       controller.abort();
       scanEpoch.current++;
     };
-  }, [api, inventoryReady, inventoryScope, type, gameVersion, loader, reload]);
+  }, [
+    api,
+    inventoryReady,
+    inventoryScope,
+    type,
+    contentGameVersion,
+    contentLoader,
+    reload,
+  ]);
 
   useEffect(() => {
     if (selection) dialog.current?.showModal();
@@ -794,20 +818,8 @@ export default function Launchpad({ notify }: PageProps) {
     operation.current++;
     setDialogError("");
     setPlan(null);
-    // Catalog filters can be broad or target another server. Start installations
-    // with this server's detected configuration whenever it is supported.
-    setTargetVersion(
-      config?.gameVersion && /^\d+(?:\.\d+)+$/.test(config.gameVersion)
-        ? config.gameVersion
-        : gameVersion,
-    );
-    setTargetLoader(
-      config?.loader && loaders.includes(config.loader)
-        ? config.loader
-        : type === "datapack"
-          ? "datapack"
-          : loader,
-    );
+    setTargetVersion(contentGameVersion);
+    setTargetLoader(contentLoader);
     setSelection({ project, installed: entry });
   }
   function closeSelection() {
@@ -987,8 +999,10 @@ export default function Launchpad({ notify }: PageProps) {
   const failed = installedOnly ? !installed && scanError : searchError;
   const keySource = config?.platforms.find((item) => item.id === "curseforge");
   const updateFiltersReady = Boolean(
-    type !== "modpack" && gameVersion.trim() && loader,
+    type !== "modpack" && contentGameVersion && contentLoader,
   );
+  const listedGameVersion = installedOnly ? contentGameVersion : gameVersion;
+  const listedLoader = installedOnly ? contentLoader : loader;
   const unavailableUpdates = updateFiltersReady
     ? entries.filter(
         (item) =>
@@ -1539,8 +1553,8 @@ export default function Launchpad({ notify }: PageProps) {
             <div className="launchpad-result-count">
               {total.toLocaleString()}{" "}
               {installedOnly ? "installed items" : "projects"}
-              {gameVersion ? ` · Minecraft ${gameVersion}` : ""}
-              {loader ? ` · ${loaderName(loader)}` : ""}
+              {listedGameVersion ? ` · Minecraft ${listedGameVersion}` : ""}
+              {listedLoader ? ` · ${loaderName(listedLoader)}` : ""}
             </div>
             {visibleProjects.map(({ project, entry }) => (
               <article
