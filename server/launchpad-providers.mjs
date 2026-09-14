@@ -730,14 +730,19 @@ export function createCoreProviders({
           supportedTypes.includes(input.type) ||
           (["plugin", "datapack"].includes(input.type) &&
             supportedTypes.includes("mod"));
-        if (
-          String(value.project_id) !== input.projectId ||
-          !matchesType ||
-          !fits(mrVersion(value), input)
-        )
+        if (String(value.project_id) !== input.projectId || !matchesType)
           throw launchpadError(
             400,
             "This version does not match the selected project, Minecraft version, or loader.",
+          );
+        const version = mrVersion(value);
+        if (!fits(version, input))
+          throw Object.assign(
+            launchpadError(
+              400,
+              `${value.name || project.title} targets ${version.loaders.join(", ") || "an unspecified loader"} on Minecraft ${version.gameVersions.join(", ") || "an unspecified version"}; the selected target is ${input.loader || "any loader"} on Minecraft ${input.gameVersion || "any version"}.`,
+            ),
+            { code: "INCOMPATIBLE_VERSION" },
           );
         if (
           project.server_side === "unsupported" ||

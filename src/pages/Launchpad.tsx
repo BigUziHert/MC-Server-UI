@@ -118,6 +118,7 @@ type Plan = {
     projectId?: string;
     versionId?: string | null;
     requiredBy: string;
+    issue?: string;
   }[];
   bundledDependencies?: {
     title: string;
@@ -1887,10 +1888,20 @@ export default function Launchpad({ notify }: PageProps) {
                   <div>
                     <strong>Some requirements couldn’t be checked</strong>
                     <p>
-                      The catalog couldn’t provide details for one or more extra
-                      mods. We couldn’t verify whether you need another download
-                      for this installation to work.
+                      We couldn’t verify every required mod for this
+                      installation. Check whether another download is needed
+                      before continuing.
                     </p>
+                    {plan.unavailableDependencies!.map(
+                      (dependency, index) =>
+                        dependency.issue && (
+                          <p
+                            key={`issue:${dependency.platform}:${dependency.projectId ?? ""}:${dependency.versionId ?? ""}:${index}`}
+                          >
+                            {dependency.issue}
+                          </p>
+                        ),
+                    )}
                     {Boolean(plan.bundledDependencies?.length) && (
                       <p>
                         The libraries marked Included are packaged in the

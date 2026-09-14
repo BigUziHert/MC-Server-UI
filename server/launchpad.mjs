@@ -1052,19 +1052,23 @@ export async function createLaunchpad(ctx) {
         visited.set(key, String(value.versionId));
         result = await found.resolve(value);
       } catch (cause) {
-        if (cause.status !== 404) throw cause;
+        const incompatibleDependency =
+          depth > 0 && cause.code === "INCOMPATIBLE_VERSION";
+        if (cause.status !== 404 && !incompatibleDependency) throw cause;
         if (!depth)
           throw error(
             404,
             `${found.name} could not find the selected project or version. Refresh its versions and choose another release.`,
           );
-        // A broken upstream requirement must be visible in the review. The
-        // install endpoint requires a separate acknowledgement of this list.
+        // Missing or incompatible upstream dependency pins remain visible in
+        // the review. Never substitute a release or download an incompatible
+        // file; continuing requires explicit acknowledgement at installation.
         unavailableDependencies.push({
           platform: value.platform,
           projectId: value.projectId,
           versionId: value.versionId,
           requiredBy,
+          ...(incompatibleDependency ? { issue: cause.message } : {}),
         });
         return;
       }

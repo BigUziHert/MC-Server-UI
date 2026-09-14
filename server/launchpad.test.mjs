@@ -2133,6 +2133,166 @@ test("JEI-style missing Modrinth dependencies require explicit acknowledgement o
   );
 });
 
+for (const mismatch of ["loader", "minecraft"]) {
+  test(`an incompatible pinned dependency (${mismatch}) is reviewed explicitly without replacing an existing compatible dependency`, async (t) => {
+    const f = await fixture(t);
+    f.versions.new.dependencies = [
+      {
+        project_id: "dependency",
+        version_id: "dep",
+        dependency_type: "required",
+      },
+    ];
+    f.versions.dep.name = "Sable 2.0.3";
+    f.versions.dep.version_number = "2.0.3";
+    if (mismatch === "loader") f.versions.dep.loaders = ["fabric"];
+    else f.versions.dep.game_versions = ["1.20.1"];
+    const existing = bytes("installed Sable NeoForge 2.0.5");
+    const dependencyPath = path.join(
+      f.serverDir,
+      "mods",
+      "sable-neoforge-2.0.5.jar",
+    );
+    await fs.writeFile(dependencyPath, existing);
+    const before = await fs.stat(dependencyPath);
+    const plan = await f.service.preview({
+      ...selection,
+      replacePath: "mods/old.jar",
+    });
+    assert.deepEqual(
+      plan.files.map((file) => file.path),
+      ["mods/new.jar"],
+    );
+    assert.equal(plan.unavailableDependencies.length, 1);
+    const { issue, ...requirement } = plan.unavailableDependencies[0];
+    assert.deepEqual(requirement, {
+      platform: "modrinth",
+      projectId: "dependency",
+      versionId: "dep",
+      requiredBy: "Fixture Project",
+    });
+    assert.match(issue, /Sable 2\.0\.3/);
+    assert.match(issue, /1\.21\.1/);
+    assert.match(issue, mismatch === "loader" ? /fabric/i : /1\.20\.1/);
+    assert.match(issue, /neoforge/i);
+    for (const acknowledgedUnavailableDependencies of [
+      undefined,
+      false,
+      "true",
+    ]) {
+      await assert.rejects(
+        f.service.install({
+          planId: plan.planId,
+          confirmed: true,
+          acknowledgedUnavailableDependencies,
+        }),
+        /unavailable required dependencies/,
+      );
+      assert.equal(f.mutations, 0);
+      assert.deepEqual(
+        await fs.readFile(path.join(f.serverDir, "mods", "old.jar")),
+        f.old,
+      );
+    }
+    const job = await finish(f.service, {
+      planId: plan.planId,
+      confirmed: true,
+      acknowledgedUnavailableDependencies: true,
+    });
+    assert.equal(job.status, "completed", job.error);
+    assert.equal(job.total, 1);
+    assert.deepEqual(
+      await fs.readFile(path.join(f.serverDir, "mods", "new.jar")),
+      f.newer,
+    );
+    assert.deepEqual(await fs.readFile(dependencyPath), existing);
+    const after = await fs.stat(dependencyPath);
+    for (const field of ["ino", "size", "mtimeMs", "ctimeMs", "birthtimeMs"])
+      assert.equal(after[field], before[field], field);
+    assert.deepEqual(
+      (await f.bin.list()).map((item) => item.originalPath),
+      ["mods/old.jar"],
+    );
+    assert.equal(
+      f.requests.some(({ url }) => url === "https://cdn.modrinth.com/dep.jar"),
+      false,
+    );
+    assert.equal(
+      f.requests.some(
+        ({ url }) => new URL(url).pathname === "/v2/project/dependency/version",
+      ),
+      false,
+      "an incompatible pinned version must not be replaced with a guessed compatible release",
+    );
+    await assert.rejects(fs.stat(path.join(f.serverDir, "mods", "dep.jar")), {
+      code: "ENOENT",
+    });
+  });
+}
+
+for (const invalid of [
+  "selected-loader",
+  "selected-minecraft",
+  "dependency-project",
+  "dependency-type",
+]) {
+  test(`unavailable-dependency acknowledgement cannot bypass ${invalid} validation`, async (t) => {
+    const f = await fixture(t, {
+      request: async (url) => {
+        if (
+          invalid === "dependency-type" &&
+          new URL(url).pathname === "/v2/project/dependency"
+        )
+          return Response.json({
+            id: "dependency",
+            title: "Different content type",
+            project_type: "modpack",
+            server_side: "required",
+          });
+      },
+    });
+    if (invalid === "selected-loader") f.versions.new.loaders = ["fabric"];
+    else if (invalid === "selected-minecraft")
+      f.versions.new.game_versions = ["1.20.1"];
+    else {
+      f.versions.new.dependencies = [
+        {
+          project_id: "dependency",
+          version_id: "dep",
+          dependency_type: "required",
+        },
+      ];
+      // The identity/type failures take precedence even if the loader also differs.
+      f.versions.dep.loaders = ["fabric"];
+      if (invalid === "dependency-project")
+        f.versions.dep.project_id = "unrelated-project";
+    }
+    await assert.rejects(
+      f.service.preview({
+        ...selection,
+        acknowledgedUnavailableDependencies: true,
+      }),
+      (cause) => {
+        assert.equal(cause.status, 400);
+        if (invalid.startsWith("selected-"))
+          assert.equal(cause.code, "INCOMPATIBLE_VERSION");
+        else assert.notEqual(cause.code, "INCOMPATIBLE_VERSION");
+        return true;
+      },
+    );
+    assert.equal(f.mutations, 0);
+    assert.equal(
+      f.requests.some(({ url }) => url.startsWith("https://cdn.modrinth.com/")),
+      false,
+    );
+    assert.deepEqual(
+      await fs.readFile(path.join(f.serverDir, "mods", "old.jar")),
+      f.old,
+    );
+    assert.deepEqual(await f.bin.list(), []);
+  });
+}
+
 test("unavailable dependencies are deduplicated and count toward the resolution budget", async (t) => {
   let requests = 0;
   const f = await fixture(t, {
