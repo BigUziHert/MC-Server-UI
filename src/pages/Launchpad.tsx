@@ -794,8 +794,20 @@ export default function Launchpad({ notify }: PageProps) {
     operation.current++;
     setDialogError("");
     setPlan(null);
-    setTargetVersion(gameVersion);
-    setTargetLoader(loader);
+    // Catalog filters can be broad or target another server. Start installations
+    // with this server's detected configuration whenever it is supported.
+    setTargetVersion(
+      config?.gameVersion && /^\d+(?:\.\d+)+$/.test(config.gameVersion)
+        ? config.gameVersion
+        : gameVersion,
+    );
+    setTargetLoader(
+      config?.loader && loaders.includes(config.loader)
+        ? config.loader
+        : type === "datapack"
+          ? "datapack"
+          : loader,
+    );
     setSelection({ project, installed: entry });
   }
   function closeSelection() {

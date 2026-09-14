@@ -2728,6 +2728,145 @@ test("Launchpad Minecraft selects show stable releases only and scope filters an
   await expect(dialog).toContainText("mods/catalog.jar");
 });
 
+for (const browse of [
+  { name: "blank", gameVersion: "", loader: "" },
+  { name: "conflicting", gameVersion: "26.2", loader: "fabric" },
+]) {
+  test(`Launchpad install targets use the configured server with ${browse.name} saved browse filters`, async ({
+    page,
+    serverId,
+  }) => {
+    const versionRequests: URL[] = [];
+    await page.route("**/api/launchpad", (route) =>
+      route.fulfill({
+        json: {
+          platforms: [
+            {
+              id: "modrinth",
+              name: "Modrinth",
+              available: true,
+              types: ["mod"],
+            },
+          ],
+          gameVersion: "1.21.1",
+          gameVersions: ["26.2", "1.21.1"],
+          loader: "neoforge",
+          status: "offline",
+          warnings: [],
+        },
+      }),
+    );
+    await page.route("**/api/launchpad/installed?**", (route) =>
+      route.fulfill({ json: { items: [], warnings: [] } }),
+    );
+    await page.route("**/api/launchpad/search?**", (route) =>
+      route.fulfill({
+        json: {
+          projects: [
+            {
+              id: "jei",
+              platform: "modrinth",
+              title: "JEI",
+              description: "Just Enough Items",
+            },
+          ],
+          total: 1,
+          offset: 0,
+          limit: 10,
+        },
+      }),
+    );
+    await page.route("**/api/launchpad/versions?**", (route) => {
+      expect(route.request().headers()["x-server-id"]).toBe(serverId);
+      const url = new URL(route.request().url());
+      versionRequests.push(url);
+      // An unfiltered catalog really would choose the newer incompatible build.
+      const gameVersion = url.searchParams.get("gameVersion") || "26.2";
+      const loader = url.searchParams.get("loader") || "fabric";
+      return route.fulfill({
+        json: {
+          versions: [
+            {
+              id: `jei-${gameVersion}-${loader}`,
+              name: gameVersion === "1.21.1" ? "JEI 19.27" : "JEI 27.4",
+              version: gameVersion === "1.21.1" ? "19.27" : "27.4",
+              gameVersions: [gameVersion],
+              loaders: [loader],
+              publishedAt: "2026-09-01T00:00:00Z",
+              downloadable: true,
+            },
+          ],
+        },
+      });
+    });
+
+    await page.goto("/#launchpad");
+    const browseVersion = page.getByLabel("Minecraft version", { exact: true });
+    const browseLoader = page.getByLabel("Loader", { exact: true });
+    await expect(browseVersion).toHaveValue("1.21.1");
+    await browseVersion.selectOption(browse.gameVersion);
+    await browseLoader.selectOption(browse.loader);
+    await expect
+      .poll(() =>
+        page.evaluate(
+          (id) =>
+            JSON.parse(
+              sessionStorage.getItem(`mc-panel.launchpad.view.${id}`) || "null",
+            ),
+          serverId,
+        ),
+      )
+      .toMatchObject({
+        gameVersion: browse.gameVersion,
+        loader: browse.loader,
+      });
+    await page.reload();
+    await expect(browseVersion).toHaveValue(browse.gameVersion);
+    await expect(browseLoader).toHaveValue(browse.loader);
+    await page
+      .getByRole("button", { name: "Install JEI", exact: true })
+      .click();
+
+    const dialog = page.getByRole("dialog");
+    const targetVersion = dialog.getByLabel("Target Minecraft version", {
+      exact: true,
+    });
+    const targetLoader = dialog.getByLabel("Target loader", { exact: true });
+    const projectVersion = dialog.getByLabel("Project version", {
+      exact: true,
+    });
+    await expect(targetVersion).toHaveValue("1.21.1");
+    await expect(targetLoader).toHaveValue("neoforge");
+    await expect(projectVersion).toHaveValue("jei-1.21.1-neoforge");
+    await expect(projectVersion.locator("option")).toHaveText([
+      "Select a version",
+      "JEI 19.27",
+    ]);
+    expect(versionRequests.length).toBeGreaterThan(0);
+    for (const request of versionRequests)
+      expect(Object.fromEntries(request.searchParams)).toMatchObject({
+        projectId: "jei",
+        type: "mod",
+        gameVersion: "1.21.1",
+        loader: "neoforge",
+      });
+
+    await targetVersion.selectOption("26.2");
+    await expect(projectVersion).toHaveValue("jei-26.2-neoforge");
+    await targetLoader.selectOption("fabric");
+    await expect(projectVersion).toHaveValue("jei-26.2-fabric");
+    expect(
+      Object.fromEntries(versionRequests.at(-1)!.searchParams),
+    ).toMatchObject({
+      gameVersion: "26.2",
+      loader: "fabric",
+    });
+    await dialog.getByRole("button", { name: "Cancel", exact: true }).click();
+    await expect(browseVersion).toHaveValue(browse.gameVersion);
+    await expect(browseLoader).toHaveValue(browse.loader);
+  });
+}
+
 test("Launchpad refresh retries a failed stable catalog while preserving configured and selected release versions", async ({
   page,
 }) => {
