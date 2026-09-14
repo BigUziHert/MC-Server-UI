@@ -903,6 +903,248 @@ test("Launchpad hash-identifies installed mods, filters compatibility, confirms 
   );
 });
 
+for (const algorithm of ["sha512", "sha256", "sha1"]) {
+  test(`updates skip identical dependencies without downloading or touching them (${algorithm})`, async (t) => {
+    const f = await fixture(t);
+    f.versions.new.dependencies = [
+      {
+        project_id: "dependency",
+        version_id: "dep",
+        dependency_type: "required",
+      },
+    ];
+    f.versions.dep.files[0].hashes = {
+      // A weaker conflicting hash must not override the strongest checksum.
+      sha1: "0".repeat(40),
+      [algorithm]: createHash(algorithm)
+        .update(f.dependency)
+        .digest("hex")
+        .toUpperCase(),
+    };
+    const dependencyPath = path.join(f.serverDir, "mods", "dep.jar");
+    await fs.writeFile(dependencyPath, f.dependency);
+    const before = await fs.stat(dependencyPath);
+    const plan = await f.service.preview({
+      ...selection,
+      replacePath: "mods/old.jar",
+    });
+    assert.equal(plan.unchangedCount, 1);
+    assert.deepEqual(
+      plan.files.map((file) => file.path),
+      ["mods/new.jar"],
+    );
+    const job = await finish(f.service, {
+      planId: plan.planId,
+      confirmed: true,
+    });
+    assert.equal(job.status, "completed", job.error);
+    assert.equal(job.total, 1);
+    assert.equal(job.completed, 1);
+    assert.equal(
+      f.requests.filter(({ url }) => url === "https://cdn.modrinth.com/dep.jar")
+        .length,
+      0,
+    );
+    assert.deepEqual(await fs.readFile(dependencyPath), f.dependency);
+    const after = await fs.stat(dependencyPath);
+    for (const field of ["ino", "size", "mtimeMs", "ctimeMs", "birthtimeMs"])
+      assert.equal(after[field], before[field], field);
+    assert.deepEqual(
+      (await f.bin.list()).map((item) => item.originalPath),
+      ["mods/old.jar"],
+    );
+  });
+}
+
+test("matching version labels do not skip a dependency with different bytes", async (t) => {
+  const f = await fixture(t);
+  f.versions.new.dependencies = [
+    {
+      project_id: "dependency",
+      version_id: "dep",
+      dependency_type: "required",
+    },
+  ];
+  const changed = bytes("different dependency bytes");
+  const dependencyPath = path.join(f.serverDir, "mods", "dep.jar");
+  await fs.writeFile(dependencyPath, changed);
+  await fs.writeFile(
+    path.join(f.dataDir, "launchpad", "installed.json"),
+    JSON.stringify([
+      {
+        path: "mods/dep.jar",
+        sha512: hashes(changed).sha512,
+        platform: "modrinth",
+        projectId: "dependency",
+        versionId: "dep",
+        type: "mod",
+      },
+    ]),
+  );
+  const service = await f.boot();
+  const plan = await service.preview(selection);
+  assert.equal(plan.unchangedCount, 0);
+  assert.equal(
+    plan.files.find((file) => file.path === "mods/dep.jar").action,
+    "replace",
+  );
+  const job = await finish(service, { planId: plan.planId, confirmed: true });
+  assert.equal(job.status, "completed", job.error);
+  assert.equal(
+    f.requests.filter(({ url }) => url === "https://cdn.modrinth.com/dep.jar")
+      .length,
+    1,
+  );
+  assert.deepEqual(await fs.readFile(dependencyPath), f.dependency);
+  assert.deepEqual(
+    (await f.bin.list()).map((item) => item.originalPath).sort(),
+    ["mods/dep.jar", "mods/old.jar"],
+  );
+});
+
+for (const change of ["edited", "removed"]) {
+  test(`a skipped dependency ${change} after review aborts before any file promotion`, async (t) => {
+    const f = await fixture(t);
+    f.versions.new.dependencies = [
+      {
+        project_id: "dependency",
+        version_id: "dep",
+        dependency_type: "required",
+      },
+    ];
+    const dependencyPath = path.join(f.serverDir, "mods", "dep.jar");
+    await fs.writeFile(dependencyPath, f.dependency);
+    const plan = await f.service.preview(selection);
+    assert.equal(plan.unchangedCount, 1);
+    if (change === "edited") {
+      const before = await fs.stat(dependencyPath);
+      await fs.writeFile(
+        dependencyPath,
+        bytes("x".repeat(f.dependency.length)),
+      );
+      await fs.utimes(dependencyPath, before.atime, before.mtime);
+    } else await fs.unlink(dependencyPath);
+    const job = await finish(f.service, {
+      planId: plan.planId,
+      confirmed: true,
+    });
+    assert.equal(job.status, "failed");
+    assert.match(job.error, /mods\/dep.jar changed since review/);
+    assert.deepEqual(
+      await fs.readFile(path.join(f.serverDir, "mods", "old.jar")),
+      f.old,
+    );
+    await assert.rejects(fs.stat(path.join(f.serverDir, "mods", "new.jar")), {
+      code: "ENOENT",
+    });
+    assert.deepEqual(await f.bin.list(), []);
+    assert.equal(
+      f.requests.filter(({ url }) => url === "https://cdn.modrinth.com/dep.jar")
+        .length,
+      0,
+    );
+  });
+}
+
+test("an identical renamed dependency stays in place and its absent destination remains part of review", async (t) => {
+  const f = await fixture(t);
+  f.versions.new.dependencies = [
+    {
+      project_id: "dependency",
+      version_id: "dep",
+      dependency_type: "required",
+    },
+  ];
+  const renamedPath = path.join(f.serverDir, "mods", "my-dependency.jar");
+  await fs.writeFile(renamedPath, f.dependency);
+  await fs.writeFile(
+    path.join(f.dataDir, "launchpad", "installed.json"),
+    JSON.stringify([
+      {
+        path: "mods/my-dependency.jar",
+        sha512: hashes(f.dependency).sha512,
+        platform: "modrinth",
+        projectId: "dependency",
+        versionId: "dep",
+        type: "mod",
+      },
+    ]),
+  );
+  const service = await f.boot();
+  const first = await service.preview(selection);
+  assert.equal(first.unchangedCount, 1);
+  assert.deepEqual(
+    first.files.map((file) => file.path),
+    ["mods/new.jar"],
+  );
+  // An external writer must not introduce a duplicate after the review.
+  const destination = path.join(f.serverDir, "mods", "dep.jar");
+  await fs.writeFile(destination, f.dependency);
+  const failed = await finish(service, {
+    planId: first.planId,
+    confirmed: true,
+  });
+  assert.equal(failed.status, "failed");
+  assert.match(failed.error, /mods\/dep.jar changed since review/);
+  assert.deepEqual(await f.bin.list(), []);
+  await fs.unlink(destination);
+  const plan = await service.preview(selection);
+  const before = await fs.stat(renamedPath);
+  const job = await finish(service, { planId: plan.planId, confirmed: true });
+  assert.equal(job.status, "completed", job.error);
+  assert.equal(plan.unchangedCount, 1);
+  assert.equal((await fs.stat(renamedPath)).mtimeMs, before.mtimeMs);
+  assert.deepEqual(await fs.readFile(renamedPath), f.dependency);
+  await assert.rejects(fs.stat(destination), { code: "ENOENT" });
+  assert.equal(
+    f.requests.filter(({ url }) => url === "https://cdn.modrinth.com/dep.jar")
+      .length,
+    0,
+  );
+});
+
+test("an all-up-to-date review has no changes and cannot start an installation", async (t) => {
+  const f = await fixture(t);
+  let plan;
+  for (let count = 0; count < 8; count++) {
+    plan = await f.service.preview({
+      ...selection,
+      versionId: "old",
+      replacePath: "mods/old.jar",
+    });
+    await assert.rejects(
+      fs.stat(path.join(f.dataDir, "launchpad", plan.planId)),
+      {
+        code: "ENOENT",
+      },
+    );
+  }
+  assert.deepEqual(plan.files, []);
+  assert.equal(plan.unchangedCount, 1);
+  await assert.rejects(
+    f.service.install({ planId: plan.planId, confirmed: true }),
+    {
+      status: 409,
+      message:
+        "All reviewed files are already up to date. No installation is needed.",
+    },
+  );
+  assert.equal(f.mutations, 0);
+  assert.equal(
+    f.requests.filter(({ url }) => url.startsWith("https://cdn.modrinth.com/"))
+      .length,
+    0,
+  );
+  assert.deepEqual(await f.bin.list(), []);
+  assert.deepEqual(
+    await fs.readFile(path.join(f.serverDir, "mods", "old.jar")),
+    f.old,
+  );
+  // Repeated empty reviews must leave all four real installation slots available.
+  for (let count = 0; count < 4; count++)
+    assert.equal((await f.service.preview(selection)).files.length, 1);
+});
+
 test("installed project icons and titles are available with All loaders and All versions", async (t) => {
   const f = await fixture(t);
   const result = await f.service.installed({
@@ -1608,6 +1850,118 @@ test("bundled libraries satisfy only checksum-identified catalog requirements an
     });
   }
 });
+test("unchanged dependencies supply verified bundled libraries without downloads or extra review rows", async (t) => {
+  const nested = zip([
+    [
+      "META-INF/neoforge.mods.toml",
+      '[[mods]]\nmodId="bundled_library"\nversion="1.2.3"\ndisplayName="Bundled Library"\n',
+    ],
+  ]);
+  const embeddedPath = "META-INF/jarjar/library.jar";
+  const parent = zip([
+    [
+      "META-INF/jarjar/metadata.json",
+      JSON.stringify({
+        jars: [
+          {
+            identifier: { group: "example", artifact: "library" },
+            version: { range: "[1,2)", artifactVersion: "1.2.3" },
+            path: embeddedPath,
+          },
+        ],
+      }),
+    ],
+    [embeddedPath, nested],
+  ]);
+  const nestedHash = hashes(nested).sha512;
+  const f = await fixture(t, {
+    request: async (url, init) => {
+      const pathname = new URL(url).pathname;
+      if (pathname.startsWith("/v2/project/bundledProject"))
+        return new Response(null, { status: 404 });
+      if (
+        pathname === "/v2/version_files" &&
+        JSON.parse(init.body).hashes.includes(nestedHash)
+      )
+        return Response.json({
+          [nestedHash]: {
+            id: "embedded-version",
+            project_id: "bundledProject",
+            game_versions: ["1.21.1"],
+            loaders: ["neoforge"],
+            environment: "server_only",
+            files: [{ hashes: hashes(nested) }],
+          },
+        });
+    },
+  });
+  f.versions.new.dependencies = [
+    {
+      project_id: "dependency",
+      version_id: "dep",
+      dependency_type: "required",
+    },
+  ];
+  f.versions.dep.dependencies = [
+    {
+      project_id: "bundledProject",
+      version_id: null,
+      dependency_type: "required",
+    },
+  ];
+  f.versions.dep.files[0].hashes = hashes(parent);
+  f.versions.dep.files[0].size = parent.length;
+  const installedPath = path.join(f.serverDir, "mods", "dep.jar");
+  await fs.writeFile(installedPath, parent);
+  const before = await fs.stat(installedPath);
+  const plan = await f.service.preview(selection);
+  assert.equal(plan.unchangedCount, 1);
+  assert.deepEqual(
+    plan.files.map((file) => file.path),
+    ["mods/new.jar"],
+  );
+  assert.deepEqual(plan.bundledDependencies, []);
+  assert.deepEqual(plan.unavailableDependencies, []);
+  assert.equal(
+    f.requests.filter(({ url }) => url === "https://cdn.modrinth.com/dep.jar")
+      .length,
+    0,
+  );
+  const job = await finish(f.service, { planId: plan.planId, confirmed: true });
+  assert.equal(job.status, "completed", job.error);
+  const after = await fs.stat(installedPath);
+  assert.equal(after.ino, before.ino);
+  assert.equal(after.mtimeMs, before.mtimeMs);
+  assert.equal(after.ctimeMs, before.ctimeMs);
+  assert.deepEqual(await fs.readFile(installedPath), parent);
+  assert.deepEqual(
+    (await f.bin.list()).map((item) => item.originalPath),
+    ["mods/old.jar"],
+  );
+  // Local inspection must enforce the provider size used by its total budget.
+  for (const size of [parent.length - 1, parent.length + 1]) {
+    f.versions.dep.files[0].size = size;
+    await assert.rejects(
+      f.service.preview(selection),
+      /mods\/dep.jar changed since review/,
+    );
+  }
+  f.versions.dep.files[0].size = -1;
+  const invalidSize = await f.service.preview(selection);
+  assert.equal(invalidSize.unavailableDependencies.length, 1);
+  assert.ok(
+    invalidSize.warnings.some((warning) =>
+      /mods\/dep.jar.*inspection limits/.test(warning),
+    ),
+  );
+  assert.equal(f.mutations, 1);
+  assert.equal(
+    f.requests.filter(({ url }) => url === "https://cdn.modrinth.com/dep.jar")
+      .length,
+    0,
+  );
+});
+
 test("bundled dependency fingerprint matches also require an exact SHA-1 identity", async (t) => {
   const f = await fixture(t);
   f.setServer({ loader: "fabric" });

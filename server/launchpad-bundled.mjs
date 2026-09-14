@@ -404,7 +404,7 @@ function permitsServer(metadata, loader) {
 }
 
 /**
- * Read declared embedded JARs from an already checksum-verified private file.
+ * Read declared embedded JARs from a checksum-verified staged file or Buffer.
  * No extraction or execution. Hashes prove file identity, never names/mod IDs.
  * The selected loader is required and controls declarations at every depth.
  * Limits apply across the whole traversal. fingerprint, if supplied, is a
@@ -419,11 +419,18 @@ export async function inspectBundledDependencies(
     throw invalid(
       "Choose a supported mod loader before inspecting bundled dependencies.",
     );
-  const info = await fs.lstat(archive);
-  if (!info.isFile() || info.isSymbolicLink())
-    throw invalid(
-      "Bundled dependency inspection requires a regular staged JAR file.",
-    );
+  if (Buffer.isBuffer(archive)) {
+    if (archive.length > 64 * 1024 ** 2)
+      throw invalid(
+        "Bundled dependency inspection exceeds its 64 MB JAR limit.",
+      );
+  } else {
+    const info = await fs.lstat(archive);
+    if (!info.isFile() || info.isSymbolicLink())
+      throw invalid(
+        "Bundled dependency inspection requires a regular staged JAR file.",
+      );
+  }
   const budget = { entries: 0, bytes: 0, jars: 0 };
   const result = [];
   const inspect = async (

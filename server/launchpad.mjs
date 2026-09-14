@@ -240,6 +240,7 @@ export async function createLaunchpad(ctx) {
     await fs.rename(temporary, await privatePath("installed.json"));
   };
   const plans = new Map();
+  const noOpReviews = new Map();
   const jobs = new Map();
   const previews = new Set();
   // These caches accelerate display only. Preview and installation still hash
@@ -1142,6 +1143,7 @@ export async function createLaunchpad(ctx) {
       if (
         ++inspected > 16 ||
         !Number.isSafeInteger(file.size) ||
+        file.size < 0 ||
         file.size > 64 * 1024 ** 2 ||
         (total += file.size) > 128 * 1024 ** 2
       ) {
@@ -1150,14 +1152,53 @@ export async function createLaunchpad(ctx) {
         );
         continue;
       }
-      const target = path.join(stage, `dependency-inspection-${index}.jar`);
-      await downloadVerified(file, target, file.hosts, request, {
-        signal: input.signal,
-      });
-      // Keep the verified download for installation instead of fetching it twice.
-      file.stagedPath = target;
+      let source;
+      if (file.installedPath) {
+        // Read a bounded snapshot so inspection never follows bytes changed
+        // after the checksum comparison, or needs to download an unchanged JAR.
+        const handle = await fs.open(
+          await safePath(serverDir, file.installedPath),
+          "r",
+        );
+        const chunks = [];
+        let size = 0;
+        try {
+          const stat = await handle.stat();
+          if (!stat.isFile() || stat.size !== file.size)
+            throw error(409, `${file.installedPath} changed since review.`);
+          for await (const chunk of handle.createReadStream({
+            autoClose: false,
+          })) {
+            input.signal?.throwIfAborted();
+            if ((size += chunk.length) > file.size)
+              throw error(409, `${file.installedPath} changed since review.`);
+            chunks.push(chunk);
+          }
+        } finally {
+          await handle.close();
+        }
+        source = Buffer.concat(chunks);
+        const [algorithm, requiredHash] = strongestHash(file.hashes);
+        if (
+          source.length !== file.size ||
+          createHash("sha512").update(source).digest("hex") !==
+            file.installedHash ||
+          createHash(algorithm).update(source).digest("hex") !== requiredHash
+        )
+          throw error(
+            409,
+            `${file.installedPath} changed since review. Review the installation again.`,
+          );
+      } else {
+        source = path.join(stage, `dependency-inspection-${index}.jar`);
+        await downloadVerified(file, source, file.hosts, request, {
+          signal: input.signal,
+        });
+        // Keep the verified download for installation instead of fetching it twice.
+        file.stagedPath = source;
+      }
       try {
-        for (const bundled of await inspectBundledDependencies(target, {
+        for (const bundled of await inspectBundledDependencies(source, {
           signal: input.signal,
           loader: input.loader,
           fingerprint: curseFingerprint,
@@ -1480,7 +1521,6 @@ export async function createLaunchpad(ctx) {
     const stage = await privatePath(planId);
     await fs.mkdir(stage);
     try {
-      await inspectUnavailableDependencies(result, input, stage);
       if (result.archive) {
         const pack = await unpackPack(result, input, stage);
         result.files.push(
@@ -1517,6 +1557,7 @@ export async function createLaunchpad(ctx) {
         );
       const paths = new Set();
       const files = [];
+      const unchanged = [];
       const local =
         input.type === "modpack"
           ? []
@@ -1579,6 +1620,34 @@ export async function createLaunchpad(ctx) {
             409,
             "The installed file changed after identification. Refresh installed files and review the update again.",
           );
+        // Compare bytes, not names or version labels. A verified package may
+        // have been renamed locally; keep it in place when the provider's
+        // destination is absent so the update cannot create a duplicate JAR.
+        const existingPath = previous && !current ? previous.path : file.path;
+        const existingHash = previous && !current ? previous.sha512 : expected;
+        if (existingHash && (!previous || !current)) {
+          const [algorithm, requiredHash] = strongestHash(file.hashes);
+          const actualHash =
+            algorithm === "sha512"
+              ? existingHash
+              : await fileHash(
+                  await safePath(serverDir, existingPath),
+                  algorithm,
+                );
+          if (actualHash === requiredHash) {
+            // Retain both the existing file and absent destination snapshots
+            // for the final pre-mutation check, even though neither is listed
+            // as a change or passed to the download/promotion loops.
+            unchanged.push({
+              ...file,
+              expected,
+              previous,
+              installedPath: existingPath,
+              installedHash: existingHash,
+            });
+            continue;
+          }
+        }
         files.push({
           ...file,
           author: file.author || matches[0]?.author,
@@ -1587,12 +1656,15 @@ export async function createLaunchpad(ctx) {
           action: expected || previous ? "replace" : "install",
         });
       }
+      result.files = [...files, ...unchanged];
+      await inspectUnavailableDependencies(result, input, stage);
       const expiresAt = new Date(Date.now() + 15 * 60 * 1000).toISOString();
       const plan = {
         id: planId,
         input,
         stage,
         files,
+        unchanged,
         title: result.title,
         iconUrl: result.iconUrl,
         author:
@@ -1606,16 +1678,27 @@ export async function createLaunchpad(ctx) {
         versionName: result.versionName,
         warnings: [...new Set(result.warnings)],
         unavailableDependencies: result.unavailableDependencies,
-        bundledDependencies: result.bundledDependencies,
+        bundledDependencies: result.bundledDependencies.filter((dependency) =>
+          files.some((file) => file.path === dependency.bundledWith),
+        ),
         loaderInstall: result.loaderInstall,
         expiresAt,
       };
       lifetime.signal.throwIfAborted();
-      plans.set(planId, plan);
+      if (files.length) plans.set(planId, plan);
+      else {
+        await fs.rm(stage, { recursive: true, force: true });
+        // Empty reviews need no staging or install-plan slot. Keep only a few
+        // recent IDs so an attempted confirmation receives a useful error.
+        noOpReviews.set(planId, Date.parse(expiresAt));
+        while (noOpReviews.size > 4)
+          noOpReviews.delete(noOpReviews.keys().next().value);
+      }
       return {
         planId,
         title: plan.title,
         versionName: plan.versionName,
+        unchangedCount: unchanged.length,
         files: files.map((file) => ({
           path: file.path,
           size: file.size,
@@ -1644,7 +1727,7 @@ export async function createLaunchpad(ctx) {
       const recovered = [],
         promoted = [];
       // Validate the entire reviewed snapshot before making any server changes.
-      for (const file of plan.files) {
+      for (const file of [...plan.files, ...plan.unchanged]) {
         const target = await safePath(serverDir, file.path);
         const stat = await statOrNull(target);
         if ((stat ? await fileHash(target) : null) !== file.expected)
@@ -1808,6 +1891,11 @@ export async function createLaunchpad(ctx) {
       );
     if (active || preparingInstall)
       throw error(409, "Another Launchpad installation is already running.");
+    if ((noOpReviews.get(input?.planId) ?? 0) > Date.now())
+      throw error(
+        409,
+        "All reviewed files are already up to date. No installation is needed.",
+      );
     const plan = plans.get(input?.planId);
     if (!plan || Date.parse(plan.expiresAt) < Date.now())
       throw error(
@@ -1986,6 +2074,7 @@ export async function createLaunchpad(ctx) {
           .rm(await privatePath(id), { recursive: true, force: true })
           .catch(() => {});
       plans.clear();
+      noOpReviews.clear();
     },
   };
 }

@@ -106,6 +106,7 @@ type Plan = {
   title: string;
   versionName: string;
   expiresAt: string;
+  unchangedCount?: number;
   files: {
     path: string;
     size: number;
@@ -1792,51 +1793,73 @@ export default function Launchpad({ notify }: PageProps) {
           ) : (
             <>
               <p className="management-dialog-description">
-                <strong>{plan.versionName}</strong> will make these changes to
-                this server. The server will remain stopped.
+                {plan.files.length ? (
+                  <>
+                    <strong>{plan.versionName}</strong> will make these changes
+                    to this server. The server will remain stopped.
+                  </>
+                ) : (
+                  <>
+                    No file changes are needed for{" "}
+                    <strong>{plan.versionName}</strong>.
+                  </>
+                )}
               </p>
-              <ul
-                className="launchpad-review-files"
-                aria-label="Installation files"
-                tabIndex={0}
-              >
-                {plan.files.map((file) => (
-                  <li key={file.path}>
-                    <span>
-                      {file.path}
-                      {file.previousPath && file.previousPath !== file.path && (
-                        <small className="launchpad-previous-path">
-                          Replaces {file.previousPath}
-                        </small>
-                      )}
-                    </span>
-                    <span
-                      className={`launchpad-badge ${file.action === "replace" ? "update" : ""}`}
+              {(plan.files.length > 0 ||
+                Boolean(plan.bundledDependencies?.length)) && (
+                <ul
+                  className="launchpad-review-files"
+                  aria-label="Installation files"
+                  tabIndex={0}
+                >
+                  {plan.files.map((file) => (
+                    <li key={file.path}>
+                      <span>
+                        {file.path}
+                        {file.previousPath &&
+                          file.previousPath !== file.path && (
+                            <small className="launchpad-previous-path">
+                              Replaces {file.previousPath}
+                            </small>
+                          )}
+                      </span>
+                      <span
+                        className={`launchpad-badge ${file.action === "replace" ? "update" : ""}`}
+                      >
+                        {file.action === "replace" ? "Replace" : "Install"}
+                      </span>
+                      <span>{formatBytes(file.size)}</span>
+                    </li>
+                  ))}
+                  {plan.bundledDependencies?.map((dependency, index) => (
+                    <li
+                      key={`bundled:${dependency.bundledWith}:${dependency.path}:${index}`}
                     >
-                      {file.action === "replace" ? "Replace" : "Install"}
-                    </span>
-                    <span>{formatBytes(file.size)}</span>
-                  </li>
-                ))}
-                {plan.bundledDependencies?.map((dependency, index) => (
-                  <li
-                    key={`bundled:${dependency.bundledWith}:${dependency.path}:${index}`}
-                  >
-                    <span>
-                      {dependency.title}
-                      {dependency.version ? ` ${dependency.version}` : ""}
-                      <small className="launchpad-previous-path">
-                        Included in{" "}
-                        {dependency.bundledWith.split(/[\\/]/).pop()}
-                        {dependency.serverCompatible === false
-                          ? " · Not active on the server"
-                          : ""}
-                      </small>
-                    </span>
-                    <span className="launchpad-badge">Included</span>
-                  </li>
-                ))}
-              </ul>
+                      <span>
+                        {dependency.title}
+                        {dependency.version ? ` ${dependency.version}` : ""}
+                        <small className="launchpad-previous-path">
+                          Included in{" "}
+                          {dependency.bundledWith.split(/[\\/]/).pop()}
+                          {dependency.serverCompatible === false
+                            ? " · Not active on the server"
+                            : ""}
+                        </small>
+                      </span>
+                      <span className="launchpad-badge">Included</span>
+                    </li>
+                  ))}
+                </ul>
+              )}
+              {Boolean(plan.unchangedCount) && (
+                <p className="management-dialog-description">
+                  {plan.unchangedCount} file
+                  {plan.unchangedCount === 1 ? " is" : "s are"} already up to
+                  date.
+                  {plan.unchangedCount === 1 ? " It will" : " They will"} be
+                  left unchanged.
+                </p>
+              )}
               {plan.warnings.map((warning) => (
                 <p className="launchpad-review-warning" key={warning}>
                   {warning}
@@ -1889,14 +1912,16 @@ export default function Launchpad({ notify }: PageProps) {
                   </div>
                 </div>
               )}
-              <p className="management-dialog-description">
-                Review {plan.files.length} file
-                {plan.files.length === 1 ? "" : "s"}
-                {plan.bundledDependencies?.length
-                  ? ` and ${plan.bundledDependencies.length} included ${plan.bundledDependencies.length === 1 ? "library" : "libraries"}`
-                  : ""}{" "}
-                before continuing.
-              </p>
+              {plan.files.length > 0 && (
+                <p className="management-dialog-description">
+                  Review {plan.files.length} file
+                  {plan.files.length === 1 ? "" : "s"}
+                  {plan.bundledDependencies?.length
+                    ? ` and ${plan.bundledDependencies.length} included ${plan.bundledDependencies.length === 1 ? "library" : "libraries"}`
+                    : ""}{" "}
+                  before continuing.
+                </p>
+              )}
             </>
           )}
           {!canInstall && (
@@ -1949,9 +1974,11 @@ export default function Launchpad({ notify }: PageProps) {
                   )}
                   {busy === "install"
                     ? "Starting installation..."
-                    : plan.unavailableDependencies?.length
-                      ? "Install anyway"
-                      : "Confirm installation"}
+                    : plan.files.length === 0
+                      ? "Already up to date"
+                      : plan.unavailableDependencies?.length
+                        ? "Install anyway"
+                        : "Confirm installation"}
                 </button>
               </>
             ) : (

@@ -349,7 +349,7 @@ test("Versions offers older stable Fabric loaders and requires opting in to expe
 test("Launchpad exposes six platforms, only four content tabs, and a reviewed installed-mod update", async ({
   page,
   serverId,
-}) => {
+}, testInfo) => {
   const providers = [
     ["modrinth", "Modrinth", ["modpack", "mod", "datapack", "plugin"]],
     ["curseforge", "CurseForge", ["modpack", "mod"]],
@@ -419,6 +419,7 @@ test("Launchpad exposes six platforms, only four content tabs, and a reviewed in
     route.fulfill({ json: { versions: [version] } }),
   );
   let previewBody: Record<string, unknown> | undefined;
+  let alreadyInstalled = false;
   await page.route("**/api/launchpad/preview", (route) => {
     expect(route.request().headers()["x-server-id"]).toBe(serverId);
     previewBody = route.request().postDataJSON();
@@ -427,14 +428,17 @@ test("Launchpad exposes six platforms, only four content tabs, and a reviewed in
         planId: "review-token",
         title: "Better Mod",
         versionName: "2.0",
-        files: [
-          {
-            path: "mods/better-2.jar",
-            size: 2048,
-            action: "replace",
-            previousPath: "mods/better-1.jar",
-          },
-        ],
+        unchangedCount: alreadyInstalled ? 3 : 2,
+        files: alreadyInstalled
+          ? []
+          : [
+              {
+                path: "mods/better-2.jar",
+                size: 2048,
+                action: "replace",
+                previousPath: "mods/better-1.jar",
+              },
+            ],
         warnings: [],
         expiresAt: "2099-01-01T00:00:00Z",
       },
@@ -486,6 +490,13 @@ test("Launchpad exposes six platforms, only four content tabs, and a reviewed in
   await expect(dialog).toBeVisible();
   await dialog.getByRole("button", { name: /Review/ }).click();
   await expect(dialog).toContainText("mods/better-2.jar");
+  await expect(dialog).toContainText("2 files are already up to date.");
+  await expect(dialog).toContainText("Review 1 file before continuing.");
+  await expect(
+    dialog
+      .getByRole("list", { name: "Installation files" })
+      .getByRole("listitem"),
+  ).toHaveCount(1);
   expect(previewBody).toMatchObject({
     platform: "modrinth",
     projectId: "better",
@@ -494,6 +505,26 @@ test("Launchpad exposes six platforms, only four content tabs, and a reviewed in
     gameVersion: "1.21.1",
     loader: "neoforge",
   });
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.screenshot({
+    path: testInfo.outputPath("review-changes-mobile.png"),
+  });
+  alreadyInstalled = true;
+  await dialog.getByRole("button", { name: "Back", exact: true }).click();
+  await dialog.getByRole("button", { name: /Review/ }).click();
+  await expect(dialog).toContainText("No file changes are needed for 2.0.");
+  await expect(dialog).toContainText("3 files are already up to date.");
+  await expect(
+    dialog.getByRole("list", { name: "Installation files" }),
+  ).toHaveCount(0);
+  await expect(
+    dialog.getByRole("button", { name: "Already up to date" }),
+  ).toBeDisabled();
+  await expect(dialog).not.toContainText("Review 0 files");
+  expect(submitted).toBeUndefined();
+  alreadyInstalled = false;
+  await dialog.getByRole("button", { name: "Back", exact: true }).click();
+  await dialog.getByRole("button", { name: /Review/ }).click();
   await dialog.getByRole("button", { name: "Confirm installation" }).click();
   await expect
     .poll(() => submitted)
