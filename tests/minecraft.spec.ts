@@ -490,7 +490,8 @@ test("Launchpad exposes six platforms, only four content tabs, and a reviewed in
   await expect(dialog).toBeVisible();
   await dialog.getByRole("button", { name: /Review/ }).click();
   await expect(dialog).toContainText("mods/better-2.jar");
-  await expect(dialog).toContainText("2 files are already up to date.");
+  await expect(dialog).not.toContainText("files are already up to date");
+  await expect(dialog).not.toContainText("left unchanged");
   await expect(dialog).toContainText("Review 1 file before continuing.");
   await expect(
     dialog
@@ -513,7 +514,7 @@ test("Launchpad exposes six platforms, only four content tabs, and a reviewed in
   await dialog.getByRole("button", { name: "Back", exact: true }).click();
   await dialog.getByRole("button", { name: /Review/ }).click();
   await expect(dialog).toContainText("No file changes are needed for 2.0.");
-  await expect(dialog).toContainText("3 files are already up to date.");
+  await expect(dialog).not.toContainText("files are already up to date");
   await expect(
     dialog.getByRole("list", { name: "Installation files" }),
   ).toHaveCount(0);

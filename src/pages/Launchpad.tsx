@@ -106,7 +106,6 @@ type Plan = {
   title: string;
   versionName: string;
   expiresAt: string;
-  unchangedCount?: number;
   files: {
     path: string;
     size: number;
@@ -1850,15 +1849,6 @@ export default function Launchpad({ notify }: PageProps) {
                     </li>
                   ))}
                 </ul>
-              )}
-              {Boolean(plan.unchangedCount) && (
-                <p className="management-dialog-description">
-                  {plan.unchangedCount} file
-                  {plan.unchangedCount === 1 ? " is" : "s are"} already up to
-                  date.
-                  {plan.unchangedCount === 1 ? " It will" : " They will"} be
-                  left unchanged.
-                </p>
               )}
               {plan.warnings.map((warning) => (
                 <p className="launchpad-review-warning" key={warning}>
