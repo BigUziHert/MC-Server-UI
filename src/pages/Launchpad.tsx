@@ -1704,6 +1704,41 @@ export default function Launchpad({ notify }: PageProps) {
           </p>
           {!plan ? (
             <>
+              <div className="form-field">
+                <label htmlFor="launchpad-target-loader">Target loader</label>
+                <select
+                  id="launchpad-target-loader"
+                  value={targetLoader}
+                  disabled={Boolean(busy)}
+                  onChange={(event) => setTargetLoader(event.target.value)}
+                >
+                  <option value="">Not selected</option>
+                  {loaders.map((value) => (
+                    <option key={value} value={value}>
+                      {loaderName(value)}
+                    </option>
+                  ))}
+                </select>
+              </div>
+              <div className="form-field">
+                <label htmlFor="launchpad-target-minecraft">
+                  Target Minecraft version
+                </label>
+                <select
+                  id="launchpad-target-minecraft"
+                  value={targetVersion}
+                  required
+                  disabled={Boolean(busy)}
+                  onChange={(event) => setTargetVersion(event.target.value)}
+                >
+                  <option value="">Select Minecraft version</option>
+                  {minecraftVersions.map((value) => (
+                    <option key={value} value={value}>
+                      {value}
+                    </option>
+                  ))}
+                </select>
+              </div>
               {versionsLoading ? (
                 <p role="status">Loading compatible versions...</p>
               ) : versionsError ? (
@@ -1765,41 +1800,6 @@ export default function Launchpad({ notify }: PageProps) {
                   )}
                 </div>
               )}
-              <div className="form-field">
-                <label htmlFor="launchpad-target-minecraft">
-                  Target Minecraft version
-                </label>
-                <select
-                  id="launchpad-target-minecraft"
-                  value={targetVersion}
-                  required
-                  disabled={Boolean(busy)}
-                  onChange={(event) => setTargetVersion(event.target.value)}
-                >
-                  <option value="">Select Minecraft version</option>
-                  {minecraftVersions.map((value) => (
-                    <option key={value} value={value}>
-                      {value}
-                    </option>
-                  ))}
-                </select>
-              </div>
-              <div className="form-field">
-                <label htmlFor="launchpad-target-loader">Target loader</label>
-                <select
-                  id="launchpad-target-loader"
-                  value={targetLoader}
-                  disabled={Boolean(busy)}
-                  onChange={(event) => setTargetLoader(event.target.value)}
-                >
-                  <option value="">Not selected</option>
-                  {loaders.map((value) => (
-                    <option key={value} value={value}>
-                      {loaderName(value)}
-                    </option>
-                  ))}
-                </select>
-              </div>
             </>
           ) : (
             <>
