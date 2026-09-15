@@ -98,9 +98,6 @@
   color: var(--muted);
   min-width: 0;
 }
-.subusers-search:focus-within {
-  border-color: var(--accent);
-}
 .subusers-search input {
   width: 205px;
   min-width: 0;

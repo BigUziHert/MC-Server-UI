@@ -4,6 +4,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { createCoreProviders } from "./launchpad-providers.mjs";
 import { safeInstallPath, unpackProviderZip } from "./launchpad-archives.mjs";
 import { inspectBundledDependencies } from "./launchpad-bundled.mjs";
+import { installedDependencySatisfies } from "./launchpad-dependency-ranges.mjs";
 import { createModRemoval } from "./launchpad-removal.mjs";
 import {
   checkedProviderUrl,
@@ -1032,16 +1033,141 @@ export async function createLaunchpad(ctx) {
       job: lastJob ? { ...jobs.get(lastJob) } : null,
     };
   }
-  async function resolveTree(input) {
+  async function resolveTree(input, stage, local) {
     const files = [],
       warnings = [],
       unavailableDependencies = [],
       recoveredDependencies = new Set(),
       attempted = new Set(),
-      visited = new Map();
+      visited = new Map(),
+      preservedDependencies = new Set();
+    let inspectedParents = 0,
+      inspectionBytes = 0;
     let rootResult;
-    async function visit(value, depth = 0, requiredBy) {
-      const attemptKey = `${value.platform}:${value.projectId ?? ""}:${value.versionId ?? ""}`;
+    async function preserveInstalled(found, value, parentFiles) {
+      const matches = local.filter(
+        (item) =>
+          item.platform === value.platform &&
+          item.projectId === value.projectId,
+      );
+      if (matches.length > 1)
+        throw error(
+          409,
+          "Multiple installed files match this project. Use File Manager to resolve duplicates before updating.",
+        );
+      const existing = matches[0];
+      const key = `${value.platform}:${value.projectId}`;
+      if (
+        !existing ||
+        (existing.versionId === value.versionId &&
+          !preservedDependencies.has(key))
+      )
+        return null;
+      const fail = () =>
+        error(
+          409,
+          `${existing.title || "The dependency"} is already installed, but its version could not be verified against this mod's requirements. Review the required dependency versions before installing.`,
+        );
+      if (
+        !parentFiles ||
+        parentFiles.length !== 1 ||
+        !["forge", "neoforge"].includes(input.loader)
+      )
+        throw fail();
+      const result = await found.resolve({
+        ...value,
+        versionId: existing.versionId,
+      });
+      if (result.archive || result.files?.length !== 1) throw fail();
+      const artifact = result.files[0],
+        parent = parentFiles[0];
+      const limit = 64 * 1024 ** 2;
+      if (
+        ![artifact, parent].every(
+          (file) =>
+            Number.isSafeInteger(file.size) &&
+            file.size >= 0 &&
+            file.size <= limit,
+        )
+      )
+        throw fail();
+      const handle = await fs.open(
+        await safePath(serverDir, existing.path),
+        "r",
+      );
+      let source;
+      try {
+        const before = await handle.stat();
+        if (!before.isFile() || before.size !== artifact.size) throw fail();
+        const chunks = [];
+        let size = 0;
+        for await (const chunk of handle.createReadStream({
+          autoClose: false,
+        })) {
+          input.signal?.throwIfAborted();
+          if ((size += chunk.length) > artifact.size) throw fail();
+          chunks.push(chunk);
+        }
+        source = Buffer.concat(chunks);
+        const [algorithm, expectedHash] = strongestHash(artifact.hashes);
+        if (
+          fileStamp(before) !== fileStamp(await handle.stat()) ||
+          source.length !== artifact.size ||
+          createHash("sha512").update(source).digest("hex") !==
+            existing.sha512 ||
+          createHash(algorithm).update(source).digest("hex") !== expectedHash
+        )
+          throw error(
+            409,
+            `${existing.path} changed after identification. Refresh installed mods and review the update again.`,
+          );
+      } finally {
+        await handle.close();
+      }
+      if (!parent.stagedPath) {
+        if (
+          ++inspectedParents > 16 ||
+          (inspectionBytes += parent.size) > 128 * 1024 ** 2
+        )
+          throw fail();
+        parent.stagedPath = path.join(
+          stage,
+          `compatibility-${inspectedParents}.jar`,
+        );
+        await downloadVerified(
+          parent,
+          parent.stagedPath,
+          parent.hosts,
+          request,
+          { signal: input.signal },
+        );
+      }
+      if (
+        !(await installedDependencySatisfies(parent.stagedPath, source, {
+          loader: input.loader,
+          signal: input.signal,
+        }))
+      )
+        throw fail();
+      preservedDependencies.add(key);
+      value.versionId = existing.versionId;
+      // Keep the exact installed path, including locally renamed JARs. It must
+      // pass the ordinary unchanged-byte and pre-promotion snapshot checks.
+      return {
+        ...result,
+        files: [{ ...artifact, path: existing.path, preserveInstalled: true }],
+      };
+    }
+    async function visit(
+      value,
+      depth = 0,
+      requiredBy,
+      parentFiles,
+      parentKey = "",
+    ) {
+      // Different dependents must each prove their own range, even if they
+      // repeat the same incorrect catalog pin. Deduplicate only the same edge.
+      const attemptKey = `${parentKey}>${value.platform}:${value.projectId ?? ""}:${value.versionId ?? ""}`;
       if (attempted.has(attemptKey)) return;
       if (depth > 20 || attempted.size >= 100)
         throw error(
@@ -1077,7 +1203,11 @@ export async function createLaunchpad(ctx) {
             );
         }
         const key = `${value.platform}:${value.projectId}`;
-        if (visited.get(key) === String(value.versionId)) return;
+        if (
+          visited.get(key) === String(value.versionId) &&
+          !preservedDependencies.has(key)
+        )
+          return;
         try {
           result = await found.resolve(value);
         } catch (cause) {
@@ -1104,6 +1234,13 @@ export async function createLaunchpad(ctx) {
           if (key !== `${input.platform}:${input.projectId}`)
             recoveredDependencies.add(key);
         }
+        if (
+          depth &&
+          key !== `${input.platform}:${input.projectId}` &&
+          (recoveringDependency || preservedDependencies.has(key))
+        )
+          result =
+            (await preserveInstalled(found, value, parentFiles)) ?? result;
         if (visited.has(key)) {
           if (visited.get(key) !== String(value.versionId))
             throw error(
@@ -1121,7 +1258,7 @@ export async function createLaunchpad(ctx) {
             409,
             "Required dependencies request conflicting versions of the same project. Resolve them manually before installing.",
           );
-        if (recoveringDependency)
+        if (recoveringDependency || preservedDependencies.has(key))
           throw error(
             400,
             "A compatible release for a required dependency could not be verified. Choose another project version or correct the dependency before installing.",
@@ -1151,13 +1288,14 @@ export async function createLaunchpad(ctx) {
           );
       }
       const prefix = await destination(value.type);
+      const nodeFiles = [];
       for (const file of result.files ?? []) {
         const target = safeInstallPath(
           file.path.includes("/") || !prefix
             ? file.path
             : `${prefix}/${file.path}`,
         );
-        files.push({
+        const planned = {
           ...file,
           path: target,
           platform: value.platform,
@@ -1169,7 +1307,9 @@ export async function createLaunchpad(ctx) {
           author: result.author,
           type: value.type,
           hosts: found.downloadHosts,
-        });
+        };
+        files.push(planned);
+        nodeFiles.push(planned);
       }
       for (const dependency of result.dependencies ?? [])
         await visit(
@@ -1183,6 +1323,8 @@ export async function createLaunchpad(ctx) {
           },
           depth + 1,
           result.title,
+          nodeFiles,
+          `${value.platform}:${value.projectId}:${value.versionId}`,
         );
     }
     await visit({ ...input });
@@ -1590,11 +1732,15 @@ export async function createLaunchpad(ctx) {
     const input = selection(raw, true);
     await assertCompatibility(input);
     const found = await provider(input.platform);
-    const result = await resolveTree(input);
     const planId = randomUUID();
     const stage = await privatePath(planId);
     await fs.mkdir(stage);
     try {
+      const local =
+        input.type === "modpack"
+          ? []
+          : (await installed({ ...input, identityOnly: true })).items;
+      const result = await resolveTree(input, stage, local);
       if (result.archive) {
         const pack = await unpackPack(result, input, stage);
         result.files.push(
@@ -1632,10 +1778,6 @@ export async function createLaunchpad(ctx) {
       const paths = new Set();
       const files = [];
       const unchanged = [];
-      const local =
-        input.type === "modpack"
-          ? []
-          : (await installed({ ...input, identityOnly: true })).items;
       for (const file of result.files) {
         file.path = safeInstallPath(file.path);
         const folded = file.path.toLowerCase();
@@ -1733,6 +1875,11 @@ export async function createLaunchpad(ctx) {
             continue;
           }
         }
+        if (file.preserveInstalled)
+          throw error(
+            409,
+            `${file.path} changed since its dependency requirements were checked. Review the installation again.`,
+          );
         files.push({
           ...file,
           author: file.author || matches[0]?.author,

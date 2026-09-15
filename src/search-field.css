@@ -18,13 +18,10 @@
   min-width: 0;
   padding-right: 32px !important;
 }
+.search-field .search-field-control > input:focus,
 .search-field .search-field-control > input:focus-visible {
   outline: none !important;
-}
-.search-field.search-field:focus-within {
-  border-color: #969bb3;
-  box-shadow: 0 0 0 1px #969bb340;
-  border-radius: 6px;
+  box-shadow: none !important;
 }
 .search-field .search-field-clear {
   position: absolute;

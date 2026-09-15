@@ -849,7 +849,15 @@ test("Launchpad installed updates sort before pagination and keep priority when 
   ]);
   await expect(page.getByRole("button", { name: /^Update / })).toHaveCount(2);
   await page.setViewportSize({ width: 390, height: 844 });
-  await page.getByLabel("Search Launchpad", { exact: true }).fill("alpha");
+  const search = page.getByLabel("Search Launchpad", { exact: true });
+  const searchField = search.locator("xpath=../..");
+  const unfocusedBorder = await searchField.evaluate(
+    (element) => getComputedStyle(element).borderColor,
+  );
+  const unfocusedInputBorder = await search.evaluate(
+    (element) => getComputedStyle(element).borderColor,
+  );
+  await search.fill("alpha");
   await expect(names).toHaveText([
     "Alpha Mod 9",
     "Alpha Mod 1",
@@ -868,18 +876,14 @@ test("Launchpad installed updates sort before pagination and keep priority when 
     ),
   ).toBe(true);
   await page.getByRole("button", { name: "Clear search", exact: true }).click();
-  const search = page.getByLabel("Search Launchpad", { exact: true });
   await expect(search).toHaveValue("");
   await expect(search).toBeFocused();
   await expect(search).toHaveCSS("outline-style", "none");
-  await expect(search.locator("xpath=../..")).toHaveCSS(
-    "border-color",
-    "rgb(150, 155, 179)",
-  );
-  await expect(search.locator("xpath=../..")).toHaveCSS(
-    "box-shadow",
-    "rgba(150, 155, 179, 0.25) 0px 0px 0px 1px",
-  );
+  await expect(search).toHaveCSS("box-shadow", "none");
+  await expect(search).toHaveCSS("border-color", unfocusedInputBorder);
+  await expect(searchField).toHaveCSS("border-color", unfocusedBorder);
+  await expect(searchField).toHaveCSS("box-shadow", "none");
+  await expect(searchField).toHaveCSS("outline-style", "none");
   await expect(names).toHaveText(first);
   await expect(page.getByRole("status", { name: "Launchpad page" })).toHaveText(
     "Page 1 of 3",

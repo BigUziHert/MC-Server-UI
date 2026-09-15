@@ -212,6 +212,13 @@ test("select visible all respects filters and selection clears on directory and 
   const selection = page.getByRole("region", {
     name: "Selected files and folders",
   });
+  const searchField = search.locator("xpath=../..");
+  const unfocusedBorder = await searchField.evaluate(
+    (element) => getComputedStyle(element).borderColor,
+  );
+  const unfocusedInputBorder = await search.evaluate(
+    (element) => getComputedStyle(element).borderColor,
+  );
   await search.fill("alpha");
   await all.check();
   await expect(selection).toContainText("2 selected");
@@ -219,14 +226,11 @@ test("select visible all respects filters and selection clears on directory and 
   await expect(search).toHaveValue("");
   await expect(search).toBeFocused();
   await expect(search).toHaveCSS("outline-style", "none");
-  await expect(search.locator("xpath=../..")).toHaveCSS(
-    "border-color",
-    "rgb(150, 155, 179)",
-  );
-  await expect(search.locator("xpath=../..")).toHaveCSS(
-    "box-shadow",
-    "rgba(150, 155, 179, 0.25) 0px 0px 0px 1px",
-  );
+  await expect(search).toHaveCSS("box-shadow", "none");
+  await expect(search).toHaveCSS("border-color", unfocusedInputBorder);
+  await expect(searchField).toHaveCSS("border-color", unfocusedBorder);
+  await expect(searchField).toHaveCSS("box-shadow", "none");
+  await expect(searchField).toHaveCSS("outline-style", "none");
   await expect(all).toHaveAttribute("aria-checked", "mixed");
   await expect(
     page.getByRole("checkbox", { name: "Select beta.txt", exact: true }),

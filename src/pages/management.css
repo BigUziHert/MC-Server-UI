@@ -183,10 +183,6 @@
   height: 100%;
   padding: 0 !important;
 }
-.management-search:focus-within {
-  border-color: #969bb3;
-  box-shadow: 0 0 0 2px #ffd00014;
-}
 .management-search input::placeholder {
   color: #969bb3;
 }

@@ -2133,11 +2133,13 @@ test("JEI-style missing Modrinth dependencies require explicit acknowledgement o
   );
 });
 
-async function pinnedLoaderFixture(t) {
+async function pinnedLoaderFixture(t, requestHook) {
   const catalog = [],
     identities = new Map();
   const f = await fixture(t, {
     request: async (url, init) => {
+      const custom = await requestHook?.(url, init);
+      if (custom) return custom;
       const pathname = new URL(url).pathname;
       if (pathname === "/v2/project/dependency/version")
         return Response.json(catalog);
@@ -2303,7 +2305,7 @@ for (const unavailable of [
   });
 }
 
-test("recovering a wrong-loader pin cannot downgrade a different installed dependency release", async (t) => {
+test("recovering a wrong-loader pin cannot downgrade an unverified installed dependency release", async (t) => {
   const { f, identities, compatible } = await pinnedLoaderFixture(t);
   const existingBytes = bytes("installed Sable NeoForge 2.0.5");
   const existing = {
@@ -2336,12 +2338,285 @@ test("recovering a wrong-loader pin cannot downgrade a different installed depen
   for (const field of ["ino", "size", "mtimeMs", "ctimeMs", "birthtimeMs"])
     assert.equal(after[field], before[field], field);
   assert.equal(f.mutations, 0);
-  assert.equal(
-    f.requests.some(({ url }) => url.startsWith("https://cdn.modrinth.com/")),
-    false,
+  assert.ok(
+    f.requests
+      .filter(({ url }) => url.startsWith("https://cdn.modrinth.com/"))
+      .every(({ url }) => url === f.versions.new.files[0].url),
   );
   assert.deepEqual(
     await fs.readFile(path.join(f.serverDir, "mods", "old.jar")),
+    f.old,
+  );
+  assert.deepEqual(await f.bin.list(), []);
+});
+
+async function installedRangeFixture(t, range = "[1.1.0,)", requestHook) {
+  const state = await pinnedLoaderFixture(t, requestHook);
+  const { f, compatible, identities } = state;
+  const parent = zip([
+    [
+      "META-INF/neoforge.mods.toml",
+      `
+modLoader="javafml"
+loaderVersion="[1,)"
+license="MIT"
+[[mods]]
+modId="ragdolls"
+version="0.7.5"
+[[dependencies.ragdolls]]
+modId="sable"
+type="required"
+versionRange="${range}"
+side="BOTH"
+`,
+    ],
+  ]);
+  const installedBytes = zip([
+    [
+      "META-INF/neoforge.mods.toml",
+      `
+modLoader="javafml"
+loaderVersion="[1,)"
+license="MIT"
+[[mods]]
+modId="sable"
+version="2.0.5"
+`,
+    ],
+  ]);
+  f.newer = parent;
+  Object.assign(f.versions.new.files[0], {
+    size: parent.length,
+    hashes: hashes(parent),
+  });
+  f.downloads.set(f.versions.new.files[0].url, parent);
+  const existing = {
+    ...structuredClone(compatible),
+    id: "dep-newer",
+    name: "Sable 2.0.5 NeoForge",
+    version_number: "2.0.5",
+    files: [
+      {
+        ...compatible.files[0],
+        filename: "sable-neoforge-2.0.5.jar",
+        url: "https://cdn.modrinth.com/sable-neoforge-2.0.5.jar",
+        hashes: hashes(installedBytes),
+        size: installedBytes.length,
+      },
+    ],
+    dependencies: [],
+  };
+  f.versions[existing.id] = existing;
+  f.downloads.set(existing.files[0].url, installedBytes);
+  identities.set(hashes(installedBytes).sha512, existing);
+  const installedPath = path.join(f.serverDir, "mods", "renamed-sable.jar");
+  await fs.writeFile(installedPath, installedBytes);
+  // This belongs only to the recovered older release, never the installed one.
+  compatible.dependencies = [
+    {
+      project_id: "old-only",
+      version_id: "old-only",
+      dependency_type: "required",
+    },
+  ];
+  return { ...state, existing, installedBytes, installedPath };
+}
+
+test("a verified installed dependency satisfying the new mod's declared range is retained during wrong-loader recovery", async (t) => {
+  const { f, existing, installedBytes, installedPath, compatible, fabricUrl } =
+    await installedRangeFixture(t);
+  const before = await fs.stat(installedPath);
+  const plan = await f.service.preview({
+    ...selection,
+    replacePath: "mods/old.jar",
+  });
+  assert.deepEqual(
+    plan.files.map(({ path }) => path),
+    ["mods/new.jar"],
+  );
+  assert.equal(plan.unchangedCount, 1);
+  assert.deepEqual(plan.unavailableDependencies, []);
+  const job = await finish(f.service, { planId: plan.planId, confirmed: true });
+  assert.equal(job.status, "completed", job.error);
+  assert.equal(job.total, 1);
+  assert.deepEqual(await fs.readFile(installedPath), installedBytes);
+  const after = await fs.stat(installedPath);
+  for (const field of ["ino", "size", "mtimeMs", "ctimeMs", "birthtimeMs"])
+    assert.equal(after[field], before[field], field);
+  const installed = await f.service.installed({ ...selection, local: true });
+  assert.equal(
+    installed.items.find(({ projectId }) => projectId === "dependency")
+      .versionId,
+    existing.id,
+  );
+  assert.deepEqual(
+    await fs.readFile(path.join(f.serverDir, "mods/new.jar")),
+    f.newer,
+  );
+  assert.equal(
+    f.requests.some(
+      ({ url }) =>
+        [existing.files[0].url, compatible.files[0].url, fabricUrl].includes(
+          url,
+        ) || new URL(url).pathname.includes("old-only"),
+    ),
+    false,
+  );
+  assert.equal(
+    f.requests.filter(({ url }) => url === f.versions.new.files[0].url).length,
+    1,
+    "verified parent inspection is reused for installation",
+  );
+  assert.deepEqual(
+    (await f.bin.list()).map(({ originalPath }) => originalPath),
+    ["mods/old.jar"],
+  );
+});
+
+for (const range of ["[2.0.6,)", "[1.1.0,2.0.5)", "[2.0.3]", "unknown"])
+  test(`an installed dependency cannot bypass an incompatible or unknown declaration ${range}`, async (t) => {
+    const { f, installedBytes, installedPath } = await installedRangeFixture(
+      t,
+      range,
+    );
+    await assert.rejects(
+      f.service.preview({
+        ...selection,
+        acknowledgedUnavailableDependencies: true,
+      }),
+      { status: 409 },
+    );
+    assert.equal(f.mutations, 0);
+    assert.deepEqual(await fs.readFile(installedPath), installedBytes);
+    assert.deepEqual(
+      await fs.readFile(path.join(f.serverDir, "mods/old.jar")),
+      f.old,
+    );
+    assert.deepEqual(await f.bin.list(), []);
+  });
+
+test("each dependent must independently permit a preserved installed library even when catalog pins repeat", async (t) => {
+  const { f, installedBytes, installedPath } = await installedRangeFixture(t);
+  const otherBytes = zip([
+    [
+      "META-INF/neoforge.mods.toml",
+      `
+[[mods]]
+modId="othermod"
+version="1.0"
+[[dependencies.othermod]]
+modId="sable"
+type="required"
+versionRange="[1.1.0,2.0.5)"
+side="SERVER"
+`,
+    ],
+  ]);
+  f.versions.other = {
+    ...structuredClone(f.versions.new),
+    id: "other",
+    project_id: "other",
+    name: "Other mod",
+    files: [
+      {
+        ...f.versions.new.files[0],
+        filename: "other.jar",
+        url: "https://cdn.modrinth.com/other.jar",
+        size: otherBytes.length,
+        hashes: hashes(otherBytes),
+      },
+    ],
+  };
+  f.downloads.set(f.versions.other.files[0].url, otherBytes);
+  f.versions.new.dependencies.push({
+    project_id: "other",
+    version_id: "other",
+    dependency_type: "required",
+  });
+  await assert.rejects(f.service.preview(selection), { status: 409 });
+  assert.equal(f.mutations, 0);
+  assert.deepEqual(await fs.readFile(installedPath), installedBytes);
+});
+
+test("a missing exact-version lookup cannot bypass another parent's preserved-dependency proof", async (t) => {
+  let installedVersionLookups = 0;
+  const { f, existing, installedBytes, installedPath } =
+    await installedRangeFixture(t, "[1.1.0,)", (url) => {
+      if (
+        new URL(url).pathname === "/v2/version/dep-newer" &&
+        ++installedVersionLookups === 2
+      )
+        return new Response("Removed from the catalog", { status: 404 });
+    });
+  const otherBytes = zip([
+    [
+      "META-INF/neoforge.mods.toml",
+      `
+[[mods]]
+modId="othermod"
+version="1.0"
+[[dependencies.othermod]]
+modId="sable"
+type="required"
+versionRange="[1.1.0,2.0.5)"
+side="SERVER"
+`,
+    ],
+  ]);
+  f.versions.other = {
+    ...structuredClone(f.versions.new),
+    id: "other",
+    project_id: "other",
+    name: "Other mod",
+    files: [
+      {
+        ...f.versions.new.files[0],
+        filename: "other.jar",
+        url: "https://cdn.modrinth.com/other.jar",
+        size: otherBytes.length,
+        hashes: hashes(otherBytes),
+      },
+    ],
+    dependencies: [
+      {
+        project_id: "dependency",
+        version_id: existing.id,
+        dependency_type: "required",
+      },
+    ],
+  };
+  f.downloads.set(f.versions.other.files[0].url, otherBytes);
+  f.versions.new.dependencies.push({
+    project_id: "other",
+    version_id: "other",
+    dependency_type: "required",
+  });
+  await assert.rejects(
+    f.service.preview({
+      ...selection,
+      acknowledgedUnavailableDependencies: true,
+    }),
+    { status: 400 },
+  );
+  assert.equal(installedVersionLookups, 2);
+  assert.equal(f.mutations, 0);
+  assert.deepEqual(await fs.readFile(installedPath), installedBytes);
+  assert.deepEqual(
+    await fs.readFile(path.join(f.serverDir, "mods", "old.jar")),
+    f.old,
+  );
+  assert.deepEqual(await f.bin.list(), []);
+});
+
+test("changing a preserved dependency after review prevents all mod promotion", async (t) => {
+  const { f, installedPath } = await installedRangeFixture(t);
+  const plan = await f.service.preview(selection);
+  await fs.writeFile(installedPath, "externally changed dependency");
+  const job = await finish(f.service, { planId: plan.planId, confirmed: true });
+  assert.equal(job.status, "failed");
+  assert.match(job.error, /changed since review/);
+  assert.deepEqual(
+    await fs.readFile(path.join(f.serverDir, "mods/old.jar")),
     f.old,
   );
   assert.deepEqual(await f.bin.list(), []);
