@@ -452,6 +452,61 @@ function fakeJava({ confirm = true, flushDelay = 0, fakeChat = false } = {}) {
   };
 }
 
+test("live console waits for command delivery and rejects a failed or disconnected input", async (t) => {
+  const java = fakeJava();
+  let acknowledge;
+  let entered;
+  const writing = new Promise((resolve) => {
+    entered = resolve;
+  });
+  java.child.stdin = new Writable({
+    write(_chunk, _encoding, callback) {
+      acknowledge = callback;
+      entered();
+    },
+  });
+  const { request, serverDir } = await fixture(t, {
+    jar: "server.jar",
+    spawnServer: java.spawnServer,
+  });
+  await fs.writeFile(path.join(serverDir, "server.jar"), "never executed");
+  await fs.writeFile(path.join(serverDir, "eula.txt"), "eula=true\n");
+  assert.equal(
+    (await request("/api/server/power", json("POST", { action: "start" })))
+      .status,
+    200,
+  );
+  try {
+    const pending = request(
+      "/api/console/command",
+      json("POST", { command: "say delivery proof" }),
+    );
+    await writing;
+    const beforeDelivery = (await request("/api/audit")).body.entries;
+    acknowledge(new Error("Fixture server pipe closed"));
+    acknowledge = null;
+    assert.equal((await pending).status, 500);
+    assert.equal(
+      beforeDelivery.some((entry) => entry.action === "Console command"),
+      false,
+    );
+    assert.equal(
+      (await request("/api/console/command", json("POST", { command: "list" })))
+        .status,
+      409,
+    );
+    assert.equal(
+      (await request("/api/audit")).body.entries.some(
+        (entry) => entry.action === "Console command",
+      ),
+      false,
+    );
+  } finally {
+    acknowledge?.();
+    java.child.emit("close", 0);
+  }
+});
+
 test("live online backup flushes, blocks concurrent writes, and restores automatic saves", async (t) => {
   const java = fakeJava({ flushDelay: 120 });
   const { request, serverDir } = await fixture(t, {

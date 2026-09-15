@@ -341,8 +341,9 @@ function javaFileArguments(text) {
   return tokens;
 }
 
-function javaHeapLimit(args) {
+function javaStartupOptions(args) {
   let memoryLimitMB = null;
+  let jarIndex = -1;
   const valueOptions = new Set([
     "-cp",
     "-classpath",
@@ -361,9 +362,13 @@ function javaHeapLimit(args) {
   ]);
   for (let index = 0; index < args.length; index++) {
     const arg = args[index];
+    if (arg === "-jar") {
+      jarIndex = index;
+      break;
+    }
     // Everything following the entry point is a game argument, not a JVM flag.
     if (
-      ["-jar", "-m", "--module"].includes(arg) ||
+      ["-m", "--module"].includes(arg) ||
       arg.startsWith("--module=") ||
       !arg.startsWith("-")
     )
@@ -381,7 +386,7 @@ function javaHeapLimit(args) {
         Number.isSafeInteger(bytes) && bytes > 0 ? bytes / 1024 ** 2 : null;
     }
   }
-  return memoryLimitMB;
+  return { memoryLimitMB, jarIndex };
 }
 
 export async function inspectJavaArguments(directory, args) {
@@ -400,9 +405,9 @@ export async function inspectJavaArguments(directory, args) {
     for (const token of tokens) expanded.push(token);
     if (tokens.includes("--disable-@files")) expandFiles = false;
   }
-  const jarIndex = args.indexOf("-jar");
+  const { memoryLimitMB, jarIndex } = javaStartupOptions(expanded);
   if (jarIndex !== -1) {
-    const jar = args[jarIndex + 1];
+    const jar = expanded[jarIndex + 1];
     if (typeof jar !== "string" || !/\.jar$/i.test(jar))
       throw error(
         400,
@@ -427,7 +432,7 @@ export async function inspectJavaArguments(directory, args) {
   }
   return {
     ...describeJavaArguments(args),
-    memoryLimitMB: javaHeapLimit(expanded),
+    memoryLimitMB,
   };
 }
 

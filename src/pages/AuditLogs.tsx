@@ -13,9 +13,9 @@ import {
   Server,
   ShieldCheck,
   Users,
-  X,
 } from "lucide-react";
 import { useServerApi, relativeTime, type PageProps } from "../api";
+import SearchField from "../SearchField";
 import "./management.css";
 
 type Category = "server" | "file" | "backup" | "user" | "database" | "player";
@@ -142,24 +142,13 @@ export default function AuditLogs({ notify }: PageProps) {
             <h2 id="audit-list-title">Activity log</h2>
             <span className="management-count">{filtered.length}</span>
           </div>
-          <label className="management-search management-audit-search">
-            <Search size={16} />
-            <input
-              aria-label="Search audit logs"
-              placeholder="Search actions, details, or actors..."
-              value={search}
-              onChange={(e) => setSearch(e.target.value)}
-            />
-            {search && (
-              <button
-                className="management-clear-search"
-                aria-label="Clear search"
-                onClick={() => setSearch("")}
-              >
-                <X size={14} />
-              </button>
-            )}
-          </label>
+          <SearchField
+            className="management-search management-audit-search"
+            aria-label="Search audit logs"
+            placeholder="Search actions, details, or actors..."
+            value={search}
+            onValueChange={setSearch}
+          />
         </div>
         <div className="management-audit-filters">
           <ListFilter size={16} />

@@ -1,5 +1,49 @@
 import { test, expect } from "@playwright/test";
 
+test("restarting to update waits for the selected server to finish saving", async ({
+  page,
+}) => {
+  let releaseSave: (() => void) | undefined;
+  const saveGate = new Promise<void>((resolve) => {
+    releaseSave = resolve;
+  });
+  let saving = false;
+  let installed = false;
+  await page.route("**/api/desktop/selection", async (route) => {
+    if (route.request().method() === "PUT") {
+      saving = true;
+      await saveGate;
+    }
+    await route.fulfill({ json: { desktop: true, activeServerId: null } });
+  });
+  await page.route("**/api/desktop/updates**", (route) => {
+    if (route.request().method() === "POST") installed = true;
+    return route.fulfill({
+      json: {
+        desktop: true,
+        supported: true,
+        version: "0.1.3-dev.0",
+        channel: "dev",
+        status: installed ? "installing" : "downloaded",
+        availableVersion: "0.1.3-dev.9.1",
+        message: "Update downloaded.",
+      },
+    });
+  });
+  await page.goto("/");
+  await expect.poll(() => saving).toBe(true);
+  await page.getByRole("button", { name: "App updates", exact: true }).click();
+  const restart = page.getByRole("button", {
+    name: "Restart to update",
+    exact: true,
+  });
+  await restart.click();
+  await expect(restart).toBeDisabled();
+  expect(installed).toBe(false);
+  releaseSave!();
+  await expect.poll(() => installed).toBe(true);
+});
+
 test("desktop updates show version, manual download, and restart without submitting before a click", async ({
   page,
 }) => {

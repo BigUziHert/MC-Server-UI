@@ -12,13 +12,59 @@ export async function api<T = any>(
   const response = await fetch(`/api${path}`, { ...options, headers });
   if (!response.ok) {
     const body = await response.json().catch(() => ({}));
-    throw new Error(body.error || `Request failed (${response.status})`);
+    throw Object.assign(
+      new Error(body.error || `Request failed (${response.status})`),
+      {
+        status: response.status,
+      },
+    );
   }
   if (response.status === 204) return undefined as T;
   return response.json();
 }
 export const post = <T = any>(path: string, body: unknown = {}) =>
   api<T>(path, { method: "POST", body: JSON.stringify(body) });
+
+let desktopSelectionWrite: Promise<unknown> = Promise.resolve();
+let latestDesktopSelection: string | null | undefined;
+export function saveDesktopSelection(activeServerId: string | null) {
+  latestDesktopSelection = activeServerId;
+  desktopSelectionWrite = desktopSelectionWrite
+    .catch(() => {})
+    .then(() =>
+      api("/desktop/selection", {
+        method: "PUT",
+        body: JSON.stringify({ activeServerId }),
+        keepalive: true,
+      }),
+    );
+  return desktopSelectionWrite;
+}
+export async function flushDesktopSelection() {
+  let retried = false;
+  for (;;) {
+    const observed = desktopSelectionWrite;
+    try {
+      await observed;
+    } catch (cause) {
+      if (observed !== desktopSelectionWrite) continue;
+      if (retried || latestDesktopSelection === undefined) throw cause;
+      retried = true;
+      saveDesktopSelection(latestDesktopSelection);
+      continue;
+    }
+    if (observed === desktopSelectionWrite) return;
+  }
+}
+
+declare global {
+  interface Window {
+    __mcPanelFlushSelection?: () => Promise<unknown>;
+  }
+}
+// Native Quit uses the same pending-save barrier as the in-app update action.
+// This exposes no Node.js capabilities or credentials to the renderer.
+window.__mcPanelFlushSelection = flushDesktopSelection;
 
 // Bind requests and downloads to the mounted workspace, including async work
 // that finishes after the user switches servers. No mutable global selector.

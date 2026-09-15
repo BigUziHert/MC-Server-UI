@@ -149,7 +149,14 @@ function updateProperties(text, changes) {
     groups = [];
   for (let i = 0; i < natural.length; i++) {
     let group = natural[i];
-    while ((group.match(/\\+$/)?.[0].length ?? 0) % 2 && i + 1 < natural.length)
+    // Java comment lines never continue, even when their last character is a
+    // backslash. Keep them separate so editing the next key preserves them.
+    const comment = /^[ \t\f]*[#!]/.test(group.replace(/^\uFEFF/, ""));
+    while (
+      !comment &&
+      (group.match(/\\+$/)?.[0].length ?? 0) % 2 &&
+      i + 1 < natural.length
+    )
       group += newline + natural[++i];
     const key = [...parseProperties(group).keys()][0];
     groups.push({ group, key });

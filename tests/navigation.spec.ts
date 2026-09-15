@@ -23,10 +23,209 @@ const test = base.extend<{ serverId: string }>({
 });
 
 test.beforeEach(async ({ page, serverId }) => {
-  await page.addInitScript(
-    (id) => localStorage.setItem("mc-panel.active-server", id),
-    serverId,
+  await page.addInitScript((id) => {
+    if (!localStorage.getItem("mc-panel.active-server"))
+      localStorage.setItem("mc-panel.active-server", id);
+  }, serverId);
+});
+
+test("desktop selection is restored before scoped requests and persists subsequent changes", async ({
+  page,
+  request,
+  serverId,
+}) => {
+  const fleet = await (await request.get("/api/servers")).json();
+  const other = fleet.servers.find(
+    (server: { id: string }) => server.id !== serverId,
   );
+  expect(other).toBeTruthy();
+  let savedId = other.id;
+  const writes: string[] = [];
+  let releaseSelection: (() => void) | undefined;
+  const pendingSelection = new Promise<void>((resolve) => {
+    releaseSelection = resolve;
+  });
+  let firstRead = true;
+  await page.route("**/api/desktop/selection", async (route) => {
+    if (route.request().method() === "PUT") {
+      savedId = route.request().postDataJSON().activeServerId;
+      writes.push(savedId);
+    } else if (firstRead) {
+      firstRead = false;
+      await pendingSelection;
+    }
+    await route.fulfill({ json: { desktop: true, activeServerId: savedId } });
+  });
+  const scopedIds: string[] = [];
+  page.on("request", (request) => {
+    if (/\/api\/(?:server|console)(?:\?|$|\/)/.test(request.url()))
+      scopedIds.push(request.headers()["x-server-id"]);
+  });
+  await page.goto("/#console");
+  await expect(
+    page.getByRole("heading", { name: "Opening MC Panel…" }),
+  ).toBeVisible();
+  expect(scopedIds).toEqual([]);
+  releaseSelection!();
+  const switcher = page.getByRole("combobox", {
+    name: "Switch server",
+    exact: true,
+  });
+  await expect(switcher).toHaveValue(other.id);
+  await expect.poll(() => scopedIds.length).toBeGreaterThan(0);
+  expect(scopedIds.every((id) => id === other.id)).toBe(true);
+  expect(writes).toEqual([]);
+  await switcher.selectOption(serverId);
+  await expect.poll(() => savedId).toBe(serverId);
+  await page.reload();
+  await expect(switcher).toHaveValue(serverId);
+  expect(writes).toEqual([serverId]);
+  // A stale desktop preference must not mount or scope requests to a removed ID.
+  savedId = "00000000-0000-0000-0000-000000000000";
+  scopedIds.length = 0;
+  await page.reload();
+  await expect(switcher).toHaveValue(fleet.defaultServerId);
+  await expect.poll(() => savedId).toBe(fleet.defaultServerId);
+  expect(scopedIds).not.toContain("00000000-0000-0000-0000-000000000000");
+});
+
+test("browser server selection survives reload and all new workspace requests keep its scope", async ({
+  page,
+  request,
+  serverId,
+}) => {
+  const fleet = await (await request.get("/api/servers")).json();
+  const other = fleet.servers.find(
+    (server: { id: string }) => server.id !== serverId,
+  );
+  await page.goto("/#console");
+  const switcher = page.getByRole("combobox", {
+    name: "Switch server",
+    exact: true,
+  });
+  await expect(switcher).toHaveValue(serverId);
+  await switcher.selectOption(other.id);
+  await expect
+    .poll(() =>
+      page.evaluate(() => localStorage.getItem("mc-panel.active-server")),
+    )
+    .toBe(other.id);
+  const scopedIds: string[] = [];
+  page.on("request", (request) => {
+    if (/\/api\/(?:server|console)(?:\?|$|\/)/.test(request.url()))
+      scopedIds.push(request.headers()["x-server-id"]);
+  });
+  await page.reload();
+  await expect(switcher).toHaveValue(other.id);
+  await expect.poll(() => scopedIds.length).toBeGreaterThan(0);
+  expect(scopedIds.every((id) => id === other.id)).toBe(true);
+});
+
+test("a failed desktop selection read waits for retry without opening the default server", async ({
+  page,
+  serverId,
+}) => {
+  let available = false;
+  await page.route("**/api/desktop/selection", (route) =>
+    route.fulfill(
+      available
+        ? { json: { desktop: true, activeServerId: serverId } }
+        : {
+            status: 500,
+            json: { error: "Could not read the saved server choice." },
+          },
+    ),
+  );
+  const serverRequests: string[] = [];
+  page.on("request", (request) => {
+    if (/\/api\/(?:server|console)(?:\?|$|\/)/.test(request.url()))
+      serverRequests.push(request.url());
+  });
+  await page.goto("/");
+  await expect(page.getByRole("alert")).toContainText(
+    "Could not read the saved server choice.",
+  );
+  expect(serverRequests).toEqual([]);
+  available = true;
+  await page
+    .getByRole("button", { name: "Retry connection", exact: true })
+    .click();
+  await expect(
+    page.getByRole("combobox", { name: "Switch server", exact: true }),
+  ).toHaveValue(serverId);
+});
+
+test("native selection flush retries once after failure and drains choices queued while waiting", async ({
+  page,
+  request,
+  serverId,
+}) => {
+  const fleet = await (await request.get("/api/servers")).json();
+  const other = fleet.servers.find(
+    (server: { id: string }) => server.id !== serverId,
+  );
+  let savedId = other.id;
+  let fail = true;
+  let gated = false;
+  const attempts: string[] = [];
+  const releases: (() => void)[] = [];
+  await page.route("**/api/desktop/selection", async (route) => {
+    if (route.request().method() === "PUT") {
+      const id = route.request().postDataJSON().activeServerId;
+      attempts.push(id);
+      if (fail)
+        return route.fulfill({
+          status: 500,
+          json: { error: "Fixture preference save failed." },
+        });
+      if (gated)
+        await new Promise<void>((resolve) => {
+          releases.push(resolve);
+        });
+      savedId = id;
+    }
+    await route.fulfill({ json: { desktop: true, activeServerId: savedId } });
+  });
+  await page.goto("/");
+  const switcher = page.getByRole("combobox", {
+    name: "Switch server",
+    exact: true,
+  });
+  await expect(switcher).toHaveValue(other.id);
+  await switcher.selectOption(serverId);
+  await expect(
+    page.getByRole("status").filter({ hasText: "choice could not be saved" }),
+  ).toBeVisible();
+  const failure = await page.evaluate(async () => {
+    try {
+      await window.__mcPanelFlushSelection?.();
+      return "unexpected success";
+    } catch (cause) {
+      return (cause as Error).message;
+    }
+  });
+  expect(failure).toBe("Fixture preference save failed.");
+  expect(attempts).toEqual([serverId, serverId]);
+  fail = false;
+  await page.evaluate(() => window.__mcPanelFlushSelection?.());
+  expect(attempts).toEqual([serverId, serverId, serverId]);
+  expect(savedId).toBe(serverId);
+  gated = true;
+  await switcher.selectOption(other.id);
+  await expect.poll(() => releases.length).toBe(1);
+  let flushed = false;
+  const flush = page
+    .evaluate(() => window.__mcPanelFlushSelection?.())
+    .then(() => {
+      flushed = true;
+    });
+  await switcher.selectOption(serverId);
+  releases[0]();
+  await expect.poll(() => releases.length).toBe(2);
+  expect(flushed).toBe(false);
+  releases[1]();
+  await flush;
+  expect(savedId).toBe(serverId);
 });
 
 test("navigation groups collapse independently, persist, and reopen for a newly selected page", async ({

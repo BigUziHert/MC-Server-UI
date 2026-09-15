@@ -431,6 +431,16 @@ export async function createMinecraft(ctx) {
       endpoint(async (req, res) => res.json(await launchpad.preview(req.body))),
     );
     app.post(
+      "/api/launchpad/removal-preview",
+      endpoint(async (req, res) =>
+        res.json(await launchpad.removalPreview(req.body)),
+      ),
+    );
+    app.post(
+      "/api/launchpad/remove",
+      endpoint(async (req, res) => res.json(await launchpad.remove(req.body))),
+    );
+    app.post(
       "/api/launchpad/install",
       endpoint(async (req, res) =>
         res.status(202).json(await launchpad.install(req.body)),

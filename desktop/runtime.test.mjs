@@ -9,6 +9,7 @@ import { EventEmitter } from "node:events";
 import { PassThrough, Writable } from "node:stream";
 import { DESKTOP_COOKIE_NAME, startDesktopRuntime } from "./runtime.mjs";
 import { createFleet } from "../server/index.mjs";
+import { flushRendererSelection } from "./selection.mjs";
 
 const json = (method, body) => ({ method, body: JSON.stringify(body) });
 async function addServer(runtime, settings = {}) {
@@ -54,6 +55,44 @@ async function fixture(t) {
   return { rootDir, dataDir, launch };
 }
 
+test("native quit waits for pending renderer selection writes and reports a bounded failure", async () => {
+  let finish;
+  let flushed = false;
+  const write = new Promise((resolve) => {
+    finish = resolve;
+  });
+  const pending = flushRendererSelection({
+    executeJavaScript(expression) {
+      assert.equal(expression, "window.__mcPanelFlushSelection?.()");
+      return write;
+    },
+  }).then(() => {
+    flushed = true;
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(flushed, false);
+  finish();
+  await pending;
+  assert.equal(flushed, true);
+  await assert.rejects(
+    flushRendererSelection(
+      {
+        executeJavaScript: () => new Promise(() => {}),
+      },
+      { timeoutMs: 5 },
+    ),
+    { code: "PANEL_SELECTION_FLUSH_FAILED" },
+  );
+  await assert.rejects(
+    flushRendererSelection({
+      executeJavaScript: async () => {
+        throw new Error("Save rejected");
+      },
+    }),
+    { code: "PANEL_SELECTION_FLUSH_FAILED" },
+  );
+});
+
 test("desktop runtime requires its random session cookie for all API, file and static routes", async (t) => {
   const { launch } = await fixture(t);
   const runtime = await launch();
@@ -66,6 +105,7 @@ test("desktop runtime requires its random session cookie for all API, file and s
     "/index.html",
     "/favicon.svg",
     "/api/servers",
+    "/api/desktop/selection",
     "/api/files/download?path=server.properties",
   ])
     assert.equal((await fetch(runtime.url + route)).status, 401, route);
@@ -121,6 +161,131 @@ test("desktop runtime requires its random session cookie for all API, file and s
       assert.equal(icon.status, 200);
       assert.match(await icon.text(), /<svg/);
     },
+  );
+});
+
+test("desktop selection survives a new runtime and falls back when its server is removed", async (t) => {
+  const { launch, dataDir } = await fixture(t);
+  const first = await launch();
+  const original = await addServer(first, {
+    name: "First server",
+    port: 25565,
+  });
+  const selected = await addServer(first, {
+    name: "Selected server",
+    port: 25566,
+  });
+  const endpoint = "/api/desktop/selection";
+  assert.deepEqual(await (await first.request(endpoint)).json(), {
+    desktop: true,
+    activeServerId: null,
+  });
+  assert.equal(
+    (
+      await first.request(
+        endpoint,
+        json("PUT", { activeServerId: selected.id }),
+      )
+    ).status,
+    200,
+  );
+  await first.close();
+  const second = await launch();
+  assert.notEqual(second.token, first.token);
+  assert.deepEqual(await (await second.request(endpoint)).json(), {
+    desktop: true,
+    activeServerId: selected.id,
+  });
+  assert.equal(
+    (await (await second.request("/api/servers")).json()).defaultServerId,
+    original.id,
+  );
+  assert.equal(
+    (await second.request(`/api/servers/${selected.id}`, { method: "DELETE" }))
+      .status,
+    200,
+  );
+  assert.deepEqual(await (await second.request(endpoint)).json(), {
+    desktop: true,
+    activeServerId: null,
+  });
+  assert.equal(
+    (
+      await second.request(
+        endpoint,
+        json("PUT", { activeServerId: original.id }),
+      )
+    ).status,
+    200,
+  );
+  await second.close();
+  const third = await launch();
+  assert.equal(
+    (await (await third.request(endpoint)).json()).activeServerId,
+    original.id,
+  );
+  assert.equal(
+    JSON.parse(
+      await fs.readFile(path.join(dataDir, "desktop-selection.json"), "utf8"),
+    ).activeServerId,
+    original.id,
+  );
+});
+
+test("desktop selection rejects invalid requests and recovers from malformed saved preferences", async (t) => {
+  const { launch, dataDir } = await fixture(t);
+  const runtime = await launch();
+  const endpoint = "/api/desktop/selection";
+  const server = await addServer(runtime);
+  for (const activeServerId of ["missing", 12, {}, []])
+    assert.equal(
+      (await runtime.request(endpoint, json("PUT", { activeServerId }))).status,
+      400,
+    );
+  assert.equal(
+    (await runtime.request(endpoint, { method: "PUT", body: "{" })).status,
+    400,
+  );
+  assert.equal(
+    (await runtime.request(endpoint, { method: "PUT", body: "x".repeat(513) }))
+      .status,
+    413,
+  );
+  assert.equal(
+    (await runtime.request(endpoint, { method: "POST" })).status,
+    405,
+  );
+  assert.equal(
+    (
+      await runtime.request(endpoint, {
+        ...json("PUT", { activeServerId: server.id }),
+        headers: { Origin: "https://outside.example" },
+      })
+    ).status,
+    403,
+  );
+  await fs.writeFile(path.join(dataDir, "desktop-selection.json"), "{");
+  assert.equal(
+    (await (await runtime.request(endpoint)).json()).activeServerId,
+    null,
+  );
+  assert.equal(
+    (
+      await runtime.request(
+        endpoint,
+        json("PUT", { activeServerId: server.id }),
+      )
+    ).status,
+    200,
+  );
+  assert.equal(
+    (await runtime.request(endpoint, json("PUT", { activeServerId: null })))
+      .status,
+    200,
+  );
+  assert.equal(
+    (await (await runtime.request(endpoint)).json()).activeServerId,
+    null,
   );
 });
 

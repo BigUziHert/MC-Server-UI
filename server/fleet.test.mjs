@@ -67,6 +67,31 @@ async function fixture(t, settings = {}) {
   return { dataDir, boot };
 }
 
+test("browser desktop-selection capability is independent of an empty fleet and an unavailable server", async (t) => {
+  const { boot } = await fixture(t, { createDefaultServer: false });
+  const fleet = await boot();
+  const expected = {
+    status: 200,
+    body: { desktop: false, activeServerId: null },
+  };
+  assert.deepEqual(await fleet.request("/api/desktop/selection"), expected);
+  const created = await fleet.request(
+    "/api/servers",
+    json("POST", { name: "Unavailable fixture", port: 25565 }),
+  );
+  assert.equal(created.status, 201);
+  // An optional app capability must never dispatch into a selected server.
+  const runtime = fleet.runtimes.get(created.body.server.id);
+  runtime.app = (_req, res) =>
+    res.status(409).json({ error: "Imported folder unavailable." });
+  assert.equal((await fleet.request("/api/server")).status, 409);
+  assert.deepEqual(await fleet.request("/api/desktop/selection"), expected);
+  assert.deepEqual(
+    await fleet.request("/api/desktop/selection", {}, "missing-server"),
+    expected,
+  );
+});
+
 test("fleet scopes files, console, backups, schedules, users, databases and player permissions", async (t) => {
   const { boot } = await fixture(t);
   const { request, base, tick } = await boot();

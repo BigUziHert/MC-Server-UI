@@ -284,6 +284,11 @@ test("FTB search applies compatibility and resolves required server files with p
     0,
   );
   const result = await ftb.resolve(ftbSelection);
+  assert.deepEqual(result.loaderInstall, {
+    loader: "neoforge",
+    gameVersion: "1.21.1",
+    loaderVersion: "21.1.1",
+  });
   assert.deepEqual(result.files, [
     {
       path: "mods/fixture.jar",
@@ -367,6 +372,11 @@ test("ATLauncher resolves required mods and config archive together and pins leg
   const input = { ...ftbSelection, projectId: "FixturePack", versionId: "1.0" };
   assert.equal((await at.versions(input))[0].downloadable, true);
   const resolved = await at.resolve(input);
+  assert.deepEqual(resolved.loaderInstall, {
+    loader: "neoforge",
+    gameVersion: "1.21.1",
+    loaderVersion: "21.1.1",
+  });
   assert.equal(resolved.files.length, 1);
   assert.deepEqual(resolved.files[0], {
     path: "mods/fixture.jar",
@@ -519,6 +529,28 @@ test("Spigot project paging uses provider totals and never fabricates download c
   assert.equal(result.projects[0].downloads, undefined);
   assert.match(requests[0], /page=3/);
   assert.equal(new URL(requests[0]).searchParams.get("sort"), "-downloads");
+});
+
+test("Spigot search never reports zero results when the total header is absent or inconsistent", async () => {
+  for (const total of [undefined, "0", "garbage"]) {
+    const { provider } = fixture(
+      {},
+      () =>
+        new Response(JSON.stringify([{ id: 1, name: "One" }]), {
+          headers: total === undefined ? {} : { "x-total": total },
+        }),
+    );
+    const result = await provider("spigot").search({
+      type: "plugin",
+      query: "",
+      gameVersion: "",
+      loader: "paper",
+      offset: 10,
+      limit: 5,
+    });
+    assert.equal(result.total, 11);
+    assert.equal(result.projects.length, 1);
+  }
 });
 
 test("Spigot delegates each advertised sort to the upstream catalog before pagination on every search route", async () => {

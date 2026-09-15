@@ -10,11 +10,11 @@ import {
   Layers,
   LoaderCircle,
   RefreshCw,
-  Search,
   ShieldCheck,
   X,
 } from "lucide-react";
 import { ServerScope, useServerApi, type PageProps } from "../api";
+import SearchField from "../SearchField";
 import "./management.css";
 import "./versions.css";
 
@@ -249,7 +249,15 @@ export default function Versions({ notify }: PageProps) {
     }
   }
   async function install() {
-    if (!selected || !confirming || !accepted) return;
+    if (
+      !selected ||
+      !confirming ||
+      !accepted ||
+      submitting ||
+      jobBusy ||
+      current?.status !== "offline"
+    )
+      return;
     const token = generation.current;
     setSubmitting(true);
     setDialogError("");
@@ -386,15 +394,13 @@ export default function Versions({ notify }: PageProps) {
       {!selected ? (
         <>
           <div className="versions-toolbar">
-            <label className="management-search">
-              <Search size={16} />
-              <input
-                aria-label="Search server software"
-                placeholder="Search server software…"
-                value={search}
-                onChange={(event) => setSearch(event.target.value)}
-              />
-            </label>
+            <SearchField
+              className="management-search"
+              aria-label="Search server software"
+              placeholder="Search server software…"
+              value={search}
+              onValueChange={setSearch}
+            />
             <span>
               {providers.length
                 ? `${shownProviders.length} software options`
@@ -484,15 +490,14 @@ export default function Versions({ notify }: PageProps) {
                     : "Minecraft releases"}
                 </h3>
               </div>
-              <label className="management-search">
-                <Search size={15} />
-                <input
-                  aria-label="Search Minecraft versions"
-                  placeholder="Search versions…"
-                  value={search}
-                  onChange={(event) => setSearch(event.target.value)}
-                />
-              </label>
+              <SearchField
+                className="management-search"
+                iconSize={15}
+                aria-label="Search Minecraft versions"
+                placeholder="Search versions…"
+                value={search}
+                onValueChange={setSearch}
+              />
               <label className="versions-toggle">
                 <input
                   type="checkbox"
@@ -695,6 +700,11 @@ export default function Versions({ notify }: PageProps) {
             {dialogError}
           </p>
         )}
+        {current?.status !== "offline" && (
+          <p className="management-form-error" role="alert">
+            Stop this server before installing a version.
+          </p>
+        )}
         <div className="modal-actions">
           <button
             className="btn"
@@ -705,7 +715,12 @@ export default function Versions({ notify }: PageProps) {
           </button>
           <button
             className="btn primary"
-            disabled={!accepted || submitting}
+            disabled={
+              !accepted ||
+              submitting ||
+              jobBusy ||
+              current?.status !== "offline"
+            }
             onClick={() => void install()}
           >
             {submitting ? (

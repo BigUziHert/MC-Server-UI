@@ -14,6 +14,7 @@ import { mkdirSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { startDesktopRuntime } from "./runtime.mjs";
+import { flushRendererSelection } from "./selection.mjs";
 import updaterPackage from "electron-updater";
 import { applyDownloadedUpdate, createUpdateController } from "./updates.mjs";
 
@@ -135,8 +136,10 @@ async function requestQuit(installUpdate = false) {
         return false;
       }
     }
-    if (window && !window.isDestroyed())
+    if (window && !window.isDestroyed()) {
+      await flushRendererSelection(window.webContents);
       window.setTitle("Shutting down · MC Panel");
+    }
     tray?.setToolTip("MC Panel — shutting down servers");
     await runtime?.close({ gracefulOnly: installUpdate });
     clearTimeout(initialUpdateTimer);
@@ -158,6 +161,13 @@ async function requestQuit(installUpdate = false) {
   } catch (cause) {
     quitting = false;
     await logError(cause);
+    if (cause.code === "PANEL_SELECTION_FLUSH_FAILED") {
+      dialog.showErrorBox(
+        "Server choice was not saved",
+        "MC Panel could not save your selected server. The app and servers are still open. Try quitting or updating again.",
+      );
+      return false;
+    }
     const { response } = await dialog.showMessageBox(window, {
       type: "error",
       title: "Shutdown did not finish",

@@ -4,6 +4,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { createCoreProviders } from "./launchpad-providers.mjs";
 import { safeInstallPath, unpackProviderZip } from "./launchpad-archives.mjs";
 import { inspectBundledDependencies } from "./launchpad-bundled.mjs";
+import { createModRemoval } from "./launchpad-removal.mjs";
 import {
   checkedProviderUrl,
   downloadVerified,
@@ -290,6 +291,39 @@ export async function createLaunchpad(ctx) {
     lastJob = null,
     closing = false,
     versionsCache = null;
+  const removal = createModRemoval({
+    serverDir,
+    safePath,
+    fileHash,
+    fileStamp,
+    getServer,
+    recycle,
+    restore,
+    withMinecraftMutation,
+    signal: lifetime.signal,
+    isBusy: () => Boolean(active || preparingInstall),
+    async onRemoved(relative) {
+      const previous = receipts;
+      receipts = receipts.filter((item) => item.path !== relative);
+      try {
+        await saveReceipts();
+      } catch (cause) {
+        receipts = previous;
+        throw cause;
+      }
+      fileCache.delete(relative);
+      updateCache.clear();
+      updateFailures.clear();
+      try {
+        await ctx.audit?.(
+          "Launchpad mod removed",
+          `${relative} moved to Recycle Bin.`,
+        );
+      } catch {
+        // Audit storage failure must not undo a completed, recoverable removal.
+      }
+    },
+  });
   const provider = async (platform) => {
     const found = providers.find((value) => value.id === platform);
     if (!found || found.available === false)
@@ -1537,7 +1571,7 @@ export async function createLaunchpad(ctx) {
   }
   async function preparePreview(raw) {
     if (closing) throw error(503, "Launchpad is shutting down.");
-    if (active)
+    if (active || preparingInstall || removal.busy)
       throw error(
         409,
         "Wait for the current Launchpad installation to finish.",
@@ -1940,7 +1974,7 @@ export async function createLaunchpad(ctx) {
         400,
         "Review the exact file changes and confirm the installation first.",
       );
-    if (active || preparingInstall)
+    if (active || preparingInstall || removal.busy)
       throw error(409, "Another Launchpad installation is already running.");
     if ((noOpReviews.get(input?.planId) ?? 0) > Date.now())
       throw error(
@@ -2102,6 +2136,8 @@ export async function createLaunchpad(ctx) {
     installed,
     preview,
     install,
+    removalPreview: removal.preview,
+    remove: removal.remove,
     job(id) {
       if (!jobs.has(id))
         throw error(
@@ -2118,6 +2154,7 @@ export async function createLaunchpad(ctx) {
       );
       lifetime.abort(stopped);
       activeController?.abort(stopped);
+      await removal.close();
       await Promise.allSettled([...previews]);
       await active;
       for (const [id] of plans)

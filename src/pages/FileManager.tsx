@@ -20,7 +20,6 @@ import {
   LockKeyhole,
   Pencil,
   RefreshCw,
-  Search,
   Trash2,
   Undo2,
   Upload,
@@ -33,6 +32,7 @@ import {
   type PageProps,
 } from "../api";
 import "./storage.css";
+import SearchField from "../SearchField";
 import "./file-selection.css";
 import "./recycle-bin.css";
 
@@ -519,21 +519,14 @@ export default function FileManager({ notify }: PageProps) {
           </div>
         </div>
         <div className="files-filter">
-          <label className="storage-search">
-            <Search size={16} />
-            <input
-              ref={searchInput}
-              placeholder="Search files and folders…"
-              aria-label="Search files and folders"
-              value={query}
-              onChange={(event) => setQuery(event.target.value)}
-            />
-            {query && (
-              <button aria-label="Clear search" onClick={() => setQuery("")}>
-                <X size={14} />
-              </button>
-            )}
-          </label>
+          <SearchField
+            className="storage-search"
+            ref={searchInput}
+            placeholder="Search files and folders…"
+            aria-label="Search files and folders"
+            value={query}
+            onValueChange={setQuery}
+          />
           <div className="file-selection-slot">
             {!selectedEntries.length && (
               <span className="muted files-count">{entries.length} items</span>
@@ -1194,21 +1187,14 @@ function RecycleBin({ notify, onBack }: PageProps & { onBack: () => void }) {
           </p>
         </div>
         <div className="files-filter">
-          <label className="storage-search">
-            <Search size={16} />
-            <input
-              ref={searchInput}
-              aria-label="Search recycled items"
-              placeholder="Search recycled items…"
-              value={query}
-              onChange={(event) => setQuery(event.target.value)}
-            />
-            {query && (
-              <button aria-label="Clear search" onClick={() => setQuery("")}>
-                <X size={14} />
-              </button>
-            )}
-          </label>
+          <SearchField
+            className="storage-search"
+            ref={searchInput}
+            aria-label="Search recycled items"
+            placeholder="Search recycled items…"
+            value={query}
+            onValueChange={setQuery}
+          />
           <span className="muted files-count">
             {items.length} {items.length === 1 ? "item" : "items"}
           </span>

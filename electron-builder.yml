@@ -21,12 +21,15 @@ files:
   - server/launchpad-network.mjs
   - server/launchpad-archives.mjs
   - server/launchpad-bundled.mjs
+  - server/launchpad-mod-metadata.mjs
+  - server/launchpad-removal.mjs
   - server/launchpad-providers.mjs
   - server/launchpad-extra.mjs
   - shared/subuser-permissions.json
   - desktop/main.mjs
   - desktop/runtime.mjs
   - desktop/updates.mjs
+  - desktop/selection.mjs
   - desktop/assets/**/*
   - package.json
 asar: true

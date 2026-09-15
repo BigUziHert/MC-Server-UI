@@ -128,6 +128,8 @@ The server's **display name** can change while it runs. Its **server list messag
 
 Switching servers does not stop them or pause their backup schedules. Files and permissions always belong to the server selected when the operation was started. In-game OP access belongs in **Players**; **Subusers** continues to hold local panel access records and does not grant Minecraft permissions.
 
+The desktop app remembers the selected server across restarts and app updates in its own data folder, restoring that selection before loading server pages. If the saved server was removed, it selects a remaining registry entry. Browser sessions keep their selection in local browser storage.
+
 ## Connect a real Java server
 
 For a new server, use the server selector and settings as described above. To import an existing server directory into a fresh panel installation:
@@ -181,6 +183,10 @@ Installation reviews list only files that need changing. Files that already matc
 
 **Properties** shows tabs for configuration files that actually exist: `server.properties`, `bukkit.yml`, `spigot.yml`, `pufferfish.yml`, `purpur.yml`, and Paper's global/world defaults. Search and edit scalar fields using typed inputs; YAML lists remain editable in File Manager. Saving preserves unrelated fields and comments, detects stale revisions, and keeps port/MOTD settings consistent with the server registry. Most properties can be saved while running and apply after restart; changing the managed port or MOTD requires stopping the server.
 
+Use **Remove** on an installed mod to review removal while the server is stopped. Launchpad reads local Forge, NeoForge, Fabric, or Quilt declarations, including embedded libraries, and blocks removal when another installed mod requires it or dependency metadata cannot be read. Alternate and conditional requirements are treated conservatively. Only the selected JAR moves to Recycle Bin; its dependencies, configuration, and other installed mods remain. Removing or replacing a mod after review invalidates that review. Restore a removed mod from File Manager's Recycle Bin.
+
+Text search fields include a small clear button and a subtle focus indicator. Clearing a search keeps keyboard focus in the field.
+
 ## Backup scheduling and data
 
 Schedules use the **API host's local timezone**, included in the API response and schedule interface. Each server's scheduler checks every 15 seconds and persists its next deadline in that server's `panel.json`. Keep the API running for jobs to execute. After downtime, one overdue job runs per server on the next check; missed intervals are not replayed in a burst.
@@ -210,7 +216,7 @@ data/
       panel.json    that server's schedule, player history, records, and audit
 ```
 
-An empty desktop workspace contains only `servers.json`. Servers created through the panel use their own `instances/<server-id>/` directory, including the first server. Imported servers use that directory for panel metadata and backups while keeping Minecraft files in the selected external folder. Existing storage locations are preserved when switching the default server or removing a demo.
+An empty desktop workspace contains the server registry and, after a selection has been saved, `desktop-selection.json`. Servers created through the panel use their own `instances/<server-id>/` directory, including the first server. Imported servers use that directory for panel metadata and backups while keeping Minecraft files in the selected external folder. Existing storage locations are preserved when switching the default server or removing a demo.
 
 The Recycle Bin is a protected virtual folder in File Manager. It allows restoring or permanently deleting selected recovery items, with confirmation before permanent deletion; uploads and editing remain disabled. Permanent deletion cannot be undone and affects only the selected private recovery entries, including incomplete entries. Failed deletions retain any remaining data for retry, and partially deleted entries cannot be restored. Recovery data otherwise remains in the panel's data directory across restarts and updates. Files and folders can be deleted and restored while the server is running, including across drives. Cross-drive moves verify the recovery copy before removing copied entries; new files created during removal are left intact. Detected changes or file locks report an error and retain recovery data. Restore creates missing parent directories, preserves copied file modes and modification times, and leaves both versions intact if the original path is occupied. The bin does not include files deleted before this feature was installed or files deleted outside MC Panel.
 

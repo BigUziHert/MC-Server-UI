@@ -434,6 +434,15 @@ export function createExtraProviders({ fetch: request = fetch, json } = {}) {
         title: pack.name,
         versionName: manifest.name,
         files,
+        loaderInstall: {
+          loader: input.loader,
+          gameVersion: input.gameVersion,
+          loaderVersion: manifest.targets.find(
+            (target) =>
+              target.type === "modloader" &&
+              target.name.toLowerCase() === input.loader,
+          )?.version,
+        },
         warnings: [
           `Requires ${input.loader} ${manifest.targets?.find((target) => target.type === "modloader")?.version ?? ""}. Install the matching runtime in Versions before starting.`,
           ...(skipped
@@ -644,6 +653,12 @@ export function createExtraProviders({ fetch: request = fetch, json } = {}) {
         versionName: selected.version,
         files,
         archive,
+        loaderInstall: {
+          loader: input.loader,
+          gameVersion: input.gameVersion,
+          loaderVersion:
+            manifest.loader?.version ?? manifest.loader?.metadata?.loader,
+        },
         warnings: [
           `Requires ${input.loader} ${manifest.loader?.version ?? manifest.loader?.metadata?.loader ?? ""}. Set up the matching runtime in Versions before starting.`,
           ...(pinned ? [pinWarning] : []),
@@ -702,7 +717,9 @@ export function createExtraProviders({ fetch: request = fetch, json } = {}) {
         try {
           return {
             values: JSON.parse(reply.body),
-            total: Number(reply.headers.get("x-total")),
+            total: reply.headers.has("x-total")
+              ? Number(reply.headers.get("x-total"))
+              : null,
           };
         } catch {
           throw error(502, "Spigot returned invalid catalog data.");
@@ -723,7 +740,8 @@ export function createExtraProviders({ fetch: request = fetch, json } = {}) {
           url: `https://www.spigotmc.org/resources/${pack.id}/`,
         })),
         total:
-          Number.isSafeInteger(loaded.total) && loaded.total >= 0
+          Number.isSafeInteger(loaded.total) &&
+          loaded.total >= input.offset + loaded.values.length
             ? loaded.total
             : input.offset + loaded.values.length,
         offset: input.offset,

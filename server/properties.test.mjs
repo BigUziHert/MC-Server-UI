@@ -59,6 +59,24 @@ test("Java Properties preserves comments, continuations, escaped keys and textua
   assert.equal(state.config.maxPlayers, 12);
   assert.ok(!state.audits[0].join(" ").includes("第二世界"));
 });
+
+test("Properties preserves backslash-terminated comments when editing the following property", async (t) => {
+  const original =
+    "# configuration directory C:\\\r\ncustom=old\r\n  ! keep this comment \\\r\nmotd=first\\\r\n  second\r\nuntouched=keep\r\n";
+  const { root, service } = await fixture(t, original);
+  const loaded = await service.get("server.properties");
+  await service.save({
+    ...loaded,
+    changes: [
+      { key: "custom", value: "updated" },
+      { key: "motd", value: "Welcome" },
+    ],
+  });
+  assert.equal(
+    await fs.readFile(path.join(root, "server.properties"), "utf8"),
+    "# configuration directory C:\\\r\ncustom=updated\r\n  ! keep this comment \\\r\nmotd=Welcome\r\nuntouched=keep\r\n",
+  );
+});
 test("Properties edits nested YAML scalars without losing comments, sequences, anchors or unrelated fields", async (t) => {
   const original =
     '# config\nsettings:\n  # tuning\n  connection-throttle: 4000\n  enabled: true\n  list: [one, two]\ndefaults: &common\n  name: "safe"\ncopy: *common\n';

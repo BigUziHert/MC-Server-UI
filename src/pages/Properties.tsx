@@ -1,12 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import {
-  FileCode2,
-  RefreshCw,
-  Save,
-  Search,
-  SlidersHorizontal,
-} from "lucide-react";
+import { FileCode2, RefreshCw, Save, SlidersHorizontal } from "lucide-react";
 import { useServerApi, type PageProps } from "../api";
+import SearchField from "../SearchField";
 import "./properties.css";
 
 type Field = {
@@ -189,15 +184,13 @@ export default function Properties({ notify }: PageProps) {
         ))}
       </div>
       <div className="properties-toolbar">
-        <label className="storage-search">
-          <Search size={16} />
-          <input
-            aria-label="Search properties"
-            placeholder="Search properties…"
-            value={search}
-            onChange={(event) => setSearch(event.target.value)}
-          />
-        </label>
+        <SearchField
+          className="storage-search"
+          aria-label="Search properties"
+          placeholder="Search properties…"
+          value={search}
+          onValueChange={setSearch}
+        />
         <span>{filtered.length} properties</span>
         <button
           className="btn icon"

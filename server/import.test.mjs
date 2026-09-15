@@ -840,6 +840,40 @@ test("Java-argument imports reject missing or escaping launch files and recover 
   assert.equal((await restarted.request("/api/server")).status, 200);
 });
 
+test("Java startup validates the expanded JAR entry point and ignores game arguments named -jar", async (t) => {
+  const { directory, prepare } = await fixture(t);
+  await prepare(directory);
+  const argumentFile = path.join(directory, "startup_args.txt");
+  for (const contents of [
+    "-Xmx2G -jar missing.jar nogui",
+    "-Xmx2G -jar ../outside.jar nogui",
+    "-Xmx2G -jar",
+  ]) {
+    await fs.writeFile(argumentFile, contents);
+    await assert.rejects(
+      inspectJavaArguments(directory, ["@startup_args.txt"]),
+      {
+        status: 400,
+      },
+    );
+  }
+  await fs.writeFile(argumentFile, "-Xmx2G -jar server.jar nogui");
+  assert.equal(
+    (await inspectJavaArguments(directory, ["@startup_args.txt"]))
+      .memoryLimitMB,
+    2048,
+  );
+  for (const args of [
+    ["-Xmx2G", "example.Main", "-jar", "game-option"],
+    ["-Xmx2G", "-cp", "-jar", "example.Main"],
+    ["-Xmx2G", "--module", "example/server", "-jar", "game-option"],
+  ])
+    assert.equal(
+      (await inspectJavaArguments(directory, args)).memoryLimitMB,
+      2048,
+    );
+});
+
 test("custom script and executable imports retain explicit startup options without running anything", async (t) => {
   const { directory, root, prepare, boot } = await fixture(t, {
     spawnServer: () => assert.fail("Import cannot start a process"),

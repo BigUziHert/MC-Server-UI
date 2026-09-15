@@ -2,6 +2,7 @@ import http from "node:http";
 import { randomBytes, timingSafeEqual } from "node:crypto";
 import path from "node:path";
 import { createFleet } from "../server/index.mjs";
+import { createDesktopSelection, readSelectionBody } from "./selection.mjs";
 
 export const DESKTOP_COOKIE_NAME = "mc-panel-desktop";
 
@@ -48,6 +49,10 @@ export async function startDesktopRuntime({
     backupFlushTimeoutMs,
     selectServerDirectory,
   });
+  const selection = createDesktopSelection({
+    dataDir: fleet.dataDir,
+    hasServer: (id) => fleet.runtimes.has(id),
+  });
   let url;
   let host;
   let closing;
@@ -73,6 +78,31 @@ export async function startDesktopRuntime({
     if (!authenticated(req.headers.cookie, expectedToken))
       return reject(401, "An authenticated desktop session is required.");
     const requestPath = new URL(req.url, url).pathname;
+    if (requestPath === "/api/desktop/selection") {
+      if (!["GET", "PUT"].includes(req.method))
+        return reject(
+          405,
+          "Use GET to read or PUT to save the selected server.",
+        );
+      void (async () => {
+        const result =
+          req.method === "GET"
+            ? await selection.read()
+            : await selection.save(await readSelectionBody(req));
+        res.writeHead(200, {
+          "Content-Type": "application/json; charset=utf-8",
+        });
+        res.end(JSON.stringify(result));
+      })().catch((cause) =>
+        reject(
+          cause.status ?? 500,
+          cause.status
+            ? cause.message
+            : "The selected server could not be saved or read.",
+        ),
+      );
+      return;
+    }
     if (
       requestPath === "/api/desktop/updates" ||
       requestPath.startsWith("/api/desktop/updates/")
@@ -139,6 +169,7 @@ export async function startDesktopRuntime({
           // The fleet sends stop to its managed Java processes and waits for their exit.
           // Stop accepting HTTP first, but keep current responses alive during that shutdown.
           try {
+            await selection.close();
             await fleet.close({ gracefulOnly });
           } finally {
             listener.closeAllConnections();

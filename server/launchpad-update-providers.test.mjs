@@ -366,7 +366,7 @@ test("an eight-second batch budget covers both update and current-version reques
   const budgets = [];
   t.mock.method(AbortSignal, "timeout", (milliseconds) => {
     budgets.push(milliseconds);
-    return timeout(20);
+    return timeout(milliseconds === 8000 ? 20 : milliseconds);
   });
   let calls = 0;
   const signals = [];
@@ -391,8 +391,9 @@ test("an eight-second batch budget covers both update and current-version reques
     });
   });
   const result = await p.updates(input, [row]);
-  assert.deepEqual(budgets, [8000]);
-  assert.equal(signals[0], signals[1]);
+  assert.deepEqual(budgets, [8000, 60000, 60000]);
+  assert.ok(signals.every((signal) => signal.aborted));
+  assert.equal(signals[0].reason, signals[1].reason);
   assert.deepEqual(result.updates, {});
   assert.match(result.warnings[0], /took too long/);
   await p.updates(input, [row]);
@@ -438,7 +439,9 @@ test("caller cancellation aborts in-flight batch requests, skips queued batches,
 for (const stalled of ["request", "response body"])
   test(`a stalled ${stalled} that ignores abort cannot permanently occupy update queue lanes`, async (t) => {
     const deadlines = [];
+    const timeout = AbortSignal.timeout.bind(AbortSignal);
     t.mock.method(AbortSignal, "timeout", (milliseconds) => {
+      if (milliseconds === 60000) return timeout(milliseconds);
       assert.equal(milliseconds, 8000);
       const controller = new AbortController();
       deadlines.push(controller);
@@ -535,8 +538,9 @@ test("caller cancellation releases uncooperative update requests so the next cal
   assert.equal(Object.keys(retry.issues).length, 101);
 });
 
-test("optional caller signals reach existing Modrinth and CurseForge version and identification helpers", async () => {
-  const signal = new AbortController().signal;
+test("optional caller cancellation reaches existing Modrinth and CurseForge version and identification helpers", async () => {
+  const caller = new AbortController();
+  const signal = caller.signal;
   const requests = [];
   const [mr, cf] = createCoreProviders({
     key: async () => "fixture-key",
@@ -556,5 +560,9 @@ test("optional caller signals reach existing Modrinth and CurseForge version and
   await cf.versions({ ...input, projectId: "123", signal });
   await cf.identifyFingerprints([123], { signal });
   assert.equal(requests.length, 4);
-  for (const request of requests) assert.equal(request.options.signal, signal);
+  caller.abort(new Error("caller cancelled catalog"));
+  for (const request of requests) {
+    assert.equal(request.options.signal.aborted, true);
+    assert.equal(request.options.signal.reason, signal.reason);
+  }
 });

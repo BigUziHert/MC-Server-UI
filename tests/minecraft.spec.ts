@@ -192,12 +192,14 @@ test("Properties reports external file changes without overwriting them", async 
 test("Versions shows official builds and requires a reviewed choice before installation", async ({
   page,
 }, testInfo) => {
+  let serverStatus = "offline";
   await page.route("**/api/server", async (route) => {
     const response = await route.fetch();
     const server = await response.json();
     await route.fulfill({
       json: {
         ...server,
+        status: serverStatus,
         software: "NeoForge",
         version: "21.1.200",
         minecraftVersion: "1.21.1",
@@ -253,6 +255,20 @@ test("Versions shows official builds and requires a reviewed choice before insta
   await expect(dialog).toContainText("21.1.250");
   await expect(dialog.getByRole("button", { name: /Install/ })).toBeDisabled();
   await expect(dialog).toContainText(/worlds|world/i);
+  const confirm = dialog.getByRole("button", {
+    name: "Install version",
+    exact: true,
+  });
+  await dialog.getByRole("checkbox").check();
+  await expect(confirm).toBeEnabled();
+  serverStatus = "running";
+  await expect(confirm).toBeDisabled();
+  await expect(dialog.getByRole("alert")).toHaveText(
+    "Stop this server before installing a version.",
+  );
+  serverStatus = "offline";
+  await expect(confirm).toBeEnabled();
+  await expect(dialog.getByRole("alert")).toHaveCount(0);
 });
 
 test("Versions offers older stable Fabric loaders and requires opting in to experimental builds", async ({
@@ -851,7 +867,19 @@ test("Launchpad installed updates sort before pagination and keep priority when 
       () => document.documentElement.scrollWidth <= window.innerWidth,
     ),
   ).toBe(true);
-  await page.getByLabel("Search Launchpad", { exact: true }).fill("");
+  await page.getByRole("button", { name: "Clear search", exact: true }).click();
+  const search = page.getByLabel("Search Launchpad", { exact: true });
+  await expect(search).toHaveValue("");
+  await expect(search).toBeFocused();
+  await expect(search).toHaveCSS("outline-style", "none");
+  await expect(search.locator("xpath=../..")).toHaveCSS(
+    "border-color",
+    "rgb(150, 155, 179)",
+  );
+  await expect(search.locator("xpath=../..")).toHaveCSS(
+    "box-shadow",
+    "rgba(150, 155, 179, 0.25) 0px 0px 0px 1px",
+  );
   await expect(names).toHaveText(first);
   await expect(page.getByRole("status", { name: "Launchpad page" })).toHaveText(
     "Page 1 of 3",
@@ -3236,6 +3264,191 @@ test("Launchpad refresh retries a failed stable catalog while preserving configu
     ),
   ).toBe(true);
 });
+
+for (const blockedBy of ["none", "dependent", "unreadable"]) {
+  test(`Launchpad reviews installed mod removal with ${blockedBy} blocking it`, async ({
+    page,
+    serverId,
+  }, testInfo) => {
+    let removed = false;
+    let reviews = 0;
+    const removals: unknown[] = [];
+    await page.route("**/api/launchpad", (route) =>
+      route.fulfill({
+        json: {
+          platforms: [
+            {
+              id: "modrinth",
+              name: "Modrinth",
+              available: true,
+              types: ["mod"],
+            },
+          ],
+          gameVersion: "1.21.1",
+          gameVersions: ["1.21.1"],
+          loader: "neoforge",
+          status: "offline",
+          warnings: [],
+        },
+      }),
+    );
+    await page.route("**/api/launchpad/search?**", (route) =>
+      route.fulfill({ json: { projects: [], total: 0, offset: 0, limit: 10 } }),
+    );
+    await page.route("**/api/launchpad/installed?**", (route) =>
+      route.fulfill({
+        json: {
+          items: [
+            ...(!removed
+              ? [
+                  {
+                    path: "mods/target.jar",
+                    name: "target.jar",
+                    title: "Target Mod",
+                    size: 2048,
+                    platform: null,
+                  },
+                ]
+              : []),
+            {
+              path: "mods/library.jar",
+              name: "library.jar",
+              title: "Shared Library",
+              size: 1024,
+              platform: "modrinth",
+              projectId: "library",
+              versionId: "library-version",
+            },
+          ],
+          warnings: [],
+        },
+      }),
+    );
+    await page.route("**/api/launchpad/removal-preview", (route) => {
+      expect(route.request().headers()["x-server-id"]).toBe(serverId);
+      expect(route.request().postDataJSON()).toEqual({
+        path: "mods/target.jar",
+      });
+      reviews++;
+      return route.fulfill({
+        json: {
+          ...(blockedBy === "none"
+            ? {
+                planId: `removal-${reviews}`,
+                expiresAt: "2099-01-01T00:00:00Z",
+              }
+            : {}),
+          title: "Target Mod",
+          files: [{ path: "mods/target.jar", size: 2048 }],
+          dependents:
+            blockedBy === "dependent"
+              ? [{ path: "mods/addon.jar", title: "Dependent Add-on" }]
+              : [],
+          warnings:
+            blockedBy === "unreadable"
+              ? ["mods/unknown.jar could not be checked for dependencies."]
+              : [],
+          blocked: blockedBy !== "none",
+        },
+      });
+    });
+    await page.route("**/api/launchpad/remove", (route) => {
+      expect(route.request().headers()["x-server-id"]).toBe(serverId);
+      removals.push(route.request().postDataJSON());
+      if (removals.length === 1)
+        return route.fulfill({
+          status: 409,
+          json: {
+            error:
+              "Installed files changed since review. Review removal again.",
+          },
+        });
+      removed = true;
+      return route.fulfill({
+        json: {
+          ok: true,
+          path: "mods/target.jar",
+          recycled: { id: "recycled-target" },
+        },
+      });
+    });
+    await page.goto("/#launchpad");
+    await page.getByRole("switch", { name: "Show installed content" }).check();
+    const remove = page.getByRole("button", {
+      name: "Remove Target Mod",
+      exact: true,
+    });
+    await expect(remove).toBeEnabled();
+    await remove.click();
+    const dialog = page.getByRole("dialog");
+    const files = dialog.getByRole("list", {
+      name: "Files to remove",
+      exact: true,
+    });
+    await expect(files.getByRole("listitem")).toHaveCount(1);
+    await expect(files).toContainText("mods/target.jar");
+    await expect(files).not.toContainText("library.jar");
+    expect(removals).toHaveLength(0);
+    if (blockedBy !== "none") {
+      await expect(
+        dialog.getByRole("heading", { name: "Mod removal blocked" }),
+      ).toBeVisible();
+      await expect(
+        dialog.getByRole("button", { name: "Remove mod", exact: true }),
+      ).toHaveCount(0);
+      if (blockedBy === "dependent") {
+        await expect(
+          dialog.getByRole("list", { name: "Mods requiring this mod" }),
+        ).toContainText("Dependent Add-on");
+        await expect(dialog).toContainText("Remove these dependent mods first");
+      } else
+        await expect(dialog).toContainText(
+          "mods/unknown.jar could not be checked",
+        );
+      await dialog.getByRole("button", { name: "Close", exact: true }).click();
+      expect(removals).toHaveLength(0);
+      return;
+    }
+    await expect(dialog).toContainText("Recycle Bin");
+    await expect(dialog).toContainText(
+      "Other mods and libraries will stay installed",
+    );
+    await page.setViewportSize({ width: 390, height: 844 });
+    await page.screenshot({
+      path: testInfo.outputPath("review-mod-removal-mobile.png"),
+      animations: "disabled",
+    });
+    await dialog.getByRole("button", { name: "Cancel", exact: true }).click();
+    expect(removals).toHaveLength(0);
+    await remove.click();
+    await dialog
+      .getByRole("button", { name: "Remove mod", exact: true })
+      .click();
+    await expect(dialog.getByRole("alert")).toContainText(
+      "Installed files changed since review",
+    );
+    await expect(
+      dialog.getByRole("button", { name: "Remove mod", exact: true }),
+    ).toHaveCount(0);
+    await dialog
+      .getByRole("button", { name: "Review removal again", exact: true })
+      .click();
+    await dialog
+      .getByRole("button", { name: "Remove mod", exact: true })
+      .click();
+    await expect(dialog).not.toBeVisible();
+    expect(removals).toEqual([
+      { planId: "removal-2", confirmed: true },
+      { planId: "removal-3", confirmed: true },
+    ]);
+    await expect(
+      page.getByRole("article", { name: "Target Mod", exact: true }),
+    ).toHaveCount(0);
+    await expect(
+      page.getByRole("article", { name: "Shared Library", exact: true }),
+    ).toBeVisible();
+  });
+}
 
 test("Versions decodes all eighteen bundled software logos without external image requests", async ({
   page,

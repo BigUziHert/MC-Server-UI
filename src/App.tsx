@@ -37,7 +37,13 @@ import {
   Users,
   X,
 } from "lucide-react";
-import { api as fleetApi, formatBytes, ServerScope, useServerApi } from "./api";
+import {
+  api as fleetApi,
+  formatBytes,
+  saveDesktopSelection,
+  ServerScope,
+  useServerApi,
+} from "./api";
 import FileManager from "./pages/FileManager";
 import Backups from "./pages/Backups";
 import Subusers from "./pages/Subusers";
@@ -47,6 +53,7 @@ import Versions from "./pages/Versions";
 import Launchpad from "./pages/Launchpad";
 import Properties from "./pages/Properties";
 import PlayerHead from "./PlayerHead";
+import SearchField from "./SearchField";
 import DesktopUpdates from "./DesktopUpdates";
 import ServerIcon from "./ServerIcon";
 import { version as appVersion } from "../package.json";
@@ -256,6 +263,9 @@ export default function App() {
   const [notice, setNotice] = useState("");
   const fleetRequest = useRef(0);
   const fleetInFlight = useRef(false);
+  const desktopSelection = useRef<boolean | null>(null);
+  const persistedSelection = useRef("");
+  const [selectionReady, setSelectionReady] = useState(false);
   const loadServers = useCallback(async (showLoading = false) => {
     if (fleetInFlight.current) return;
     fleetInFlight.current = true;
@@ -265,21 +275,41 @@ export default function App() {
       setError("");
     }
     try {
-      const result = await fleetApi<{
-        servers: ServerRecord[];
-        defaultServerId: string | null;
-      }>("/servers", { signal: AbortSignal.timeout(10_000) });
+      const [result, selection] = await Promise.all([
+        fleetApi<{
+          servers: ServerRecord[];
+          defaultServerId: string | null;
+        }>("/servers", { signal: AbortSignal.timeout(10_000) }),
+        desktopSelection.current === null
+          ? fleetApi<{ desktop: boolean; activeServerId: string | null }>(
+              "/desktop/selection",
+              { signal: AbortSignal.timeout(10_000) },
+            ).catch((cause) => {
+              // Browser runtimes do not provide desktop preferences. A failed
+              // desktop read must be retried before mounting any server workspace.
+              if (cause instanceof SyntaxError || cause?.status === 404)
+                return null;
+              throw cause;
+            })
+          : Promise.resolve(null),
+      ]);
       if (request !== fleetRequest.current) return;
+      if (desktopSelection.current === null) {
+        desktopSelection.current = selection?.desktop === true;
+        persistedSelection.current = selection?.activeServerId ?? "";
+      }
       setServers(result.servers);
-      setActiveId((current) =>
-        result.servers.some((server) => server.id === current)
-          ? current
+      setActiveId((current) => {
+        const preferred = selection?.activeServerId || current;
+        return result.servers.some((server) => server.id === preferred)
+          ? preferred
           : (result.servers.find(
               (server) => server.id === result.defaultServerId,
             )?.id ??
-            result.servers[0]?.id ??
-            ""),
-      );
+              result.servers[0]?.id ??
+              "");
+      });
+      setSelectionReady(true);
       setError("");
     } catch (cause) {
       if (request === fleetRequest.current)
@@ -308,6 +338,20 @@ export default function App() {
       /* Selection still works without browser storage. */
     }
   }, [activeId]);
+  useEffect(() => {
+    if (
+      !selectionReady ||
+      !desktopSelection.current ||
+      persistedSelection.current === activeId
+    )
+      return;
+    persistedSelection.current = activeId;
+    void saveDesktopSelection(activeId || null).catch(() => {
+      setNotice(
+        "Your server was selected, but the choice could not be saved for the next app launch.",
+      );
+    });
+  }, [activeId, selectionReady]);
   useEffect(() => {
     if (!notice) return;
     const timer = setTimeout(() => setNotice(""), 5000);
@@ -1302,12 +1346,13 @@ function ConsolePage({
           </div>
           {showSearch && (
             <div className="log-search">
-              <Search size={15} />
-              <input
+              <SearchField
+                className="console-log-search-field"
+                iconSize={15}
                 aria-label="Filter console logs"
                 placeholder="Search console output…"
                 value={search}
-                onChange={(e) => setSearch(e.target.value)}
+                onValueChange={setSearch}
                 autoFocus
               />
               <button

@@ -83,7 +83,7 @@
         {
           "id": "file.delete",
           "label": "Delete files",
-          "description": "Permanently delete files and folders."
+          "description": "Move files and folders to Recycle Bin, or permanently remove recycled files."
         }
       ]
     },

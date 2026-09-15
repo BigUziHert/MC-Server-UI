@@ -1620,8 +1620,8 @@ test("metadata timeout cools down queued batches without hiding cached icons or 
   );
   assert.deepEqual(
     timeouts,
-    [8000, 8000],
-    "the optional metadata request uses its own eight-second limit",
+    [8000, 60000, 8000, 60000],
+    "each metadata request keeps its shorter eight-second budget alongside the transport deadline",
   );
   assert.deepEqual(result.projects, [
     {

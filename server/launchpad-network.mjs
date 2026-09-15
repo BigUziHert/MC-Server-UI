@@ -39,15 +39,19 @@ export function checkedProviderUrl(value, hosts) {
 }
 async function responseFor(
   url,
-  { fetch: request = fetch, headers = {}, ...options } = {},
+  { fetch: request = fetch, headers = {}, deadlineMs = 60000, ...options } = {},
   hosts,
 ) {
   let address = checkedProviderUrl(url, hosts);
+  const deadline = AbortSignal.timeout(deadlineMs);
+  const signal = options.signal
+    ? AbortSignal.any([options.signal, deadline])
+    : deadline;
   for (let redirects = 0; redirects <= 4; redirects++) {
     const response = await request(address, {
       ...options,
       redirect: "manual",
-      signal: options.signal ?? AbortSignal.timeout(60000),
+      signal,
       headers: { "User-Agent": USER_AGENT, ...headers },
     });
     if ([301, 302, 303, 307, 308].includes(response.status)) {
@@ -143,7 +147,11 @@ export async function downloadVerified(
   downloadSignal.throwIfAborted();
   const response = await responseFor(
     file.url,
-    { fetch: request, signal: downloadSignal },
+    {
+      fetch: request,
+      signal: downloadSignal,
+      deadlineMs: file.archive === true ? 300000 : 60000,
+    },
     hosts,
   );
   const handle = await fs.open(target, "wx");

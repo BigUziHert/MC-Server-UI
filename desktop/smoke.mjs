@@ -886,6 +886,15 @@ try {
 
   const imported = await importSmokeExisting(page);
   const neoForge = await importSmokeNeoForge(page);
+  await ui(
+    page.getByRole("combobox", { name: "Switch server", exact: true }),
+  ).toHaveValue(neoForge.id);
+  await ui
+    .poll(
+      async () =>
+        (await browserApi(page, "/desktop/selection")).data.activeServerId,
+    )
+    .toBe(neoForge.id);
 
   step("Closing the hidden window keeps the tray runtime available.");
   const trayState = await application.evaluate(({ BrowserWindow, Menu }) => {
@@ -923,6 +932,12 @@ try {
     "Relaunching the same profile to verify saved worlds, files, and databases.",
   );
   ({ page } = await launchPackaged());
+  await ui(
+    page.getByRole("combobox", { name: "Switch server", exact: true }),
+  ).toHaveValue(neoForge.id);
+  await page
+    .getByRole("combobox", { name: "Switch server", exact: true })
+    .selectOption(serverId);
   await ui(
     page.getByRole("heading", { name: "Desktop smoke world", exact: true }),
   ).toBeVisible();

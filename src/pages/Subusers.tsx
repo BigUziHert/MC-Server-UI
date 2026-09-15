@@ -11,12 +11,12 @@ import {
   Pencil,
   Plus,
   RefreshCw,
-  Search,
   Trash2,
   Users,
   X,
 } from "lucide-react";
 import { useServerApi, relativeTime, type PageProps } from "../api";
+import SearchField from "../SearchField";
 import catalog from "../../shared/subuser-permissions.json";
 import "./subusers.css";
 
@@ -214,15 +214,13 @@ export default function Subusers({ notify }: PageProps) {
             <span>{users.length}</span>
           </div>
           <div className="subusers-controls">
-            <label className="subusers-search">
-              <Search size={16} />
-              <input
-                aria-label="Search access records"
-                placeholder="Search by email…"
-                value={search}
-                onChange={(event) => setSearch(event.target.value)}
-              />
-            </label>
+            <SearchField
+              className="subusers-search"
+              aria-label="Search access records"
+              placeholder="Search by email…"
+              value={search}
+              onValueChange={setSearch}
+            />
             <button
               className="btn icon"
               aria-label="Refresh access records"

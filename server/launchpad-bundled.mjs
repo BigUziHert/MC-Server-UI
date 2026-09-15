@@ -412,7 +412,7 @@ function permitsServer(metadata, loader) {
  */
 export async function inspectBundledDependencies(
   archive,
-  { signal, fingerprint, loader } = {},
+  { signal, fingerprint, loader, visitMetadata } = {},
 ) {
   signal?.throwIfAborted();
   if (!["neoforge", "forge", "fabric", "quilt"].includes(loader))
@@ -472,6 +472,7 @@ export async function inspectBundledDependencies(
         if (raw.has(name)) metadata[key] = jsonObject(raw.get(name), name);
       const serverCompatible =
         parentPermitsServer && permitsServer(metadata, loader);
+      visitMetadata?.(metadata, { depth, path: parentPath, serverCompatible });
       if (depth) {
         const descriptor = {
           ...describe(metadata, fallback, parentPath, loader),

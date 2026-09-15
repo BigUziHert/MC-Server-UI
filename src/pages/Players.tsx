@@ -13,7 +13,6 @@ import {
   Check,
   Info,
   RefreshCw,
-  Search,
   ShieldCheck,
   ShieldMinus,
   ShieldPlus,
@@ -31,6 +30,7 @@ import {
 } from "lucide-react";
 import { ServerScope, useServerApi, type PageProps } from "../api";
 import PlayerHead from "../PlayerHead";
+import SearchField from "../SearchField";
 import "./management.css";
 import "./players.css";
 
@@ -747,15 +747,15 @@ export default function Players({ notify }: PageProps) {
           )}
         >
           {operators.length > 0 && (
-            <label className="players-roster-search">
-              <Search size={13} />
-              <input
-                aria-label="Search operators"
-                placeholder="Search operators..."
-                value={search}
-                onChange={(event) => setSearch(event.target.value)}
-              />
-            </label>
+            <SearchField
+              className="players-roster-search"
+              iconSize={13}
+              aria-label="Search operators"
+              clearLabel="Clear operator search"
+              placeholder="Search operators..."
+              value={search}
+              onValueChange={setSearch}
+            />
           )}
         </Roster>
         <Roster
@@ -864,17 +864,14 @@ export default function Players({ notify }: PageProps) {
             <span className="management-count">{history.length}</span>
           </div>
           <div className="management-controls">
-            <label className="management-search">
-              <Search size={16} />
-              <input
-                aria-label="Search player history"
-                placeholder="Search known players..."
-                value={historySearch}
-                onChange={(event) => {
-                  setHistorySearch(event.target.value);
-                }}
-              />
-            </label>
+            <SearchField
+              className="management-search"
+              aria-label="Search player history"
+              clearLabel="Clear player history search"
+              placeholder="Search known players..."
+              value={historySearch}
+              onValueChange={setHistorySearch}
+            />
             <button
               className="btn icon"
               aria-label="Refresh player history"

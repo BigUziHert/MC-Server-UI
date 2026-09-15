@@ -215,7 +215,18 @@ test("select visible all respects filters and selection clears on directory and 
   await search.fill("alpha");
   await all.check();
   await expect(selection).toContainText("2 selected");
-  await search.clear();
+  await page.getByRole("button", { name: "Clear search", exact: true }).click();
+  await expect(search).toHaveValue("");
+  await expect(search).toBeFocused();
+  await expect(search).toHaveCSS("outline-style", "none");
+  await expect(search.locator("xpath=../..")).toHaveCSS(
+    "border-color",
+    "rgb(150, 155, 179)",
+  );
+  await expect(search.locator("xpath=../..")).toHaveCSS(
+    "box-shadow",
+    "rgba(150, 155, 179, 0.25) 0px 0px 0px 1px",
+  );
   await expect(all).toHaveAttribute("aria-checked", "mixed");
   await expect(
     page.getByRole("checkbox", { name: "Select beta.txt", exact: true }),
@@ -241,6 +252,10 @@ test("select visible all respects filters and selection clears on directory and 
     page.getByRole("checkbox", { name: "Select archive", exact: true }),
   ).not.toBeChecked();
   await page.setViewportSize({ width: 390, height: 844 });
+  await search.fill("alpha");
+  await page.getByRole("button", { name: "Clear search", exact: true }).click();
+  await expect(search).toHaveValue("");
+  await expect(search).toBeFocused();
   expect(
     await page.evaluate(
       () => document.documentElement.scrollWidth - window.innerWidth,

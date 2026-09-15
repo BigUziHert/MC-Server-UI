@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { ArrowDownToLine, RefreshCw, X } from "lucide-react";
-import { api, post } from "./api";
+import { api, flushDesktopSelection, post } from "./api";
 import "./updates.css";
 
 type UpdateState = {
@@ -44,6 +44,7 @@ export default function DesktopUpdates() {
     setBusy(true);
     setError("");
     try {
+      if (name === "install") await flushDesktopSelection();
       setState(await post<UpdateState>(`/desktop/updates/${name}`));
     } catch (cause) {
       setError(

@@ -1272,7 +1272,7 @@ export async function createPanel(options = {}) {
   });
   const writeServer = (child, command) =>
     new Promise((resolve, reject) => {
-      if (child !== processHandle || !child.stdin.writable)
+      if (!child || child !== processHandle || !child.stdin?.writable)
         return reject(
           error(
             409,
@@ -2104,7 +2104,7 @@ export async function createPanel(options = {}) {
       const normalized = command.trim().replace(/^\//, "");
       append(`> ${normalized}`);
       if (normalized === "stop") await power("stop");
-      else if (mode === "live") processHandle.stdin.write(`${normalized}\n`);
+      else if (mode === "live") await writeServer(processHandle, normalized);
       else if (normalized === "help")
         append(
           "[Demo] Available examples: help, list, say <message>, save-all, time query daytime, stop.",
@@ -3291,6 +3291,11 @@ export async function createFleet(options = {}) {
     });
     res.json(result);
   });
+  // Desktop preferences belong to the app, not to the default server runtime.
+  // The authenticated desktop wrapper supplies the persistent implementation.
+  app.get("/api/desktop/selection", (_req, res) =>
+    res.json({ desktop: false, activeServerId: null }),
+  );
   app.use(async (req, res, next) => {
     if (!/^\/api(?:\/|$)/.test(req.path)) return next();
     const header = req.headers["x-server-id"];

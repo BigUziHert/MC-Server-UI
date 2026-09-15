@@ -235,12 +235,39 @@
 }
 .launchpad-project-action {
   display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
   align-items: flex-end;
   justify-content: flex-end;
   flex-shrink: 0;
 }
 .launchpad-project-action .btn {
   min-width: 112px;
+}
+.launchpad-project-action .launchpad-remove {
+  min-width: 0;
+}
+.launchpad-removal-dependencies {
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.6;
+}
+.launchpad-removal-dependencies ul {
+  max-height: 180px;
+  overflow-y: auto;
+  margin: 0 0 16px;
+  padding-left: 20px;
+  overflow-wrap: anywhere;
+}
+.launchpad-removal-dependencies li + li {
+  margin-top: 8px;
+}
+.launchpad-removal-dependencies strong,
+.launchpad-removal-dependencies span {
+  display: block;
+}
+.launchpad-removal-dependencies strong {
+  color: var(--text);
 }
 .launchpad-badge {
   border: 1px solid var(--border);

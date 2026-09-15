@@ -21,12 +21,13 @@ import {
   Package,
   Puzzle,
   RefreshCw,
-  Search,
   SlidersHorizontal,
   ExternalLink,
+  Trash2,
   X,
 } from "lucide-react";
 import { formatBytes, ServerScope, useServerApi, type PageProps } from "../api";
+import SearchField from "../SearchField";
 import "./management.css";
 import "./launchpad.css";
 
@@ -129,6 +130,15 @@ type Plan = {
   }[];
 };
 type Selection = { project: Project; installed?: InstalledItem };
+type RemovalPlan = {
+  planId?: string;
+  title: string;
+  files: { path: string; size: number }[];
+  dependents: { path: string; title: string }[];
+  warnings: string[];
+  blocked: boolean;
+  expiresAt?: string;
+};
 const kinds = [
   { id: "modpack", label: "Modpacks", icon: Layers3 },
   { id: "mod", label: "Mods", icon: Puzzle },
@@ -371,9 +381,12 @@ export default function Launchpad({ notify }: PageProps) {
   const [targetLoader, setTargetLoader] = useState("");
   const [plan, setPlan] = useState<Plan | null>(null);
   const [dialogError, setDialogError] = useState("");
-  const [busy, setBusy] = useState<"preview" | "install" | "settings" | null>(
-    null,
-  );
+  const [removal, setRemoval] = useState<InstalledItem | null>(null);
+  const [removalPlan, setRemovalPlan] = useState<RemovalPlan | null>(null);
+  const [removalError, setRemovalError] = useState("");
+  const [busy, setBusy] = useState<
+    "preview" | "install" | "settings" | "removal-preview" | "remove" | null
+  >(null);
   const [job, setJob] = useState<Job | null>(null);
   const [jobError, setJobError] = useState("");
   const [jobReload, setJobReload] = useState(0);
@@ -385,6 +398,7 @@ export default function Launchpad({ notify }: PageProps) {
   const pending = useRef(false);
   const dialog = useRef<HTMLDialogElement>(null);
   const settingsDialog = useRef<HTMLDialogElement>(null);
+  const removalDialog = useRef<HTMLDialogElement>(null);
   const tabs = useRef<HTMLDivElement>(null);
   const source = config?.platforms.find((item) => item.id === platform);
   const inventoryReady = Boolean(config);
@@ -487,6 +501,9 @@ export default function Launchpad({ notify }: PageProps) {
     forceScan.current = null;
     setJob(null);
     setSelection(null);
+    setRemoval(null);
+    setRemovalPlan(null);
+    setRemovalError("");
     setSettingsOpen(false);
     setApiKey("");
     setQuery("");
@@ -745,6 +762,10 @@ export default function Launchpad({ notify }: PageProps) {
     else settingsDialog.current?.close();
   }, [settingsOpen]);
   useEffect(() => {
+    if (removal) removalDialog.current?.showModal();
+    else removalDialog.current?.close();
+  }, [removal]);
+  useEffect(() => {
     if (!selection) return;
     const controller = new AbortController();
     setVersionsLoading(true);
@@ -831,6 +852,96 @@ export default function Launchpad({ notify }: PageProps) {
     setDialogError("");
     pending.current = false;
     setBusy(null);
+  }
+  function closeRemoval() {
+    if (busy === "remove") return;
+    operation.current++;
+    setRemoval(null);
+    setRemovalPlan(null);
+    setRemovalError("");
+    pending.current = false;
+    setBusy(null);
+  }
+  async function reviewRemoval(entry: InstalledItem) {
+    if (pending.current || !canInstall) return;
+    const currentSession = session.current,
+      currentOperation = ++operation.current;
+    setRemoval(entry);
+    setRemovalPlan(null);
+    setRemovalError("");
+    pending.current = true;
+    setBusy("removal-preview");
+    try {
+      const next = await post<RemovalPlan>("/launchpad/removal-preview", {
+        path: entry.path,
+      });
+      if (
+        currentSession === session.current &&
+        currentOperation === operation.current
+      )
+        setRemovalPlan(next);
+    } catch (cause) {
+      if (
+        currentSession === session.current &&
+        currentOperation === operation.current
+      )
+        setRemovalError(messageOf(cause));
+    } finally {
+      if (
+        currentSession === session.current &&
+        currentOperation === operation.current
+      ) {
+        pending.current = false;
+        setBusy(null);
+      }
+    }
+  }
+  async function removeMod() {
+    if (
+      pending.current ||
+      !removal ||
+      !removalPlan?.planId ||
+      removalPlan.blocked ||
+      !canInstall
+    )
+      return;
+    const currentSession = session.current,
+      currentOperation = operation.current;
+    pending.current = true;
+    setBusy("remove");
+    setRemovalError("");
+    try {
+      await post("/launchpad/remove", {
+        planId: removalPlan.planId,
+        confirmed: true,
+      });
+      if (
+        currentSession !== session.current ||
+        currentOperation !== operation.current
+      )
+        return;
+      setRemoval(null);
+      setRemovalPlan(null);
+      reloadContent();
+      notify(`${removal.title || removal.name} moved to Recycle Bin.`);
+    } catch (cause) {
+      if (
+        currentSession === session.current &&
+        currentOperation === operation.current
+      ) {
+        setRemovalError(messageOf(cause));
+        // A failed or stale confirmation needs a fresh dependency/file review.
+        setRemovalPlan(null);
+      }
+    } finally {
+      if (
+        currentSession === session.current &&
+        currentOperation === operation.current
+      ) {
+        pending.current = false;
+        setBusy(null);
+      }
+    }
   }
   async function preview(event: FormEvent) {
     event.preventDefault();
@@ -1263,18 +1374,17 @@ export default function Launchpad({ notify }: PageProps) {
             Page {Math.floor(currentOffset / limit) + 1} of {pageCount}
           </span>
         </div>
-        <label className="launchpad-search">
-          <Search size={17} />
-          <input
-            aria-label="Search Launchpad"
-            placeholder={`Search ${kinds.find((item) => item.id === type)?.label.toLowerCase()}...`}
-            value={query}
-            onChange={(event) => {
-              setQuery(event.target.value);
-              setOffset(0);
-            }}
-          />
-        </label>
+        <SearchField
+          className="launchpad-search"
+          iconSize={17}
+          aria-label="Search Launchpad"
+          placeholder={`Search ${kinds.find((item) => item.id === type)?.label.toLowerCase()}...`}
+          value={query}
+          onValueChange={(value) => {
+            setQuery(value);
+            setOffset(0);
+          }}
+        />
         {installedOnly ? (
           <label className="launchpad-sort">
             Sort by
@@ -1672,6 +1782,22 @@ export default function Launchpad({ notify }: PageProps) {
                           : "Install"}
                     </button>
                   )}
+                  {entry && type === "mod" && (
+                    <button
+                      type="button"
+                      className="btn launchpad-remove"
+                      aria-label={`Remove ${project.title}`}
+                      title={
+                        status !== "offline"
+                          ? "Stop the server before removing mods."
+                          : "Review mod removal"
+                      }
+                      disabled={!canInstall || Boolean(busy)}
+                      onClick={() => void reviewRemoval(entry)}
+                    >
+                      <Trash2 size={14} /> Remove
+                    </button>
+                  )}
                 </div>
               </article>
             ))}
@@ -2031,6 +2157,128 @@ export default function Launchpad({ notify }: PageProps) {
             )}
           </div>
         </form>
+      </dialog>
+      <dialog
+        className="modal management-dialog launchpad-dialog launchpad-removal-dialog"
+        ref={removalDialog}
+        aria-labelledby="launchpad-removal-title"
+        onCancel={(event) => {
+          event.preventDefault();
+          closeRemoval();
+        }}
+      >
+        <div className="management-dialog-heading">
+          <span className="management-icon">
+            <Trash2 size={22} />
+          </span>
+          <button
+            type="button"
+            className="btn icon"
+            aria-label="Close mod removal"
+            disabled={busy === "remove"}
+            onClick={closeRemoval}
+          >
+            <X size={18} />
+          </button>
+        </div>
+        <h2 id="launchpad-removal-title">
+          {removalPlan?.blocked ? "Mod removal blocked" : "Remove mod"}
+        </h2>
+        <p className="management-dialog-description">
+          <strong>
+            {removalPlan?.title || removal?.title || removal?.name}
+          </strong>
+        </p>
+        {busy === "removal-preview" && (
+          <p className="management-dialog-description" role="status">
+            Checking installed dependencies…
+          </p>
+        )}
+        {removalPlan && (
+          <>
+            <ul className="launchpad-review-files" aria-label="Files to remove">
+              {removalPlan.files.map((file) => (
+                <li key={file.path}>
+                  <span>{file.path}</span>
+                  <span>{formatBytes(file.size)}</span>
+                </li>
+              ))}
+            </ul>
+            {removalPlan.dependents.length > 0 && (
+              <div className="launchpad-removal-dependencies">
+                <p>Remove these dependent mods first:</p>
+                <ul aria-label="Mods requiring this mod" tabIndex={0}>
+                  {removalPlan.dependents.map((item) => (
+                    <li key={item.path}>
+                      <strong>{item.title}</strong>
+                      <span>{item.path}</span>
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            )}
+            {removalPlan.warnings.map((warning, index) => (
+              <p
+                className="launchpad-review-warning"
+                key={`${index}:${warning}`}
+              >
+                {warning}
+              </p>
+            ))}
+            {!removalPlan.blocked && (
+              <p className="management-dialog-description">
+                This file will move to Recycle Bin, where you can restore it.
+                Other mods and libraries will stay installed.
+              </p>
+            )}
+          </>
+        )}
+        {!canInstall && (
+          <p className="management-form-error" role="alert">
+            {working
+              ? "Wait for the installation to finish before removing mods."
+              : "Stop the server in Console before removing mods."}
+          </p>
+        )}
+        {removalError && (
+          <p className="management-form-error" role="alert">
+            {removalError}
+          </p>
+        )}
+        <div className="management-dialog-actions">
+          <button
+            type="button"
+            className="btn"
+            disabled={busy === "remove"}
+            onClick={closeRemoval}
+          >
+            {removalPlan?.blocked ? "Close" : "Cancel"}
+          </button>
+          {removalPlan && !removalPlan.blocked ? (
+            <button
+              type="button"
+              className="btn danger"
+              disabled={Boolean(busy) || !canInstall || !removalPlan.planId}
+              onClick={() => void removeMod()}
+            >
+              {busy === "remove" ? (
+                <LoaderCircle size={15} className="spin" />
+              ) : (
+                <Trash2 size={15} />
+              )}
+              {busy === "remove" ? "Removing…" : "Remove mod"}
+            </button>
+          ) : removalError && removal ? (
+            <button
+              type="button"
+              className="btn"
+              disabled={Boolean(busy) || !canInstall}
+              onClick={() => void reviewRemoval(removal)}
+            >
+              Review removal again
+            </button>
+          ) : null}
+        </div>
       </dialog>
       <dialog
         className="modal management-dialog launchpad-dialog"
