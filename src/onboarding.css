@@ -368,6 +368,25 @@
   gap: 24px;
   align-items: center;
 }
+.setup-java-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 8px;
+}
+.setup-java-header label {
+  margin-bottom: 0;
+}
+.setup-java-header .btn {
+  font-size: 11px;
+  padding: 7px 10px;
+  flex-shrink: 0;
+}
+.setup-java-path {
+  overflow-wrap: anywhere;
+  font-family: var(--font-mono, monospace);
+}
 .setup-wizard .setup-memory input[type="range"] {
   flex: 1;
   padding: 0;

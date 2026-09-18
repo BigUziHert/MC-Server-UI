@@ -728,14 +728,23 @@ async function chooseNewServer(page: Page) {
     .click();
   const dialog = page.getByRole("dialog");
   await expect(dialog).toBeVisible();
-  await dialog.getByText("Advanced setup", { exact: true }).click();
-  await dialog
-    .getByRole("button", { name: "Create an empty server", exact: true })
-    .click();
+  await expect(
+    dialog.getByRole("button", { name: "Server software", exact: true }),
+  ).toBeVisible();
+  await expect(
+    dialog.getByRole("button", { name: "Modpack", exact: true }),
+  ).toBeVisible();
+  await expect(dialog.getByText("Advanced setup", { exact: true })).toHaveCount(
+    0,
+  );
+  await expect(
+    dialog.getByRole("button", { name: "Create an empty server", exact: true }),
+  ).toHaveCount(0);
+  await expect(dialog.getByLabel("Mode", { exact: true })).toHaveCount(0);
   return page.getByRole("dialog");
 }
 
-test("server creation, editable names, and the selected workspace persist across reloads", async ({
+test("editable server names and the selected workspace persist across reloads", async ({
   page,
   request,
 }) => {
@@ -746,34 +755,29 @@ test("server creation, editable names, and the selected workspace persist across
     exact: true,
   });
   await expect(selector).toHaveValue(initial.defaultServerId);
-  await page.getByRole("button", { name: "Add server", exact: true }).click();
-  let dialog = await chooseNewServer(page);
-  await dialog.getByLabel("Server name", { exact: true }).fill("E2E Creative");
-  await dialog.getByLabel("Mode", { exact: true }).selectOption("demo");
-  await dialog.getByText("Advanced settings", { exact: true }).click();
-  await dialog.getByLabel("Server port", { exact: true }).fill("25671");
-  await dialog
-    .getByRole("button", { name: "Create server", exact: true })
-    .click();
-  await expect(dialog).not.toBeVisible();
-  const created = (await listServers(request)).servers.find(
-    (server) => server.name === "E2E Creative",
-  );
-  expect(created).toBeDefined();
-  await expect(selector).toHaveValue(created!.id);
+  // Existing-workspace tests use isolated API fixtures; creation is covered by onboarding.spec.ts.
+  const created = await createTestServer(request, "E2E Creative", 25671);
+  await page.reload();
+  await switchServer(page, created.id);
   await expect(
     page.getByRole("heading", { name: "E2E Creative", exact: true }),
   ).toBeVisible();
   expect(created).toMatchObject({
     mode: "demo",
     port: 25671,
-    memoryLimitMB: 4096,
+    memoryLimitMB: 2048,
   });
 
   await page
     .getByRole("button", { name: "Server settings", exact: true })
     .click();
-  dialog = page.getByRole("dialog", { name: "Server settings", exact: true });
+  let dialog = page.getByRole("dialog", {
+    name: "Server settings",
+    exact: true,
+  });
+  await expect(
+    dialog.getByRole("combobox", { name: "Mode", exact: true }),
+  ).toHaveCount(0);
   await expect(dialog.getByLabel("Server name", { exact: true })).toHaveValue(
     "E2E Creative",
   );
@@ -1276,10 +1280,6 @@ test("mobile navigation exposes server controls and the Players page without hor
   ).toBeInViewport();
   await page.getByRole("button", { name: "Add server", exact: true }).click();
   let dialog = await chooseNewServer(page);
-  await dialog
-    .getByLabel("Server name", { exact: true })
-    .fill("A longer mobile server name");
-  await dialog.getByLabel("Mode", { exact: true }).selectOption("demo");
   await assertFits("Add server dialog");
   const box = await dialog.boundingBox();
   expect(box).not.toBeNull();
@@ -1597,8 +1597,9 @@ test("populated Minecraft head lists fit mobile Console and Players layouts", as
   }
 });
 
-test("an empty fleet supports advanced empty-server creation with Minecraft Java defaults", async ({
+test("an empty fleet shows only guided creation and refreshes after a server is added", async ({
   page,
+  request,
 }, testInfo) => {
   let firstServer: TestServer | undefined;
   const unexpectedServerRequests: string[] = [];
@@ -1677,27 +1678,33 @@ test("an empty fleet supports advanced empty-server creation with Minecraft Java
     .getByRole("button", { name: "Create a new server", exact: true })
     .click();
   const dialog = page.getByRole("dialog");
-  await dialog.getByText("Advanced setup", { exact: true }).click();
-  await dialog
-    .getByRole("button", { name: "Create an empty server", exact: true })
-    .click();
-  await expect(dialog.getByLabel("Mode", { exact: true })).toHaveValue("live");
   await expect(
-    dialog.getByLabel("Server JAR", { exact: true }),
-  ).not.toBeVisible();
-  await dialog.getByText("Advanced settings", { exact: true }).click();
-  await expect(dialog.getByLabel("Server JAR", { exact: true })).toHaveValue(
-    "server.jar",
+    dialog.getByRole("button", { name: "Server software", exact: true }),
+  ).toBeVisible();
+  await expect(
+    dialog.getByRole("button", { name: "Modpack", exact: true }),
+  ).toBeVisible();
+  await expect(dialog.getByText("Advanced setup", { exact: true })).toHaveCount(
+    0,
   );
-  await dialog
-    .getByLabel("Server name", { exact: true })
-    .fill("E2E First Real Server");
-  await dialog.getByLabel("Server port", { exact: true }).fill("25675");
-  await dialog.getByLabel("Memory (MB)", { exact: true }).fill("1024");
-  await dialog
-    .getByRole("button", { name: "Create server", exact: true })
-    .click();
+  await expect(
+    dialog.getByRole("button", { name: "Create an empty server", exact: true }),
+  ).toHaveCount(0);
+  await expect(dialog.getByLabel("Mode", { exact: true })).toHaveCount(0);
+  await page.keyboard.press("Escape");
   await expect(dialog).not.toBeVisible();
+  await expect(welcome).toBeVisible();
+  const fixture = await request.post("/api/servers", {
+    data: {
+      name: "E2E First Real Server",
+      mode: "live",
+      port: 25675,
+      memoryLimitMB: 1024,
+    },
+  });
+  expect(fixture.status()).toBe(201);
+  firstServer = (await fixture.json()).server;
+  await page.reload();
   await expect(
     page.getByRole("heading", { level: 1, name: "Console", exact: true }),
   ).toBeVisible();

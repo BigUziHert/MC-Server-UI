@@ -1,7 +1,12 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
-import { spawn } from "node:child_process";
+import {
+  probeJava,
+  createJavaDiscovery,
+  compatibleJava,
+} from "./java-discovery.mjs";
+export { probeJava } from "./java-discovery.mjs";
 import { totalmem, freemem } from "node:os";
 import { createVersionsService } from "./versions.mjs";
 import { createLaunchpad, providerJson } from "./launchpad.mjs";
@@ -13,81 +18,6 @@ const emptyServer = async () => ({
   gameVersion: null,
   loader: null,
 });
-
-export function probeJava(
-  javaPath = "java",
-  { spawnProcess = spawn, timeoutMs = 5000 } = {},
-) {
-  if (
-    typeof javaPath !== "string" ||
-    !javaPath.trim() ||
-    javaPath.length > 1024 ||
-    /[\x00-\x1f\x7f]/.test(javaPath)
-  )
-    throw fail(400, "Enter java or the path to a Java executable.");
-  return new Promise((resolve) => {
-    let child,
-      timer,
-      done = false,
-      output = "";
-    const finish = (error) => {
-      if (done) return;
-      done = true;
-      clearTimeout(timer);
-      const match =
-        /(?:openjdk|java)\s+(?:version\s+)?["']?([\d][\w.+-]*)/i.exec(output);
-      const version = match?.[1] ?? null;
-      const majorVersion = version
-        ? Number(
-            version.startsWith("1.")
-              ? version.split(".")[1]
-              : version.split(/[.+-]/)[0],
-          )
-        : null;
-      resolve({
-        path: javaPath,
-        available: !error && !!majorVersion,
-        version,
-        majorVersion,
-        ...(error || !majorVersion
-          ? { error: error || "Java did not report a recognizable version." }
-          : {}),
-      });
-    };
-    try {
-      child = spawnProcess(javaPath, ["-version"], {
-        shell: false,
-        windowsHide: true,
-        stdio: ["ignore", "pipe", "pipe"],
-      });
-      const collect = (data) => {
-        output = (output + data.toString()).slice(0, 65536);
-      };
-      child.stdout?.on("data", collect);
-      child.stderr?.on("data", collect);
-      child.once("error", (cause) =>
-        finish(
-          cause.code === "ENOENT"
-            ? "Java was not found. Install a compatible Java runtime or choose its executable."
-            : `Could not check Java: ${cause.message}`,
-        ),
-      );
-      child.once("close", (code) =>
-        finish(
-          code === 0 ? null : `Java version check exited with code ${code}.`,
-        ),
-      );
-      timer = setTimeout(() => {
-        finish(
-          "Java version check timed out. Check the executable path and try again.",
-        );
-        child.kill();
-      }, timeoutMs);
-    } catch (cause) {
-      finish(`Could not check Java: ${cause.message}`);
-    }
-  });
-}
 
 // Catalog reads have no selected server. Pack reviews use a disposable empty
 // workspace and the same checksum/path/dependency checks as scoped installs.
@@ -173,6 +103,102 @@ export async function createServerSetup({ dataDir, safePath, ...options }) {
     };
   };
   const javaProbe = options.javaProbe ?? probeJava;
+  // Unit fixtures can inject just a probe without scanning the developer's PC.
+  const discoverJava =
+    options.javaDiscovery ??
+    (options.javaProbe
+      ? async () => {
+          const java = await javaProbe(options.javaPath ?? "java");
+          return java.available ? [java] : [];
+        }
+      : createJavaDiscovery({
+          preferredPath: options.javaPath,
+          ...options.javaDiscoveryOptions,
+        }));
+  async function javaRequirement(input = {}) {
+    const required = input.requiredJavaVersion;
+    if (
+      required !== undefined &&
+      (!Number.isInteger(required) || required < 8 || required > 100)
+    )
+      throw fail(400, "Choose a valid required Java version.");
+    if (
+      input.gameVersion !== undefined &&
+      (typeof input.gameVersion !== "string" || input.gameVersion.length > 128)
+    )
+      throw fail(400, "Choose a Minecraft release.");
+    let requiredJavaVersion = required ?? null;
+    const warnings = [];
+    if (!requiredJavaVersion && input.gameVersion) {
+      if (input.provider && input.provider !== "vanilla") {
+        try {
+          const catalog = await versions.builds(
+            input.provider,
+            input.gameVersion,
+          );
+          requiredJavaVersion =
+            catalog.builds.find((build) => Number.isInteger(build.javaVersion))
+              ?.javaVersion ?? null;
+        } catch {}
+      }
+      if (!requiredJavaVersion)
+        try {
+          const official = await versions.builds("vanilla", input.gameVersion);
+          requiredJavaVersion =
+            official.builds.find((build) => Number.isInteger(build.javaVersion))
+              ?.javaVersion ?? null;
+        } catch {}
+      // Official older manifests omit the Java metadata. These release-era
+      // requirements are bounded; new/experimental releases require metadata.
+      if (
+        !requiredJavaVersion &&
+        /^1\.(?:[0-9]|1[0-6])(?:\.\d+)?$/.test(input.gameVersion)
+      )
+        requiredJavaVersion = 8;
+      if (!requiredJavaVersion)
+        warnings.push(
+          "The official catalog could not confirm this release's Java requirement. Refresh the list when the catalog is available.",
+        );
+    }
+    return {
+      requiredJavaVersion,
+      requirement: requiredJavaVersion
+        ? `Java ${requiredJavaVersion} (64-bit)`
+        : input.gameVersion
+          ? "Java requirement unavailable"
+          : "Choose a Minecraft version to filter installed Java",
+      warnings,
+    };
+  }
+  async function javaInstallations(input = {}) {
+    const [detected, requirement] = await Promise.all([
+      discoverJava({ refresh: input.refresh === true }),
+      javaRequirement(input),
+    ]);
+    const validated = detected.filter(
+      (java) =>
+        java.available && Number.isInteger(java.majorVersion) && java.path,
+    );
+    const installations = (
+      input.gameVersion && !requirement.requiredJavaVersion
+        ? []
+        : validated.filter((java) =>
+            compatibleJava(java, requirement.requiredJavaVersion),
+          )
+    ).map(({ path, version, majorVersion, vendor, architecture }) => ({
+      path,
+      version,
+      majorVersion,
+      ...(vendor ? { vendor } : {}),
+      ...(architecture ? { architecture } : {}),
+    }));
+    return {
+      ...requirement,
+      installations,
+      recommendedPath: installations[0]?.path ?? null,
+      detectedCount: validated.length,
+    };
+  }
   async function preflight(input = {}) {
     if (!input || typeof input !== "object" || Array.isArray(input))
       throw fail(400, "Provide the new server's memory and Java settings.");
@@ -183,37 +209,31 @@ export async function createServerSetup({ dataDir, safePath, ...options }) {
       memoryLimitMB > 262144
     )
       throw fail(400, "Memory must be an integer between 256 and 262144 MB.");
-    if (
-      input.requiredJavaVersion !== undefined &&
-      (!Number.isInteger(input.requiredJavaVersion) ||
-        input.requiredJavaVersion < 8 ||
-        input.requiredJavaVersion > 100)
-    )
-      throw fail(400, "Choose a valid required Java version.");
-    const java = await javaProbe(input.javaPath ?? options.javaPath ?? "java");
-    let requiredJavaVersion = input.requiredJavaVersion ?? null;
-    const warnings = [];
-    if (!requiredJavaVersion && input.gameVersion) {
-      try {
-        const official = await versions.builds("vanilla", input.gameVersion);
-        requiredJavaVersion =
-          official.builds.find((build) => Number.isInteger(build.javaVersion))
-            ?.javaVersion ?? null;
-      } catch {
-        warnings.push(
-          "The official catalog could not confirm this release's Java requirement. Check its release notes before starting.",
-        );
-      }
+    const { requiredJavaVersion, requirement, warnings } =
+      await javaRequirement(input);
+    let java;
+    if (input.javaPath !== undefined) java = await javaProbe(input.javaPath);
+    else {
+      const detected = await discoverJava();
+      java = detected.find((entry) =>
+        compatibleJava(entry, requiredJavaVersion),
+      ) ?? {
+        path: null,
+        available: false,
+        version: null,
+        majorVersion: null,
+        error: `Java was not found${requiredJavaVersion ? ` for ${requirement}` : ""}. Install a compatible runtime, then refresh the Java list.`,
+      };
     }
     const memory = host();
     if (!java.available) warnings.push(java.error ?? "Java is unavailable.");
     if (
       requiredJavaVersion &&
       java.available &&
-      java.majorVersion < requiredJavaVersion
+      !compatibleJava(java, requiredJavaVersion)
     )
       warnings.push(
-        `This release requires Java ${requiredJavaVersion} or newer; the selected executable is Java ${java.majorVersion}.`,
+        `This release requires Java ${requiredJavaVersion} (64-bit); the selected executable is Java ${java.majorVersion}${java.architecture ? ` (${java.architecture})` : ""}. Choose a compatible runtime from the list.`,
       );
     if (memoryLimitMB >= memory.hostMemoryMB)
       warnings.push(
@@ -228,12 +248,13 @@ export async function createServerSetup({ dataDir, safePath, ...options }) {
         "The selected allocation is above currently available RAM. Close other applications or lower the allocation before starting.",
       );
     const compatible =
-      java.available &&
-      (!requiredJavaVersion || java.majorVersion >= requiredJavaVersion);
+      compatibleJava(java, requiredJavaVersion) &&
+      (!input.gameVersion || !!requiredJavaVersion);
     return {
       ...memory,
       java,
       requiredJavaVersion,
+      requirement,
       memoryLimitMB,
       warnings,
       compatible,
@@ -332,6 +353,22 @@ export async function createServerSetup({ dataDir, safePath, ...options }) {
     app.post(
       "/api/server-setup/preflight",
       endpoint(async (req, res) => res.json(await preflight(req.body))),
+    );
+    app.get(
+      "/api/server-setup/java",
+      endpoint(async (req, res) =>
+        res.json(
+          await javaInstallations({
+            gameVersion: req.query.gameVersion || undefined,
+            provider: req.query.provider || undefined,
+            requiredJavaVersion:
+              req.query.requiredJavaVersion === undefined
+                ? undefined
+                : Number(req.query.requiredJavaVersion),
+            refresh: req.query.refresh === "1",
+          }),
+        ),
+      ),
     );
     app.get(
       "/api/server-setup/versions",

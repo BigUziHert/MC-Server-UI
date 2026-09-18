@@ -45,8 +45,8 @@ type Inspection = {
   javaPath?: string;
   memoryLimitMB?: number;
 };
-type Step = "choice" | "create" | "manual" | "import";
-type Work = "browse" | "inspect" | "create" | "import" | null;
+type Step = "choice" | "create" | "import";
+type Work = "browse" | "inspect" | "import" | null;
 
 export default function AddServer({
   servers,
@@ -59,18 +59,9 @@ export default function AddServer({
   onClose: () => void;
   onSaved: (server: ServerRecord) => void;
 }) {
-  let nextPort = 25565;
-  while (servers.some((server) => server.port === nextPort)) nextPort++;
   const [step, setStep] = useState<Step>(initialStep);
   const [wizardLocked, setWizardLocked] = useState(false);
   const wizardClose = useRef<(() => void) | null>(null);
-  const [name, setName] = useState("");
-  const [mode, setMode] = useState<"live" | "demo">("live");
-  const [port, setPort] = useState(String(nextPort));
-  const [memory, setMemory] = useState("4096");
-  const [startup, setStartup] = useState(() => startupDraft());
-  const [motd, setMotd] = useState("Welcome to our Minecraft server");
-  const [advanced, setAdvanced] = useState(false);
   const [canBrowse, setCanBrowse] = useState(false);
   const [browseUnavailable, setBrowseUnavailable] = useState(false);
   const [directory, setDirectory] = useState("");
@@ -86,13 +77,11 @@ export default function AddServer({
   const [error, setError] = useState("");
   const dialog = useRef<HTMLDialogElement>(null);
   const choiceButton = useRef<HTMLButtonElement>(null);
-  const nameInput = useRef<HTMLInputElement>(null);
   const directoryInput = useRef<HTMLInputElement>(null);
   const inspectedName = useRef<HTMLInputElement>(null);
   const operation = useRef(0);
   const inspectionRequest = useRef<AbortController | null>(null);
-  const locked =
-    wizardLocked || work === "create" || work === "import" || work === "browse";
+  const locked = wizardLocked || work === "import" || work === "browse";
   const freshInspection = inspection?.directory === directory;
   const portConflict = servers.find(
     (server) => server.port === Number(importPort),
@@ -127,7 +116,6 @@ export default function AddServer({
   useEffect(() => {
     if (dialog.current) dialog.current.scrollTop = 0;
     if (step === "choice") choiceButton.current?.focus();
-    if (step === "manual") nameInput.current?.focus();
     if (step === "import") directoryInput.current?.focus();
   }, [step]);
   useEffect(() => {
@@ -181,50 +169,6 @@ export default function AddServer({
     )
       return "Memory must be a whole number from 256 to 262144 MB.";
     return "";
-  }
-
-  async function create(event: FormEvent) {
-    event.preventDefault();
-    if (work) return;
-    const invalid = settingsError(
-      port,
-      startup.launchType === "jar" ? memory : null,
-    );
-    if (!name.trim()) {
-      setError("Give your server a name.");
-      nameInput.current?.focus();
-      return;
-    }
-    if (invalid || (mode === "live" && startupError(startup))) {
-      setError(invalid || startupError(startup));
-      setAdvanced(true);
-      return;
-    }
-    const request = ++operation.current;
-    setWork("create");
-    setError("");
-    try {
-      const result = await post<{ server: ServerRecord }>("/servers", {
-        name: name.trim(),
-        mode,
-        port: Number(port),
-        ...(startup.launchType === "jar"
-          ? { memoryLimitMB: Number(memory) }
-          : {}),
-        ...startupPayload(mode === "live" ? startup : startupDraft()),
-        motd,
-      });
-      if (request === operation.current) onSaved(result.server);
-    } catch (cause) {
-      if (request === operation.current)
-        setError(
-          cause instanceof Error
-            ? cause.message
-            : "Unable to create the server.",
-        );
-    } finally {
-      if (request === operation.current) setWork(null);
-    }
   }
 
   async function browse() {
@@ -351,7 +295,7 @@ export default function AddServer({
   const title =
     step === "choice"
       ? "Add a server"
-      : step === "create" || step === "manual"
+      : step === "create"
         ? "Create a new server"
         : "Import an existing server";
   return (
@@ -396,9 +340,7 @@ export default function AddServer({
           <p className="server-add-intro">
             {step === "choice"
               ? "Start a fresh world or bring the server you already have."
-              : step === "manual"
-                ? "Give your server a name. You can add its files next."
-                : "Connect the existing server folder on the computer running MC Panel."}
+              : "Connect the existing server folder on the computer running MC Panel."}
           </p>
         </>
       )}
@@ -407,7 +349,6 @@ export default function AddServer({
         <NewServerWizard
           servers={servers}
           onBack={() => navigate("choice")}
-          onManual={() => navigate("manual")}
           onClose={close}
           onSaved={onSaved}
           onLockChange={setWizardLocked}
@@ -430,7 +371,7 @@ export default function AddServer({
               </span>
               <span>
                 <strong>Create a new server</strong>
-                <span>A fresh folder for a new Minecraft world.</span>
+                <span>Choose server software or a modpack to install.</span>
               </span>
               <ArrowRight size={18} />
             </button>
@@ -462,152 +403,6 @@ export default function AddServer({
             </button>
           </div>
         </>
-      )}
-
-      {step === "manual" && (
-        <form onSubmit={create} noValidate>
-          <div className="form-field">
-            <label htmlFor="new-server-name">Server name</label>
-            <input
-              ref={nameInput}
-              id="new-server-name"
-              required
-              maxLength={64}
-              placeholder="Survival with friends"
-              value={name}
-              onChange={(event) => setName(event.target.value)}
-              disabled={locked}
-            />
-          </div>
-          <div className="form-field">
-            <label htmlFor="new-server-mode">Mode</label>
-            <select
-              id="new-server-mode"
-              value={mode}
-              onChange={(event) =>
-                setMode(event.target.value as "live" | "demo")
-              }
-              disabled={locked}
-            >
-              <option value="live">Live Minecraft server</option>
-              <option value="demo">Demo server</option>
-            </select>
-          </div>
-          <div className="server-create-defaults">
-            <Box size={16} />
-            <span>
-              {mode === "live" && startup.launchType === "jar"
-                ? `${Number(memory) / 1024} GB memory`
-                : mode === "live"
-                  ? "Custom startup"
-                  : "Simulated console"}
-              <span>·</span>Port {port || "—"}
-            </span>
-          </div>
-          <details
-            className="server-advanced"
-            open={advanced}
-            onToggle={(event) => setAdvanced(event.currentTarget.open)}
-          >
-            <summary>
-              <Settings2 size={15} /> Advanced settings{" "}
-              <ChevronDown size={15} />
-            </summary>
-            <fieldset
-              disabled={locked}
-              className="server-config-fields server-advanced-fields"
-            >
-              <div className="server-form-grid">
-                <div className="form-field">
-                  <label htmlFor="new-server-port">Server port</label>
-                  <input
-                    id="new-server-port"
-                    type="number"
-                    required
-                    min={1024}
-                    max={65535}
-                    value={port}
-                    onChange={(event) => setPort(event.target.value)}
-                  />
-                </div>
-                {startup.launchType === "jar" && (
-                  <div className="form-field">
-                    <label htmlFor="new-server-memory">Memory (MB)</label>
-                    <input
-                      id="new-server-memory"
-                      type="number"
-                      required
-                      min={256}
-                      max={262144}
-                      value={memory}
-                      onChange={(event) => setMemory(event.target.value)}
-                    />
-                  </div>
-                )}
-              </div>
-              {mode === "live" && (
-                <>
-                  <LaunchMethodFields
-                    idPrefix="new-server"
-                    value={startup}
-                    onChange={setStartup}
-                  />
-                  <LaunchMemoryNote type={startup.launchType} />
-                  <LaunchAdvancedFields
-                    idPrefix="new-server"
-                    value={startup}
-                    onChange={setStartup}
-                  />
-                </>
-              )}
-              <div className="form-field">
-                <label htmlFor="new-server-motd">
-                  Server list message (MOTD)
-                </label>
-                <input
-                  id="new-server-motd"
-                  maxLength={160}
-                  value={motd}
-                  onChange={(event) => setMotd(event.target.value)}
-                />
-              </div>
-            </fieldset>
-          </details>
-          <div className="server-setup-note">
-            <Box size={17} />
-            <p>
-              {mode === "demo"
-                ? "Console and player actions are simulated. Files and backups use real local storage."
-                : startup.launchType === "jar"
-                  ? "After creating, upload your server JAR and accept the Minecraft EULA before starting. Java must be installed on this computer."
-                  : "After creating, add your server files in File Manager and finish your server's setup before starting."}
-            </p>
-          </div>
-          {error && (
-            <div className="server-form-error" role="alert">
-              <AlertCircle size={16} />
-              {error}
-            </div>
-          )}
-          <div className="server-dialog-actions">
-            <button
-              type="button"
-              className="btn"
-              disabled={locked}
-              onClick={close}
-            >
-              Cancel
-            </button>
-            <button
-              type="submit"
-              className="btn primary"
-              disabled={!!work || !name.trim()}
-            >
-              <Plus size={15} />
-              {work === "create" ? "Creating…" : "Create server"}
-            </button>
-          </div>
-        </form>
       )}
 
       {step === "import" && (

@@ -55,6 +55,21 @@ type Java = {
   path?: string;
   error?: string;
 };
+type JavaInstallation = {
+  path: string;
+  version: string;
+  majorVersion: number;
+  vendor?: string;
+  architecture?: string;
+};
+type JavaChoices = {
+  installations: JavaInstallation[];
+  recommendedPath: string | null;
+  detectedCount: number;
+  requiredJavaVersion: number | null;
+  requirement: string;
+  warnings: string[];
+};
 type Catalog = {
   providers: Provider[];
   platforms: Platform[];
@@ -113,7 +128,6 @@ type Step = "source" | "catalog" | "configure" | "review" | "install" | "done";
 type Props = {
   servers: ServerRecord[];
   onBack: () => void;
-  onManual: () => void;
   onClose: () => void;
   onSaved: (server: ServerRecord) => void;
   onLockChange: (locked: boolean) => void;
@@ -160,7 +174,6 @@ const wait = (signal: AbortSignal) =>
 export default function NewServerWizard({
   servers,
   onBack,
-  onManual,
   onClose,
   onSaved,
   onLockChange,
@@ -194,7 +207,12 @@ export default function NewServerWizard({
   const [apiKey, setApiKey] = useState("");
   const [name, setName] = useState("");
   const [memory, setMemory] = useState("4");
-  const [javaPath, setJavaPath] = useState("java");
+  const [javaPath, setJavaPath] = useState("");
+  const [javaChoices, setJavaChoices] = useState<JavaChoices | null>(null);
+  const [javaLoading, setJavaLoading] = useState(false);
+  const [javaError, setJavaError] = useState("");
+  const [javaRefresh, setJavaRefresh] = useState(0);
+  const [javaChoicesKey, setJavaChoicesKey] = useState("");
   const [port, setPort] = useState(() => {
     let next = 25565;
     while (servers.some((s) => s.port === next)) next++;
@@ -235,6 +253,15 @@ export default function NewServerWizard({
     kind === "software"
       ? Boolean(provider && build && gameVersion)
       : Boolean(project && packVersion && gameVersion && packLoader);
+  const javaSelectionKey = query({
+    gameVersion,
+    provider: kind === "software" ? provider?.id || "" : packLoader,
+    requiredJavaVersion: kind === "software" ? build?.javaVersion || "" : "",
+  });
+  const selectedJava =
+    javaChoicesKey === javaSelectionKey
+      ? javaChoices?.installations.find((item) => item.path === javaPath)
+      : undefined;
   const displayStep = ["source", "catalog"].includes(step)
     ? 0
     : step === "configure"
@@ -272,16 +299,44 @@ export default function NewServerWizard({
       .then((result) => {
         if (cancel.signal.aborted) return;
         setCatalog(result);
-        if (result.java.path)
-          setJavaPath((current) =>
-            current === "java" ? result.java.path! : current,
-          );
       })
       .catch((cause) => {
         if (!cancel.signal.aborted) setCatalogError(message(cause));
       });
     return () => cancel.abort();
   }, [refresh]);
+  useEffect(() => {
+    if (step !== "configure" || !isPrepared) return;
+    const cancel = new AbortController();
+    setJavaLoading(true);
+    setJavaError("");
+    setJavaChoices(null);
+    void api<JavaChoices>(
+      `/server-setup/java?${javaSelectionKey}${javaRefresh ? "&refresh=1" : ""}`,
+      { signal: AbortSignal.any([cancel.signal, AbortSignal.timeout(30000)]) },
+    )
+      .then((result) => {
+        if (cancel.signal.aborted) return;
+        setJavaChoices(result);
+        setJavaChoicesKey(javaSelectionKey);
+        setJavaPath((current) =>
+          result.installations.some((item) => item.path === current)
+            ? current
+            : result.installations.find(
+                (item) => item.path === result.recommendedPath,
+              )?.path ||
+              result.installations[0]?.path ||
+              "",
+        );
+      })
+      .catch((cause) => {
+        if (!cancel.signal.aborted) setJavaError(message(cause));
+      })
+      .finally(() => {
+        if (!cancel.signal.aborted) setJavaLoading(false);
+      });
+    return () => cancel.abort();
+  }, [step, isPrepared, javaSelectionKey, javaRefresh]);
   useEffect(() => {
     if (!provider || kind !== "software") return;
     const cancel = new AbortController();
@@ -503,6 +558,12 @@ export default function NewServerWizard({
   async function review(event: FormEvent) {
     event.preventDefault();
     if (busyRef.current || !isPrepared) return;
+    if (javaLoading || !selectedJava) {
+      setError(
+        "Choose an installed, compatible Java version before continuing.",
+      );
+      return;
+    }
     const mb = Number(memory) * 1024;
     if (!name.trim()) {
       setError("Give your server a name.");
@@ -539,16 +600,19 @@ export default function NewServerWizard({
         requiredJavaVersion?: number;
       }>("/server-setup/preflight", {
         memoryLimitMB: mb,
-        javaPath: javaPath.trim() || "java",
+        javaPath: selectedJava.path,
+        provider: kind === "software" ? provider?.id : packLoader,
         gameVersion,
         requiredJavaVersion:
           kind === "software" ? build?.javaVersion : undefined,
       });
-      if (!check.java.available || check.compatible === false)
+      if (!check.java.available || check.compatible === false) {
+        setJavaRefresh((value) => value + 1);
         throw new Error(
           check.java.error ||
-            `Java ${check.requiredJavaVersion || "for this Minecraft version"} is needed. Set its executable in Advanced settings, then retry.`,
+            `Java ${check.requiredJavaVersion || "for this Minecraft version"} is needed. Refresh Java and choose a compatible installation.`,
         );
+      }
       if (check.ready === false)
         throw new Error(
           "Choose a smaller memory allocation so this PC has RAM available for Windows and other apps.",
@@ -567,7 +631,7 @@ export default function NewServerWizard({
           !required.loaderVersion
         )
           throw new Error(
-            "This pack does not identify an exact server runtime for automatic setup. Choose another release, or use Advanced setup to configure it manually.",
+            "This pack does not identify an exact server runtime for automatic setup. Choose another release, or import a server you have already installed.",
           );
         if (
           required.loader !== packLoader ||
@@ -721,7 +785,7 @@ export default function NewServerWizard({
               mode: "live",
               memoryLimitMB: Number(memory) * 1024,
               port: Number(port),
-              javaPath: javaPath.trim() || "java",
+              javaPath,
             },
           },
         );
@@ -925,18 +989,6 @@ export default function NewServerWizard({
               </span>
             </button>
           </div>
-          <details className="setup-advanced">
-            <summary>
-              <Settings2 size={14} /> Advanced setup
-            </summary>
-            <p>
-              For custom launch commands, manual installation, or a demo
-              workspace.
-            </p>
-            <button className="btn" onClick={onManual}>
-              Create an empty server <ArrowRight size={14} />
-            </button>
-          </details>
         </>
       )}
       {step === "catalog" && (
@@ -1034,7 +1086,9 @@ export default function NewServerWizard({
                     disabled={!releases.length || loading}
                     onChange={(event) => setGameVersion(event.target.value)}
                   >
-                    <option value="">Select version</option>
+                    <option value="" disabled>
+                      Select version
+                    </option>
                     {releases
                       .filter((item) => item.stable || experimental)
                       .map((item) => (
@@ -1051,7 +1105,9 @@ export default function NewServerWizard({
                     disabled={loading || !builds.length}
                     onChange={(event) => setBuildId(event.target.value)}
                   >
-                    <option value="">Select build</option>
+                    <option value="" disabled>
+                      Select build
+                    </option>
                     {builds
                       .filter((item) => item.stable || experimental)
                       .map((item) => (
@@ -1283,7 +1339,9 @@ export default function NewServerWizard({
                   disabled={loading}
                   onChange={(event) => setPackVersionId(event.target.value)}
                 >
-                  <option value="">Select a release</option>
+                  <option value="" disabled>
+                    Select a release
+                  </option>
                   {packVersions.map((item) => (
                     <option
                       key={item.id}
@@ -1315,7 +1373,9 @@ export default function NewServerWizard({
                       value={packLoader}
                       onChange={(event) => setPackLoader(event.target.value)}
                     >
-                      <option value="">Select loader</option>
+                      <option value="" disabled>
+                        Select loader
+                      </option>
                       {packVersion.loaders
                         .filter((value) => modLoaders.includes(value))
                         .map((value) => (
@@ -1424,6 +1484,57 @@ export default function NewServerWizard({
               Leave memory available for Windows and other apps.
             </small>
           </div>
+          <div className="form-field setup-java-field">
+            <div className="setup-java-header">
+              <label htmlFor="setup-java">Java executable</label>
+              <button
+                className="btn"
+                type="button"
+                disabled={busy || javaLoading}
+                onClick={() => setJavaRefresh((value) => value + 1)}
+              >
+                <RefreshCw size={14} className={javaLoading ? "spin" : ""} />
+                Refresh Java
+              </button>
+            </div>
+            <select
+              id="setup-java"
+              value={selectedJava?.path || ""}
+              disabled={
+                busy || javaLoading || !javaChoices?.installations.length
+              }
+              required
+              onChange={(event) => setJavaPath(event.target.value)}
+              aria-describedby="setup-java-help"
+            >
+              <option value="" disabled>
+                {javaLoading
+                  ? "Finding installed Java versions…"
+                  : "No compatible Java installation found"}
+              </option>
+              {javaChoices?.installations.map((item) => (
+                <option key={item.path} value={item.path}>
+                  Java {item.version}
+                  {item.vendor ? ` · ${item.vendor}` : ""} — {item.path}
+                </option>
+              ))}
+            </select>
+            <small id="setup-java-help">
+              {javaLoading
+                ? "Checking Java installations on the computer running MC Panel."
+                : javaError
+                  ? javaError
+                  : javaChoices?.installations.length
+                    ? javaChoices.requirement
+                    : `${javaChoices?.requirement || "A compatible Java runtime is required."} Install it on this PC, then select Refresh Java.`}
+            </small>
+            {selectedJava && (
+              <small className="setup-java-path">{selectedJava.path}</small>
+            )}
+            {javaChoices?.warnings.map((warning) => (
+              <small key={warning}>{warning}</small>
+            ))}
+          </div>
           <details className="setup-advanced">
             <summary>
               <Settings2 size={14} /> Advanced settings
@@ -1438,15 +1549,6 @@ export default function NewServerWizard({
                   value={port}
                   disabled={busy}
                   onChange={(event) => setPort(event.target.value)}
-                />
-              </label>
-              <label className="form-field">
-                Java executable
-                <input
-                  value={javaPath}
-                  disabled={busy}
-                  onChange={(event) => setJavaPath(event.target.value)}
-                  placeholder="java or a full path"
                 />
               </label>
             </div>
@@ -1622,7 +1724,7 @@ export default function NewServerWizard({
             className="btn primary"
             type="submit"
             form="setup-configure"
-            disabled={busy}
+            disabled={busy || javaLoading || !selectedJava}
           >
             {busy ? (
               <LoaderCircle size={15} className="spin" />

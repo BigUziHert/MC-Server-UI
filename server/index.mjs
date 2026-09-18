@@ -3459,7 +3459,7 @@ if (
   } catch (cause) {
     if (cause.code !== "ENOENT") throw cause;
   }
-  const panel = await createFleet();
+  const panel = await createFleet({ createDefaultServer: false });
   const port = Number(process.env.PORT ?? 3001);
   const listener = panel.app.listen(port, "127.0.0.1", () =>
     console.log(

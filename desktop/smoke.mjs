@@ -309,7 +309,7 @@ async function launchPackaged({ expectEmpty = false } = {}) {
 
 async function createSmokeDemo(page) {
   step(
-    "Verifying the clean welcome screen, then explicitly creating a demo for the smoke checks.",
+    "Verifying guided creation, then preparing an isolated API fixture for the smoke checks.",
   );
   await capturePackaged("packaged-first-launch.png");
   await ui(
@@ -330,19 +330,24 @@ async function createSmokeDemo(page) {
   ).toBeVisible();
   await capturePackaged("packaged-create-source.png");
   assert.deepEqual((await browserApi(page, "/servers")).data.servers, []);
-  await dialog.getByText("Advanced setup", { exact: true }).click();
-  await dialog
-    .getByRole("button", { name: "Create an empty server", exact: true })
-    .click();
-  await ui(dialog.getByLabel("Mode", { exact: true })).toHaveValue("live");
-  await dialog.getByLabel("Mode", { exact: true }).selectOption("demo");
-  await dialog
-    .getByLabel("Server name", { exact: true })
-    .fill("Desktop smoke demo");
-  await dialog
-    .getByRole("button", { name: "Create server", exact: true })
-    .click();
+  await ui(dialog.getByText("Advanced setup", { exact: true })).toHaveCount(0);
+  await ui(
+    dialog.getByRole("button", { name: "Create an empty server", exact: true }),
+  ).toHaveCount(0);
+  await ui(dialog.getByLabel("Mode", { exact: true })).toHaveCount(0);
+  await page.keyboard.press("Escape");
   await ui(dialog).not.toBeVisible();
+  const fixture = await browserApi(page, "/servers", {
+    method: "POST",
+    body: {
+      name: "Desktop smoke demo",
+      mode: "demo",
+      port: 25565,
+      memoryLimitMB: 2048,
+    },
+  });
+  assert.equal(fixture.status, 201);
+  await page.reload();
   await ui(
     page.getByRole("heading", { level: 1, name: "Console", exact: true }),
   ).toBeVisible();

@@ -14,6 +14,8 @@ type SetupFixture = {
   creationRequests: Record<string, unknown>[];
   mutations: string[];
   catalogRequests: string[];
+  javaRequests: URLSearchParams[];
+  preflightRequests: Record<string, unknown>[];
   port: number;
 };
 
@@ -21,7 +23,35 @@ const java = {
   available: true,
   majorVersion: 21,
   version: "21.0.7",
-  path: "java",
+  path: "C:\\Program Files\\Eclipse Adoptium\\jdk-21.0.8.9-hotspot\\bin\\java.exe",
+};
+const staleJavaPath =
+  "C:\\Program Files\\Eclipse Adoptium\\jdk-21.0.5.11-hotspot\\bin\\java.exe";
+const alternateJavaPath =
+  "C:\\Program Files\\Microsoft\\jdk-21.0.7\\bin\\java.exe";
+const javaInstallations = [
+  {
+    path: java.path,
+    version: "21.0.8",
+    majorVersion: 21,
+    vendor: "Eclipse Adoptium",
+    architecture: "amd64",
+  },
+  {
+    path: alternateJavaPath,
+    version: "21.0.7",
+    majorVersion: 21,
+    vendor: "Microsoft",
+    architecture: "amd64",
+  },
+];
+const javaCatalog = {
+  installations: javaInstallations,
+  recommendedPath: java.path,
+  detectedCount: 3,
+  requiredJavaVersion: 21,
+  requirement: "Java 21",
+  warnings: [],
 };
 const provider = {
   id: "paper",
@@ -79,6 +109,8 @@ const test = base.extend<{ setup: SetupFixture }>({
       creationRequests: [],
       mutations: [],
       catalogRequests: [],
+      javaRequests: [],
+      preflightRequests: [],
       port,
     };
     page.on("request", (request) => {
@@ -120,7 +152,7 @@ const test = base.extend<{ setup: SetupFixture }>({
             hostMemoryMB: 16384,
             freeMemoryMB: 12288,
             suggestedMemoryMB: 4096,
-            java,
+            java: { ...java, path: staleJavaPath },
             warnings: [],
           },
         });
@@ -131,8 +163,14 @@ const test = base.extend<{ setup: SetupFixture }>({
         state.created.push(body.server);
       await route.fulfill({ response, json: body });
     });
-    await page.route("**/api/server-setup/preflight", (route) =>
-      route.fulfill({
+    await page.route("**/api/server-setup/java?**", (route) => {
+      state.javaRequests.push(new URL(route.request().url()).searchParams);
+      return route.fulfill({ json: javaCatalog });
+    });
+    await page.route("**/api/server-setup/preflight", (route) => {
+      const body = route.request().postDataJSON();
+      state.preflightRequests.push(body);
+      return route.fulfill({
         json: {
           hostMemoryMB: 16384,
           freeMemoryMB: 12288,
@@ -141,11 +179,11 @@ const test = base.extend<{ setup: SetupFixture }>({
           requiredJavaVersion: 21,
           compatible: true,
           ready: true,
-          java,
+          java: { ...java, path: body.javaPath },
           warnings: [],
         },
-      }),
-    );
+      });
+    });
     await page.route("**/api/server-setup/versions", (route) =>
       route.fulfill({
         json: { providers: [provider], job: null, current: null },
@@ -186,6 +224,16 @@ async function openCreate(page: Page, screenshots?: TestInfo) {
   await expect(
     dialog.getByRole("button", { name: "Modpack", exact: true }),
   ).toBeVisible();
+  await expect(dialog.getByText("Advanced setup", { exact: true })).toHaveCount(
+    0,
+  );
+  await expect(
+    dialog.getByRole("button", { name: "Create an empty server", exact: true }),
+  ).toHaveCount(0);
+  await expect(
+    dialog.getByRole("combobox", { name: "Mode", exact: true }),
+  ).toHaveCount(0);
+  await expect(dialog.getByText(/demo/i)).toHaveCount(0);
   if (screenshots)
     await page.screenshot({
       path: screenshots.outputPath("setup-source-desktop.png"),
@@ -203,14 +251,27 @@ async function choosePaper(page: Page) {
   await dialog
     .getByRole("combobox", { name: "Minecraft version", exact: true })
     .selectOption("1.21.1");
+  await expect(
+    dialog
+      .getByRole("combobox", { name: "Build", exact: true })
+      .locator('option[value=""]'),
+  ).toHaveJSProperty("disabled", true);
   await dialog
     .getByRole("combobox", { name: "Build", exact: true })
     .selectOption("151");
   await dialog.getByRole("button", { name: "Continue", exact: true }).click();
 }
 
-async function configure(page: Page, state: SetupFixture, name: string) {
+async function configure(
+  page: Page,
+  state: SetupFixture,
+  name: string,
+  selectedJavaPath = java.path,
+) {
   const dialog = page.getByRole("dialog");
+  await expect(
+    dialog.getByRole("combobox", { name: "Java executable", exact: true }),
+  ).toHaveValue(selectedJavaPath);
   await dialog.getByLabel("Server name", { exact: true }).fill(name);
   await dialog.getByLabel("Memory (GB)", { exact: true }).fill("4");
   await dialog.getByText("Advanced settings", { exact: true }).click();
@@ -279,6 +340,122 @@ test("Welcome opens the import folder workflow directly and cancelling preserves
   expect(setup.created).toEqual([]);
   expect(setup.mutations).toEqual([]);
   expect(setup.catalogRequests).toEqual([]);
+});
+
+test("Java selection uses only detected compatible executables and refresh preserves the selected runtime", async ({
+  page,
+  setup,
+}) => {
+  const newlyInstalled = {
+    path: "C:\\Program Files\\Amazon Corretto\\jdk21.0.9_10\\bin\\java.exe",
+    version: "21.0.9",
+    majorVersion: 21,
+    vendor: "Amazon.com Inc.",
+    architecture: "amd64",
+  };
+  let refreshed = false;
+  await page.route("**/api/server-setup/java?**", (route) => {
+    const params = new URL(route.request().url()).searchParams;
+    setup.javaRequests.push(params);
+    refreshed ||= params.get("refresh") === "1";
+    return route.fulfill({
+      json: {
+        ...javaCatalog,
+        installations: refreshed
+          ? [...javaInstallations, newlyInstalled]
+          : javaInstallations,
+        recommendedPath: refreshed ? newlyInstalled.path : java.path,
+      },
+    });
+  });
+  await openCreate(page);
+  await choosePaper(page);
+  const dialog = page.getByRole("dialog");
+  const chooser = dialog.getByRole("combobox", {
+    name: "Java executable",
+    exact: true,
+  });
+  await expect(chooser).toBeVisible();
+  await expect(chooser).toHaveValue(java.path);
+  expect(
+    await chooser
+      .locator("option")
+      .evaluateAll((options) =>
+        options
+          .filter((option) => !(option as HTMLOptionElement).disabled)
+          .map((option) => (option as HTMLOptionElement).value),
+      ),
+  ).toEqual(javaInstallations.map((item) => item.path));
+  await expect(
+    chooser.locator("option", { hasText: staleJavaPath }),
+  ).toHaveCount(0);
+  expect(setup.javaRequests.at(-1)?.get("gameVersion")).toBe("1.21.1");
+  expect(setup.javaRequests.at(-1)?.get("provider")).toBe("paper");
+  expect(setup.javaRequests.at(-1)?.get("requiredJavaVersion")).toBe("21");
+  await chooser.selectOption(alternateJavaPath);
+  await dialog
+    .getByRole("button", { name: "Refresh Java", exact: true })
+    .click();
+  await expect(
+    chooser.locator("option", { hasText: newlyInstalled.path }),
+  ).toHaveCount(1);
+  await expect(chooser).toHaveValue(alternateJavaPath);
+  await configure(page, setup, "Compatible Java world", alternateJavaPath);
+  expect(setup.preflightRequests.at(-1)).toMatchObject({
+    javaPath: alternateJavaPath,
+    gameVersion: "1.21.1",
+    requiredJavaVersion: 21,
+  });
+  expect(setup.created).toHaveLength(0);
+});
+
+test("missing compatible Java blocks review until a refreshed scan finds an installed runtime", async ({
+  page,
+  setup,
+}) => {
+  let refreshed = false;
+  await page.route("**/api/server-setup/java?**", (route) => {
+    refreshed ||=
+      new URL(route.request().url()).searchParams.get("refresh") === "1";
+    return route.fulfill({
+      json: refreshed
+        ? javaCatalog
+        : {
+            ...javaCatalog,
+            installations: [],
+            recommendedPath: null,
+            detectedCount: 1,
+            warnings: [
+              "No installed Java runtime is compatible with this Minecraft version.",
+            ],
+          },
+    });
+  });
+  await openCreate(page);
+  await choosePaper(page);
+  const dialog = page.getByRole("dialog");
+  const chooser = dialog.getByRole("combobox", {
+    name: "Java executable",
+    exact: true,
+  });
+  await expect(chooser).toHaveValue("");
+  await expect(chooser.locator('option[value=""]')).toHaveJSProperty(
+    "disabled",
+    true,
+  );
+  await expect(
+    dialog.getByRole("button", { name: "Review installation", exact: true }),
+  ).toBeDisabled();
+  expect(setup.preflightRequests).toHaveLength(0);
+  expect(setup.mutations).toHaveLength(0);
+  await dialog
+    .getByRole("button", { name: "Refresh Java", exact: true })
+    .click();
+  await expect(chooser).toHaveValue(java.path);
+  await configure(page, setup, "New Java installation");
+  expect(setup.preflightRequests).toHaveLength(1);
+  expect(setup.preflightRequests[0].javaPath).toBe(java.path);
+  expect(setup.created).toHaveLength(0);
 });
 
 test("software catalog errors retry and cancellation leaves the fleet empty", async ({
@@ -378,7 +555,16 @@ test("confirmed software creation retries installation on the same stopped serve
   });
   await openCreate(page);
   await choosePaper(page);
-  const dialog = await configure(page, setup, "Guided Paper world");
+  await page
+    .getByRole("dialog")
+    .getByRole("combobox", { name: "Java executable", exact: true })
+    .selectOption(alternateJavaPath);
+  const dialog = await configure(
+    page,
+    setup,
+    "Guided Paper world",
+    alternateJavaPath,
+  );
   await expect(dialog).toContainText("Paper");
   await expect(dialog).toContainText("1.21.1");
   await page.screenshot({
@@ -419,6 +605,7 @@ test("confirmed software creation retries installation on the same stopped serve
       memoryLimitMB: 4096,
       port: setup.port,
       mode: "live",
+      javaPath: alternateJavaPath,
     },
   });
   expect(installs).toHaveLength(2);
@@ -456,6 +643,18 @@ test("mobile software review stays within the viewport and can be cancelled with
   await page.setViewportSize({ width: 390, height: 844 });
   await openCreate(page);
   await choosePaper(page);
+  await expect(
+    page.getByRole("combobox", { name: "Java executable", exact: true }),
+  ).toHaveValue(java.path);
+  expect(
+    await page.evaluate(
+      () => document.documentElement.scrollWidth - window.innerWidth,
+    ),
+  ).toBeLessThanOrEqual(1);
+  await page.screenshot({
+    path: testInfo.outputPath("guided-java-mobile.png"),
+    fullPage: true,
+  });
   const dialog = await configure(page, setup, "A mobile Minecraft world");
   await page.evaluate(() => document.fonts.ready);
   const dimensions = await dialog.boundingBox();

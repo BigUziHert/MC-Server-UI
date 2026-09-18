@@ -794,7 +794,7 @@ test("Java probe uses a bounded hidden shell-free executable check and handles m
   const checked = await probeJava("C:\\Java Path\\java.exe", { spawnProcess });
   assert.equal(checked.majorVersion, 21);
   assert.equal(checked.available, true);
-  assert.deepEqual(invocation[1], ["-version"]);
+  assert.deepEqual(invocation[1], ["-XshowSettings:properties", "-version"]);
   assert.equal(invocation[2].shell, false);
   assert.equal(invocation[2].windowsHide, true);
   const missing = await probeJava("not-found", {
@@ -811,4 +811,129 @@ test("Java probe uses a bounded hidden shell-free executable check and handles m
   });
   assert.equal(missing.available, false);
   assert.match(missing.error, /Java was not found/);
+});
+
+test("Java selection exposes only compatible installed runtimes and refreshes without creating a server", async (t) => {
+  const calls = [];
+  const detected = [26, 21, 17, 8].map((majorVersion) => ({
+    ...java,
+    path: `C:\\Java\\${majorVersion}\\bin\\java.exe`,
+    majorVersion,
+    version: `${majorVersion}.0.1`,
+    architecture: "amd64",
+  }));
+  const f = await fixture(t, {
+    javaDiscovery: async (input) => {
+      calls.push(input);
+      return [
+        ...detected,
+        { ...detected[1], path: "32-bit-java", architecture: "i586" },
+        { path: "stale-java", available: false },
+      ];
+    },
+    versionsService: {
+      ...versionService(),
+      builds: async (_provider, gameVersion) => ({
+        builds: [{ javaVersion: gameVersion === "1.21.1" ? 21 : 17 }],
+      }),
+    },
+  });
+  const modern = await f.request(
+    "/api/server-setup/java?gameVersion=1.21.1&provider=neoforge&refresh=1",
+  );
+  assert.equal(modern.status, 200);
+  assert.equal(modern.body.requiredJavaVersion, 21);
+  assert.deepEqual(
+    modern.body.installations.map((item) => item.majorVersion),
+    [21],
+  );
+  assert.equal(modern.body.recommendedPath, detected[1].path);
+  assert.equal(modern.body.detectedCount, 5);
+  assert.equal(calls[0].refresh, true);
+  const older = await f.request(
+    "/api/server-setup/java?gameVersion=1.20.1&provider=forge",
+  );
+  assert.deepEqual(
+    older.body.installations.map((item) => item.majorVersion),
+    [17],
+  );
+  assert.equal(
+    (await f.request("/api/server-setup/java?requiredJavaVersion=NaN")).status,
+    400,
+  );
+  assert.equal((await f.request("/api/servers")).body.servers.length, 0);
+});
+
+test("bootstrap avoids a stale default path and review rechecks the selected executable", async (t) => {
+  const selected = {
+    ...java,
+    path: "C:\\Working JDK\\bin\\java.exe",
+    architecture: "amd64",
+  };
+  let present = true,
+    probes = 0;
+  const f = await fixture(t, {
+    javaPath: "C:\\Deleted Adoptium\\bin\\java.exe",
+    javaDiscovery: async () => [selected],
+    javaProbe: async (executable) => {
+      probes++;
+      return present && executable === selected.path
+        ? selected
+        : {
+            path: executable,
+            available: false,
+            error: `Java was not found at ${executable}`,
+          };
+    },
+  });
+  const boot = await f.request("/api/server-setup");
+  assert.equal(boot.body.java.path, selected.path);
+  assert.equal(boot.body.java.available, true);
+  const body = {
+    javaPath: selected.path,
+    gameVersion: "1.21.1",
+    memoryLimitMB: 4096,
+  };
+  assert.equal(
+    (await f.request("/api/server-setup/preflight", json("POST", body))).body
+      .ready,
+    true,
+  );
+  present = false;
+  const disappeared = await f.request(
+    "/api/server-setup/preflight",
+    json("POST", body),
+  );
+  assert.equal(disappeared.body.ready, false);
+  assert.equal(probes, 2);
+  assert.ok(
+    disappeared.body.warnings.some((item) => item.includes(selected.path)),
+  );
+});
+
+test("unknown Java requirements do not offer or approve arbitrary runtimes", async (t) => {
+  const f = await fixture(t, {
+    versionsService: {
+      ...versionService(),
+      builds: async () => {
+        throw new Error("Offline");
+      },
+    },
+  });
+  const listing = await f.request(
+    "/api/server-setup/java?gameVersion=unknown-new-release",
+  );
+  assert.deepEqual(listing.body.installations, []);
+  assert.equal(listing.body.recommendedPath, null);
+  assert.ok(listing.body.warnings.length > 0);
+  const reviewed = await f.request(
+    "/api/server-setup/preflight",
+    json("POST", { gameVersion: "unknown-new-release", javaPath: "java" }),
+  );
+  assert.equal(reviewed.body.ready, false);
+  const legacy = await f.request(
+    "/api/server-setup/java?gameVersion=1.16.5&provider=forge",
+  );
+  assert.equal(legacy.body.requiredJavaVersion, 8);
+  assert.deepEqual(legacy.body.installations, []);
 });

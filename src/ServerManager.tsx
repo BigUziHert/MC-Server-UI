@@ -151,7 +151,7 @@ function ServerSettings({
   const [connectionHost, setConnectionHost] = useState(
     editing?.connectionHost ?? "",
   );
-  const [mode, setMode] = useState<"demo" | "live">(editing?.mode ?? "live");
+  const mode = editing?.mode ?? "live";
   const [port, setPort] = useState(String(editing?.port ?? nextPort));
   const [memory, setMemory] = useState(String(editing?.memoryLimitMB ?? 4096));
   const [startup, setStartup] = useState(() =>
@@ -337,24 +337,12 @@ function ServerSettings({
             <AlertCircle size={16} />
             <span>
               You can rename this server or change its displayed address now.
-              Stop it from the console to change its mode, port, or in-game
-              message.
+              Stop it from the console to change its port or in-game message.
             </span>
           </div>
         )}
         <fieldset disabled={busy || running} className="server-config-fields">
           <div className="server-form-grid">
-            <div className="form-field">
-              <label htmlFor="server-mode">Mode</label>
-              <select
-                id="server-mode"
-                value={mode}
-                onChange={(e) => setMode(e.target.value as "demo" | "live")}
-              >
-                <option value="live">Live Minecraft server</option>
-                <option value="demo">Demo server</option>
-              </select>
-            </div>
             <div className="form-field">
               <label htmlFor="server-port">Server port</label>
               <input

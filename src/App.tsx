@@ -875,17 +875,16 @@ function ServerWorkspace({
             </div>
             <h2 id="help-title">Your server starts here.</h2>
             <p>
-              This development workspace runs on your computer. Files, backup
-              archives, schedules, database files, and activity are stored
-              locally.
+              MC Panel runs on your computer. Server files, backup archives,
+              schedules, and activity are stored locally.
             </p>
             <div className="help-step">
               <span>01</span>
               <div>
                 <strong>Explore the console</strong>
                 <p>
-                  Demo mode simulates a Minecraft server. Try <code>help</code>,{" "}
-                  <code>list</code>, or <code>say Hello world</code>.
+                  Start your server to see its live output and send commands.
+                  Use the resource cards to check CPU, memory, and storage.
                 </p>
               </div>
             </div>
@@ -894,9 +893,8 @@ function ServerWorkspace({
               <div>
                 <strong>Make it your own</strong>
                 <p>
-                  Upload files in File Manager and set an automatic backup
-                  schedule. These operations use real local files, including in
-                  demo mode.
+                  Manage files in File Manager, install mods from Launchpad, and
+                  set an automatic backup schedule.
                 </p>
               </div>
             </div>

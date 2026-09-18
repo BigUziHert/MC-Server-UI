@@ -58,18 +58,12 @@ export default defineConfig({
     },
   ],
   webServer: {
-    command: `"${process.execPath}" server/index.mjs`,
+    command: `"${process.execPath}" tests/start-server.mjs`,
     url: `http://127.0.0.1:${port}`,
     reuseExistingServer: false,
     timeout: 30_000,
     env: {
-      PORT: String(port),
-      PANEL_DATA_DIR: dataDir,
-      MC_SERVER_DIR: path.join(dataDir, "server"),
-      MC_SERVER_JAR: "",
-      MC_SERVER_NAME: "E2E Overworld",
-      MC_SERVER_ADDRESS: "localhost:25565",
-      MC_MEMORY_MB: "4096",
+      PANEL_E2E_DATA_DIR: dataDir,
     },
   },
 });
