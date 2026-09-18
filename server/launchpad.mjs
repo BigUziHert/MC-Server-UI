@@ -6,6 +6,9 @@ import { safeInstallPath, unpackProviderZip } from "./launchpad-archives.mjs";
 import { inspectBundledDependencies } from "./launchpad-bundled.mjs";
 import { installedDependencySatisfies } from "./launchpad-dependency-ranges.mjs";
 import { createModRemoval } from "./launchpad-removal.mjs";
+import { createVersionsService } from "./versions.mjs";
+import { cleanInstall, prepareCleanSettings } from "./clean-install.mjs";
+import { inferPackRuntime } from "./launchpad-pack-runtime.mjs";
 import {
   checkedProviderUrl,
   downloadVerified,
@@ -189,6 +192,8 @@ export function curseFingerprint(bytes) {
 }
 
 export async function createLaunchpad(ctx) {
+  const runtimeVersions =
+    ctx.versionsService ?? createVersionsService(ctx.versionsOptions);
   const {
     serverDir,
     dataDir,
@@ -405,6 +410,7 @@ export async function createLaunchpad(ctx) {
   }
   async function assertCompatibility(input) {
     const current = await getServer();
+    if (input.type === "modpack") return current;
     if (current.gameVersion && current.gameVersion !== input.gameVersion)
       throw error(
         409,
@@ -456,6 +462,41 @@ export async function createLaunchpad(ctx) {
         `This pack requires ${required.loader} ${required.loaderVersion}; the configured loader is ${actual}. Install the required loader build in Versions first.`,
       );
   }
+  async function resolvePackRuntime(required, input) {
+    if (!required?.loader || !required?.gameVersion || !required?.loaderVersion)
+      throw error(
+        400,
+        "This pack does not declare an exact server runtime. Choose a pack release with complete loader metadata.",
+      );
+    if (
+      required.loader !== input.loader ||
+      required.gameVersion !== input.gameVersion
+    )
+      throw error(
+        400,
+        "The pack runtime does not match the selected Minecraft version and loader.",
+      );
+    const listing = await runtimeVersions.builds(
+      required.loader,
+      required.gameVersion,
+    );
+    const build = listing.builds.find(
+      (item) =>
+        item.id === required.loaderVersion ||
+        item.id === `${required.gameVersion}-${required.loaderVersion}`,
+    );
+    if (!build)
+      throw error(
+        400,
+        "The pack's required loader build is unavailable from its official catalog. No server files were changed.",
+      );
+    return {
+      provider: required.loader,
+      version: required.gameVersion,
+      build: build.id,
+      software: listing.provider?.name ?? required.loader,
+    };
+  }
   async function destination(type) {
     if (type === "mod") return "mods";
     if (type === "plugin") return "plugins";
@@ -464,8 +505,6 @@ export async function createLaunchpad(ctx) {
     return "";
   }
   async function protectedPackPath(name) {
-    const current = await getServer();
-    const world = safeInstallPath(current.world || "world").toLowerCase();
     const lower = name.toLowerCase();
     const startupFiles = [
       "user_jvm_args.txt",
@@ -478,26 +517,12 @@ export async function createLaunchpad(ctx) {
       "server.jar",
       "fabric-server-launcher.properties",
       "quilt-server-launcher.properties",
-      current.jar,
-      current.launchScript,
     ]
       .filter(Boolean)
       .map((value) => value.toLowerCase());
-    if (
-      (startupFiles.includes(lower) || lower.startsWith("libraries/")) &&
-      (await statOrNull(await safePath(serverDir, name)))
-    )
+    if (startupFiles.includes(lower) || lower.startsWith("libraries/"))
       return true;
-    return (
-      /^(?:eula\.txt|server\.properties|ops\.json|whitelist\.json|banned-players\.json|banned-ips\.json)$/i.test(
-        name,
-      ) ||
-      lower === world ||
-      lower.startsWith(world + "/") ||
-      /^(?:world_nether|world_the_end|logs|backups|recycle-bin)(?:\/|$)/i.test(
-        name,
-      )
-    );
+    return lower === "eula.txt";
   }
   async function scan(type, signal = lifetime.signal, warnings = []) {
     if (type === "modpack") return [];
@@ -1553,17 +1578,7 @@ export async function createLaunchpad(ctx) {
     const entries = await unpackProviderZip(archive, extracted, undefined, {
       signal: input.signal,
     });
-    const current = await getServer();
-    const world = safeInstallPath(current.world || "world");
-    const protectedFile = (name) =>
-      /^(?:eula\.txt|server\.properties|ops\.json|whitelist\.json|banned-players\.json|banned-ips\.json)$/i.test(
-        name,
-      ) ||
-      name.toLowerCase() === world.toLowerCase() ||
-      name.toLowerCase().startsWith(world.toLowerCase() + "/") ||
-      /^(?:world_nether|world_the_end|logs|backups|recycle-bin)(?:\/|$)/i.test(
-        name,
-      );
+    const protectedFile = (name) => name.toLowerCase() === "eula.txt";
     const files = [],
       warnings = [];
     let loaderInstall;
@@ -1608,11 +1623,8 @@ export async function createLaunchpad(ctx) {
       if (declared.length !== 1 || loaderKeys[declared[0]] !== input.loader)
         throw error(
           400,
-          "The pack's required loader does not match this server. Set up the matching runtime in Versions first.",
+          "The pack's required loader does not match the selected loader.",
         );
-      warnings.push(
-        `Requires ${input.loader} ${manifest.dependencies[declared[0]]}. Install that runtime in Versions before starting this pack.`,
-      );
       loaderInstall = {
         loader: input.loader,
         gameVersion: input.gameVersion,
@@ -1716,6 +1728,8 @@ export async function createLaunchpad(ctx) {
         }
         files.push({ ...entry, path: relative });
       }
+      loaderInstall =
+        result.loaderInstall ?? (await inferPackRuntime(files, input));
     } else throw error(400, "This provider's archive format is unsupported.");
     return { files, warnings, loaderInstall };
   }
@@ -1778,12 +1792,15 @@ export async function createLaunchpad(ctx) {
         result.warnings.push(...pack.warnings);
         result.loaderInstall = pack.loaderInstall ?? result.loaderInstall;
       }
+      let runtime;
       if (input.type === "modpack") {
-        await assertPackRuntime(result.loaderInstall);
+        runtime = await resolvePackRuntime(result.loaderInstall, input);
         const accepted = [];
         for (const file of result.files) {
           if (await protectedPackPath(file.path))
-            result.warnings.push(`Preserved server data: ${file.path}.`);
+            result.warnings.push(
+              `Skipped ${file.path}: supplied by the verified runtime.`,
+            );
           else accepted.push(file);
         }
         result.files = accepted;
@@ -1815,6 +1832,15 @@ export async function createLaunchpad(ctx) {
         if (!file.stagedPath) {
           strongestHash(file.hashes);
           checkedProviderUrl(file.url, file.hosts);
+        }
+        if (input.type === "modpack") {
+          files.push({
+            ...file,
+            expected: null,
+            previous: null,
+            action: "install",
+          });
+          continue;
         }
         const matches = local.filter(
           (item) =>
@@ -1932,6 +1958,7 @@ export async function createLaunchpad(ctx) {
           files.some((file) => file.path === dependency.bundledWith),
         ),
         loaderInstall: result.loaderInstall,
+        runtime,
         expiresAt,
       };
       input.signal.throwIfAborted();
@@ -1959,6 +1986,19 @@ export async function createLaunchpad(ctx) {
         unavailableDependencies: plan.unavailableDependencies,
         bundledDependencies: plan.bundledDependencies,
         loaderInstall: plan.loaderInstall ?? null,
+        ...(input.type === "modpack"
+          ? {
+              cleanInstall: true,
+              runtime: plan.runtime,
+              summary: {
+                fileCount: files.length,
+                totalBytes: files.reduce(
+                  (sum, file) => sum + (Number(file.size) || 0),
+                  0,
+                ),
+              },
+            }
+          : {}),
         expiresAt,
       };
     } catch (cause) {
@@ -1967,6 +2007,7 @@ export async function createLaunchpad(ctx) {
     }
   }
   async function promote(plan, job) {
+    if (plan.input.type === "modpack") return promotePack(plan, job);
     return withMinecraftMutation(async () => {
       lifetime.signal.throwIfAborted();
       await assertCompatibility(plan.input);
@@ -2133,6 +2174,124 @@ export async function createLaunchpad(ctx) {
       }
     });
   }
+  async function promotePack(plan, job) {
+    return withMinecraftMutation(async () => {
+      lifetime.signal.throwIfAborted();
+      if ((await getServer()).status !== "offline")
+        throw error(409, "Stop the server before installing a modpack.");
+      const {
+        status: _status,
+        address: _address,
+        ...previousConfiguration
+      } = ctx.getConfiguration();
+      const previousReceipts = [...receipts];
+      const runtimeStage = path.join(plan.stage, "runtime");
+      await fs.mkdir(runtimeStage);
+      const runtime = await runtimeVersions.stage(plan.runtime, {
+        stageDir: runtimeStage,
+        javaPath: previousConfiguration.javaPath,
+        signal: lifetime.signal,
+        onProgress: (value) => {
+          job.message = value.message;
+        },
+      });
+      const runtimePaths = new Set(
+        runtime.files.map((file) => file.path.toLowerCase()),
+      );
+      const packFiles = [];
+      for (const file of plan.files) {
+        if (runtimePaths.has(file.path.toLowerCase())) continue;
+        const parent = path.posix.dirname(file.path);
+        await fs.mkdir(
+          await safePath(runtime.stageDir, parent === "." ? "" : parent),
+          { recursive: true },
+        );
+        const target = await safePath(runtime.stageDir, file.path);
+        await fs.copyFile(file.stagedPath, target, 1);
+        if ((await fileHash(target)) !== file.sha512)
+          throw error(
+            409,
+            "A staged pack file changed before installation. No server files were changed.",
+          );
+        runtime.files.push({ path: file.path });
+        packFiles.push(file);
+      }
+      await prepareCleanSettings(runtime, ctx);
+      let configured = false;
+      const clearCaches = () => {
+        fileCache.clear();
+        identities.clear();
+        updateCache.clear();
+        updateFailures.clear();
+      };
+      const recovery = await cleanInstall(runtime, {
+        ...ctx,
+        signal: lifetime.signal,
+        onProgress: (value) => {
+          job.message = value.message;
+        },
+        commit: async () => {
+          configured = true;
+          await ctx.applyConfiguration({
+            ...runtime.configuration,
+            mode: "live",
+            minecraftVersion: runtime.summary.version,
+          });
+          receipts = packFiles.map((file) => ({
+            path: file.path,
+            sha512: file.sha512,
+            platform: null,
+            type: "modpack",
+            installedAt: new Date().toISOString(),
+          }));
+          receipts.push({
+            pack: true,
+            type: "modpack",
+            platform: plan.input.platform,
+            projectId: plan.input.projectId,
+            versionId: plan.input.versionId,
+            title: plan.title,
+            iconUrl: plan.iconUrl,
+            author: plan.author,
+            versionName: plan.versionName,
+            path: "",
+            installedAt: new Date().toISOString(),
+          });
+          await saveReceipts();
+          clearCaches();
+        },
+        rollback: async () => {
+          receipts = previousReceipts;
+          clearCaches();
+          const failures = [];
+          try {
+            await saveReceipts();
+          } catch (cause) {
+            failures.push(cause);
+          }
+          if (configured)
+            try {
+              await ctx.applyConfiguration(previousConfiguration);
+            } catch (cause) {
+              failures.push(cause);
+            }
+          if (failures.length)
+            throw new AggregateError(
+              failures,
+              "Server settings could not be fully restored.",
+            );
+        },
+      });
+      Object.assign(job, recovery);
+      job.completed = job.total;
+      await ctx
+        .audit?.(
+          "Modpack installed",
+          `${plan.title}: clean installation with ${plan.runtime.software} ${plan.runtime.build}. Previous server files are retained in Recycle Bin.`,
+        )
+        .catch(() => {});
+    });
+  }
   async function install(input) {
     if (closing) throw error(503, "Launchpad is shutting down.");
     if (input?.confirmed !== true)
@@ -2152,6 +2311,11 @@ export async function createLaunchpad(ctx) {
       throw error(
         409,
         "This review expired. Review the version again before installing.",
+      );
+    if (plan.input.type === "modpack" && input.cleanInstall !== true)
+      throw error(
+        400,
+        "Confirm the clean installation: all current server files, including worlds, mods and configuration, will be removed.",
       );
     if (
       plan.unavailableDependencies?.length &&
@@ -2302,6 +2466,23 @@ export async function createLaunchpad(ctx) {
     installed,
     preview,
     install,
+    snapshotInstalled: () => [...receipts],
+    clearInstalled: async () => {
+      receipts = [];
+      await saveReceipts();
+      fileCache.clear();
+      identities.clear();
+      updateCache.clear();
+      updateFailures.clear();
+    },
+    restoreInstalled: async (value) => {
+      receipts = [...value];
+      await saveReceipts();
+      fileCache.clear();
+      identities.clear();
+      updateCache.clear();
+      updateFailures.clear();
+    },
     removalPreview: removal.preview,
     remove: removal.remove,
     job(id) {

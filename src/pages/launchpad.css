@@ -456,6 +456,45 @@
   border-radius: 7px;
   overscroll-behavior: contain;
 }
+.launchpad-pack-summary {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px 24px;
+  margin: 16px 0;
+  padding: 16px;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  font-size: 12px;
+  color: var(--muted);
+}
+.launchpad-pack-summary strong {
+  color: var(--text);
+}
+.launchpad-pack-runtime {
+  flex-basis: 100%;
+  overflow-wrap: anywhere;
+}
+.launchpad-clean-warning {
+  color: #efb3a4;
+  border-color: #704338;
+  background: #40282230;
+  margin-top: 18px;
+}
+.launchpad-clean-confirm {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  margin: 18px 0;
+  font-size: 12px;
+  line-height: 1.6;
+}
+.launchpad-clean-confirm input {
+  width: 16px;
+  height: 16px;
+  margin: 2px 0 0;
+  flex: 0 0 16px;
+  accent-color: var(--accent);
+}
 .launchpad-review-files li {
   display: flex;
   align-items: center;

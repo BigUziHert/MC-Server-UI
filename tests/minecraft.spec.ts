@@ -191,7 +191,17 @@ test("Properties reports external file changes without overwriting them", async 
 });
 test("Versions shows official builds and requires a reviewed choice before installation", async ({
   page,
+  serverId,
 }, testInfo) => {
+  const installations: unknown[] = [];
+  await page.route("**/api/versions/install", (route) => {
+    expect(route.request().headers()["x-server-id"]).toBe(serverId);
+    installations.push(route.request().postDataJSON());
+    return route.fulfill({
+      status: 202,
+      json: { id: "version-clean-install", state: "complete" },
+    });
+  });
   let serverStatus = "offline";
   await page.route("**/api/server", async (route) => {
     const response = await route.fetch();
@@ -255,11 +265,21 @@ test("Versions shows official builds and requires a reviewed choice before insta
   await expect(dialog).toContainText("21.1.250");
   await expect(dialog.getByRole("button", { name: /Install/ })).toBeDisabled();
   await expect(dialog).toContainText(/worlds|world/i);
+  await expect(dialog).toContainText(
+    "All current files will be removed, including worlds, mods, plugins and settings.",
+  );
+  await expect(dialog).not.toContainText("stay in place");
   const confirm = dialog.getByRole("button", {
     name: "Install version",
     exact: true,
   });
-  await dialog.getByRole("checkbox").check();
+  await dialog
+    .getByRole("checkbox", {
+      name: "I understand this replaces all files in this server’s folder.",
+      exact: true,
+    })
+    .check();
+  expect(installations).toEqual([]);
   await expect(confirm).toBeEnabled();
   serverStatus = "running";
   await expect(confirm).toBeDisabled();
@@ -269,6 +289,17 @@ test("Versions shows official builds and requires a reviewed choice before insta
   serverStatus = "offline";
   await expect(confirm).toBeEnabled();
   await expect(dialog.getByRole("alert")).toHaveCount(0);
+  await confirm.click();
+  await expect(dialog).not.toBeVisible();
+  expect(installations).toEqual([
+    {
+      provider: "neoforge",
+      version: "1.21.1",
+      build: "21.1.250",
+      confirmed: true,
+      cleanInstall: true,
+    },
+  ]);
 });
 
 test("Versions offers older stable Fabric loaders and requires opting in to experimental builds", async ({
@@ -553,6 +584,199 @@ test("Launchpad exposes six platforms, only four content tabs, and a reviewed in
     ),
   ).toBe(true);
 });
+
+for (const viewport of [
+  { name: "desktop", width: 1348, height: 1000 },
+  { name: "mobile", width: 390, height: 844 },
+]) {
+  test(`Launchpad modpack review stays compact and requires clean installation acknowledgement on ${viewport.name}`, async ({
+    page,
+    serverId,
+  }, testInfo) => {
+    await page.setViewportSize(viewport);
+    const version = {
+      id: "pack-v2",
+      name: "Adventure Pack 2.0",
+      version: "2.0",
+      gameVersions: ["1.21.1"],
+      loaders: ["neoforge"],
+      downloadable: true,
+    };
+    await page.route("**/api/launchpad", (route) =>
+      route.fulfill({
+        json: {
+          platforms: [
+            {
+              id: "modrinth",
+              name: "Modrinth",
+              available: true,
+              types: ["modpack"],
+            },
+          ],
+          gameVersion: "1.21.1",
+          gameVersions: ["1.21.1"],
+          loader: "neoforge",
+          status: "offline",
+          warnings: [],
+        },
+      }),
+    );
+    await page.route("**/api/launchpad/search?**", (route) =>
+      route.fulfill({
+        json: {
+          projects: [
+            {
+              id: "adventure-pack",
+              platform: "modrinth",
+              title: "Adventure Pack",
+              description: "A large server modpack",
+            },
+          ],
+          total: 1,
+          offset: 0,
+          limit: 10,
+        },
+      }),
+    );
+    await page.route("**/api/launchpad/installed?**", (route) =>
+      route.fulfill({ json: { items: [], warnings: [] } }),
+    );
+    await page.route("**/api/launchpad/versions?**", (route) =>
+      route.fulfill({ json: { versions: [version] } }),
+    );
+    let previews = 0;
+    await page.route("**/api/launchpad/preview", (route) => {
+      expect(route.request().headers()["x-server-id"]).toBe(serverId);
+      expect(route.request().postDataJSON()).toMatchObject({
+        type: "modpack",
+        projectId: "adventure-pack",
+        versionId: "pack-v2",
+      });
+      return route.fulfill({
+        json: {
+          planId: `pack-plan-${++previews}`,
+          title: "Adventure Pack",
+          versionName: version.name,
+          expiresAt: "2099-01-01T00:00:00Z",
+          cleanInstall: true,
+          runtime: {
+            provider: "neoforge",
+            software: "NeoForge",
+            version: "1.21.1",
+            build: "21.1.250",
+          },
+          summary: { fileCount: 500, totalBytes: 1024 * 1024 * 500 },
+          files: Array.from({ length: 500 }, (_, index) => ({
+            path: `mods/individual-mod-${index}.jar`,
+            size: 1024 * 1024,
+            action: "install",
+          })),
+          warnings: Array.from(
+            { length: 120 },
+            (_, index) => `Skipped mods/client-mod-${index}.jar: client-only.`,
+          ),
+          unavailableDependencies: [
+            {
+              platform: "modrinth",
+              projectId: "missing-library",
+              requiredBy: "Adventure Pack",
+              issue: "A required server library could not be checked.",
+            },
+          ],
+        },
+      });
+    });
+    const installations: unknown[] = [];
+    await page.route("**/api/launchpad/install", (route) => {
+      expect(route.request().headers()["x-server-id"]).toBe(serverId);
+      installations.push(route.request().postDataJSON());
+      return route.fulfill({
+        json: {
+          job: {
+            id: "clean-pack-job",
+            status: "completed",
+            message: "Adventure Pack installed",
+            total: 500,
+            completed: 500,
+          },
+        },
+      });
+    });
+    await page.goto("/#launchpad");
+    await page.getByRole("tab", { name: "Modpacks", exact: true }).click();
+    await page
+      .getByRole("button", { name: "Install Adventure Pack", exact: true })
+      .click();
+    const dialog = page.getByRole("dialog");
+    await dialog.getByRole("button", { name: /Review/ }).click();
+    await expect(
+      dialog.getByRole("group", {
+        name: "Modpack installation summary",
+        exact: true,
+      }),
+    ).toContainText("500 files");
+    await expect(dialog).toContainText("NeoForge 1.21.1 · Build 21.1.250");
+    await expect(
+      dialog.getByRole("list", { name: "Installation files", exact: true }),
+    ).toHaveCount(0);
+    await expect(dialog).not.toContainText("individual-mod-");
+    await expect(dialog).not.toContainText("client-mod-");
+    await expect(dialog).not.toContainText("Skipped");
+    await expect(
+      dialog.getByText("Some requirements couldn’t be checked", {
+        exact: true,
+      }),
+    ).toBeVisible();
+    await expect(dialog).toContainText(
+      "A required server library could not be checked.",
+    );
+    await expect(dialog).toContainText(
+      "All current files will be removed, including worlds, mods, plugins and settings.",
+    );
+    const acknowledgement = dialog.getByRole("checkbox", {
+      name: "I understand this replaces all files in this server’s folder.",
+      exact: true,
+    });
+    const confirm = dialog.getByRole("button", {
+      name: "Install anyway",
+      exact: true,
+    });
+    await expect(confirm).toBeDisabled();
+    expect(installations).toEqual([]);
+    await acknowledgement.check();
+    await expect(confirm).toBeEnabled();
+    await dialog.getByRole("button", { name: "Back", exact: true }).click();
+    await dialog.getByRole("button", { name: /Review/ }).click();
+    await expect(acknowledgement).not.toBeChecked();
+    await expect(confirm).toBeDisabled();
+    const dimensions = await dialog.boundingBox();
+    expect(dimensions!.x).toBeGreaterThanOrEqual(0);
+    expect(dimensions!.x + dimensions!.width).toBeLessThanOrEqual(
+      viewport.width + 1,
+    );
+    expect(
+      await dialog.evaluate(
+        (element) => element.scrollWidth - element.clientWidth,
+      ),
+    ).toBeLessThanOrEqual(1);
+    expect((await dialog.innerText()).length).toBeLessThan(1800);
+    await dialog.screenshot({
+      path: testInfo.outputPath(`compact-modpack-review-${viewport.name}.png`),
+      animations: "disabled",
+    });
+    await acknowledgement.check();
+    await confirm.click();
+    await expect(dialog).not.toBeVisible();
+    expect(installations).toEqual([
+      {
+        planId: "pack-plan-2",
+        confirmed: true,
+        cleanInstall: true,
+        acknowledgedUnavailableDependencies: true,
+      },
+    ]);
+  });
+}
 
 test("Launchpad separates mod and plugin loaders and defaults Paper to Plugins", async ({
   page,

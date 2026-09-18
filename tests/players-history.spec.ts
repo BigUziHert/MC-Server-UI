@@ -189,9 +189,10 @@ test("known profiles show heads and unknown login dates; demo ban/unban persist 
   await dialog
     .getByRole("button", { name: "Unban player", exact: true })
     .click();
+  await expect(dialog).not.toBeVisible();
   await expect(
     row.getByRole("button", { name: "Ban History_Player" }),
-  ).toBeVisible();
+  ).toBeEnabled();
   await page.getByLabel("Search player history").fill("Banned_Player");
   await expect(row).toHaveCount(0);
   await expect(

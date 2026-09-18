@@ -75,6 +75,7 @@ export async function createServerSetup({ dataDir, safePath, ...options }) {
     }));
   const common = {
     safePath,
+    versionsService: versions,
     fetch: catalogFetch,
     extraProviders,
     platformConfig,

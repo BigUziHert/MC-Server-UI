@@ -213,6 +213,69 @@ test("paths, root deletion, nested junctions and changed restore parents cannot 
   assert.equal((await bin.list())[0].id, item.id);
 });
 
+test("recycle and restore reject a replaced server root before touching another folder", async (t) => {
+  for (const action of ["recycle", "restore"])
+    await t.test(action, async (t) => {
+      const f = await fixture(t);
+      const outside = path.join(f.root, "outside");
+      const moved = path.join(f.root, "original-server");
+      await fs.mkdir(outside);
+      await fs.writeFile(
+        path.join(outside, "proof"),
+        "outside stays untouched",
+      );
+      await fs.writeFile(
+        path.join(f.serverDir, "proof"),
+        "original server file",
+      );
+      const original = await f.boot();
+      const entry =
+        action === "restore" ? await original.recycle("proof") : null;
+      let swapped = false;
+      const bin = await f.boot({
+        fileSystem: {
+          ...fs,
+          rename: async (from, to) => {
+            await fs.rename(from, to);
+            if (!swapped && path.basename(to) === "entry.json") {
+              const metadata = JSON.parse(await fs.readFile(to, "utf8"));
+              if (
+                metadata.phase ===
+                (action === "recycle" ? "prepared" : "restoring")
+              ) {
+                swapped = true;
+                await fs.rename(f.serverDir, moved);
+                await fs.symlink(
+                  outside,
+                  f.serverDir,
+                  process.platform === "win32" ? "junction" : "dir",
+                );
+              }
+            }
+          },
+        },
+      });
+      await assert.rejects(
+        action === "recycle" ? bin.recycle("proof") : bin.restore(entry.id),
+        /server folder changed/i,
+      );
+      assert.equal(swapped, true);
+      assert.equal(
+        await fs.readFile(path.join(outside, "proof"), "utf8"),
+        "outside stays untouched",
+      );
+      await fs.unlink(f.serverDir);
+      await fs.rename(moved, f.serverDir);
+      if (entry) {
+        await (await f.boot()).restore(entry.id);
+      }
+      assert.equal(
+        await fs.readFile(path.join(f.serverDir, "proof"), "utf8"),
+        "original server file",
+      );
+    });
+});
+
 test("a substituted private storage junction is rejected without reading or modifying its target", async (t) => {
   const f = await fixture(t);
   const bin = await f.boot();
@@ -699,10 +762,18 @@ test("failed final journal after atomic rename remains recoverable after restart
       },
     },
   });
-  await assert.rejects(bin.recycle("proof"), /interrupted/);
+  let recoveryId;
+  await assert.rejects(bin.recycle("proof"), (cause) => {
+    assert.match(cause.message, /interrupted/);
+    assert.equal(cause.originalPath, "proof");
+    assert.match(cause.recoveryId, /^[a-f0-9-]{36}$/i);
+    recoveryId = cause.recoveryId;
+    return true;
+  });
   await missing(path.join(f.serverDir, "proof"));
   const restarted = await f.boot();
   const [item] = await restarted.list();
+  assert.equal(item.id, recoveryId);
   assert.equal(item.status, "ready");
   await restarted.restore(item.id);
   assert.equal(

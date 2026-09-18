@@ -16,7 +16,7 @@ import {
   Terminal,
   X,
 } from "lucide-react";
-import { api, formatBytes } from "./api";
+import { api } from "./api";
 import type { ServerRecord } from "./ServerManager";
 import SearchField from "./SearchField";
 import { SoftwareIcon } from "./pages/Versions";
@@ -106,6 +106,14 @@ type Plan = {
   files: { path: string; size: number; action?: string }[];
   warnings: string[];
   loaderInstall?: Runtime;
+  runtime?: {
+    provider: string;
+    version: string;
+    build: string;
+    software: string;
+  };
+  summary?: { fileCount: number; totalBytes: number };
+  cleanInstall?: boolean;
   unavailableDependencies?: {
     platform: string;
     projectId?: string;
@@ -145,6 +153,21 @@ const names: Record<string, string> = {
   velocity: "Velocity",
 };
 const modLoaders = ["fabric", "forge", "neoforge", "quilt"];
+function javaVersions(choices: JavaChoices) {
+  const versions = new Map<number, JavaInstallation>();
+  const installations = [...choices.installations].sort(
+    (a, b) =>
+      b.majorVersion - a.majorVersion ||
+      b.version.localeCompare(a.version, "en", { numeric: true }) ||
+      Number(b.path === choices.recommendedPath) -
+        Number(a.path === choices.recommendedPath) ||
+      a.path.localeCompare(b.path, "en"),
+  );
+  for (const installation of installations)
+    if (!versions.has(installation.majorVersion))
+      versions.set(installation.majorVersion, installation);
+  return [...versions.values()];
+}
 const message = (cause: unknown) =>
   cause instanceof Error
     ? cause.message
@@ -207,7 +230,7 @@ export default function NewServerWizard({
   const [apiKey, setApiKey] = useState("");
   const [name, setName] = useState("");
   const [memory, setMemory] = useState("4");
-  const [javaPath, setJavaPath] = useState("");
+  const [javaMajor, setJavaMajor] = useState<number | null>(null);
   const [javaChoices, setJavaChoices] = useState<JavaChoices | null>(null);
   const [javaLoading, setJavaLoading] = useState(false);
   const [javaError, setJavaError] = useState("");
@@ -260,7 +283,9 @@ export default function NewServerWizard({
   });
   const selectedJava =
     javaChoicesKey === javaSelectionKey
-      ? javaChoices?.installations.find((item) => item.path === javaPath)
+      ? javaChoices?.installations.find(
+          (item) => item.majorVersion === javaMajor,
+        )
       : undefined;
   const displayStep = ["source", "catalog"].includes(step)
     ? 0
@@ -317,16 +342,16 @@ export default function NewServerWizard({
     )
       .then((result) => {
         if (cancel.signal.aborted) return;
-        setJavaChoices(result);
+        const installations = javaVersions(result);
+        setJavaChoices({ ...result, installations });
         setJavaChoicesKey(javaSelectionKey);
-        setJavaPath((current) =>
-          result.installations.some((item) => item.path === current)
+        setJavaMajor((current) =>
+          installations.some((item) => item.majorVersion === current)
             ? current
-            : result.installations.find(
-                (item) => item.path === result.recommendedPath,
-              )?.path ||
-              result.installations[0]?.path ||
-              "",
+            : installations.find((item) => item.path === result.recommendedPath)
+                ?.majorVersion ||
+              installations[0]?.majorVersion ||
+              null,
         );
       })
       .catch((cause) => {
@@ -379,13 +404,6 @@ export default function NewServerWizard({
       .then((result) => {
         if (cancel.signal.aborted) return;
         setBuilds(result.builds);
-        setBuildId(
-          result.builds.find(
-            (item) => item.recommended && (item.stable || experimental),
-          )?.id ||
-            result.builds.find((item) => item.stable || experimental)?.id ||
-            "",
-        );
       })
       .catch((cause) => {
         if (!cancel.signal.aborted) setListError(message(cause));
@@ -640,23 +658,15 @@ export default function NewServerWizard({
           throw new Error(
             "The pack's runtime differs from the selected release. Choose a matching release and try again.",
           );
-        const versions = await request<{ builds: Release[] }>(
-          `/server-setup/versions/${encodeURIComponent(required.loader)}/${encodeURIComponent(required.gameVersion)}`,
-        );
-        const exact = versions.builds.filter(
-          (item) =>
-            item.id === required.loaderVersion ||
-            item.id === `${required.gameVersion}-${required.loaderVersion}`,
-        );
-        if (exact.length !== 1)
+        if (!next.runtime || !next.cleanInstall)
           throw new Error(
             `The required ${names[required.loader] || required.loader} ${required.loaderVersion} build is not available from its official catalog. Try another pack release.`,
           );
         setRuntime({
-          provider: required.loader,
-          version: required.gameVersion,
-          build: exact[0].id,
-          label: `${names[required.loader] || required.loader} ${exact[0].label}`,
+          provider: next.runtime.provider,
+          version: next.runtime.version,
+          build: next.runtime.build,
+          label: `${next.runtime.software} ${next.runtime.build}`,
         });
         setPlan(next);
       } else
@@ -785,7 +795,7 @@ export default function NewServerWizard({
               mode: "live",
               memoryLimitMB: Number(memory) * 1024,
               port: Number(port),
-              javaPath,
+              javaPath: selectedJava?.path,
             },
           },
         );
@@ -817,7 +827,7 @@ export default function NewServerWizard({
           serverId,
         );
       }
-      if (!runtimeDone.current) {
+      if (kind === "software" && !runtimeDone.current) {
         setProgress(`Installing ${runtime.label}…`);
         await followJob(
           await startJob(
@@ -827,6 +837,7 @@ export default function NewServerWizard({
               version: runtime.version,
               build: runtime.build,
               confirmed: true,
+              cleanInstall: true,
             },
             serverId,
           ),
@@ -847,7 +858,8 @@ export default function NewServerWizard({
           next.files.some((file) => !priorPaths.has(file.path)) ||
           JSON.stringify(next.unavailableDependencies || []) !== priorIssues ||
           JSON.stringify(next.loaderInstall) !==
-            JSON.stringify(plan?.loaderInstall)
+            JSON.stringify(plan?.loaderInstall) ||
+          JSON.stringify(next.runtime) !== JSON.stringify(plan?.runtime)
         ) {
           setPlan(next);
           setAcknowledged(false);
@@ -856,21 +868,20 @@ export default function NewServerWizard({
             "The provider's installation details changed. Review the updated files before continuing.",
           );
         }
-        if (next.files.length)
-          await followJob(
-            await startJob(
-              "launchpad",
-              {
-                planId: next.planId,
-                confirmed: true,
-                acknowledgedUnavailableDependencies: acknowledged,
-              },
-              serverId,
-            ),
+        await followJob(
+          await startJob(
             "launchpad",
+            {
+              planId: next.planId,
+              confirmed: true,
+              cleanInstall: true,
+              acknowledgedUnavailableDependencies: acknowledged,
+            },
             serverId,
-          );
-        else packDone.current = true;
+          ),
+          "launchpad",
+          serverId,
+        );
       }
       await refreshCreatedServer();
       setProgress("Your server is ready.");
@@ -1133,8 +1144,7 @@ export default function NewServerWizard({
                       setGameVersion(
                         releases.find((item) => item.stable)?.id || "",
                       );
-                    if (!event.target.checked && !build?.stable)
-                      setBuildId(builds.find((item) => item.stable)?.id || "");
+                    if (!event.target.checked && !build?.stable) setBuildId("");
                   }}
                 />{" "}
                 Include experimental releases
@@ -1499,12 +1509,12 @@ export default function NewServerWizard({
             </div>
             <select
               id="setup-java"
-              value={selectedJava?.path || ""}
+              value={selectedJava?.majorVersion ?? ""}
               disabled={
                 busy || javaLoading || !javaChoices?.installations.length
               }
               required
-              onChange={(event) => setJavaPath(event.target.value)}
+              onChange={(event) => setJavaMajor(Number(event.target.value))}
               aria-describedby="setup-java-help"
             >
               <option value="" disabled>
@@ -1513,9 +1523,8 @@ export default function NewServerWizard({
                   : "No compatible Java installation found"}
               </option>
               {javaChoices?.installations.map((item) => (
-                <option key={item.path} value={item.path}>
-                  Java {item.version}
-                  {item.vendor ? ` · ${item.vendor}` : ""} — {item.path}
+                <option key={item.majorVersion} value={item.majorVersion}>
+                  JAVA {item.majorVersion}
                 </option>
               ))}
             </select>
@@ -1528,9 +1537,6 @@ export default function NewServerWizard({
                     ? javaChoices.requirement
                     : `${javaChoices?.requirement || "A compatible Java runtime is required."} Install it on this PC, then select Refresh Java.`}
             </small>
-            {selectedJava && (
-              <small className="setup-java-path">{selectedJava.path}</small>
-            )}
             {javaChoices?.warnings.map((warning) => (
               <small key={warning}>{warning}</small>
             ))}
@@ -1589,22 +1595,6 @@ export default function NewServerWizard({
               </dd>
             </div>
           </dl>
-          {plan && (
-            <details className="setup-file-review">
-              <summary>
-                {plan.files.length} modpack files to install{" "}
-                <ChevronRight size={14} />
-              </summary>
-              <ul aria-label="Modpack installation files">
-                {plan.files.map((file) => (
-                  <li key={file.path}>
-                    <span>{file.path}</span>
-                    <small>{formatBytes(file.size)}</small>
-                  </li>
-                ))}
-              </ul>
-            </details>
-          )}
           {warnings.map((value) => (
             <p className="setup-warning" key={value}>
               {value}

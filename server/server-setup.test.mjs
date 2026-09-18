@@ -327,9 +327,33 @@ test("failed guided registry persistence publishes neither the server nor its id
   );
 });
 
-test("guided memory reaches Java argument launchers and packs preserve installed runtime files", async (t) => {
+test("guided modpacks install their runtime atomically and switching to Vanilla clears the pack", async (t) => {
   const versionsService = versionService();
-  versionsService.stage = async (_input, { stageDir }) => {
+  const runtimeStages = [];
+  versionsService.builds = async (provider) => ({
+    builds: [
+      { id: provider === "neoforge" ? "21.1.200" : "1.21.1", stable: true },
+    ],
+  });
+  versionsService.stage = async (input, { stageDir }) => {
+    runtimeStages.push(input.provider);
+    if (input.provider === "vanilla") {
+      await fs.writeFile(path.join(stageDir, "server.jar"), "vanilla runtime");
+      return {
+        stageDir,
+        files: [{ path: "server.jar" }],
+        configuration: {
+          launchType: "jar",
+          jar: "server.jar",
+          launchArgs: [],
+          launchScript: "",
+          launchExecutable: "",
+          software: "Vanilla",
+          version: "1.21.1",
+        },
+        summary: { provider: "vanilla", version: "1.21.1", build: "1.21.1" },
+      };
+    }
     await fs.mkdir(path.join(stageDir, "libraries"));
     const files = {
       "server.jar": "verified runtime",
@@ -377,6 +401,11 @@ test("guided memory reaches Java argument launchers and packs preserve installed
         resolve: async () => ({
           title: "Fixture",
           versionName: "1",
+          loaderInstall: {
+            loader: "neoforge",
+            gameVersion: "1.21.1",
+            loaderVersion: "21.1.200",
+          },
           files: paths.map((name) => ({
             path: name,
             url: "https://cdn.modrinth.com/fixture.jar",
@@ -394,34 +423,25 @@ test("guided memory reaches Java argument launchers and packs preserve installed
     "/api/server-setup",
     json(
       "POST",
-      requestBody({ configuration: { ...configuration, memoryLimitMB: 6144 } }),
+      requestBody({
+        acceptedEula: true,
+        configuration: { ...configuration, memoryLimitMB: 6144 },
+      }),
     ),
   );
   const { id, serverDir } = created.body.server;
-  const queued = await f.request(
-    "/api/versions/install",
-    json("POST", {
-      provider: "neoforge",
-      version: "1.21.1",
-      build: "21.1.200",
-      confirmed: true,
-    }),
-    id,
+  await fs.mkdir(path.join(serverDir, "old-world"));
+  await fs.mkdir(path.join(serverDir, "mods"));
+  await fs.mkdir(path.join(serverDir, "config"));
+  await fs.writeFile(
+    path.join(serverDir, "old-world", "level.dat"),
+    "old world",
   );
-  let runtimeJob;
-  for (let attempt = 0; attempt < 200; attempt++) {
-    runtimeJob = (
-      await f.request(`/api/versions/jobs/${queued.body.id}`, {}, id)
-    ).body;
-    if (["failed", "complete"].includes(runtimeJob.state)) break;
-    await new Promise((resolve) => setTimeout(resolve, 10));
-  }
-  assert.equal(runtimeJob.state, "complete", JSON.stringify(runtimeJob));
-  const detected = await validateStartupFiles(serverDir, {
-    launchType: "java-args",
-    launchArgs: ["@user_jvm_args.txt", "@libraries/runtime_args.txt", "nogui"],
-  });
-  assert.equal(detected.memoryLimitMB, 6144);
+  await fs.writeFile(path.join(serverDir, "mods", "old-loader.jar"), "old mod");
+  await fs.writeFile(
+    path.join(serverDir, "config", "old.toml"),
+    "old settings",
+  );
   const reviewed = await f.request(
     "/api/launchpad/preview",
     json("POST", {
@@ -435,17 +455,26 @@ test("guided memory reaches Java argument launchers and packs preserve installed
     id,
   );
   assert.equal(reviewed.status, 200, JSON.stringify(reviewed.body));
+  assert.equal(reviewed.body.cleanInstall, true);
   assert.deepEqual(
     reviewed.body.files.map((file) => file.path),
     ["mods/fixture.jar"],
   );
-  for (const name of paths.slice(1))
-    assert.ok(reviewed.body.warnings.some((warning) => warning.includes(name)));
+  assert.deepEqual(
+    runtimeStages,
+    [],
+    "Review must not run the runtime installer",
+  );
   const installed = await f.request(
     "/api/launchpad/install",
-    json("POST", { planId: reviewed.body.planId, confirmed: true }),
+    json("POST", {
+      planId: reviewed.body.planId,
+      confirmed: true,
+      cleanInstall: true,
+    }),
     id,
   );
+  assert.equal(installed.status, 202, JSON.stringify(installed.body));
   let packJob;
   for (let attempt = 0; attempt < 200; attempt++) {
     packJob = (
@@ -455,6 +484,15 @@ test("guided memory reaches Java argument launchers and packs preserve installed
     await new Promise((resolve) => setTimeout(resolve, 10));
   }
   assert.equal(packJob.status, "completed", JSON.stringify(packJob));
+  assert.deepEqual(runtimeStages, ["neoforge"]);
+  for (const removed of ["old-world", "mods/old-loader.jar", "config/old.toml"])
+    await assert.rejects(fs.stat(path.join(serverDir, removed)), {
+      code: "ENOENT",
+    });
+  assert.equal(
+    await fs.readFile(path.join(serverDir, "mods", "fixture.jar"), "utf8"),
+    "new pack content",
+  );
   assert.match(
     await fs.readFile(path.join(serverDir, "user_jvm_args.txt"), "utf8"),
     /-Xmx6144M/,
@@ -470,6 +508,51 @@ test("guided memory reaches Java argument launchers and packs preserve installed
     await fs.readFile(path.join(serverDir, "server.jar"), "utf8"),
     "verified runtime",
   );
+  const detected = await validateStartupFiles(serverDir, {
+    launchType: "java-args",
+    launchArgs: ["@user_jvm_args.txt", "@libraries/runtime_args.txt", "nogui"],
+  });
+  assert.equal(detected.memoryLimitMB, 6144);
+  assert.match(
+    await fs.readFile(path.join(serverDir, "eula.txt"), "utf8"),
+    /eula=true/,
+  );
+  const queued = await f.request(
+    "/api/versions/install",
+    json("POST", {
+      provider: "vanilla",
+      version: "1.21.1",
+      build: "1.21.1",
+      confirmed: true,
+      cleanInstall: true,
+    }),
+    id,
+  );
+  assert.equal(queued.status, 202, JSON.stringify(queued.body));
+  let vanillaJob;
+  for (let attempt = 0; attempt < 200; attempt++) {
+    vanillaJob = (
+      await f.request(`/api/versions/jobs/${queued.body.id}`, {}, id)
+    ).body;
+    if (["failed", "complete"].includes(vanillaJob.state)) break;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  assert.equal(vanillaJob.state, "complete", JSON.stringify(vanillaJob));
+  assert.equal(
+    await fs.readFile(path.join(serverDir, "server.jar"), "utf8"),
+    "vanilla runtime",
+  );
+  for (const removed of ["mods", "libraries", "user_jvm_args.txt"])
+    await assert.rejects(fs.stat(path.join(serverDir, removed)), {
+      code: "ENOENT",
+    });
+  assert.match(
+    await fs.readFile(path.join(serverDir, "eula.txt"), "utf8"),
+    /eula=true/,
+  );
+  const state = (await f.request("/api/server", {}, id)).body;
+  assert.equal(state.software, "Vanilla");
+  assert.equal(state.status, "offline");
 });
 
 test("guided creation is confirmed, idempotent across concurrent retries and restart, and leaves EULA off by default", async (t) => {
@@ -667,6 +750,14 @@ test("pack reviews expose verified runtime requirements, clean scratch data and 
     loaderVersion: "21.1.200",
   };
   const f = await fixture(t, {
+    versionsService: {
+      ...versionService(),
+      builds: async () => ({
+        builds: [{ id: "21.1.200", label: "21.1.200", stable: true }],
+      }),
+      stage: async () =>
+        assert.fail("A catalog review must not install a runtime"),
+    },
     extraProviders: [
       {
         id: "fixturepack",
@@ -707,6 +798,8 @@ test("pack reviews expose verified runtime requirements, clean scratch data and 
   );
   assert.equal(reviewed.status, 200, JSON.stringify(reviewed.body));
   assert.deepEqual(reviewed.body.loaderInstall, required);
+  assert.equal(reviewed.body.cleanInstall, true);
+  assert.equal(reviewed.body.runtime.build, "21.1.200");
   assert.deepEqual(
     reviewed.body.files.map((file) => file.path),
     ["mods/fixture.jar"],
@@ -742,6 +835,7 @@ test("failed runtime installs retry on the same created server through the exist
         version: "1.21.1",
         build: "12",
         confirmed: true,
+        cleanInstall: true,
       }),
       id,
     );

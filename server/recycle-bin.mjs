@@ -31,6 +31,29 @@ export async function createRecycleBin({
   const io = fileSystem;
   const directory = await safePath(dataDir, "recycle-bin");
   const originalRoot = await io.realpath(serverDir);
+  const originalRootStat = await io.lstat(serverDir);
+  const assertServerRoot = async () => {
+    const current = await io.lstat(serverDir);
+    if (
+      !current.isDirectory() ||
+      current.isSymbolicLink() ||
+      current.ino !== originalRootStat.ino ||
+      current.dev !== originalRootStat.dev ||
+      current.birthtimeMs !== originalRootStat.birthtimeMs ||
+      (await io.realpath(serverDir)) !== originalRoot
+    )
+      throw error(
+        409,
+        "The server folder changed. Recycle Bin files have been retained; restart the panel after restoring the original folder.",
+      );
+  };
+  await assertServerRoot();
+  const serverPath = async (relative) => {
+    await assertServerRoot();
+    const target = await safePath(serverDir, relative);
+    await assertServerRoot();
+    return target;
+  };
   const relative = path.relative(originalRoot, directory);
   if (
     !relative ||
@@ -124,7 +147,7 @@ export async function createRecycleBin({
         409,
         "This recovery record is incomplete. Its stored files have been retained.",
       );
-    await safePath(serverDir, metadata.originalPath);
+    await serverPath(metadata.originalPath);
     return { entryDir, metadata, payload: await safePath(entryDir, "content") };
   };
   const walk = async (root, base = "", rows = []) => {
@@ -289,7 +312,7 @@ export async function createRecycleBin({
     // here: a live server may have created new, unarchived files since verification.
     for (const row of [...snapshot.rows].reverse()) {
       const relative = [originalPath, row.path].filter(Boolean).join("/");
-      const target = await safePath(serverDir, relative);
+      const target = await serverPath(relative);
       const stat = await io.lstat(target);
       if (!sameIdentity(stat, row)) throw changed(relative);
       if (row.type === "file") {
@@ -298,7 +321,7 @@ export async function createRecycleBin({
           (await hashFile(target)) !== snapshot.hashes.get(row.path)
         )
           throw changed(relative);
-        const checked = await safePath(serverDir, relative);
+        const checked = await serverPath(relative);
         if (!sameFile(await io.lstat(checked), row)) throw changed(relative);
         try {
           await io.unlink(checked);
@@ -306,7 +329,7 @@ export async function createRecycleBin({
           throw removalFailure(cause, relative);
         }
       } else {
-        const checked = await safePath(serverDir, relative);
+        const checked = await serverPath(relative);
         if (!sameIdentity(await io.lstat(checked), row))
           throw changed(relative);
         try {
@@ -401,7 +424,7 @@ export async function createRecycleBin({
             400,
             "The server root cannot be moved to the Recycle Bin.",
           );
-        const source = await safePath(serverDir, originalPath);
+        const source = await serverPath(originalPath);
         if (path.resolve(source) === originalRoot)
           throw error(
             400,
@@ -423,7 +446,7 @@ export async function createRecycleBin({
         const payload = await safePath(entryDir, "content");
         await persist(entryDir, metadata);
         try {
-          await safePath(serverDir, originalPath);
+          await serverPath(originalPath);
           try {
             await io.rename(source, payload);
           } catch (cause) {
@@ -438,7 +461,7 @@ export async function createRecycleBin({
             );
             metadata.phase = "copied";
             await persist(entryDir, metadata);
-            await safePath(serverDir, originalPath);
+            await serverPath(originalPath);
             await verifySource(source, snapshot);
             await removeVerifiedSource(originalPath, snapshot);
           }
@@ -450,6 +473,7 @@ export async function createRecycleBin({
           // retained even when source removal or the final journal write fails.
           if (!(await lstat(payload)))
             await io.rm(entryDir, { recursive: true, force: true });
+          else Object.assign(cause, { recoveryId: metadata.id, originalPath });
           throw cause;
         }
       });
@@ -464,7 +488,7 @@ export async function createRecycleBin({
             "This recovery copy is incomplete and cannot be restored automatically.",
           );
         await walk(payload);
-        const destination = await safePath(serverDir, metadata.originalPath);
+        const destination = await serverPath(metadata.originalPath);
         if (await lstat(destination))
           throw error(
             409,
@@ -472,15 +496,14 @@ export async function createRecycleBin({
           );
         const parent = path.posix.dirname(metadata.originalPath);
         if (parent !== ".") {
-          const parentPath = await safePath(serverDir, parent);
+          const parentPath = await serverPath(parent);
           await io.mkdir(parentPath, { recursive: true });
-          await safePath(serverDir, parent);
+          await serverPath(parent);
         }
         metadata.phase = "restoring";
         await persist(entryDir, metadata);
         await copyVerified(payload, (relative) =>
-          safePath(
-            serverDir,
+          serverPath(
             [metadata.originalPath, relative].filter(Boolean).join("/"),
           ),
         );

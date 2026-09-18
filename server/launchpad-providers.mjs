@@ -1043,9 +1043,7 @@ export function createCoreProviders({
             author: projectAuthors(project),
             versionName: file.displayName,
             archive: { ...download, format: "server-zip" },
-            warnings: [
-              "Only the author's server pack is installed. Minecraft and its loader must already match this pack.",
-            ],
+            warnings: [],
           };
         const extension = input.type === "datapack" ? /\.zip$/i : /\.jar$/i;
         if (!extension.test(file.fileName))

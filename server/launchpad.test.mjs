@@ -15,6 +15,7 @@ import { containedSourcePath } from "./import.mjs";
 import { unpackProviderZip, safeInstallPath } from "./launchpad-archives.mjs";
 import { downloadVerified } from "./launchpad-network.mjs";
 import { createCoreProviders } from "./launchpad-providers.mjs";
+import { inferPackRuntime } from "./launchpad-pack-runtime.mjs";
 
 const bytes = (value) => Buffer.from(value);
 const safePath = (root, relative = "") =>
@@ -242,6 +243,43 @@ async function fixture(t, options = {}) {
       dataDir,
       safePath,
       getServer: async () => server,
+      getConfiguration: () => ({
+        ...server,
+        javaPath: "java",
+        memoryLimitMB: 6144,
+        port: 25565,
+        mode: "live",
+      }),
+      applyConfiguration: async (value) => {
+        server = { ...server, ...value };
+      },
+      versionsService: {
+        builds: async (provider, version) => ({
+          provider: { name: provider },
+          builds: [
+            { id: provider === "forge" ? `${version}-21.1.200` : "21.1.200" },
+          ],
+        }),
+        stage: async (input, { stageDir }) => {
+          const output = path.join(stageDir, "server");
+          await fs.mkdir(output);
+          await fs.writeFile(
+            path.join(output, "runtime.jar"),
+            "verified runtime",
+          );
+          return {
+            stageDir: output,
+            files: [{ path: "runtime.jar" }],
+            configuration: {
+              jar: "runtime.jar",
+              launchType: "jar",
+              software: input.provider,
+              version: input.build,
+            },
+            summary: input,
+          };
+        },
+      },
       fetch: request,
       recycle: (value) => bin.recycle(value),
       restore: (id) => bin.restore(id),
@@ -2955,7 +2993,7 @@ test("partial promotion failure rolls back only newly installed files and restor
   );
 });
 
-test("Modrinth packs install server dependencies and overrides without client files or protected server/world data", async (t) => {
+test("Modrinth packs replace old data with the verified runtime and server pack while retaining EULA acceptance", async (t) => {
   const f = await fixture(t, { type: "modpack" });
   await fs.mkdir(path.join(f.serverDir, "Survival"));
   await fs.writeFile(
@@ -3006,12 +3044,26 @@ test("Modrinth packs install server dependencies and overrides without client fi
   ];
   const plan = await f.service.preview({ ...selection, type: "modpack" });
   assert.deepEqual(plan.files.map((file) => file.path).sort(), [
+    "Survival/level.dat",
     "config/common.cfg",
     "mods/server.jar",
   ]);
   assert.match(plan.warnings.join(" "), /client-only/);
+  assert.equal(plan.cleanInstall, true);
+  assert.equal(plan.runtime.build, "21.1.200");
+  assert.equal(plan.summary.fileCount, 3);
+  await assert.rejects(
+    f.service.install({ planId: plan.planId, confirmed: true }),
+    /Confirm the clean installation/,
+  );
   assert.equal(
-    (await finish(f.service, { planId: plan.planId, confirmed: true })).status,
+    (
+      await finish(f.service, {
+        planId: plan.planId,
+        confirmed: true,
+        cleanInstall: true,
+      })
+    ).status,
     "completed",
   );
   assert.equal(
@@ -3020,11 +3072,18 @@ test("Modrinth packs install server dependencies and overrides without client fi
   );
   assert.equal(
     await fs.readFile(path.join(f.serverDir, "Survival", "level.dat"), "utf8"),
-    "existing world",
+    "wrong world",
   );
-  assert.equal(
+  assert.match(
     await fs.readFile(path.join(f.serverDir, "eula.txt"), "utf8"),
-    "eula=false",
+    /eula=false/,
+  );
+  await assert.rejects(fs.stat(path.join(f.serverDir, "mods", "old.jar")), {
+    code: "ENOENT",
+  });
+  assert.equal(
+    await fs.readFile(path.join(f.serverDir, "runtime.jar"), "utf8"),
+    "verified runtime",
   );
   assert.equal(
     (await f.service.installed({ ...selection, type: "modpack" })).items[0]
@@ -3691,7 +3750,7 @@ test("CurseForge applies each supported sort to both upstream pages including al
   }
 });
 
-test("direct pack files merge with server ZIP overrides and preserve worlds, EULA, RAM and existing startup files", async (t) => {
+test("direct pack files and ZIP overrides replace old worlds and startup files through a clean installation", async (t) => {
   const f = await fixture(t);
   const archive = zip([
     ["config/pack.cfg", "pack configuration"],
@@ -3711,6 +3770,11 @@ test("direct pack files merge with server ZIP overrides and preserve worlds, EUL
     resolve: async () => ({
       title: "Combined pack",
       versionName: "1.0",
+      loaderInstall: {
+        loader: "neoforge",
+        gameVersion: "1.21.1",
+        loaderVersion: "21.1.200",
+      },
       files: [
         {
           path: "mods/server.jar",
@@ -3755,36 +3819,40 @@ test("direct pack files merge with server ZIP overrides and preserve worlds, EUL
     type: "modpack",
   });
   assert.deepEqual(plan.files.map((file) => file.path).sort(), [
+    "Survival/level.dat",
     "config/pack.cfg",
+    "custom-start.cmd",
     "mods/server.jar",
-    "start.sh",
   ]);
-  for (const name of Object.keys(preserved))
-    assert.ok(plan.warnings.some((warning) => warning.includes(name)));
   assert.equal(
-    (await finish(service, { planId: plan.planId, confirmed: true })).status,
+    (
+      await finish(service, {
+        planId: plan.planId,
+        confirmed: true,
+        cleanInstall: true,
+      })
+    ).status,
     "completed",
   );
   assert.equal(
     await fs.readFile(path.join(f.serverDir, "Survival", "level.dat"), "utf8"),
-    "original world",
+    "must not replace world",
   );
-  assert.equal(
+  assert.match(
     await fs.readFile(path.join(f.serverDir, "eula.txt"), "utf8"),
-    "eula=false",
+    /eula=false/,
   );
-  for (const [name, content] of Object.entries(preserved))
-    assert.equal(
-      await fs.readFile(path.join(f.serverDir, name), "utf8"),
-      content,
-    );
+  for (const name of ["user_jvm_args.txt", "run.bat", "start.sh"])
+    await assert.rejects(fs.stat(path.join(f.serverDir, name)), {
+      code: "ENOENT",
+    });
   assert.equal(
-    await fs.readFile(path.join(f.serverDir, "start.sh"), "utf8"),
-    "new pack start script",
+    await fs.readFile(path.join(f.serverDir, "custom-start.cmd"), "utf8"),
+    "replacement launcher",
   );
 });
 
-test("pack review rejects a known different loader build and client-only required dependencies", async (t) => {
+test("pack review selects its required runtime even when an older loader is installed and still rejects client-only dependencies", async (t) => {
   const f = await fixture(t);
   const service = await f.boot({
     extraProviders: [
@@ -3815,10 +3883,12 @@ test("pack review rejects a known different loader build and client-only require
     ],
   });
   f.setServer({ loaderVersion: "21.1.199" });
-  await assert.rejects(
-    service.preview({ ...selection, platform: "fixturepack", type: "modpack" }),
-    /requires neoforge 21.1.200/,
-  );
+  const plan = await service.preview({
+    ...selection,
+    platform: "fixturepack",
+    type: "modpack",
+  });
+  assert.equal(plan.runtime.build, "21.1.200");
   f.versions.new.dependencies = [
     {
       project_id: "dependency",
@@ -4032,3 +4102,220 @@ test(
     assert.equal((await f.bin.list()).length, 1);
   },
 );
+
+async function cleanPackFixture(t, overrides = {}) {
+  const f = await fixture(t);
+  const extra = {
+    id: "fixturepack",
+    name: "Fixture",
+    types: ["modpack"],
+    available: true,
+    downloadHosts: ["cdn.modrinth.com"],
+    resolve: async () => ({
+      title: "Clean pack",
+      versionName: "1",
+      loaderInstall: {
+        loader: "neoforge",
+        gameVersion: "1.21.1",
+        loaderVersion: "21.1.200",
+      },
+      files: [
+        {
+          path: "mods/server.jar",
+          url: "https://cdn.modrinth.com/new.jar",
+          size: f.newer.length,
+          hashes: hashes(f.newer),
+        },
+      ],
+    }),
+  };
+  const service = await f.boot({ extraProviders: [extra], ...overrides });
+  return {
+    ...f,
+    service,
+    input: { ...selection, platform: "fixturepack", type: "modpack" },
+  };
+}
+
+test("reinstalling identical pack bytes still clears files outside the new pack", async (t) => {
+  const f = await cleanPackFixture(t);
+  const first = await f.service.preview(f.input);
+  assert.equal(
+    (
+      await finish(f.service, {
+        planId: first.planId,
+        confirmed: true,
+        cleanInstall: true,
+      })
+    ).status,
+    "completed",
+  );
+  await fs.mkdir(path.join(f.serverDir, "old-world"));
+  await fs.writeFile(
+    path.join(f.serverDir, "old-world", "level.dat"),
+    "old world",
+  );
+  await fs.writeFile(
+    path.join(f.serverDir, "mods", "unrelated.jar"),
+    "old mod",
+  );
+  const second = await f.service.preview(f.input);
+  assert.equal(second.files.length, 1);
+  assert.equal(
+    (
+      await finish(f.service, {
+        planId: second.planId,
+        confirmed: true,
+        cleanInstall: true,
+      })
+    ).status,
+    "completed",
+  );
+  await assert.rejects(fs.stat(path.join(f.serverDir, "old-world")), {
+    code: "ENOENT",
+  });
+  await assert.rejects(
+    fs.stat(path.join(f.serverDir, "mods", "unrelated.jar")),
+    { code: "ENOENT" },
+  );
+  assert.deepEqual(
+    await fs.readFile(path.join(f.serverDir, "mods", "server.jar")),
+    f.newer,
+  );
+});
+
+test("a failed required runtime download leaves all old server files untouched", async (t) => {
+  const f = await cleanPackFixture(t, {
+    versionsService: {
+      builds: async () => ({ builds: [{ id: "21.1.200" }] }),
+      stage: async () => {
+        throw new Error("runtime checksum failed");
+      },
+    },
+  });
+  await fs.writeFile(path.join(f.serverDir, "run.bat"), "original startup");
+  const plan = await f.service.preview(f.input);
+  const job = await finish(f.service, {
+    planId: plan.planId,
+    confirmed: true,
+    cleanInstall: true,
+  });
+  assert.equal(job.status, "failed");
+  assert.match(job.error, /runtime checksum failed/);
+  assert.deepEqual(
+    await fs.readFile(path.join(f.serverDir, "mods", "old.jar")),
+    f.old,
+  );
+  assert.equal(
+    await fs.readFile(path.join(f.serverDir, "run.bat"), "utf8"),
+    "original startup",
+  );
+  assert.deepEqual(await f.bin.list(), []);
+});
+
+test("a failed receipt write cannot prevent restoring the previous runtime configuration", async (t) => {
+  const applied = [];
+  const f = await cleanPackFixture(t, {
+    applyConfiguration: async (value) => {
+      applied.push(value);
+    },
+  });
+  const plan = await f.service.preview(f.input);
+  const rename = fs.rename.bind(fs);
+  t.mock.method(fs, "rename", async (source, target) => {
+    if (path.basename(target) === "installed.json")
+      throw Object.assign(new Error("receipt disk failure"), { code: "EIO" });
+    return rename(source, target);
+  });
+  const job = await finish(f.service, {
+    planId: plan.planId,
+    confirmed: true,
+    cleanInstall: true,
+  });
+  assert.equal(job.status, "failed");
+  assert.match(job.error, /receipt disk failure.*Recovery needs attention/);
+  assert.equal(applied.length, 2);
+  assert.equal(applied[0].jar, "runtime.jar");
+  assert.equal(applied[1].jar, undefined);
+  assert.deepEqual(
+    await fs.readFile(path.join(f.serverDir, "mods", "old.jar")),
+    f.old,
+  );
+});
+
+test("server ZIP runtime metadata accepts exact known formats and rejects ambiguous declarations", async (t) => {
+  const f = await fixture(t);
+  const entries = async (values) =>
+    Promise.all(
+      values.map(async ([name, content], index) => {
+        const stagedPath = path.join(f.dataDir, `metadata-${index}`);
+        await fs.writeFile(stagedPath, content);
+        return { path: name, stagedPath, size: Buffer.byteLength(content) };
+      }),
+    );
+  for (const [files, expected] of [
+    [
+      [
+        [
+          "manifest.json",
+          JSON.stringify({
+            minecraft: {
+              version: "1.21.1",
+              modLoaders: [{ id: "neoforge-21.1.200", primary: true }],
+            },
+          }),
+        ],
+      ],
+      { loader: "neoforge", loaderVersion: "21.1.200", gameVersion: "1.21.1" },
+    ],
+    [
+      [
+        [
+          "run.bat",
+          "java @user_jvm_args.txt @libraries/net/neoforged/neoforge/21.1.200/win_args.txt nogui",
+        ],
+      ],
+      { loader: "neoforge", loaderVersion: "21.1.200", gameVersion: "1.21.1" },
+    ],
+    [
+      [["forge-1.12.2-14.23.5.2860-universal.jar", "jar"]],
+      { loader: "forge", loaderVersion: "14.23.5.2860", gameVersion: "1.12.2" },
+    ],
+    [
+      [
+        [
+          "variables.txt",
+          "MINECRAFT_VERSION=1.20.1\nMODLOADER=FABRIC\nMODLOADER_VERSION=0.16.14",
+        ],
+      ],
+      { loader: "fabric", loaderVersion: "0.16.14", gameVersion: "1.20.1" },
+    ],
+  ])
+    assert.deepEqual(
+      await inferPackRuntime(await entries(files), {
+        ...selection,
+        gameVersion: expected.gameVersion,
+      }),
+      expected,
+    );
+  assert.equal(
+    await inferPackRuntime(
+      await entries([["mods/forge-1.21.1-52.0.0.jar", "not loader metadata"]]),
+      selection,
+    ),
+    undefined,
+  );
+  await assert.rejects(
+    inferPackRuntime(
+      await entries([
+        [
+          "run.bat",
+          "java @libraries/net/neoforged/neoforge/21.1.200/win_args.txt",
+        ],
+        ["variables.txt", "NEOFORGE_VERSION=21.1.201"],
+      ]),
+      selection,
+    ),
+    /conflicting runtime versions/,
+  );
+});

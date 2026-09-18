@@ -256,6 +256,12 @@ async function choosePaper(page: Page) {
       .getByRole("combobox", { name: "Build", exact: true })
       .locator('option[value=""]'),
   ).toHaveJSProperty("disabled", true);
+  await expect(
+    dialog.getByRole("combobox", { name: "Build", exact: true }),
+  ).toHaveValue("");
+  await expect(
+    dialog.getByRole("button", { name: "Continue", exact: true }),
+  ).toBeDisabled();
   await dialog
     .getByRole("combobox", { name: "Build", exact: true })
     .selectOption("151");
@@ -266,12 +272,12 @@ async function configure(
   page: Page,
   state: SetupFixture,
   name: string,
-  selectedJavaPath = java.path,
+  selectedJavaMajor = 21,
 ) {
   const dialog = page.getByRole("dialog");
   await expect(
     dialog.getByRole("combobox", { name: "Java executable", exact: true }),
-  ).toHaveValue(selectedJavaPath);
+  ).toHaveValue(String(selectedJavaMajor));
   await dialog.getByLabel("Server name", { exact: true }).fill(name);
   await dialog.getByLabel("Memory (GB)", { exact: true }).fill("4");
   await dialog.getByText("Advanced settings", { exact: true }).click();
@@ -342,7 +348,58 @@ test("Welcome opens the import folder workflow directly and cancelling preserves
   expect(setup.catalogRequests).toEqual([]);
 });
 
-test("Java selection uses only detected compatible executables and refresh preserves the selected runtime", async ({
+test("software builds require an explicit choice and reset after changing Minecraft or software", async ({
+  page,
+  setup,
+}) => {
+  await page.route("**/api/server-setup/versions/paper", (route) =>
+    route.fulfill({
+      json: {
+        versions: [release, { id: "1.20.1", label: "1.20.1", stable: true }],
+      },
+    }),
+  );
+  await page.route("**/api/server-setup/versions/paper/1.20.1", (route) =>
+    route.fulfill({
+      json: { builds: [{ ...build, id: "196", label: "196" }] },
+    }),
+  );
+  const dialog = await openCreate(page);
+  await dialog
+    .getByRole("button", { name: "Server software", exact: true })
+    .click();
+  await dialog.getByRole("button", { name: /Paper/ }).click();
+  const builds = dialog.getByRole("combobox", { name: "Build", exact: true });
+  const versions = dialog.getByRole("combobox", {
+    name: "Minecraft version",
+    exact: true,
+  });
+  const next = dialog.getByRole("button", { name: "Continue", exact: true });
+  await expect(builds).toBeEnabled();
+  await expect(builds).toHaveValue("");
+  await expect(builds.locator('option[value=""]')).toHaveJSProperty(
+    "disabled",
+    true,
+  );
+  await expect(next).toBeDisabled();
+  await builds.selectOption("151");
+  await expect(next).toBeEnabled();
+  await versions.selectOption("1.20.1");
+  await expect(builds.locator('option[value="196"]')).toHaveCount(1);
+  await expect(builds).toHaveValue("");
+  await expect(next).toBeDisabled();
+  await builds.selectOption("196");
+  await expect(next).toBeEnabled();
+  await dialog.getByRole("button", { name: "Back", exact: true }).click();
+  await dialog.getByRole("button", { name: /Paper/ }).click();
+  await expect(builds.locator('option[value="151"]')).toHaveCount(1);
+  await expect(builds).toHaveValue("");
+  await expect(next).toBeDisabled();
+  expect(setup.preflightRequests).toEqual([]);
+  expect(setup.mutations).toEqual([]);
+});
+
+test("Java choices group duplicate installations by major and review uses the newest refreshed executable", async ({
   page,
   setup,
 }) => {
@@ -364,7 +421,7 @@ test("Java selection uses only detected compatible executables and refresh prese
         installations: refreshed
           ? [...javaInstallations, newlyInstalled]
           : javaInstallations,
-        recommendedPath: refreshed ? newlyInstalled.path : java.path,
+        recommendedPath: refreshed ? newlyInstalled.path : alternateJavaPath,
       },
     });
   });
@@ -376,33 +433,32 @@ test("Java selection uses only detected compatible executables and refresh prese
     exact: true,
   });
   await expect(chooser).toBeVisible();
-  await expect(chooser).toHaveValue(java.path);
+  await expect(chooser).toHaveValue("21");
   expect(
-    await chooser
-      .locator("option")
-      .evaluateAll((options) =>
-        options
-          .filter((option) => !(option as HTMLOptionElement).disabled)
-          .map((option) => (option as HTMLOptionElement).value),
-      ),
-  ).toEqual(javaInstallations.map((item) => item.path));
-  await expect(
-    chooser.locator("option", { hasText: staleJavaPath }),
-  ).toHaveCount(0);
+    await chooser.locator("option").evaluateAll((options) =>
+      options
+        .filter((option) => !(option as HTMLOptionElement).disabled)
+        .map((option) => ({
+          value: (option as HTMLOptionElement).value,
+          label: option.textContent,
+        })),
+    ),
+  ).toEqual([{ value: "21", label: "JAVA 21" }]);
+  await expect(dialog).not.toContainText(java.path);
+  await expect(dialog).not.toContainText(alternateJavaPath);
+  await expect(dialog).not.toContainText(staleJavaPath);
   expect(setup.javaRequests.at(-1)?.get("gameVersion")).toBe("1.21.1");
   expect(setup.javaRequests.at(-1)?.get("provider")).toBe("paper");
   expect(setup.javaRequests.at(-1)?.get("requiredJavaVersion")).toBe("21");
-  await chooser.selectOption(alternateJavaPath);
   await dialog
     .getByRole("button", { name: "Refresh Java", exact: true })
     .click();
-  await expect(
-    chooser.locator("option", { hasText: newlyInstalled.path }),
-  ).toHaveCount(1);
-  await expect(chooser).toHaveValue(alternateJavaPath);
-  await configure(page, setup, "Compatible Java world", alternateJavaPath);
+  await expect(chooser.locator("option:not([disabled])")).toHaveCount(1);
+  await expect(chooser).toHaveValue("21");
+  await expect(chooser).toBeEnabled();
+  await configure(page, setup, "Compatible Java world");
   expect(setup.preflightRequests.at(-1)).toMatchObject({
-    javaPath: alternateJavaPath,
+    javaPath: newlyInstalled.path,
     gameVersion: "1.21.1",
     requiredJavaVersion: 21,
   });
@@ -451,7 +507,7 @@ test("missing compatible Java blocks review until a refreshed scan finds an inst
   await dialog
     .getByRole("button", { name: "Refresh Java", exact: true })
     .click();
-  await expect(chooser).toHaveValue(java.path);
+  await expect(chooser).toHaveValue("21");
   await configure(page, setup, "New Java installation");
   expect(setup.preflightRequests).toHaveLength(1);
   expect(setup.preflightRequests[0].javaPath).toBe(java.path);
@@ -555,16 +611,7 @@ test("confirmed software creation retries installation on the same stopped serve
   });
   await openCreate(page);
   await choosePaper(page);
-  await page
-    .getByRole("dialog")
-    .getByRole("combobox", { name: "Java executable", exact: true })
-    .selectOption(alternateJavaPath);
-  const dialog = await configure(
-    page,
-    setup,
-    "Guided Paper world",
-    alternateJavaPath,
-  );
+  const dialog = await configure(page, setup, "Guided Paper world");
   await expect(dialog).toContainText("Paper");
   await expect(dialog).toContainText("1.21.1");
   await page.screenshot({
@@ -605,7 +652,7 @@ test("confirmed software creation retries installation on the same stopped serve
       memoryLimitMB: 4096,
       port: setup.port,
       mode: "live",
-      javaPath: alternateJavaPath,
+      javaPath: java.path,
     },
   });
   expect(installs).toHaveLength(2);
@@ -616,6 +663,7 @@ test("confirmed software creation retries installation on the same stopped serve
       version: "1.21.1",
       build: "151",
       confirmed: true,
+      cleanInstall: true,
     });
   }
   expect(setup.mutations.some((url) => url.endsWith("/power"))).toBe(false);
@@ -645,7 +693,7 @@ test("mobile software review stays within the viewport and can be cancelled with
   await choosePaper(page);
   await expect(
     page.getByRole("combobox", { name: "Java executable", exact: true }),
-  ).toHaveValue(java.path);
+  ).toHaveValue("21");
   expect(
     await page.evaluate(
       () => document.documentElement.scrollWidth - window.innerWidth,
@@ -810,6 +858,14 @@ test("modpack creation reviews an exact release and scopes runtime and pack inst
     expiresAt: "2099-01-01T00:00:00Z",
     files: [{ path: "mods/adventures.jar", size: 2048, action: "install" }],
     warnings: [],
+    cleanInstall: true,
+    summary: { fileCount: 1, totalBytes: 2048 },
+    runtime: {
+      provider: "fabric",
+      version: "1.21.1",
+      build: "0.16.10",
+      software: "Fabric",
+    },
     loaderInstall: {
       loader: "fabric",
       gameVersion: "1.21.1",
@@ -890,8 +946,10 @@ test("modpack creation reviews an exact release and scopes runtime and pack inst
   await dialog.getByRole("button", { name: "Continue", exact: true }).click();
   await configure(page, setup, "Guided adventure pack");
   await expect(dialog).toContainText("Test Adventures");
-  await dialog.getByText("1 modpack files to install", { exact: true }).click();
-  await expect(dialog).toContainText("mods/adventures.jar");
+  await expect(dialog).not.toContainText("mods/adventures.jar");
+  await expect(
+    dialog.getByRole("list", { name: "Modpack installation files" }),
+  ).toHaveCount(0);
   await page.screenshot({
     path: testInfo.outputPath("modpack-install-review.png"),
     fullPage: true,
@@ -903,22 +961,17 @@ test("modpack creation reviews an exact release and scopes runtime and pack inst
     dialog.getByRole("button", { name: "Open Console", exact: true }),
   ).toBeEnabled();
   expect(setup.created).toHaveLength(1);
-  expect(scopedRequests.length).toBeGreaterThanOrEqual(3);
+  expect(scopedRequests.length).toBeGreaterThanOrEqual(2);
   for (const call of scopedRequests) {
     expect(call.serverId).toBe(setup.created[0].id);
     expect(call.serverId).not.toBe(existingId);
   }
   expect(
     scopedRequests.find((call) => call.path === "/api/versions/install")?.body,
-  ).toMatchObject({
-    provider: "fabric",
-    version: "1.21.1",
-    build: "0.16.10",
-    confirmed: true,
-  });
+  ).toBeUndefined();
   expect(
     scopedRequests.find((call) => call.path === "/api/launchpad/install")?.body,
-  ).toMatchObject({ planId: plan.planId, confirmed: true });
+  ).toMatchObject({ planId: plan.planId, confirmed: true, cleanInstall: true });
   expect(setup.mutations.some((url) => url.endsWith("/power"))).toBe(false);
   await assertStopped(request, setup.created[0].id);
   const currentSettings = await (

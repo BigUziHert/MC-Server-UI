@@ -1,6 +1,7 @@
 import fs from "node:fs/promises";
 import path from "node:path";
-import { randomUUID, createHash } from "node:crypto";
+import { randomUUID } from "node:crypto";
+import { cleanInstall, prepareCleanSettings } from "./clean-install.mjs";
 import { createVersionsService } from "./versions.mjs";
 import { createPropertiesService } from "./properties.mjs";
 import { createLaunchpad, providerJson } from "./launchpad.mjs";
@@ -8,153 +9,50 @@ import { createExtraProviders } from "./launchpad-extra.mjs";
 
 const fail = (status, message) => Object.assign(new Error(message), { status });
 const missing = (cause) => cause.code === "ENOENT";
-const digest = (buffer) => createHash("sha256").update(buffer).digest("hex");
-async function statOrNull(target) {
-  try {
-    return await fs.lstat(target);
-  } catch (cause) {
-    if (missing(cause)) return null;
-    throw cause;
-  }
-}
-function relativeFile(value) {
-  if (
-    typeof value !== "string" ||
-    !value ||
-    value.includes("\\") ||
-    value
-      .split("/")
-      .some(
-        (part) =>
-          !part || part === "." || part === ".." || /[:\x00-\x1f]/.test(part),
-      ) ||
-    path.isAbsolute(value)
-  )
-    throw fail(400, "The installer returned an invalid file path.");
-  return value;
-}
-
-// Copy a verified installer result into one server. Every replaced file is
-// retained in Recycle Bin; a failed promotion restores the previous runtime.
+// Every runtime installation replaces the whole server folder. The registered
+// name, port, memory and Java selection remain panel settings.
 export async function promoteVersion(result, ctx) {
-  const originals = [],
-    written = [],
-    seen = new Set();
-  const candidates = [];
-  for (const entry of result.files) {
-    const relative = relativeFile(entry.path),
-      folded = process.platform === "win32" ? relative.toLowerCase() : relative;
-    if (seen.has(folded))
-      throw fail(400, "The installer returned duplicate file paths.");
-    seen.add(folded);
-    const source = await ctx.safePath(result.stageDir, relative),
-      target = await ctx.safePath(ctx.serverDir, relative);
-    const sourceStat = await fs.lstat(source),
-      previous = await statOrNull(target);
-    if (
-      !sourceStat.isFile() ||
-      sourceStat.isSymbolicLink() ||
-      (previous && (!previous.isFile() || previous.isSymbolicLink()))
-    )
-      throw fail(
-        409,
-        `Cannot install over ${relative}. Choose a regular server file.`,
-      );
-    if (previous && entry.preserveExisting) continue;
-    candidates.push({
-      relative,
-      source,
-      previous,
-      mode: sourceStat.mode,
-      hash: previous ? digest(await fs.readFile(target)) : null,
-    });
-  }
-  try {
-    for (const file of candidates) {
-      ctx.onProgress?.({ message: `Installing ${file.relative}…` });
-      const target = await ctx.safePath(ctx.serverDir, file.relative);
-      const present = await statOrNull(target);
-      if ((present ? digest(await fs.readFile(target)) : null) !== file.hash)
-        throw fail(
-          409,
-          `${file.relative} changed during installation. Retry after the external file edit finishes.`,
-        );
-      if (present)
-        originals.push({
-          path: file.relative,
-          ...(await ctx.recycle(file.relative)),
-        });
-      const parent = path.posix.dirname(file.relative);
-      await fs.mkdir(
-        await ctx.safePath(ctx.serverDir, parent === "." ? "" : parent),
-        { recursive: true },
-      );
-      const destination = await ctx.safePath(ctx.serverDir, file.relative);
-      const output = await fs.open(destination, "wx");
-      const identity = await output.stat();
-      written.push({
-        path: file.relative,
-        ino: identity.ino,
-        dev: identity.dev,
+  const {
+    status: _status,
+    address: _address,
+    ...previousConfiguration
+  } = ctx.getConfiguration();
+  const previousInstalled = ctx.snapshotInstalled?.();
+  let configured = false;
+  await prepareCleanSettings(result, ctx);
+  return cleanInstall(result, {
+    ...ctx,
+    commit: async () => {
+      configured = true;
+      await ctx.applyConfiguration({
+        ...result.configuration,
+        mode: "live",
+        minecraftVersion: result.summary.version,
       });
-      try {
-        const input = await fs.open(
-          await ctx.safePath(result.stageDir, file.relative),
-          "r",
-        );
+      await ctx.clearInstalled?.();
+    },
+    rollback: async () => {
+      const failures = [];
+      if (configured)
         try {
-          for await (const chunk of input.createReadStream({
-            autoClose: false,
-          }))
-            await output.writeFile(chunk);
-          await output.sync();
-          if (process.platform !== "win32")
-            await output.chmod(file.mode & 0o777);
-        } finally {
-          await input.close();
+          await ctx.applyConfiguration(previousConfiguration);
+        } catch (cause) {
+          failures.push(cause);
         }
-      } finally {
-        await output.close();
-      }
-    }
-    await ctx.applyConfiguration({
-      ...result.configuration,
-      mode: "live",
-      minecraftVersion: result.summary.version,
-    });
-  } catch (cause) {
-    const failures = [];
-    for (const entry of written.reverse()) {
-      try {
-        const current = await fs.lstat(
-          await ctx.safePath(ctx.serverDir, entry.path),
+      if (previousInstalled)
+        try {
+          await ctx.restoreInstalled?.(previousInstalled);
+        } catch (cause) {
+          failures.push(cause);
+        }
+      if (failures.length)
+        throw new AggregateError(
+          failures,
+          "Server settings could not be fully restored.",
         );
-        if (
-          !current.isFile() ||
-          current.isSymbolicLink() ||
-          current.ino !== entry.ino ||
-          current.dev !== entry.dev
-        )
-          throw fail(409, "The file was externally replaced.");
-        await ctx.recycle(entry.path);
-      } catch {
-        failures.push(entry.path);
-      }
-    }
-    for (const entry of originals.reverse()) {
-      try {
-        await ctx.restore(entry.id);
-      } catch {
-        failures.push(entry.path);
-      }
-    }
-    throw fail(
-      cause.status ?? 500,
-      `${cause.message} ${failures.length ? `Restore these originals from Recycle Bin: ${[...new Set(failures)].join(", ")}.` : "Previous server files were restored."}`,
-    );
-  }
+    },
+  });
 }
-
 export async function createMinecraft(ctx) {
   const catalogLifetime = new AbortController();
   const request = ctx.fetch ?? fetch;
@@ -228,6 +126,7 @@ export async function createMinecraft(ctx) {
     }));
   const launchpad = await createLaunchpad({
     ...ctx,
+    versionsService: versions,
     fetch: catalogFetch,
     platformConfig,
     extraProviders: extras,
@@ -246,6 +145,11 @@ export async function createMinecraft(ctx) {
     if (closing) throw fail(503, "Minecraft management is shutting down.");
     if (input?.confirmed !== true)
       throw fail(400, "Review and confirm the selected server build first.");
+    if (input.cleanInstall !== true)
+      throw fail(
+        400,
+        "Confirm the clean installation: all current server files, including worlds, mods and configuration, will be removed.",
+      );
     const selection = {
       provider: input.provider,
       version: input.version,
@@ -278,17 +182,22 @@ export async function createMinecraft(ctx) {
             409,
             "Installation cancelled while the panel was closing.",
           );
-        await promoteVersion(result, {
+        const recovery = await promoteVersion(result, {
           ...ctx,
+          signal: controller.signal,
+          snapshotInstalled: launchpad.snapshotInstalled,
+          clearInstalled: launchpad.clearInstalled,
+          restoreInstalled: launchpad.restoreInstalled,
           onProgress: (progress) => {
             job.message = progress.message;
           },
         });
+        Object.assign(job, recovery);
         await ctx
           .audit(
             "server",
             "Server version installed",
-            `${result.summary.provider} ${result.summary.version}, build ${result.summary.build}. Replaced files are retained in Recycle Bin.`,
+            `${result.summary.provider} ${result.summary.version}, build ${result.summary.build}. Clean installation; previous server files are retained in Recycle Bin.`,
           )
           .catch(() => {});
         return {
@@ -353,6 +262,7 @@ export async function createMinecraft(ctx) {
           providers: versions.listProviders(),
           current: await ctx.getServer(),
           job: lastJob ? jobs.get(lastJob) : null,
+          cleanInstall: true,
         }),
       ),
     );

@@ -4,6 +4,9 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { createPanel, createFleet } from "./index.mjs";
+import { promoteVersion } from "./minecraft.mjs";
+import { createRecycleBin } from "./recycle-bin.mjs";
+import { containedSourcePath } from "./import.mjs";
 
 const json = (method, body) => ({ method, body: JSON.stringify(body) });
 const selection = {
@@ -11,6 +14,7 @@ const selection = {
   version: "1.21.1",
   build: "12",
   confirmed: true,
+  cleanInstall: true,
 };
 const gate = () => {
   let resolve;
@@ -162,7 +166,7 @@ async function install(f, id) {
   });
 }
 
-test("version jobs promote only selected software, retain original files in Recycle Bin, and persist fleet metadata", async (t) => {
+test("version jobs clean the entire selected server folder, retain recovery files, and persist fleet metadata", async (t) => {
   const f = await fixture(t, { fleet: true });
   const before = await fs.readFile(path.join(f.serverDir, "server.properties"));
   const result = await install(f);
@@ -173,19 +177,24 @@ test("version jobs promote only selected software, retain original files in Recy
   );
   assert.equal(
     await fs.readFile(path.join(f.serverDir, "user_jvm_args.txt"), "utf8"),
-    "-Xms6G -Xmx12G\n",
+    "installer defaults",
   );
-  assert.equal(
-    await fs.readFile(path.join(f.serverDir, "world", "level.dat"), "utf8"),
-    "precious world",
-  );
-  assert.deepEqual(
+  await assert.rejects(fs.stat(path.join(f.serverDir, "world")), {
+    code: "ENOENT",
+  });
+  assert.notDeepEqual(
     await fs.readFile(path.join(f.serverDir, "server.properties")),
     before,
   );
   const recycled = (await f.request("/api/files/recycle-bin")).body.items;
-  assert.equal(recycled.length, 1);
-  assert.equal(recycled[0].originalPath, "server.jar");
+  for (const name of [
+    "world",
+    "server.jar",
+    "server.properties",
+    "user_jvm_args.txt",
+  ])
+    assert.ok(recycled.some((item) => item.originalPath === name));
+  assert.match(result.backupPath, /recycle-bin$/);
   assert.equal((await f.request("/api/versions")).body.job.id, result.id);
   await f.restart();
   const current = (await f.request("/api/server")).body;
@@ -320,15 +329,22 @@ test("queued installations hold server power, file, settings and backup locks un
 });
 
 test("a failed registry application rolls replaced files back and retains the former startup configuration", async (t) => {
+  let attempts = 0;
   const f = await fixture(t, {
     persistMinecraftConfiguration: async () => {
-      throw Object.assign(new Error("fixture registry failure"), {
-        status: 409,
-      });
+      if (++attempts === 1)
+        throw Object.assign(new Error("fixture registry failure"), {
+          status: 409,
+        });
     },
   });
   const result = await install(f);
   assert.equal(result.state, "failed");
+  assert.equal(
+    attempts,
+    2,
+    "configuration rollback reaches registry persistence",
+  );
   assert.match(
     result.error,
     /fixture registry failure.*Previous server files were restored/,
@@ -359,7 +375,7 @@ test("malformed or duplicate promotion paths fail before replacing any source fi
     });
     const result = await install(f);
     assert.equal(result.state, "failed", bad);
-    assert.match(result.error, /invalid file path|duplicate file paths/);
+    assert.match(result.error, /invalid file path|conflicting file paths/);
     assert.equal(
       await fs.readFile(path.join(f.serverDir, "server.jar"), "utf8"),
       "original JAR",
@@ -373,6 +389,15 @@ test("malformed or duplicate promotion paths fail before replacing any source fi
 
 test("version installation requires explicit confirmation and a stopped server", async (t) => {
   const f = await fixture(t, { mode: "demo" });
+  assert.equal(
+    (
+      await f.request(
+        "/api/versions/install",
+        json("POST", { ...selection, cleanInstall: false }),
+      )
+    ).status,
+    400,
+  );
   assert.equal(
     (
       await f.request(
@@ -452,6 +477,60 @@ test("closing aborts a staged installer and waits without promoting its partial 
   await started.promise;
   await f.close();
   assert.equal(aborted, true);
+  assert.equal(
+    await fs.readFile(path.join(f.serverDir, "server.jar"), "utf8"),
+    "original JAR",
+  );
+});
+
+test("partial configuration failures roll back settings and receipts independently", async (t) => {
+  const f = await fixture(t);
+  const stage = path.join(f.root, "promotion-test");
+  await fs.mkdir(stage);
+  const result = await makeStage({ stageDir: stage });
+  const safePath = (root, relative = "") =>
+    relative ? containedSourcePath(root, relative) : fs.realpath(root);
+  const bin = await createRecycleBin({
+    dataDir: f.root,
+    serverDir: f.serverDir,
+    safePath,
+  });
+  let configuration = {
+    software: "Previous",
+    port: 25565,
+    memoryLimitMB: 4096,
+  };
+  let applies = 0,
+    restores = 0;
+  await assert.rejects(
+    promoteVersion(result, {
+      serverDir: f.serverDir,
+      dataDir: f.root,
+      safePath,
+      getConfiguration: () => configuration,
+      applyConfiguration: async (value) => {
+        configuration = value;
+        if (++applies === 1)
+          throw new Error("failed after configuration changed");
+        throw new Error("restore persisted but refresh failed");
+      },
+      snapshotInstalled: () => [{ title: "Previous pack" }],
+      restoreInstalled: async (value) => {
+        assert.equal(value[0].title, "Previous pack");
+        restores++;
+      },
+      recycle: (name) => bin.recycle(name),
+      restore: (id) => bin.restore(id),
+    }),
+    /failed after configuration changed.*Recovery needs attention for server settings/,
+  );
+  assert.equal(applies, 2);
+  assert.equal(configuration.software, "Previous");
+  assert.equal(
+    restores,
+    1,
+    "receipt rollback still runs when configuration rollback throws",
+  );
   assert.equal(
     await fs.readFile(path.join(f.serverDir, "server.jar"), "utf8"),
     "original JAR",

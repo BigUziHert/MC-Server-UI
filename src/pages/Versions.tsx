@@ -267,6 +267,7 @@ export default function Versions({ notify }: PageProps) {
         version,
         build: confirming.id,
         confirmed: true,
+        cleanInstall: true,
       });
       if (token === generation.current) {
         setJob(result);
@@ -338,7 +339,7 @@ export default function Versions({ notify }: PageProps) {
             {current.status}
           </span>
           <span className="versions-current-hint">
-            Installs preserve your world and existing JVM settings.
+            Version installs replace all files in the server folder.
           </span>
         </section>
       )}
@@ -669,18 +670,17 @@ export default function Versions({ notify }: PageProps) {
           </button>
         </div>
         <p className="management-dialog-description">
-          Install {selected?.name} {version}, {confirming?.label}. This updates
-          server software and startup settings. Your world, mods, plugins, and
-          existing JVM settings stay in place. The next Start runs real server
-          software.
+          Install {selected?.name} {version}, {confirming?.label}. The server
+          will remain stopped when installation finishes.
         </p>
-        <div className="management-notice">
-          <Info size={18} />
+        <div className="management-notice warning">
+          <AlertCircle size={18} />
           <div>
-            <strong>Check compatibility before changing versions</strong>
+            <strong>This replaces the server folder’s contents</strong>
             <p>
-              Keep a backup of your world. Mods and plugins must support the
-              selected software and Minecraft release.
+              All current files will be removed, including worlds, mods, plugins
+              and settings. The selected software will be installed into a clean
+              folder.
               {confirming && !confirming.stable
                 ? " This is an experimental build."
                 : ""}
@@ -693,7 +693,7 @@ export default function Versions({ notify }: PageProps) {
             checked={accepted}
             onChange={(event) => setAccepted(event.target.checked)}
           />{" "}
-          I’m ready to install this version on the selected server.
+          I understand this replaces all files in this server’s folder.
         </label>
         {dialogError && (
           <p className="management-form-error" role="alert">

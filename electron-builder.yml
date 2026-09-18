@@ -17,6 +17,8 @@ files:
   - server/recycle-bin.mjs
   - server/player-history.mjs
   - server/minecraft.mjs
+  - server/clean-install.mjs
+  - server/launchpad-pack-runtime.mjs
   - server/properties.mjs
   - server/versions.mjs
   - server/launchpad.mjs

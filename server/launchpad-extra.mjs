@@ -1015,10 +1015,7 @@ export function createExtraProviders({ fetch: request = fetch, json } = {}) {
         title: pack.title,
         versionName: pack.version,
         archive: { format: "server-zip", ...archive },
-        warnings: [
-          pinWarning,
-          "Use the Forge build required by this pack before starting. Review included startup files and configuration changes.",
-        ],
+        warnings: [pinWarning],
       };
     },
   };

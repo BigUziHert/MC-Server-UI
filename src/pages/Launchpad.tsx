@@ -114,6 +114,14 @@ type Plan = {
     previousPath?: string;
   }[];
   warnings: string[];
+  cleanInstall?: boolean;
+  summary?: { fileCount: number; totalBytes: number };
+  runtime?: {
+    provider: string;
+    version: string;
+    build: string;
+    software: string;
+  };
   unavailableDependencies?: {
     platform: string;
     projectId?: string;
@@ -380,6 +388,7 @@ export default function Launchpad({ notify }: PageProps) {
   const [targetVersion, setTargetVersion] = useState("");
   const [targetLoader, setTargetLoader] = useState("");
   const [plan, setPlan] = useState<Plan | null>(null);
+  const [cleanAccepted, setCleanAccepted] = useState(false);
   const [dialogError, setDialogError] = useState("");
   const [removal, setRemoval] = useState<InstalledItem | null>(null);
   const [removalPlan, setRemovalPlan] = useState<RemovalPlan | null>(null);
@@ -840,6 +849,7 @@ export default function Launchpad({ notify }: PageProps) {
     operation.current++;
     setDialogError("");
     setPlan(null);
+    setCleanAccepted(false);
     setTargetVersion(contentGameVersion);
     setTargetLoader(contentLoader);
     setSelection({ project, installed: entry });
@@ -849,6 +859,7 @@ export default function Launchpad({ notify }: PageProps) {
     operation.current++;
     setSelection(null);
     setPlan(null);
+    setCleanAccepted(false);
     setDialogError("");
     pending.current = false;
     setBusy(null);
@@ -960,6 +971,7 @@ export default function Launchpad({ notify }: PageProps) {
     }
     const currentSession = session.current,
       currentOperation = operation.current;
+    setCleanAccepted(false);
     pending.current = true;
     setBusy("preview");
     setDialogError("");
@@ -998,6 +1010,7 @@ export default function Launchpad({ notify }: PageProps) {
   }
   async function install() {
     if (!plan || pending.current) return;
+    if ((type === "modpack" || plan.cleanInstall) && !cleanAccepted) return;
     if (!canInstall) {
       setDialogError("Stop the server in Console before installing.");
       return;
@@ -1011,6 +1024,9 @@ export default function Launchpad({ notify }: PageProps) {
       const next = await post<{ job: Job }>("/launchpad/install", {
         planId: plan.planId,
         confirmed: true,
+        ...(type === "modpack" || plan.cleanInstall
+          ? { cleanInstall: true }
+          : {}),
         ...(plan.unavailableDependencies?.length
           ? { acknowledgedUnavailableDependencies: true }
           : {}),
@@ -1838,7 +1854,13 @@ export default function Launchpad({ notify }: PageProps) {
           </h2>
           <div className="launchpad-step">
             <span>Step {plan ? "2" : "1"} of 2</span>
-            <span>{plan ? "Review file changes" : "Select a version"}</span>
+            <span>
+              {plan
+                ? type === "modpack"
+                  ? "Review modpack"
+                  : "Review file changes"
+                : "Select a version"}
+            </span>
           </div>
           <p className="management-dialog-description">
             {selection?.project.title}
@@ -1945,7 +1967,12 @@ export default function Launchpad({ notify }: PageProps) {
           ) : (
             <>
               <p className="management-dialog-description">
-                {plan.files.length ? (
+                {type === "modpack" ? (
+                  <>
+                    <strong>{plan.versionName}</strong> will be installed into a
+                    clean server folder. The server will remain stopped.
+                  </>
+                ) : plan.files.length ? (
                   <>
                     <strong>{plan.versionName}</strong> will make these changes
                     to this server. The server will remain stopped.
@@ -1957,57 +1984,99 @@ export default function Launchpad({ notify }: PageProps) {
                   </>
                 )}
               </p>
-              {(plan.files.length > 0 ||
-                Boolean(plan.bundledDependencies?.length)) && (
-                <ul
-                  className="launchpad-review-files"
-                  aria-label="Installation files"
-                  tabIndex={0}
+              {type === "modpack" && (
+                <div
+                  className="launchpad-pack-summary"
+                  role="group"
+                  aria-label="Modpack installation summary"
                 >
-                  {plan.files.map((file) => (
-                    <li key={file.path}>
-                      <span>
-                        {file.path}
-                        {file.previousPath &&
-                          file.previousPath !== file.path && (
-                            <small className="launchpad-previous-path">
-                              Replaces {file.previousPath}
-                            </small>
-                          )}
-                      </span>
-                      <span
-                        className={`launchpad-badge ${file.action === "replace" ? "update" : ""}`}
-                      >
-                        {file.action === "replace" ? "Replace" : "Install"}
-                      </span>
-                      <span>{formatBytes(file.size)}</span>
-                    </li>
-                  ))}
-                  {plan.bundledDependencies?.map((dependency, index) => (
-                    <li
-                      key={`bundled:${dependency.bundledWith}:${dependency.path}:${index}`}
-                    >
-                      <span>
-                        {dependency.title}
-                        {dependency.version ? ` ${dependency.version}` : ""}
-                        <small className="launchpad-previous-path">
-                          Included in{" "}
-                          {dependency.bundledWith.split(/[\\/]/).pop()}
-                          {dependency.serverCompatible === false
-                            ? " · Not active on the server"
-                            : ""}
-                        </small>
-                      </span>
-                      <span className="launchpad-badge">Included</span>
-                    </li>
-                  ))}
-                </ul>
+                  <span>
+                    <strong>
+                      {plan.summary?.fileCount ?? plan.files.length}
+                    </strong>{" "}
+                    files
+                  </span>
+                  <span>
+                    <strong>
+                      {formatBytes(
+                        plan.summary?.totalBytes ??
+                          plan.files.reduce(
+                            (total, file) => total + file.size,
+                            0,
+                          ),
+                      )}
+                    </strong>{" "}
+                    download
+                  </span>
+                  {plan.runtime && (
+                    <span className="launchpad-pack-runtime">
+                      <strong>
+                        {plan.runtime.software ||
+                          loaderName(plan.runtime.provider)}
+                      </strong>{" "}
+                      {plan.runtime.version} · Build {plan.runtime.build}
+                    </span>
+                  )}
+                </div>
               )}
-              {plan.warnings.map((warning) => (
-                <p className="launchpad-review-warning" key={warning}>
-                  {warning}
-                </p>
-              ))}
+              {type !== "modpack" &&
+                (plan.files.length > 0 ||
+                  Boolean(plan.bundledDependencies?.length)) && (
+                  <ul
+                    className="launchpad-review-files"
+                    aria-label="Installation files"
+                    tabIndex={0}
+                  >
+                    {plan.files.map((file) => (
+                      <li key={file.path}>
+                        <span>
+                          {file.path}
+                          {file.previousPath &&
+                            file.previousPath !== file.path && (
+                              <small className="launchpad-previous-path">
+                                Replaces {file.previousPath}
+                              </small>
+                            )}
+                        </span>
+                        <span
+                          className={`launchpad-badge ${file.action === "replace" ? "update" : ""}`}
+                        >
+                          {file.action === "replace" ? "Replace" : "Install"}
+                        </span>
+                        <span>{formatBytes(file.size)}</span>
+                      </li>
+                    ))}
+                    {plan.bundledDependencies?.map((dependency, index) => (
+                      <li
+                        key={`bundled:${dependency.bundledWith}:${dependency.path}:${index}`}
+                      >
+                        <span>
+                          {dependency.title}
+                          {dependency.version ? ` ${dependency.version}` : ""}
+                          <small className="launchpad-previous-path">
+                            Included in{" "}
+                            {dependency.bundledWith.split(/[\\/]/).pop()}
+                            {dependency.serverCompatible === false
+                              ? " · Not active on the server"
+                              : ""}
+                          </small>
+                        </span>
+                        <span className="launchpad-badge">Included</span>
+                      </li>
+                    ))}
+                  </ul>
+                )}
+              {plan.warnings
+                .filter(
+                  (warning) =>
+                    type !== "modpack" ||
+                    !/^(?:Skipped |Preserved server data:)/i.test(warning),
+                )
+                .map((warning) => (
+                  <p className="launchpad-review-warning" key={warning}>
+                    {warning}
+                  </p>
+                ))}
               {Boolean(plan.unavailableDependencies?.length) && (
                 <div className="launchpad-inline-notice launchpad-dependency-notice">
                   <AlertCircle size={17} />
@@ -2028,16 +2097,20 @@ export default function Launchpad({ notify }: PageProps) {
                           </p>
                         ),
                     )}
-                    {Boolean(plan.bundledDependencies?.length) && (
-                      <p>
-                        The libraries marked Included are packaged in the
-                        download, but we couldn’t match them to the missing
-                        catalog entry.
-                      </p>
-                    )}
+                    {type !== "modpack" &&
+                      Boolean(plan.bundledDependencies?.length) && (
+                        <p>
+                          The libraries marked Included are packaged in the
+                          download, but we couldn’t match them to the missing
+                          catalog entry.
+                        </p>
+                      )}
                     <p>
-                      Choose Install anyway to install the files listed above,
-                      or Cancel to check the mod author’s requirements first.
+                      Choose Install anyway to{" "}
+                      {type === "modpack"
+                        ? "install this modpack"
+                        : "install the files listed above"}
+                      , or Cancel to check the mod author’s requirements first.
                     </p>
                     <details className="launchpad-dependency-details">
                       <summary>Technical details</summary>
@@ -2065,7 +2138,7 @@ export default function Launchpad({ notify }: PageProps) {
                   </div>
                 </div>
               )}
-              {plan.files.length > 0 && (
+              {type !== "modpack" && plan.files.length > 0 && (
                 <p className="management-dialog-description">
                   Review {plan.files.length} file
                   {plan.files.length === 1 ? "" : "s"}
@@ -2074,6 +2147,35 @@ export default function Launchpad({ notify }: PageProps) {
                     : ""}{" "}
                   before continuing.
                 </p>
+              )}
+              {(type === "modpack" || plan.cleanInstall) && (
+                <>
+                  <div className="launchpad-inline-notice launchpad-clean-warning">
+                    <AlertCircle size={17} />
+                    <div>
+                      <strong>
+                        This replaces the server folder’s contents
+                      </strong>
+                      <p>
+                        All current files will be removed, including worlds,
+                        mods, plugins and settings. The modpack and its required
+                        server software will be installed into a clean folder.
+                      </p>
+                    </div>
+                  </div>
+                  <label className="launchpad-clean-confirm">
+                    <input
+                      type="checkbox"
+                      checked={cleanAccepted}
+                      disabled={Boolean(busy)}
+                      onChange={(event) =>
+                        setCleanAccepted(event.target.checked)
+                      }
+                    />
+                    I understand this replaces all files in this server’s
+                    folder.
+                  </label>
+                </>
               )}
             </>
           )}
@@ -2107,6 +2209,7 @@ export default function Launchpad({ notify }: PageProps) {
                   disabled={Boolean(busy)}
                   onClick={() => {
                     setPlan(null);
+                    setCleanAccepted(false);
                     setDialogError("");
                   }}
                 >
@@ -2116,7 +2219,11 @@ export default function Launchpad({ notify }: PageProps) {
                   type="button"
                   className="btn primary"
                   disabled={
-                    Boolean(busy) || !canInstall || plan.files.length === 0
+                    Boolean(busy) ||
+                    !canInstall ||
+                    (type !== "modpack" && plan.files.length === 0) ||
+                    ((type === "modpack" || plan.cleanInstall) &&
+                      !cleanAccepted)
                   }
                   onClick={() => void install()}
                 >
@@ -2127,7 +2234,7 @@ export default function Launchpad({ notify }: PageProps) {
                   )}
                   {busy === "install"
                     ? "Starting installation..."
-                    : plan.files.length === 0
+                    : type !== "modpack" && plan.files.length === 0
                       ? "Already up to date"
                       : plan.unavailableDependencies?.length
                         ? "Install anyway"
