@@ -1246,8 +1246,8 @@ export async function createPanel(options = {}) {
     fetch: options.catalogFetch,
     extraProviders: options.extraProviders,
     getConfiguration: () => ({ ...configuration, status }),
-    getServer: async () => {
-      await refreshStartupMetadata();
+    getServer: async ({ refresh = false } = {}) => {
+      await refreshStartupMetadata(refresh);
       const software = startupMetadata.software,
         version = startupMetadata.version;
       const loader =

@@ -39,6 +39,18 @@ type Current = {
   status: string;
   mode: string;
 };
+type RuntimeUpdate = {
+  available: boolean;
+  provider: string | null;
+  gameVersion: string | null;
+  build: string | null;
+};
+type Catalog = {
+  providers: Provider[];
+  current?: Current;
+  runtimeUpdate?: RuntimeUpdate;
+  job?: Job | null;
+};
 type Job = {
   id: string;
   state: "queued" | "running" | "complete" | "failed";
@@ -91,6 +103,9 @@ export default function Versions({ notify }: PageProps) {
   const scope = useContext(ServerScope);
   const [providers, setProviders] = useState<Provider[]>([]);
   const [current, setCurrent] = useState<Current | null>(null);
+  const [runtimeUpdate, setRuntimeUpdate] = useState<RuntimeUpdate | null>(
+    null,
+  );
   const [selected, setSelected] = useState<Provider | null>(null);
   const [releases, setReleases] = useState<Release[]>([]);
   const [version, setVersion] = useState("");
@@ -102,12 +117,19 @@ export default function Versions({ notify }: PageProps) {
   const [error, setError] = useState("");
   const [confirming, setConfirming] = useState<Build | null>(null);
   const [accepted, setAccepted] = useState(false);
+  const [installMode, setInstallMode] = useState<"update" | "clean">("clean");
   const [submitting, setSubmitting] = useState(false);
   const [job, setJob] = useState<Job | null>(null);
   const [dialogError, setDialogError] = useState("");
   const generation = useRef(0);
   const dialog = useRef<HTMLDialogElement>(null);
   const jobBusy = job?.state === "queued" || job?.state === "running";
+  const canUpdate = Boolean(
+    runtimeUpdate?.available &&
+    runtimeUpdate.provider === selected?.id &&
+    runtimeUpdate.gameVersion === version,
+  );
+  const updating = installMode === "update";
 
   const refresh = useCallback(async () => {
     const token = ++generation.current;
@@ -115,13 +137,14 @@ export default function Versions({ notify }: PageProps) {
     setError("");
     try {
       const [catalog, server] = await Promise.all([
-        api<{ providers: Provider[]; job?: Job | null }>("/versions"),
+        api<Catalog>("/versions"),
         api<Current>("/server"),
       ]);
       if (token !== generation.current) return;
       setProviders(catalog.providers);
       setJob(catalog.job ?? null);
-      setCurrent(server);
+      setCurrent({ ...server, ...catalog.current, status: server.status });
+      setRuntimeUpdate(catalog.runtimeUpdate ?? null);
     } catch (cause) {
       if (token === generation.current)
         setError(
@@ -146,9 +169,16 @@ export default function Versions({ notify }: PageProps) {
   useEffect(() => {
     let cancelled = false;
     const timer = setInterval(() => {
-      void api<Current>("/server")
-        .then((server) => {
-          if (!cancelled) setCurrent(server);
+      void Promise.all([api<Current>("/server"), api<Catalog>("/versions")])
+        .then(([server, catalog]) => {
+          if (!cancelled) {
+            setCurrent({
+              ...server,
+              ...catalog.current,
+              status: server.status,
+            });
+            setRuntimeUpdate(catalog.runtimeUpdate ?? null);
+          }
         })
         .catch(() => {});
     }, 3000);
@@ -177,8 +207,18 @@ export default function Versions({ notify }: PageProps) {
             result.message ||
               "Server software installed. Start the server when you are ready.",
           );
-          const server = await api<Current>("/server");
-          if (!cancelled) setCurrent(server);
+          const [server, catalog] = await Promise.all([
+            api<Current>("/server"),
+            api<Catalog>("/versions"),
+          ]);
+          if (!cancelled) {
+            setCurrent({
+              ...server,
+              ...catalog.current,
+              status: server.status,
+            });
+            setRuntimeUpdate(catalog.runtimeUpdate ?? null);
+          }
         } else if (result.state === "failed")
           notify(
             result.error || result.message || "Installation failed.",
@@ -252,7 +292,7 @@ export default function Versions({ notify }: PageProps) {
     if (
       !selected ||
       !confirming ||
-      !accepted ||
+      (updating ? !canUpdate : !accepted) ||
       submitting ||
       jobBusy ||
       current?.status !== "offline"
@@ -267,7 +307,7 @@ export default function Versions({ notify }: PageProps) {
         version,
         build: confirming.id,
         confirmed: true,
-        cleanInstall: true,
+        ...(updating ? { updateRuntime: true } : { cleanInstall: true }),
       });
       if (token === generation.current) {
         setJob(result);
@@ -339,7 +379,7 @@ export default function Versions({ notify }: PageProps) {
             {current.status}
           </span>
           <span className="versions-current-hint">
-            Version installs replace all files in the server folder.
+            Runtime updates keep your files. Clean installs replace them.
           </span>
         </section>
       )}
@@ -617,11 +657,17 @@ export default function Versions({ notify }: PageProps) {
                         disabled={jobBusy || current?.status !== "offline"}
                         onClick={() => {
                           setConfirming(build);
+                          setInstallMode(canUpdate ? "update" : "clean");
                           setAccepted(false);
                           setDialogError("");
                         }}
                       >
-                        <Download size={14} /> Install
+                        {canUpdate ? (
+                          <RefreshCw size={14} />
+                        ) : (
+                          <Download size={14} />
+                        )}
+                        {canUpdate ? "Update" : "Install"}
                       </button>
                     </div>
                   ))}
@@ -659,7 +705,9 @@ export default function Versions({ notify }: PageProps) {
         }}
       >
         <div className="modal-header">
-          <h2 id="versions-install-title">Install {selected?.name}</h2>
+          <h2 id="versions-install-title">
+            {updating ? "Update" : "Install"} {selected?.name}
+          </h2>
           <button
             className="btn icon"
             aria-label="Close installation dialog"
@@ -670,31 +718,96 @@ export default function Versions({ notify }: PageProps) {
           </button>
         </div>
         <p className="management-dialog-description">
-          Install {selected?.name} {version}, {confirming?.label}. The server
-          will remain stopped when installation finishes.
+          {updating ? "Update" : "Install"} {selected?.name} {confirming?.label}{" "}
+          for Minecraft {version}. The server will remain stopped when
+          installation finishes.
         </p>
-        <div className="management-notice warning">
-          <AlertCircle size={18} />
-          <div>
-            <strong>This replaces the server folder’s contents</strong>
-            <p>
-              All current files will be removed, including worlds, mods, plugins
-              and settings. The selected software will be installed into a clean
-              folder.
-              {confirming && !confirming.stable
-                ? " This is an experimental build."
-                : ""}
-            </p>
+        {(canUpdate || updating) && (
+          <fieldset className="versions-install-mode" disabled={submitting}>
+            <legend>Installation type</legend>
+            <label>
+              <input
+                type="radio"
+                name="version-install-mode"
+                value="update"
+                checked={updating}
+                disabled={!canUpdate}
+                onChange={() => {
+                  setInstallMode("update");
+                  setAccepted(false);
+                  setDialogError("");
+                }}
+              />
+              <span>
+                <strong>Update runtime</strong>
+                <small>Keep worlds, mods, plugins and settings.</small>
+              </span>
+            </label>
+            <label>
+              <input
+                type="radio"
+                name="version-install-mode"
+                value="clean"
+                checked={!updating}
+                onChange={() => {
+                  setInstallMode("clean");
+                  setAccepted(false);
+                  setDialogError("");
+                }}
+              />
+              <span>
+                <strong>Clean install</strong>
+                <small>Replace all files in this server’s folder.</small>
+              </span>
+            </label>
+          </fieldset>
+        )}
+        {updating ? (
+          <div className="management-notice">
+            <ShieldCheck size={18} />
+            <div>
+              <strong>Your server files stay in place</strong>
+              <p>
+                Only the {selected?.name} runtime is updated. Your worlds, mods,
+                plugins, configuration and Java settings are preserved.
+                {confirming && !confirming.stable
+                  ? " This is an experimental build."
+                  : ""}
+              </p>
+            </div>
           </div>
-        </div>
-        <label className="versions-confirm">
-          <input
-            type="checkbox"
-            checked={accepted}
-            onChange={(event) => setAccepted(event.target.checked)}
-          />{" "}
-          I understand this replaces all files in this server’s folder.
-        </label>
+        ) : (
+          <>
+            <div className="management-notice warning">
+              <AlertCircle size={18} />
+              <div>
+                <strong>This replaces the server folder’s contents</strong>
+                <p>
+                  All current files will be removed, including worlds, mods,
+                  plugins and settings. The selected software will be installed
+                  into a clean folder.
+                  {confirming && !confirming.stable
+                    ? " This is an experimental build."
+                    : ""}
+                </p>
+              </div>
+            </div>
+            <label className="versions-confirm">
+              <input
+                type="checkbox"
+                checked={accepted}
+                onChange={(event) => setAccepted(event.target.checked)}
+              />{" "}
+              I understand this replaces all files in this server’s folder.
+            </label>
+          </>
+        )}
+        {updating && !canUpdate && (
+          <p className="management-form-error" role="alert">
+            The current runtime changed or could not be verified. Close this
+            dialog and review the version again.
+          </p>
+        )}
         {dialogError && (
           <p className="management-form-error" role="alert">
             {dialogError}
@@ -716,7 +829,7 @@ export default function Versions({ notify }: PageProps) {
           <button
             className="btn primary"
             disabled={
-              !accepted ||
+              (updating ? !canUpdate : !accepted) ||
               submitting ||
               jobBusy ||
               current?.status !== "offline"
@@ -728,7 +841,11 @@ export default function Versions({ notify }: PageProps) {
             ) : (
               <Download size={15} />
             )}{" "}
-            {submitting ? "Preparing…" : "Install version"}
+            {submitting
+              ? "Preparing…"
+              : updating
+                ? "Update runtime"
+                : "Install version"}
           </button>
         </div>
       </dialog>

@@ -189,6 +189,137 @@ test("Properties reports external file changes without overwriting them", async 
     ).content,
   ).toContain("# changed elsewhere");
 });
+test("Versions updates an imported NeoForge runtime without a clean install and keeps clean install explicit", async ({
+  page,
+  serverId,
+}, testInfo) => {
+  const installations: unknown[] = [];
+  let detectedProvider = "neoforge";
+  let detectedMinecraft = "1.21.1";
+  let verifiable = true;
+  await page.route("**/api/versions/install", (route) => {
+    expect(route.request().headers()["x-server-id"]).toBe(serverId);
+    installations.push(route.request().postDataJSON());
+    return route.fulfill({
+      status: 202,
+      json: { id: "runtime-update", state: "complete" },
+    });
+  });
+  await page.route("**/api/versions", (route) =>
+    route.fulfill({
+      json: {
+        providers: [
+          {
+            id: "neoforge",
+            name: "NeoForge",
+            description: "Modded Minecraft server",
+            kind: "server",
+            installable: true,
+            website: "https://neoforged.net",
+          },
+        ],
+        // Imported launchers can identify a runtime even without saved Minecraft metadata.
+        current: {
+          software: "NeoForge",
+          version: "21.1.250",
+          status: "offline",
+          mode: "live",
+        },
+        runtimeUpdate: {
+          available: verifiable,
+          provider: detectedProvider,
+          gameVersion: detectedMinecraft,
+          build: "21.1.250",
+        },
+        job: null,
+      },
+    }),
+  );
+  await page.route("**/api/versions/neoforge", (route) =>
+    route.fulfill({
+      json: { versions: [{ id: "1.21.1", label: "1.21.1", stable: true }] },
+    }),
+  );
+  await page.route("**/api/versions/neoforge/1.21.1", (route) =>
+    route.fulfill({
+      json: { builds: [{ id: "21.1.251", label: "21.1.251", stable: true }] },
+    }),
+  );
+  await page.goto("/#versions");
+  await page.getByRole("button", { name: "Choose version" }).click();
+  await page.getByRole("button", { name: "1.21.1", exact: true }).click();
+  await page.getByRole("button", { name: "Update", exact: true }).click();
+  const dialog = page.getByRole("dialog");
+  await expect(
+    dialog.getByRole("heading", { name: "Update NeoForge" }),
+  ).toBeVisible();
+  await expect(
+    dialog.getByRole("radio", { name: /Update runtime/ }),
+  ).toBeChecked();
+  await expect(dialog).toContainText("Your server files stay in place");
+  await expect(dialog).toContainText("21.1.251");
+  await expect(dialog.getByRole("checkbox")).toHaveCount(0);
+  const update = dialog.getByRole("button", {
+    name: "Update runtime",
+    exact: true,
+  });
+  await expect(update).toBeEnabled();
+  await page.screenshot({
+    path: testInfo.outputPath("runtime-update-review.png"),
+    fullPage: true,
+  });
+  await dialog.getByRole("radio", { name: /Clean install/ }).check();
+  await expect(
+    dialog.getByRole("button", { name: "Install version", exact: true }),
+  ).toBeDisabled();
+  await expect(dialog).toContainText("All current files will be removed");
+  await dialog.getByRole("checkbox").check();
+  await expect(
+    dialog.getByRole("button", { name: "Install version", exact: true }),
+  ).toBeEnabled();
+  await dialog.getByRole("radio", { name: /Update runtime/ }).check();
+  // A stale review must never turn into a clean installation automatically.
+  verifiable = false;
+  await expect(update).toBeDisabled();
+  await expect(dialog).toContainText(
+    "The current runtime changed or could not be verified",
+  );
+  await expect(dialog.getByRole("checkbox")).toHaveCount(0);
+  expect(installations).toEqual([]);
+  verifiable = true;
+  await expect(update).toBeEnabled();
+  await update.click();
+  expect(installations).toEqual([
+    {
+      provider: "neoforge",
+      version: "1.21.1",
+      build: "21.1.251",
+      confirmed: true,
+      updateRuntime: true,
+    },
+  ]);
+  await expect(dialog).not.toBeVisible();
+
+  // Both a loader switch and a Minecraft release change require a clean install.
+  for (const [provider, minecraft] of [
+    ["fabric", "1.21.1"],
+    ["neoforge", "1.20.1"],
+  ]) {
+    detectedProvider = provider;
+    detectedMinecraft = minecraft;
+    await expect(
+      page.getByRole("button", { name: "Install", exact: true }),
+    ).toBeVisible();
+    await page.getByRole("button", { name: "Install", exact: true }).click();
+    await expect(dialog.getByRole("radio")).toHaveCount(0);
+    await expect(
+      dialog.getByRole("button", { name: "Install version", exact: true }),
+    ).toBeDisabled();
+    await expect(dialog.getByRole("checkbox")).not.toBeChecked();
+    await dialog.getByRole("button", { name: "Cancel", exact: true }).click();
+  }
+});
+
 test("Versions shows official builds and requires a reviewed choice before installation", async ({
   page,
   serverId,

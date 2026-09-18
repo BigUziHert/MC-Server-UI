@@ -19,6 +19,7 @@ files:
   - server/player-history.mjs
   - server/minecraft.mjs
   - server/clean-install.mjs
+  - server/runtime-update.mjs
   - server/launchpad-pack-runtime.mjs
   - server/properties.mjs
   - server/versions.mjs
