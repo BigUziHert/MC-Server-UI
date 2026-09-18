@@ -55,17 +55,25 @@
   padding: 14px 16px;
 }
 .launchpad-search {
-  display: flex;
-  align-items: center;
-  gap: 9px;
   flex: 1;
   min-width: 170px;
-  color: var(--muted);
 }
-.launchpad-search input {
-  width: 100%;
-  min-height: 37px;
+.launchpad-toolbar-actions {
+  display: flex;
+  align-items: center;
+  flex: 0 0 auto;
+  gap: 12px;
+  white-space: nowrap;
   font-size: 12px;
+}
+@media (min-width: 601px) and (max-width: 1250px) {
+  .launchpad-toolbar {
+    display: grid;
+    grid-template-columns: auto minmax(170px, 1fr);
+  }
+  .launchpad-toolbar-actions {
+    justify-self: end;
+  }
 }
 .launchpad-installed-toggle {
   display: flex;
@@ -596,7 +604,6 @@
   }
   .launchpad-search {
     flex-basis: 100%;
-    order: -1;
   }
   .launchpad-pagination {
     flex-wrap: wrap;

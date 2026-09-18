@@ -53,7 +53,8 @@ import Versions from "./pages/Versions";
 import Launchpad from "./pages/Launchpad";
 import Properties from "./pages/Properties";
 import PlayerHead from "./PlayerHead";
-import SearchField from "./SearchField";
+import SearchField, { useDebouncedValue } from "./SearchField";
+import Switch from "./Switch";
 import DesktopUpdates from "./DesktopUpdates";
 import ServerIcon from "./ServerIcon";
 import { version as appVersion } from "../package.json";
@@ -264,6 +265,7 @@ export default function App() {
     firstServer?: boolean;
   } | null>(null);
   const [notice, setNotice] = useState("");
+  const [showPanelAudit, setShowPanelAudit] = useState(false);
   const fleetRequest = useRef(0);
   const fleetInFlight = useRef(false);
   const desktopSelection = useRef<boolean | null>(null);
@@ -442,8 +444,16 @@ export default function App() {
             </button>
           )}
         </div>
+      ) : showPanelAudit && !firstServerSetup ? (
+        <main className="fleet-audit">
+          <button className="btn" onClick={() => setShowPanelAudit(false)}>
+            Back to welcome
+          </button>
+          <AuditLogs scope="panel" notify={(message) => setNotice(message)} />
+        </main>
       ) : (
         <EmptyFleet
+          onAudit={() => setShowPanelAudit(true)}
           onAdd={(initialStep) =>
             setManager({ editing: null, initialStep, firstServer: true })
           }
@@ -478,7 +488,13 @@ export default function App() {
   );
 }
 
-function EmptyFleet({ onAdd }: { onAdd: (step: "create" | "import") => void }) {
+function EmptyFleet({
+  onAdd,
+  onAudit,
+}: {
+  onAdd: (step: "create" | "import") => void;
+  onAudit: () => void;
+}) {
   return (
     <div className="fleet-welcome-shell fleet-welcome-simple">
       <header className="fleet-welcome-header">
@@ -491,6 +507,10 @@ function EmptyFleet({ onAdd }: { onAdd: (step: "create" | "import") => void }) {
           </span>
         </div>
         <div className="welcome-header-actions">
+          <button className="btn" onClick={onAudit}>
+            <FileText size={16} />
+            Panel audit logs
+          </button>
           <DesktopUpdates />
           <a
             className="help-button"
@@ -948,6 +968,7 @@ function ConsolePage({
   const setCommand = (value: string) =>
     setDrafts((previous) => ({ ...previous, [inputMode]: value }));
   const [search, setSearch] = useState("");
+  const query = useDebouncedValue(search);
   const [showSearch, setShowSearch] = useState(false);
   const [autoScroll, setAutoScroll] = useState(true);
   const [busy, setBusy] = useState(false);
@@ -1072,13 +1093,13 @@ function ConsolePage({
     .filter((line) =>
       `${line.message} ${line.level}`
         .toLowerCase()
-        .includes(search.toLowerCase()),
+        .includes((showSearch ? query : "").toLowerCase()),
     );
   return (
     <>
       <div className="page-heading console-heading">
         <div>
-          <div className="eyebrow">SERVER OVERVIEW</div>
+          <p className="eyebrow">SERVER OVERVIEW</p>
           <h1>Console</h1>
         </div>
         <div className="heading-meta">
@@ -1297,7 +1318,10 @@ function ConsolePage({
                 className={`tool-button ${showSearch ? "selected" : ""}`}
                 aria-label="Search console logs"
                 title="Search logs"
-                onClick={() => setShowSearch((v) => !v)}
+                onClick={() => {
+                  if (showSearch) setSearch("");
+                  setShowSearch((v) => !v);
+                }}
               >
                 <Search size={16} />
               </button>
@@ -1325,7 +1349,7 @@ function ConsolePage({
                 className="console-log-search-field"
                 iconSize={15}
                 aria-label="Filter console logs"
-                placeholder="Search console output…"
+                placeholder="Search logs…"
                 value={search}
                 onValueChange={setSearch}
                 autoFocus
@@ -1386,28 +1410,17 @@ function ConsolePage({
               <span className="console-status-separator">•</span>UTF-8
             </span>
             <div className="console-options">
-              <button
-                type="button"
-                role="switch"
+              <Switch
                 aria-label="Server messaging"
-                aria-checked={inputMode === "message"}
-                className={`message-toggle ${inputMode === "message" ? "active" : ""}`}
+                label="Server messaging"
+                checked={inputMode === "message"}
                 disabled={busy}
-                title="Send messages to every player without typing say"
-                onClick={() => {
-                  setInputMode((previous) =>
-                    previous === "message" ? "command" : "message",
-                  );
+                onCheckedChange={(enabled) => {
+                  setInputMode(enabled ? "message" : "command");
                   historyIndex.current = -1;
                   commandInput.current?.focus();
                 }}
-              >
-                <MessageSquare size={12} />
-                Server messaging
-                <span className="message-toggle-track" aria-hidden="true">
-                  <span />
-                </span>
-              </button>
+              />
               <button
                 onClick={() => setAutoScroll((v) => !v)}
                 className={autoScroll ? "autoscroll active" : "autoscroll"}

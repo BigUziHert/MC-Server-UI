@@ -220,6 +220,9 @@ test("select visible all respects filters and selection clears on directory and 
     (element) => getComputedStyle(element).borderColor,
   );
   await search.fill("alpha");
+  await expect(
+    page.getByRole("checkbox", { name: "Select beta.txt", exact: true }),
+  ).toHaveCount(0);
   await all.check();
   await expect(selection).toContainText("2 selected");
   await page.getByRole("button", { name: "Clear search", exact: true }).click();
@@ -240,7 +243,7 @@ test("select visible all respects filters and selection clears on directory and 
     .check();
   await search.fill("alpha.txt");
   await expect(selection).toContainText("3 selected");
-  await expect(selection).toContainText("2 hidden by the filter");
+  await expect(selection).toContainText("2 outside this page or filter");
   await all.uncheck();
   await search.clear();
   await expect(

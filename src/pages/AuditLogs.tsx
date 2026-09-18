@@ -1,21 +1,27 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
   Activity,
-  AlertCircle,
   Archive,
   Check,
   Clock3,
   FileText,
   Gamepad2,
   ListFilter,
-  RefreshCw,
   Search,
   Server,
   ShieldCheck,
   Users,
 } from "lucide-react";
-import { useServerApi, relativeTime, type PageProps } from "../api";
-import SearchField from "../SearchField";
+import {
+  api as panelApi,
+  useServerApi,
+  relativeTime,
+  type PageProps,
+} from "../api";
+import SearchField, { useDebouncedValue } from "../SearchField";
+import RefreshButton from "../RefreshButton";
+import StatePanel from "../StatePanel";
+import Pagination from "../Pagination";
 import "./management.css";
 
 type Category = "server" | "file" | "backup" | "user" | "player";
@@ -25,7 +31,7 @@ type AuditEntry = {
   detail: string;
   actor: string;
   createdAt: string;
-  category: Category | "database";
+  category: Category;
 };
 const categories = [
   { value: "server" as Category, label: "Server", icon: Server },
@@ -39,8 +45,13 @@ function actionLabel(action: string) {
   return words.charAt(0).toUpperCase() + words.slice(1);
 }
 
-export default function AuditLogs({ notify }: PageProps) {
-  const { api } = useServerApi();
+export default function AuditLogs({
+  notify,
+  scope = "server",
+}: PageProps & { scope?: "server" | "panel" }) {
+  const { api: serverApi } = useServerApi();
+  const [activityScope, setActivityScope] = useState(scope);
+  const api = activityScope === "panel" ? panelApi : serverApi;
   const [entries, setEntries] = useState<AuditEntry[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
@@ -48,40 +59,89 @@ export default function AuditLogs({ notify }: PageProps) {
   const [category, setCategory] = useState<Category | "all">("all");
   const [updatedAt, setUpdatedAt] = useState<Date | null>(null);
 
+  const [refreshing, setRefreshing] = useState(false);
+  const [page, setPage] = useState(1),
+    [pageSize, setPageSize] = useState(25);
+  const [, tick] = useState(0);
+  const generation = useRef(0),
+    loaded = useRef(false),
+    inFlight = useRef(false);
   const refresh = useCallback(
     async (manual = false) => {
-      setLoading(true);
+      if (inFlight.current) return false;
+      inFlight.current = true;
+      const token = generation.current;
+      if (!loaded.current) setLoading(true);
+      if (manual) setRefreshing(true);
       setError("");
       try {
-        const data = await api<{ entries: AuditEntry[] }>("/audit");
+        const data = await api<{ entries: AuditEntry[] }>(
+          activityScope === "panel" ? "/panel/audit" : "/audit",
+        );
+        if (token !== generation.current) return false;
         setEntries(
-          data.entries
-            .filter((entry) => entry.category !== "database")
-            .sort((a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt)),
+          data.entries.sort(
+            (a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt),
+          ),
         );
+        loaded.current = true;
         setUpdatedAt(new Date());
-        if (manual) notify("Audit log refreshed.");
-      } catch (e) {
-        setError(
-          e instanceof Error ? e.message : "Unable to load the audit log.",
-        );
+        return true;
+      } catch (cause) {
+        if (token === generation.current)
+          setError(
+            cause instanceof Error
+              ? cause.message
+              : "Unable to load the audit log.",
+          );
+        return false;
       } finally {
-        setLoading(false);
+        if (token === generation.current) {
+          inFlight.current = false;
+          setLoading(false);
+          setRefreshing(false);
+        }
       }
     },
-    [notify],
+    [api, activityScope],
   );
   useEffect(() => {
+    generation.current++;
+    loaded.current = false;
+    inFlight.current = false;
+    setEntries([]);
+    setUpdatedAt(null);
+    setSearch("");
+    setCategory("all");
+    setPage(1);
     void refresh();
+    const poll = window.setInterval(() => {
+      if (document.visibilityState === "visible") void refresh();
+    }, 10000);
+    const clock = window.setInterval(() => tick((value) => value + 1), 30000);
+    return () => {
+      generation.current++;
+      window.clearInterval(poll);
+      window.clearInterval(clock);
+    };
   }, [refresh]);
-
-  const query = search.toLowerCase();
+  const debouncedSearch = useDebouncedValue(search);
+  useEffect(() => setPage(1), [debouncedSearch, category, pageSize]);
+  const query = debouncedSearch.toLowerCase();
   const filtered = entries.filter(
     (entry) =>
       (category === "all" || entry.category === category) &&
       `${entry.action} ${actionLabel(entry.action)} ${entry.detail} ${entry.actor}`
         .toLowerCase()
         .includes(query),
+  );
+  const currentPage = Math.min(
+    page,
+    Math.max(1, Math.ceil(filtered.length / pageSize)),
+  );
+  const visible = filtered.slice(
+    (currentPage - 1) * pageSize,
+    currentPage * pageSize,
   );
   const hasFilters = category !== "all" || Boolean(search);
   const today = new Date().toDateString();
@@ -93,21 +153,10 @@ export default function AuditLogs({ notify }: PageProps) {
     <div className="management-page">
       <div className="page-heading management-heading">
         <div>
-          <div className="management-eyebrow">ACTIVITY & OVERSIGHT</div>
+          <p className="eyebrow">ACTIVITY & OVERSIGHT</p>
           <h1>Audit logs</h1>
           <p>Every action has a story. Keep track of yours.</p>
         </div>
-        <button
-          className="btn"
-          disabled={loading}
-          onClick={() => void refresh(true)}
-        >
-          <RefreshCw
-            size={16}
-            className={loading ? "management-spinning" : ""}
-          />{" "}
-          Refresh activity
-        </button>
       </div>
 
       <div className="management-audit-overview panel">
@@ -115,7 +164,11 @@ export default function AuditLogs({ notify }: PageProps) {
           <ShieldCheck size={25} />
         </span>
         <div className="management-audit-summary">
-          <strong>Your server's activity, in one place</strong>
+          <strong>
+            {activityScope === "panel"
+              ? "Panel activity, including removed servers"
+              : "Your server's activity, in one place"}
+          </strong>
           <p>
             Panel actions are recorded locally so you can review what changed
             and when.
@@ -141,13 +194,34 @@ export default function AuditLogs({ notify }: PageProps) {
             <h2 id="audit-list-title">Activity log</h2>
             <span className="management-count">{filtered.length}</span>
           </div>
-          <SearchField
-            className="management-search management-audit-search"
-            aria-label="Search audit logs"
-            placeholder="Search actions, details, or actors..."
-            value={search}
-            onValueChange={setSearch}
-          />
+          <div className="management-controls">
+            {scope !== "panel" && (
+              <select
+                aria-label="Audit scope"
+                value={activityScope}
+                onChange={(event) =>
+                  setActivityScope(event.target.value as "server" | "panel")
+                }
+              >
+                <option value="server">This server</option>
+                <option value="panel">Panel activity</option>
+              </select>
+            )}
+            <SearchField
+              className="management-search management-audit-search"
+              aria-label="Search audit logs"
+              placeholder="Search audit logs…"
+              value={search}
+              onValueChange={setSearch}
+            />
+            <RefreshButton
+              label="Refresh audit logs"
+              refreshing={refreshing}
+              onRefresh={() => refresh(true)}
+              notify={notify}
+              successMessage="Audit logs refreshed."
+            />
+          </div>
         </div>
         <div className="management-audit-filters">
           <ListFilter size={16} />
@@ -176,46 +250,42 @@ export default function AuditLogs({ notify }: PageProps) {
             ))}
           </div>
         </div>
-        {error ? (
-          <div className="management-error" role="alert">
-            <AlertCircle size={18} />
-            <span>{error}</span>
-            <button className="btn" onClick={() => void refresh()}>
-              Try again
-            </button>
-          </div>
-        ) : loading ? (
-          <div className="management-loading" role="status">
-            <RefreshCw size={20} className="management-spinning" /> Loading
-            server activity...
-          </div>
+        {error && (
+          <StatePanel
+            variant="error"
+            title="Unable to refresh activity"
+            message={error}
+            onRetry={() => void refresh(true)}
+          />
+        )}
+        {loading ? (
+          <StatePanel variant="loading" title="Loading server activity…" />
         ) : filtered.length === 0 ? (
-          <div className="empty-state management-empty">
-            <div className="management-empty-icon">
-              {hasFilters ? <Search size={27} /> : <Activity size={27} />}
-            </div>
-            <h3>
-              {hasFilters
-                ? "No activity matches your filters"
-                : "A fresh start"}
-            </h3>
-            <p>
-              {hasFilters
+          <StatePanel
+            variant="empty"
+            icon={hasFilters ? <Search size={27} /> : <Activity size={27} />}
+            title={
+              hasFilters ? "No activity matches your filters" : "A fresh start"
+            }
+            message={
+              hasFilters
                 ? "Try another search or include a different category."
-                : "Actions you take in this panel will appear here."}
-            </p>
-            {hasFilters && (
-              <button
-                className="btn"
-                onClick={() => {
-                  setSearch("");
-                  setCategory("all");
-                }}
-              >
-                Clear filters
-              </button>
-            )}
-          </div>
+                : "Actions you take in this panel will appear here."
+            }
+            action={
+              hasFilters && (
+                <button
+                  className="btn"
+                  onClick={() => {
+                    setSearch("");
+                    setCategory("all");
+                  }}
+                >
+                  Clear filters
+                </button>
+              )
+            }
+          />
         ) : (
           <div className="table-wrap">
             <table className="data-table management-table management-audit-table">
@@ -228,7 +298,7 @@ export default function AuditLogs({ notify }: PageProps) {
                 </tr>
               </thead>
               <tbody>
-                {filtered.map((entry) => {
+                {visible.map((entry) => {
                   const item = categories.find(
                     (value) => value.value === entry.category,
                   );
@@ -287,6 +357,14 @@ export default function AuditLogs({ notify }: PageProps) {
             </table>
           </div>
         )}
+        <Pagination
+          page={currentPage}
+          pageSize={pageSize}
+          total={filtered.length}
+          onPageChange={setPage}
+          onPageSizeChange={setPageSize}
+          label="audit events"
+        />
         <div className="management-panel-footer management-audit-footer">
           <span>
             <Check size={14} />

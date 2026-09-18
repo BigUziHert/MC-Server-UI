@@ -133,7 +133,7 @@ for (const viewport of [
     for (const selector of [
       ".backup-nudge",
       ".workspace-note",
-      ".console-heading p",
+      ".console-heading p:not(.eyebrow)",
       ".players-metric .metric-footnote",
     ]) {
       await expect(page.locator(selector)).toHaveCount(0);

@@ -19,7 +19,6 @@ import {
   LoaderCircle,
   LockKeyhole,
   Pencil,
-  RefreshCw,
   Trash2,
   Undo2,
   Upload,
@@ -32,7 +31,10 @@ import {
   type PageProps,
 } from "../api";
 import "./storage.css";
-import SearchField from "../SearchField";
+import SearchField, { useDebouncedValue } from "../SearchField";
+import RefreshButton from "../RefreshButton";
+import StatePanel from "../StatePanel";
+import Pagination from "../Pagination";
 import "./file-selection.css";
 import "./recycle-bin.css";
 
@@ -88,6 +90,11 @@ export default function FileManager({ notify }: PageProps) {
   const [showingBin, setShowingBin] = useState(false);
   const [entries, setEntries] = useState<Entry[]>([]);
   const [query, setQuery] = useState("");
+  const debouncedQuery = useDebouncedValue(query);
+  const [page, setPage] = useState(1),
+    [pageSize, setPageSize] = useState(25);
+  const loaded = useRef(false);
+  useEffect(() => setPage(1), [debouncedQuery, pageSize, path]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
   const [uploading, setUploading] = useState(false);
@@ -121,20 +128,30 @@ export default function FileManager({ notify }: PageProps) {
         `/files?path=${encodeURIComponent(path)}`,
       );
       if (id === requestId.current) {
+        loaded.current = true;
         setEntries(result.entries);
         const available = new Set(result.entries.map((entry) => entry.path));
         setSelected(
           (previous) =>
             new Set([...previous].filter((item) => available.has(item))),
         );
+        return true;
       }
+      return false;
     } catch (failure) {
       if (id === requestId.current) setError(messageOf(failure));
+      return false;
     } finally {
       if (id === requestId.current) setLoading(false);
     }
   }, [path, api]);
 
+  useEffect(() => {
+    loaded.current = false;
+    setEntries([]);
+    setQuery("");
+    setPage(1);
+  }, [api, path]);
   useEffect(() => {
     if (!showingBin) void load();
     return () => {
@@ -284,6 +301,7 @@ export default function FileManager({ notify }: PageProps) {
       if (pathRef.current === uploadPath) await load();
     } catch (failure) {
       notify(messageOf(failure), true);
+      if (pathRef.current === uploadPath) await load();
     } finally {
       setUploading(false);
       if (uploadInput.current) uploadInput.current.value = "";
@@ -367,8 +385,10 @@ export default function FileManager({ notify }: PageProps) {
     }
   }
 
-  const visible = entries
-    .filter((entry) => entry.name.toLowerCase().includes(query.toLowerCase()))
+  const filtered = entries
+    .filter((entry) =>
+      entry.name.toLowerCase().includes(debouncedQuery.toLowerCase()),
+    )
     .sort((a, b) =>
       a.type === b.type
         ? a.name.localeCompare(b.name)
@@ -376,6 +396,14 @@ export default function FileManager({ notify }: PageProps) {
           ? -1
           : 1,
     );
+  const currentPage = Math.min(
+    page,
+    Math.max(1, Math.ceil(filtered.length / pageSize)),
+  );
+  const visible = filtered.slice(
+    (currentPage - 1) * pageSize,
+    currentPage * pageSize,
+  );
   const segments = path.split("/").filter(Boolean);
   const selectedEntries = entries.filter((entry) => selected.has(entry.path));
   const visibleSelectedCount = visible.filter((entry) =>
@@ -507,15 +535,13 @@ export default function FileManager({ notify }: PageProps) {
               <FilePlus2 size={15} />
               New file
             </button>
-            <button
-              className="btn icon"
-              title="Refresh files"
-              aria-label="Refresh files"
-              onClick={() => void load()}
-              disabled={loading}
-            >
-              <RefreshCw size={15} className={loading ? "spin" : ""} />
-            </button>
+            <RefreshButton
+              label="Refresh files"
+              disabled={saving || uploading}
+              onRefresh={load}
+              notify={notify}
+              successMessage="Files refreshed."
+            />
           </div>
         </div>
         <div className="files-filter">
@@ -543,7 +569,7 @@ export default function FileManager({ notify }: PageProps) {
                 <strong>{selectedEntries.length} selected</strong>
                 <span>
                   {hiddenSelectedCount > 0
-                    ? `${hiddenSelectedCount} hidden by the filter`
+                    ? `${hiddenSelectedCount} outside this page or filter`
                     : "\u00a0"}
                 </span>
               </div>
@@ -566,54 +592,53 @@ export default function FileManager({ notify }: PageProps) {
             </div>
           </div>
         </div>
-        {error ? (
-          <div className="empty-state">
-            <strong>Unable to load files</strong>
-            <p>{error}</p>
-            <button className="btn" onClick={() => void load()}>
-              Try again
-            </button>
-          </div>
-        ) : loading ? (
-          <div className="empty-state">
-            <LoaderCircle size={24} className="spin" />
-            <p>Loading your files…</p>
-          </div>
+        {error && (
+          <StatePanel
+            variant="error"
+            title="Unable to load files"
+            message={error}
+            onRetry={() => void load()}
+          />
+        )}
+        {loading && !loaded.current ? (
+          <StatePanel variant="loading" title="Loading your files…" />
         ) : (
           <div className="table-wrap">
             <table className="data-table file-table">
-              <thead>
-                <tr>
-                  <th scope="col">
-                    <div className="file-selection-name">
-                      <input
-                        className="file-selection-checkbox"
-                        type="checkbox"
-                        aria-label="Select all visible files and folders"
-                        checked={allVisibleSelected}
-                        aria-checked={
-                          visibleSelectedCount > 0 && !allVisibleSelected
-                            ? "mixed"
-                            : allVisibleSelected
-                        }
-                        ref={(input) => {
-                          if (input)
-                            input.indeterminate =
-                              visibleSelectedCount > 0 && !allVisibleSelected;
-                        }}
-                        disabled={!visible.length || saving}
-                        onChange={toggleVisibleSelection}
-                      />
-                      <span>Name</span>
-                    </div>
-                  </th>
-                  <th scope="col">Size</th>
-                  <th scope="col">Last modified</th>
-                  <th scope="col">
-                    <span className="storage-sr-only">Actions</span>
-                  </th>
-                </tr>
-              </thead>
+              {visible.length > 0 && (
+                <thead>
+                  <tr>
+                    <th scope="col">
+                      <div className="file-selection-name">
+                        <input
+                          className="file-selection-checkbox"
+                          type="checkbox"
+                          aria-label="Select all visible files and folders"
+                          checked={allVisibleSelected}
+                          aria-checked={
+                            visibleSelectedCount > 0 && !allVisibleSelected
+                              ? "mixed"
+                              : allVisibleSelected
+                          }
+                          ref={(input) => {
+                            if (input)
+                              input.indeterminate =
+                                visibleSelectedCount > 0 && !allVisibleSelected;
+                          }}
+                          disabled={!visible.length || saving}
+                          onChange={toggleVisibleSelection}
+                        />
+                        <span>Name</span>
+                      </div>
+                    </th>
+                    <th scope="col">Size</th>
+                    <th scope="col">Last modified</th>
+                    <th scope="col">
+                      <span className="storage-sr-only">Actions</span>
+                    </th>
+                  </tr>
+                </thead>
+              )}
               <tbody>
                 {!path && (
                   <tr
@@ -744,28 +769,40 @@ export default function FileManager({ notify }: PageProps) {
               </tbody>
             </table>
             {!visible.length && (
-              <div className="empty-state">
-                <Folder size={30} />
-                <strong>{query ? "No matching files" : "A fresh start"}</strong>
-                <p>
-                  {query
+              <StatePanel
+                variant="empty"
+                icon={<Folder size={30} />}
+                title={query ? "No matching files" : "A fresh start"}
+                message={
+                  query
                     ? "Try a different file or folder name."
-                    : "Upload your server files or create a new folder."}
-                </p>
-                {!query && (
-                  <button
-                    className="btn"
-                    onClick={() => uploadInput.current?.click()}
-                    disabled={uploading}
-                  >
-                    <Upload size={15} />
-                    Upload files
-                  </button>
-                )}
-              </div>
+                    : "Upload your server files or create a new folder."
+                }
+                action={
+                  !query && (
+                    <button
+                      className="btn"
+                      onClick={() => uploadInput.current?.click()}
+                      disabled={uploading}
+                    >
+                      <Upload size={15} />
+                      Upload files
+                    </button>
+                  )
+                }
+              />
             )}
           </div>
         )}
+        <Pagination
+          page={currentPage}
+          pageSize={pageSize}
+          total={filtered.length}
+          onPageChange={setPage}
+          onPageSizeChange={setPageSize}
+          label="files"
+          disabled={saving}
+        />
         <div className="files-footer">
           <span>
             <span className="storage-status-dot" />
@@ -969,6 +1006,8 @@ function RecycleBin({ notify, onBack }: PageProps & { onBack: () => void }) {
   const { api, post } = useServerApi();
   const [items, setItems] = useState<RecycledItem[]>([]);
   const [query, setQuery] = useState("");
+  const debouncedQuery = useDebouncedValue(query);
+  const loaded = useRef(false);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
   const [restoring, setRestoring] = useState<string | null>(null);
@@ -979,6 +1018,9 @@ function RecycleBin({ notify, onBack }: PageProps & { onBack: () => void }) {
     failures?: { item: RecycledItem; message: string }[];
   } | null>(null);
   const [actionError, setActionError] = useState("");
+  const [restoreWarnings, setRestoreWarnings] = useState<string[]>([]);
+  const [checkingRestore, setCheckingRestore] = useState(false);
+  const restoreReview = useRef(0);
   const [completed, setCompleted] = useState(0);
   const actionDialog = useRef<HTMLDialogElement>(null);
   const cancelAction = useRef<HTMLButtonElement>(null);
@@ -997,20 +1039,27 @@ function RecycleBin({ notify, onBack }: PageProps & { onBack: () => void }) {
         "/files/recycle-bin",
       );
       if (id === requestId.current) {
+        loaded.current = true;
         setItems(result.items);
         const available = new Set(result.items.map((item) => item.id));
         setSelected(
           (previous) =>
             new Set([...previous].filter((id) => available.has(id))),
         );
+        return true;
       }
+      return false;
     } catch (failure) {
       if (id === requestId.current) setError(messageOf(failure));
+      return false;
     } finally {
       if (id === requestId.current) setLoading(false);
     }
   }, [api]);
   useEffect(() => {
+    loaded.current = false;
+    setItems([]);
+    setQuery("");
     void load();
     return () => {
       requestId.current++;
@@ -1024,12 +1073,44 @@ function RecycleBin({ notify, onBack }: PageProps & { onBack: () => void }) {
     } else actionDialog.current?.close();
   }, [actionOpen]);
 
+  async function checkRestore(targets: RecycledItem[]) {
+    const warnings: string[] = [];
+    for (const item of targets.filter((value) =>
+      /^mods\/[^/]+\.jar$/i.test(value.originalPath),
+    )) {
+      try {
+        const result = await api<{
+          duplicates: { path: string; title: string }[];
+          warnings: string[];
+        }>(`/files/recycle-bin/${encodeURIComponent(item.id)}/restore-preview`);
+        warnings.push(
+          ...result.duplicates.map(
+            (duplicate) =>
+              `Restoring ${item.name} would add another copy of ${duplicate.title || "this mod"}. Already installed: ${duplicate.path}. Remove the extra copy before starting the server.`,
+          ),
+          ...result.warnings,
+        );
+      } catch (cause) {
+        warnings.push(
+          `Could not check ${item.name} for duplicate mods: ${messageOf(cause)}`,
+        );
+      }
+    }
+    return [...new Set(warnings)];
+  }
   async function restore(item: RecycledItem) {
     if (restorePending.current || item.status !== "ready") return;
     restorePending.current = true;
     setRestoring(item.id);
     setRestoreErrors((previous) => ({ ...previous, [item.id]: "" }));
     try {
+      const warnings = await checkRestore([item]);
+      if (warnings.length) {
+        setRestoreWarnings(warnings);
+        setActionError("");
+        setAction({ type: "restore", targets: [item] });
+        return;
+      }
       await post(
         `/files/recycle-bin/${encodeURIComponent(item.id)}/restore`,
         {},
@@ -1051,21 +1132,37 @@ function RecycleBin({ notify, onBack }: PageProps & { onBack: () => void }) {
     }
   }
 
-  function openAction(type: "restore" | "delete", targets: RecycledItem[]) {
+  async function openAction(
+    type: "restore" | "delete",
+    targets: RecycledItem[],
+  ) {
     if (!targets.length || restorePending.current) return;
     setActionError("");
     setCompleted(0);
+    setRestoreWarnings([]);
     setAction({ type, targets: [...targets] });
+    const token = ++restoreReview.current;
+    if (type === "restore") {
+      setCheckingRestore(true);
+      const warnings = await checkRestore(targets);
+      if (token === restoreReview.current) {
+        setRestoreWarnings(warnings);
+        setCheckingRestore(false);
+      }
+    }
   }
   function closeAction() {
     if (restorePending.current) return;
+    restoreReview.current++;
+    setCheckingRestore(false);
+    setRestoreWarnings([]);
     setAction(null);
     setActionError("");
     searchInput.current?.focus();
   }
   async function submitAction(event: FormEvent) {
     event.preventDefault();
-    if (!action || restorePending.current) return;
+    if (!action || restorePending.current || checkingRestore) return;
     restorePending.current = true;
     const successes = new Set<string>();
     const failures: { item: RecycledItem; message: string }[] = [];
@@ -1117,7 +1214,7 @@ function RecycleBin({ notify, onBack }: PageProps & { onBack: () => void }) {
   const visible = items.filter((item) =>
     `${item.name} ${item.originalPath}`
       .toLowerCase()
-      .includes(query.toLowerCase()),
+      .includes(debouncedQuery.toLowerCase()),
   );
   const selectedItems = items.filter((item) => selected.has(item.id));
   const visibleSelected = visible.filter((item) =>
@@ -1166,15 +1263,13 @@ function RecycleBin({ notify, onBack }: PageProps & { onBack: () => void }) {
             <span className="recycle-bin-protected">
               <LockKeyhole size={13} /> Protected
             </span>
-            <button
-              className="btn icon"
-              aria-label="Refresh Recycle Bin"
-              title="Refresh Recycle Bin"
-              disabled={loading || !!restoring}
-              onClick={() => void load()}
-            >
-              <RefreshCw size={15} className={loading ? "spin" : ""} />
-            </button>
+            <RefreshButton
+              label="Refresh Recycle Bin"
+              disabled={!!restoring}
+              onRefresh={load}
+              notify={notify}
+              successMessage="Recycle Bin refreshed."
+            />
           </div>
         </div>
         <div className="recycle-bin-notice">
@@ -1266,31 +1361,29 @@ function RecycleBin({ notify, onBack }: PageProps & { onBack: () => void }) {
             </button>
           </div>
         </div>
-        {error ? (
-          <div className="empty-state" role="alert">
-            <strong>Unable to load Recycle Bin</strong>
-            <p>{error}</p>
-            <button className="btn" onClick={() => void load()}>
-              Try again
-            </button>
-          </div>
-        ) : loading ? (
-          <div className="empty-state">
-            <LoaderCircle size={24} className="spin" />
-            <p>Loading recycled items…</p>
-          </div>
+        {error && (
+          <StatePanel
+            variant="error"
+            title="Unable to load Recycle Bin"
+            message={error}
+            onRetry={() => void load()}
+          />
+        )}
+        {loading && !loaded.current ? (
+          <StatePanel variant="loading" title="Loading recycled items…" />
         ) : !visible.length ? (
-          <div className="empty-state">
-            <Trash2 size={30} />
-            <strong>
-              {query ? "No matching recycled items" : "Recycle Bin is empty"}
-            </strong>
-            <p>
-              {query
+          <StatePanel
+            variant="empty"
+            icon={<Trash2 size={30} />}
+            title={
+              query ? "No matching recycled items" : "Recycle Bin is empty"
+            }
+            message={
+              query
                 ? "Try a different name or original path."
-                : "Deleted files and folders appear here so you can restore them."}
-            </p>
-          </div>
+                : "Deleted files and folders appear here so you can restore them."
+            }
+          />
         ) : (
           <ul className="recycle-bin-items" aria-label="Recycled items">
             {visible.map((item) => (
@@ -1457,6 +1550,19 @@ function RecycleBin({ notify, onBack }: PageProps & { onBack: () => void }) {
                 </li>
               ))}
             </ul>
+            {checkingRestore && (
+              <StatePanel variant="loading" title="Checking restored mods…" />
+            )}
+            {!!restoreWarnings.length && (
+              <div className="management-notice warning" role="status">
+                <div>
+                  <strong>Review duplicate mods before restoring</strong>
+                  {restoreWarnings.map((warning) => (
+                    <p key={warning}>{warning}</p>
+                  ))}
+                </div>
+              </div>
+            )}
             {actionError && (
               <p className="storage-form-error" role="alert">
                 {actionError}
@@ -1487,7 +1593,7 @@ function RecycleBin({ notify, onBack }: PageProps & { onBack: () => void }) {
               <button
                 type="submit"
                 className={`btn ${action.type === "delete" ? "danger" : "primary"}`}
-                disabled={!!restoring}
+                disabled={!!restoring || checkingRestore}
               >
                 {restoring
                   ? `${action.type === "delete" ? "Deleting" : "Restoring"} ${completed} of ${action.targets.length}…`

@@ -454,7 +454,7 @@ export default function AddServer({
             >
               <RefreshCw
                 size={15}
-                className={work === "inspect" ? "server-import-spinning" : ""}
+                className={work === "inspect" ? "spin" : ""}
               />
               {work === "inspect" ? "Inspecting folder…" : "Inspect folder"}
             </button>

@@ -12,7 +12,6 @@ import {
   ArrowUpRight,
   Check,
   Info,
-  RefreshCw,
   ShieldCheck,
   ShieldMinus,
   ShieldPlus,
@@ -25,12 +24,14 @@ import {
   Plus,
   UserCheck,
   UserMinus,
-  ChevronLeft,
-  ChevronRight,
 } from "lucide-react";
 import { ServerScope, useServerApi, type PageProps } from "../api";
 import PlayerHead from "../PlayerHead";
-import SearchField from "../SearchField";
+import SearchField, { useDebouncedValue } from "../SearchField";
+import RefreshButton from "../RefreshButton";
+import StatePanel from "../StatePanel";
+import SharedPagination from "../Pagination";
+import Switch from "../Switch";
 import "./management.css";
 import "./players.css";
 
@@ -105,6 +106,7 @@ function usePlayerPagination<T>(id: string, players: T[], filter = "") {
   }
 
   return {
+    total: players.length,
     rows: players.slice(page * pageSize, (page + 1) * pageSize),
     page,
     pages,
@@ -126,43 +128,22 @@ function Pagination({
   disabled: boolean;
 }) {
   return (
-    <footer className="players-pagination">
-      <label>
-        Rows
-        <select
-          aria-label={`${title} rows per page`}
-          value={paging.pageSize}
-          onChange={(event) => paging.changeSize(Number(event.target.value))}
-        >
-          {pageSizes.map((size) => (
-            <option key={size} value={size}>
-              {size}
-            </option>
-          ))}
-        </select>
-      </label>
-      <span role="status" aria-label={`${title} page`}>
-        Page {paging.page + 1} of {paging.pages}
-      </span>
-      <div>
-        <button
-          className="btn icon"
-          aria-label={`${title} previous page`}
-          disabled={disabled || paging.page === 0}
-          onClick={() => paging.changePage(paging.page - 1)}
-        >
-          <ChevronLeft size={15} />
-        </button>
-        <button
-          className="btn icon"
-          aria-label={`${title} next page`}
-          disabled={disabled || paging.page === paging.pages - 1}
-          onClick={() => paging.changePage(paging.page + 1)}
-        >
-          <ChevronRight size={15} />
-        </button>
-      </div>
-    </footer>
+    <SharedPagination
+      page={paging.page + 1}
+      pageSize={paging.pageSize}
+      total={paging.total}
+      onPageChange={(page) => paging.changePage(page - 1)}
+      onPageSizeChange={paging.changeSize}
+      pageSizes={pageSizes}
+      label={title.toLowerCase()}
+      disabled={disabled}
+      ariaLabels={{
+        pageSize: title + " rows per page",
+        page: title + " page",
+        previous: title + " previous page",
+        next: title + " next page",
+      }}
+    />
   );
 }
 
@@ -202,9 +183,9 @@ function Roster({
       <div className="panel players-roster-body">
         {children}
         {loading ? (
-          <p className="players-roster-empty">Loading...</p>
+          <StatePanel variant="loading" title="Loading players…" />
         ) : players.length === 0 ? (
-          <p className="players-roster-empty">{empty}</p>
+          <StatePanel variant="empty" title={empty} />
         ) : (
           <ul ref={list} aria-label={`${title} list`} tabIndex={0}>
             {paging.rows.map((player) => (
@@ -233,6 +214,8 @@ export default function Players({ notify }: PageProps) {
   const [error, setError] = useState("");
   const [search, setSearch] = useState("");
   const [historySearch, setHistorySearch] = useState("");
+  const query = useDebouncedValue(search),
+    historyQuery = useDebouncedValue(historySearch);
   const [moderating, setModerating] = useState<Moderation | null>(null);
   const [reason, setReason] = useState("");
   const [granting, setGranting] = useState(false);
@@ -259,12 +242,14 @@ export default function Players({ notify }: PageProps) {
       if (!silent) setLoading(true);
       try {
         const response = await api<PlayersResponse>("/players");
-        if (currentRequest !== request.current) return;
+        if (currentRequest !== request.current) return false;
         setData(response);
         setError("");
+        return true;
       } catch (e) {
-        if (currentRequest !== request.current) return;
+        if (currentRequest !== request.current) return false;
         setError(e instanceof Error ? e.message : "Unable to load operators.");
+        return false;
       } finally {
         if (currentRequest === request.current) setLoading(false);
       }
@@ -312,7 +297,7 @@ export default function Players({ notify }: PageProps) {
   const canManage = Boolean(data && !error && data.status === "running");
   const operators = data?.operators ?? [];
   const filtered = operators.filter((player) =>
-    player.name.toLowerCase().includes(search.trim().toLowerCase()),
+    player.name.toLowerCase().includes(query.trim().toLowerCase()),
   );
   const history = data?.history ?? [];
   const online = data?.online ?? history.filter((player) => player.online);
@@ -340,7 +325,7 @@ export default function Players({ notify }: PageProps) {
         : player.name.toLowerCase() === operator.name.toLowerCase(),
     );
   const filteredHistory = history.filter((player) =>
-    player.name.toLowerCase().includes(historySearch.trim().toLowerCase()),
+    player.name.toLowerCase().includes(historyQuery.trim().toLowerCase()),
   );
   const historyPaging = usePlayerPagination(
     "history",
@@ -558,7 +543,7 @@ export default function Players({ notify }: PageProps) {
     <div className="management-page players-page">
       <div className="page-heading management-heading">
         <div>
-          <div className="management-eyebrow">IN-GAME MANAGEMENT</div>
+          <p className="eyebrow">IN-GAME MANAGEMENT</p>
           <h1>Players</h1>
         </div>
       </div>
@@ -599,26 +584,21 @@ export default function Players({ notify }: PageProps) {
           {data ? online.length : "—"}{" "}
           <span>/ {data?.maxPlayers ?? "—"} players online</span>
         </strong>
-        <button
-          className="btn icon"
-          aria-label="Refresh players"
-          disabled={loading}
-          onClick={() => void refresh()}
-        >
-          <RefreshCw
-            size={16}
-            className={loading ? "management-spinning" : ""}
-          />
-        </button>
+        <RefreshButton
+          label="Refresh players"
+          disabled={busy}
+          onRefresh={() => refresh(true)}
+          notify={notify}
+          successMessage="Players refreshed."
+        />
       </div>
       {error && (
-        <div className="management-error" role="alert">
-          <AlertCircle size={18} />
-          <span>{error}</span>
-          <button className="btn" onClick={() => void refresh()}>
-            Try again
-          </button>
-        </div>
+        <StatePanel
+          variant="error"
+          title="Unable to refresh players"
+          message={error}
+          onRetry={() => void refresh(true)}
+        />
       )}
 
       <div className="players-rosters">
@@ -724,16 +704,6 @@ export default function Players({ notify }: PageProps) {
           filter={search}
           empty={search ? "No matching players" : "No operators."}
           loading={loading && !data}
-          tools={
-            <button
-              className="btn icon"
-              aria-label="Refresh operators"
-              disabled={loading}
-              onClick={() => void refresh()}
-            >
-              <RefreshCw size={14} />
-            </button>
-          }
           actions={(player) => (
             <button
               className="btn icon"
@@ -752,7 +722,7 @@ export default function Players({ notify }: PageProps) {
               iconSize={13}
               aria-label="Search operators"
               clearLabel="Clear operator search"
-              placeholder="Search operators..."
+              placeholder="Search operators…"
               value={search}
               onValueChange={setSearch}
             />
@@ -781,18 +751,10 @@ export default function Players({ notify }: PageProps) {
               >
                 <Plus size={14} />
               </button>
-              <button
-                role="switch"
+              <Switch
                 aria-label="Enable whitelist"
-                aria-checked={data?.whitelistEnabled ?? false}
-                className="players-whitelist-switch"
-                title={
-                  data?.whitelistEnabled == null
-                    ? "Whitelist setting unavailable"
-                    : data.whitelistEnabled
-                      ? "Whitelist enabled"
-                      : "Whitelist disabled"
-                }
+                label=""
+                checked={data?.whitelistEnabled ?? false}
                 disabled={
                   !canManage ||
                   busy ||
@@ -801,15 +763,10 @@ export default function Players({ notify }: PageProps) {
                     data?.whitelistAvailable === false) ||
                   data?.whitelistEnabled == null
                 }
-                onClick={() =>
-                  openWhitelist({
-                    kind: "state",
-                    enabled: !data?.whitelistEnabled,
-                  })
+                onCheckedChange={(enabled) =>
+                  openWhitelist({ kind: "state", enabled })
                 }
-              >
-                <span />
-              </button>
+              />
             </>
           }
           actions={(player) => (
@@ -868,18 +825,10 @@ export default function Players({ notify }: PageProps) {
               className="management-search"
               aria-label="Search player history"
               clearLabel="Clear player history search"
-              placeholder="Search known players..."
+              placeholder="Search players…"
               value={historySearch}
               onValueChange={setHistorySearch}
             />
-            <button
-              className="btn icon"
-              aria-label="Refresh player history"
-              disabled={loading}
-              onClick={() => void refresh()}
-            >
-              <RefreshCw size={16} />
-            </button>
           </div>
         </div>
         <p className="players-history-help">
@@ -892,26 +841,21 @@ export default function Players({ notify }: PageProps) {
             {warning}
           </p>
         ))}
-        {error ? (
-          <p className="players-history-empty">
-            Player history is unavailable. Refresh to try again.
-          </p>
-        ) : loading ? (
-          <p className="players-history-empty" role="status">
-            Loading player history...
-          </p>
+        {loading && !data ? (
+          <StatePanel variant="loading" title="Loading player history…" />
         ) : filteredHistory.length === 0 ? (
-          <div className="players-history-empty">
-            <Users size={27} />
-            <h3>
-              {historySearch ? "No matching history" : "No known players yet"}
-            </h3>
-            <p>
-              {historySearch
+          <StatePanel
+            variant="empty"
+            icon={<Users size={27} />}
+            title={
+              historySearch ? "No matching history" : "No known players yet"
+            }
+            message={
+              historySearch
                 ? "Try another Minecraft username."
-                : "Players will appear when they join while this panel is running, or when their profiles are available in the server’s saved files."}
-            </p>
-          </div>
+                : "Players will appear when they join while this panel is running, or when their profiles are available in the server’s saved files."
+            }
+          />
         ) : (
           <ul
             className="players-history-list"

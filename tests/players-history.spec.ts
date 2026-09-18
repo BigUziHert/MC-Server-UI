@@ -326,7 +326,7 @@ test("offline and unreadable ban states retain history but disable unsafe player
     }),
   ).toBeDisabled();
   offline = false;
-  await page.getByRole("button", { name: "Refresh player history" }).click();
+  await page.getByRole("button", { name: "Refresh players" }).click();
   await expect(
     row.getByRole("button", {
       name: "Grant OP for History_Player",
@@ -350,7 +350,7 @@ test("Grant OP belongs to a known-player row and guards the selected identity an
   await expect(page.locator(".page-heading").getByRole("button")).toHaveCount(
     0,
   );
-  await expect(page.locator(".page-heading p")).toHaveCount(0);
+  await expect(page.locator(".page-heading p:not(.eyebrow)")).toHaveCount(0);
   await expect(
     page.getByRole("button", { name: "Grant your first OP" }),
   ).toHaveCount(0);
@@ -453,7 +453,7 @@ test("live row OP preserves pending state until Minecraft saves the operator rec
   ).toHaveCount(0);
   confirmed = true;
   await page
-    .getByRole("button", { name: "Refresh operators", exact: true })
+    .getByRole("button", { name: "Refresh players", exact: true })
     .click();
   await expect(grant).toBeDisabled();
   await expect(

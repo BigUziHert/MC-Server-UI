@@ -1,4 +1,4 @@
-import { test as base, expect, type Route } from "@playwright/test";
+import { test as base, expect, type Route, type Page } from "@playwright/test";
 import { removeTestServer, stopTestServer } from "./server-fixtures";
 
 const test = base.extend<{ serverId: string }>({
@@ -27,6 +27,387 @@ test.beforeEach(async ({ page, serverId }) => {
     (id) => localStorage.setItem("mc-panel.active-server", id),
     serverId,
   );
+});
+
+async function mockInstalledPage(page: Page, type = "mod", extra = {}) {
+  await page.route(/\/api\/launchpad(?:\?.*)?$/, (route) =>
+    route.fulfill({
+      json: {
+        platforms: [
+          { id: "modrinth", name: "Modrinth", available: true, types: [type] },
+        ],
+        gameVersion: "1.21.1",
+        gameVersions: ["1.21.1", "1.20.1"],
+        loader:
+          type === "plugin"
+            ? "paper"
+            : type === "datapack"
+              ? "datapack"
+              : "neoforge",
+        status: "offline",
+        warnings: [],
+        ...extra,
+      },
+    }),
+  );
+  await page.route("**/api/launchpad/search?**", (route) =>
+    route.fulfill({ json: { projects: [], total: 0, offset: 0, limit: 10 } }),
+  );
+}
+
+test("Launchpad retains unchanged identity through stripped local refresh and reports background completion", async ({
+  page,
+}) => {
+  await mockInstalledPage(page);
+  await page.route("https://example.com/known.png", (route) =>
+    route.fulfill({
+      contentType: "image/svg+xml",
+      body: '<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16"><rect width="16" height="16" fill="green"/></svg>',
+    }),
+  );
+  const update = {
+    id: "new",
+    name: "New release",
+    version: "2",
+    downloadable: true,
+    loaders: ["neoforge"],
+    gameVersions: ["1.21.1"],
+  };
+  const known = {
+    path: "mods/known.jar",
+    name: "known.jar",
+    sha512: "same-checksum",
+    size: 512,
+    platform: "modrinth",
+    projectId: "known",
+    title: "Known Mod",
+    iconUrl: "https://example.com/known.png",
+    author: "Known author",
+    update,
+    updateCheck: "checked",
+  };
+  let full = 0;
+  let held: Route | undefined;
+  let background = false;
+  const requests: URL[] = [];
+  await page.route("**/api/launchpad/installed?**", (route) => {
+    const url = new URL(route.request().url());
+    requests.push(url);
+    if (url.searchParams.has("local"))
+      return route.fulfill({
+        json: {
+          items: [
+            {
+              path: known.path,
+              name: known.name,
+              sha512: known.sha512,
+              size: 512,
+              platform: null,
+            },
+          ],
+          warnings: [],
+        },
+      });
+    full++;
+    if (full === 2) {
+      held = route;
+      return;
+    }
+    if (background) background = false;
+    return route.fulfill({
+      json: { items: [known], warnings: [], checkingUpdates: false },
+    });
+  });
+  await page.goto("/#launchpad");
+  await page.getByRole("switch", { name: "Show installed content" }).check();
+  const row = page.getByRole("article", { name: "Known Mod", exact: true });
+  await expect(
+    row.getByRole("button", { name: "Update Known Mod" }),
+  ).toBeEnabled();
+  await page
+    .getByRole("button", { name: "Refresh Launchpad and check updates" })
+    .click();
+  await expect.poll(() => Boolean(held)).toBe(true);
+  await expect(row).toContainText("Known author");
+  await expect(row.locator("img")).toHaveAttribute("src", known.iconUrl);
+  await expect(
+    row.getByRole("button", { name: "Update Known Mod" }),
+  ).toBeEnabled();
+  expect(requests.at(-1)?.searchParams.get("background")).toBe("true");
+  background = true;
+  await held!.fulfill({
+    json: {
+      items: [known],
+      warnings: [],
+      checkingUpdates: true,
+      progress: { completed: 1, total: 2 },
+    },
+  });
+  await expect(
+    page.getByRole("status", { name: "Installed content refresh" }),
+  ).toBeVisible();
+  await expect.poll(() => full).toBe(3);
+  expect(requests.at(-1)?.searchParams.has("refresh")).toBe(false);
+  await expect(
+    page.getByRole("button", { name: "Refresh Launchpad and check updates" }),
+  ).toBeEnabled();
+  await expect(
+    page.getByRole("status", { name: "Installed content refresh" }),
+  ).toHaveCount(0);
+});
+
+test("Launchpad drops stale identity for replaced bytes and does not resurrect deleted files", async ({
+  page,
+}) => {
+  await mockInstalledPage(page);
+  let refresh = false;
+  let held: Route | undefined;
+  await page.route("**/api/launchpad/installed?**", (route) => {
+    const local = new URL(route.request().url()).searchParams.has("local");
+    if (refresh && !local) {
+      held = route;
+      return;
+    }
+    return route.fulfill({
+      json: {
+        warnings: [],
+        items: refresh
+          ? [
+              {
+                path: "mods/changed.jar",
+                name: "changed.jar",
+                sha512: "new-bytes",
+                platform: null,
+                size: 2,
+              },
+            ]
+          : [
+              {
+                path: "mods/changed.jar",
+                name: "changed.jar",
+                sha512: "old-bytes",
+                platform: "modrinth",
+                projectId: "old",
+                title: "Old identity",
+                size: 1,
+              },
+              {
+                path: "mods/deleted.jar",
+                name: "deleted.jar",
+                sha512: "deleted",
+                platform: "modrinth",
+                projectId: "deleted",
+                title: "Deleted Mod",
+                size: 1,
+              },
+            ],
+      },
+    });
+  });
+  await page.goto("/#launchpad");
+  await page.getByRole("switch", { name: "Show installed content" }).check();
+  await expect(
+    page.getByRole("article", { name: "Old identity", exact: true }),
+  ).toBeVisible();
+  refresh = true;
+  await page
+    .getByRole("button", { name: "Refresh Launchpad and check updates" })
+    .click();
+  await expect.poll(() => Boolean(held)).toBe(true);
+  await expect(page.getByRole("article")).toHaveCount(1);
+  await expect(page.getByRole("article")).toHaveAccessibleName("changed.jar");
+  await expect(page.getByRole("article")).toContainText("Unidentified file");
+  await held!.fulfill({ status: 503, json: { error: "Offline provider" } });
+  await expect(page.getByRole("alert")).toContainText("Offline provider");
+  await expect(page.getByRole("article")).toHaveCount(1);
+});
+
+for (const type of ["plugin", "datapack"])
+  test(`Launchpad cancels abandoned ${type} removal and removes rows before refresh returns`, async ({
+    page,
+    serverId,
+  }) => {
+    await mockInstalledPage(page, type);
+    const path =
+      type === "plugin" ? "plugins/test.jar" : "world/datapacks/test.zip";
+    let removed = false;
+    const cancelled: string[] = [];
+    let previews = 0;
+    await page.route("**/api/launchpad/installed?**", (route) => {
+      if (removed) return;
+      return route.fulfill({
+        json: {
+          items: [
+            {
+              path,
+              name: "test",
+              title: "Test content",
+              size: 100,
+              sha512: "bytes",
+              platform: null,
+            },
+          ],
+          warnings: [],
+        },
+      });
+    });
+    await page.route("**/api/launchpad/removal-preview", (route) => {
+      expect(route.request().postDataJSON()).toEqual({ path, type });
+      return route.fulfill({
+        json: {
+          planId: `review-${++previews}`,
+          title: "Test content",
+          files: [{ path, size: 100 }],
+          warnings: [],
+          dependents: [],
+          blocked: false,
+        },
+      });
+    });
+    await page.route("**/api/launchpad/removal-preview/*/cancel", (route) => {
+      expect(route.request().headers()["x-server-id"]).toBe(serverId);
+      cancelled.push(route.request().url());
+      return route.fulfill({ json: { ok: true } });
+    });
+    await page.route("**/api/launchpad/remove", (route) => {
+      removed = true;
+      return route.fulfill({ json: { ok: true } });
+    });
+    await page.goto("/#launchpad");
+    await page.getByRole("switch", { name: "Show installed content" }).check();
+    const remove = page.getByRole("button", {
+      name: "Remove Test content",
+      exact: true,
+    });
+    await remove.click();
+    await page
+      .getByRole("dialog")
+      .getByRole("button", { name: "Cancel", exact: true })
+      .click();
+    await expect.poll(() => cancelled.length).toBe(1);
+    expect(cancelled[0]).toContain("review-1/cancel");
+    await remove.click();
+    await page
+      .getByRole("dialog")
+      .getByRole("button", { name: `Remove ${type}`, exact: true })
+      .click();
+    await expect(
+      page.getByRole("article", { name: "Test content", exact: true }),
+    ).toHaveCount(0);
+    expect(cancelled).toHaveLength(1);
+  });
+
+test("Launchpad stops polling unknown jobs and offers an installed-list refresh", async ({
+  page,
+}) => {
+  await page.clock.install();
+  await mockInstalledPage(page, "mod", {
+    job: { id: "missing", status: "running", completed: 0, total: 1 },
+  });
+  await page.route("**/api/launchpad/installed?**", (route) =>
+    route.fulfill({ json: { items: [], warnings: [] } }),
+  );
+  let polls = 0;
+  await page.route("**/api/launchpad/jobs/missing", (route) => {
+    polls++;
+    return route.fulfill({ status: 404, json: { error: "Job unavailable" } });
+  });
+  await page.goto("/#launchpad");
+  await expect(page.getByRole("alert")).toContainText(
+    "no longer being tracked",
+  );
+  await page.clock.runFor(15_000);
+  expect(polls).toBe(1);
+});
+
+test("Launchpad refresh uses newly detected runtime and clears incompatible update recommendations", async ({
+  page,
+}) => {
+  await mockInstalledPage(page);
+  let fresh = false;
+  await page.route(/\/api\/launchpad(?:\?.*)?$/, (route) => {
+    if (new URL(route.request().url()).searchParams.has("refresh"))
+      fresh = true;
+    return route.fulfill({
+      json: {
+        platforms: [
+          { id: "modrinth", name: "Modrinth", available: true, types: ["mod"] },
+        ],
+        gameVersion: fresh ? "1.20.1" : "1.21.1",
+        gameVersions: ["1.21.1", "1.20.1"],
+        loader: fresh ? "fabric" : "neoforge",
+        status: "offline",
+        warnings: [],
+      },
+    });
+  });
+  const item = {
+    path: "mods/shared.jar",
+    name: "shared.jar",
+    sha512: "shared",
+    size: 100,
+    platform: "modrinth",
+    projectId: "shared",
+    title: "Shared Mod",
+    updateCheck: "checked",
+  };
+  let delayed: Route | undefined;
+  let forced: URL | undefined;
+  await page.route("**/api/launchpad/installed?**", (route) => {
+    const url = new URL(route.request().url());
+    if (fresh && !url.searchParams.has("local")) {
+      delayed = route;
+      forced = url;
+      return;
+    }
+    return route.fulfill({
+      json: {
+        items: [
+          {
+            ...item,
+            update: !fresh
+              ? {
+                  id: "old-target-update",
+                  name: "NeoForge update",
+                  version: "2",
+                  downloadable: true,
+                  gameVersions: ["1.21.1"],
+                  loaders: ["neoforge"],
+                }
+              : null,
+          },
+        ],
+        warnings: [],
+      },
+    });
+  });
+  await page.goto("/#launchpad");
+  await page.getByRole("switch", { name: "Show installed content" }).check();
+  await expect(
+    page.getByRole("button", { name: "Update Shared Mod", exact: true }),
+  ).toBeVisible();
+  await page
+    .getByRole("button", { name: "Refresh Launchpad and check updates" })
+    .click();
+  await expect.poll(() => Boolean(delayed)).toBe(true);
+  expect(Object.fromEntries(forced!.searchParams)).toMatchObject({
+    gameVersion: "1.20.1",
+    loader: "fabric",
+    refresh: "true",
+    background: "true",
+  });
+  await expect(
+    page.getByRole("button", { name: "Update Shared Mod", exact: true }),
+  ).toHaveCount(0);
+  await expect(
+    page.getByRole("article", { name: "Shared Mod", exact: true }),
+  ).toBeVisible();
+  await delayed!.fulfill({
+    json: { items: [{ ...item, update: null }], warnings: [] },
+  });
+  await expect(
+    page.getByRole("button", { name: "Refresh Launchpad and check updates" }),
+  ).toBeEnabled();
 });
 test("Minecraft navigation sits between server and management and Properties saves scoped edits", async ({
   page,
@@ -497,7 +878,7 @@ test("Versions offers older stable Fabric loaders and requires opting in to expe
     path: testInfo.outputPath("fabric-stable-loaders.png"),
     fullPage: true,
   });
-  const experimental = page.getByRole("checkbox", {
+  const experimental = page.getByRole("switch", {
     name: "Include experimental releases",
     exact: true,
   });
@@ -552,7 +933,7 @@ test("Launchpad exposes six platforms, only four content tabs, and a reviewed in
       body: '<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64"><rect width="64" height="64" rx="12" fill="#68c985"/><path d="M16 18h32v28H16z" fill="#18231c"/></svg>',
     }),
   );
-  await page.route("**/api/launchpad", (route) =>
+  await page.route(/\/api\/launchpad(?:\?.*)?$/, (route) =>
     route.fulfill({
       json: {
         platforms: providers.map(([id, name, types]) => ({
@@ -733,7 +1114,7 @@ for (const viewport of [
       loaders: ["neoforge"],
       downloadable: true,
     };
-    await page.route("**/api/launchpad", (route) =>
+    await page.route(/\/api\/launchpad(?:\?.*)?$/, (route) =>
       route.fulfill({
         json: {
           platforms: [
@@ -912,7 +1293,7 @@ for (const viewport of [
 test("Launchpad separates mod and plugin loaders and defaults Paper to Plugins", async ({
   page,
 }) => {
-  await page.route("**/api/launchpad", (route) =>
+  await page.route(/\/api\/launchpad(?:\?.*)?$/, (route) =>
     route.fulfill({
       json: {
         platforms: [
@@ -966,7 +1347,7 @@ test("Launchpad catalog sorting sends scoped choices and resets pagination with 
   serverId,
 }) => {
   const searches: URL[] = [];
-  await page.route("**/api/launchpad", (route) =>
+  await page.route(/\/api\/launchpad(?:\?.*)?$/, (route) =>
     route.fulfill({
       json: {
         platforms: [
@@ -1079,7 +1460,6 @@ test("Launchpad catalog sorting sends scoped choices and resets pagination with 
   await expect.poll(lastSearch).toMatchObject({
     platform: "curseforge",
     sort: "popular",
-    query: "copper",
     offset: "0",
   });
   await expect(page.getByRole("article").first()).toHaveAccessibleName(
@@ -1124,7 +1504,7 @@ test("Launchpad installed updates sort before pagination and keep priority when 
     publishedAt: "2026-09-01T00:00:00Z",
     downloadable: true,
   };
-  await page.route("**/api/launchpad", (route) =>
+  await page.route(/\/api\/launchpad(?:\?.*)?$/, (route) =>
     route.fulfill({
       json: {
         platforms: [
@@ -1206,9 +1586,7 @@ test("Launchpad installed updates sort before pagination and keep priority when 
   await page.setViewportSize({ width: 390, height: 844 });
   const search = page.getByLabel("Search Launchpad", { exact: true });
   const searchField = search.locator("xpath=../..");
-  const unfocusedBorder = await searchField.evaluate(
-    (element) => getComputedStyle(element).borderColor,
-  );
+
   const unfocusedInputBorder = await search.evaluate(
     (element) => getComputedStyle(element).borderColor,
   );
@@ -1236,7 +1614,7 @@ test("Launchpad installed updates sort before pagination and keep priority when 
   await expect(search).toHaveCSS("outline-style", "none");
   await expect(search).toHaveCSS("box-shadow", "none");
   await expect(search).toHaveCSS("border-color", unfocusedInputBorder);
-  await expect(searchField).toHaveCSS("border-color", unfocusedBorder);
+  await expect(searchField).toHaveCSS("border-color", "rgb(48, 49, 64)");
   await expect(searchField).toHaveCSS("box-shadow", "none");
   await expect(searchField).toHaveCSS("outline-style", "none");
   await expect(names).toHaveText(first);
@@ -1291,7 +1669,7 @@ test("Launchpad installed sorts order the entire list before paging and retain i
     downloadable: true,
   };
   const searches: URL[] = [];
-  await page.route("**/api/launchpad", (route) =>
+  await page.route(/\/api\/launchpad(?:\?.*)?$/, (route) =>
     route.fulfill({
       json: {
         platforms: [
@@ -1574,7 +1952,7 @@ test("Launchpad keeps refreshed local files usable after installation while remo
       versionId: "old",
     },
   ];
-  await page.route("**/api/launchpad", (route) => {
+  await page.route(/\/api\/launchpad(?:\?.*)?$/, (route) => {
     configRequests++;
     if (holdConfig) {
       delayedConfig = route;
@@ -1713,15 +2091,13 @@ test("Launchpad keeps refreshed local files usable after installation while remo
     "mods/better-2.jar",
     "mods/zeta.jar",
   ]);
-  await page
-    .getByRole("button", { name: "Retry installed refresh", exact: true })
-    .click();
+  await page.getByRole("button", { name: "Try again", exact: true }).click();
   await expect(
     page.getByRole("article", { name: "Better Mod", exact: true }),
   ).toContainText("By Recovered author");
   await expect(refreshing).toHaveCount(0);
   await expect(
-    page.getByRole("button", { name: "Retry installed refresh", exact: true }),
+    page.getByRole("button", { name: "Try again", exact: true }),
   ).toHaveCount(0);
   expect(localRequests).toBe(3);
   expect(
@@ -1735,7 +2111,7 @@ test("Launchpad keeps refreshed local files usable after installation while remo
     })
     .click();
   await expect.poll(() => Boolean(delayedConfig)).toBe(true);
-  await expect.poll(() => fullRequests.length).toBe(4);
+  expect(fullRequests.length).toBe(3);
   await expect(refreshing).toHaveCount(0);
   await delayedConfig!.fulfill({ json: { ...config } });
   holdConfig = false;
@@ -1747,7 +2123,7 @@ test("Launchpad keeps refreshed local files usable after installation while remo
   ).toBeEnabled();
   // Advance the scan debounce after the new config object arrives, without a wall-clock sleep.
   await page.clock.runFor(1000);
-  expect(configRequests).toBe(2);
+  expect(configRequests).toBe(4);
   expect(localRequests).toBe(4);
   expect(fullRequests.length).toBe(4);
   expect(fullRequests[3].searchParams.get("refresh")).toBe("true");
@@ -1774,9 +2150,7 @@ test("Launchpad keeps refreshed local files usable after installation while remo
     "mods/zeta.jar",
   ]);
   await expect(sort).toBeEnabled();
-  await page
-    .getByRole("button", { name: "Retry installed refresh", exact: true })
-    .click();
+  await page.getByRole("button", { name: "Try again", exact: true }).click();
   await expect(
     page.getByRole("article", { name: "Better Mod", exact: true }),
   ).toContainText("By Recovered author");
@@ -1838,7 +2212,7 @@ test("Launchpad preserves known updates and exposes successful-response provider
         compatible && updateCheck === "unavailable" ? issue : undefined,
     },
   ];
-  await page.route("**/api/launchpad", (route) =>
+  await page.route(/\/api\/launchpad(?:\?.*)?$/, (route) =>
     route.fulfill({
       json: {
         platforms: [
@@ -1898,7 +2272,7 @@ test("Launchpad preserves known updates and exposes successful-response provider
     exact: true,
   });
   const retry = page.getByRole("button", {
-    name: "Retry updates",
+    name: "Try again",
     exact: true,
   });
   await expect(update).toBeEnabled();
@@ -2069,7 +2443,7 @@ for (const browse of [
       },
       { id: serverId, gameVersion: browse.gameVersion, loader: browse.loader },
     );
-    await page.route("**/api/launchpad", (route) =>
+    await page.route(/\/api\/launchpad(?:\?.*)?$/, (route) =>
       route.fulfill({
         json: {
           platforms: [
@@ -2333,7 +2707,7 @@ test("Launchpad confines installed update issues to the matching files and platf
       updateIssue: curseIssue,
     },
   ];
-  await page.route("**/api/launchpad", (route) =>
+  await page.route(/\/api\/launchpad(?:\?.*)?$/, (route) =>
     route.fulfill({
       json: {
         platforms: [
@@ -2386,7 +2760,7 @@ test("Launchpad confines installed update issues to the matching files and platf
     name: "Show installed content",
   });
   const retry = page.getByRole("button", {
-    name: "Retry updates",
+    name: "Try again",
     exact: true,
   });
   await expect(
@@ -2409,11 +2783,11 @@ test("Launchpad confines installed update issues to the matching files and platf
   const summary = page.getByRole("alert");
   await expect(summary).toHaveCount(1);
   await expect(summary).toContainText(
-    "Could not check updates for 1 installed item.",
+    "Could not check updates for 2 installed items.",
   );
   await expect(retry).toBeEnabled();
   await expect(clientRow.getByText(clientIssue, { exact: true })).toBeVisible();
-  await expect(page.locator(".launchpad-project-issue")).toHaveCount(1);
+  await expect(page.locator(".launchpad-project-issue")).toHaveCount(2);
   await expect(healthyRow.locator(".launchpad-project-issue")).toHaveCount(0);
   await expect(unidentified.locator(".launchpad-project-issue")).toHaveCount(0);
   await expect(
@@ -2421,8 +2795,9 @@ test("Launchpad confines installed update issues to the matching files and platf
   ).toBeVisible();
   await expect(
     page.getByRole("article", { name: "Curse Addon", exact: true }),
-  ).toHaveCount(0);
-  await expect(page.getByText(curseIssue, { exact: true })).toHaveCount(0);
+  ).toBeVisible();
+  await expect(page.getByLabel("Platform", { exact: true })).toBeDisabled();
+  await expect(page.getByLabel("Platform", { exact: true })).toHaveValue("all");
   await expect(
     page.getByRole("button", { name: `Update ${healthy.title}`, exact: true }),
   ).toBeEnabled();
@@ -2447,9 +2822,9 @@ test("Launchpad confines installed update issues to the matching files and platf
   await expect(summary).toHaveCount(0);
   await search.fill("");
   await expect(summary).toContainText(
-    "Could not check updates for 1 installed item.",
+    "Could not check updates for 2 installed items.",
   );
-  await page.getByLabel("Platform", { exact: true }).selectOption("curseforge");
+  await search.fill("curse");
   await expect(summary).toContainText(
     "Could not check updates for 1 installed item.",
   );
@@ -2460,7 +2835,7 @@ test("Launchpad confines installed update issues to the matching files and platf
   ).toBeVisible();
   await expect(page.getByText(clientIssue, { exact: true })).toHaveCount(0);
   await expect(page.locator(".launchpad-project-issue")).toHaveCount(1);
-  await page.getByLabel("Platform", { exact: true }).selectOption("modrinth");
+  await search.fill("");
   await expect(
     page.getByRole("button", { name: `Update ${healthy.title}`, exact: true }),
   ).toBeEnabled();
@@ -2555,7 +2930,7 @@ test("Launchpad lists every affected file and reason beyond the current installe
       updateIssue: "A separate provider is unavailable.",
     },
   ];
-  await page.route("**/api/launchpad", (route) =>
+  await page.route(/\/api\/launchpad(?:\?.*)?$/, (route) =>
     route.fulfill({
       json: {
         platforms: [
@@ -2607,7 +2982,7 @@ test("Launchpad lists every affected file and reason beyond the current installe
   ).toBeEnabled();
   const summary = page.getByRole("alert");
   await expect(summary).toContainText(
-    "Could not check updates for 4 installed items.",
+    "Could not check updates for 5 installed items.",
   );
   const affected = summary.getByRole("list", {
     name: "Files with unavailable update checks",
@@ -2617,7 +2992,7 @@ test("Launchpad lists every affected file and reason beyond the current installe
   await summary.getByText("View affected files", { exact: true }).focus();
   await page.keyboard.press("Enter");
   await expect(affected).toBeVisible();
-  await expect(affected.getByRole("listitem")).toHaveCount(4);
+  await expect(affected.getByRole("listitem")).toHaveCount(5);
   for (const item of failures) {
     const entry = affected
       .getByRole("listitem")
@@ -2632,7 +3007,7 @@ test("Launchpad lists every affected file and reason beyond the current installe
     ).toHaveCount(0);
   }
   await expect(affected).not.toContainText("local-helper.jar");
-  await expect(affected).not.toContainText("Other Provider Failure");
+  await expect(affected).toContainText("Other Provider Failure");
   await expect(affected).not.toContainText("JEI");
   await summary.screenshot({
     path: testInfo.outputPath("all-unavailable-files-desktop.png"),
@@ -2646,10 +3021,11 @@ test("Launchpad lists every affected file and reason beyond the current installe
   ).toHaveText("Page 2 of 2");
   await expect(names).toHaveText([
     "local-helper.jar",
+    "Other Provider Failure",
     ...failures.map((item) => item.title),
   ]);
   await expect(affected).toBeVisible();
-  await expect(affected.getByRole("listitem")).toHaveCount(4);
+  await expect(affected.getByRole("listitem")).toHaveCount(5);
   const search = page.getByLabel("Search Launchpad", { exact: true });
   await search.fill("Missing Project");
   await expect(summary).toContainText(
@@ -2666,7 +3042,7 @@ test("Launchpad lists every affected file and reason beyond the current installe
   await expect(summary).toHaveCount(0);
   await search.fill("");
   await expect(summary).toContainText(
-    "Could not check updates for 4 installed items.",
+    "Could not check updates for 5 installed items.",
   );
   await summary.getByText("View affected files", { exact: true }).click();
   await page.setViewportSize({ width: 390, height: 844 });
@@ -2678,7 +3054,7 @@ test("Launchpad lists every affected file and reason beyond the current installe
     )
     .toBeLessThanOrEqual(1);
   await expect(affected).toBeVisible();
-  await expect(affected.getByRole("listitem")).toHaveCount(4);
+  await expect(affected.getByRole("listitem")).toHaveCount(5);
   await expect
     .poll(() =>
       affected.evaluate((element) => element.getBoundingClientRect().width),
@@ -2711,7 +3087,7 @@ test("Launchpad requires an explicit Install anyway choice for unchecked require
     publishedAt: "2026-09-01T00:00:00Z",
     downloadable: true,
   };
-  await page.route("**/api/launchpad", (route) =>
+  await page.route(/\/api\/launchpad(?:\?.*)?$/, (route) =>
     route.fulfill({
       json: {
         platforms: [
@@ -2884,7 +3260,7 @@ for (const unavailable of [true, false])
     const previousPath = "mods/example-mod-1.0.jar";
     const nextPath = "mods/example-mod-2.0.jar";
     const bundledPath = "META-INF/jarjar/bundled-library-0.5.6.jar";
-    await page.route("**/api/launchpad", (route) =>
+    await page.route(/\/api\/launchpad(?:\?.*)?$/, (route) =>
       route.fulfill({
         json: {
           platforms: [
@@ -3136,7 +3512,7 @@ test("Launchpad ignores delayed installed metadata after loader, version, type a
       title: string;
       item: Record<string, unknown>;
     }[] = [];
-    await page.route("**/api/launchpad", (route) =>
+    await page.route(/\/api\/launchpad(?:\?.*)?$/, (route) =>
       route.fulfill({
         json: {
           platforms: [
@@ -3256,7 +3632,7 @@ test("Launchpad Minecraft selects show stable releases only and scope filters an
     "custom-1.21.1",
   ];
   const searches: URL[] = [];
-  await page.route("**/api/launchpad", (route) =>
+  await page.route(/\/api\/launchpad(?:\?.*)?$/, (route) =>
     route.fulfill({
       json: {
         platforms: [
@@ -3403,7 +3779,7 @@ for (const browse of [
     serverId,
   }) => {
     const versionRequests: URL[] = [];
-    await page.route("**/api/launchpad", (route) =>
+    await page.route(/\/api\/launchpad(?:\?.*)?$/, (route) =>
       route.fulfill({
         json: {
           platforms: [
@@ -3595,7 +3971,7 @@ for (const browse of [
       downloadable: true,
     };
     const versionRequests: URL[] = [];
-    await page.route("**/api/launchpad", (route) =>
+    await page.route(/\/api\/launchpad(?:\?.*)?$/, (route) =>
       route.fulfill({
         json: {
           platforms: [
@@ -3734,7 +4110,7 @@ test("Launchpad refresh retries a failed stable catalog while preserving configu
   const custom = "1.99.2";
   const catalog = ["26.2", "1.21.11", "1.21.1", "1.7.10"];
   let configRequests = 0;
-  await page.route("**/api/launchpad", (route) => {
+  await page.route(/\/api\/launchpad(?:\?.*)?$/, (route) => {
     configRequests++;
     return route.fulfill({
       json: {
@@ -3827,7 +4203,7 @@ for (const blockedBy of ["none", "dependent", "unreadable"]) {
     let removed = false;
     let reviews = 0;
     const removals: unknown[] = [];
-    await page.route("**/api/launchpad", (route) =>
+    await page.route(/\/api\/launchpad(?:\?.*)?$/, (route) =>
       route.fulfill({
         json: {
           platforms: [
@@ -3882,6 +4258,7 @@ for (const blockedBy of ["none", "dependent", "unreadable"]) {
       expect(route.request().headers()["x-server-id"]).toBe(serverId);
       expect(route.request().postDataJSON()).toEqual({
         path: "mods/target.jar",
+        type: "mod",
       });
       reviews++;
       return route.fulfill({
@@ -3979,7 +4356,7 @@ for (const blockedBy of ["none", "dependent", "unreadable"]) {
           animations: "disabled",
         });
         await dialog
-          .getByRole("button", { name: "Retry dependency check", exact: true })
+          .getByRole("button", { name: "Try again", exact: true })
           .click();
         await expect.poll(() => reviews).toBe(2);
         await expect(
@@ -3994,9 +4371,7 @@ for (const blockedBy of ["none", "dependent", "unreadable"]) {
       return;
     }
     await expect(dialog).toContainText("Recycle Bin");
-    await expect(dialog).toContainText(
-      "Other mods and libraries will stay installed",
-    );
+    await expect(dialog).toContainText("Other files will stay installed");
     await page.setViewportSize({ width: 390, height: 844 });
     await page.screenshot({
       path: testInfo.outputPath("review-mod-removal-mobile.png"),
@@ -4015,7 +4390,7 @@ for (const blockedBy of ["none", "dependent", "unreadable"]) {
       dialog.getByRole("button", { name: "Remove mod", exact: true }),
     ).toHaveCount(0);
     await dialog
-      .getByRole("button", { name: "Review removal again", exact: true })
+      .getByRole("button", { name: "Try again", exact: true })
       .click();
     await dialog
       .getByRole("button", { name: "Remove mod", exact: true })

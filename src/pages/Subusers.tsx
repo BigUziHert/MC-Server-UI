@@ -6,17 +6,12 @@ import {
   useState,
   type FormEvent,
 } from "react";
-import {
-  AlertCircle,
-  Pencil,
-  Plus,
-  RefreshCw,
-  Trash2,
-  Users,
-  X,
-} from "lucide-react";
+import { AlertCircle, Pencil, Plus, Trash2, Users, X } from "lucide-react";
 import { useServerApi, relativeTime, type PageProps } from "../api";
-import SearchField from "../SearchField";
+import SearchField, { useDebouncedValue } from "../SearchField";
+import RefreshButton from "../RefreshButton";
+import StatePanel from "../StatePanel";
+import Pagination from "../Pagination";
 import catalog from "../../shared/subuser-permissions.json";
 import "./subusers.css";
 
@@ -83,6 +78,11 @@ export default function Subusers({ notify }: PageProps) {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
   const [search, setSearch] = useState("");
+  const debouncedSearch = useDebouncedValue(search);
+  const [page, setPage] = useState(1),
+    [pageSize, setPageSize] = useState(25);
+  const loaded = useRef(false);
+  useEffect(() => setPage(1), [debouncedSearch, pageSize]);
   const [editor, setEditor] = useState<"create" | Subuser | null>(null);
   const [email, setEmail] = useState("");
   const [selected, setSelected] = useState<string[]>([]);
@@ -100,23 +100,31 @@ export default function Subusers({ notify }: PageProps) {
     request.current?.abort();
     const controller = new AbortController();
     request.current = controller;
-    setLoading(true);
+    if (!loaded.current) setLoading(true);
     setError("");
     try {
       const result = await api<{ users: Subuser[] }>("/subusers", {
         signal: controller.signal,
       });
-      if (!controller.signal.aborted) setUsers(result.users);
+      if (controller.signal.aborted) return false;
+      setUsers(result.users);
+      loaded.current = true;
+      return true;
     } catch (cause) {
       if (!controller.signal.aborted)
         setError(
           cause instanceof Error ? cause.message : "Unable to load subusers.",
         );
+      return false;
     } finally {
       if (!controller.signal.aborted) setLoading(false);
     }
   }, [api]);
   useEffect(() => {
+    loaded.current = false;
+    setUsers([]);
+    setSearch("");
+    setPage(1);
     void refresh();
     return () => request.current?.abort();
   }, [refresh]);
@@ -194,13 +202,24 @@ export default function Subusers({ notify }: PageProps) {
     }
   }
   const filtered = users.filter((user) =>
-    user.email.toLowerCase().includes(search.toLowerCase()),
+    user.email.toLowerCase().includes(debouncedSearch.toLowerCase()),
   );
 
+  const currentPage = Math.min(
+    page,
+    Math.max(1, Math.ceil(filtered.length / pageSize)),
+  );
+  const visible = filtered.slice(
+    (currentPage - 1) * pageSize,
+    currentPage * pageSize,
+  );
   return (
     <div className="subusers-page">
-      <header className="subusers-heading">
-        <h1>Subusers</h1>
+      <header className="page-heading">
+        <div>
+          <p className="eyebrow">MANAGEMENT</p>
+          <h1>Subusers</h1>
+        </div>
         <button className="btn primary" onClick={() => openEditor()}>
           <Plus size={16} />
           New user
@@ -217,49 +236,40 @@ export default function Subusers({ notify }: PageProps) {
             <SearchField
               className="subusers-search"
               aria-label="Search access records"
-              placeholder="Search by email…"
+              placeholder="Search subusers…"
               value={search}
               onValueChange={setSearch}
             />
-            <button
-              className="btn icon"
-              aria-label="Refresh access records"
-              title="Refresh users"
-              disabled={loading}
-              onClick={() => void refresh()}
-            >
-              <RefreshCw
-                size={15}
-                className={loading ? "subusers-spinning" : ""}
-              />
-            </button>
+            <RefreshButton
+              label="Refresh access records"
+              disabled={busy}
+              onRefresh={refresh}
+              notify={notify}
+              successMessage="Access records refreshed."
+            />
           </div>
         </div>
-        {error ? (
-          <div className="subusers-error" role="alert">
-            <AlertCircle size={18} />
-            <span>{error}</span>
-            <button className="btn" onClick={() => void refresh()}>
-              Try again
-            </button>
-          </div>
-        ) : loading ? (
-          <div className="subusers-empty" role="status">
-            <RefreshCw size={20} className="subusers-spinning" />
-            <span>Loading subusers…</span>
-          </div>
+        {error && (
+          <StatePanel
+            variant="error"
+            title="Unable to refresh subusers"
+            message={error}
+            onRetry={() => void refresh()}
+          />
+        )}
+        {loading ? (
+          <StatePanel variant="loading" title="Loading subusers…" />
         ) : filtered.length === 0 ? (
-          <div className="subusers-empty">
-            <Users size={25} />
-            <div>
-              <h2>{search ? "No matching people" : "No subusers"}</h2>
-              <p>
-                {search
-                  ? "Try another email address."
-                  : "Create a local record for someone who helps manage this server."}
-              </p>
-            </div>
-          </div>
+          <StatePanel
+            variant="empty"
+            icon={<Users size={25} />}
+            title={search ? "No matching people" : "No subusers"}
+            message={
+              search
+                ? "Try another email address."
+                : "Create a local record for someone who helps manage this server."
+            }
+          />
         ) : (
           <table className="subusers-table">
             <thead>
@@ -273,7 +283,7 @@ export default function Subusers({ notify }: PageProps) {
               </tr>
             </thead>
             <tbody>
-              {filtered.map((user) => {
+              {visible.map((user) => {
                 const count = permissionsFor(user).length;
                 return (
                   <tr key={user.id}>
@@ -332,6 +342,14 @@ export default function Subusers({ notify }: PageProps) {
             </tbody>
           </table>
         )}
+        <Pagination
+          page={currentPage}
+          pageSize={pageSize}
+          total={filtered.length}
+          onPageChange={setPage}
+          onPageSizeChange={setPageSize}
+          label="subusers"
+        />
       </section>
 
       <dialog

@@ -14,13 +14,7 @@
 .management-heading > div {
   min-width: 0;
 }
-.management-eyebrow {
-  font-size: 10px;
-  font-weight: 700;
-  letter-spacing: 1.6px;
-  color: #969bb3;
-  margin-bottom: 12px;
-}
+
 .management-heading h1 {
   margin: 0 0 10px;
 }
@@ -158,33 +152,7 @@
   gap: 9px;
 }
 .management-search {
-  display: flex;
-  align-items: center;
-  gap: 9px;
-  border: 1px solid #303140;
-  border-radius: 6px;
-  background: #15151d;
   min-width: 0;
-  padding: 0 12px;
-  height: 36px;
-  color: #969bb3;
-}
-.management-search input {
-  width: 195px;
-  min-width: 0;
-  background: transparent;
-  border: 0 !important;
-  border-radius: 0;
-  outline: none !important;
-  box-shadow: none !important;
-  color: #eef0f8;
-  font: inherit;
-  font-size: 11px;
-  height: 100%;
-  padding: 0 !important;
-}
-.management-search input::placeholder {
-  color: #969bb3;
 }
 .management-table {
   width: 100%;
@@ -727,18 +695,7 @@
   font-size: 10px;
   color: #969bb3;
 }
-.management-audit-search input {
-  width: 246px;
-}
-.management-clear-search {
-  padding: 0;
-  background: transparent;
-  border: 0;
-  color: #969bb3;
-  cursor: pointer;
-  display: flex;
-  align-items: center;
-}
+
 .management-audit-filters {
   display: flex;
   align-items: center;
@@ -918,18 +875,8 @@
   clip: rect(0, 0, 0, 0);
   white-space: nowrap;
 }
-.management-spinning {
-  animation: management-spin 1s linear infinite;
-}
-@keyframes management-spin {
-  to {
-    transform: rotate(360deg);
-  }
-}
+
 @media (prefers-reduced-motion: reduce) {
-  .management-spinning {
-    animation: none;
-  }
 }
 @media (max-width: 1100px) {
   .management-database-summary {
@@ -978,9 +925,6 @@
   .management-search {
     width: 100%;
     box-sizing: border-box;
-  }
-  .management-search input {
-    width: 100%;
   }
   .management-controls .management-search {
     flex: 1;
@@ -1100,4 +1044,16 @@
 /* Keep offscreen table action labels inside their horizontally scrolling headers. */
 .management-table th {
   position: relative;
+}
+.management-event-icon.category-server {
+  color: #82b7ff;
+  background: #82b7ff14;
+}
+.management-category.category-server {
+  color: #82b7ff;
+  border-color: #82b7ff40;
+  background: #82b7ff12;
+}
+.management-audit-search {
+  width: 280px;
 }

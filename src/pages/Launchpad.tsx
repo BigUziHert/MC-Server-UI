@@ -10,8 +10,6 @@ import {
   AlertCircle,
   ArrowRight,
   Check,
-  ChevronLeft,
-  ChevronRight,
   Download,
   FileCode2,
   Info,
@@ -27,7 +25,11 @@ import {
   X,
 } from "lucide-react";
 import { formatBytes, ServerScope, useServerApi, type PageProps } from "../api";
-import SearchField from "../SearchField";
+import SearchField, { useDebouncedValue } from "../SearchField";
+import RefreshButton from "../RefreshButton";
+import StatePanel from "../StatePanel";
+import Pagination from "../Pagination";
+import Switch from "../Switch";
 import "./management.css";
 import "./launchpad.css";
 
@@ -63,6 +65,7 @@ type Project = {
 };
 type InstalledItem = {
   path: string;
+  sha512?: string;
   name: string;
   size: number;
   platform: string | null;
@@ -101,7 +104,52 @@ type SearchResult = {
   limit: number;
   warnings?: string[];
 };
-type InstalledResult = { items: InstalledItem[]; warnings: string[] };
+type InstalledResult = {
+  items: InstalledItem[];
+  warnings: string[];
+  checkingUpdates?: boolean;
+  progress?: { completed: number; total: number };
+};
+function pendingInventory(result: InstalledResult): InstalledResult {
+  return {
+    ...result,
+    warnings: [],
+    checkingUpdates: false,
+    progress: undefined,
+    items: result.items.map((item) => ({
+      ...item,
+      update: null,
+      updateIssue: undefined,
+      updateCheck: item.platform && item.projectId ? "pending" : undefined,
+    })),
+  };
+}
+function mergeLocalInventory(
+  local: InstalledResult,
+  previous?: InstalledResult,
+): InstalledResult {
+  const known = new Map(previous?.items.map((item) => [item.path, item]));
+  return {
+    ...local,
+    items: local.items.map((item) => {
+      const old = known.get(item.path);
+      if (!old || !item.sha512 || item.sha512 !== old.sha512) return item;
+      return {
+        ...item,
+        platform: old.platform || item.platform,
+        projectId: old.projectId ?? item.projectId,
+        versionId: old.versionId ?? item.versionId,
+        versionName: old.versionName ?? item.versionName,
+        title: old.title ?? item.title,
+        iconUrl: old.iconUrl ?? item.iconUrl,
+        author: old.author ?? item.author,
+        update: old.update !== undefined ? old.update : item.update,
+        updateCheck: old.updateCheck ?? item.updateCheck,
+        updateIssue: old.updateIssue ?? item.updateIssue,
+      };
+    }),
+  };
+}
 type Plan = {
   planId: string;
   title: string;
@@ -323,7 +371,9 @@ export default function Launchpad({ notify }: PageProps) {
   const [gameVersion, setGameVersion] = useState("");
   const [loader, setLoader] = useState("");
   const [status, setStatus] = useState<string | null>(null);
+  const [statusStale, setStatusStale] = useState(false);
   const [query, setQuery] = useState("");
+  const filteredQuery = useDebouncedValue(query);
   const [sort, setSort] = useState("downloads");
   const [installedSort, setInstalledSort] = useState<InstalledSort>("updates");
   const [installedOnly, setInstalledOnly] = useState(false);
@@ -337,6 +387,7 @@ export default function Launchpad({ notify }: PageProps) {
     }
   });
   const [results, setResults] = useState<SearchResult | null>(null);
+  const resultsScope = useRef("");
   const [searchLoading, setSearchLoading] = useState(false);
   const [searchError, setSearchError] = useState("");
   const loaders = loadersFor(type).filter(
@@ -362,21 +413,27 @@ export default function Launchpad({ notify }: PageProps) {
   const [inventory, setInventory] = useState<{
     api: typeof api;
     scope: string;
+    type: ContentType;
     result: InstalledResult;
   } | null>(null);
   const inventoryRef = useRef<typeof inventory>(null);
   const installed =
-    inventory?.api === api && inventory.scope === inventoryScope
-      ? inventory.result
+    inventory?.api === api && inventory.type === type
+      ? inventory.scope === inventoryScope
+        ? inventory.result
+        : pendingInventory(inventory.result)
       : null;
   const [scanLoading, setScanLoading] = useState(false);
   const [scanRefreshing, setScanRefreshing] = useState(false);
   const [scanError, setScanError] = useState("");
   const [reload, setReload] = useState(0);
   const scanEpoch = useRef(0);
-  const forceScan = useRef<{ api: typeof api; scope: string } | null>(null);
+  const forceScan = useRef<{ api: typeof api; token: number } | null>(null);
+  const refreshSequence = useRef(0);
+  const [manualRefreshing, setManualRefreshing] = useState(false);
+  const manualCompletion = useRef<((success: boolean) => void) | null>(null);
+  const [pendingPaths, setPendingPaths] = useState<Set<string>>(new Set());
   const reloadContent = useCallback(() => {
-    forceScan.current = null;
     setReload((value) => value + 1);
   }, []);
   const [selection, setSelection] = useState<Selection | null>(null);
@@ -388,6 +445,7 @@ export default function Launchpad({ notify }: PageProps) {
   const [targetVersion, setTargetVersion] = useState("");
   const [targetLoader, setTargetLoader] = useState("");
   const [plan, setPlan] = useState<Plan | null>(null);
+  const consumedPlans = useRef(new Set<string>());
   const [cleanAccepted, setCleanAccepted] = useState(false);
   const [dialogError, setDialogError] = useState("");
   const [removal, setRemoval] = useState<InstalledItem | null>(null);
@@ -418,6 +476,8 @@ export default function Launchpad({ notify }: PageProps) {
   const supported = Boolean(source?.types.includes(type));
   const working = Boolean(job && ["queued", "running"].includes(job.status));
   const canInstall = status === "offline" && !working;
+  const contentName =
+    type === "plugin" ? "plugin" : type === "datapack" ? "datapack" : "mod";
   const minecraftVersions = [
     ...new Set(
       [
@@ -433,15 +493,18 @@ export default function Launchpad({ notify }: PageProps) {
   ];
 
   const loadConfig = useCallback(
-    async (initial = false) => {
+    async (initial = false, fresh = false) => {
       const current = session.current;
       setConfigLoading(true);
       setConfigError("");
       try {
-        const next = await api<Config>("/launchpad");
-        if (current !== session.current) return;
+        const next = await api<Config>(
+          `/launchpad${fresh ? "?refresh=1" : ""}`,
+        );
+        if (current !== session.current) return false;
         setConfig(next);
         setStatus(next.status);
+        setStatusStale(false);
         if (initial) {
           const saved = readSavedView(viewKey);
           const first =
@@ -453,7 +516,8 @@ export default function Launchpad({ notify }: PageProps) {
             next.platforms[0];
           setPlatform(first?.id ?? "modrinth");
           const initialType =
-            saved.type && first?.types.includes(saved.type)
+            saved.type &&
+            (saved.installedOnly || first?.types.includes(saved.type))
               ? saved.type
               : pluginLoaders.includes(next.loader ?? "") &&
                   first?.types.includes("plugin")
@@ -491,14 +555,66 @@ export default function Launchpad({ notify }: PageProps) {
           setViewReady(viewKey);
           setJob(next.job ?? null);
         }
+        return true;
       } catch (cause) {
         if (current === session.current) setConfigError(messageOf(cause));
+        return false;
       } finally {
         if (current === session.current) setConfigLoading(false);
       }
     },
     [api, viewKey],
   );
+
+  const refreshInstalled = useCallback(async () => {
+    const currentSession = session.current;
+    manualCompletion.current?.(false);
+    setManualRefreshing(true);
+    const configured = await loadConfig(false, true);
+    if (currentSession !== session.current) return false;
+    if (!configured) {
+      setManualRefreshing(false);
+      return false;
+    }
+    forceScan.current = { api, token: ++refreshSequence.current };
+    const completion = new Promise<boolean>((resolve) => {
+      manualCompletion.current = resolve;
+    });
+    setReload((value) => value + 1);
+    return completion;
+  }, [api, loadConfig]);
+
+  const reconcileJob = useCallback(async () => {
+    const currentSession = session.current;
+    await loadConfig();
+    if (currentSession === session.current) reloadContent();
+  }, [loadConfig, reloadContent]);
+
+  // Reviews reserve staged files. Release them on Back, close, server change,
+  // or unmount; an accepted job owns its staging until it finishes.
+  useEffect(() => {
+    const id = plan?.planId;
+    return () => {
+      if (id && !consumedPlans.current.delete(id))
+        void api(`/launchpad/preview/${encodeURIComponent(id)}/cancel`, {
+          method: "POST",
+          keepalive: true,
+        }).catch(() => {});
+    };
+  }, [api, plan?.planId]);
+  useEffect(() => {
+    const id = removalPlan?.planId;
+    return () => {
+      if (id && !consumedPlans.current.delete(id))
+        void api(
+          `/launchpad/removal-preview/${encodeURIComponent(id)}/cancel`,
+          {
+            method: "POST",
+            keepalive: true,
+          },
+        ).catch(() => {});
+    };
+  }, [api, removalPlan?.planId]);
 
   useEffect(() => {
     session.current++;
@@ -508,8 +624,14 @@ export default function Launchpad({ notify }: PageProps) {
     setInventory(null);
     inventoryRef.current = null;
     forceScan.current = null;
+    manualCompletion.current?.(false);
+    manualCompletion.current = null;
+    setManualRefreshing(false);
+    setPendingPaths(new Set());
+    setStatusStale(false);
     setJob(null);
     setSelection(null);
+    setPlan(null);
     setRemoval(null);
     setRemovalPlan(null);
     setRemovalError("");
@@ -523,19 +645,30 @@ export default function Launchpad({ notify }: PageProps) {
     setBusy(null);
     pending.current = false;
     void loadConfig(true);
+    let statusFailures = 0;
     const timer = window.setInterval(() => {
       const current = session.current;
       void api<{ status: string }>("/server")
         .then((next) => {
-          if (current === session.current) setStatus(next.status);
+          if (current === session.current) {
+            statusFailures = 0;
+            setStatus(next.status);
+            setStatusStale(false);
+          }
         })
         .catch(() => {
-          if (current === session.current) setStatus(null);
+          if (current === session.current) {
+            statusFailures++;
+            setStatusStale(true);
+            if (statusFailures > 1) setStatus(null);
+          }
         });
     }, 5000);
     return () => {
       session.current++;
       operation.current++;
+      manualCompletion.current?.(false);
+      manualCompletion.current = null;
       window.clearInterval(timer);
     };
   }, [api, loadConfig]);
@@ -579,6 +712,20 @@ export default function Launchpad({ notify }: PageProps) {
       return;
     }
     const controller = new AbortController();
+    const scope = JSON.stringify([
+      platform,
+      type,
+      query.trim(),
+      gameVersion.trim(),
+      loader,
+      catalogSort,
+      offset,
+      limit,
+    ]);
+    if (resultsScope.current !== scope) {
+      resultsScope.current = scope;
+      setResults(null);
+    }
     setSearchLoading(true);
     setSearchError("");
     const timer = window.setTimeout(() => {
@@ -630,23 +777,43 @@ export default function Launchpad({ notify }: PageProps) {
       epoch === scanEpoch.current &&
       currentSession === session.current;
     let hasSnapshot =
-      inventoryRef.current?.api === api &&
-      inventoryRef.current.scope === inventoryScope;
+      inventoryRef.current?.api === api && inventoryRef.current.type === type;
     setScanLoading(!hasSnapshot);
     setScanRefreshing(true);
     setScanError("");
     if (!hasSnapshot) {
       inventoryRef.current = null;
       setInventory(null);
+    } else if (inventoryRef.current!.scope !== inventoryScope) {
+      const next = {
+        api,
+        scope: inventoryScope,
+        type,
+        result: pendingInventory(inventoryRef.current!.result),
+      };
+      inventoryRef.current = next;
+      setInventory(next);
     }
-    const publish = (result: InstalledResult) => {
+    const publish = (result: InstalledResult, local = false) => {
       if (!current()) return;
-      const next = { api, scope: inventoryScope, result };
+      const next = {
+        api,
+        scope: inventoryScope,
+        type,
+        result: local
+          ? mergeLocalInventory(result, inventoryRef.current?.result)
+          : result,
+      };
       inventoryRef.current = next;
       setInventory(next);
       hasSnapshot = true;
+      if (local) setPendingPaths(new Set());
     };
-    async function readStage(local: boolean, force: boolean) {
+    async function readStage(
+      local: boolean,
+      force: boolean,
+      remaining = 45_000,
+    ) {
       const stage = new AbortController();
       let timer: number;
       let abort: () => void = () => {};
@@ -667,7 +834,7 @@ export default function Launchpad({ notify }: PageProps) {
               ),
             );
           },
-          local ? 30_000 : 45_000,
+          local ? 30_000 : Math.max(1, Math.min(45_000, remaining)),
         );
       });
       try {
@@ -679,6 +846,7 @@ export default function Launchpad({ notify }: PageProps) {
               loader: contentLoader,
               local: local ? "true" : undefined,
               refresh: !local && force ? "true" : undefined,
+              background: !local && force ? "true" : undefined,
             })}`,
             { signal: stage.signal },
           ),
@@ -690,13 +858,13 @@ export default function Launchpad({ notify }: PageProps) {
       }
     }
     const timer = window.setTimeout(() => {
-      const force =
-        forceScan.current?.api === api &&
-        forceScan.current.scope === inventoryScope;
-      forceScan.current = null;
+      const forcedRequest =
+        forceScan.current?.api === api ? forceScan.current : null;
+      const force = Boolean(forcedRequest);
       void (async () => {
+        let success = false;
         try {
-          publish(await readStage(true, false));
+          publish(await readStage(true, false), true);
         } catch (cause) {
           if (!current()) return;
           setScanError(
@@ -707,8 +875,32 @@ export default function Launchpad({ notify }: PageProps) {
         }
         if (!current()) return;
         try {
-          publish(await readStage(false, force));
-          if (current()) setScanError("");
+          const deadline = Date.now() + 120_000;
+          let result = await readStage(false, force);
+          publish(result);
+          while (current() && result.checkingUpdates) {
+            await new Promise<void>((resolve) => {
+              const done = () => {
+                window.clearTimeout(wait);
+                controller.signal.removeEventListener("abort", done);
+                resolve();
+              };
+              const wait = window.setTimeout(done, 3000);
+              controller.signal.addEventListener("abort", done, { once: true });
+            });
+            if (!current()) return;
+            if (Date.now() >= deadline)
+              throw new Error(
+                "The update check is taking longer than expected. Try again to see its latest results.",
+              );
+            result = await readStage(false, false, deadline - Date.now());
+            publish(result);
+          }
+          if (current()) {
+            setScanError("");
+            setPendingPaths(new Set());
+            success = true;
+          }
         } catch (cause) {
           if (current()) {
             const snapshot = inventoryRef.current;
@@ -743,6 +935,15 @@ export default function Launchpad({ notify }: PageProps) {
           if (current()) {
             setScanLoading(false);
             setScanRefreshing(false);
+            if (
+              forcedRequest &&
+              forceScan.current?.token === forcedRequest.token
+            ) {
+              forceScan.current = null;
+              setManualRefreshing(false);
+              manualCompletion.current?.(success);
+              manualCompletion.current = null;
+            }
           }
         }
       })();
@@ -824,15 +1025,25 @@ export default function Launchpad({ notify }: PageProps) {
         setJob(next.job);
         setJobError("");
         if (next.job.status === "completed") {
-          reloadContent();
+          void reconcileJob();
           notify(next.job.message || "Installation completed.");
         }
-        if (next.job.status === "failed")
+        if (next.job.status === "failed") {
+          void reconcileJob();
           notify(next.job.error || next.job.message, true);
+        }
         if (["queued", "running"].includes(next.job.status))
           timer = window.setTimeout(poll, 1000);
       } catch (cause) {
         if (!controller.signal.aborted) {
+          if ((cause as { status?: number }).status === 404) {
+            setJob(null);
+            setJobError(
+              "This installation is no longer being tracked. Check the installed list for its result.",
+            );
+            void reconcileJob();
+            return;
+          }
           setJobError(messageOf(cause));
           timer = window.setTimeout(poll, 3000);
         }
@@ -843,7 +1054,7 @@ export default function Launchpad({ notify }: PageProps) {
       controller.abort();
       window.clearTimeout(timer);
     };
-  }, [api, job?.id, job?.status, jobReload, notify, reloadContent]);
+  }, [api, job?.id, job?.status, jobReload, notify, reconcileJob]);
 
   function chooseProject(project: Project, entry?: InstalledItem) {
     operation.current++;
@@ -892,12 +1103,18 @@ export default function Launchpad({ notify }: PageProps) {
     try {
       const next = await post<RemovalPlan>("/launchpad/removal-preview", {
         path: entry.path,
+        type,
       });
       if (
         currentSession === session.current &&
         currentOperation === operation.current
-      )
+      ) {
         setRemovalPlan(next);
+      } else if (next.planId) {
+        void post(
+          `/launchpad/removal-preview/${encodeURIComponent(next.planId)}/cancel`,
+        ).catch(() => {});
+      }
     } catch (cause) {
       if (
         currentSession === session.current &&
@@ -933,6 +1150,7 @@ export default function Launchpad({ notify }: PageProps) {
         planId: removalPlan.planId,
         confirmed: true,
       });
+      consumedPlans.current.add(removalPlan.planId);
       if (
         currentSession !== session.current ||
         currentOperation !== operation.current
@@ -940,6 +1158,20 @@ export default function Launchpad({ notify }: PageProps) {
         return;
       setRemoval(null);
       setRemovalPlan(null);
+      const removedPaths = new Set(removalPlan.files.map((file) => file.path));
+      if (inventoryRef.current?.api === api) {
+        const next = {
+          ...inventoryRef.current,
+          result: {
+            ...inventoryRef.current.result,
+            items: inventoryRef.current.result.items.filter(
+              (item) => !removedPaths.has(item.path),
+            ),
+          },
+        };
+        inventoryRef.current = next;
+        setInventory(next);
+      }
       reloadContent();
       notify(`${removal.title || removal.name} moved to Recycle Bin.`);
     } catch (cause) {
@@ -970,6 +1202,12 @@ export default function Launchpad({ notify }: PageProps) {
       );
       return;
     }
+    if (!targetLoader) {
+      setDialogError(
+        "Choose your server’s loader before reviewing this installation.",
+      );
+      return;
+    }
     if (!canInstall) {
       setDialogError(
         "Stop the server in Console before reviewing file changes.",
@@ -997,8 +1235,13 @@ export default function Launchpad({ notify }: PageProps) {
       if (
         currentSession === session.current &&
         currentOperation === operation.current
-      )
+      ) {
         setPlan(next);
+      } else if (next.planId) {
+        void post(
+          `/launchpad/preview/${encodeURIComponent(next.planId)}/cancel`,
+        ).catch(() => {});
+      }
     } catch (cause) {
       if (
         currentSession === session.current &&
@@ -1038,19 +1281,31 @@ export default function Launchpad({ notify }: PageProps) {
           ? { acknowledgedUnavailableDependencies: true }
           : {}),
       });
+      consumedPlans.current.add(plan.planId);
       if (
         currentSession !== session.current ||
         currentOperation !== operation.current
       )
         return;
       setJob(next.job);
+      setPendingPaths(
+        new Set(
+          plan.cleanInstall || type === "modpack"
+            ? inventoryRef.current?.result.items.map((item) => item.path)
+            : plan.files.flatMap((file) => [
+                file.path,
+                ...(file.previousPath ? [file.previousPath] : []),
+              ]),
+        ),
+      );
       setJobError("");
       setSelection(null);
       setPlan(null);
       if (next.job.status === "completed") {
-        reloadContent();
+        void reconcileJob();
         notify(next.job.message);
       }
+      if (next.job.status === "failed") void reconcileJob();
     } catch (cause) {
       if (
         currentSession === session.current &&
@@ -1111,12 +1366,10 @@ export default function Launchpad({ notify }: PageProps) {
     setOffset(0);
   }
   const entries = (installed?.items ?? [])
-    .filter(
-      (entry) =>
-        (!entry.platform || entry.platform === platform) &&
-        `${entry.title ?? ""} ${entry.name} ${entry.path} ${entry.author ?? ""}`
-          .toLowerCase()
-          .includes(query.trim().toLowerCase()),
+    .filter((entry) =>
+      `${entry.title ?? ""} ${entry.name} ${entry.path} ${entry.author ?? ""}`
+        .toLowerCase()
+        .includes(filteredQuery.trim().toLowerCase()),
     )
     .sort((a, b) => compareInstalled(a, b, installedSort));
   const total = installedOnly ? entries.length : (results?.total ?? 0);
@@ -1128,9 +1381,10 @@ export default function Launchpad({ notify }: PageProps) {
     if (installedOnly && installed && offset !== currentOffset)
       setOffset(currentOffset);
   }, [installedOnly, installed, offset, currentOffset]);
-  const pageCount = Math.max(1, Math.ceil(total / limit));
   const selectedVersion = versions.find((version) => version.id === versionId);
-  const loading = installedOnly ? !installed && scanLoading : searchLoading;
+  const loading = installedOnly
+    ? !installed && scanLoading
+    : !results && searchLoading;
   const failed = installedOnly ? !installed && scanError : searchError;
   const keySource = config?.platforms.find((item) => item.id === "curseforge");
   const updateFiltersReady = Boolean(
@@ -1168,6 +1422,15 @@ export default function Launchpad({ notify }: PageProps) {
               entry.projectId === project.id,
           ),
         }));
+  const duplicateProjects = new Set<string>();
+  const projectCounts = new Map<string, number>();
+  for (const item of installed?.items ?? []) {
+    if (!item.platform || !item.projectId) continue;
+    const key = `${item.platform}:${item.projectId}`;
+    const count = (projectCounts.get(key) ?? 0) + 1;
+    projectCounts.set(key, count);
+    if (count > 1) duplicateProjects.add(key);
+  }
   const warnings = [
     ...new Set([
       ...(config?.warnings ?? []),
@@ -1182,23 +1445,14 @@ export default function Launchpad({ notify }: PageProps) {
         <div className="page-heading">
           <h1>Launchpad</h1>
         </div>
-        <div className="panel launchpad-empty">
-          {configLoading ? (
-            <>
-              <LoaderCircle className="spin" size={24} />
-              <p role="status">Loading Launchpad...</p>
-            </>
-          ) : (
-            <>
-              <AlertCircle size={24} />
-              <h2>Unable to load Launchpad</h2>
-              <p role="alert">{configError}</p>
-              <button className="btn" onClick={() => void loadConfig(true)}>
-                Try again
-              </button>
-            </>
-          )}
-        </div>
+        <StatePanel
+          variant={configLoading ? "loading" : "error"}
+          title={
+            configLoading ? "Loading Launchpad…" : "Unable to load Launchpad"
+          }
+          message={configError}
+          onRetry={() => void loadConfig(true)}
+        />
       </div>
     );
 
@@ -1206,7 +1460,7 @@ export default function Launchpad({ notify }: PageProps) {
     <div className="management-page launchpad-page">
       <div className="page-heading management-heading">
         <div>
-          <div className="management-eyebrow">MINECRAFT</div>
+          <p className="eyebrow">MINECRAFT</p>
           <h1>Launchpad</h1>
         </div>
         <button
@@ -1225,17 +1479,25 @@ export default function Launchpad({ notify }: PageProps) {
           Platform
           <select
             aria-label="Platform"
-            value={platform}
+            value={installedOnly ? "all" : platform}
+            disabled={installedOnly}
+            title={
+              installedOnly
+                ? "Installed content includes every platform."
+                : undefined
+            }
             onChange={(event) => {
               const next = config.platforms.find(
                 (item) => item.id === event.target.value,
               );
               setPlatform(event.target.value);
+              setQuery("");
               setOffset(0);
               if (next && !next.types.includes(type))
                 changeType(next.types[0] ?? "modpack");
             }}
           >
+            {installedOnly && <option value="all">All platforms</option>}
             {config.platforms.map((item) => (
               <option key={item.id} value={item.id}>
                 {item.name}
@@ -1247,6 +1509,14 @@ export default function Launchpad({ notify }: PageProps) {
           Minecraft version
           <select
             aria-label="Minecraft version"
+            aria-describedby={
+              installedOnly && !updateFiltersReady && type !== "modpack"
+                ? "launchpad-update-target"
+                : undefined
+            }
+            aria-invalid={
+              installedOnly && type !== "modpack" && !contentGameVersion
+            }
             value={gameVersion}
             onChange={(event) => {
               setGameVersion(event.target.value);
@@ -1265,6 +1535,12 @@ export default function Launchpad({ notify }: PageProps) {
           Loader
           <select
             aria-label="Loader"
+            aria-describedby={
+              installedOnly && !updateFiltersReady && type !== "modpack"
+                ? "launchpad-update-target"
+                : undefined
+            }
+            aria-invalid={installedOnly && type !== "modpack" && !contentLoader}
             value={loader}
             onChange={(event) => {
               setLoader(event.target.value);
@@ -1294,9 +1570,9 @@ export default function Launchpad({ notify }: PageProps) {
             aria-selected={type === id}
             aria-controls="launchpad-results"
             tabIndex={type === id ? 0 : -1}
-            disabled={!source?.types.includes(id)}
+            disabled={!installedOnly && !source?.types.includes(id)}
             title={
-              !source?.types.includes(id)
+              !installedOnly && !source?.types.includes(id)
                 ? `${source?.name ?? "This platform"} does not offer ${label.toLowerCase()}.`
                 : undefined
             }
@@ -1307,8 +1583,8 @@ export default function Launchpad({ notify }: PageProps) {
               )
                 return;
               event.preventDefault();
-              const supportedKinds = kinds.filter((item) =>
-                source?.types.includes(item.id),
+              const supportedKinds = kinds.filter(
+                (item) => installedOnly || source?.types.includes(item.id),
               );
               const current = supportedKinds.findIndex(
                 (item) => item.id === type,
@@ -1338,6 +1614,28 @@ export default function Launchpad({ notify }: PageProps) {
           </button>
         ))}
       </div>
+      {statusStale && status && (
+        <div className="launchpad-inline-notice" role="status">
+          <Info size={17} />
+          <span>
+            Reconnecting to the server. Last known status: {status}. File
+            changes are checked again before they run.
+          </span>
+        </div>
+      )}
+      {installedOnly && !updateFiltersReady && type !== "modpack" && (
+        <div
+          className="launchpad-inline-notice"
+          id="launchpad-update-target"
+          role="status"
+        >
+          <Info size={17} />
+          <span>
+            Choose this server’s Minecraft version and loader above to check for
+            updates.
+          </span>
+        </div>
+      )}
       {status !== "offline" && (
         <div className="launchpad-inline-notice">
           <Info size={17} />
@@ -1350,58 +1648,29 @@ export default function Launchpad({ notify }: PageProps) {
         </div>
       )}
       <div className="panel launchpad-toolbar">
-        <div className="launchpad-pagination">
-          <button
-            className="btn icon"
-            aria-label="Previous Launchpad page"
-            disabled={loading || currentOffset === 0}
-            onClick={() => setOffset(Math.max(0, currentOffset - limit))}
-          >
-            <ChevronLeft size={16} />
-          </button>
-          <button
-            className="btn icon"
-            aria-label="Next Launchpad page"
-            disabled={loading || currentOffset + limit >= total}
-            onClick={() => setOffset(currentOffset + limit)}
-          >
-            <ChevronRight size={16} />
-          </button>
-          <label>
-            Rows
-            <select
-              aria-label="Launchpad rows per page"
-              value={limit}
-              onChange={(event) => {
-                const value = Number(event.target.value);
-                setLimit(value);
-                setOffset(0);
-                try {
-                  localStorage.setItem(
-                    "mc-panel.launchpad.rows",
-                    String(value),
-                  );
-                } catch {
-                  /* Keep session pagination available. */
-                }
-              }}
-            >
-              {rowsOptions.map((size) => (
-                <option key={size} value={size}>
-                  {size}
-                </option>
-              ))}
-            </select>
-          </label>
-          <span role="status" aria-label="Launchpad page">
-            Page {Math.floor(currentOffset / limit) + 1} of {pageCount}
-          </span>
-        </div>
+        <Pagination
+          label="Launchpad"
+          page={Math.floor(currentOffset / limit) + 1}
+          pageSize={limit}
+          total={total}
+          pageSizes={rowsOptions}
+          disabled={loading}
+          onPageChange={(page) => setOffset((page - 1) * limit)}
+          onPageSizeChange={(value) => {
+            setLimit(value);
+            setOffset(0);
+            try {
+              localStorage.setItem("mc-panel.launchpad.rows", String(value));
+            } catch {
+              /* session only */
+            }
+          }}
+        />
         <SearchField
           className="launchpad-search"
-          iconSize={17}
+          grow
           aria-label="Search Launchpad"
-          placeholder={`Search ${kinds.find((item) => item.id === type)?.label.toLowerCase()}...`}
+          placeholder={`Search ${kinds.find((item) => item.id === type)?.label.toLowerCase()}…`}
           value={query}
           onValueChange={(value) => {
             setQuery(value);
@@ -1445,33 +1714,27 @@ export default function Launchpad({ notify }: PageProps) {
             </select>
           </label>
         ) : null}
-        <label className="launchpad-installed-toggle">
-          <input
-            type="checkbox"
-            role="switch"
+        <div className="launchpad-toolbar-actions">
+          <Switch
+            label="Installed only"
             aria-label="Show installed content"
             checked={installedOnly}
-            onChange={(event) => {
-              setInstalledOnly(event.target.checked);
+            onCheckedChange={(checked) => {
+              setInstalledOnly(checked);
               setOffset(0);
+              setQuery("");
+              if (!checked && !source?.types.includes(type))
+                changeType(source?.types[0] ?? "modpack");
             }}
           />
-          Installed only
-        </label>
-        <button
-          className="btn icon"
-          aria-label="Refresh Launchpad and check updates"
-          disabled={
-            configLoading || searchLoading || scanLoading || scanRefreshing
-          }
-          onClick={() => {
-            forceScan.current = { api, scope: inventoryScope };
-            void loadConfig();
-            setReload((value) => value + 1);
-          }}
-        >
-          <RefreshCw size={16} className={scanRefreshing ? "spin" : ""} />
-        </button>
+          <RefreshButton
+            label="Refresh Launchpad and check updates"
+            refreshing={manualRefreshing}
+            onRefresh={refreshInstalled}
+            notify={notify}
+            successMessage="Launchpad refreshed."
+          />
+        </div>
       </div>
       {job && (
         <div
@@ -1501,7 +1764,19 @@ export default function Launchpad({ notify }: PageProps) {
               <button
                 className="btn icon"
                 aria-label="Dismiss installation status"
-                onClick={() => setJob(null)}
+                onClick={() => {
+                  const currentSession = session.current;
+                  void post(
+                    `/launchpad/jobs/${encodeURIComponent(job.id)}/dismiss`,
+                  )
+                    .then(() => {
+                      if (currentSession === session.current)
+                        setJob((current) =>
+                          current?.id === job.id ? null : current,
+                        );
+                    })
+                    .catch((cause) => notify(messageOf(cause), true));
+                }}
               >
                 <X size={16} />
               </button>
@@ -1521,18 +1796,29 @@ export default function Launchpad({ notify }: PageProps) {
                 className="btn"
                 onClick={() => setJobReload((value) => value + 1)}
               >
-                Retry progress
+                Try again
               </button>
             </div>
           )}
         </div>
+      )}
+      {!job && jobError && (
+        <StatePanel
+          variant="error"
+          title="Installation status unavailable"
+          message={jobError}
+          onRetry={() => {
+            setJobError("");
+            void refreshInstalled();
+          }}
+        />
       )}
       {configError && (
         <div className="launchpad-error" role="alert">
           <AlertCircle size={16} />
           <span>{configError}</span>
           <button className="btn" onClick={() => void loadConfig()}>
-            Retry settings
+            Try again
           </button>
         </div>
       )}
@@ -1551,8 +1837,10 @@ export default function Launchpad({ notify }: PageProps) {
           <LoaderCircle size={14} className="spin" />
           <span>
             {scanLoading
-              ? "Reading installed files..."
-              : "Refreshing installed details and checking updates..."}
+              ? "Reading installed files…"
+              : installed?.checkingUpdates && installed.progress
+                ? `Checking updates for ${Math.max(0, installed.progress.total - installed.progress.completed)} of ${installed.progress.total}…`
+                : "Refreshing installed details and checking updates…"}
           </span>
         </div>
       )}
@@ -1562,12 +1850,10 @@ export default function Launchpad({ notify }: PageProps) {
           <span>{scanError}</span>
           <button
             className="btn"
-            onClick={() => {
-              forceScan.current = { api, scope: inventoryScope };
-              setReload((value) => value + 1);
-            }}
+            disabled={manualRefreshing}
+            onClick={() => void refreshInstalled()}
           >
-            Retry installed refresh
+            Try again
           </button>
         </div>
       )}
@@ -1600,13 +1886,10 @@ export default function Launchpad({ notify }: PageProps) {
           </div>
           <button
             className="btn"
-            disabled={scanRefreshing || scanLoading}
-            onClick={() => {
-              forceScan.current = { api, scope: inventoryScope };
-              setReload((value) => value + 1);
-            }}
+            disabled={manualRefreshing}
+            onClick={() => void refreshInstalled()}
           >
-            Retry updates
+            Try again
           </button>
         </div>
       )}
@@ -1618,72 +1901,70 @@ export default function Launchpad({ notify }: PageProps) {
         aria-busy={loading}
       >
         {!installedOnly && (!source?.available || !supported) ? (
-          <div className="panel launchpad-empty">
-            <SlidersHorizontal size={25} />
-            <h2>
-              {source?.name ?? "Platform"}{" "}
-              {supported ? "is unavailable" : "does not offer this content"}
-            </h2>
-            <p>
-              {source?.reason || "Choose another platform or content type."}
-            </p>
-            {source?.requiresKey && (
-              <button
-                className="btn primary"
-                onClick={() => {
-                  setSettingsError("");
-                  setApiKey("");
-                  setSettingsOpen(true);
-                }}
-              >
-                <KeyRound size={15} /> Configure API key
-              </button>
-            )}
-          </div>
+          <StatePanel
+            variant="empty"
+            icon={<SlidersHorizontal size={25} />}
+            title={`${source?.name ?? "Platform"} ${supported ? "is unavailable" : "does not offer this content"}`}
+            message={
+              source?.reason || "Choose another platform or content type."
+            }
+            action={
+              source?.requiresKey && (
+                <button
+                  className="btn primary"
+                  onClick={() => {
+                    setSettingsError("");
+                    setApiKey("");
+                    setSettingsOpen(true);
+                  }}
+                >
+                  <KeyRound size={15} /> Configure API key
+                </button>
+              )
+            }
+          />
         ) : loading ? (
-          <div className="panel launchpad-empty">
-            <LoaderCircle className="spin" size={25} />
-            <p role="status">
-              {installedOnly
-                ? "Reading installed files..."
-                : "Loading projects..."}
-            </p>
-          </div>
-        ) : failed ? (
-          <div className="panel launchpad-empty">
-            <AlertCircle size={25} />
-            <h2>
-              Unable to load {installedOnly ? "installed content" : "projects"}
-            </h2>
-            <p role="alert">{failed}</p>
-            <button
-              className="btn"
-              onClick={() => {
-                if (installedOnly) {
-                  forceScan.current = { api, scope: inventoryScope };
-                  setReload((value) => value + 1);
-                } else reloadContent();
-              }}
-            >
-              Try again
-            </button>
-          </div>
+          <StatePanel
+            variant="loading"
+            title={
+              installedOnly ? "Reading installed files…" : "Loading projects…"
+            }
+          />
+        ) : failed && !visibleProjects.length ? (
+          <StatePanel
+            variant="error"
+            title={`Unable to load ${installedOnly ? "installed content" : "projects"}`}
+            message={failed}
+            onRetry={() => {
+              if (installedOnly) void refreshInstalled();
+              else reloadContent();
+            }}
+          />
         ) : visibleProjects.length === 0 ? (
-          <div className="panel launchpad-empty">
-            <Package size={27} />
-            <h2>
-              {installedOnly
+          <StatePanel
+            variant="empty"
+            icon={<Package size={27} />}
+            title={
+              installedOnly
                 ? "No installed content matches"
-                : "No projects found"}
-            </h2>
-            <p>
-              {installedOnly
-                ? "Installed files appear here after a scan. Try another platform, content type, or search."
-                : "Try another search, Minecraft version, or loader."}
-            </p>
-          </div>
+                : "No projects found"
+            }
+            message={
+              installedOnly
+                ? "Installed files appear here after a scan. Try another content type or search."
+                : "Try another search, Minecraft version, or loader."
+            }
+          />
         ) : (
           <>
+            {failed && (
+              <StatePanel
+                variant="error"
+                title="Projects could not be refreshed"
+                message={failed}
+                onRetry={reloadContent}
+              />
+            )}
             <div className="launchpad-result-count">
               {total.toLocaleString()}{" "}
               {installedOnly ? "installed items" : "projects"}
@@ -1723,6 +2004,24 @@ export default function Launchpad({ notify }: PageProps) {
                       <span className="launchpad-badge update">
                         Update available
                       </span>
+                    )}
+                    {installedOnly && entry?.platform && (
+                      <span className="launchpad-badge">
+                        {config.platforms.find(
+                          (item) => item.id === entry.platform,
+                        )?.name ?? entry.platform}
+                      </span>
+                    )}
+                    {entry &&
+                      duplicateProjects.has(
+                        `${entry.platform}:${entry.projectId}`,
+                      ) && (
+                        <span className="launchpad-badge update">
+                          Duplicate — remove one
+                        </span>
+                      )}
+                    {entry && pendingPaths.has(entry.path) && (
+                      <span className="launchpad-badge">Refreshing file…</span>
                     )}
                   </div>
                   <p>{project.description || "No description provided."}</p>
@@ -1787,6 +2086,7 @@ export default function Launchpad({ notify }: PageProps) {
                       disabled={
                         working ||
                         Boolean(busy) ||
+                        Boolean(entry && pendingPaths.has(entry.path)) ||
                         !config.platforms.find(
                           (item) => item.id === project.platform,
                         )?.available
@@ -1805,17 +2105,21 @@ export default function Launchpad({ notify }: PageProps) {
                           : "Install"}
                     </button>
                   )}
-                  {entry && type === "mod" && (
+                  {entry && type !== "modpack" && (
                     <button
                       type="button"
                       className="btn launchpad-remove"
                       aria-label={`Remove ${project.title}`}
                       title={
                         status !== "offline"
-                          ? "Stop the server before removing mods."
-                          : "Review mod removal"
+                          ? `Stop the server before removing ${contentName}s.`
+                          : `Review ${contentName} removal`
                       }
-                      disabled={!canInstall || Boolean(busy)}
+                      disabled={
+                        !canInstall ||
+                        Boolean(busy) ||
+                        pendingPaths.has(entry.path)
+                      }
                       onClick={() => void reviewRemoval(entry)}
                     >
                       <Trash2 size={14} /> Remove
@@ -1879,6 +2183,10 @@ export default function Launchpad({ notify }: PageProps) {
                 <select
                   id="launchpad-target-loader"
                   value={targetLoader}
+                  aria-invalid={!targetLoader}
+                  aria-describedby={
+                    !targetLoader ? "launchpad-loader-notice" : undefined
+                  }
                   disabled={Boolean(busy)}
                   onChange={(event) => setTargetLoader(event.target.value)}
                 >
@@ -1889,6 +2197,14 @@ export default function Launchpad({ notify }: PageProps) {
                     </option>
                   ))}
                 </select>
+                {!targetLoader && (
+                  <p
+                    id="launchpad-loader-notice"
+                    className="management-warning"
+                  >
+                    Choose a loader to filter compatible versions.
+                  </p>
+                )}
               </div>
               <div className="form-field">
                 <label htmlFor="launchpad-target-minecraft">
@@ -1919,7 +2235,7 @@ export default function Launchpad({ notify }: PageProps) {
                     className="btn"
                     onClick={() => setVersionReload((value) => value + 1)}
                   >
-                    Retry versions
+                    Try again
                   </button>
                 </div>
               ) : (
@@ -2255,6 +2571,8 @@ export default function Launchpad({ notify }: PageProps) {
                 disabled={
                   Boolean(busy) ||
                   !canInstall ||
+                  !targetVersion.trim() ||
+                  !targetLoader ||
                   !selectedVersion?.downloadable ||
                   versionsLoading
                 }
@@ -2288,7 +2606,7 @@ export default function Launchpad({ notify }: PageProps) {
           <button
             type="button"
             className="btn icon"
-            aria-label="Close mod removal"
+            aria-label={`Close ${contentName} removal`}
             disabled={busy === "remove"}
             onClick={closeRemoval}
           >
@@ -2300,7 +2618,7 @@ export default function Launchpad({ notify }: PageProps) {
             ? removalPlan.dependents.length
               ? "Mod removal blocked"
               : "Dependency check incomplete"
-            : "Remove mod"}
+            : `Remove ${contentName}`}
         </h2>
         <p className="management-dialog-description">
           <strong>
@@ -2309,7 +2627,9 @@ export default function Launchpad({ notify }: PageProps) {
         </p>
         {busy === "removal-preview" && (
           <p className="management-dialog-description" role="status">
-            Checking installed dependencies…
+            {type === "mod"
+              ? "Checking installed dependencies…"
+              : "Checking the installed file…"}
           </p>
         )}
         {removalPlan && (
@@ -2363,7 +2683,7 @@ export default function Launchpad({ notify }: PageProps) {
             {!removalPlan.blocked && (
               <p className="management-dialog-description">
                 This file will move to Recycle Bin, where you can restore it.
-                Other mods and libraries will stay installed.
+                Other files will stay installed.
               </p>
             )}
           </>
@@ -2371,8 +2691,8 @@ export default function Launchpad({ notify }: PageProps) {
         {!canInstall && (
           <p className="management-form-error" role="alert">
             {working
-              ? "Wait for the installation to finish before removing mods."
-              : "Stop the server in Console before removing mods."}
+              ? `Wait for the installation to finish before removing ${contentName}s.`
+              : `Stop the server in Console before removing ${contentName}s.`}
           </p>
         )}
         {removalError && (
@@ -2401,7 +2721,7 @@ export default function Launchpad({ notify }: PageProps) {
               ) : (
                 <Trash2 size={15} />
               )}
-              {busy === "remove" ? "Removing…" : "Remove mod"}
+              {busy === "remove" ? "Removing…" : `Remove ${contentName}`}
             </button>
           ) : (removalError || removalPlan?.warnings.length) && removal ? (
             <button
@@ -2410,7 +2730,7 @@ export default function Launchpad({ notify }: PageProps) {
               disabled={Boolean(busy) || !canInstall}
               onClick={() => void reviewRemoval(removal)}
             >
-              {removalError ? "Review removal again" : "Retry dependency check"}
+              Try again
             </button>
           ) : null}
         </div>

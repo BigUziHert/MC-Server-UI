@@ -14,7 +14,10 @@ import {
   X,
 } from "lucide-react";
 import { ServerScope, useServerApi, type PageProps } from "../api";
-import SearchField from "../SearchField";
+import SearchField, { useDebouncedValue } from "../SearchField";
+import RefreshButton from "../RefreshButton";
+import StatePanel from "../StatePanel";
+import Switch from "../Switch";
 import "./management.css";
 import "./versions.css";
 
@@ -41,6 +44,7 @@ type Current = {
 };
 type RuntimeUpdate = {
   available: boolean;
+  reason?: string;
   provider: string | null;
   gameVersion: string | null;
   build: string | null;
@@ -53,11 +57,22 @@ type Catalog = {
 };
 type Job = {
   id: string;
-  state: "queued" | "running" | "complete" | "failed";
+  status: "queued" | "running" | "completed" | "failed";
+  state?: "queued" | "running" | "complete" | "failed";
   message?: string;
   error?: string;
   progress?: { phase?: string; message?: string };
 };
+
+function normalizeJob(value: Job | { job: Job }): Job {
+  const job = "job" in value ? value.job : value;
+  return {
+    ...job,
+    status:
+      job.status ??
+      (job.state === "complete" ? "completed" : (job.state ?? "failed")),
+  };
+}
 
 const softwareIcons: Record<string, string> = {
   vanilla: "vanilla.png",
@@ -111,6 +126,12 @@ export default function Versions({ notify }: PageProps) {
   const [version, setVersion] = useState("");
   const [builds, setBuilds] = useState<Build[]>([]);
   const [search, setSearch] = useState("");
+  const [releaseSearch, setReleaseSearch] = useState("");
+  const softwareQuery = useDebouncedValue(search),
+    releaseQuery = useDebouncedValue(releaseSearch);
+  const loaded = useRef(false);
+  const selectionRef = useRef({ selected, version });
+  selectionRef.current = { selected, version };
   const [showExperimental, setShowExperimental] = useState(false);
   const [loading, setLoading] = useState(true);
   const [loadingBuilds, setLoadingBuilds] = useState(false);
@@ -123,7 +144,7 @@ export default function Versions({ notify }: PageProps) {
   const [dialogError, setDialogError] = useState("");
   const generation = useRef(0);
   const dialog = useRef<HTMLDialogElement>(null);
-  const jobBusy = job?.state === "queued" || job?.state === "running";
+  const jobBusy = job?.status === "queued" || job?.status === "running";
   const canUpdate = Boolean(
     runtimeUpdate?.available &&
     runtimeUpdate.provider === selected?.id &&
@@ -131,31 +152,62 @@ export default function Versions({ notify }: PageProps) {
   );
   const updating = installMode === "update";
 
-  const refresh = useCallback(async () => {
-    const token = ++generation.current;
-    setLoading(true);
-    setError("");
-    try {
-      const [catalog, server] = await Promise.all([
-        api<Catalog>("/versions"),
-        api<Current>("/server"),
-      ]);
-      if (token !== generation.current) return;
-      setProviders(catalog.providers);
-      setJob(catalog.job ?? null);
-      setCurrent({ ...server, ...catalog.current, status: server.status });
-      setRuntimeUpdate(catalog.runtimeUpdate ?? null);
-    } catch (cause) {
-      if (token === generation.current)
-        setError(
-          cause instanceof Error ? cause.message : "Unable to load versions.",
+  const refresh = useCallback(
+    async (manual = false) => {
+      const token = ++generation.current;
+      if (!loaded.current) setLoading(true);
+      setError("");
+      const target = selectionRef.current;
+      try {
+        const [catalog, server, releaseResult, buildResult] = await Promise.all(
+          [
+            api<Catalog>(`/versions${manual ? "?refresh=1" : ""}`),
+            api<Current>("/server"),
+            manual && target.selected
+              ? api<{ versions: Release[] }>(
+                  `/versions/${encodeURIComponent(target.selected.id)}?refresh=1`,
+                )
+              : Promise.resolve(null),
+            manual && target.selected && target.version
+              ? api<{ builds: Build[] }>(
+                  `/versions/${encodeURIComponent(target.selected.id)}/${encodeURIComponent(target.version)}?refresh=1`,
+                )
+              : Promise.resolve(null),
+          ],
         );
-    } finally {
-      if (token === generation.current) setLoading(false);
-    }
-  }, [api]);
+        if (token !== generation.current) return false;
+        loaded.current = true;
+        if (releaseResult) setReleases(releaseResult.versions);
+        if (buildResult) {
+          setBuilds(buildResult.builds);
+          setLoadingBuilds(false);
+        }
+        setProviders(catalog.providers);
+        setJob(catalog.job ? normalizeJob(catalog.job) : null);
+        setCurrent({ ...server, ...catalog.current, status: server.status });
+        setRuntimeUpdate(catalog.runtimeUpdate ?? null);
+        return true;
+      } catch (cause) {
+        if (token === generation.current)
+          setError(
+            cause instanceof Error ? cause.message : "Unable to load versions.",
+          );
+        return false;
+      } finally {
+        if (token === generation.current) setLoading(false);
+      }
+    },
+    [api],
+  );
 
   useEffect(() => {
+    loaded.current = false;
+    setProviders([]);
+    setCurrent(null);
+    setRuntimeUpdate(null);
+    setReleases([]);
+    setBuilds([]);
+    setReleaseSearch("");
     setSelected(null);
     setVersion("");
     setJob(null);
@@ -197,12 +249,14 @@ export default function Versions({ notify }: PageProps) {
     let timer: ReturnType<typeof setTimeout>;
     async function poll() {
       try {
-        const result = await api<Job>(
-          `/versions/jobs/${encodeURIComponent(job!.id)}`,
+        const result = normalizeJob(
+          await api<Job | { job: Job }>(
+            `/versions/jobs/${encodeURIComponent(job!.id)}`,
+          ),
         );
         if (cancelled) return;
         setJob(result);
-        if (result.state === "complete") {
+        if (result.status === "completed") {
           notify(
             result.message ||
               "Server software installed. Start the server when you are ready.",
@@ -219,7 +273,7 @@ export default function Versions({ notify }: PageProps) {
             });
             setRuntimeUpdate(catalog.runtimeUpdate ?? null);
           }
-        } else if (result.state === "failed")
+        } else if (result.status === "failed")
           notify(
             result.error || result.message || "Installation failed.",
             true,
@@ -232,7 +286,12 @@ export default function Versions({ notify }: PageProps) {
               ? cause.message
               : "Unable to check installation progress.",
           );
-          timer = setTimeout(poll, 3000);
+          if ((cause as { status?: number }).status === 404) {
+            setJob(null);
+            setError(
+              "This installation is no longer being tracked. Check the current server software before trying again.",
+            );
+          } else timer = setTimeout(poll, 3000);
         }
       }
     }
@@ -249,7 +308,7 @@ export default function Versions({ notify }: PageProps) {
     setVersion("");
     setBuilds([]);
     setReleases([]);
-    setSearch("");
+    setReleaseSearch("");
     setError("");
     setLoading(true);
     try {
@@ -298,17 +357,20 @@ export default function Versions({ notify }: PageProps) {
       current?.status !== "offline"
     )
       return;
-    const token = generation.current;
+    const token = ++generation.current;
+    setLoading(false);
     setSubmitting(true);
     setDialogError("");
     try {
-      const result = await post<Job>("/versions/install", {
-        provider: selected.id,
-        version,
-        build: confirming.id,
-        confirmed: true,
-        ...(updating ? { updateRuntime: true } : { cleanInstall: true }),
-      });
+      const result = normalizeJob(
+        await post<Job | { job: Job }>("/versions/install", {
+          provider: selected.id,
+          version,
+          build: confirming.id,
+          confirmed: true,
+          ...(updating ? { updateRuntime: true } : { cleanInstall: true }),
+        }),
+      );
       if (token === generation.current) {
         setJob(result);
         setConfirming(null);
@@ -328,7 +390,7 @@ export default function Versions({ notify }: PageProps) {
     generation.current++;
     setSelected(null);
     setVersion("");
-    setSearch("");
+    setReleaseSearch("");
     setError("");
     setLoading(false);
     setLoadingBuilds(false);
@@ -336,12 +398,12 @@ export default function Versions({ notify }: PageProps) {
   const shownProviders = providers.filter((provider) =>
     `${provider.name} ${provider.description}`
       .toLowerCase()
-      .includes(search.toLowerCase()),
+      .includes(softwareQuery.toLowerCase()),
   );
   const shownReleases = releases.filter(
     (release) =>
       (showExperimental || release.stable) &&
-      release.label.toLowerCase().includes(search.toLowerCase()),
+      release.label.toLowerCase().includes(releaseQuery.toLowerCase()),
   );
   const shownBuilds = builds.filter(
     (build) => showExperimental || build.stable,
@@ -354,15 +416,6 @@ export default function Versions({ notify }: PageProps) {
           <h1>Versions</h1>
           <p>Choose the software that runs your world.</p>
         </div>
-        <button
-          className="btn"
-          onClick={() =>
-            selected ? void chooseProvider(selected) : void refresh()
-          }
-          disabled={loading || jobBusy}
-        >
-          <RefreshCw size={15} /> Refresh
-        </button>
       </div>
       {current && (
         <section className="versions-current panel">
@@ -370,7 +423,7 @@ export default function Versions({ notify }: PageProps) {
             <SoftwareIcon software={current.software} />
           </div>
           <div>
-            <span className="eyebrow">CURRENT SOFTWARE</span>
+            <p className="eyebrow">CURRENT SOFTWARE</p>
             <strong>
               {current.software} <span>{current.version}</span>
             </strong>
@@ -385,12 +438,12 @@ export default function Versions({ notify }: PageProps) {
       )}
       {job && (
         <section
-          className={`management-notice versions-job ${job.state === "failed" ? "warning" : ""}`}
+          className={`management-notice versions-job ${job.status === "failed" ? "warning" : ""}`}
           role="status"
         >
           {jobBusy ? (
-            <LoaderCircle size={19} className="versions-spin" />
-          ) : job.state === "complete" ? (
+            <LoaderCircle size={19} className="spin" />
+          ) : job.status === "completed" ? (
             <Check size={19} />
           ) : (
             <AlertCircle size={19} />
@@ -399,7 +452,7 @@ export default function Versions({ notify }: PageProps) {
             <strong>
               {jobBusy
                 ? "Installing server software"
-                : job.state === "complete"
+                : job.status === "completed"
                   ? "Installation complete"
                   : "Installation failed"}
             </strong>
@@ -410,6 +463,33 @@ export default function Versions({ notify }: PageProps) {
                 "Preparing the official download…"}
             </p>
           </div>
+          {!jobBusy && (
+            <button
+              className="btn icon"
+              aria-label="Dismiss installation status"
+              onClick={async () => {
+                const dismissedId = job.id;
+                try {
+                  await post(
+                    `/versions/jobs/${encodeURIComponent(dismissedId)}/dismiss`,
+                    {},
+                  );
+                  setJob((currentJob) =>
+                    currentJob?.id === dismissedId ? null : currentJob,
+                  );
+                } catch (cause) {
+                  notify(
+                    cause instanceof Error
+                      ? cause.message
+                      : "Unable to dismiss installation status.",
+                    true,
+                  );
+                }
+              }}
+            >
+              <X size={16} />
+            </button>
+          )}
         </section>
       )}
       {(selected?.kind === "proxy" || current?.software === "Velocity") && (
@@ -427,14 +507,23 @@ export default function Versions({ notify }: PageProps) {
         </div>
       )}
       {error && (
-        <div className="management-notice warning" role="alert">
-          <AlertCircle size={17} />
-          <span>{error}</span>
-        </div>
+        <StatePanel
+          variant="error"
+          title="Unable to load versions"
+          message={error}
+          onRetry={() => void refresh(true)}
+        />
       )}
       {!selected ? (
         <>
           <div className="versions-toolbar">
+            <RefreshButton
+              label="Refresh versions"
+              disabled={jobBusy || submitting}
+              onRefresh={() => refresh(true)}
+              notify={notify}
+              successMessage="Versions refreshed."
+            />
             <SearchField
               className="management-search"
               aria-label="Search server software"
@@ -448,11 +537,8 @@ export default function Versions({ notify }: PageProps) {
                 : "Official provider catalogs"}
             </span>
           </div>
-          {loading ? (
-            <div className="versions-loading">
-              <LoaderCircle className="versions-spin" /> Loading server
-              software…
-            </div>
+          {loading && !providers.length ? (
+            <StatePanel variant="loading" title="Loading server software…" />
           ) : (
             <div className="versions-grid">
               {shownProviders.map((provider) => (
@@ -512,6 +598,13 @@ export default function Versions({ notify }: PageProps) {
               <ArrowLeft size={15} /> All software
             </button>
             <h2>{selected.name}</h2>
+            <RefreshButton
+              label="Refresh versions"
+              disabled={jobBusy || submitting}
+              onRefresh={() => refresh(true)}
+              notify={notify}
+              successMessage="Versions refreshed."
+            />
             <a
               className="versions-source"
               href={selected.website}
@@ -536,22 +629,18 @@ export default function Versions({ notify }: PageProps) {
                 iconSize={15}
                 aria-label="Search Minecraft versions"
                 placeholder="Search versions…"
-                value={search}
-                onValueChange={setSearch}
+                value={releaseSearch}
+                onValueChange={setReleaseSearch}
               />
-              <label className="versions-toggle">
-                <input
-                  type="checkbox"
-                  checked={showExperimental}
-                  onChange={(event) =>
-                    setShowExperimental(event.target.checked)
-                  }
-                />{" "}
-                Include experimental releases
-              </label>
+              <Switch
+                className="versions-toggle"
+                label="Include experimental releases"
+                checked={showExperimental}
+                onCheckedChange={setShowExperimental}
+              />
               <div className="versions-release-list">
-                {loading ? (
-                  <p className="versions-loading">Loading releases…</p>
+                {loading && !releases.length ? (
+                  <StatePanel variant="loading" title="Loading releases…" />
                 ) : shownReleases.length ? (
                   shownReleases.map((release) => (
                     <button
@@ -565,9 +654,11 @@ export default function Versions({ notify }: PageProps) {
                     </button>
                   ))
                 ) : (
-                  <p className="versions-empty">
-                    No matching releases. Try changing the filter.
-                  </p>
+                  <StatePanel
+                    variant="empty"
+                    title="No matching releases"
+                    message="Try changing the filter."
+                  />
                 )}
               </div>
             </section>
@@ -604,19 +695,17 @@ export default function Versions({ notify }: PageProps) {
                   </div>
                 )}
               {!version ? (
-                <div className="versions-empty">
-                  <SoftwareIcon software={selected.id} />
-                  <h3>Find the right version for your world</h3>
-                  <p>
-                    Select a release to see available builds from{" "}
-                    {selected.name}.
-                  </p>
-                </div>
-              ) : loadingBuilds ? (
-                <div className="versions-loading">
-                  <LoaderCircle className="versions-spin" /> Loading official
-                  builds…
-                </div>
+                <StatePanel
+                  variant="empty"
+                  icon={<SoftwareIcon software={selected.id} />}
+                  title="Find the right version for your world"
+                  message={`Select a release to see available builds from ${selected.name}.`}
+                />
+              ) : loadingBuilds && !builds.length ? (
+                <StatePanel
+                  variant="loading"
+                  title="Loading official builds…"
+                />
               ) : shownBuilds.length ? (
                 <div className="versions-build-list">
                   {shownBuilds.map((build, index) => (
@@ -673,15 +762,16 @@ export default function Versions({ notify }: PageProps) {
                   ))}
                 </div>
               ) : (
-                <div className="versions-empty">
-                  <Info size={27} />
-                  <h3>No builds match this filter</h3>
-                  <p>
-                    {builds.length
+                <StatePanel
+                  variant="empty"
+                  icon={<Info size={27} />}
+                  title="No builds match this filter"
+                  message={
+                    builds.length
                       ? "Include experimental releases to see the available builds."
-                      : "The provider has no server build for this release."}
-                  </p>
-                </div>
+                      : "The provider has no server build for this release."
+                  }
+                />
               )}
               <div className="versions-build-footer">
                 <ShieldCheck size={15} />
@@ -722,6 +812,11 @@ export default function Versions({ notify }: PageProps) {
           for Minecraft {version}. The server will remain stopped when
           installation finishes.
         </p>
+        {!canUpdate && runtimeUpdate?.reason && (
+          <p className="management-dialog-description">
+            {runtimeUpdate.reason}
+          </p>
+        )}
         {(canUpdate || updating) && (
           <fieldset className="versions-install-mode" disabled={submitting}>
             <legend>Installation type</legend>
@@ -837,7 +932,7 @@ export default function Versions({ notify }: PageProps) {
             onClick={() => void install()}
           >
             {submitting ? (
-              <LoaderCircle size={15} className="versions-spin" />
+              <LoaderCircle size={15} className="spin" />
             ) : (
               <Download size={15} />
             )}{" "}

@@ -1791,3 +1791,149 @@ input:disabled {
     scroll-behavior: auto !important;
   }
 }
+
+/* Shared page controls retain their geometry across every management page. */
+.spin {
+  animation: shared-spin 1s linear infinite;
+}
+@keyframes shared-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .spin {
+    animation: none;
+  }
+}
+.state-panel {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  padding: 32px 20px;
+  text-align: center;
+  color: var(--muted);
+}
+.state-panel h3 {
+  margin: 0;
+  font-size: 15px;
+  color: var(--text);
+}
+.state-panel p {
+  margin: 0;
+  max-width: 640px;
+  font-size: 13px;
+  line-height: 1.6;
+}
+.state-panel-error {
+  color: var(--warning, #eaaa83);
+}
+.pagination {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 12px;
+  padding: 14px 18px;
+  color: var(--muted);
+  font-size: 12px;
+  border-top: 1px solid var(--border);
+}
+.pagination > div,
+.pagination label {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+}
+.pagination select {
+  width: auto;
+  min-width: 58px;
+  height: 32px;
+  padding: 0 8px;
+}
+.shared-switch {
+  display: inline-flex;
+  align-items: center;
+  gap: 9px;
+  border: 0;
+  padding: 5px 0;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.shared-switch-track {
+  flex: 0 0 34px;
+  width: 34px;
+  height: 20px;
+  border: 1px solid #55576b;
+  border-radius: 12px;
+  background: #3a3b4b;
+  padding: 2px;
+}
+.shared-switch-track > span {
+  display: block;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: #e6e7ed;
+  transition: transform 0.15s;
+}
+.shared-switch[aria-checked="true"] .shared-switch-track {
+  border-color: var(--accent, #ffd600);
+  background: var(--accent, #ffd600);
+}
+.shared-switch[aria-checked="true"] .shared-switch-track > span {
+  transform: translateX(14px);
+  background: #16161e;
+}
+.shared-switch:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+.shared-switch:focus-visible {
+  outline: 2px solid var(--accent, #ffd600);
+  outline-offset: 4px;
+  border-radius: 4px;
+}
+@media (max-width: 600px) {
+  .pagination {
+    padding: 12px;
+  }
+  .pagination > div {
+    flex-wrap: wrap;
+  }
+}
+
+.fleet-audit {
+  max-width: 1300px;
+  margin: 0 auto;
+  padding: 32px;
+}
+.fleet-audit > .btn {
+  margin-bottom: 22px;
+}
+.page-heading .eyebrow {
+  font-size: 10px;
+  margin: 0 0 9px;
+  font-weight: 600;
+  letter-spacing: 1.65px;
+}
+.launchpad-toolbar .pagination {
+  padding: 0;
+  border: 0;
+}
+.launchpad-toolbar .pagination > span {
+  display: none;
+}
+.players-roster-search {
+  margin: 10px;
+}
+@media (max-width: 600px) {
+  .fleet-audit {
+    padding: 16px;
+  }
+}

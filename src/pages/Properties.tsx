@@ -1,7 +1,10 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { FileCode2, RefreshCw, Save, SlidersHorizontal } from "lucide-react";
+import { FileCode2, Save, SlidersHorizontal } from "lucide-react";
 import { useServerApi, type PageProps } from "../api";
-import SearchField from "../SearchField";
+import SearchField, { useDebouncedValue } from "../SearchField";
+import RefreshButton from "../RefreshButton";
+import StatePanel from "../StatePanel";
+import Switch from "../Switch";
 import "./properties.css";
 
 type Field = {
@@ -32,6 +35,9 @@ export default function Properties({ notify }: PageProps) {
     [saving, setSaving] = useState(false),
     [error, setError] = useState(""),
     [search, setSearch] = useState("");
+  const debouncedSearch = useDebouncedValue(search);
+  const [catalogReload, setCatalogReload] = useState(0);
+  const [pendingReload, setPendingReload] = useState(false);
   const [pending, setPending] = useState<string | null>(null);
   const request = useRef(0),
     session = useRef(0),
@@ -41,25 +47,29 @@ export default function Properties({ notify }: PageProps) {
     .map((field) => ({ key: field.key, value: values[field.key] }));
   const dirty = changes.length > 0;
   const load = useCallback(
-    async (file: string) => {
+    async (file: string, preserve = false) => {
       const id = ++request.current;
       setLoading(true);
       setError("");
-      setConfig(null);
-      setValues({});
+      if (!preserve) {
+        setConfig(null);
+        setValues({});
+      }
       try {
         const data = await api<Config>(
           `/minecraft/properties/file?path=${encodeURIComponent(file)}`,
         );
-        if (id !== request.current) return;
+        if (id !== request.current) return false;
         setConfig(data);
         setValues(
           Object.fromEntries(
             data.fields.map((field) => [field.key, field.value]),
           ),
         );
+        return true;
       } catch (cause) {
         if (id === request.current) setError((cause as Error).message);
+        return false;
       } finally {
         if (id === request.current) setLoading(false);
       }
@@ -99,7 +109,7 @@ export default function Properties({ notify }: PageProps) {
       session.current++;
       request.current++;
     };
-  }, [api, load]);
+  }, [api, load, catalogReload]);
   useEffect(() => {
     if (pending) dialog.current?.showModal();
     else dialog.current?.close();
@@ -113,11 +123,13 @@ export default function Properties({ notify }: PageProps) {
     return () => window.removeEventListener("beforeunload", warn);
   }, [dirty]);
   const select = (file: string) => {
-    if (saving) return;
+    if (saving || loading) return;
     if (dirty) {
+      setPendingReload(false);
       setPending(file);
       return;
     }
+    setSearch("");
     setSelected(file);
     void load(file);
   };
@@ -146,13 +158,15 @@ export default function Properties({ notify }: PageProps) {
     }
   }
   const filtered = (config?.fields ?? []).filter((field) =>
-    `${field.label} ${field.key}`.toLowerCase().includes(search.toLowerCase()),
+    `${field.label} ${field.key}`
+      .toLowerCase()
+      .includes(debouncedSearch.toLowerCase()),
   );
   return (
     <div className="properties-page">
       <div className="page-heading">
         <div>
-          <span className="eyebrow">MINECRAFT</span>
+          <p className="eyebrow">MINECRAFT</p>
           <h1>Properties</h1>
         </div>
         <button
@@ -177,7 +191,7 @@ export default function Properties({ notify }: PageProps) {
             className={selected === file.path ? "selected" : ""}
             key={file.path}
             onClick={() => select(file.path)}
-            disabled={saving}
+            disabled={saving || loading}
           >
             {file.name}
           </button>
@@ -192,30 +206,46 @@ export default function Properties({ notify }: PageProps) {
           onValueChange={setSearch}
         />
         <span>{filtered.length} properties</span>
-        <button
-          className="btn icon"
-          aria-label="Reload properties"
+        <RefreshButton
+          label="Refresh properties"
           disabled={loading || saving || !selected}
-          onClick={() => select(selected)}
-        >
-          <RefreshCw size={16} />
-        </button>
+          onRefresh={async () => {
+            if (dirty) {
+              setPendingReload(true);
+              setPending(selected);
+              return false;
+            }
+            return load(selected, true);
+          }}
+          notify={notify}
+          successMessage="Properties refreshed."
+        />
       </div>
       {error && (
-        <div className="form-alert error" role="alert">
-          {error}
-        </div>
+        <StatePanel
+          variant="error"
+          title="Unable to load properties"
+          message={error}
+          onRetry={() => {
+            if (selected) select(selected);
+            else setCatalogReload((v) => v + 1);
+          }}
+        />
       )}
-      {loading ? (
-        <div className="panel properties-empty" role="status">
-          Loading configuration…
-        </div>
+      {loading && !config ? (
+        <StatePanel
+          className="panel"
+          variant="loading"
+          title="Loading configuration…"
+        />
       ) : !files.length ? (
-        <div className="panel properties-empty">
-          <FileCode2 size={30} />
-          <h2>No configuration files yet</h2>
-          <p>Configuration files appear after Minecraft creates them.</p>
-        </div>
+        <StatePanel
+          className="panel"
+          variant="empty"
+          icon={<FileCode2 size={30} />}
+          title="No configuration files yet"
+          message="Configuration files appear after Minecraft creates them."
+        />
       ) : (
         config && (
           <>
@@ -224,35 +254,23 @@ export default function Properties({ notify }: PageProps) {
                 <label className="panel property-field" key={field.key}>
                   <span>{field.label}</span>
                   {field.type === "boolean" ? (
-                    <span className="property-switch">
-                      <button
-                        type="button"
-                        role="switch"
-                        className="property-toggle"
-                        aria-label={field.label}
-                        aria-checked={values[field.key] === true}
-                        disabled={saving}
-                        onClick={() =>
-                          setValues((current) => ({
-                            ...current,
-                            [field.key]: current[field.key] !== true,
-                          }))
-                        }
-                      >
-                        <span aria-hidden="true" />
-                      </button>
-                      <span
-                        className="property-switch-status"
-                        aria-hidden="true"
-                      >
-                        {values[field.key] === true ? "On" : "Off"}
-                      </span>
-                    </span>
+                    <Switch
+                      aria-label={field.label}
+                      label={values[field.key] === true ? "On" : "Off"}
+                      checked={values[field.key] === true}
+                      disabled={saving || loading}
+                      onCheckedChange={(checked) =>
+                        setValues((current) => ({
+                          ...current,
+                          [field.key]: checked,
+                        }))
+                      }
+                    />
                   ) : field.options ? (
                     <select
                       aria-label={field.label}
                       value={String(values[field.key])}
-                      disabled={saving}
+                      disabled={saving || loading}
                       onChange={(event) =>
                         setValues((current) => ({
                           ...current,
@@ -278,7 +296,7 @@ export default function Properties({ notify }: PageProps) {
                       max={field.max}
                       autoComplete="off"
                       spellCheck={false}
-                      disabled={saving}
+                      disabled={saving || loading}
                       value={String(values[field.key])}
                       onChange={(event) =>
                         setValues((current) => ({
@@ -297,9 +315,12 @@ export default function Properties({ notify }: PageProps) {
               ))}
             </div>
             {!filtered.length && (
-              <div className="panel properties-empty">
-                No matching properties.
-              </div>
+              <StatePanel
+                className="panel"
+                variant="empty"
+                title="No matching properties"
+                message="Try another search."
+              />
             )}
             <p className="properties-note">
               <SlidersHorizontal size={15} />
@@ -315,8 +336,16 @@ export default function Properties({ notify }: PageProps) {
         aria-labelledby="discard-properties-title"
         onCancel={() => setPending(null)}
       >
-        <h2 id="discard-properties-title">Discard unsaved changes?</h2>
-        <p>Your {changes.length} unsaved changes will be discarded.</p>
+        <h2 id="discard-properties-title">
+          {pendingReload
+            ? `Reload and discard ${changes.length} unsaved changes?`
+            : "Discard unsaved changes?"}
+        </h2>
+        <p>
+          {pendingReload
+            ? "Reloading replaces your edits with the saved file."
+            : `Your ${changes.length} unsaved changes will be discarded.`}
+        </p>
         <div className="modal-actions">
           <button className="btn" onClick={() => setPending(null)}>
             Keep editing
@@ -327,12 +356,15 @@ export default function Properties({ notify }: PageProps) {
               const target = pending;
               setPending(null);
               if (target) {
+                if (!pendingReload) setSearch("");
                 setSelected(target);
-                void load(target);
+                void load(target, pendingReload).then((ok) => {
+                  if (ok && pendingReload) notify("Properties refreshed.");
+                });
               }
             }}
           >
-            Discard changes
+            {pendingReload ? "Reload properties" : "Discard changes"}
           </button>
         </div>
       </dialog>

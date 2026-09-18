@@ -78,40 +78,7 @@
   gap: 16px;
 }
 .storage-search {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  color: #969bb3;
   width: min(100%, 330px);
-  background: #101016;
-  border: 1px solid var(--storage-border);
-  border-radius: 7px;
-  padding: 0 12px;
-}
-.storage-search input:focus-visible {
-  outline: none;
-}
-.storage-search input {
-  width: 100%;
-  min-width: 0;
-  height: 36px;
-  background: none;
-  border: none;
-  outline: none;
-  color: #eef0f8;
-  font: inherit;
-  font-size: 12px;
-}
-.storage-search input::placeholder {
-  color: var(--storage-muted);
-}
-.storage-search button {
-  display: flex;
-  background: none;
-  border: none;
-  padding: 3px;
-  color: #969bb3;
-  cursor: pointer;
 }
 .files-count {
   font-size: 11px;

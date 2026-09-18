@@ -159,20 +159,6 @@
   font-size: 12px;
   line-height: 1.5;
 }
-.players-roster-search {
-  display: flex;
-  align-items: center;
-  gap: 7px;
-  padding: 8px 10px;
-  border-bottom: 1px solid var(--border);
-  color: var(--muted);
-}
-.players-roster-search input {
-  min-width: 0;
-  width: 100%;
-  padding: 6px;
-  font-size: 11px;
-}
 .players-whitelist-switch {
   width: 34px;
   height: 19px;

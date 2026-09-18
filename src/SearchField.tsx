@@ -1,17 +1,34 @@
-import { forwardRef, useRef, type ComponentPropsWithoutRef } from "react";
+import {
+  forwardRef,
+  useEffect,
+  useRef,
+  useState,
+  type ComponentPropsWithoutRef,
+} from "react";
 import { Search, X } from "lucide-react";
 import "./search-field.css";
 
 type SearchFieldProps = Omit<
   ComponentPropsWithoutRef<"input">,
-  "type" | "value" | "onChange" | "className"
+  "type" | "value" | "onChange" | "className" | "size"
 > & {
   value: string;
   onValueChange: (value: string) => void;
   className?: string;
   iconSize?: number;
   clearLabel?: string;
+  size?: "sm" | "md";
+  grow?: boolean;
 };
+
+export function useDebouncedValue<T>(value: T, delay = 300) {
+  const [debounced, setDebounced] = useState(value);
+  useEffect(() => {
+    const timer = window.setTimeout(() => setDebounced(value), delay);
+    return () => window.clearTimeout(timer);
+  }, [value, delay]);
+  return debounced;
+}
 
 const SearchField = forwardRef<HTMLInputElement, SearchFieldProps>(
   function SearchField(
@@ -22,13 +39,17 @@ const SearchField = forwardRef<HTMLInputElement, SearchFieldProps>(
       iconSize = 16,
       clearLabel = "Clear search",
       disabled,
+      size = "md",
+      grow = false,
       ...inputProps
     },
     ref,
   ) {
     const input = useRef<HTMLInputElement | null>(null);
     return (
-      <div className={`search-field ${className}`}>
+      <div
+        className={`search-field search-field-${size} ${grow ? "search-field-grow" : ""} ${className}`}
+      >
         <Search size={iconSize} aria-hidden="true" />
         <div className="search-field-control">
           <input

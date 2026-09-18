@@ -498,14 +498,7 @@
 .server-source-error > svg {
   margin-top: 2px;
 }
-.server-import-spinning {
-  animation: server-import-spin 1s linear infinite;
-}
-@keyframes server-import-spin {
-  to {
-    transform: rotate(360deg);
-  }
-}
+
 @media (max-width: 500px) {
   .server-add-choice {
     padding: 17px 13px;

@@ -478,6 +478,12 @@ test("recovery selection stays stationary, selects visible items only, and confi
     exact: true,
   });
   await search.fill("treasure");
+  await expect(
+    page.getByRole("checkbox", {
+      name: "Select recycled untouched.txt",
+      exact: true,
+    }),
+  ).toHaveCount(0);
   await all.check();
   await expect(
     page.getByRole("region", { name: "Recycle Bin selection" }),

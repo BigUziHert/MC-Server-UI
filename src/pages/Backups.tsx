@@ -26,6 +26,9 @@ import {
   type PageProps,
 } from "../api";
 import "./storage.css";
+import RefreshButton from "../RefreshButton";
+import StatePanel from "../StatePanel";
+import Switch from "../Switch";
 
 type Backup = {
   id: string;
@@ -86,25 +89,40 @@ export default function Backups({ notify }: PageProps) {
   const [dialogError, setDialogError] = useState("");
   const dialogRef = useRef<HTMLDivElement>(null);
   const busyRef = useRef(false);
+  const generation = useRef(0);
   busyRef.current = busy;
 
-  const load = useCallback(async (initial = false) => {
-    if (initial) setLoading(true);
-    setError("");
-    try {
-      const result = await api<BackupResult>("/backups");
-      setBackups(result.backups);
-      setSavedSchedule(result.schedule);
-      setTimezone(result.timezone || "server time");
-      if (initial) setSchedule(result.schedule);
-    } catch (failure) {
-      setError(messageOf(failure));
-    } finally {
-      setLoading(false);
-    }
-  }, []);
+  const load = useCallback(
+    async (initial = false) => {
+      const token = generation.current;
+      if (initial) setLoading(true);
+      setError("");
+      try {
+        const result = await api<BackupResult>("/backups");
+        if (token !== generation.current) return false;
+        setBackups(result.backups);
+        setSavedSchedule(result.schedule);
+        setTimezone(result.timezone || "server time");
+        if (initial) setSchedule(result.schedule);
+        return true;
+      } catch (failure) {
+        if (token === generation.current) setError(messageOf(failure));
+        return false;
+      } finally {
+        if (token === generation.current) setLoading(false);
+      }
+    },
+    [api],
+  );
   useEffect(() => {
+    generation.current++;
+    setBackups([]);
+    setSchedule(defaults);
+    setSavedSchedule(defaults);
     void load(true);
+    return () => {
+      generation.current++;
+    };
   }, [load]);
   useEffect(() => {
     if (!dialog) return;
@@ -204,6 +222,7 @@ export default function Backups({ notify }: PageProps) {
     <div className="storage-page">
       <div className="page-heading">
         <div>
+          <p className="eyebrow">MANAGEMENT</p>
           <h1>Backups</h1>
           <p>A little peace of mind for everything you've built.</p>
         </div>
@@ -220,19 +239,21 @@ export default function Backups({ notify }: PageProps) {
           Create backup
         </button>
       </div>
+      {error && (
+        <StatePanel
+          className="panel"
+          variant="error"
+          title="Unable to load backups"
+          message={error}
+          onRetry={() => void load()}
+        />
+      )}
       {loading ? (
-        <div className="panel empty-state">
-          <LoaderCircle size={24} className="spin" />
-          <p>Loading your backups…</p>
-        </div>
-      ) : error ? (
-        <div className="panel empty-state">
-          <strong>Unable to load backups</strong>
-          <p>{error}</p>
-          <button className="btn" onClick={() => void load(true)}>
-            Try again
-          </button>
-        </div>
+        <StatePanel
+          className="panel"
+          variant="loading"
+          title="Loading your backups…"
+        />
       ) : (
         <>
           <div className="backup-stats">
@@ -288,28 +309,34 @@ export default function Backups({ notify }: PageProps) {
                   <p>Download an archive whenever you need it.</p>
                 </div>
                 <span className="badge">{backups.length} total</span>
+                <RefreshButton
+                  label="Refresh backups"
+                  disabled={busy || saving}
+                  onRefresh={() => load()}
+                  notify={notify}
+                  successMessage="Backups refreshed."
+                />
               </div>
               {!backups.length ? (
-                <div className="empty-state backup-empty">
-                  <div className="backup-empty-icon">
-                    <Archive size={29} />
-                  </div>
-                  <strong>Your next adventure deserves a backup</strong>
-                  <p>
-                    Save a snapshot of your server files before making changes.
-                  </p>
-                  <button
-                    className="btn"
-                    onClick={() => {
-                      setName("");
-                      setDialogError("");
-                      setDialog("create");
-                    }}
-                  >
-                    <Plus size={15} />
-                    Create your first backup
-                  </button>
-                </div>
+                <StatePanel
+                  variant="empty"
+                  icon={<Archive size={29} />}
+                  title="Your next adventure deserves a backup"
+                  message="Save a snapshot of your server files before making changes."
+                  action={
+                    <button
+                      className="btn"
+                      onClick={() => {
+                        setName("");
+                        setDialogError("");
+                        setDialog("create");
+                      }}
+                    >
+                      <Plus size={15} />
+                      Create your first backup
+                    </button>
+                  }
+                />
               ) : (
                 <div className="backup-list">
                   {[...backups]
@@ -400,19 +427,13 @@ export default function Backups({ notify }: PageProps) {
                       <strong>Enable schedule</strong>
                       <span>Run backups automatically</span>
                     </div>
-                    <button
-                      type="button"
-                      className={`storage-switch ${schedule.enabled ? "enabled" : ""}`}
-                      role="switch"
-                      aria-checked={schedule.enabled}
+                    <Switch
                       aria-label="Enable automatic backups"
-                      onClick={() =>
-                        updateSchedule({ enabled: !schedule.enabled })
-                      }
+                      label=""
+                      checked={schedule.enabled}
+                      onCheckedChange={(enabled) => updateSchedule({ enabled })}
                       disabled={saving}
-                    >
-                      <span />
-                    </button>
+                    />
                   </div>
                   <div className="schedule-fields">
                     <label className="form-field">

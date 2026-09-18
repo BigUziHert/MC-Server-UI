@@ -18,7 +18,7 @@ import {
 } from "lucide-react";
 import { api, formatBytes } from "./api";
 import type { ServerRecord } from "./ServerManager";
-import SearchField from "./SearchField";
+import SearchField, { useDebouncedValue } from "./SearchField";
 import { SoftwareIcon } from "./pages/Versions";
 import { ProjectIcon } from "./pages/Launchpad";
 import "./onboarding.css";
@@ -230,6 +230,7 @@ export default function NewServerWizard({
   const [total, setTotal] = useState(0);
   const [offset, setOffset] = useState(0);
   const [search, setSearch] = useState("");
+  const softwareQuery = useDebouncedValue(search);
   const [filterVersion, setFilterVersion] = useState("");
   const [filterLoader, setFilterLoader] = useState("");
   const [sort, setSort] = useState("downloads");
@@ -470,7 +471,7 @@ export default function NewServerWizard({
         .finally(() => {
           if (!cancel.signal.aborted) setLoading(false);
         });
-    }, 250);
+    }, 300);
     return () => {
       clearTimeout(timer);
       cancel.abort();
@@ -1106,7 +1107,7 @@ export default function NewServerWizard({
                   .filter((item) =>
                     `${item.name} ${item.description}`
                       .toLowerCase()
-                      .includes(search.toLowerCase()),
+                      .includes(softwareQuery.toLowerCase()),
                   )
                   .map((item) => (
                     <article key={item.id} className="setup-software-card">

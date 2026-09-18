@@ -33,6 +33,7 @@ export default defineConfig({
     "server-removal.spec.ts",
     "minecraft.spec.ts",
     "navigation.spec.ts",
+    "ui-consistency.spec.ts",
     "onboarding.spec.ts",
   ],
   fullyParallel: false,

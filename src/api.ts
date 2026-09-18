@@ -97,7 +97,8 @@ export function relativeTime(value: string) {
   );
   if (seconds < 60) return "Just now";
   if (seconds < 3600) return `${Math.floor(seconds / 60)} min ago`;
-  if (seconds < 86400) return `${Math.floor(seconds / 3600)} hours ago`;
+  if (seconds < 86400)
+    return `${Math.floor(seconds / 3600)} ${Math.floor(seconds / 3600) === 1 ? "hour" : "hours"} ago`;
   return new Date(value).toLocaleDateString(undefined, {
     month: "short",
     day: "numeric",

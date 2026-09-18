@@ -637,8 +637,10 @@ test("audit filters show file, server and player actions without databases", asy
   for (const action of ["Server started", "Server restarted", "Server stopped"])
     await expect(rows.filter({ hasText: action }).first()).toBeVisible();
   await expect(rows.filter({ hasText: "Audit_Player" })).toHaveCount(0);
-  await page.getByRole("button", { name: "Refresh activity" }).click();
-  await expect(page.getByRole("status")).toContainText("Audit log refreshed.");
+  await page.getByRole("button", { name: "Refresh audit logs" }).click();
+  await expect(
+    page.getByRole("status").filter({ hasText: "Audit logs refreshed." }),
+  ).toBeVisible();
 });
 
 test("all pages fit a mobile viewport and navigation remains usable", async ({

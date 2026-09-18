@@ -219,14 +219,7 @@
   color: var(--muted);
   font-size: 13px;
 }
-.versions-spin {
-  animation: versions-spin 1.2s linear infinite;
-}
-@keyframes versions-spin {
-  to {
-    transform: rotate(360deg);
-  }
-}
+
 .versions-browser {
   display: grid;
   grid-template-columns: 270px minmax(0, 1fr);
