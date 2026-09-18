@@ -6,11 +6,47 @@ import path from "node:path";
 import { EventEmitter } from "node:events";
 import { PassThrough, Writable } from "node:stream";
 import { createPanel } from "./index.mjs";
-import { createPlayerHistory, moderationCommand } from "./player-history.mjs";
+import {
+  createPlayerHistory,
+  moderationCommand,
+  playerCommandAudit,
+} from "./player-history.mjs";
 
 const uuid = "12345678-1234-1234-1234-123456789abc";
 const profile = { name: "History_Player", uuid };
 const json = (method, body) => ({ method, body: JSON.stringify(body) });
+
+test("moderation audit labels distinguish sent commands from simulated state changes", () => {
+  for (const [command, action] of [
+    ["op Builder", "Player op requested"],
+    ["deop Builder", "Player deop requested"],
+    ["ban Builder griefing", "Player ban requested"],
+    ["pardon Builder", "Player unban requested"],
+    ["kick Builder reconnect", "Player kick requested"],
+    ["whitelist add Builder", "Whitelist addition requested"],
+    ["whitelist remove Builder", "Whitelist removal requested"],
+    ["whitelist on", "Whitelist enable requested"],
+    ["whitelist off", "Whitelist disable requested"],
+    ["minecraft:op Builder", "Player op requested"],
+  ]) {
+    const event = playerCommandAudit(command);
+    assert.equal(event.action, action);
+    assert.match(event.detail, /Sent to Minecraft:/);
+  }
+  assert.equal(
+    playerCommandAudit("op Builder", { simulated: true }).action,
+    "Player opped (simulated)",
+  );
+  assert.equal(playerCommandAudit("say op Builder"), null);
+  assert.equal(playerCommandAudit("whitelist list"), null);
+  for (const command of [
+    "constructor",
+    "toString",
+    "__proto__",
+    "whitelist constructor",
+  ])
+    assert.equal(playerCommandAudit(command), null);
+});
 
 test("cached profiles never invent login dates; observations persist once and repeated polls stay clean", async () => {
   const snapshots = [];
@@ -376,6 +412,39 @@ test("live logger history ignores chat, supports Forge prefixes, and live modera
     200,
   );
   assert.equal(panel.commands.at(-1), "pardon History_Player\n");
+  assert.equal(
+    (
+      await panel.request(
+        "/api/console/command",
+        json("POST", { command: `op ${profile.name}` }),
+      )
+    ).status,
+    200,
+  );
+  assert.equal(
+    (
+      await panel.request(
+        "/api/console/command",
+        json("POST", { command: `whitelist add ${profile.name}` }),
+      )
+    ).status,
+    200,
+  );
+  const audit = (await panel.request("/api/audit")).body.entries;
+  const playerActions = audit
+    .filter((entry) => entry.category === "player")
+    .map((entry) => entry.action);
+  assert.deepEqual(playerActions, [
+    "Whitelist addition requested",
+    "Player op requested",
+    "Player unban requested",
+    "Player ban requested",
+    "Player kick requested",
+  ]);
+  assert.equal(
+    audit.filter((entry) => entry.action === "Console command").length,
+    0,
+  );
   await panel.restart();
   data = (await panel.request("/api/players")).body;
   assert.equal(data.status, "offline");

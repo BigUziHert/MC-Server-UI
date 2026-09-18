@@ -941,6 +941,58 @@ test("Launchpad hash-identifies installed mods, filters compatibility, confirms 
   );
 });
 
+test("Launchpad audits only completed mod changes, separates added dependencies, and keeps installations when audit persistence fails", async (t) => {
+  const f = await fixture(t);
+  const events = [];
+  const service = await f.boot({
+    audit: async (...event) => {
+      events.push(event);
+      throw new Error("Fixture audit storage unavailable");
+    },
+  });
+  f.versions.new.dependencies = [
+    {
+      project_id: "dependency",
+      version_id: "dep",
+      dependency_type: "required",
+    },
+  ];
+  const plan = await service.preview({
+    ...selection,
+    replacePath: "mods/old.jar",
+  });
+  await assert.rejects(service.install({ planId: plan.planId }), {
+    status: 400,
+  });
+  assert.deepEqual(
+    events,
+    [],
+    "a preview and rejected confirmation are not completed changes",
+  );
+  const job = await finish(service, { planId: plan.planId, confirmed: true });
+  assert.equal(job.status, "completed", job.error);
+  assert.deepEqual(events.map(([action]) => action).sort(), [
+    "Mod added",
+    "Mod updated",
+  ]);
+  assert.match(
+    events.find(([action]) => action === "Mod updated")[1],
+    /mods\/new.jar/,
+  );
+  assert.match(
+    events.find(([action]) => action === "Mod added")[1],
+    /mods\/dep.jar/,
+  );
+  assert.deepEqual(
+    await fs.readFile(path.join(f.serverDir, "mods/new.jar")),
+    f.newer,
+  );
+  assert.deepEqual(
+    await fs.readFile(path.join(f.serverDir, "mods/dep.jar")),
+    f.dependency,
+  );
+});
+
 for (const algorithm of ["sha512", "sha256", "sha1"]) {
   test(`updates skip identical dependencies without downloading or touching them (${algorithm})`, async (t) => {
     const f = await fixture(t);

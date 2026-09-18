@@ -5,8 +5,8 @@ import {
   Archive,
   Check,
   Clock3,
-  Database,
   FileText,
+  Gamepad2,
   ListFilter,
   RefreshCw,
   Search,
@@ -18,22 +18,21 @@ import { useServerApi, relativeTime, type PageProps } from "../api";
 import SearchField from "../SearchField";
 import "./management.css";
 
-type Category = "server" | "file" | "backup" | "user" | "database" | "player";
+type Category = "server" | "file" | "backup" | "user" | "player";
 type AuditEntry = {
   id: string;
   action: string;
   detail: string;
   actor: string;
   createdAt: string;
-  category: Category;
+  category: Category | "database";
 };
 const categories = [
   { value: "server" as Category, label: "Server", icon: Server },
   { value: "file" as Category, label: "Files", icon: FileText },
+  { value: "player" as Category, label: "Players", icon: Gamepad2 },
   { value: "backup" as Category, label: "Backups", icon: Archive },
   { value: "user" as Category, label: "Subusers", icon: Users },
-  { value: "player" as Category, label: "Players", icon: ShieldCheck },
-  { value: "database" as Category, label: "Databases", icon: Database },
 ];
 function actionLabel(action: string) {
   const words = action.replace(/[._-]+/g, " ");
@@ -56,9 +55,9 @@ export default function AuditLogs({ notify }: PageProps) {
       try {
         const data = await api<{ entries: AuditEntry[] }>("/audit");
         setEntries(
-          [...data.entries].sort(
-            (a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt),
-          ),
+          data.entries
+            .filter((entry) => entry.category !== "database")
+            .sort((a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt)),
         );
         setUpdatedAt(new Date());
         if (manual) notify("Audit log refreshed.");

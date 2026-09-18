@@ -8,6 +8,37 @@ export const validPlayerUuid = (uuid) =>
   typeof uuid === "string" &&
   /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i.test(uuid);
 
+// Commands written to Java are requests, not proof that Minecraft accepted them.
+export function playerCommandAudit(command, { simulated = false } = {}) {
+  const normalized = command.trim().replace(/^\//, "");
+  const [verb, argument] = normalized.replace(/^minecraft:/i, "").split(/\s+/);
+  const labels = {
+    op: ["Player op requested", "Player opped"],
+    deop: ["Player deop requested", "Player deopped"],
+    ban: ["Player ban requested", "Player banned"],
+    pardon: ["Player unban requested", "Player unbanned"],
+    kick: ["Player kick requested", "Player kicked"],
+    "ban-ip": ["IP ban requested", "IP banned"],
+    "pardon-ip": ["IP unban requested", "IP unbanned"],
+  };
+  const whitelistLabels = {
+    add: ["Whitelist addition requested", "Player whitelisted"],
+    remove: ["Whitelist removal requested", "Player removed from whitelist"],
+    on: ["Whitelist enable requested", "Whitelist enabled"],
+    off: ["Whitelist disable requested", "Whitelist disabled"],
+    reload: ["Whitelist reload requested", "Whitelist reloaded"],
+  };
+  const label =
+    verb === "whitelist"
+      ? Object.hasOwn(whitelistLabels, argument) && whitelistLabels[argument]
+      : Object.hasOwn(labels, verb) && labels[verb];
+  if (!label) return null;
+  return {
+    action: simulated ? `${label[1]} (simulated)` : label[0],
+    detail: `${simulated ? "Simulated" : "Sent to Minecraft"}: ${normalized}.`,
+  };
+}
+
 export function whitelistCommand(action, input) {
   if (action === "state") {
     if (typeof input?.enabled !== "boolean")

@@ -26,6 +26,7 @@ import {
   createPlayerHistory,
   readPlayerRecords,
   moderationCommand,
+  playerCommandAudit,
   validPlayerUuid,
   whitelistCommand,
   readWhitelistSettings,
@@ -922,7 +923,12 @@ export async function createPanel(options = {}) {
     ...(options.source === "imported" ? { source: "imported", serverDir } : {}),
   });
 
-  async function startServer() {
+  const lifecycleAudit = (action, detail) => {
+    // saveChain drains these writes at shutdown. Audit I/O must not make a
+    // stopped server appear busy or change the process outcome.
+    return audit("server", action, detail).catch(() => {});
+  };
+  async function startServer(restarting = false) {
     if (status !== "offline")
       throw error(409, "The server is already running or changing state.");
     // Reserve the transition before any filesystem awaits so concurrent starts cannot spawn twice.
@@ -938,6 +944,10 @@ export async function createPanel(options = {}) {
           status = "running";
           startedAt = Date.now();
           append("[Demo] Done! Server is ready.", "success");
+          void lifecycleAudit(
+            restarting ? "Server restarted" : "Server started",
+            "Simulated server is ready.",
+          );
         }, 900);
         demoTimer.unref();
         return;
@@ -1023,6 +1033,26 @@ export async function createPanel(options = {}) {
       processStop = stop;
       telemetry.reset(child.pid);
       startedAt = Date.now();
+      let becameReady = false;
+      let launchError;
+      const ready = (text) => {
+        if (processHandle !== child || status !== "starting" || becameReady)
+          return;
+        // Do not treat a player's chat containing "Done (" as a startup event.
+        const clean = text.replace(/\x1b\[[0-9;]*m/g, "").trim();
+        if (
+          !/^(?:(?:(?:\[[^\]\r\n]{1,80}\]\s*)?\[(?:Server thread|main)\/INFO\](?:\s*\[[^\]\r\n]{1,120}\])?|\[\d{2}:\d{2}:\d{2} INFO\](?:\s*\[[^\]\r\n]{1,120}\])?):\s*|\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} \[INFO\]\s*)Done \(/.test(
+            clean,
+          )
+        )
+          return;
+        becameReady = true;
+        status = "running";
+        void lifecycleAudit(
+          restarting ? "Server restarted" : "Server started",
+          `${configuration.name} is ready to accept players.`,
+        );
+      };
       const bindOutput = (stream, defaultLevel) => {
         let buffer = "";
         stream.setEncoding("utf8");
@@ -1033,8 +1063,7 @@ export async function createPanel(options = {}) {
           buffer = chunks.pop().slice(-32768);
           for (const text of chunks) {
             trackPlayerOutput(text, child);
-            if (/Done \(/.test(text) && status === "starting")
-              status = "running";
+            ready(text);
             append(
               text,
               /\bERROR\b|\bFATAL\b/.test(text)
@@ -1048,6 +1077,7 @@ export async function createPanel(options = {}) {
         stream.on("end", () => {
           if (buffer) {
             trackPlayerOutput(buffer, child);
+            ready(buffer);
             append(buffer, defaultLevel);
           }
         });
@@ -1058,9 +1088,19 @@ export async function createPanel(options = {}) {
         append(`[Panel] Server input: ${cause.message}`, "error"),
       );
       child.on("error", (cause) => {
+        launchError = cause;
         append(`[Panel] Java failed: ${cause.message}`, "error");
       });
       child.on("close", (code) => {
+        void lifecycleAudit(
+          !becameReady && !stop.requested
+            ? "Server start failed"
+            : code === 0 || stop.requested
+              ? "Server stopped"
+              : "Server exited unexpectedly",
+          launchError?.message ??
+            `${configuration.name} exited with code ${code ?? "unknown"}.`,
+        );
         telemetry.reset(child.pid);
         clearTimeout(stopTimer);
         processHandle = null;
@@ -1079,7 +1119,7 @@ export async function createPanel(options = {}) {
           status = "offline";
           if (restartRequested && !closed) {
             restartRequested = false;
-            startServer().catch((cause) => append(cause.message, "error"));
+            startServer(true).catch((cause) => append(cause.message, "error"));
           }
         };
         if (terminationPromise)
@@ -1091,6 +1131,7 @@ export async function createPanel(options = {}) {
     } catch (cause) {
       status = "offline";
       startedAt = null;
+      await lifecycleAudit("Server start failed", cause.message);
       throw cause;
     }
   }
@@ -1119,9 +1160,10 @@ export async function createPanel(options = {}) {
           status = "offline";
           startedAt = null;
           append("[Demo] Server stopped.");
+          void lifecycleAudit("Server stopped", "Simulated server stopped.");
           if (restartRequested) {
             restartRequested = false;
-            startServer().catch((cause) => append(cause.message, "error"));
+            startServer(true).catch((cause) => append(cause.message, "error"));
           }
         }, 650);
         demoTimer.unref();
@@ -1153,11 +1195,6 @@ export async function createPanel(options = {}) {
         stop.requestStop();
       }
     }
-    await audit(
-      "server",
-      `Server ${action}`,
-      `${mode === "demo" ? "Simulated" : "Requested"} server ${action}.`,
-    );
   }
 
   let backupBusy = false;
@@ -1931,11 +1968,10 @@ export async function createPanel(options = {}) {
         append(
           `[${mode === "demo" ? "Demo" : "Panel"}] ${mode === "demo" ? "Simulated" : "Requested"}: ${command}`,
         );
-        await audit(
-          "player",
-          `Whitelist ${action} ${mode === "demo" ? "simulated" : "requested"}`,
-          command,
-        );
+        const event = playerCommandAudit(command, {
+          simulated: mode === "demo",
+        });
+        await audit("player", event.action, event.detail);
         res.json({
           simulated: mode === "demo",
           message:
@@ -2008,11 +2044,10 @@ export async function createPanel(options = {}) {
         append(
           `[${mode === "demo" ? "Demo" : "Panel"}] ${mode === "demo" ? "Simulated" : "Requested"}: ${command}`,
         );
-        await audit(
-          "player",
-          `${action === "unban" ? "Player unban" : action === "ban" ? "Player ban" : "Player kick"} ${mode === "demo" ? "simulated" : "requested"}`,
-          command,
-        );
+        const event = playerCommandAudit(command, {
+          simulated: mode === "demo",
+        });
+        await audit("player", event.action, event.detail);
         res.json({
           simulated: mode === "demo",
           message:
@@ -2066,13 +2101,10 @@ export async function createPanel(options = {}) {
         append(
           `[${mode === "demo" ? "Demo" : "Panel"}] ${mode === "demo" ? "Simulated" : "Requested"}: ${command}`,
         );
-        await audit(
-          "player",
-          action === "op"
-            ? "Operator access requested"
-            : "Operator removal requested",
-          `${mode === "demo" ? "Simulated" : "Sent to Java"}: ${command}.`,
-        );
+        const event = playerCommandAudit(command, {
+          simulated: mode === "demo",
+        });
+        await audit("player", event.action, event.detail);
         res.json({
           simulated: mode === "demo",
           message:
@@ -2124,7 +2156,17 @@ export async function createPanel(options = {}) {
           `[Demo] Received “${normalized}”. Connect a live server to execute Minecraft commands.`,
           "warn",
         );
-      await audit("server", "Console command", normalized);
+      const playerEvent = playerCommandAudit(normalized);
+      if (playerEvent)
+        await audit(
+          "player",
+          playerEvent.action,
+          mode === "demo"
+            ? `Demo console command: ${normalized}. No live player state was changed.`
+            : playerEvent.detail,
+        );
+      else if (normalized !== "stop")
+        await audit("server", "Console command", normalized);
       res.json({ ok: true });
     }),
   );
@@ -2181,6 +2223,10 @@ export async function createPanel(options = {}) {
     dest: uploadDir,
     limits: { fileSize: 256 * 1024 * 1024, files: 20, fields: 5 },
   });
+  const isModFile = (relative) =>
+    /^mods\/[^/]+\.jar(?:\.disabled)?$/i.test(
+      String(relative).replace(/\\/g, "/"),
+    );
   app.post(
     "/api/files/upload",
     upload.array("files", 20),
@@ -2208,11 +2254,21 @@ export async function createPanel(options = {}) {
         }
         for (let i = 0; i < files.length; i++)
           await fs.copyFile(files[i].path, destinations[i], 1);
-        await audit(
-          "file",
-          "Files uploaded",
-          `${files.length} file(s) uploaded to /${directory}.`,
+        const uploadedPaths = files.map((file) =>
+          [directory, file.originalname].filter(Boolean).join("/"),
         );
+        const modPaths = uploadedPaths.filter(isModFile);
+        const otherPaths = uploadedPaths.filter(
+          (relative) => !isModFile(relative),
+        );
+        if (modPaths.length)
+          await audit(
+            "file",
+            modPaths.length === 1 ? "Mod added" : "Mods added",
+            modPaths.join(", "),
+          );
+        if (otherPaths.length)
+          await audit("file", "Files uploaded", otherPaths.join(", "));
         diskCache.at = 0;
         res.status(201).json({ uploaded: files.length });
       } finally {
@@ -2243,7 +2299,10 @@ export async function createPanel(options = {}) {
       else await fs.writeFile(target, content, { flag: "wx" });
       await audit(
         "file",
-        `${type === "file" ? "File" : "Directory"} created`,
+        type === "file" &&
+          isModFile([directory, name].filter(Boolean).join("/"))
+          ? "Mod added"
+          : `${type === "file" ? "File" : "Directory"} created`,
         [directory, name].filter(Boolean).join("/"),
       );
       diskCache.at = 0;
@@ -2294,7 +2353,15 @@ export async function createPanel(options = {}) {
       if (!(await exists(target)))
         throw error(404, "File or directory not found.");
       const recycled = await recycleBin.recycle(relative);
-      await audit("file", "Moved to Recycle Bin", relative);
+      await audit(
+        "file",
+        isModFile(relative)
+          ? "Mod deleted"
+          : /^mods[\\/]?$/i.test(relative)
+            ? "Mods deleted"
+            : "File deleted",
+        `${relative} · moved to Recycle Bin.`,
+      );
       diskCache.at = 0;
       res.json({ ok: true, recycled });
     }),
@@ -2483,7 +2550,27 @@ export async function createPanel(options = {}) {
       res.json({ ok: true });
     }),
   );
-  app.get("/api/audit", (_req, res) => res.json({ entries: state.audit }));
+  app.get("/api/audit", (_req, res) => {
+    const legacyContentActions = {
+      "Launchpad installation completed": "Content installed",
+      "Content installed": "Content installed",
+      "Launchpad mod removed": "Mod deleted",
+      "Mod removed": "Mod deleted",
+    };
+    res.json({
+      entries: state.audit
+        .filter((entry) => entry.category !== "database")
+        .map((entry) =>
+          Object.hasOwn(legacyContentActions, entry.action)
+            ? {
+                ...entry,
+                category: "file",
+                action: legacyContentActions[entry.action],
+              }
+            : entry,
+        ),
+    });
+  });
   minecraft.mount(app);
   app.use("/api", (_req, _res, next) =>
     next(error(404, "API endpoint not found.")),

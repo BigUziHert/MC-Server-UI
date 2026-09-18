@@ -529,7 +529,7 @@ test("removing the Databases page preserves existing SQLite files", async ({
   ).toEqual(original);
 });
 
-test("audit filters distinguish real file and database actions and support search", async ({
+test("audit filters show file, server and player actions without databases", async ({
   page,
   request,
 }) => {
@@ -547,28 +547,71 @@ test("audit filters distinguish real file and database actions and support searc
   ).toBe(true);
   expect(
     (
+      await request.put("/api/files/content", {
+        data: { path: "e2e-audit-probe.txt", content: "edited audit probe" },
+      })
+    ).ok(),
+  ).toBe(true);
+  expect(
+    (
       await request.post("/api/databases", {
         data: { name: "e2e_audit_database" },
       })
     ).ok(),
   ).toBe(true);
+  const serverStatus = async () =>
+    (await (await request.get("/api/server")).json()).status;
+  if ((await serverStatus()) !== "offline") {
+    expect(
+      (
+        await request.post("/api/server/power", { data: { action: "stop" } })
+      ).ok(),
+    ).toBe(true);
+    await expect.poll(serverStatus).toBe("offline");
+  }
+  for (const action of ["start", "restart"]) {
+    expect(
+      (await request.post("/api/server/power", { data: { action } })).ok(),
+    ).toBe(true);
+    await expect.poll(serverStatus).toBe("running");
+  }
+  for (const action of ["op", "ban", "unban", "deop"]) {
+    const response = await request.post(`/api/players/${action}`, {
+      data: { name: "Audit_Player" },
+    });
+    expect(response.ok(), await response.text()).toBe(true);
+  }
+  const audit = await (await request.get("/api/audit")).json();
+  expect(
+    audit.entries.some(
+      (entry: { category: string }) => entry.category === "database",
+    ),
+  ).toBe(false);
   await openPage(page, "audit", "Audit logs");
   const filters = page.getByRole("group", {
     name: "Filter by activity category",
   });
   const rows = page.getByRole("table").getByRole("row");
-  await expect(rows.filter({ hasText: "e2e-audit-probe.txt" })).toBeVisible();
-  await expect(rows.filter({ hasText: "e2e_audit_database" })).toBeVisible();
+  await expect(
+    filters.getByRole("button", { name: "Databases", exact: true }),
+  ).toHaveCount(0);
+  await expect(rows.filter({ hasText: "e2e-audit-probe.txt" })).toHaveCount(2);
+  await expect(rows.filter({ hasText: "e2e_audit_database" })).toHaveCount(0);
   await filters.getByRole("button", { name: "Files", exact: true }).click();
   await expect(
     filters.getByRole("button", { name: "Files", exact: true }),
   ).toHaveAttribute("aria-pressed", "true");
-  await expect(rows.filter({ hasText: "e2e-audit-probe.txt" })).toBeVisible();
+  await expect(
+    rows
+      .filter({ hasText: "e2e-audit-probe.txt" })
+      .filter({ hasText: "File edited" }),
+  ).toBeVisible();
+  await expect(rows.filter({ hasText: "Audit_Player" })).toHaveCount(0);
   await expect(rows.filter({ hasText: "e2e_audit_database" })).toHaveCount(0);
   await page
     .getByRole("textbox", { name: "Search audit logs" })
     .fill("e2e-audit-probe.txt");
-  await expect(rows).toHaveCount(2);
+  await expect(rows).toHaveCount(3);
   await page
     .getByRole("textbox", { name: "Search audit logs" })
     .fill("does-not-exist-in-log");
@@ -578,9 +621,22 @@ test("audit filters distinguish real file and database actions and support searc
   await page
     .getByRole("button", { name: "Clear filters", exact: true })
     .click();
-  await filters.getByRole("button", { name: "Databases", exact: true }).click();
-  await expect(rows.filter({ hasText: "e2e_audit_database" })).toBeVisible();
+  await filters.getByRole("button", { name: "Players", exact: true }).click();
+  await expect(rows.filter({ hasText: "Audit_Player" })).toHaveCount(4);
+  for (const action of [
+    "Player opped",
+    "Player deopped",
+    "Player banned",
+    "Player unbanned",
+  ])
+    await expect(
+      rows.filter({ hasText: "Audit_Player" }).filter({ hasText: action }),
+    ).toBeVisible();
   await expect(rows.filter({ hasText: "e2e-audit-probe.txt" })).toHaveCount(0);
+  await filters.getByRole("button", { name: "Server", exact: true }).click();
+  for (const action of ["Server started", "Server restarted", "Server stopped"])
+    await expect(rows.filter({ hasText: action }).first()).toBeVisible();
+  await expect(rows.filter({ hasText: "Audit_Player" })).toHaveCount(0);
   await page.getByRole("button", { name: "Refresh activity" }).click();
   await expect(page.getByRole("status")).toContainText("Audit log refreshed.");
 });

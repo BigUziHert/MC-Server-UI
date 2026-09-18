@@ -329,10 +329,7 @@ export async function createLaunchpad(ctx) {
       updateCache.clear();
       updateFailures.clear();
       try {
-        await ctx.audit?.(
-          "Launchpad mod removed",
-          `${relative} moved to Recycle Bin.`,
-        );
+        await ctx.audit?.("Mod deleted", `${relative} moved to Recycle Bin.`);
       } catch {
         // Audit storage failure must not undo a completed, recoverable removal.
       }
@@ -2130,10 +2127,26 @@ export async function createLaunchpad(ctx) {
           });
         }
         await saveReceipts();
-        await ctx.audit?.(
-          "Launchpad installation completed",
-          `${plan.title} ${plan.versionName}: ${plan.files.length} files. Replaced files are retained in Recycle Bin.`,
-        );
+        const changes = new Map();
+        for (const file of plan.files) {
+          const kind =
+            { mod: "Mod", plugin: "Plugin", datapack: "Datapack" }[file.type] ??
+            "File";
+          const verb = file.action === "replace" ? "updated" : "added";
+          const key = `${kind} ${verb}`;
+          if (!changes.has(key)) changes.set(key, { kind, verb, files: [] });
+          changes.get(key).files.push(file.path);
+        }
+        for (const { kind, verb, files } of changes.values()) {
+          try {
+            await ctx.audit?.(
+              `${kind}${files.length > 1 ? "s" : ""} ${verb}`,
+              `${plan.title} ${plan.versionName}: ${files.join(", ")}. Replaced files are retained in Recycle Bin.`,
+            );
+          } catch {
+            // Audit persistence must not roll back a completed installation.
+          }
+        }
       } catch (cause) {
         const failures = [];
         for (const written of promoted.reverse()) {
@@ -2288,6 +2301,7 @@ export async function createLaunchpad(ctx) {
         .audit?.(
           "Modpack installed",
           `${plan.title}: clean installation with ${plan.runtime.software} ${plan.runtime.build}. Previous server files are retained in Recycle Bin.`,
+          "server",
         )
         .catch(() => {});
     });

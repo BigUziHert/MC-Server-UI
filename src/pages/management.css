@@ -815,7 +815,7 @@
   border-color: #42354d;
   color: #b5a0cc;
 }
-.management-event-icon.category-database {
+.management-event-icon.category-player {
   background: #253037;
   border-color: #334653;
   color: #95b7cc;
@@ -861,7 +861,7 @@
   background: #302738;
   color: #b49ac7;
 }
-.management-category.category-database {
+.management-category.category-player {
   background: #22323a;
   color: #8fafc1;
 }

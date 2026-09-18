@@ -342,8 +342,8 @@ export default function Launchpad({ notify }: PageProps) {
   const loaders = loadersFor(type).filter(
     (value) => !config?.loaders || config.loaders.includes(value),
   );
-  // Installed updates and installation defaults target this server, even when
-  // the catalog filters are broad or set to another Minecraft version/loader.
+  // Installed updates and individual content installs target this server, even
+  // when catalog filters are set to another Minecraft version or loader.
   const contentGameVersion =
     config?.gameVersion && /^\d+(?:\.\d+)+$/.test(config.gameVersion)
       ? config.gameVersion
@@ -850,8 +850,15 @@ export default function Launchpad({ notify }: PageProps) {
     setDialogError("");
     setPlan(null);
     setCleanAccepted(false);
-    setTargetVersion(contentGameVersion);
-    setTargetLoader(contentLoader);
+    // Modpacks replace the server runtime, so catalog installs start with the
+    // chosen filters. Installed-only updates keep the current server target.
+    const browsingModpack = type === "modpack" && !installedOnly;
+    setTargetVersion(
+      browsingModpack
+        ? gameVersion.trim() || contentGameVersion
+        : contentGameVersion,
+    );
+    setTargetLoader(browsingModpack ? loader || contentLoader : contentLoader);
     setSelection({ project, installed: entry });
   }
   function closeSelection() {

@@ -130,7 +130,8 @@ export async function createMinecraft(ctx) {
     fetch: catalogFetch,
     platformConfig,
     extraProviders: extras,
-    audit: (action, detail) => ctx.audit("server", action, detail),
+    audit: (action, detail, category = "file") =>
+      ctx.audit(category, action, detail),
   });
   const privateDir = await ctx.safePath(ctx.dataDir, "versions");
   await fs.mkdir(privateDir, { recursive: true });

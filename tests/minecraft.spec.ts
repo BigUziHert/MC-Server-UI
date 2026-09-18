@@ -3402,6 +3402,201 @@ for (const browse of [
   });
 }
 
+for (const browse of [
+  {
+    name: "selected Minecraft release",
+    gameVersion: "1.20.1",
+    loader: "neoforge",
+    installed: false,
+    installedOnly: false,
+  },
+  {
+    name: "selected release and loader",
+    gameVersion: "1.20.1",
+    loader: "forge",
+    installed: false,
+    installedOnly: false,
+  },
+  {
+    name: "All filters",
+    gameVersion: "",
+    loader: "",
+    installed: false,
+    installedOnly: false,
+  },
+  {
+    name: "installed pack in the catalog",
+    gameVersion: "1.20.1",
+    loader: "forge",
+    installed: true,
+    installedOnly: false,
+  },
+  {
+    name: "installed-only pack",
+    gameVersion: "1.20.1",
+    loader: "forge",
+    installed: true,
+    installedOnly: true,
+  },
+]) {
+  test(`Launchpad modpack target follows ${browse.name} through review`, async ({
+    page,
+    serverId,
+  }) => {
+    const expectedVersion = browse.installedOnly
+      ? "1.21.1"
+      : browse.gameVersion || "1.21.1";
+    const expectedLoader = browse.installedOnly
+      ? "neoforge"
+      : browse.loader || "neoforge";
+    const project = {
+      id: "battlearmory",
+      platform: "modrinth",
+      title: "BattleArmory TACZ",
+      description: "Modpack target fixture",
+    };
+    const version = {
+      id: "pack-release",
+      name: "BattleArmory release",
+      version: "2.0",
+      gameVersions: [expectedVersion],
+      loaders: [expectedLoader],
+      downloadable: true,
+    };
+    const versionRequests: URL[] = [];
+    await page.route("**/api/launchpad", (route) =>
+      route.fulfill({
+        json: {
+          platforms: [
+            {
+              id: "modrinth",
+              name: "Modrinth",
+              available: true,
+              types: ["modpack"],
+            },
+          ],
+          gameVersion: "1.21.1",
+          gameVersions: ["1.21.1", "1.20.1"],
+          loader: "neoforge",
+          status: "offline",
+          warnings: [],
+        },
+      }),
+    );
+    await page.route("**/api/launchpad/search?**", (route) =>
+      route.fulfill({
+        json: { projects: [project], total: 1, offset: 0, limit: 10 },
+      }),
+    );
+    await page.route("**/api/launchpad/installed?**", (route) =>
+      route.fulfill({
+        json: {
+          items: browse.installed
+            ? [
+                {
+                  path: ".launchpad/modpack",
+                  name: "BattleArmory TACZ",
+                  title: "BattleArmory TACZ",
+                  size: 0,
+                  platform: "modrinth",
+                  projectId: project.id,
+                  versionId: "old-release",
+                  versionName: "1.0",
+                  update: version,
+                  updateCheck: "checked",
+                },
+              ]
+            : [],
+          warnings: [],
+        },
+      }),
+    );
+    await page.route("**/api/launchpad/versions?**", (route) => {
+      expect(route.request().headers()["x-server-id"]).toBe(serverId);
+      versionRequests.push(new URL(route.request().url()));
+      return route.fulfill({ json: { versions: [version] } });
+    });
+    let review: Record<string, unknown> | undefined;
+    await page.route("**/api/launchpad/preview", (route) => {
+      review = route.request().postDataJSON();
+      return route.fulfill({
+        json: {
+          planId: "pack-target-review",
+          title: project.title,
+          versionName: version.name,
+          cleanInstall: true,
+          runtime: {
+            provider: expectedLoader,
+            software: expectedLoader,
+            version: expectedVersion,
+            build: "fixture",
+          },
+          summary: { fileCount: 1, totalBytes: 1024 },
+          files: [{ path: "mods/fixture.jar", size: 1024, action: "install" }],
+          warnings: [],
+          expiresAt: "2099-01-01T00:00:00Z",
+        },
+      });
+    });
+
+    await page.goto("/#launchpad");
+    const browseVersion = page.getByLabel("Minecraft version", { exact: true });
+    const browseLoader = page.getByLabel("Loader", { exact: true });
+    await expect(browseVersion).toHaveValue("1.21.1");
+    await browseVersion.selectOption(browse.gameVersion);
+    await browseLoader.selectOption(browse.loader);
+    if (browse.installedOnly) {
+      await page
+        .getByRole("switch", { name: "Show installed content" })
+        .check();
+    }
+    await page
+      .getByRole("button", {
+        name: `${browse.installed ? "Update" : "Install"} BattleArmory TACZ`,
+        exact: true,
+      })
+      .click();
+
+    const dialog = page.getByRole("dialog");
+    await expect(
+      dialog.getByLabel("Target Minecraft version", { exact: true }),
+    ).toHaveValue(expectedVersion);
+    await expect(
+      dialog.getByLabel("Target loader", { exact: true }),
+    ).toHaveValue(expectedLoader);
+    await expect(
+      dialog.getByLabel("Project version", { exact: true }),
+    ).toHaveValue(version.id);
+    expect(versionRequests.length).toBeGreaterThan(0);
+    for (const request of versionRequests) {
+      expect(Object.fromEntries(request.searchParams)).toMatchObject({
+        projectId: project.id,
+        type: "modpack",
+        gameVersion: expectedVersion,
+        loader: expectedLoader,
+      });
+    }
+    await dialog
+      .getByRole("button", { name: "Review installation", exact: true })
+      .click();
+    await expect
+      .poll(() => review)
+      .toMatchObject({
+        projectId: project.id,
+        versionId: version.id,
+        type: "modpack",
+        gameVersion: expectedVersion,
+        loader: expectedLoader,
+      });
+    await expect(
+      dialog.getByRole("heading", { name: "Review installation" }),
+    ).toBeVisible();
+    await expect(
+      dialog.getByRole("group", { name: "Modpack installation summary" }),
+    ).toContainText(`${expectedVersion} · Build fixture`);
+  });
+}
+
 test("Launchpad refresh retries a failed stable catalog while preserving configured and selected release versions", async ({
   page,
 }) => {

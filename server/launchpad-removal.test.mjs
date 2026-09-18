@@ -302,7 +302,11 @@ test("removing a consumer retains its shared dependencies, other mods and config
     "consumer.jar": mod("neoforge", "consumer", ["library"]),
     "other.jar": mod("neoforge", "other", ["library"]),
   };
-  const f = await fixture(t, { files });
+  const events = [];
+  const f = await fixture(t, {
+    files,
+    audit: async (...event) => events.push(event),
+  });
   await fs.mkdir(path.join(f.serverDir, "config"));
   await f.write("config/consumer.toml", "keep configuration\n");
   const plan = await f.service.removalPreview({ path: "mods/consumer.jar" });
@@ -311,7 +315,11 @@ test("removing a consumer retains its shared dependencies, other mods and config
     plan.files.map((value) => value.path),
     ["mods/consumer.jar"],
   );
+  assert.deepEqual(events, []);
   await f.service.remove({ planId: plan.planId, confirmed: true });
+  assert.deepEqual(events, [
+    ["Mod deleted", "mods/consumer.jar moved to Recycle Bin."],
+  ]);
   for (const name of ["library.jar", "other.jar"])
     assert.deepEqual(await f.read(`mods/${name}`), files[name]);
   assert.equal(

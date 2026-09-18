@@ -102,6 +102,189 @@ test("file operations upload and download original bytes, edit text, and reject 
     200,
   );
   assert.deepEqual((await request("/api/files?path=custom")).body.entries, []);
+  const entries = (await request("/api/audit")).body.entries;
+  assert.ok(
+    entries.some(
+      (entry) =>
+        entry.category === "file" &&
+        entry.action === "File edited" &&
+        entry.detail === "custom/hello.txt",
+    ),
+  );
+  assert.ok(
+    entries.some(
+      (entry) =>
+        entry.category === "file" &&
+        entry.action === "File deleted" &&
+        entry.detail.includes("custom/hello.txt"),
+    ),
+  );
+});
+
+test("audit describes added and deleted mods and hides legacy database records without erasing history", async (t) => {
+  const { request, base, serverDir, dataDir, audit, assertRemovable } =
+    await fixture(t, {
+      mode: "live",
+    });
+  await fs.mkdir(path.join(serverDir, "mods"));
+  const form = new FormData();
+  form.append("files", new Blob(["mod bytes"]), "new-mod.jar");
+  form.append("files", new Blob(["notes"]), "README.txt");
+  assert.equal(
+    (
+      await fetch(`${base}/api/files/upload?path=mods`, {
+        method: "POST",
+        body: form,
+      })
+    ).status,
+    201,
+  );
+  // Upload responses precede temporary-file cleanup; wait for its mutation
+  // lock to release before exercising the exclusive Recycle Bin operation.
+  for (let attempt = 0; ; attempt++) {
+    try {
+      assertRemovable();
+      break;
+    } catch (cause) {
+      if (attempt >= 100) throw cause;
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+  }
+  const removed = await request("/api/files?path=mods/new-mod.jar", {
+    method: "DELETE",
+  });
+  assert.equal(removed.status, 200, JSON.stringify(removed.body));
+  await audit("database", "SQLite database created", "legacy database");
+  await audit(
+    "server",
+    "Launchpad installation completed",
+    "old mod installation",
+  );
+  const entries = (await request("/api/audit")).body.entries;
+  assert.ok(
+    entries.some(
+      (entry) =>
+        entry.category === "file" &&
+        entry.action === "Mod added" &&
+        entry.detail === "mods/new-mod.jar",
+    ),
+  );
+  assert.ok(
+    entries.some(
+      (entry) =>
+        entry.category === "file" &&
+        entry.action === "Mod deleted" &&
+        entry.detail.includes("mods/new-mod.jar"),
+    ),
+  );
+  assert.ok(
+    entries.some(
+      (entry) =>
+        entry.category === "file" &&
+        entry.action === "Files uploaded" &&
+        entry.detail === "mods/README.txt",
+    ),
+  );
+  assert.ok(
+    entries.some(
+      (entry) =>
+        entry.category === "file" &&
+        entry.action === "Content installed" &&
+        entry.detail === "old mod installation",
+    ),
+  );
+  assert.ok(entries.every((entry) => entry.category !== "database"));
+  const saved = JSON.parse(
+    await fs.readFile(path.join(dataDir, "panel.json"), "utf8"),
+  );
+  assert.ok(saved.audit.some((entry) => entry.category === "database"));
+});
+
+test("live lifecycle audits confirmed starts, restarts and exits, never chat or failed startup as success", async (t) => {
+  const children = [];
+  const spawnServer = () => {
+    const child = new EventEmitter();
+    child.stdout = new PassThrough();
+    child.stderr = new PassThrough();
+    child.stdin = new Writable({
+      write(_chunk, _encoding, done) {
+        done();
+      },
+    });
+    child.kill = () => child.emit("close", 0);
+    children.push(child);
+    return child;
+  };
+  const { request, serverDir } = await fixture(t, {
+    jar: "server.jar",
+    spawnServer,
+  });
+  await fs.writeFile(path.join(serverDir, "server.jar"), "not executed");
+  await fs.writeFile(path.join(serverDir, "eula.txt"), "eula=true\n");
+  const actions = async () =>
+    (await request("/api/audit")).body.entries
+      .filter((entry) => entry.category === "server")
+      .map((entry) => entry.action);
+  const waitFor = async (predicate) => {
+    for (let attempt = 0; attempt < 100; attempt++) {
+      if (await predicate()) return;
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.fail("Expected lifecycle transition did not complete");
+  };
+  assert.equal(
+    (await request("/api/server/power", json("POST", { action: "start" })))
+      .status,
+    200,
+  );
+  children[0].stdout.write("[Server thread/INFO]: <Player> Done (1s)!\n");
+  assert.equal((await request("/api/server")).body.status, "starting");
+  assert.deepEqual(await actions(), []);
+  children[0].stdout.write(
+    "[18Sep2026 13:02:01.210] [Server thread/INFO] [minecraft/DedicatedServer]: Done (1s)!\n",
+  );
+  await waitFor(async () => (await actions()).includes("Server started"));
+  children[0].stdout.write("[Server thread/INFO]: Done (1s)!\n");
+  assert.equal(
+    (await actions()).filter((action) => action === "Server started").length,
+    1,
+  );
+  assert.equal(
+    (await request("/api/server/power", json("POST", { action: "restart" })))
+      .status,
+    200,
+  );
+  children[0].emit("close", 0);
+  await waitFor(() => children.length === 2);
+  children[1].stdout.write("  2013-06-01 12:00:00 [INFO] Done (1s)!\n");
+  await waitFor(async () => (await actions()).includes("Server restarted"));
+  assert.equal(
+    (await request("/api/console/command", json("POST", { command: "stop" })))
+      .status,
+    200,
+  );
+  children[1].emit("close", 0);
+  await waitFor(
+    async () =>
+      (await actions()).filter((action) => action === "Server stopped")
+        .length === 2,
+  );
+  assert.equal(
+    (await actions()).filter((action) => action === "Console command").length,
+    0,
+  );
+  assert.equal(
+    (await request("/api/server/power", json("POST", { action: "start" })))
+      .status,
+    200,
+  );
+  children[2].emit("error", new Error("fixture Java failed"));
+  children[2].emit("close", 1);
+  await waitFor(async () => (await actions()).includes("Server start failed"));
+  assert.equal(
+    (await actions()).filter((action) => action === "Server started").length,
+    1,
+  );
 });
 
 test("sandbox rejects traversal, reserved names, root deletion, and symlink access", async (t) => {
