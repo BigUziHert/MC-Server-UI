@@ -701,6 +701,11 @@ test("explicit EULA acceptance and the new-server CurseForge key are persisted w
     true,
   );
   assert.ok(!JSON.stringify(settings.body).includes("fixture-key"));
+  const setupAudit = (await f.request("/api/panel/audit")).body.entries;
+  assert.ok(
+    setupAudit.some((entry) => entry.action === "CurseForge API key saved"),
+  );
+  assert.ok(!JSON.stringify(setupAudit).includes("fixture-key"));
   const created = await f.request(
     "/api/server-setup",
     json("POST", requestBody({ acceptedEula: true })),
@@ -729,6 +734,22 @@ test("explicit EULA acceptance and the new-server CurseForge key are persisted w
     ).body.platforms.find((platform) => platform.id === "curseforge")
       .keyConfigured,
     true,
+  );
+  const audit = (await f.request("/api/audit", {}, created.body.server.id)).body
+    .entries;
+  assert.equal(
+    audit.filter((entry) => entry.action === "EULA accepted").length,
+    1,
+  );
+  assert.ok(!JSON.stringify(audit).includes("fixture-key"));
+  await f.request(
+    "/api/server-setup/launchpad/settings",
+    json("PUT", { curseforgeApiKey: "" }),
+  );
+  assert.ok(
+    (await f.request("/api/panel/audit")).body.entries.some(
+      (entry) => entry.action === "CurseForge API key removed",
+    ),
   );
 });
 

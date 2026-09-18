@@ -177,7 +177,7 @@ export async function createRecycleBin({
     }
     return rows;
   };
-  const hashFile = async (target) => {
+  const hashFile = async (target, algorithm = "sha256") => {
     const before = await io.lstat(target);
     if (!before.isFile() || before.isSymbolicLink())
       throw error(400, "Only regular files can be recovered.");
@@ -193,7 +193,7 @@ export async function createRecycleBin({
           409,
           "The file changed during recovery. Try again when it is no longer being edited.",
         );
-      const hash = createHash("sha256");
+      const hash = createHash(algorithm);
       const buffer = Buffer.allocUnsafe(128 * 1024);
       for (;;) {
         const { bytesRead } = await handle.read(buffer, 0, buffer.length, null);
@@ -381,6 +381,21 @@ export async function createRecycleBin({
   };
   return {
     directory,
+    inspect(id) {
+      return exclusive(async () => {
+        const record = await read(id);
+        const item = await view(record);
+        if (item.status !== "ready") throw error(409, item.message);
+        return {
+          ...item,
+          ...(item.type === "file" &&
+          /^mods\/[^/]+\.jar(?:\.disabled)?$/i.test(item.originalPath) &&
+          item.size <= 512 * 1024 ** 2
+            ? { sha512: await hashFile(record.payload, "sha512") }
+            : {}),
+        };
+      });
+    },
     async list() {
       const entries = await io.readdir(await storage(), {
         withFileTypes: true,
@@ -492,7 +507,7 @@ export async function createRecycleBin({
         if (await lstat(destination))
           throw error(
             409,
-            `“${metadata.originalPath}” already exists. Rename or recycle it before restoring this item.`,
+            `“${metadata.originalPath}” already exists. Delete or move the existing file first.`,
           );
         const parent = path.posix.dirname(metadata.originalPath);
         if (parent !== ".") {
@@ -519,8 +534,13 @@ export async function createRecycleBin({
         return metadata.originalPath;
       });
     },
-    deletePermanently(id) {
+    deletePermanently(id, { details = false } = {}) {
       return exclusive(async () => {
+        const metadata = details
+          ? await read(id)
+              .then((record) => record.metadata)
+              .catch(() => null)
+          : null;
         // Purge uses the validated private ID only. Damaged metadata or an
         // unavailable original server path must not prevent removing an entry.
         const entryDir = await entryDirectory(id);
@@ -590,7 +610,13 @@ export async function createRecycleBin({
             );
           throw cause;
         }
-        return id;
+        return details
+          ? {
+              id,
+              originalPath: metadata?.originalPath ?? null,
+              type: metadata?.type ?? null,
+            }
+          : id;
       });
     },
   };

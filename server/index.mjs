@@ -21,6 +21,8 @@ import { decodeIcon, readServerIcon, writeServerIcon } from "./server-icon.mjs";
 import { createRecycleBin } from "./recycle-bin.mjs";
 import { createMinecraft } from "./minecraft.mjs";
 import { createServerSetup } from "./server-setup.mjs";
+import { auditEntry, auditHistory, contentKind } from "./audit.mjs";
+import { installedMinecraftMetadata } from "./installed-minecraft.mjs";
 import { createLauncherStop } from "./launcher-stop.mjs";
 import {
   createPlayerHistory,
@@ -531,6 +533,8 @@ export async function createPanel(options = {}) {
   const timezone = Intl.DateTimeFormat().resolvedOptions().timeZone;
   state.schedule = { ...defaultSchedule, ...state.schedule, timezone };
   const events = new EventEmitter();
+  let reportPersistenceFailure = (cause) =>
+    console.error("Panel state could not be saved:", cause);
   let saveChain = Promise.resolve();
   const save = () => {
     const serialized = JSON.stringify(state, null, 2);
@@ -540,18 +544,20 @@ export async function createPanel(options = {}) {
         const temp = `${statePath}.${randomUUID()}.tmp`;
         await fs.writeFile(temp, serialized);
         await fs.rename(temp, statePath);
+      })
+      .catch((cause) => {
+        reportPersistenceFailure(cause);
+        throw cause;
       });
     return saveChain;
   };
-  const audit = async (category, action, detail) => {
-    state.audit.unshift({
-      id: randomUUID(),
-      category,
-      action,
-      detail,
-      actor: "Local administrator",
-      createdAt: new Date().toISOString(),
-    });
+  const audit = async (
+    category,
+    action,
+    detail,
+    actor = "Local administrator",
+  ) => {
+    state.audit.unshift(auditEntry(category, action, detail, actor));
     state.audit = state.audit.slice(0, 2000);
     await save();
   };
@@ -595,6 +601,7 @@ export async function createPanel(options = {}) {
   let startedAt = mode === "demo" ? Date.now() - 3_600_000 : null;
   let processHandle = null;
   let processStop;
+  let processStopActor;
   let stopTimer;
   let terminationPromise;
   let restartRequested = false;
@@ -640,12 +647,30 @@ export async function createPanel(options = {}) {
           /* Missing startup files are reported on Start; metadata stays unknown. */
         }
       }
+      if (current.mode === "live" && !current.minecraftVersion) {
+        const installed = await installedMinecraftMetadata({
+          serverDir,
+          safePath,
+          configuration: current,
+          detected,
+        });
+        detected = { ...detected, ...installed };
+      }
       if (
         configuration === current &&
         !processHandle &&
         (mode === "demo" || status === "offline")
       ) {
-        startupMetadata = metadataFor(current, detected);
+        startupMetadata = {
+          ...metadataFor(current, detected),
+          ...(detected.gameVersion
+            ? { gameVersion: detected.gameVersion }
+            : {}),
+        };
+        if (current.launchType === "jar" && detected.software) {
+          startupMetadata.software = detected.software;
+          startupMetadata.version = detected.version ?? startupMetadata.version;
+        }
         startupMetadataAt = Date.now();
       }
     })();
@@ -759,6 +784,13 @@ export async function createPanel(options = {}) {
     lines.push(line);
     if (lines.length > 1500) lines.splice(0, lines.length - 1500);
     events.emit("line", line);
+  };
+  reportPersistenceFailure = (cause) => {
+    append(
+      `[Panel] Could not save panel state or audit history: ${cause.code ?? "storage error"}. Check disk space and permissions.`,
+      "error",
+    );
+    console.error("Panel state could not be saved:", cause);
   };
   if (mode === "demo") {
     append(
@@ -923,10 +955,10 @@ export async function createPanel(options = {}) {
     ...(options.source === "imported" ? { source: "imported", serverDir } : {}),
   });
 
-  const lifecycleAudit = (action, detail) => {
+  const lifecycleAudit = (action, detail, actor = "Local administrator") => {
     // saveChain drains these writes at shutdown. Audit I/O must not make a
     // stopped server appear busy or change the process outcome.
-    return audit("server", action, detail).catch(() => {});
+    return audit("server", action, detail, actor).catch(() => {});
   };
   async function startServer(restarting = false) {
     if (status !== "offline")
@@ -995,6 +1027,16 @@ export async function createPanel(options = {}) {
           "Read the Minecraft EULA, then set eula=true in your server eula.txt before starting.",
         );
       await writeProperties({ "server-port": configuration.port });
+      if (!configuration.minecraftVersion)
+        detectedStartup = {
+          ...detectedStartup,
+          ...(await installedMinecraftMetadata({
+            serverDir,
+            safePath,
+            configuration,
+            detected: detectedStartup,
+          })),
+        };
       status = "starting";
       append("[Panel] Starting server…");
       const child = (options.spawnServer ?? spawn)(executable, launchArgs, {
@@ -1009,7 +1051,17 @@ export async function createPanel(options = {}) {
         stdio: ["pipe", "pipe", "pipe"],
       });
       processHandle = child;
-      startupMetadata = metadataFor(configuration, detectedStartup);
+      startupMetadata = {
+        ...metadataFor(configuration, detectedStartup),
+        ...(detectedStartup.gameVersion
+          ? { gameVersion: detectedStartup.gameVersion }
+          : {}),
+      };
+      if (detectedStartup.software && configuration.launchType === "jar") {
+        startupMetadata.software = detectedStartup.software;
+        startupMetadata.version =
+          detectedStartup.version ?? startupMetadata.version;
+      }
       const stop = createLauncherStop({
         child,
         windowsBatch:
@@ -1031,6 +1083,7 @@ export async function createPanel(options = {}) {
           ),
       });
       processStop = stop;
+      processStopActor = null;
       telemetry.reset(child.pid);
       startedAt = Date.now();
       let becameReady = false;
@@ -1100,6 +1153,7 @@ export async function createPanel(options = {}) {
               : "Server exited unexpectedly",
           launchError?.message ??
             `${configuration.name} exited with code ${code ?? "unknown"}.`,
+          processStopActor ?? "Server process",
         );
         telemetry.reset(child.pid);
         clearTimeout(stopTimer);
@@ -1170,6 +1224,7 @@ export async function createPanel(options = {}) {
       } else {
         const child = processHandle;
         const stop = processStop;
+        processStopActor = "Local administrator";
         // Bound an unresponsive wrapper, but never interrupt Minecraft after it
         // confirms graceful shutdown. A trailing batch pause is handled on stdout.
         if (["script", "executable"].includes(configuration.launchType)) {
@@ -1241,6 +1296,8 @@ export async function createPanel(options = {}) {
     dataDir,
     safePath,
     withMinecraftMutation,
+    isContentMutationActive: () =>
+      activeMutations > 0 || recycleBusy || minecraftBusy,
     versionsService: options.versionsService,
     versionsOptions: options.versionsOptions,
     fetch: options.catalogFetch,
@@ -1256,7 +1313,8 @@ export async function createPanel(options = {}) {
         )
           ? software.toLowerCase()
           : null;
-      let gameVersion = configuration.minecraftVersion;
+      let gameVersion =
+        configuration.minecraftVersion ?? startupMetadata.gameVersion ?? null;
       if (loader === "neoforge") {
         const parts = /^(\d+)\.(\d+)\.(\d+)/.exec(version ?? "");
         if (parts)
@@ -1439,9 +1497,20 @@ export async function createPanel(options = {}) {
             force: true,
           });
           state.backups = state.backups.filter((item) => item.id !== old.id);
+          await audit(
+            "backup",
+            "Backup deleted",
+            `${old.name} (retention).`,
+            "Scheduler",
+          );
         }
       }
-      await audit("backup", "Backup created", `${backupName} (${trigger}).`);
+      await audit(
+        "backup",
+        "Backup created",
+        `${backupName} (${trigger}).`,
+        trigger === "scheduled" ? "Scheduler" : "Local administrator",
+      );
       return item;
     } catch (cause) {
       await fs.rm(`${target}.tmp`, { force: true });
@@ -1461,6 +1530,7 @@ export async function createPanel(options = {}) {
               "backup",
               "World save recovery failed",
               `Run save-on on the server: ${cause.message}`,
+              trigger === "scheduled" ? "Scheduler" : "Local administrator",
             );
           }
         }
@@ -1488,7 +1558,12 @@ export async function createPanel(options = {}) {
       try {
         await createBackup(undefined, "scheduled");
       } catch (cause) {
-        await audit("backup", "Scheduled backup failed", cause.message);
+        await audit(
+          "backup",
+          "Scheduled backup failed",
+          cause.message,
+          "Scheduler",
+        );
         append(`[Panel] Scheduled backup failed: ${cause.message}`, "error");
       }
     } finally {
@@ -1695,7 +1770,7 @@ export async function createPanel(options = {}) {
       await writeServerIcon(serverDir, decodeIcon(req.body?.image), safePath);
       state.iconPreference = "server";
       await audit(
-        "file",
+        "server",
         "Server icon updated",
         "server-icon.png · game clients see the new icon after a server restart.",
       );
@@ -2160,7 +2235,7 @@ export async function createPanel(options = {}) {
       if (playerEvent)
         await audit(
           "player",
-          playerEvent.action,
+          mode === "demo" ? `${playerEvent.action} (demo)` : playerEvent.action,
           mode === "demo"
             ? `Demo console command: ${normalized}. No live player state was changed.`
             : playerEvent.detail,
@@ -2177,20 +2252,43 @@ export async function createPanel(options = {}) {
   app.delete(
     "/api/files/recycle-bin/:id",
     trackOperation(async (req, res) => {
-      await recycleBin.deletePermanently(req.params.id);
+      const removed = await recycleBin.deletePermanently(req.params.id, {
+        details: true,
+      });
       await audit(
         "file",
         "Recycle Bin item permanently deleted",
-        req.params.id,
+        removed.originalPath ??
+          `Recovery item ${req.params.id} (original path unavailable)`,
       );
       res.json({ ok: true, id: req.params.id });
     }),
   );
+  app.get("/api/files/recycle-bin/:id/restore-preview", async (req, res) => {
+    const item = await recycleBin.inspect(req.params.id);
+    res.json(
+      item.sha512 && minecraft.duplicateCheck
+        ? await minecraft.duplicateCheck({
+            path: item.originalPath,
+            sha512: item.sha512,
+          })
+        : { duplicates: [], warnings: [] },
+    );
+  });
   app.post(
     "/api/files/recycle-bin/:id/restore",
     trackOperation(async (req, res) => {
       const restoredPath = await recycleBin.restore(req.params.id);
-      await audit("file", "File restored from Recycle Bin", restoredPath);
+      const restored = await fs.stat(await safePath(serverDir, restoredPath));
+      const kind = await fileKind(
+        restoredPath,
+        restored.isDirectory() ? "directory" : "file",
+      );
+      await audit(
+        "file",
+        `${kind} restored`,
+        `${restoredPath} · restored from Recycle Bin.`,
+      );
       diskCache.at = 0;
       res.json({ ok: true, path: restoredPath });
     }),
@@ -2223,10 +2321,37 @@ export async function createPanel(options = {}) {
     dest: uploadDir,
     limits: { fileSize: 256 * 1024 * 1024, files: 20, fields: 5 },
   });
-  const isModFile = (relative) =>
-    /^mods\/[^/]+\.jar(?:\.disabled)?$/i.test(
-      String(relative).replace(/\\/g, "/"),
-    );
+  const fileKind = async (relative, type = "file") => {
+    let world = "world";
+    try {
+      world =
+        parseProperties(
+          await fs.readFile(
+            await safePath(serverDir, "server.properties"),
+            "utf8",
+          ),
+        ).get("level-name") || world;
+    } catch {
+      /* Classification must not undo an otherwise successful file change. */
+    }
+    return contentKind(relative, type, world);
+  };
+  const auditUploads = async (paths) => {
+    const groups = new Map();
+    for (const relative of paths) {
+      const kind = await fileKind(relative);
+      if (!groups.has(kind)) groups.set(kind, []);
+      groups.get(kind).push(relative);
+    }
+    for (const [kind, items] of groups)
+      await audit(
+        "file",
+        kind === "File"
+          ? "Files uploaded"
+          : `${kind}${items.length > 1 ? "s" : ""} added`,
+        items.join(", "),
+      );
+  };
   app.post(
     "/api/files/upload",
     upload.array("files", 20),
@@ -2252,23 +2377,20 @@ export async function createPanel(options = {}) {
             );
           destinations.push(target);
         }
-        for (let i = 0; i < files.length; i++)
-          await fs.copyFile(files[i].path, destinations[i], 1);
-        const uploadedPaths = files.map((file) =>
-          [directory, file.originalname].filter(Boolean).join("/"),
-        );
-        const modPaths = uploadedPaths.filter(isModFile);
-        const otherPaths = uploadedPaths.filter(
-          (relative) => !isModFile(relative),
-        );
-        if (modPaths.length)
-          await audit(
-            "file",
-            modPaths.length === 1 ? "Mod added" : "Mods added",
-            modPaths.join(", "),
-          );
-        if (otherPaths.length)
-          await audit("file", "Files uploaded", otherPaths.join(", "));
+        const uploadedPaths = [];
+        try {
+          for (let i = 0; i < files.length; i++) {
+            await fs.copyFile(files[i].path, destinations[i], 1);
+            uploadedPaths.push(
+              [directory, files[i].originalname].filter(Boolean).join("/"),
+            );
+          }
+        } catch (cause) {
+          await auditUploads(uploadedPaths).catch(() => {});
+          diskCache.at = 0;
+          throw cause;
+        }
+        await auditUploads(uploadedPaths);
         diskCache.at = 0;
         res.status(201).json({ uploaded: files.length });
       } finally {
@@ -2297,12 +2419,15 @@ export async function createPanel(options = {}) {
         throw error(409, "A file or directory with this name already exists.");
       if (type === "directory") await fs.mkdir(target);
       else await fs.writeFile(target, content, { flag: "wx" });
+      const kind = await fileKind(
+        [directory, name].filter(Boolean).join("/"),
+        type,
+      );
       await audit(
         "file",
-        type === "file" &&
-          isModFile([directory, name].filter(Boolean).join("/"))
-          ? "Mod added"
-          : `${type === "file" ? "File" : "Directory"} created`,
+        ["File", "Directory"].includes(kind)
+          ? `${kind} created`
+          : `${kind} added`,
         [directory, name].filter(Boolean).join("/"),
       );
       diskCache.at = 0;
@@ -2355,11 +2480,7 @@ export async function createPanel(options = {}) {
       const recycled = await recycleBin.recycle(relative);
       await audit(
         "file",
-        isModFile(relative)
-          ? "Mod deleted"
-          : /^mods[\\/]?$/i.test(relative)
-            ? "Mods deleted"
-            : "File deleted",
+        `${await fileKind(relative, recycled.type)} deleted`,
         `${relative} · moved to Recycle Bin.`,
       );
       diskCache.at = 0;
@@ -2551,24 +2672,11 @@ export async function createPanel(options = {}) {
     }),
   );
   app.get("/api/audit", (_req, res) => {
-    const legacyContentActions = {
-      "Launchpad installation completed": "Content installed",
-      "Content installed": "Content installed",
-      "Launchpad mod removed": "Mod deleted",
-      "Mod removed": "Mod deleted",
-    };
     res.json({
-      entries: state.audit
-        .filter((entry) => entry.category !== "database")
-        .map((entry) =>
-          Object.hasOwn(legacyContentActions, entry.action)
-            ? {
-                ...entry,
-                category: "file",
-                action: legacyContentActions[entry.action],
-              }
-            : entry,
-        ),
+      entries: auditHistory([
+        ...state.audit,
+        ...(options.panelAuditEntries?.() ?? []),
+      ]),
     });
   });
   minecraft.mount(app);
@@ -2632,6 +2740,17 @@ export async function createPanel(options = {}) {
         clearTimeout(demoTimer);
         clearTimeout(stopTimer);
         closePromise = (async () => {
+          if (mode === "demo" && status !== "offline") {
+            await lifecycleAudit(
+              status === "starting"
+                ? "Server start cancelled"
+                : "Server stopped",
+              "Simulated server closed with the panel.",
+              "Server process",
+            );
+            status = "offline";
+            restartRequested = false;
+          }
           await minecraft.close();
           // An HTTP client can leave before its disk writes or backup finish.
           // Wait for the handler itself, including save-on and its audit write.
@@ -2643,6 +2762,7 @@ export async function createPanel(options = {}) {
           if (processHandle) {
             const child = processHandle;
             const stop = processStop;
+            processStopActor ??= "Server process";
             const exited = new Promise((resolve) =>
               child.once("close", resolve),
             );
@@ -2713,6 +2833,44 @@ export async function createFleet(options = {}) {
   await fs.mkdir(requestedDataDir, { recursive: true });
   const dataDir = await fs.realpath(requestedDataDir);
   const registryPath = await safePath(dataDir, "servers.json");
+  const panelAuditPath = await safePath(dataDir, "panel-audit.json");
+  let panelAuditEntries = [];
+  try {
+    const stored = JSON.parse(await fs.readFile(panelAuditPath, "utf8"));
+    if (Array.isArray(stored)) panelAuditEntries = stored;
+  } catch (cause) {
+    if (cause.code !== "ENOENT") throw cause;
+  }
+  let panelAuditChain = Promise.resolve();
+  const panelAudit = (
+    category,
+    action,
+    detail,
+    actor = "Local administrator",
+    context = {},
+  ) => {
+    panelAuditEntries.unshift(
+      auditEntry(category, action, detail, actor, context),
+    );
+    panelAuditEntries = panelAuditEntries.slice(0, 2000);
+    const serialized = JSON.stringify(panelAuditEntries, null, 2);
+    panelAuditChain = panelAuditChain
+      .catch(() => {})
+      .then(async () => {
+        const temporary = `${panelAuditPath}.${randomUUID()}.tmp`;
+        try {
+          await fs.writeFile(temporary, serialized);
+          await fs.rename(temporary, panelAuditPath);
+        } finally {
+          await fs.rm(temporary, { force: true }).catch(() => {});
+        }
+      })
+      .catch((cause) => {
+        console.error("Panel audit history could not be saved:", cause);
+        throw cause;
+      });
+    return panelAuditChain;
+  };
   const legacyServerDir = path.resolve(
     options.serverDir ?? env.MC_SERVER_DIR ?? path.join(dataDir, "server"),
   );
@@ -2888,6 +3046,8 @@ export async function createFleet(options = {}) {
       versionsOptions: options.versionsOptions,
       catalogFetch: options.catalogFetch,
       extraProviders: options.extraProviders,
+      panelAuditEntries: () =>
+        panelAuditEntries.filter((event) => event.serverId === entry.id),
       persistMinecraftConfiguration: (next) =>
         serialize(async () => {
           checkPort(next.port, entry.id);
@@ -3089,6 +3249,19 @@ export async function createFleet(options = {}) {
     next();
   });
   app.use(express.json({ limit: "2mb" }));
+  app.get("/api/panel/audit", (_req, res) =>
+    res.json({ entries: auditHistory(panelAuditEntries) }),
+  );
+  app.get("/api/audit", (req, res, next) => {
+    if (
+      req.query.scope === "panel" ||
+      (!registry.servers.length &&
+        !req.headers["x-server-id"] &&
+        !req.query.serverId)
+    )
+      return res.json({ entries: auditHistory(panelAuditEntries) });
+    next();
+  });
   app.get("/api/server-import", (_req, res) =>
     res.json({
       canBrowse: typeof options.selectServerDirectory === "function",
@@ -3235,6 +3408,7 @@ export async function createFleet(options = {}) {
     ...options,
     dataDir,
     safePath,
+    audit: panelAudit,
     javaPath:
       options.javaPath ??
       env.JAVA_PATH ??
@@ -3358,6 +3532,12 @@ export async function createFleet(options = {}) {
         "Server created",
         `${config.name} created in ${config.mode} mode on port ${config.port}.`,
       );
+      if (config.mode === "live" && acceptedEula)
+        await runtime.audit(
+          "server",
+          "EULA accepted",
+          "Minecraft EULA accepted during server setup.",
+        );
       return {
         server: {
           ...runtime.descriptor(),
@@ -3462,6 +3642,13 @@ export async function createFleet(options = {}) {
         throw cause;
       }
       runtimes.delete(entry.id);
+      await panelAudit(
+        "server",
+        "Server removed",
+        `${entry.name} removed from the panel. Its Minecraft files, worlds, backups, and Recycle Bin were preserved.`,
+        "Local administrator",
+        { serverId: entry.id, serverName: entry.name },
+      ).catch(() => {});
       return {
         ok: true,
         serverId: entry.id,
@@ -3532,6 +3719,7 @@ export async function createFleet(options = {}) {
       await Promise.all(
         [...runtimes.values()].map((runtime) => runtime.close(closeOptions)),
       );
+      await panelAuditChain;
       if (!options.telemetry) telemetry.close();
     },
   };

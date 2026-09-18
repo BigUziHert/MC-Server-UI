@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { randomUUID } from "node:crypto";
+import { randomUUID, createHash } from "node:crypto";
 import { EventEmitter } from "node:events";
 import { PassThrough, Writable } from "node:stream";
 import * as tar from "tar";
@@ -42,6 +42,28 @@ async function fixture(t) {
     createRecycleBin({ dataDir, serverDir, safePath, ...options });
   return { root, dataDir, serverDir, boot };
 }
+
+test("restore inspection hashes only the validated recycled mod and exposes no private payload path", async (t) => {
+  const f = await fixture(t);
+  await fs.mkdir(path.join(f.serverDir, "mods"));
+  const bytes = Buffer.from("recycled mod bytes");
+  await fs.writeFile(path.join(f.serverDir, "mods", "example.jar"), bytes);
+  const bin = await f.boot();
+  const entry = await bin.recycle("mods/example.jar");
+  const inspected = await bin.inspect(entry.id);
+  assert.equal(inspected.originalPath, "mods/example.jar");
+  assert.equal(
+    inspected.sha512,
+    createHash("sha512").update(bytes).digest("hex"),
+  );
+  assert.equal("payload" in inspected, false);
+  await missing(path.join(f.serverDir, "mods", "example.jar"));
+  assert.equal(await bin.restore(entry.id), "mods/example.jar");
+  assert.deepEqual(
+    await fs.readFile(path.join(f.serverDir, "mods", "example.jar")),
+    bytes,
+  );
+});
 
 async function apiFixture(t, options = {}) {
   const f = await fixture(t);

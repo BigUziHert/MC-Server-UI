@@ -281,6 +281,17 @@ test("live lifecycle audits confirmed starts, restarts and exits, never chat or 
   children[2].emit("error", new Error("fixture Java failed"));
   children[2].emit("close", 1);
   await waitFor(async () => (await actions()).includes("Server start failed"));
+  const lifecycleEvents = (await request("/api/audit")).body.entries;
+  assert.equal(
+    lifecycleEvents.find((entry) => entry.action === "Server start failed")
+      .actor,
+    "Server process",
+  );
+  assert.ok(
+    lifecycleEvents
+      .filter((entry) => entry.action === "Server stopped")
+      .every((entry) => entry.actor === "Local administrator"),
+  );
   assert.equal(
     (await actions()).filter((action) => action === "Server started").length,
     1,

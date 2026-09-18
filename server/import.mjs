@@ -433,6 +433,8 @@ export async function inspectJavaArguments(directory, args) {
   return {
     ...describeJavaArguments(args),
     memoryLimitMB,
+    // Backend-only advisory arguments for reading the selected launcher's metadata.
+    expandedArgs: expanded,
   };
 }
 

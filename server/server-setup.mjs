@@ -81,6 +81,12 @@ export async function createServerSetup({ dataDir, safePath, ...options }) {
     extraProviders,
     platformConfig,
     getServer: emptyServer,
+    audit: (
+      action,
+      detail,
+      category = "server",
+      actor = "Local administrator",
+    ) => Promise.resolve(options.audit?.(category, action, detail, actor)),
   };
   const catalog = await createLaunchpad({ ...common, catalogOnly: true });
   const activeReviews = new Set();
