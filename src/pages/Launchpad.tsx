@@ -2296,7 +2296,11 @@ export default function Launchpad({ notify }: PageProps) {
           </button>
         </div>
         <h2 id="launchpad-removal-title">
-          {removalPlan?.blocked ? "Mod removal blocked" : "Remove mod"}
+          {removalPlan?.blocked
+            ? removalPlan.dependents.length
+              ? "Mod removal blocked"
+              : "Dependency check incomplete"
+            : "Remove mod"}
         </h2>
         <p className="management-dialog-description">
           <strong>
@@ -2331,14 +2335,31 @@ export default function Launchpad({ notify }: PageProps) {
                 </ul>
               </div>
             )}
-            {removalPlan.warnings.map((warning, index) => (
-              <p
-                className="launchpad-review-warning"
-                key={`${index}:${warning}`}
-              >
-                {warning}
-              </p>
-            ))}
+            {removalPlan.warnings.length > 0 && (
+              <div className="launchpad-inline-notice">
+                <AlertCircle size={18} />
+                <div>
+                  <strong>Some dependencies could not be checked</strong>
+                  <p>
+                    Dependency information could not be read from{" "}
+                    {removalPlan.warnings.length} installed{" "}
+                    {removalPlan.warnings.length === 1 ? "file" : "files"}.
+                    Their requirements are still unknown.
+                  </p>
+                  <details className="launchpad-update-issues">
+                    <summary>View affected files</summary>
+                    <ul
+                      aria-label="Files with unreadable dependencies"
+                      tabIndex={0}
+                    >
+                      {removalPlan.warnings.map((warning, index) => (
+                        <li key={`${index}:${warning}`}>{warning}</li>
+                      ))}
+                    </ul>
+                  </details>
+                </div>
+              </div>
+            )}
             {!removalPlan.blocked && (
               <p className="management-dialog-description">
                 This file will move to Recycle Bin, where you can restore it.
@@ -2382,14 +2403,14 @@ export default function Launchpad({ notify }: PageProps) {
               )}
               {busy === "remove" ? "Removing…" : "Remove mod"}
             </button>
-          ) : removalError && removal ? (
+          ) : (removalError || removalPlan?.warnings.length) && removal ? (
             <button
               type="button"
               className="btn"
               disabled={Boolean(busy) || !canInstall}
               onClick={() => void reviewRemoval(removal)}
             >
-              Review removal again
+              {removalError ? "Review removal again" : "Retry dependency check"}
             </button>
           ) : null}
         </div>

@@ -8,10 +8,11 @@ import { launchpadError } from "./launchpad-network.mjs";
 
 const limits = {
   metadata: 512 * 1024,
-  nested: 16 * 1024 ** 2,
-  total: 128 * 1024 ** 2,
+  nested: 128 * 1024 ** 2,
+  total: 512 * 1024 ** 2,
   jars: 64,
-  entries: 10000,
+  entries: 250000,
+  directoryBytes: 64 * 1024 ** 2,
   depth: 3,
 };
 const metadataNames = [
@@ -89,48 +90,71 @@ function nextEntry(zip, signal) {
 }
 
 async function indexEntries(zip, budget, signal) {
-  const entries = new Map(),
-    seen = new Map(),
-    parents = new Set();
+  const entries = new Map();
+  if (
+    !Number.isSafeInteger(zip.entryCount) ||
+    zip.entryCount < 0 ||
+    zip.entryCount > limits.entries - budget.entries
+  )
+    throw invalid("Bundled dependency inspection exceeds 250,000 ZIP entries.");
   for (;;) {
     signal?.throwIfAborted();
     const entry = await nextEntry(zip, signal);
     if (!entry) return entries;
     if (++budget.entries > limits.entries)
       throw invalid(
-        "Bundled dependency inspection exceeds 10,000 ZIP entries.",
+        "Bundled dependency inspection exceeds 250,000 ZIP entries.",
       );
-    const name = safeInstallPath(entry.fileName.replace(/\/$/, ""));
-    const key = name.toLowerCase();
-    const kind = (entry.externalFileAttributes >>> 16) & 0xf000;
-    if (kind && kind !== 0x8000 && kind !== 0x4000)
+    budget.directoryBytes +=
+      46 +
+      entry.fileNameLength +
+      entry.extraFieldLength +
+      entry.fileCommentLength;
+    if (budget.directoryBytes > limits.directoryBytes)
       throw invalid(
-        "Bundled dependency archives cannot contain links or special files.",
+        "Bundled dependency inspection exceeds 64 MB of ZIP directory data.",
       );
-    if (entry.generalPurposeBitFlag & 1)
-      throw invalid(
-        "Encrypted bundled dependency archives cannot be inspected.",
-      );
-    const directory =
-      entry.fileName.endsWith("/") ||
-      kind === 0x4000 ||
-      Boolean(entry.externalFileAttributes & 0x10);
-    if (seen.has(key) || (!directory && parents.has(key)))
-      throw invalid(
-        "Bundled dependency archives contain duplicate or conflicting paths.",
-      );
-    const parts = key.split("/");
-    for (let count = 1; count < parts.length; count++) {
-      const parent = parts.slice(0, count).join("/");
-      if (seen.get(parent) === false)
-        throw invalid(
-          "Bundled dependency archives contain conflicting file paths.",
-        );
-      parents.add(parent);
-    }
-    seen.set(key, directory);
-    entries.set(name, { entry, directory });
+    // A JAR is a case-sensitive resource namespace, not a Windows directory to
+    // extract. Fat JARs can have repeated licenses, case-distinct resources,
+    // native symlink entries, and a resource beside its similarly named package.
+    // Keep only possible metadata/JAR entries; check ambiguity and file type if
+    // that exact resource is actually consumed below. Nothing is extracted.
+    const name = entry.fileName.replace(/\/$/, "");
+    if (!metadataNames.includes(name) && !/\.jar$/i.test(name)) continue;
+    if (entries.has(name)) entries.get(name).ambiguous = true;
+    else entries.set(name, { entry });
   }
+}
+
+function regularEntry(found, name) {
+  if (!found)
+    throw invalid(
+      `The declared bundled dependency ${name} is missing or is not a regular file.`,
+    );
+  if (found.ambiguous)
+    throw invalid(
+      `Bundled dependency resource ${name} has duplicate or conflicting entries.`,
+    );
+  const { entry } = found;
+  // The upper attributes describe Unix mode only when the ZIP's creator is
+  // Unix. Applying them to DOS/Windows archives misclassifies regular resources.
+  const unix = entry.versionMadeBy >>> 8 === 3;
+  const kind = unix ? (entry.externalFileAttributes >>> 16) & 0xf000 : 0;
+  if (kind && kind !== 0x8000 && kind !== 0x4000)
+    throw invalid(
+      `Bundled dependency resource ${name} cannot be a link or special file.`,
+    );
+  if (
+    entry.fileName.endsWith("/") ||
+    kind === 0x4000 ||
+    (!unix && Boolean(entry.externalFileAttributes & 0x10))
+  )
+    throw invalid(`Bundled dependency resource ${name} is not a regular file.`);
+  if (entry.generalPurposeBitFlag & 1)
+    throw invalid(
+      `Encrypted bundled dependency resource ${name} cannot be inspected.`,
+    );
+  return entry;
 }
 
 async function readEntry(zip, entry, maximum, budget, signal) {
@@ -144,7 +168,7 @@ async function readEntry(zip, entry, maximum, budget, signal) {
       `Bundled dependency entry ${entry.fileName} exceeds its ${maximum / 1024} KB inspection limit.`,
     );
   if ((budget.bytes += entry.uncompressedSize) > limits.total)
-    throw invalid("Bundled dependency inspection exceeds 128 MB in total.");
+    throw invalid("Bundled dependency inspection exceeds 512 MB in total.");
   const stream = await new Promise((resolve, reject) => {
     let settled = false;
     const aborted = () => {
@@ -409,10 +433,12 @@ function permitsServer(metadata, loader) {
  * The selected loader is required and controls declarations at every depth.
  * Limits apply across the whole traversal. fingerprint, if supplied, is a
  * synchronous callback for a provider's uint32 fingerprint algorithm.
+ * metadataOnly visits the same verified declarations but omits descriptor/hash
+ * work when the caller only needs provided and required mod IDs.
  */
 export async function inspectBundledDependencies(
   archive,
-  { signal, fingerprint, loader, visitMetadata } = {},
+  { signal, fingerprint, loader, visitMetadata, metadataOnly = false } = {},
 ) {
   signal?.throwIfAborted();
   if (!["neoforge", "forge", "fabric", "quilt"].includes(loader))
@@ -420,9 +446,9 @@ export async function inspectBundledDependencies(
       "Choose a supported mod loader before inspecting bundled dependencies.",
     );
   if (Buffer.isBuffer(archive)) {
-    if (archive.length > 64 * 1024 ** 2)
+    if (archive.length > limits.nested)
       throw invalid(
-        "Bundled dependency inspection exceeds its 64 MB JAR limit.",
+        "Bundled dependency inspection exceeds its 128 MB JAR limit.",
       );
   } else {
     const info = await fs.lstat(archive);
@@ -431,7 +457,7 @@ export async function inspectBundledDependencies(
         "Bundled dependency inspection requires a regular staged JAR file.",
       );
   }
-  const budget = { entries: 0, bytes: 0, jars: 0 };
+  const budget = { entries: 0, directoryBytes: 0, bytes: 0, jars: 0 };
   const result = [];
   const inspect = async (
     source,
@@ -452,14 +478,16 @@ export async function inspectBundledDependencies(
       for (const name of metadataNames) {
         const found = entries.get(name);
         if (!found) continue;
-        if (found.directory)
-          throw invalid(
-            `Bundled dependency metadata ${name} is not a regular file.`,
-          );
         raw.set(
           name,
           (
-            await readEntry(zip, found.entry, limits.metadata, budget, signal)
+            await readEntry(
+              zip,
+              regularEntry(found, name),
+              limits.metadata,
+              budget,
+              signal,
+            )
           ).toString("utf8"),
         );
       }
@@ -473,7 +501,7 @@ export async function inspectBundledDependencies(
       const serverCompatible =
         parentPermitsServer && permitsServer(metadata, loader);
       visitMetadata?.(metadata, { depth, path: parentPath, serverCompatible });
-      if (depth) {
+      if (depth && !metadataOnly) {
         const descriptor = {
           ...describe(metadata, fallback, parentPath, loader),
           path: parentPath,
@@ -498,13 +526,9 @@ export async function inspectBundledDependencies(
             "The archive contains more than 64 bundled dependencies.",
           );
         const found = entries.get(name);
-        if (!found || found.directory)
-          throw invalid(
-            `The declared bundled dependency ${name} is missing or is not a regular file.`,
-          );
         const buffer = await readEntry(
           zip,
-          found.entry,
+          regularEntry(found, name),
           limits.nested,
           budget,
           signal,

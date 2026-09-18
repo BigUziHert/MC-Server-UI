@@ -20,6 +20,16 @@ const identifier = (value) => {
   if (!/^[a-z][a-z0-9_-]{1,63}$/.test(id)) invalid();
   return id;
 };
+const libraryWrapper = (metadata) => {
+  const manifest = metadata.raw.get("META-INF/MANIFEST.MF");
+  if (typeof manifest !== "string") return false;
+  // Java manifest attribute names are case-insensitive and lines may continue.
+  // Only main attributes describe the JAR, not per-entry sections below them.
+  const main = manifest.replace(/\r\n?/g, "\n").split("\n\n", 1)[0];
+  const types = [...main.replace(/\n /g, "").matchAll(/^FMLModType: (.*)$/gim)];
+  if (types.length > 1) invalid();
+  return ["LIBRARY", "GAMELIBRARY"].includes(types[0]?.[1]);
+};
 
 /** Read required mod IDs from the installed loader's authoritative metadata.
  * This checks removal, not version-range satisfaction. Alternate/conditional
@@ -29,14 +39,22 @@ export async function inspectInstalledMod(archive, { loader, signal } = {}) {
   const provided = new Set(),
     required = new Set();
   let title,
-    recognized = false;
+    recognized = false,
+    wrapped = false;
   await inspectBundledDependencies(archive, {
     loader,
     signal,
+    metadataOnly: true,
     visitMetadata(metadata, { depth, serverCompatible }) {
+      if (!depth && ["forge", "neoforge"].includes(loader))
+        wrapped = libraryWrapper(metadata);
       const add = (set, value) => set.add(identifier(value));
       const named = (value) => {
-        if (!depth && typeof value === "string" && value.trim())
+        if (
+          (!depth || (wrapped && !title)) &&
+          typeof value === "string" &&
+          value.trim()
+        )
           title = value.trim().slice(0, 256);
       };
       if (loader === "quilt" && metadata.quilt) {
@@ -100,6 +118,13 @@ export async function inspectInstalledMod(archive, { loader, signal } = {}) {
           add(provided, value.modId);
           named(value.displayName ?? value.modId);
         }
+        // Language support is required even when authors omit a matching entry
+        // in dependencies. The standard Java/low-code loaders ship with FML.
+        if (
+          mod.modLoader !== undefined &&
+          !["javafml", "lowcodefml"].includes(mod.modLoader)
+        )
+          add(required, mod.modLoader);
         if (mod.dependencies !== undefined && !object(mod.dependencies))
           invalid();
         for (const dependencies of Object.values(mod.dependencies ?? {})) {
@@ -112,16 +137,20 @@ export async function inspectInstalledMod(archive, { loader, signal } = {}) {
               invalid();
             if (value.side === "CLIENT") continue;
             if (loader === "neoforge" && value.type !== undefined) {
+              // NeoForge's ModInfo accepts dependency types in any case.
+              // Unknown values still fail, rather than hiding real requirements.
+              if (typeof value.type !== "string") invalid();
+              const type = value.type.toLowerCase();
               if (
                 ![
                   "required",
                   "optional",
                   "incompatible",
                   "discouraged",
-                ].includes(value.type)
+                ].includes(type)
               )
                 invalid();
-              if (value.type !== "required") continue;
+              if (type !== "required") continue;
             } else if (value.mandatory !== undefined) {
               if (typeof value.mandatory !== "boolean") invalid();
               if (!value.mandatory) continue;
@@ -132,6 +161,9 @@ export async function inspectInstalledMod(archive, { loader, signal } = {}) {
       }
     },
   });
-  if (!recognized) invalid();
+  // A loader library can be a container for declared JarJar mods (for example,
+  // language support packages). Only actual nested mod metadata identifies it;
+  // a manifest label or arbitrary embedded files alone cannot justify removal.
+  if (!recognized && !(wrapped && provided.size)) invalid();
   return { title, provided: [...provided], required: [...required] };
 }

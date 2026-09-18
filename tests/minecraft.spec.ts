@@ -3945,7 +3945,12 @@ for (const blockedBy of ["none", "dependent", "unreadable"]) {
     expect(removals).toHaveLength(0);
     if (blockedBy !== "none") {
       await expect(
-        dialog.getByRole("heading", { name: "Mod removal blocked" }),
+        dialog.getByRole("heading", {
+          name:
+            blockedBy === "dependent"
+              ? "Mod removal blocked"
+              : "Dependency check incomplete",
+        }),
       ).toBeVisible();
       await expect(
         dialog.getByRole("button", { name: "Remove mod", exact: true }),
@@ -3955,10 +3960,35 @@ for (const blockedBy of ["none", "dependent", "unreadable"]) {
           dialog.getByRole("list", { name: "Mods requiring this mod" }),
         ).toContainText("Dependent Add-on");
         await expect(dialog).toContainText("Remove these dependent mods first");
-      } else
+      } else {
         await expect(dialog).toContainText(
+          "Their requirements are still unknown.",
+        );
+        const issues = dialog.getByRole("list", {
+          name: "Files with unreadable dependencies",
+        });
+        await expect(issues).not.toBeVisible();
+        await dialog.getByText("View affected files", { exact: true }).click();
+        await expect(issues).toBeVisible();
+        await expect(issues).toContainText(
           "mods/unknown.jar could not be checked",
         );
+        await page.setViewportSize({ width: 390, height: 844 });
+        await page.screenshot({
+          path: testInfo.outputPath("removal-incomplete-check-mobile.png"),
+          animations: "disabled",
+        });
+        await dialog
+          .getByRole("button", { name: "Retry dependency check", exact: true })
+          .click();
+        await expect.poll(() => reviews).toBe(2);
+        await expect(
+          dialog.getByRole("heading", { name: "Dependency check incomplete" }),
+        ).toBeVisible();
+        await expect(
+          dialog.getByRole("button", { name: "Remove mod", exact: true }),
+        ).toHaveCount(0);
+      }
       await dialog.getByRole("button", { name: "Close", exact: true }).click();
       expect(removals).toHaveLength(0);
       return;

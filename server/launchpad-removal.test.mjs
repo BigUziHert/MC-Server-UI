@@ -329,6 +329,69 @@ test("removing a consumer retains its shared dependencies, other mods and config
   assert.equal((await f.bin.list()).length, 1);
 });
 
+for (const requiresSelected of [false, true]) {
+  test(`removal inspects large library wrappers and mixed-case metadata while ${requiresSelected ? "protecting a required mod" : "allowing an unrelated mod to be removed"}`, async (t) => {
+    const metadata = [
+      'modLoader="javafml"',
+      'loaderVersion="[1,)"',
+      "[[mods]]",
+      'modId="bundled_consumer"',
+      'version="1.0"',
+      'displayName="Bundled Consumer"',
+      "[[dependencies.bundled_consumer]]",
+      `modId="${requiresSelected ? "selected" : "minecraft"}"`,
+      'type="REQUIRED"',
+      'side="BOTH"',
+    ].join("\n");
+    const child = zip([
+      ["META-INF/neoforge.mods.toml", metadata],
+      ["assets/large-resource.bin", Buffer.alloc(17 * 1024 ** 2, 7)],
+    ]);
+    const wrapper = zip([
+      [
+        "META-INF/MANIFEST.MF",
+        "Manifest-Version: 1.0\r\nFMLModType: LIBRARY\r\n\r\n",
+      ],
+      [
+        "META-INF/jarjar/metadata.json",
+        JSON.stringify({ jars: [{ path: "META-INF/jarjar/consumer.jar" }] }),
+      ],
+      ["META-INF/jarjar/consumer.jar", child],
+      ["assets/example/Texture.png", "upper-case resource"],
+      ["assets/example/texture.png", "lower-case resource"],
+      ...Array.from({ length: 10010 }, (_, index) => [
+        `assets/example/${index}.json`,
+        "{}",
+      ]),
+    ]);
+    const selected = mod("neoforge", "selected");
+    const f = await fixture(t, {
+      files: { "selected.jar": selected, "large-wrapper.jar": wrapper },
+    });
+    const plan = await f.service.removalPreview({ path: "mods/selected.jar" });
+    assert.deepEqual(plan.warnings, []);
+    assert.equal(plan.blocked, requiresSelected);
+    assert.deepEqual(
+      plan.dependents.map((value) => value.path),
+      requiresSelected ? ["mods/large-wrapper.jar"] : [],
+    );
+    if (requiresSelected) {
+      assert.equal(plan.planId, undefined);
+      assert.deepEqual(await f.read("mods/selected.jar"), selected);
+      assert.deepEqual(await f.bin.list(), []);
+    } else {
+      await f.service.remove({ planId: plan.planId, confirmed: true });
+      await assert.rejects(f.read("mods/selected.jar"), { code: "ENOENT" });
+      assert.deepEqual(
+        (await f.bin.list()).map((entry) => entry.originalPath),
+        ["mods/selected.jar"],
+      );
+    }
+    assert.deepEqual(await f.read("mods/large-wrapper.jar"), wrapper);
+    assert.deepEqual(f.state.network, []);
+  });
+}
+
 test("bundled mod IDs and dependencies protect their containing JARs", async (t) => {
   const container = (id, nested) =>
     zip([

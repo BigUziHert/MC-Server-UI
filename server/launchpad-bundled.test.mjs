@@ -27,17 +27,17 @@ function zip(entries) {
     local.writeUInt16LE(method, 8);
     local.writeUInt32LE(checksum, 14);
     local.writeUInt32LE(encoded.length, 18);
-    local.writeUInt32LE(data.length, 22);
+    local.writeUInt32LE(options.uncompressedSize ?? data.length, 22);
     local.writeUInt16LE(name.length, 26);
     const row = Buffer.alloc(46);
     row.writeUInt32LE(0x02014b50);
-    row.writeUInt16LE(0x314, 4);
+    row.writeUInt16LE(options.versionMadeBy ?? 0x314, 4);
     row.writeUInt16LE(20, 6);
     row.writeUInt16LE(flags, 8);
     row.writeUInt16LE(method, 10);
     row.writeUInt32LE(checksum, 16);
     row.writeUInt32LE(encoded.length, 20);
-    row.writeUInt32LE(data.length, 24);
+    row.writeUInt32LE(options.uncompressedSize ?? data.length, 24);
     row.writeUInt16LE(name.length, 28);
     row.writeUInt32LE(((options.mode ?? 0o100644) << 16) >>> 0, 38);
     row.writeUInt32LE(offset, 42);
@@ -377,33 +377,163 @@ test("client-only Fabric and Quilt bundles remain visible but cannot satisfy a s
   }
 });
 
-test("inspection rejects unsafe, duplicate, conflicting, encrypted and nonregular ZIP entries even outside declared files", async (t) => {
+test("inspection still rejects ZIP traversal names without extracting any resource", async (t) => {
   const f = await fixture(t);
   const cases = [
     [["../escape", "x"]],
     [["/absolute", "x"]],
     [["back\\slash", "x"]],
-    [
-      ["same", "a"],
-      ["SAME", "b"],
-    ],
-    [
-      ["file", "a"],
-      ["file/child", "b"],
-    ],
-    [
-      ["file/child", "b"],
-      ["file", "a"],
-    ],
-    [["link", "target", { mode: 0o120777 }]],
-    [["device", "", { mode: 0o020600 }]],
-    [["secret", "x", { encrypted: true }]],
   ];
   for (const entries of cases)
     await assert.rejects(
       f.inspect(zip(entries)),
       /unsafe|invalid|absolute|duplicate|conflicting|links|special|[Ee]ncrypted/,
     );
+});
+
+test("case-sensitive resource names, fat-JAR collisions and unrelated platform attributes do not affect metadata inspection", async (t) => {
+  const f = await fixture(t);
+  let visited;
+  const archive = zip([
+    [
+      "fabric.mod.json",
+      json({
+        schemaVersion: 1,
+        id: "parent_mod",
+        version: "1",
+        depends: { needed_mod: "*" },
+      }),
+    ],
+    ["assets/test/Texture.png", "first"],
+    ["assets/test/texture.png", "second"],
+    ["META-INF/LICENSE", "license one"],
+    ["META-INF/LICENSE", "license two"],
+    ["resource", "data"],
+    ["resource/child", "other data"],
+    ["native-link", "native-library", { mode: 0o120777 }],
+    ["special-resource", "", { mode: 0o020600 }],
+    ["secret-resource", "ignored encrypted data", { encrypted: true }],
+    ["assets/CON", "a legal Java resource name"],
+    ["unused-corrupt-resource", "data", { crc: 0 }],
+  ]);
+  assert.deepEqual(
+    await f.inspect(archive, {
+      metadataOnly: true,
+      visitMetadata(value) {
+        visited = value;
+      },
+    }),
+    [],
+  );
+  assert.deepEqual(visited.fabric.depends, { needed_mod: "*" });
+  assert.deepEqual(await fs.readdir(f.root), ["verified-review.jar"]);
+  assert.deepEqual(await fs.readFile(f.archive), archive);
+});
+
+test("only consumed metadata and declared JARs must be unambiguous, regular, unencrypted resources", async (t) => {
+  const f = await fixture(t),
+    metadata = json({ schemaVersion: 1, id: "parent_mod", version: "1" });
+  for (const options of [
+    { mode: 0o120777 },
+    { mode: 0o020600 },
+    { encrypted: true },
+  ]) {
+    await assert.rejects(
+      f.inspect(zip([["fabric.mod.json", metadata, options]])),
+      /link|special|[Ee]ncrypted/,
+    );
+    await assert.rejects(
+      f.inspect(fabricParent([["lib.jar", nested(), options]])),
+      /link|special|[Ee]ncrypted/,
+    );
+  }
+  await assert.rejects(
+    f.inspect(
+      zip([
+        ["fabric.mod.json", metadata],
+        ["fabric.mod.json", metadata],
+      ]),
+    ),
+    /duplicate/,
+  );
+  await assert.rejects(
+    f.inspect(
+      fabricParent([
+        ["lib.jar", nested()],
+        ["lib.jar", nested()],
+      ]),
+    ),
+    /duplicate/,
+  );
+  const seen = [];
+  await f.inspect(
+    zip([["fabric.mod.json", metadata, { versionMadeBy: 20, mode: 0o120777 }]]),
+    {
+      metadataOnly: true,
+      visitMetadata(value) {
+        seen.push(value.fabric.id);
+      },
+    },
+  );
+  assert.deepEqual(seen, ["parent_mod"]);
+  assert.equal(
+    (
+      await f.inspect(
+        fabricParent([
+          ["lib.jar", nested()],
+          ["LIB.jar", nested("Other Library")],
+        ]),
+      )
+    ).length,
+    2,
+  );
+});
+
+test("large legitimate resource archives and embedded JARs are inspected without reading unused payloads", async (t) => {
+  const f = await fixture(t);
+  const metadata = json({
+    schemaVersion: 1,
+    id: "large_mod",
+    version: "1",
+    depends: { shared_library: "*" },
+  });
+  const archive = zip([
+    ["fabric.mod.json", metadata],
+    ...Array.from({ length: 12000 }, (_, index) => [
+      `classes/Test${index}.class`,
+      "",
+    ]),
+  ]);
+  const visited = [];
+  await f.inspect(archive, {
+    metadataOnly: true,
+    visitMetadata(value) {
+      visited.push(value.fabric?.id);
+    },
+  });
+  assert.deepEqual(visited, ["large_mod"]);
+  const child = zip([
+    ["fabric.mod.json", metadata],
+    ["padding.bin", Buffer.alloc(17 * 1024 ** 2)],
+  ]);
+  assert.ok(child.length > 16 * 1024 ** 2);
+  visited.length = 0;
+  const result = await f.inspect(
+    fabricParent([["large.jar", child, { compress: true }]]),
+    {
+      metadataOnly: true,
+      fingerprint() {
+        assert.fail(
+          "Removal metadata inspection does not need provider fingerprints",
+        );
+      },
+      visitMetadata(value, context) {
+        visited.push([context.depth, value.fabric.id, value.fabric.depends]);
+      },
+    },
+  );
+  assert.deepEqual(result, []);
+  assert.deepEqual(visited.at(-1), [1, "large_mod", { shared_library: "*" }]);
 });
 
 test("declarations must identify existing regular JAR entries and valid bounded loader metadata", async (t) => {
@@ -455,7 +585,11 @@ test("metadata, nested file, traversal depth, archive count and central director
   await assert.rejects(
     f.inspect(
       fabricParent([
-        ["large.jar", Buffer.alloc(16 * 1024 ** 2 + 1), { compress: true }],
+        [
+          "large.jar",
+          zip([]),
+          { compress: true, uncompressedSize: 128 * 1024 ** 2 + 1 },
+        ],
       ]),
     ),
     /inspection limit/,
@@ -472,11 +606,20 @@ test("metadata, nested file, traversal depth, archive count and central director
   for (let index = 0; index < 4; index++)
     chain = fabricParent([["next.jar", chain]]);
   await assert.rejects(f.inspect(chain), /three nested/);
+  const entries = zip(
+    Array.from({ length: 60000 }, (_, index) => [`entry-${index}`, ""]),
+  );
   await assert.rejects(
     f.inspect(
-      zip(Array.from({ length: 10001 }, (_, index) => [`entry-${index}`, ""])),
+      fabricParent(
+        Array.from({ length: 5 }, (_, index) => [
+          `${index}.jar`,
+          entries,
+          { compress: true },
+        ]),
+      ),
     ),
-    /10,000 ZIP entries/,
+    /250,000 ZIP entries/,
   );
 });
 
@@ -486,14 +629,15 @@ test("the total inflated read budget applies across distinct nested archives", a
   await assert.rejects(
     f.inspect(
       fabricParent(
-        Array.from({ length: 9 }, (_, index) => [
+        Array.from({ length: 35 }, (_, index) => [
           `${index}.jar`,
           child,
           { compress: true },
         ]),
       ),
+      { metadataOnly: true },
     ),
-    /128 MB/,
+    /512 MB/,
   );
 });
 
