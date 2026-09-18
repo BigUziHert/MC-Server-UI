@@ -282,7 +282,7 @@ const queryString = (values: Record<string, string | number | undefined>) => {
     if (value !== undefined && value !== "") params.set(key, String(value));
   return params.toString();
 };
-function ProjectIcon({ url }: { url?: string | null }) {
+export function ProjectIcon({ url }: { url?: string | null }) {
   const [failed, setFailed] = useState<string | null>(null);
   const safe = url && /^https:\/\//i.test(url) ? url : null;
   return (

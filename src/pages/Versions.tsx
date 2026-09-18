@@ -68,7 +68,7 @@ const softwareIcons: Record<string, string> = {
   folia: "folia.png",
 };
 
-function SoftwareIcon({ software }: { software: string }) {
+export function SoftwareIcon({ software }: { software: string }) {
   const id = software.trim().toLowerCase();
   const source = Object.hasOwn(softwareIcons, id) ? softwareIcons[id] : null;
   const [failed, setFailed] = useState<string | null>(null);

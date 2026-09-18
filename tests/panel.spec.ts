@@ -726,12 +726,13 @@ async function chooseNewServer(page: Page) {
   await choice
     .getByRole("button", { name: "Create a new server", exact: true })
     .click();
-  const dialog = page.getByRole("dialog", {
-    name: "Create a new server",
-    exact: true,
-  });
+  const dialog = page.getByRole("dialog");
   await expect(dialog).toBeVisible();
-  return dialog;
+  await dialog.getByText("Advanced setup", { exact: true }).click();
+  await dialog
+    .getByRole("button", { name: "Create an empty server", exact: true })
+    .click();
+  return page.getByRole("dialog");
 }
 
 test("server creation, editable names, and the selected workspace persist across reloads", async ({
@@ -1596,7 +1597,7 @@ test("populated Minecraft head lists fit mobile Console and Players layouts", as
   }
 });
 
-test("an empty fleet shows clean onboarding and the first server defaults to Minecraft Java", async ({
+test("an empty fleet supports advanced empty-server creation with Minecraft Java defaults", async ({
   page,
 }, testInfo) => {
   let firstServer: TestServer | undefined;
@@ -1632,7 +1633,7 @@ test("an empty fleet shows clean onboarding and the first server defaults to Min
   await page.goto("/");
   const welcome = page.getByRole("heading", {
     level: 1,
-    name: "Your next world starts here",
+    name: "Welcome to MC Panel",
     exact: true,
   });
   await expect(welcome).toBeVisible();
@@ -1673,9 +1674,13 @@ test("an empty fleet shows clean onboarding and the first server defaults to Min
     fullPage: true,
   });
   await page
-    .getByRole("button", { name: "Add your first server", exact: true })
+    .getByRole("button", { name: "Create a new server", exact: true })
     .click();
-  const dialog = await chooseNewServer(page);
+  const dialog = page.getByRole("dialog");
+  await dialog.getByText("Advanced setup", { exact: true }).click();
+  await dialog
+    .getByRole("button", { name: "Create an empty server", exact: true })
+    .click();
   await expect(dialog.getByLabel("Mode", { exact: true })).toHaveValue("live");
   await expect(
     dialog.getByLabel("Server JAR", { exact: true }),
@@ -1816,7 +1821,7 @@ test("removing the last listed demo returns to onboarding and preserves its file
   await expect(dialog).not.toBeVisible();
   const welcome = page.getByRole("heading", {
     level: 1,
-    name: "Your next world starts here",
+    name: "Welcome to MC Panel",
     exact: true,
   });
   await expect(welcome).toBeVisible();
@@ -1834,7 +1839,7 @@ test("removing the last listed demo returns to onboarding and preserves its file
   await page.reload();
   await expect(welcome).toBeVisible();
   await expect(
-    page.getByRole("button", { name: "Add your first server", exact: true }),
+    page.getByRole("button", { name: "Create a new server", exact: true }),
   ).toBeVisible();
 });
 

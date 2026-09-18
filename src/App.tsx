@@ -61,6 +61,7 @@ import ServerManager, {
   ServerSwitcher,
   type ServerRecord,
 } from "./ServerManager";
+import "./welcome.css";
 
 type Page =
   | "console"
@@ -259,6 +260,8 @@ export default function App() {
   const [loading, setLoading] = useState(true);
   const [manager, setManager] = useState<{
     editing: ServerRecord | null;
+    initialStep?: "choice" | "create" | "import";
+    firstServer?: boolean;
   } | null>(null);
   const [notice, setNotice] = useState("");
   const fleetRequest = useRef(0);
@@ -358,10 +361,14 @@ export default function App() {
     return () => clearTimeout(timer);
   }, [notice]);
   const active = servers.find((server) => server.id === activeId);
+  // Registration can finish before installation. Keep the first setup in its
+  // welcome screen until the wizard hands the completed server back to us.
+  const firstServerSetup = manager?.firstServer === true;
   useEffect(() => {
-    if (!active)
+    if (firstServerSetup) document.title = "Set up your server · MC Panel";
+    else if (!active)
       document.title = `${loading ? "Opening" : error ? "Connection error" : "Welcome"} · MC Panel`;
-  }, [active, error, loading]);
+  }, [active, error, firstServerSetup, loading]);
   const saved = (server: ServerRecord) => {
     fleetRequest.current++;
     setLoading(false);
@@ -401,14 +408,14 @@ export default function App() {
   };
   return (
     <>
-      {active ? (
+      {active && !firstServerSetup ? (
         <ServerScope.Provider value={active.id}>
           <ServerWorkspace
             key={active.id}
             servers={servers}
             selected={active}
             onSelect={setActiveId}
-            onAdd={() => setManager({ editing: null })}
+            onAdd={() => setManager({ editing: null, initialStep: "choice" })}
             onSettings={(status) =>
               setManager({
                 editing: { ...active, status: status ?? active.status },
@@ -416,7 +423,7 @@ export default function App() {
             }
           />
         </ServerScope.Provider>
-      ) : loading || error ? (
+      ) : !firstServerSetup && (loading || error) ? (
         <div
           className="server-workspace-loading"
           role={error ? "alert" : "status"}
@@ -436,11 +443,16 @@ export default function App() {
           )}
         </div>
       ) : (
-        <EmptyFleet onAdd={() => setManager({ editing: null })} />
+        <EmptyFleet
+          onAdd={(initialStep) =>
+            setManager({ editing: null, initialStep, firstServer: true })
+          }
+        />
       )}
       {manager && (
         <ServerManager
           editing={manager.editing}
+          initialStep={manager.initialStep}
           servers={servers}
           onClose={() => setManager(null)}
           onSaved={saved}
@@ -449,7 +461,7 @@ export default function App() {
       )}
       {notice && (
         <div
-          className={`toast ${!active ? "fleet-empty-toast" : ""}`}
+          className={`toast ${!active || firstServerSetup ? "fleet-empty-toast" : ""}`}
           role="status"
         >
           <CheckCheck size={18} />
@@ -466,9 +478,9 @@ export default function App() {
   );
 }
 
-function EmptyFleet({ onAdd }: { onAdd: () => void }) {
+function EmptyFleet({ onAdd }: { onAdd: (step: "create" | "import") => void }) {
   return (
-    <div className="fleet-welcome-shell">
+    <div className="fleet-welcome-shell fleet-welcome-simple">
       <header className="fleet-welcome-header">
         <div className="brand" aria-label="MC Panel">
           <span className="brand-icon">
@@ -476,7 +488,6 @@ function EmptyFleet({ onAdd }: { onAdd: () => void }) {
           </span>
           <span>
             MC<span className="brand-light">PANEL</span>
-            <small>YOUR WORLD. YOUR RULES.</small>
           </span>
         </div>
         <div className="welcome-header-actions">
@@ -487,7 +498,7 @@ function EmptyFleet({ onAdd }: { onAdd: () => void }) {
             target="_blank"
             rel="noreferrer"
           >
-            <CircleHelp size={17} /> <span>Setup guide</span>{" "}
+            <CircleHelp size={17} /> <span>Help</span>{" "}
             <ExternalLink size={13} />
           </a>
         </div>
@@ -498,86 +509,52 @@ function EmptyFleet({ onAdd }: { onAdd: () => void }) {
           aria-labelledby="fleet-welcome-title"
         >
           <div className="fleet-welcome-copy">
-            <span className="fleet-welcome-eyebrow">WELCOME TO MC PANEL</span>
-            <h1 id="fleet-welcome-title">
-              Your next world
-              <br />
-              <span>starts here</span>
-            </h1>
-            <p>
-              Create a new Minecraft server or import one you already have. Your
-              console, files, players, and backups, together in one place.
-            </p>
-            <button className="btn primary fleet-welcome-add" onClick={onAdd}>
-              <Plus size={18} /> Add your first server <ArrowRight size={17} />
-            </button>
-            <span className="fleet-welcome-hint">
-              Just exploring? Demo mode is available when you add a server.
-            </span>
-          </div>
-          <div className="fleet-welcome-art" aria-hidden="true">
-            <div className="fleet-art-grid" />
-            <div className="fleet-art-ring" />
-            <span className="fleet-art-cube">
-              <Box size={102} strokeWidth={1.2} />
-            </span>
-            <span className="fleet-art-tool fleet-art-terminal">
-              <Terminal size={24} />
-            </span>
-            <span className="fleet-art-tool fleet-art-files">
-              <FolderOpen size={25} />
-            </span>
-            <span className="fleet-art-tool fleet-art-backup">
-              <Cloud size={25} />
-            </span>
-            <span className="fleet-art-dot fleet-art-dot-one" />
-            <span className="fleet-art-dot fleet-art-dot-two" />
+            <h1 id="fleet-welcome-title">Welcome to MC Panel</h1>
+            <p>Start a new Minecraft server, or bring one you already have.</p>
+            <div className="fleet-welcome-choices">
+              <button
+                className="fleet-welcome-choice"
+                aria-label="Create a new server"
+                aria-describedby="welcome-create-description"
+                onClick={() => onAdd("create")}
+              >
+                <span className="fleet-welcome-choice-icon">
+                  <Plus size={23} />
+                </span>
+                <span>
+                  <strong>Create a new server</strong>
+                  <span id="welcome-create-description">
+                    Choose your software. We’ll guide the setup.
+                  </span>
+                </span>
+                <ArrowRight size={19} />
+              </button>
+              <button
+                className="fleet-welcome-choice"
+                aria-label="Import an existing server"
+                aria-describedby="welcome-import-description"
+                onClick={() => onAdd("import")}
+              >
+                <span className="fleet-welcome-choice-icon">
+                  <FolderOpen size={23} />
+                </span>
+                <span>
+                  <strong>Import an existing server</strong>
+                  <span id="welcome-import-description">
+                    Connect a server folder on your computer.
+                  </span>
+                </span>
+                <ArrowRight size={19} />
+              </button>
+            </div>
           </div>
         </section>
-        <section
-          className="fleet-welcome-steps"
-          aria-labelledby="fleet-steps-title"
-        >
-          <div className="fleet-steps-heading">
-            <h2 id="fleet-steps-title">From an idea to your own world</h2>
-            <span>THREE SIMPLE STEPS</span>
-          </div>
-          <ol>
-            <li>
-              <span className="fleet-step-number">01</span>
-              <Box size={21} />
-              <h3>Add your server</h3>
-              <p>Create a fresh server or select the folder you already use.</p>
-            </li>
-            <li>
-              <span className="fleet-step-number">02</span>
-              <FolderOpen size={21} />
-              <h3>Bring your world</h3>
-              <p>
-                Add your server software, or keep your existing world and mods
-                right where they are.
-              </p>
-            </li>
-            <li>
-              <span className="fleet-step-number">03</span>
-              <Play size={21} />
-              <h3>Make it yours</h3>
-              <p>
-                Start from Console, invite your players, and set a backup
-                schedule that fits.
-              </p>
-            </li>
-          </ol>
-        </section>
-        <footer className="fleet-welcome-footer">
-          <span>
-            <ShieldCheck size={15} /> Your servers. Your computer. Your control.
-          </span>
-          <span>
-            MC Panel <span className="footer-version">v{appVersion}</span>
-          </span>
-        </footer>
       </main>
+      <footer className="fleet-welcome-footer">
+        <span>
+          MC Panel <span className="footer-version">v{appVersion}</span>
+        </span>
+      </footer>
     </div>
   );
 }
@@ -928,10 +905,10 @@ function ServerWorkspace({
               <div>
                 <strong>Add a Minecraft server</strong>
                 <p>
-                  Choose Add server to create a workspace or import your
-                  existing server folder. Select its launch method: a JAR, Java
-                  arguments, script, or executable. Use Settings to rename a
-                  server and Players to manage in-game OP.
+                  Choose Add server for guided setup or to import an existing
+                  server folder. Setup installs your selected server software
+                  before opening its workspace. Use Settings to configure how it
+                  runs and Players to manage in-game OP.
                 </p>
               </div>
             </div>

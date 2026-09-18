@@ -173,7 +173,7 @@ async function launchPackaged({ expectEmpty = false } = {}) {
   await ui(
     page.getByRole("heading", {
       level: 1,
-      name: expectEmpty ? "Your next world starts here" : "Console",
+      name: expectEmpty ? "Welcome to MC Panel" : "Console",
       exact: true,
     }),
   ).toBeVisible();
@@ -312,27 +312,28 @@ async function createSmokeDemo(page) {
     "Verifying the clean welcome screen, then explicitly creating a demo for the smoke checks.",
   );
   await capturePackaged("packaged-first-launch.png");
-  await page
-    .getByRole("button", { name: "Add your first server", exact: true })
-    .click();
-  const choice = page.getByRole("dialog", {
-    name: "Add a server",
-    exact: true,
-  });
   await ui(
-    choice.getByRole("button", {
+    page.getByRole("button", {
       name: "Import an existing server",
       exact: true,
     }),
   ).toBeVisible();
-  await capturePackaged("packaged-add-choice.png");
-  await choice
+  await page
     .getByRole("button", { name: "Create a new server", exact: true })
     .click();
-  const dialog = page.getByRole("dialog", {
-    name: "Create a new server",
-    exact: true,
-  });
+  const dialog = page.getByRole("dialog");
+  await ui(
+    dialog.getByRole("button", { name: "Server software", exact: true }),
+  ).toBeVisible();
+  await ui(
+    dialog.getByRole("button", { name: "Modpack", exact: true }),
+  ).toBeVisible();
+  await capturePackaged("packaged-create-source.png");
+  assert.deepEqual((await browserApi(page, "/servers")).data.servers, []);
+  await dialog.getByText("Advanced setup", { exact: true }).click();
+  await dialog
+    .getByRole("button", { name: "Create an empty server", exact: true })
+    .click();
   await ui(dialog.getByLabel("Mode", { exact: true })).toHaveValue("live");
   await dialog.getByLabel("Mode", { exact: true }).selectOption("demo");
   await dialog

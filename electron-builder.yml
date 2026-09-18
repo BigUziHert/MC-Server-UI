@@ -8,6 +8,7 @@ files:
   - dist/**/*
   - server/index.mjs
   - server/import.mjs
+  - server/server-setup.mjs
   - server/launcher-stop.mjs
   - server/connection.mjs
   - server/server-icon.mjs

@@ -6,7 +6,7 @@ A local Minecraft server panel inspired by the navigation and console layout of 
 
 **MC Panel runs in its own Windows window and includes its Node.js runtime.** End users do not need to install Node.js, use a terminal, or start a separate web server. Running a real Minecraft server still requires the Java version expected by its server software. Configure the Java executable and startup settings, and accept the Minecraft EULA yourself. Install the desktop app on the computer that will run Minecraft; it cannot attach to a Java process on another PC.
 
-A fresh desktop workspace starts with no servers. **Add your first server** offers two paths: **Create a new server** or **Import an existing server**. New servers default to Minecraft Java. Demo mode remains optional.
+A fresh desktop workspace starts with **Welcome to MC Panel** and two choices: **Create a new server** or **Import an existing server**. No server is registered until you confirm its setup.
 
 The Windows x64 build produces two executables in `release/`:
 
@@ -30,6 +30,16 @@ Both the installed and portable editions save the server registry, panel setting
 This is separate from the repository's `data/` directory, so the desktop app does not automatically import an existing development workspace. The portable executable uses the same per-user data location; it does not keep worlds beside the executable. App upgrades and uninstalling the app preserve this data. Use **Open server data folder** to find it, and retain your own backups before moving or removing server files. Existing custom Minecraft directories remain in their configured locations. Desktop startup and shutdown errors are recorded one level above this folder in `%APPDATA%\MC Panel\desktop.log`.
 
 To remove a demo or live server from the panel, stop it, open its **Settings**, choose **Remove server**, review the name, and confirm removal. Removal stops its backup schedule and preserves its Minecraft files, worlds, backups, and Recycle Bin data on disk. Imported files remain in their original folder. Removing the last server returns to the welcome screen; it stays empty after restarting the app. You can import a preserved server folder again later.
+
+### Create a new server
+
+Choose **Create a new server**, then choose **Server software** or **Modpack**. Browse server software and choose a Minecraft version and build, or browse modpacks and select a release. Catalog browsing works before your first server exists.
+
+Give the server a name and choose its memory in GB. **Advanced settings** contains the port and Java executable. Setup checks Java compatibility before you review the selected software or modpack, memory, and installation details. Accept the Minecraft EULA explicitly, then choose **Create and install**. The panel creates a separate server folder and shows installation progress. **Open Console** selects the new server; Minecraft stays stopped until you choose **Start**.
+
+Cancelling before **Create and install** leaves no server or server files behind. If installation fails, **Retry installation** continues setup for the same server instead of creating another one. Modpacks with a supported runtime install that runtime as part of setup; unavailable files and unsupported combinations are reported for review.
+
+To supply your own files or try the simulated panel, expand **Advanced setup → Create an empty server**. That form retains manual startup settings and the optional **Demo server** mode. Empty live servers require your own software and EULA acceptance before starting.
 
 ### Import an existing server
 
@@ -122,7 +132,7 @@ The **Server**, **Minecraft**, and **Management** sidebar headings collapse and 
 
 ## Manage multiple servers
 
-Use the server selector to switch workspaces and add a server. Choose **demo** for simulated activity or **live** to run an actual Java server. Give each server a unique Minecraft port (1024–65535) and its own Java heap allocation. The panel creates a separate server directory for every new server. New live instances contain `eula=false` and a starter `server.properties`; upload your JAR in File Manager, configure Java, and accept the EULA yourself before starting.
+Use the server selector to switch workspaces and **Add server** to create or import another server. Guided creation browses software or modpacks, reviews name and memory, and installs only after confirmation. Give each server a unique Minecraft port (1024–65535) and its own Java heap allocation. The panel creates a separate server directory for every new server. **Advanced setup → Create an empty server** also supports simulated demo servers and manual live setup; empty live instances contain `eula=false` and a starter `server.properties` until you supply the software and accept the EULA yourself.
 
 The server's **display name** can change while it runs. Its **server list message (MOTD)** is a separate setting, shown in Minecraft's multiplayer server list. Stop a server before changing its MOTD, port, mode, Java executable, JAR, or memory allocation. The selected port is written to `server.properties` when settings change and checked again at launch. Renaming alone does not change the MOTD.
 
@@ -155,7 +165,7 @@ MC_SOFTWARE=Paper
 MC_VERSION=1.21.4
 ```
 
-The panel owns the Java process it launches. It cannot attach to an already running server. A normal panel shutdown sends `stop` and waits up to 15 seconds before terminating the process. Software and content downloads happen only after you select and confirm an installation in Versions or Launchpad. Your EULA choice is preserved. A custom `MC_SERVER_DIR` is never populated with demonstration files. Use the **Import an existing server** interface for NeoForge startup detection; the legacy environment example above configures a JAR server.
+The panel owns the Java process it launches. It cannot attach to an already running server. A normal panel shutdown sends `stop` and waits up to 15 seconds before terminating the process. Software and content are installed in your server only after you select and confirm an installation during guided creation, Versions, or Launchpad. Catalog browsing and modpack previews can download release metadata and modpack archives before confirmation to prepare the review. Your EULA choice is preserved. A custom `MC_SERVER_DIR` is never populated with demonstration files. Use the **Import an existing server** interface for NeoForge startup detection; the legacy environment example above configures a JAR server.
 
 Live stdout, commands, power state, uptime, disk usage, in-game operator commands, and online-player tracking work. The online-player list follows recognized vanilla/Paper join and leave messages from the Java process launched by the panel. UUID authentication announcements supply player UUIDs when available. Tracking starts with that process and clears on stop, exit, and restart; it does not read old logs or attach to a separate running server. Plugins or server versions that replace these standard log messages may prevent complete tracking. This is log tracking, not a server query, and no player latency is invented. Demo mode keeps the online-player list empty.
 
@@ -223,6 +233,8 @@ The Recycle Bin is a protected virtual folder in File Manager. It allows restori
 `PANEL_DATA_DIR` changes the panel's data directory. Keep it outside a custom server directory so backups never archive themselves. Use only one API process per data directory. There is no background service installer; scheduling runs within the API process.
 
 API clients can list/create servers at `/api/servers` and update one at `/api/servers/:id`. Creating a server defaults to live Java mode; simulations require `mode: "demo"`. `DELETE /api/servers/:id` removes an offline demo or live server from the registry without deleting its Minecraft files, backups, or Recycle Bin data. It returns 409 if the server is running or has an operation in progress. Select a server for existing APIs with the `X-Server-Id` header or the `serverId` query parameter for direct download links. Unknown IDs return 404; conflicting selectors return 400. Calls without either selector use the current default server. An empty fleet has `defaultServerId: null`, and server-specific API calls return 404 until a server is created.
+
+Guided creation reads `/api/server-setup`, `/api/server-setup/versions`, and `/api/server-setup/launchpad` without a selected server. `/api/server-setup/preflight` checks the proposed Java and memory settings; `/api/server-setup/modpack-preview` reviews an exact modpack release. Confirmed creation uses `POST /api/server-setup` with a persistent `requestId`, `confirmed: true`, explicit `acceptedEula`, and `configuration`; repeating that request returns the same registration. Installation and progress calls then use the created server's `X-Server-Id` so another selected server is unaffected.
 
 For imports, `GET /api/server-import` reports native browsing availability. `POST /api/server-import/browse` opens the desktop folder picker and returns a selected `directory` or `null` on cancellation. `POST /api/server-import/inspect` accepts `{ "directory": "absolute path" }` and returns detected settings without modifying source files. `POST /api/server-import` accepts `directory`, `name`, `jar`, `javaPath`, `memoryLimitMB`, and `port`, revalidates the source, and returns a stopped live server. Imported server descriptors include `source: "imported"` and `serverDir`; unavailable imports also include `unavailable` and `sourceError`.
 

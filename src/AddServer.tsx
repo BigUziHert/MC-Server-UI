@@ -14,6 +14,7 @@ import {
 } from "lucide-react";
 import { api, post } from "./api";
 import type { ServerRecord } from "./ServerManager";
+import NewServerWizard from "./NewServerWizard";
 import {
   LaunchAdvancedFields,
   LaunchMemoryNote,
@@ -44,21 +45,25 @@ type Inspection = {
   javaPath?: string;
   memoryLimitMB?: number;
 };
-type Step = "choice" | "create" | "import";
+type Step = "choice" | "create" | "manual" | "import";
 type Work = "browse" | "inspect" | "create" | "import" | null;
 
 export default function AddServer({
   servers,
+  initialStep = "choice",
   onClose,
   onSaved,
 }: {
   servers: ServerRecord[];
+  initialStep?: "choice" | "create" | "import";
   onClose: () => void;
   onSaved: (server: ServerRecord) => void;
 }) {
   let nextPort = 25565;
   while (servers.some((server) => server.port === nextPort)) nextPort++;
-  const [step, setStep] = useState<Step>("choice");
+  const [step, setStep] = useState<Step>(initialStep);
+  const [wizardLocked, setWizardLocked] = useState(false);
+  const wizardClose = useRef<(() => void) | null>(null);
   const [name, setName] = useState("");
   const [mode, setMode] = useState<"live" | "demo">("live");
   const [port, setPort] = useState(String(nextPort));
@@ -86,7 +91,8 @@ export default function AddServer({
   const inspectedName = useRef<HTMLInputElement>(null);
   const operation = useRef(0);
   const inspectionRequest = useRef<AbortController | null>(null);
-  const locked = work === "create" || work === "import" || work === "browse";
+  const locked =
+    wizardLocked || work === "create" || work === "import" || work === "browse";
   const freshInspection = inspection?.directory === directory;
   const portConflict = servers.find(
     (server) => server.port === Number(importPort),
@@ -121,7 +127,7 @@ export default function AddServer({
   useEffect(() => {
     if (dialog.current) dialog.current.scrollTop = 0;
     if (step === "choice") choiceButton.current?.focus();
-    if (step === "create") nameInput.current?.focus();
+    if (step === "manual") nameInput.current?.focus();
     if (step === "import") directoryInput.current?.focus();
   }, [step]);
   useEffect(() => {
@@ -345,52 +351,69 @@ export default function AddServer({
   const title =
     step === "choice"
       ? "Add a server"
-      : step === "create"
+      : step === "create" || step === "manual"
         ? "Create a new server"
         : "Import an existing server";
   return (
     <dialog
       ref={dialog}
-      className={`server-dialog server-add-dialog ${step === "choice" ? "server-choice-dialog" : ""}`}
+      className={`server-dialog server-add-dialog ${step === "choice" ? "server-choice-dialog" : ""} ${step === "create" ? "server-wizard-dialog" : ""}`}
       aria-labelledby="add-server-title"
       onCancel={(event) => {
         event.preventDefault();
-        close();
+        if (step === "create") wizardClose.current?.();
+        else close();
       }}
     >
-      <div className="server-dialog-top">
-        {step === "choice" ? (
-          <span className="feature-icon">
-            <Box size={23} />
-          </span>
-        ) : (
-          <button
-            className="btn server-back-button"
-            type="button"
-            disabled={locked}
-            onClick={() => navigate("choice")}
-          >
-            <ArrowLeft size={16} /> Back
-          </button>
-        )}
-        <button
-          type="button"
-          className="btn icon"
-          aria-label="Close add server"
-          disabled={locked}
-          onClick={close}
-        >
-          <X size={17} />
-        </button>
-      </div>
-      <h2 id="add-server-title">{title}</h2>
-      <p className="server-add-intro">
-        {step === "choice"
-          ? "Start a fresh world or bring the server you already have."
-          : step === "create"
-            ? "Give your server a name. You can add its files next."
-            : "Connect the existing server folder on the computer running MC Panel."}
-      </p>
+      {step !== "create" && (
+        <>
+          <div className="server-dialog-top">
+            {step === "choice" ? (
+              <span className="feature-icon">
+                <Box size={23} />
+              </span>
+            ) : (
+              <button
+                className="btn server-back-button"
+                type="button"
+                disabled={locked}
+                onClick={() => navigate("choice")}
+              >
+                <ArrowLeft size={16} /> Back
+              </button>
+            )}
+            <button
+              type="button"
+              className="btn icon"
+              aria-label="Close add server"
+              disabled={locked}
+              onClick={close}
+            >
+              <X size={17} />
+            </button>
+          </div>
+          <h2 id="add-server-title">{title}</h2>
+          <p className="server-add-intro">
+            {step === "choice"
+              ? "Start a fresh world or bring the server you already have."
+              : step === "manual"
+                ? "Give your server a name. You can add its files next."
+                : "Connect the existing server folder on the computer running MC Panel."}
+          </p>
+        </>
+      )}
+
+      {step === "create" && (
+        <NewServerWizard
+          servers={servers}
+          onBack={() => navigate("choice")}
+          onManual={() => navigate("manual")}
+          onClose={close}
+          onSaved={onSaved}
+          onLockChange={setWizardLocked}
+          closeRequest={wizardClose}
+        />
+      )}
 
       {step === "choice" && (
         <>
@@ -441,7 +464,7 @@ export default function AddServer({
         </>
       )}
 
-      {step === "create" && (
+      {step === "manual" && (
         <form onSubmit={create} noValidate>
           <div className="form-field">
             <label htmlFor="new-server-name">Server name</label>

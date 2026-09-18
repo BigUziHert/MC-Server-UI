@@ -4,7 +4,7 @@ import * as tar from "tar";
 import { DatabaseSync } from "node:sqlite";
 import { spawn } from "node:child_process";
 import { EventEmitter } from "node:events";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { availableParallelism } from "node:os";
@@ -20,6 +20,7 @@ import {
 import { decodeIcon, readServerIcon, writeServerIcon } from "./server-icon.mjs";
 import { createRecycleBin } from "./recycle-bin.mjs";
 import { createMinecraft } from "./minecraft.mjs";
+import { createServerSetup } from "./server-setup.mjs";
 import { createLauncherStop } from "./launcher-stop.mjs";
 import {
   createPlayerHistory,
@@ -1262,6 +1263,7 @@ export async function createPanel(options = {}) {
         loader,
         loaderVersion,
         world,
+        jar: configuration.jar,
         launchScript: configuration.launchScript,
       };
     },
@@ -3142,9 +3144,51 @@ export async function createFleet(options = {}) {
       defaultServerId: registry.defaultServerId,
     });
   });
-  app.post("/api/servers", async (req, res) => {
-    const server = await serialize(async () => {
-      const config = validateServerConfiguration(req.body);
+  const setup = await createServerSetup({
+    ...options,
+    dataDir,
+    safePath,
+    javaPath:
+      options.javaPath ??
+      env.JAVA_PATH ??
+      // Desktop ignores legacy MC_* configuration, but OS Java discovery is
+      // still useful when a JDK installer configured JAVA_HOME without PATH.
+      (process.env.JAVA_HOME
+        ? path.join(
+            process.env.JAVA_HOME,
+            "bin",
+            process.platform === "win32" ? "java.exe" : "java",
+          )
+        : "java"),
+  });
+  setup.mount(app);
+  const createManagedServer = async (
+    input,
+    { requestId, acceptedEula = false } = {},
+  ) => {
+    return serialize(async () => {
+      const config = validateServerConfiguration(input);
+      const fingerprint = requestId
+        ? createHash("sha256")
+            .update(JSON.stringify({ config, acceptedEula }))
+            .digest("hex")
+        : null;
+      if (requestId) {
+        const previous = registry.servers.find(
+          (entry) => entry.setupRequestId === requestId,
+        );
+        if (previous) {
+          if (previous.setupFingerprint !== fingerprint)
+            throw error(
+              409,
+              "This setup request already created a server with different settings. Resume that server or begin a new setup.",
+            );
+          return {
+            server: { ...descriptor(previous), serverDir: previous.serverDir },
+            reused: true,
+          };
+        }
+      }
       checkPort(config.port);
       const id = randomUUID();
       const instanceDir = await safePath(dataDir, `instances/${id}`);
@@ -3177,11 +3221,11 @@ export async function createFleet(options = {}) {
       await fs.mkdir(instanceDir, { recursive: true });
       const serverDir = await safePath(instanceDir, "server");
       await fs.mkdir(serverDir);
-      // New live instances need an explicit user EULA decision and uploaded JAR.
+      // EULA acceptance is only written after an explicit guided-review choice.
       if (config.mode === "live") {
         await fs.writeFile(
           path.join(serverDir, "eula.txt"),
-          "# Read https://aka.ms/MinecraftEULA before accepting.\neula=false\n",
+          `# Read https://aka.ms/MinecraftEULA before accepting.\neula=${acceptedEula}\n`,
           { flag: "wx" },
         );
         await fs.writeFile(
@@ -3189,6 +3233,12 @@ export async function createFleet(options = {}) {
           `motd=${escapeProperty(config.motd)}\nserver-port=${config.port}\nmax-players=20\nonline-mode=true\n`,
           { flag: "wx" },
         );
+        if (requestId)
+          await fs.writeFile(
+            path.join(serverDir, "user_jvm_args.txt"),
+            `# Memory selected during server setup.\n-Xms${Math.min(config.memoryLimitMB, 1024)}M\n-Xmx${config.memoryLimitMB}M\n`,
+            { flag: "wx" },
+          );
       }
       const entry = {
         ...config,
@@ -3199,7 +3249,11 @@ export async function createFleet(options = {}) {
         address: `localhost:${config.port}`,
         version: config.mode === "demo" ? "1.21.4" : "Configured JAR",
         software: config.mode === "demo" ? "Paper" : "Java",
+        ...(requestId
+          ? { setupRequestId: requestId, setupFingerprint: fingerprint }
+          : {}),
       };
+      if (requestId) await setup.copySettings(instanceDir);
       const runtime = await makeRuntime(entry);
       try {
         await persist({
@@ -3217,9 +3271,48 @@ export async function createFleet(options = {}) {
         "Server created",
         `${config.name} created in ${config.mode} mode on port ${config.port}.`,
       );
-      return runtime.descriptor();
+      return {
+        server: {
+          ...runtime.descriptor(),
+          ...(requestId ? { serverDir } : {}),
+        },
+        reused: false,
+      };
     });
+  };
+  app.post("/api/servers", async (req, res) => {
+    const { server } = await createManagedServer(req.body);
     res.status(201).json({ server });
+  });
+  app.post("/api/server-setup", async (req, res) => {
+    const {
+      requestId,
+      confirmed,
+      configuration,
+      acceptedEula = false,
+    } = req.body ?? {};
+    if (confirmed !== true)
+      throw error(
+        400,
+        "Review the selected installation and confirm before creating the server.",
+      );
+    if (
+      typeof requestId !== "string" ||
+      !/^[a-z0-9-]{16,100}$/i.test(requestId)
+    )
+      throw error(
+        400,
+        "Provide a unique setup request ID so a retry cannot create another server.",
+      );
+    if (typeof acceptedEula !== "boolean")
+      throw error(400, "Choose whether to accept the Minecraft EULA.");
+    if (!configuration || configuration.mode !== "live")
+      throw error(400, "New guided installations must use live mode.");
+    const result = await createManagedServer(configuration, {
+      requestId,
+      acceptedEula,
+    });
+    res.status(result.reused ? 200 : 201).json(result);
   });
   app.patch("/api/servers/:id", async (req, res) => {
     const server = await serialize(async () => {
@@ -3347,6 +3440,7 @@ export async function createFleet(options = {}) {
       Promise.all([...runtimes.values()].map((runtime) => runtime.tick(now))),
     close: async (closeOptions = {}) => {
       closed = true;
+      await setup.close();
       await changeChain.catch(() => {});
       await Promise.all(
         [...runtimes.values()].map((runtime) => runtime.close(closeOptions)),

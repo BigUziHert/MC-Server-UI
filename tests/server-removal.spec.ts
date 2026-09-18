@@ -236,16 +236,16 @@ test("running servers cannot be removed and removing the final stopped server re
     .getByRole("button", { name: "Remove server", exact: true })
     .click();
   await expect(
-    page.getByRole("heading", { name: /Your next world\s*starts here/ }),
+    page.getByRole("heading", { name: "Welcome to MC Panel", exact: true }),
   ).toBeVisible();
   await expect(
     page.getByRole("combobox", { name: "Switch server", exact: true }),
   ).toHaveCount(0);
   await page.reload();
   await expect(
-    page.getByRole("heading", { name: /Your next world\s*starts here/ }),
+    page.getByRole("heading", { name: "Welcome to MC Panel", exact: true }),
   ).toBeVisible();
   await expect(
-    page.getByRole("button", { name: "Add your first server", exact: true }),
+    page.getByRole("button", { name: "Create a new server", exact: true }),
   ).toBeVisible();
 });

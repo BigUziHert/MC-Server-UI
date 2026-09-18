@@ -215,10 +215,16 @@ export async function createLaunchpad(ctx) {
     ...createCoreProviders({ fetch: request, key }),
     ...(ctx.extraProviders ?? []),
   ];
-  const privateRoot = await safePath(dataDir, "launchpad");
-  await fs.mkdir(privateRoot, { recursive: true });
-  const rootIdentity = await fs.realpath(privateRoot);
+  // Fleet onboarding can browse every provider before any server exists.
+  // A catalog-only instance never creates staging folders or reads receipts.
+  const privateRoot = ctx.catalogOnly
+    ? null
+    : await safePath(dataDir, "launchpad");
+  if (privateRoot) await fs.mkdir(privateRoot, { recursive: true });
+  const rootIdentity = privateRoot ? await fs.realpath(privateRoot) : null;
   const privatePath = async (relative) => {
+    if (ctx.catalogOnly)
+      throw error(400, "Choose a server before managing installed content.");
     const root = await safePath(dataDir, "launchpad");
     if ((await fs.realpath(root)) !== rootIdentity)
       throw error(
@@ -229,9 +235,11 @@ export async function createLaunchpad(ctx) {
   };
   let receipts = [];
   try {
-    const saved = JSON.parse(
-      await fs.readFile(await privatePath("installed.json"), "utf8"),
-    );
+    const saved = ctx.catalogOnly
+      ? []
+      : JSON.parse(
+          await fs.readFile(await privatePath("installed.json"), "utf8"),
+        );
     if (Array.isArray(saved)) receipts = saved;
   } catch (cause) {
     if (!missing(cause)) throw cause;
@@ -467,12 +475,16 @@ export async function createLaunchpad(ctx) {
       "start.bat",
       "start.cmd",
       "start.sh",
+      "server.jar",
+      "fabric-server-launcher.properties",
+      "quilt-server-launcher.properties",
+      current.jar,
       current.launchScript,
     ]
       .filter(Boolean)
       .map((value) => value.toLowerCase());
     if (
-      startupFiles.includes(lower) &&
+      (startupFiles.includes(lower) || lower.startsWith("libraries/")) &&
       (await statOrNull(await safePath(serverDir, name)))
     )
       return true;
@@ -1335,7 +1347,11 @@ export async function createLaunchpad(ctx) {
       platform: input.platform,
       projectId: input.projectId,
     };
-    await enrichProjectMetadata([rootMetadata, ...files], warnings);
+    await enrichProjectMetadata(
+      [rootMetadata, ...files],
+      warnings,
+      input.signal,
+    );
     return {
       ...rootResult,
       author: rootMetadata.author,
@@ -1530,11 +1546,12 @@ export async function createLaunchpad(ctx) {
       archive,
       found.downloadHosts,
       request,
+      { signal: input.signal },
     );
     const extracted = path.join(stage, "archive");
     await fs.mkdir(extracted);
     const entries = await unpackProviderZip(archive, extracted, undefined, {
-      signal: lifetime.signal,
+      signal: input.signal,
     });
     const current = await getServer();
     const world = safeInstallPath(current.world || "world");
@@ -1730,6 +1747,7 @@ export async function createLaunchpad(ctx) {
         "There are several pending installation reviews. Finish a review or wait for it to expire before preparing another.",
       );
     const input = selection(raw, true);
+    input.signal.throwIfAborted();
     await assertCompatibility(input);
     const found = await provider(input.platform);
     const planId = randomUUID();
@@ -1916,7 +1934,7 @@ export async function createLaunchpad(ctx) {
         loaderInstall: result.loaderInstall,
         expiresAt,
       };
-      lifetime.signal.throwIfAborted();
+      input.signal.throwIfAborted();
       if (files.length) plans.set(planId, plan);
       else {
         await fs.rm(stage, { recursive: true, force: true });
@@ -1940,6 +1958,7 @@ export async function createLaunchpad(ctx) {
         warnings: plan.warnings,
         unavailableDependencies: plan.unavailableDependencies,
         bundledDependencies: plan.bundledDependencies,
+        loaderInstall: plan.loaderInstall ?? null,
         expiresAt,
       };
     } catch (cause) {
@@ -2234,7 +2253,7 @@ export async function createLaunchpad(ctx) {
     preparingInstall = false;
     return { job: { ...job } };
   }
-  return {
+  const api = {
     config,
     async settings(input) {
       const value = input?.curseforgeApiKey;
@@ -2312,4 +2331,13 @@ export async function createLaunchpad(ctx) {
       noOpReviews.clear();
     },
   };
+  if (ctx.catalogOnly)
+    return {
+      config: api.config,
+      search: api.search,
+      versions: api.versions,
+      settings: api.settings,
+      close: api.close,
+    };
+  return api;
 }
