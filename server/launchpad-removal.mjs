@@ -17,29 +17,34 @@ export function createModRemoval(ctx) {
     );
     return task;
   };
-  const available = async () => {
+  const available = async (type = "mod") => {
     if (closing) throw error(503, "Launchpad is shutting down.");
     if (ctx.isBusy() || busy)
       throw error(409, "Wait for the current Launchpad operation to finish.");
     const current = await ctx.getServer();
     if (current.status !== "offline")
-      throw error(409, "Stop the server before removing mods.");
-    if (!["neoforge", "forge", "fabric", "quilt"].includes(current.loader))
+      throw error(409, "Stop the server before removing content.");
+    if (
+      type === "mod" &&
+      !["neoforge", "forge", "fabric", "quilt"].includes(current.loader)
+    )
       throw error(
         400,
         "Choose a server with a supported mod loader before removing mods.",
       );
     return current;
   };
-  const inventory = async (loader, inspect) => {
-    const directory = await ctx.safePath(ctx.serverDir, "mods");
+  const inventory = async (loader, inspect, type = "mod", folder = "mods") => {
+    const directory = await ctx.safePath(ctx.serverDir, folder);
     const entries = await fs
       .readdir(directory, { withFileTypes: true })
       .catch((cause) => {
         if (cause.code === "ENOENT") return [];
         throw cause;
       });
-    const candidates = entries.filter((entry) => /\.jar$/i.test(entry.name));
+    const candidates = entries.filter((entry) =>
+      (type === "datapack" ? /\.zip$/i : /\.jar$/i).test(entry.name),
+    );
     if (candidates.length > 1000)
       throw error(
         400,
@@ -50,7 +55,7 @@ export function createModRemoval(ctx) {
       a.name.localeCompare(b.name),
     )) {
       ctx.signal.throwIfAborted();
-      const relative = `mods/${entry.name}`;
+      const relative = `${folder}/${entry.name}`;
       const target = await ctx.safePath(ctx.serverDir, relative);
       const before = await fs.lstat(target);
       if (!before.isFile() || before.isSymbolicLink())
@@ -65,7 +70,7 @@ export function createModRemoval(ctx) {
         size: before.size,
         sha512,
       };
-      if (inspect) {
+      if (inspect && type === "mod") {
         try {
           Object.assign(
             row,
@@ -97,13 +102,25 @@ export function createModRemoval(ctx) {
     },
     preview(input = {}) {
       return track(async () => {
-        const current = await available();
+        const type = input.type ?? "mod";
+        if (!["mod", "plugin", "datapack"].includes(type))
+          throw error(400, "Choose installed content to remove.");
+        const current = await available(type);
+        const folder =
+          type === "mod"
+            ? "mods"
+            : type === "plugin"
+              ? "plugins"
+              : `${current.world || "world"}/datapacks`;
         if (
           typeof input.path !== "string" ||
-          !/^mods\/[^/\\]+\.jar$/i.test(input.path)
+          !input.path.startsWith(`${folder}/`) ||
+          input.path.slice(folder.length + 1).includes("/") ||
+          input.path.includes("\\") ||
+          !(type === "datapack" ? /\.zip$/i : /\.jar$/i).test(input.path)
         )
           throw error(400, "Choose an installed mod to remove.");
-        const rows = await inventory(current.loader, true);
+        const rows = await inventory(current.loader, true, type, folder);
         const selected = rows.find((row) => row.path === input.path);
         if (!selected)
           throw error(
@@ -129,10 +146,12 @@ export function createModRemoval(ctx) {
         };
         if (result.blocked) return result;
         prune();
-        if (plans.size >= 4) plans.delete(plans.keys().next().value);
+        if (plans.size >= 8) plans.delete(plans.keys().next().value);
         const planId = randomUUID(),
           expires = Date.now() + 15 * 60 * 1000;
         plans.set(planId, {
+          type,
+          folder,
           path: selected.path,
           loader: current.loader,
           snapshot: snapshot(rows),
@@ -149,7 +168,8 @@ export function createModRemoval(ctx) {
       return track(async () => {
         if (input.confirmed !== true)
           throw error(400, "Review the mod removal and confirm it first.");
-        await available();
+        const planType = plans.get(input.planId)?.type ?? "mod";
+        await available(planType);
         // Recheck after the async status read before claiming the operation.
         if (busy || ctx.isBusy())
           throw error(
@@ -172,7 +192,11 @@ export function createModRemoval(ctx) {
                 409,
                 "The server changed after this review. Stop it and review removal again.",
               );
-            if (snapshot(await inventory(plan.loader, false)) !== plan.snapshot)
+            if (
+              snapshot(
+                await inventory(plan.loader, false, plan.type, plan.folder),
+              ) !== plan.snapshot
+            )
               throw error(
                 409,
                 "Installed mods changed after this review. Review removal again.",
@@ -201,6 +225,10 @@ export function createModRemoval(ctx) {
           busy = false;
         }
       });
+    },
+    cancel(id) {
+      plans.delete(id);
+      return { ok: true };
     },
     async close() {
       closing = true;

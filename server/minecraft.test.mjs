@@ -536,3 +536,48 @@ test("partial configuration failures roll back settings and receipts independent
     "original JAR",
   );
 });
+
+test("Versions terminal outcomes survive restart and persistent dismissal with normalized job wrappers", async (t) => {
+  const f = await fixture(t);
+  const job = await install(f);
+  assert.equal(job.status, "completed");
+  assert.equal(job.job.id, job.id);
+  await f.restart();
+  assert.equal((await f.request("/api/versions")).body.job.id, job.id);
+  assert.equal(
+    (await f.request(`/api/versions/jobs/${job.id}`)).body.job.status,
+    "completed",
+  );
+  assert.equal(
+    (await f.request(`/api/versions/jobs/${job.id}/dismiss`, json("POST", {})))
+      .status,
+    200,
+  );
+  await f.restart();
+  assert.equal((await f.request("/api/versions")).body.job, null);
+});
+
+test("a terminal-history write failure cannot prevent Minecraft management shutdown", async (t) => {
+  const f = await fixture(t);
+  const rename = fs.rename.bind(fs),
+    diagnostics = [];
+  t.mock.method(console, "warn", (message) => diagnostics.push(message));
+  t.mock.method(fs, "rename", async (source, destination) => {
+    if (String(destination).endsWith("last-job.json"))
+      throw Object.assign(new Error("Fixture history disk is full"), {
+        code: "ENOSPC",
+      });
+    return rename(source, destination);
+  });
+  const completed = await install(f);
+  assert.equal(completed.status, "completed");
+  // restart calls the complete management close path before rebuilding it.
+  // Previously rejected history.flush aborted that path before runtime stop.
+  await f.restart();
+  assert.ok(
+    diagnostics.some((message) =>
+      /Installation history.*disk is full/.test(message),
+    ),
+  );
+  assert.equal((await f.request("/api/server")).body.status, "offline");
+});

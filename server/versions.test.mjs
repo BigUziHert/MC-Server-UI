@@ -643,3 +643,24 @@ test("cancelling the real benign installer process waits for owned process exit"
     /cancelled/,
   );
 });
+
+test("manual catalog refresh bypasses both release and Maven build caches", async (t) => {
+  const f = await fixture(t, neoRecords());
+  const initial = await f.service.builds("neoforge", "1.21.1");
+  assert.ok(!initial.builds.some((row) => row.id === "21.1.251"));
+  f.records[`${NEO}/maven-metadata.xml`] = XML([
+    "21.1.251",
+    "21.1.249",
+    "21.2.1",
+  ]);
+  assert.ok(
+    !(await f.service.builds("neoforge", "1.21.1")).builds.some(
+      (row) => row.id === "21.1.251",
+    ),
+  );
+  const next = await f.service.builds("neoforge", "1.21.1", { refresh: true });
+  assert.equal(next.builds[0].id, "21.1.251");
+  f.records[`${NEO}/maven-metadata.xml`] = XML(["21.1.251", "21.3.1"]);
+  const releases = await f.service.versions("neoforge", { refresh: true });
+  assert.ok(releases.versions.some((row) => row.id === "1.21.3"));
+});

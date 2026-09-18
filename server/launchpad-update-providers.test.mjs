@@ -361,7 +361,7 @@ test("missing or invalid later responses cannot overwrite a previously discovere
   assert.match(missingCurrent.warnings.join(" "), /404/);
 });
 
-test("an eight-second batch budget covers both update and current-version requests and failures cool down", async (t) => {
+test("an eight-second batch budget covers both update and current-version requests without cooling down unrelated projects", async (t) => {
   const timeout = AbortSignal.timeout.bind(AbortSignal);
   const budgets = [];
   t.mock.method(AbortSignal, "timeout", (milliseconds) => {
@@ -397,7 +397,7 @@ test("an eight-second batch budget covers both update and current-version reques
   assert.deepEqual(result.updates, {});
   assert.match(result.warnings[0], /took too long/);
   await p.updates(input, [row]);
-  assert.equal(calls, 2);
+  assert.equal(calls, 4, "timeouts do not poison the next attempt");
 });
 
 test("caller cancellation aborts in-flight batch requests, skips queued batches, and does not impose provider cooldown", async () => {
@@ -476,20 +476,18 @@ for (const stalled of ["request", "response body"])
     );
     await ready;
     const queued = p.updates(input, [item(200)]);
+    failing = false;
     for (const deadline of deadlines)
       deadline.abort(
         new DOMException("Batch deadline reached", "TimeoutError"),
       );
     const results = await Promise.all([first, queued]);
-    assert.equal(calls, 2);
+    assert.equal(calls, 3, "the queued unrelated project gets its own attempt");
     assert.ok(
       results.every((result) => Object.keys(result.updates).length === 0),
     );
-    assert.ok(
-      results.every((result) =>
-        /took too long/.test(result.warnings.join(" ")),
-      ),
-    );
+    assert.match(results[0].warnings.join(" "), /took too long/);
+    assert.deepEqual(results[1].warnings, []);
     failing = false;
     now += 30_001;
     const retry = await p.updates(input, [item(201)]);
@@ -499,7 +497,7 @@ for (const stalled of ["request", "response body"])
       retry.issues[item(201).sha512],
       /did not return an update result/,
     );
-    assert.equal(calls, 3);
+    assert.equal(calls, 4);
     for (const reject of lateFailures)
       reject(new Error("Late uncooperative network failure"));
     await delay(0);
@@ -565,4 +563,92 @@ test("optional caller cancellation reaches existing Modrinth and CurseForge vers
     assert.equal(request.options.signal.aborted, true);
     assert.equal(request.options.signal.reason, signal.reason);
   }
+});
+
+test("Quilt mod compatibility uses Fabric in update requests and catalog validation", async () => {
+  const row = item(0);
+  const offered = raw(row, { loaders: ["fabric"] });
+  const p = provider(async (url, options) => {
+    if (url.endsWith("/update")) {
+      assert.deepEqual(JSON.parse(options.body).loaders, ["quilt", "fabric"]);
+      return json({ [row.sha512]: offered });
+    }
+    if (url.includes("/project/")) {
+      assert.deepEqual(JSON.parse(new URL(url).searchParams.get("loaders")), [
+        "quilt",
+        "fabric",
+      ]);
+      return json([offered]);
+    }
+    return json([current(row, { loaders: ["fabric"] })]);
+  });
+  const selection = { ...input, loader: "quilt" };
+  assert.equal(
+    (await p.updates(selection, [row])).updates[row.sha512].id,
+    offered.id,
+  );
+  assert.equal(
+    (await p.versions({ ...selection, projectId: row.projectId }))[0].id,
+    offered.id,
+  );
+});
+
+test("a failed update batch gives every affected file a reason and does not poison a later project", async () => {
+  let failed = true;
+  const p = provider(async (_url, options) => {
+    if (failed) {
+      failed = false;
+      return new Response("bad", { status: 503 });
+    }
+    const hashes = JSON.parse(options.body).hashes;
+    return json({ [hashes[0]]: current(item(1)) });
+  });
+  const first = await p.updates(input, [item(0)]);
+  assert.match(first.issues[item(0).sha512], /503/);
+  const next = await p.updates(input, [item(1)]);
+  assert.deepEqual(next.updates, { [item(1).sha512]: null });
+});
+
+test("CurseForge file pagination retains older installed releases and requires explicit specialized plugin support", async () => {
+  const pages = [];
+  const files = Array.from({ length: 55 }, (_, index) => ({
+    id: index + 1,
+    displayName: `release ${index}`,
+    gameVersions: ["1.21.1", ...(index === 54 ? ["Folia"] : [])],
+    fileDate: "2026-01-01",
+    downloadUrl: "https://edge.forgecdn.net/example.jar",
+  }));
+  const p = createCoreProviders({
+    key: async () => "key",
+    fetch: async (url) => {
+      const offset = Number(new URL(url).searchParams.get("index"));
+      pages.push(offset);
+      return json({
+        data: files.slice(offset, offset + 50),
+        pagination: { totalCount: files.length },
+      });
+    },
+  })[1];
+  const rows = await p.versions({
+    type: "plugin",
+    loader: "folia",
+    gameVersion: "1.21.1",
+    projectId: "11",
+  });
+  assert.deepEqual(pages, [0, 50]);
+  assert.deepEqual(
+    rows.map((row) => row.id),
+    ["55"],
+  );
+  assert.equal(
+    (
+      await p.versions({
+        type: "plugin",
+        loader: "velocity",
+        gameVersion: "1.21.1",
+        projectId: "11",
+      })
+    ).length,
+    0,
+  );
 });

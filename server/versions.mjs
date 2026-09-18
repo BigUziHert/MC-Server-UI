@@ -428,7 +428,14 @@ export function createVersionsService({
         throw fail(502, "The official Maven repository returned no versions.");
       return versions.sort(newest);
     });
-  async function versions(id) {
+  const refreshProvider = (id) => {
+    cache.delete(id);
+    for (const key of cache.keys())
+      if (key === `versions:${id}` || key.startsWith(`builds:${id}:`))
+        cache.delete(key);
+  };
+  async function versions(id, { refresh = false } = {}) {
+    if (refresh) refreshProvider(id);
     const selected = provider(id);
     const entries = await cached(`versions:${id}`, async () => {
       if (id === "neoforge" || id === "forge") {
@@ -490,7 +497,8 @@ export function createVersionsService({
     });
     return { provider: selected, versions: entries };
   }
-  async function builds(id, version) {
+  async function builds(id, version, { refresh = false } = {}) {
+    if (refresh) refreshProvider(id);
     const selected = provider(id);
     if (
       !catalogIdentifier(id, version) ||

@@ -690,3 +690,42 @@ test("removal plans and recovery data belong only to their selected server", asy
   assert.equal((await first.bin.list()).length, 1);
   assert.deepEqual(await second.bin.list(), []);
 });
+
+test("plugins and datapacks can be reviewed and removed without scanning mod dependencies", async (t) => {
+  const f = await fixture(t, {
+    loader: "paper",
+    files: { "unreadable.jar": "not a jar" },
+  });
+  for (const [type, relative] of [
+    ["plugin", "plugins/example.jar"],
+    ["datapack", "world/datapacks/example.zip"],
+  ]) {
+    await fs.mkdir(path.dirname(path.join(f.serverDir, relative)), {
+      recursive: true,
+    });
+    await f.write(relative, "installed package");
+    const plan = await f.service.removalPreview({ type, path: relative });
+    assert.equal(plan.blocked, false);
+    assert.deepEqual(plan.warnings, []);
+    const result = await f.service.remove({
+      planId: plan.planId,
+      confirmed: true,
+    });
+    assert.equal(result.path, relative);
+    await assert.rejects(f.read(relative), { code: "ENOENT" });
+  }
+  assert.equal((await f.read("mods/unreadable.jar")).toString(), "not a jar");
+});
+
+test("cancelled removal plans cannot mutate files", async (t) => {
+  const f = await fixture(t, {
+    files: { "example.jar": mod("neoforge", "example") },
+  });
+  const plan = await f.service.removalPreview({ path: "mods/example.jar" });
+  assert.deepEqual(f.service.cancelRemovalPreview(plan.planId), { ok: true });
+  await assert.rejects(
+    f.service.remove({ planId: plan.planId, confirmed: true }),
+    /expired/,
+  );
+  assert.ok(await f.read("mods/example.jar"));
+});

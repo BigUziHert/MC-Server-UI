@@ -1,3 +1,4 @@
+import { terminalJobs } from "./terminal-jobs.mjs";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { randomUUID, createHash } from "node:crypto";
@@ -472,11 +473,13 @@ export async function createMinecraft(ctx) {
   const launchpad = await createLaunchpad({
     ...ctx,
     versionsService: versions,
+    isContentMutationActive: () =>
+      operations.size > 0 || ctx.isContentMutationActive?.(),
     fetch: catalogFetch,
     platformConfig,
     extraProviders: extras,
-    audit: (action, detail, category = "file") =>
-      ctx.audit(category, action, detail),
+    audit: (action, detail, category = "file", actor = "Local administrator") =>
+      ctx.audit(category, action, detail, actor),
   });
   const privateDir = await ctx.safePath(ctx.dataDir, "versions");
   await fs.mkdir(privateDir, { recursive: true });
@@ -487,6 +490,20 @@ export async function createMinecraft(ctx) {
       throw fail(409, "Version staging storage changed. Restart the panel.");
     return ctx.safePath(root, id);
   };
+  const terminal = await terminalJobs(await privatePath("last-job.json"));
+  if (terminal.get()) {
+    const job = terminal.get();
+    jobs.set(job.id, job);
+    lastJob = job.id;
+  }
+  const publicJob = (job) =>
+    job
+      ? {
+          ...job,
+          status:
+            job.status ?? (job.state === "complete" ? "completed" : job.state),
+        }
+      : null;
   function install(input) {
     if (closing) throw fail(503, "Minecraft management is shutting down.");
     if (input?.confirmed !== true)
@@ -509,6 +526,7 @@ export async function createMinecraft(ctx) {
     const job = {
       id: randomUUID(),
       state: "queued",
+      status: "queued",
       message: "Preparing installation…",
     };
     const controller = new AbortController();
@@ -516,6 +534,7 @@ export async function createMinecraft(ctx) {
     // cannot pass between job creation and its first asynchronous operation.
     const operation = ctx.withMinecraftMutation(async () => {
       job.state = "running";
+      job.status = "running";
       let staging;
       try {
         const original =
@@ -572,11 +591,13 @@ export async function createMinecraft(ctx) {
           .catch(() => {});
         return {
           state: "complete",
+          status: "completed",
           message: `${result.configuration.software} ${result.configuration.version} ${original ? "updated. Your worlds, content and settings were preserved." : "installed."} Start the server when ready.`,
         };
       } catch (cause) {
         return {
           state: "failed",
+          status: "failed",
           error: cause.message,
           message: cause.message,
         };
@@ -593,18 +614,24 @@ export async function createMinecraft(ctx) {
     operations.add(active);
     // A terminal job enables Start and other edits in the UI. Publish it only
     // after staging cleanup and the mutation wrapper have released their lock.
-    void operation
+    active.operation = operation
       .then(
         (outcome) => Object.assign(job, outcome),
         (cause) =>
           Object.assign(job, {
             state: "failed",
+            status: "failed",
             error: cause.message,
             message: cause.message,
           }),
       )
-      .finally(() => {
+      .finally(async () => {
         job.finishedAt = new Date().toISOString();
+        if (job.status === "failed")
+          await ctx
+            .audit("server", "Installation failed", job.error)
+            .catch(() => {});
+        await terminal.save(publicJob(job)).catch(() => {});
         operations.delete(active);
       });
     while (jobs.size > 30) {
@@ -633,7 +660,10 @@ export async function createMinecraft(ctx) {
           providers: versions.listProviders(),
           current,
           runtimeUpdate: await runtimeCapability(ctx, current),
-          job: lastJob ? jobs.get(lastJob) : null,
+          job:
+            lastJob && terminal.visible(publicJob(jobs.get(lastJob)))
+              ? publicJob(jobs.get(lastJob))
+              : null,
           cleanInstall: true,
         });
       }),
@@ -643,25 +673,34 @@ export async function createMinecraft(ctx) {
       endpoint(async (req, res) => {
         const job = jobs.get(req.params.id);
         if (!job) throw fail(404, "This installation job was not found.");
-        res.json(job);
+        res.json({ ...publicJob(job), job: publicJob(job) });
       }),
     );
     app.post(
       "/api/versions/install",
-      endpoint(async (req, res) => res.status(202).json(install(req.body))),
+      endpoint(async (req, res) => {
+        const job = publicJob(install(req.body));
+        res.status(202).json({ ...job, job });
+      }),
     );
     app.get(
       "/api/versions/:provider/:version",
       endpoint(async (req, res) =>
         res.json(
-          await versions.builds(req.params.provider, req.params.version),
+          await versions.builds(req.params.provider, req.params.version, {
+            refresh: ["1", "true"].includes(req.query.refresh),
+          }),
         ),
       ),
     );
     app.get(
       "/api/versions/:provider",
       endpoint(async (req, res) =>
-        res.json(await versions.versions(req.params.provider)),
+        res.json(
+          await versions.versions(req.params.provider, {
+            refresh: ["1", "true"].includes(req.query.refresh),
+          }),
+        ),
       ),
     );
     app.get(
@@ -680,7 +719,7 @@ export async function createMinecraft(ctx) {
     );
     app.get(
       "/api/launchpad",
-      endpoint(async (_req, res) => res.json(await launchpad.config())),
+      endpoint(async (req, res) => res.json(await launchpad.config(req.query))),
     );
     for (const method of ["search", "versions", "installed"])
       app.get(
@@ -713,6 +752,35 @@ export async function createMinecraft(ctx) {
       endpoint(async (req, res) => res.json(await launchpad.preview(req.body))),
     );
     app.post(
+      "/api/launchpad/preview/:id/cancel",
+      endpoint(async (req, res) =>
+        res.json(await launchpad.cancelPreview(req.params.id)),
+      ),
+    );
+    app.post(
+      "/api/launchpad/removal-preview/:id/cancel",
+      endpoint(async (req, res) =>
+        res.json(await launchpad.cancelRemovalPreview(req.params.id)),
+      ),
+    );
+    app.post(
+      "/api/launchpad/jobs/:id/dismiss",
+      endpoint(async (req, res) =>
+        res.json(await launchpad.dismissJob(req.params.id)),
+      ),
+    );
+    app.post(
+      "/api/versions/jobs/:id/dismiss",
+      endpoint(async (req, res) => {
+        const job = jobs.get(req.params.id);
+        if (job && ["completed", "failed"].includes(publicJob(job).status)) {
+          job.dismissed = true;
+          await terminal.dismiss(job.id);
+        }
+        res.json({ ok: true });
+      }),
+    );
+    app.post(
       "/api/launchpad/removal-preview",
       endpoint(async (req, res) =>
         res.json(await launchpad.removalPreview(req.body)),
@@ -734,6 +802,7 @@ export async function createMinecraft(ctx) {
     );
   }
   return {
+    duplicateCheck: launchpad.duplicateCheck,
     mount,
     async close() {
       closing = true;
@@ -743,6 +812,7 @@ export async function createMinecraft(ctx) {
       for (const active of operations) active.controller.abort();
       await Promise.allSettled([...operations].map((value) => value.operation));
       await launchpad.close();
+      await terminal.flush();
     },
   };
 }

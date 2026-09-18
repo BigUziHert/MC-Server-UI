@@ -27,9 +27,18 @@ const fileName = (value) => {
     throw launchpadError(400, "The provider returned an invalid file name.");
   return name;
 };
+const compatibleLoaders = (input) =>
+  input.loader === "quilt" && input.type === "mod"
+    ? ["quilt", "fabric"]
+    : input.loader
+      ? [input.loader]
+      : [];
 const fits = (version, input) =>
   (!input.gameVersion || version.gameVersions.includes(input.gameVersion)) &&
-  (!input.loader || version.loaders.includes(input.loader));
+  (!input.loader ||
+    compatibleLoaders(input).some((loader) =>
+      version.loaders.includes(loader),
+    ));
 const iconUrl = (value) => {
   try {
     const url = new URL(value);
@@ -272,8 +281,16 @@ function modrinthUpdates(json) {
         const updates = {},
           issues = {},
           warnings = new Set();
-        if (failureUntil > Date.now())
-          return { updates, issues, warnings: [failureWarning] };
+        if (failureUntil > Date.now()) {
+          const message = `${failureWarning} Retry in ${Math.ceil((failureUntil - Date.now()) / 1000)} seconds.`;
+          return {
+            updates,
+            issues: Object.fromEntries(
+              batch.map((item) => [item.sha512, message]),
+            ),
+            warnings: [message],
+          };
+        }
         const timeout = AbortSignal.timeout(8000);
         const signal = input.signal
           ? AbortSignal.any([input.signal, timeout])
@@ -286,7 +303,7 @@ function modrinthUpdates(json) {
             body: JSON.stringify({
               hashes: batch.map((item) => item.sha512),
               algorithm: "sha512",
-              loaders: input.loader ? [input.loader] : [],
+              loaders: compatibleLoaders(input),
               game_versions: input.gameVersion ? [input.gameVersion] : [],
             }),
           });
@@ -351,7 +368,12 @@ function modrinthUpdates(json) {
                 throw new Error(
                   `The returned version does not support Minecraft ${input.gameVersion}.`,
                 );
-              if (input.loader && !version.loaders.includes(input.loader))
+              if (
+                input.loader &&
+                !compatibleLoaders(input).some((loader) =>
+                  version.loaders.includes(loader),
+                )
+              )
                 throw new Error(
                   `The returned version does not support the selected ${input.loader} loader.`,
                 );
@@ -438,12 +460,19 @@ function modrinthUpdates(json) {
           }
         } catch (cause) {
           if (input.signal?.aborted) throw input.signal.reason;
-          failureUntil = Date.now() + (cause.status === 429 ? 60_000 : 30_000);
+          if (cause.status === 429) failureUntil = Date.now() + 60_000;
           failureWarning =
             timeout.aborted || cause.name === "TimeoutError"
               ? "Modrinth update checks took too long. Try again shortly."
               : cause.message;
-          warnings.add(failureWarning);
+          const message =
+            failureUntil > Date.now()
+              ? `${failureWarning} Retry in ${Math.ceil((failureUntil - Date.now()) / 1000)} seconds.`
+              : failureWarning;
+          warnings.add(message);
+          for (const item of batch)
+            if (!Object.hasOwn(updates, item.sha512))
+              issues[item.sha512] ??= message;
         }
         return { updates, issues, warnings: [...warnings] };
       });
@@ -494,7 +523,37 @@ function cfVersion(value, type) {
       type === "datapack"
         ? ["datapack"]
         : type === "plugin"
-          ? ["bukkit", "spigot", "paper", "purpur"]
+          ? (() => {
+              const tagged = versions
+                .map((value) => String(value).toLowerCase())
+                .filter((value) =>
+                  [
+                    "bukkit",
+                    "spigot",
+                    "paper",
+                    "purpur",
+                    "folia",
+                    "velocity",
+                    "waterfall",
+                    "bungeecord",
+                  ].includes(value),
+                );
+              // Bukkit catalogs imply the ordinary Bukkit family only. Proxy and
+              // Folia support must be explicitly declared by the release.
+              return [
+                ...new Set([
+                  ...(["velocity", "waterfall", "bungeecord", "folia"].some(
+                    (value) => tagged.includes(value),
+                  ) &&
+                  !tagged.some((value) =>
+                    ["bukkit", "spigot", "paper", "purpur"].includes(value),
+                  )
+                    ? []
+                    : ["bukkit", "spigot", "paper", "purpur"]),
+                  ...tagged,
+                ]),
+              ];
+            })()
           : versions
               .map((value) => value.toLowerCase())
               .filter((value) => Object.hasOwn(cfLoaders, value)),
@@ -518,7 +577,8 @@ export function createCoreProviders({
     const query = new URLSearchParams();
     if (input.gameVersion)
       query.set("game_versions", JSON.stringify([input.gameVersion]));
-    if (input.loader) query.set("loaders", JSON.stringify([input.loader]));
+    if (input.loader)
+      query.set("loaders", JSON.stringify(compatibleLoaders(input)));
     return json(`${mr}/project/${enc(id(input.projectId))}/version?${query}`, {
       signal: input.signal,
     });
@@ -661,15 +721,45 @@ export function createCoreProviders({
     return category.id;
   }
   const cfFiles = async (input) => {
-    const query = new URLSearchParams({ pageSize: "50" });
-    if (input.gameVersion) query.set("gameVersion", input.gameVersion);
-    if (cfLoaders[input.loader])
-      query.set("modLoaderType", String(cfLoaders[input.loader]));
-    return (
-      await curseJson(`/mods/${enc(id(input.projectId))}/files?${query}`, {
-        signal: input.signal,
-      })
-    ).data;
+    const result = [];
+    // Quilt-compatible Fabric mods use the same compatibility policy for
+    // listing, resolution and update checks. Packs keep their exact runtime.
+    const requested =
+      input.loader === "quilt" && input.type === "mod"
+        ? ["quilt", "fabric"]
+        : [input.loader];
+    for (const loader of requested) {
+      for (let index = 0; index < 10000; index += 50) {
+        const query = new URLSearchParams({
+          pageSize: "50",
+          index: String(index),
+        });
+        if (input.gameVersion) query.set("gameVersion", input.gameVersion);
+        if (cfLoaders[loader])
+          query.set("modLoaderType", String(cfLoaders[loader]));
+        const response = await curseJson(
+          `/mods/${enc(id(input.projectId))}/files?${query}`,
+          { signal: input.signal },
+        );
+        if (!Array.isArray(response.data))
+          throw launchpadError(
+            502,
+            "CurseForge returned an invalid file listing.",
+          );
+        result.push(...response.data);
+        if (
+          response.data.length < 50 ||
+          index + response.data.length >= response.pagination?.totalCount
+        )
+          break;
+        if (index === 9950)
+          throw launchpadError(
+            502,
+            "CurseForge returned too many releases to verify the installed version.",
+          );
+      }
+    }
+    return [...new Map(result.map((file) => [String(file.id), file])).values()];
   };
   return [
     {
@@ -687,7 +777,10 @@ export function createCoreProviders({
           ["server_side!=unsupported"],
         ];
         if (input.gameVersion) facets.push([`versions:${input.gameVersion}`]);
-        if (input.loader) facets.push([`categories:${input.loader}`]);
+        if (input.loader)
+          facets.push(
+            compatibleLoaders(input).map((loader) => `categories:${loader}`),
+          );
         const query = new URLSearchParams({
           query: input.query,
           facets: JSON.stringify(facets),

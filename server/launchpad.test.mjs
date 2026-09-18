@@ -495,7 +495,7 @@ test("a forced refresh interrupted before update checks cannot reuse a cached up
     timeout = AbortSignal.timeout.bind(AbortSignal);
   deadline.abort(new DOMException("Fixture refresh deadline", "TimeoutError"));
   t.mock.method(AbortSignal, "timeout", (duration) =>
-    duration === 30000 ? deadline.signal : timeout(duration),
+    duration === 90000 ? deadline.signal : timeout(duration),
   );
   const refreshed = await f.service.installed({ ...selection, refresh: true });
   assert.equal(refreshed.items[0].updateCheck, "unavailable");
@@ -632,7 +632,7 @@ test("an unresponsive provider cannot hold installed rows past the overall remot
   const timeout = AbortSignal.timeout.bind(AbortSignal),
     deadline = new AbortController();
   t.mock.method(AbortSignal, "timeout", (duration) =>
-    duration === 30000 ? deadline.signal : timeout(duration),
+    duration === 90000 ? deadline.signal : timeout(duration),
   );
   let started;
   const began = new Promise((resolve) => {
@@ -1250,7 +1250,7 @@ test("installed project icons and titles are available with All loaders and All 
     "https://cdn.modrinth.com/data/project/icon.png",
   );
   assert.equal(result.items[0].update, undefined);
-  assert.equal(result.warnings.length, 0);
+  assert.match(result.warnings.join(" "), /Minecraft version and loader/);
   assert.equal(
     f.requests.some(({ url }) => new URL(url).pathname.endsWith("/version")),
     false,
@@ -1763,7 +1763,7 @@ test("checksum failures and changed reviewed files never mutate existing server 
   let job = await finish(f.service, { planId: plan.planId, confirmed: true });
   assert.equal(job.status, "failed");
   assert.match(job.error, /checksum|size/);
-  assert.equal(f.mutations, 0);
+  assert.equal(f.mutations, 1, "download verification holds the shared lock");
   assert.deepEqual(
     await fs.readFile(path.join(f.serverDir, "mods", "old.jar")),
     f.old,
@@ -1915,7 +1915,11 @@ test("bundled libraries satisfy only checksum-identified catalog requirements an
       if (mode === "tampered-stage") {
         assert.equal(job.status, "failed");
         assert.match(job.error, /checksum/);
-        assert.equal(f.mutations, 0);
+        assert.equal(
+          f.mutations,
+          1,
+          "download verification holds the shared lock",
+        );
         assert.deepEqual(
           await fs.readFile(path.join(f.serverDir, "mods", "old.jar")),
           f.old,
@@ -3773,8 +3777,12 @@ test("existing CurseForge-only mods require matching fingerprints and SHA-1 befo
   wrongHash = true;
   now += 10 * 60_000 + 1;
   result = await f.service.installed(selection);
-  assert.equal(result.items[0].platform, null);
-  assert.equal(result.items[0].update, undefined);
+  assert.equal(
+    result.items[0].platform,
+    "curseforge",
+    "unchanged bytes retain their previously checksum-verified identity",
+  );
+  assert.equal(result.items[0].update.id, "22");
   assert.deepEqual(
     await fs.readFile(path.join(f.serverDir, "mods", "old.jar")),
     f.old,
@@ -4268,7 +4276,11 @@ test(
     await f.service.close();
     assert.equal(f.service.job(job.id).job.status, "failed");
     assert.match(f.service.job(job.id).job.error, /Launchpad closed/);
-    assert.equal(f.mutations, 0);
+    assert.equal(
+      f.mutations,
+      1,
+      "cancelled download held the shared lock without changing files",
+    );
     assert.deepEqual(
       await fs.readFile(path.join(f.serverDir, "mods/old.jar")),
       f.old,
@@ -4276,7 +4288,9 @@ test(
     await assert.rejects(fs.stat(path.join(f.serverDir, "mods/new.jar")), {
       code: "ENOENT",
     });
-    assert.deepEqual(await fs.readdir(path.join(f.dataDir, "launchpad")), []);
+    assert.deepEqual(await fs.readdir(path.join(f.dataDir, "launchpad")), [
+      "last-job.json",
+    ]);
   },
 );
 
@@ -4599,4 +4613,611 @@ test("server ZIP runtime metadata accepts exact known formats and rejects ambigu
     ),
     /conflicting runtime versions/,
   );
+});
+
+test("modpack receipts do not overwrite checksum identities across repeated scans and expiry", async (t) => {
+  let now = Date.now();
+  t.mock.method(Date, "now", () => now);
+  const f = await fixture(t);
+  await fs.writeFile(
+    path.join(f.dataDir, "launchpad", "installed.json"),
+    JSON.stringify([
+      {
+        path: "mods/old.jar",
+        sha512: hashes(f.old).sha512,
+        platform: null,
+        type: "modpack",
+      },
+    ]),
+  );
+  const service = await f.boot();
+  for (let pass = 0; pass < 3; pass++) {
+    const result = await service.installed(selection);
+    assert.equal(result.items[0].platform, "modrinth");
+    assert.equal(result.items[0].update.id, "new");
+  }
+  now += 11 * 60_000;
+  const local = await service.installed({ ...selection, local: true });
+  assert.equal(local.items[0].platform, "modrinth");
+  assert.equal(local.items[0].updateCheck, "pending");
+  assert.equal(local.items[0].update.id, "new");
+});
+
+test("cancelled reviews release staging and abandoned reviews cannot exhaust the eight slots", async (t) => {
+  const f = await fixture(t);
+  const plans = [];
+  for (let i = 0; i < 10; i++) plans.push(await f.service.preview(selection));
+  await assert.rejects(
+    fs.stat(path.join(f.dataDir, "launchpad", plans[0].planId)),
+    { code: "ENOENT" },
+  );
+  const last = plans.at(-1);
+  assert.deepEqual(await f.service.cancelPreview(last.planId), { ok: true });
+  await assert.rejects(
+    fs.stat(path.join(f.dataDir, "launchpad", last.planId)),
+    { code: "ENOENT" },
+  );
+  await assert.rejects(
+    f.service.install({ planId: last.planId, confirmed: true }),
+    /expired/,
+  );
+});
+
+test("terminal jobs survive restart, can be dismissed, and expire after ten minutes", async (t) => {
+  let now = Date.now();
+  t.mock.method(Date, "now", () => now);
+  const f = await fixture(t);
+  const plan = await f.service.preview(selection);
+  const job = await finish(f.service, { planId: plan.planId, confirmed: true });
+  await f.service.close();
+  const restarted = await f.boot();
+  assert.equal((await restarted.config()).job.id, job.id);
+  await restarted.dismissJob(job.id);
+  assert.equal((await restarted.config()).job, null);
+  await restarted.close();
+  const dismissed = await f.boot();
+  assert.equal((await dismissed.config()).job, null);
+  const stored = path.join(f.dataDir, "launchpad", "last-job.json");
+  const value = JSON.parse(await fs.readFile(stored));
+  delete value.dismissed;
+  await fs.writeFile(stored, JSON.stringify(value));
+  now = Date.parse(value.finishedAt) + 600_001;
+  const expired = await f.boot();
+  assert.equal((await expired.config()).job, null);
+});
+
+test("explicit background refresh immediately publishes progress and coalesces polling", async (t) => {
+  let release, started;
+  const gate = new Promise((resolve) => {
+    release = resolve;
+  });
+  const ready = new Promise((resolve) => {
+    started = resolve;
+  });
+  let paused = false,
+    checks = 0;
+  const f = await fixture(t, {
+    request: async (url) => {
+      if (new URL(url).pathname === "/v2/version_files/update") {
+        checks++;
+        if (paused) {
+          started();
+          await gate;
+        }
+      }
+    },
+  });
+  await f.service.installed(selection);
+  paused = true;
+  const result = await f.service.installed({
+    ...selection,
+    refresh: true,
+    background: true,
+  });
+  assert.equal(result.checkingUpdates, true);
+  assert.equal(result.items[0].update.id, "new");
+  await ready;
+  const polled = await f.service.installed(selection);
+  assert.equal(polled.checkingUpdates, true);
+  assert.deepEqual(polled.progress, { completed: 0, total: 1 });
+  assert.equal(checks, 2);
+  release();
+  let complete;
+  for (let i = 0; i < 100; i++) {
+    complete = await f.service.installed(selection);
+    if (!complete.checkingUpdates) break;
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  assert.equal(complete.checkingUpdates, false);
+  assert.equal(complete.progress.completed, 1);
+  assert.equal(complete.items[0].updateCheck, "checked");
+});
+
+test("odd filenames produce a warning while valid installed mods remain listed", async (t) => {
+  const f = await fixture(t);
+  await fs.writeFile(path.join(f.serverDir, "mods", "bad..name.jar"), "odd");
+  const result = await f.service.installed({ ...selection, local: true });
+  assert.ok(result.items.some((item) => item.path === "mods/old.jar"));
+  // safeInstallPath accepts harmless dots; use a mock directory entry rejected
+  // before safePath to simulate platform-specific filenames from imports.
+  const readdir = fs.readdir.bind(fs);
+  t.mock.method(fs, "readdir", async (directory, options) => {
+    const entries = await readdir(directory, options);
+    return String(directory).endsWith("mods")
+      ? [
+          ...entries,
+          {
+            name: "bad:stream.jar",
+            isFile: () => true,
+            isSymbolicLink: () => false,
+          },
+        ]
+      : entries;
+  });
+  const checked = await f.service.installed({ ...selection, local: true });
+  assert.match(checked.warnings.join(" "), /bad:stream.jar/);
+  assert.ok(checked.items.some((item) => item.path === "mods/old.jar"));
+});
+
+test("fallback update failures are isolated per project and missing installed releases are never up to date", async (t) => {
+  const f = await fixture(t);
+  await fs.unlink(path.join(f.serverDir, "mods", "old.jar"));
+  const receipts = [];
+  for (const id of ["failed", "healthy", "empty", "missing-current"]) {
+    const data = Buffer.from(id);
+    await fs.writeFile(path.join(f.serverDir, "mods", `${id}.jar`), data);
+    receipts.push({
+      path: `mods/${id}.jar`,
+      sha512: hashes(data).sha512,
+      platform: "fixture",
+      projectId: id,
+      versionId: "old",
+      type: "mod",
+    });
+  }
+  await fs.writeFile(
+    path.join(f.dataDir, "launchpad", "installed.json"),
+    JSON.stringify(receipts),
+  );
+  let failed = true;
+  const calls = [];
+  const service = await f.boot({
+    extraProviders: [
+      {
+        id: "fixture",
+        name: "Fixture",
+        types: ["mod"],
+        async versions(input) {
+          calls.push(input.projectId);
+          if (input.projectId === "failed" && failed)
+            throw Object.assign(new Error("Project temporarily unavailable"), {
+              status: 502,
+            });
+          if (input.projectId === "empty") return [];
+          const versions = [
+            { id: "new", publishedAt: "2026-02-01", downloadable: true },
+          ];
+          if (input.projectId !== "missing-current")
+            versions.push({
+              id: "old",
+              publishedAt: "2026-01-01",
+              downloadable: true,
+            });
+          return versions;
+        },
+      },
+    ],
+  });
+  const first = await service.installed(selection);
+  assert.equal(
+    first.items.find((item) => item.projectId === "healthy").update.id,
+    "new",
+  );
+  for (const project of ["failed", "empty", "missing-current"])
+    assert.equal(
+      first.items.find((item) => item.projectId === project).updateCheck,
+      "unavailable",
+    );
+  assert.match(
+    first.items.find((item) => item.projectId === "empty").updateIssue,
+    /No compatible/,
+  );
+  assert.match(
+    first.items.find((item) => item.projectId === "missing-current")
+      .updateIssue,
+    /installed release/,
+  );
+  failed = false;
+  const refreshed = await service.installed({ ...selection, refresh: true });
+  assert.equal(
+    refreshed.items.find((item) => item.projectId === "failed").update.id,
+    "new",
+  );
+  assert.equal(calls.filter((id) => id === "failed").length, 2);
+});
+
+test("Minecraft version catalog has a one-hour TTL and an explicit refresh", async (t) => {
+  const f = await fixture(t);
+  let now = Date.now();
+  t.mock.method(Date, "now", () => now);
+  const count = () =>
+    f.requests.filter(
+      ({ url }) => new URL(url).pathname === "/v2/tag/game_version",
+    ).length;
+  await f.service.config();
+  const first = count();
+  await f.service.config();
+  assert.equal(count(), first);
+  await f.service.config({ refresh: "true" });
+  assert.equal(count(), first + 1);
+  now += 3_600_001;
+  await f.service.config();
+  assert.equal(count(), first + 2);
+});
+
+test("pruning missing receipts keeps pack provenance and duplicate errors name every conflicting file", async (t) => {
+  const f = await fixture(t);
+  await fs.writeFile(
+    path.join(f.dataDir, "launchpad", "installed.json"),
+    JSON.stringify([
+      {
+        path: "mods/gone.jar",
+        sha512: hashes(f.old).sha512,
+        platform: "modrinth",
+        projectId: "gone",
+      },
+      {
+        pack: true,
+        path: "",
+        platform: "modrinth",
+        projectId: "pack",
+        type: "modpack",
+      },
+    ]),
+  );
+  const service = await f.boot();
+  assert.equal(service.snapshotInstalled().length, 1);
+  assert.equal(service.snapshotInstalled()[0].pack, true);
+  await fs.copyFile(
+    path.join(f.serverDir, "mods/old.jar"),
+    path.join(f.serverDir, "mods/duplicate.jar"),
+  );
+  const inventory = await service.installed(selection);
+  assert.deepEqual(
+    inventory.items.find((item) => item.path === "mods/old.jar").duplicates,
+    ["mods/duplicate.jar"],
+  );
+  const local = await service.installed({ ...selection, local: true });
+  assert.deepEqual(
+    local.items.find((item) => item.path === "mods/old.jar").duplicates,
+    ["mods/duplicate.jar"],
+  );
+  await assert.rejects(
+    service.preview({ ...selection, replacePath: "mods/old.jar" }),
+    (cause) =>
+      cause.status === 409 &&
+      /mods\/old.jar/.test(cause.message) &&
+      /mods\/duplicate.jar/.test(cause.message),
+  );
+});
+
+test("removing one installed mod preserves the other project's cached update result", async (t) => {
+  const f = await fixture(t);
+  await fs.unlink(path.join(f.serverDir, "mods/old.jar"));
+  const receipts = [];
+  for (const id of ["first", "second"]) {
+    const data = zip([
+      [
+        "META-INF/neoforge.mods.toml",
+        `modLoader="javafml"\nloaderVersion="[1,)"\nlicense="MIT"\n[[mods]]\nmodId="${id}"\nversion="1.0"\n`,
+      ],
+    ]);
+    await fs.writeFile(path.join(f.serverDir, "mods", `${id}.jar`), data);
+    receipts.push({
+      path: `mods/${id}.jar`,
+      sha512: hashes(data).sha512,
+      platform: "fixture",
+      projectId: id,
+      versionId: "old",
+      type: "mod",
+    });
+  }
+  await fs.writeFile(
+    path.join(f.dataDir, "launchpad/installed.json"),
+    JSON.stringify(receipts),
+  );
+  let calls = 0;
+  const service = await f.boot({
+    extraProviders: [
+      {
+        id: "fixture",
+        name: "Fixture",
+        types: ["mod"],
+        versions: async () => {
+          calls++;
+          return [
+            { id: "new", publishedAt: "2026-02-01", downloadable: true },
+            { id: "old", publishedAt: "2026-01-01", downloadable: true },
+          ];
+        },
+      },
+    ],
+  });
+  assert.equal((await service.installed(selection)).items.length, 2);
+  assert.equal(calls, 2);
+  const plan = await service.removalPreview({ path: "mods/first.jar" });
+  assert.equal(plan.blocked, false, JSON.stringify(plan));
+  await service.remove({ planId: plan.planId, confirmed: true });
+  const next = await service.installed(selection);
+  assert.equal(next.items.length, 1);
+  assert.equal(next.items[0].update.id, "new");
+  assert.equal(next.items[0].updateCheck, "checked");
+  assert.equal(calls, 2, "unrelated provider work remains cached");
+});
+
+test("Launchpad reserves the shared runtime lock throughout downloads and preserves a refused review", async (t) => {
+  let locked = false,
+    release,
+    entered;
+  const gate = new Promise((resolve) => {
+    release = resolve;
+  });
+  const started = new Promise((resolve) => {
+    entered = resolve;
+  });
+  const f = await fixture(t);
+  const withMinecraftMutation = (work) => {
+    if (locked)
+      throw Object.assign(new Error("Shared runtime operation in progress"), {
+        status: 409,
+      });
+    locked = true;
+    return Promise.resolve()
+      .then(work)
+      .finally(() => {
+        locked = false;
+      });
+  };
+  const direct = await f.boot({
+    withMinecraftMutation,
+    fetch: async (url) => {
+      assert.equal(String(url), "https://cdn.modrinth.com/new.jar");
+      entered();
+      await gate;
+      return new Response(f.newer);
+    },
+    extraProviders: [
+      {
+        id: "direct",
+        name: "Direct",
+        types: ["mod"],
+        downloadHosts: ["cdn.modrinth.com"],
+        resolve: async () => ({
+          title: "New",
+          versionName: "2",
+          dependencies: [],
+          files: [
+            {
+              path: "new.jar",
+              hashes: hashes(f.newer),
+              size: f.newer.length,
+              url: "https://cdn.modrinth.com/new.jar",
+            },
+          ],
+        }),
+      },
+    ],
+  });
+  await fs.writeFile(path.join(f.dataDir, "launchpad/installed.json"), "[]");
+  // Existing file identification may fail, but it cannot authorize replacement.
+  const plan = await direct.preview({ ...selection, platform: "direct" });
+  locked = true;
+  await assert.rejects(
+    direct.install({ planId: plan.planId, confirmed: true }),
+    { status: 409 },
+  );
+  locked = false;
+  const accepted = await direct.install({
+    planId: plan.planId,
+    confirmed: true,
+  });
+  await started;
+  assert.throws(() => withMinecraftMutation(async () => {}), { status: 409 });
+  assert.equal(
+    (await fs.readFile(path.join(f.serverDir, "mods/old.jar"))).toString(),
+    f.old.toString(),
+  );
+  release();
+  for (
+    let i = 0;
+    i < 100 && direct.job(accepted.job.id).job.status !== "completed";
+    i++
+  )
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  assert.equal(direct.job(accepted.job.id).job.status, "completed");
+  assert.equal(locked, false);
+});
+
+for (const operation of ["clear", "replace"])
+  test(`receipt pruning cannot publish an old snapshot after ${operation} commits`, async (t) => {
+    const f = await fixture(t);
+    const original = {
+      path: "mods/old.jar",
+      sha512: hashes(f.old).sha512,
+      platform: "modrinth",
+      projectId: "project",
+      versionId: "old",
+    };
+    await f.service.restoreInstalled([original]);
+    let entered, release;
+    const ready = new Promise((resolve) => {
+      entered = resolve;
+    });
+    const gate = new Promise((resolve) => {
+      release = resolve;
+    });
+    const lstat = fs.lstat.bind(fs);
+    let paused = false;
+    t.mock.method(fs, "lstat", async (target, ...args) => {
+      const result = await lstat(target, ...args);
+      if (
+        !paused &&
+        String(target) === path.join(f.serverDir, "mods/old.jar")
+      ) {
+        paused = true;
+        entered();
+        await gate;
+      }
+      return result;
+    });
+    const scanning = f.service.installed({
+      type: "plugin",
+      loader: "paper",
+      gameVersion: "1.21.1",
+      local: true,
+    });
+    await ready;
+    const replacement = {
+      ...original,
+      path: "mods/new.jar",
+      versionId: "new",
+      sha512: hashes(f.newer).sha512,
+    };
+    if (operation === "clear") await f.service.clearInstalled();
+    else {
+      await fs.writeFile(path.join(f.serverDir, "mods/new.jar"), f.newer);
+      await f.service.restoreInstalled([replacement]);
+    }
+    release();
+    await scanning;
+    const expected = operation === "clear" ? [] : [replacement];
+    assert.deepEqual(f.service.snapshotInstalled(), expected);
+    assert.deepEqual(
+      JSON.parse(
+        await fs.readFile(path.join(f.dataDir, "launchpad/installed.json")),
+      ),
+      expected,
+    );
+  });
+
+test("receipt pruning skips a mutation recycle gap and retains rollback provenance", async (t) => {
+  const f = await fixture(t);
+  let mutating = false;
+  const service = await f.boot({ isContentMutationActive: () => mutating });
+  const receipt = {
+    path: "mods/old.jar",
+    sha512: hashes(f.old).sha512,
+    platform: "modrinth",
+    projectId: "project",
+    versionId: "old",
+  };
+  await service.restoreInstalled([receipt]);
+  mutating = true;
+  await fs.rename(
+    path.join(f.serverDir, "mods/old.jar"),
+    path.join(f.serverDir, "old-recovery.jar"),
+  );
+  await service.installed({ ...selection, local: true });
+  assert.deepEqual(service.snapshotInstalled(), [receipt]);
+  await fs.rename(
+    path.join(f.serverDir, "old-recovery.jar"),
+    path.join(f.serverDir, "mods/old.jar"),
+  );
+  mutating = false;
+  assert.equal(
+    (await service.installed({ ...selection, local: true })).items[0].projectId,
+    "project",
+  );
+});
+
+test("receipt writes persist their queued snapshots in order", async (t) => {
+  const f = await fixture(t);
+  let entered, release;
+  const ready = new Promise((resolve) => {
+    entered = resolve;
+  });
+  const gate = new Promise((resolve) => {
+    release = resolve;
+  });
+  const rename = fs.rename.bind(fs);
+  let calls = 0;
+  t.mock.method(fs, "rename", async (source, destination) => {
+    if (
+      String(destination) ===
+        path.join(f.dataDir, "launchpad/installed.json") &&
+      ++calls === 1
+    ) {
+      entered();
+      await gate;
+    }
+    return rename(source, destination);
+  });
+  const receipt = {
+    path: "mods/old.jar",
+    sha512: hashes(f.old).sha512,
+    platform: "modrinth",
+    projectId: "project",
+    versionId: "old",
+  };
+  const first = f.service.restoreInstalled([receipt]);
+  await ready;
+  const second = f.service.clearInstalled();
+  await new Promise(setImmediate);
+  assert.equal(calls, 1, "the second write waits for the first atomic rename");
+  release();
+  await Promise.all([first, second]);
+  assert.deepEqual(
+    JSON.parse(
+      await fs.readFile(path.join(f.dataDir, "launchpad/installed.json")),
+    ),
+    [],
+  );
+});
+
+test("cancelling a claimed review during asynchronous server validation cannot delete its stage", async (t) => {
+  const f = await fixture(t);
+  let paused = false,
+    entered,
+    release;
+  const ready = new Promise((resolve) => {
+    entered = resolve;
+  });
+  const gate = new Promise((resolve) => {
+    release = resolve;
+  });
+  const service = await f.boot({
+    getServer: async () => {
+      if (paused) {
+        paused = false;
+        entered();
+        await gate;
+      }
+      return {
+        status: "offline",
+        loader: "neoforge",
+        gameVersion: "1.21.1",
+        world: "world",
+      };
+    },
+  });
+  const plan = await service.preview(selection);
+  paused = true;
+  const installing = service.install({ planId: plan.planId, confirmed: true });
+  await ready;
+  await service.cancelPreview(plan.planId);
+  assert.ok(
+    (
+      await fs.stat(path.join(f.dataDir, "launchpad", plan.planId))
+    ).isDirectory(),
+  );
+  release();
+  const accepted = await installing;
+  for (
+    let i = 0;
+    i < 100 &&
+    ["queued", "running"].includes(service.job(accepted.job.id).job.status);
+    i++
+  )
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  assert.equal(service.job(accepted.job.id).job.status, "completed");
 });
