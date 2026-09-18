@@ -179,6 +179,7 @@ export async function findJavaCandidates({
   roots: suppliedRoots,
   registryHomes = windowsRegistryHomes,
   maxDirectories = 4000,
+  managedDir,
 } = {}) {
   const p = platform === "win32" ? path.win32 : path.posix;
   const executable = platform === "win32" ? "java.exe" : "java";
@@ -191,6 +192,24 @@ export async function findJavaCandidates({
   const addRoot = (directory, depth = 3) => {
     if (directory) roots.push({ directory, depth });
   };
+  if (managedDir) {
+    try {
+      const stat = await fs.lstat(managedDir);
+      if (stat.isDirectory() && !stat.isSymbolicLink())
+        for (const entry of await fs.readdir(managedDir, {
+          withFileTypes: true,
+        }))
+          if (
+            entry.isDirectory() &&
+            /^temurin-\d+-windows-(?:x64|aarch64)-[a-f0-9]{16}$/.test(
+              entry.name,
+            )
+          )
+            addRoot(p.join(managedDir, entry.name), 4);
+    } catch {
+      /* Managed Java is optional until the first installation. */
+    }
+  }
   if (preferredPath && /[\\/]/.test(preferredPath))
     candidates.add(unquote(preferredPath));
   for (const [name, value] of Object.entries(env))

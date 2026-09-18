@@ -10,6 +10,7 @@ files:
   - server/import.mjs
   - server/server-setup.mjs
   - server/java-discovery.mjs
+  - server/java-installation.mjs
   - server/launcher-stop.mjs
   - server/connection.mjs
   - server/server-icon.mjs

@@ -514,6 +514,255 @@ test("missing compatible Java blocks review until a refreshed scan finds an inst
   expect(setup.created).toHaveLength(0);
 });
 
+test("missing Java can be installed with progress, then selected automatically for review", async ({
+  page,
+  setup,
+}, testInfo) => {
+  const managedJava = {
+    ...javaInstallations[0],
+    path: "C:\\MC Panel\\java-runtimes\\temurin-21\\bin\\java.exe",
+  };
+  let installed = false;
+  let finish = false;
+  const installRequests: Record<string, unknown>[] = [];
+  const job = {
+    id: "java-install-21",
+    status: "running",
+    message: "Downloading Java 21…",
+    majorVersion: 21,
+    downloadedBytes: 1024,
+    totalBytes: 2048,
+  };
+  await page.route("**/api/server-setup/java?**", (route) =>
+    route.fulfill({
+      json: {
+        ...javaCatalog,
+        installations: installed ? [managedJava] : [],
+        recommendedPath: installed ? managedJava.path : null,
+        installSupported: true,
+      },
+    }),
+  );
+  await page.route("**/api/server-setup/java/install", (route) => {
+    installRequests.push(route.request().postDataJSON());
+    return route.fulfill({ status: 202, json: { job } });
+  });
+  await page.route("**/api/server-setup/java/jobs/*", (route) => {
+    installed = finish;
+    return route.fulfill({
+      json: {
+        job: installed
+          ? {
+              ...job,
+              status: "completed",
+              message: "Java 21 is ready.",
+              java: managedJava,
+            }
+          : job,
+      },
+    });
+  });
+  await openCreate(page);
+  await choosePaper(page);
+  const dialog = page.getByRole("dialog");
+  const review = dialog.getByRole("button", {
+    name: "Review installation",
+    exact: true,
+  });
+  await expect(review).toBeDisabled();
+  await dialog
+    .getByRole("button", { name: "Install Java 21", exact: true })
+    .click();
+  await expect(
+    dialog.getByRole("progressbar", { name: "Java download progress" }),
+  ).toHaveAttribute("value", "1024");
+  await expect(
+    dialog.getByRole("button", { name: "Close add server", exact: true }),
+  ).toBeDisabled();
+  await expect(
+    dialog.getByRole("button", { name: "Back", exact: true }),
+  ).toBeDisabled();
+  await page.keyboard.press("Escape");
+  await expect(dialog).toBeVisible();
+  await page.screenshot({
+    path: testInfo.outputPath("java-install-progress.png"),
+    fullPage: true,
+  });
+  expect(installRequests).toEqual([
+    { gameVersion: "1.21.1", provider: "paper", build: "151" },
+  ]);
+  finish = true;
+  await expect(
+    dialog.getByRole("combobox", { name: "Java executable", exact: true }),
+  ).toHaveValue("21");
+  await expect(dialog.getByRole("status")).toContainText("Java 21 is ready.");
+  await expect(review).toBeEnabled();
+  await review.click();
+  await expect(
+    dialog.getByRole("button", { name: "Create and install", exact: true }),
+  ).toBeVisible();
+  expect(setup.preflightRequests.at(-1)?.javaPath).toBe(managedJava.path);
+  expect(setup.created).toEqual([]);
+  expect(setup.mutations).toEqual(["/api/server-setup/java/install"]);
+});
+
+test("Java installation failures can be retried without selecting an unavailable runtime", async ({
+  page,
+  setup,
+}) => {
+  let attempts = 0;
+  const job = {
+    id: "java-retry",
+    status: "failed",
+    message: "Java download failed.",
+    error: "Download interrupted. Try again.",
+    majorVersion: 21,
+    downloadedBytes: 0,
+    totalBytes: null,
+  };
+  await page.route("**/api/server-setup/java?**", (route) =>
+    route.fulfill({
+      json: {
+        ...javaCatalog,
+        installations: [],
+        recommendedPath: null,
+        installSupported: true,
+      },
+    }),
+  );
+  await page.route("**/api/server-setup/java/install", (route) => {
+    attempts++;
+    return route.fulfill({ status: 202, json: { job } });
+  });
+  await openCreate(page);
+  await choosePaper(page);
+  const dialog = page.getByRole("dialog");
+  const install = dialog.getByRole("button", {
+    name: "Install Java 21",
+    exact: true,
+  });
+  await install.click();
+  await expect(dialog.getByRole("alert")).toContainText("Download interrupted");
+  await expect(
+    dialog.getByRole("button", { name: "Review installation", exact: true }),
+  ).toBeDisabled();
+  await expect(install).toBeEnabled();
+  await install.click();
+  await expect.poll(() => attempts).toBe(2);
+  await expect(
+    dialog.getByRole("button", { name: "Close add server", exact: true }),
+  ).toBeEnabled();
+  expect(setup.preflightRequests).toEqual([]);
+  expect(setup.created).toEqual([]);
+});
+
+test("setup resumes an active Java download after reopening without submitting it twice", async ({
+  page,
+  setup,
+}) => {
+  let finished = false;
+  let submissions = 0;
+  const job = {
+    id: "java-resume",
+    status: "running",
+    message: "Checking Java…",
+    majorVersion: 21,
+    downloadedBytes: 0,
+    totalBytes: null,
+  };
+  await page.route("**/api/server-setup/java?**", (route) =>
+    route.fulfill({
+      json: {
+        ...javaCatalog,
+        installations: finished ? javaInstallations : [],
+        recommendedPath: finished ? java.path : null,
+        installSupported: true,
+        installJob: { ...job, status: finished ? "completed" : "running" },
+      },
+    }),
+  );
+  await page.route("**/api/server-setup/java/install", (route) => {
+    submissions++;
+    return route.fulfill({ status: 202, json: { job } });
+  });
+  await page.route("**/api/server-setup/java/jobs/*", (route) => {
+    finished = true;
+    return route.fulfill({
+      json: {
+        job: { ...job, status: "completed", message: "Java 21 is ready." },
+      },
+    });
+  });
+  await openCreate(page);
+  await choosePaper(page);
+  const dialog = page.getByRole("dialog");
+  await expect(
+    dialog.getByRole("combobox", { name: "Java executable", exact: true }),
+  ).toHaveValue("21");
+  await expect(
+    dialog.getByRole("button", { name: "Review installation", exact: true }),
+  ).toBeEnabled();
+  expect(submissions).toBe(0);
+  expect(setup.created).toEqual([]);
+});
+
+test("Java setup does not offer an unknown requirement or follow another release's download", async ({
+  page,
+  setup,
+}) => {
+  let known = false;
+  const polls: string[] = [];
+  await page.route("**/api/server-setup/java?**", (route) =>
+    route.fulfill({
+      json: {
+        ...javaCatalog,
+        installations: known ? javaInstallations : [],
+        recommendedPath: known ? java.path : null,
+        requiredJavaVersion: known ? 21 : null,
+        requirement: known ? "Java 21" : "Java requirement unavailable",
+        installSupported: true,
+        installJob: {
+          id: "other-java-download",
+          status: "running",
+          majorVersion: 8,
+          message: "Downloading Java 8…",
+          downloadedBytes: 0,
+          totalBytes: null,
+        },
+      },
+    }),
+  );
+  await page.route("**/api/server-setup/java/jobs/*", (route) => {
+    polls.push(route.request().url());
+    return route.fulfill({
+      status: 500,
+      json: { error: "Unrelated job must not be followed." },
+    });
+  });
+  await openCreate(page);
+  await choosePaper(page);
+  const dialog = page.getByRole("dialog");
+  await expect(dialog).toContainText("Java requirement unavailable");
+  await expect(
+    dialog.getByRole("button", { name: /Install Java/ }),
+  ).toHaveCount(0);
+  await expect(
+    dialog.getByRole("button", { name: "Close add server", exact: true }),
+  ).toBeEnabled();
+  known = true;
+  await dialog
+    .getByRole("button", { name: "Refresh Java", exact: true })
+    .click();
+  await expect(
+    dialog.getByRole("combobox", { name: "Java executable", exact: true }),
+  ).toHaveValue("21");
+  await expect(
+    dialog.getByRole("button", { name: "Review installation", exact: true }),
+  ).toBeEnabled();
+  expect(polls).toEqual([]);
+  expect(setup.created).toEqual([]);
+});
+
 test("software catalog errors retry and cancellation leaves the fleet empty", async ({
   page,
   setup,

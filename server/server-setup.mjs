@@ -11,6 +11,7 @@ import { totalmem, freemem } from "node:os";
 import { createVersionsService } from "./versions.mjs";
 import { createLaunchpad, providerJson } from "./launchpad.mjs";
 import { createExtraProviders } from "./launchpad-extra.mjs";
+import { createJavaInstallation } from "./java-installation.mjs";
 
 const fail = (status, message) => Object.assign(new Error(message), { status });
 const emptyServer = async () => ({
@@ -116,8 +117,28 @@ export async function createServerSetup({ dataDir, safePath, ...options }) {
           preferredPath: options.javaPath,
           ...options.javaDiscoveryOptions,
         }));
-  async function javaRequirement(input = {}) {
-    const required = input.requiredJavaVersion;
+  const managedJava = createJavaDiscovery({
+    env: {},
+    roots: [],
+    managedDir: path.join(dataDir, "java-runtimes"),
+    probe: javaProbe,
+  });
+  async function allJava(refresh = false) {
+    const [managed, detected] = await Promise.all([
+      managedJava({ refresh }),
+      discoverJava({ refresh }),
+    ]);
+    const unique = new Map();
+    for (const java of [...managed, ...detected])
+      if (java.path)
+        unique.set(
+          process.platform === "win32" ? java.path.toLowerCase() : java.path,
+          java,
+        );
+    return [...unique.values()];
+  }
+  async function javaRequirement(input = {}, { officialOnly = false } = {}) {
+    const required = officialOnly ? undefined : input.requiredJavaVersion;
     if (
       required !== undefined &&
       (!Number.isInteger(required) || required < 8 || required > 100)
@@ -128,6 +149,11 @@ export async function createServerSetup({ dataDir, safePath, ...options }) {
       (typeof input.gameVersion !== "string" || input.gameVersion.length > 128)
     )
       throw fail(400, "Choose a Minecraft release.");
+    if (
+      input.build !== undefined &&
+      (typeof input.build !== "string" || input.build.length > 128)
+    )
+      throw fail(400, "Choose a Minecraft build.");
     let requiredJavaVersion = required ?? null;
     const warnings = [];
     if (!requiredJavaVersion && input.gameVersion) {
@@ -137,10 +163,25 @@ export async function createServerSetup({ dataDir, safePath, ...options }) {
             input.provider,
             input.gameVersion,
           );
+          const selected = input.build
+            ? catalog.builds.find((build) => build.id === input.build)
+            : null;
+          if (input.build && !selected)
+            throw fail(
+              400,
+              "This Minecraft build is no longer available. Choose it again.",
+            );
           requiredJavaVersion =
-            catalog.builds.find((build) => Number.isInteger(build.javaVersion))
-              ?.javaVersion ?? null;
-        } catch {}
+            selected?.javaVersion ??
+            (input.build
+              ? null
+              : catalog.builds.find((build) =>
+                  Number.isInteger(build.javaVersion),
+                )?.javaVersion) ??
+            null;
+        } catch (cause) {
+          if (officialOnly && input.build) throw cause;
+        }
       }
       if (!requiredJavaVersion)
         try {
@@ -171,9 +212,29 @@ export async function createServerSetup({ dataDir, safePath, ...options }) {
       warnings,
     };
   }
+  const javaInstaller = createJavaInstallation({
+    dataDir,
+    safePath,
+    probe: javaProbe,
+    signal: lifetime.signal,
+    ...options.javaInstallationOptions,
+    requirement: async (input) => {
+      if (
+        !versions
+          .listProviders()
+          .some((provider) => provider.id === input.provider) &&
+        input.provider !== "vanilla"
+      )
+        throw fail(400, "Choose an available Minecraft server software.");
+      return javaRequirement(input, { officialOnly: true });
+    },
+    onInstalled: async () => {
+      await managedJava({ refresh: true });
+    },
+  });
   async function javaInstallations(input = {}) {
     const [detected, requirement] = await Promise.all([
-      discoverJava({ refresh: input.refresh === true }),
+      allJava(input.refresh === true),
       javaRequirement(input),
     ]);
     const validated = detected.filter(
@@ -195,6 +256,7 @@ export async function createServerSetup({ dataDir, safePath, ...options }) {
     }));
     return {
       ...requirement,
+      ...javaInstaller.support(),
       installations,
       recommendedPath: installations[0]?.path ?? null,
       detectedCount: validated.length,
@@ -215,7 +277,7 @@ export async function createServerSetup({ dataDir, safePath, ...options }) {
     let java;
     if (input.javaPath !== undefined) java = await javaProbe(input.javaPath);
     else {
-      const detected = await discoverJava();
+      const detected = await allJava();
       java = detected.find((entry) =>
         compatibleJava(entry, requiredJavaVersion),
       ) ?? {
@@ -362,6 +424,7 @@ export async function createServerSetup({ dataDir, safePath, ...options }) {
           await javaInstallations({
             gameVersion: req.query.gameVersion || undefined,
             provider: req.query.provider || undefined,
+            build: req.query.build || undefined,
             requiredJavaVersion:
               req.query.requiredJavaVersion === undefined
                 ? undefined
@@ -369,6 +432,18 @@ export async function createServerSetup({ dataDir, safePath, ...options }) {
             refresh: req.query.refresh === "1",
           }),
         ),
+      ),
+    );
+    app.post(
+      "/api/server-setup/java/install",
+      endpoint(async (req, res) =>
+        res.status(202).json({ job: javaInstaller.install(req.body) }),
+      ),
+    );
+    app.get(
+      "/api/server-setup/java/jobs/:id",
+      endpoint(async (req, res) =>
+        res.json({ job: javaInstaller.job(req.params.id) }),
       ),
     );
     app.get(
@@ -430,6 +505,7 @@ export async function createServerSetup({ dataDir, safePath, ...options }) {
     },
     async close() {
       lifetime.abort(fail(503, "Server setup is shutting down."));
+      await javaInstaller.close();
       await Promise.allSettled(
         [...activeReviews].map((closeReview) => closeReview()),
       );

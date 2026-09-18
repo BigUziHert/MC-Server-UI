@@ -3101,6 +3101,13 @@ test("Modrinth packs replace old data with the verified runtime and server pack 
     "mods/server.jar",
   ]);
   assert.match(plan.warnings.join(" "), /client-only/);
+  assert.equal(
+    f.requests.filter(
+      ({ url }) => new URL(url).pathname === "/v2/version_files",
+    ).length,
+    0,
+    "valid mrpack environments need no checksum environment lookups",
+  );
   assert.equal(plan.cleanInstall, true);
   assert.equal(plan.runtime.build, "21.1.200");
   assert.equal(plan.summary.fileCount, 3);
@@ -3159,6 +3166,228 @@ test("Modrinth packs replace old data with the verified runtime and server pack 
       .every((item) => !item.author),
     "pack authors are not falsely assigned to bundled mods",
   );
+});
+
+function configureMrpack(f, files) {
+  const manifest = {
+    formatVersion: 1,
+    game: "minecraft",
+    name: "Unknown environments fixture",
+    versionId: "2",
+    dependencies: { minecraft: "1.21.1", neoforge: "21.1.200" },
+    files,
+  };
+  const archive = zip([["modrinth.index.json", JSON.stringify(manifest)]]);
+  f.downloads.set("https://cdn.modrinth.com/pack.mrpack", archive);
+  f.versions.new.files = [
+    {
+      filename: "pack.mrpack",
+      url: "https://cdn.modrinth.com/pack.mrpack",
+      hashes: hashes(archive),
+      size: archive.length,
+      primary: true,
+    },
+  ];
+}
+const unknownPackFile = (name, data, overrides = {}) => ({
+  path: `mods/${name}.jar`,
+  hashes: hashes(data),
+  downloads: ["https://cdn.modrinth.com/new.jar"],
+  fileSize: data.length,
+  env: { server: "unknown", client: "unknown" },
+  ...overrides,
+});
+const identifiedPackFile = (file, environment, overrides = {}) => ({
+  id: "matched-release",
+  project_id: "matched-project",
+  game_versions: ["1.21.1"],
+  loaders: ["neoforge"],
+  environment,
+  files: [{ hashes: file.hashes }],
+  ...overrides,
+});
+
+test("Modrinth packs classify unknown environments by exact checksums while switching loaders", async (t) => {
+  const candidates = [
+    [unknownPackFile("server", bytes("server")), "server_only"],
+    [unknownPackFile("statuseffectbars", bytes("client")), "client_only"],
+    [
+      unknownPackFile("optional", bytes("optional")),
+      "client_only_server_optional",
+    ],
+    [
+      unknownPackFile("singleplayer", bytes("singleplayer")),
+      "singleplayer_only",
+    ],
+    [
+      unknownPackFile("legacy-sha1", bytes("legacy"), {
+        hashes: { sha1: hashes(bytes("legacy")).sha1 },
+      }),
+      "client_and_server",
+    ],
+  ];
+  const batches = [];
+  const f = await fixture(t, {
+    type: "modpack",
+    request: async (url, init) => {
+      if (new URL(url).pathname !== "/v2/version_files") return;
+      const batch = JSON.parse(init.body);
+      batches.push(batch);
+      return Response.json(
+        Object.fromEntries(
+          candidates
+            .filter(([file]) =>
+              batch.hashes.includes(file.hashes[batch.algorithm]),
+            )
+            .map(([file, environment]) => [
+              file.hashes[batch.algorithm],
+              identifiedPackFile(file, environment),
+            ]),
+        ),
+      );
+    },
+  });
+  f.setServer({ loader: "fabric" });
+  configureMrpack(
+    f,
+    candidates.map(([file]) => file),
+  );
+  const plan = await f.service.preview({ ...selection, type: "modpack" });
+  assert.deepEqual(
+    plan.files.map((file) => file.path),
+    ["mods/server.jar", "mods/legacy-sha1.jar"],
+  );
+  assert.deepEqual(
+    batches.map((batch) => [batch.algorithm, batch.hashes.length]),
+    [
+      ["sha512", 4],
+      ["sha1", 1],
+    ],
+  );
+  assert.match(
+    plan.warnings.join("\n"),
+    /Skipped mods\/statuseffectbars.jar: client-only/,
+  );
+  assert.match(
+    plan.warnings.join("\n"),
+    /Skipped mods\/optional.jar: optional server file/,
+  );
+  assert.equal(plan.runtime.provider, "neoforge");
+  assert.equal(f.mutations, 0);
+  assert.deepEqual(
+    await fs.readFile(path.join(f.serverDir, "mods/old.jar")),
+    f.old,
+  );
+});
+
+for (const failure of [
+  "unidentified",
+  "mismatched hash",
+  "wrong loader",
+  "wrong Minecraft version",
+  "unknown support",
+  "provider missing",
+  "provider unavailable",
+]) {
+  test(`Modrinth packs reject unknown environments with ${failure} without changing the server`, async (t) => {
+    const file = unknownPackFile("unverified", bytes("unverified"));
+    const f = await fixture(t, {
+      type: "modpack",
+      request: async (url) => {
+        if (new URL(url).pathname !== "/v2/version_files") return;
+        if (failure === "provider missing")
+          return new Response(null, { status: 404 });
+        if (failure === "provider unavailable")
+          return new Response(null, { status: 503 });
+        if (failure === "unidentified") return Response.json({});
+        const match = identifiedPackFile(file, "server_only");
+        if (failure === "mismatched hash")
+          match.files = [{ hashes: hashes(bytes("different")) }];
+        if (failure === "wrong loader") match.loaders = ["fabric"];
+        if (failure === "wrong Minecraft version")
+          match.game_versions = ["1.20.1"];
+        if (failure === "unknown support") match.environment = "unknown";
+        return Response.json({ [file.hashes.sha512]: match });
+      },
+    });
+    configureMrpack(f, [file]);
+    await assert.rejects(
+      f.service.preview({ ...selection, type: "modpack" }),
+      (cause) => {
+        assert.equal(cause.status, failure.startsWith("provider") ? 502 : 400);
+        assert.match(cause.message, /mods\/unverified.jar/);
+        assert.match(
+          cause.message,
+          /check server support|exact release could not be verified/,
+        );
+        return true;
+      },
+    );
+    assert.equal(f.mutations, 0);
+    assert.deepEqual(
+      await fs.readFile(path.join(f.serverDir, "mods/old.jar")),
+      f.old,
+    );
+  });
+}
+
+test("Modrinth unknown environment recovery retains path, hash and host validation", async (t) => {
+  const matches = {};
+  const f = await fixture(t, {
+    type: "modpack",
+    request: async (url) =>
+      new URL(url).pathname === "/v2/version_files"
+        ? Response.json(matches)
+        : undefined,
+  });
+  for (const [overrides, expected] of [
+    [{ path: "../escape.jar" }, /path|relative|folder|traversal/i],
+    [{ hashes: { sha512: "not-a-checksum" } }, /valid checksum/],
+    [{ downloads: ["https://evil.example/mod.jar"] }, /unsupported host/],
+    [
+      { env: { server: "maybe" } },
+      /invalid server-side dependency metadata for mods\/guarded.jar/,
+    ],
+  ]) {
+    const file = unknownPackFile("guarded", bytes("guarded"), overrides);
+    matches[file.hashes.sha512] = identifiedPackFile(file, "server_only");
+    configureMrpack(f, [file]);
+    await assert.rejects(
+      f.service.preview({ ...selection, type: "modpack" }),
+      expected,
+    );
+  }
+  assert.equal(f.mutations, 0);
+});
+
+test("Modrinth unknown environment checksum lookups use bounded batches", async (t) => {
+  const files = Array.from({ length: 101 }, (_, index) =>
+    unknownPackFile(`mod-${index}`, bytes(`mod-${index}`)),
+  );
+  const batches = [];
+  const f = await fixture(t, {
+    type: "modpack",
+    request: async (url, init) => {
+      if (new URL(url).pathname !== "/v2/version_files") return;
+      const batch = JSON.parse(init.body);
+      batches.push(batch.hashes.length);
+      return Response.json(
+        Object.fromEntries(
+          files
+            .filter((file) => batch.hashes.includes(file.hashes.sha512))
+            .map((file) => [
+              file.hashes.sha512,
+              identifiedPackFile(file, "server_only"),
+            ]),
+        ),
+      );
+    },
+  });
+  configureMrpack(f, files);
+  const plan = await f.service.preview({ ...selection, type: "modpack" });
+  assert.equal(plan.files.length, 101);
+  assert.deepEqual(batches, [100, 1]);
+  assert.equal(f.mutations, 0);
 });
 
 test("ZIP traversal, Windows aliases, links and duplicate entries are rejected inside private staging", async (t) => {

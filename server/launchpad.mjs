@@ -1627,16 +1627,110 @@ export async function createLaunchpad(ctx) {
         gameVersion: input.gameVersion,
         loaderVersion: String(manifest.dependencies[declared[0]]),
       };
+      // Some exporters write "unknown", which is not an mrpack side value.
+      // Resolve only those entries by checksum; never infer server support from
+      // their filename, download URL, or the pack's overall environment.
+      const unknownFiles = manifest.files
+        .filter((file) => file.env?.server === "unknown")
+        .map((file) => {
+          const name = safeInstallPath(file.path);
+          let algorithm, hash;
+          try {
+            [algorithm, hash] = strongestHash({
+              sha512: file.hashes?.sha512,
+              sha1: file.hashes?.sha1,
+            });
+          } catch {
+            throw error(
+              400,
+              `The pack does not provide a valid checksum to verify server support for ${name}.`,
+            );
+          }
+          return { file, name, algorithm, hash };
+        });
+      const resolvedEnvironments = new Map();
+      if (unknownFiles.length) {
+        const signal = AbortSignal.any([
+          input.signal,
+          AbortSignal.timeout(15000),
+        ]);
+        const environments = new Map([
+          ["client_only", "unsupported"],
+          ["singleplayer_only", "unsupported"],
+          ["client_only_server_optional", "optional"],
+          ["client_or_server", "optional"],
+          ["client_or_server_prefers_both", "optional"],
+          ["client_and_server", "required"],
+          ["server_only", "required"],
+          ["server_only_client_optional", "required"],
+          ["dedicated_server_only", "required"],
+        ]);
+        for (const algorithm of ["sha512", "sha1"]) {
+          const candidates = unknownFiles.filter(
+            (file) => file.algorithm === algorithm,
+          );
+          for (let offset = 0; offset < candidates.length; offset += 100) {
+            const batch = candidates.slice(offset, offset + 100);
+            let matches;
+            try {
+              matches = await abortable(
+                providerJson("https://api.modrinth.com/v2/version_files", {
+                  fetch: request,
+                  method: "POST",
+                  headers: { "Content-Type": "application/json" },
+                  body: JSON.stringify({
+                    hashes: [...new Set(batch.map((file) => file.hash))],
+                    algorithm,
+                  }),
+                  signal,
+                }),
+                signal,
+              );
+            } catch {
+              input.signal.throwIfAborted();
+              throw error(
+                502,
+                `Could not check server support for ${batch[0].name}. Try again shortly or choose another modpack release.`,
+              );
+            }
+            for (const file of batch) {
+              const version = matches?.[file.hash];
+              const environment = environments.get(version?.environment);
+              if (
+                !environment ||
+                !Array.isArray(version.game_versions) ||
+                !version.game_versions.includes(input.gameVersion) ||
+                !Array.isArray(version.loaders) ||
+                !version.loaders.includes(input.loader) ||
+                !Array.isArray(version.files) ||
+                !version.files.some(
+                  (download) =>
+                    typeof download.hashes?.[algorithm] === "string" &&
+                    download.hashes[algorithm].toLowerCase() === file.hash,
+                )
+              )
+                throw error(
+                  400,
+                  `The pack does not declare server support for ${file.name}, and its exact release could not be verified. Choose another modpack release or ask its author to correct the manifest.`,
+                );
+              resolvedEnvironments.set(file.file, environment);
+            }
+          }
+        }
+      }
       for (const file of manifest.files) {
         const name = safeInstallPath(file.path);
-        const environment = file.env?.server;
+        const environment =
+          file.env?.server === "unknown"
+            ? resolvedEnvironments.get(file)
+            : file.env?.server;
         if (
-          environment &&
+          environment !== undefined &&
           !["required", "optional", "unsupported"].includes(environment)
         )
           throw error(
             400,
-            "The pack has invalid server-side dependency metadata.",
+            `The pack has invalid server-side dependency metadata for ${name}.`,
           );
         if (environment === "unsupported" || environment === "optional") {
           warnings.push(

@@ -6,6 +6,7 @@ import os from "node:os";
 import { createHash, randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
 import { PassThrough } from "node:stream";
+import { crc32 } from "node:zlib";
 import { createFleet } from "./index.mjs";
 import { probeJava } from "./server-setup.mjs";
 import { createLaunchpad } from "./launchpad.mjs";
@@ -31,6 +32,34 @@ const requestBody = (extra = {}) => ({
   configuration,
   ...extra,
 });
+
+function javaArchive() {
+  const name = Buffer.from("jdk-21/bin/java.exe"),
+    bytes = Buffer.from("test Java executable; never run");
+  const local = Buffer.alloc(30),
+    central = Buffer.alloc(46),
+    end = Buffer.alloc(22);
+  local.writeUInt32LE(0x04034b50);
+  local.writeUInt16LE(20, 4);
+  local.writeUInt32LE(crc32(bytes), 14);
+  local.writeUInt32LE(bytes.length, 18);
+  local.writeUInt32LE(bytes.length, 22);
+  local.writeUInt16LE(name.length, 26);
+  central.writeUInt32LE(0x02014b50);
+  central.writeUInt16LE(0x314, 4);
+  central.writeUInt16LE(20, 6);
+  central.writeUInt32LE(crc32(bytes), 16);
+  central.writeUInt32LE(bytes.length, 20);
+  central.writeUInt32LE(bytes.length, 24);
+  central.writeUInt16LE(name.length, 28);
+  central.writeUInt32LE((0o100644 << 16) >>> 0, 38);
+  end.writeUInt32LE(0x06054b50);
+  end.writeUInt16LE(1, 8);
+  end.writeUInt16LE(1, 10);
+  end.writeUInt32LE(central.length + name.length, 12);
+  end.writeUInt32LE(local.length + name.length + bytes.length, 16);
+  return Buffer.concat([local, name, bytes, central, name, end]);
+}
 const versionService = () => ({
   listProviders: () => [{ id: "paper", name: "Paper", installable: true }],
   versions: async () => ({ versions: [{ id: "1.21.1", stable: true }] }),
@@ -957,6 +986,117 @@ test("Java selection exposes only compatible installed runtimes and refreshes wi
   );
   assert.equal((await f.request("/api/servers")).body.servers.length, 0);
 });
+
+test(
+  "Java install uses the selected build's official requirement and managed discovery survives restart",
+  { skip: process.platform !== "win32" },
+  async (t) => {
+    const archive = javaArchive();
+    const requested = [];
+    const f = await fixture(t, {
+      javaDiscovery: async () => [],
+      javaProbe: async (executable) => {
+        try {
+          await fs.access(executable);
+          return { ...java, path: executable, architecture: "amd64" };
+        } catch {
+          return { path: executable, available: false };
+        }
+      },
+      versionsService: {
+        ...versionService(),
+        builds: async () => ({
+          builds: [
+            { id: "other", javaVersion: 17 },
+            { id: "selected", javaVersion: 21 },
+          ],
+        }),
+      },
+      javaInstallationOptions: {
+        platform: "win32",
+        arch: "x64",
+        request: async (url) => {
+          requested.push(String(url));
+          if (new URL(url).hostname === "api.adoptium.net")
+            return Response.json([
+              {
+                vendor: "eclipse",
+                version: { major: 21, openjdk_version: "21.0.4" },
+                binary: {
+                  os: "windows",
+                  architecture: "x64",
+                  image_type: "jdk",
+                  jvm_impl: "hotspot",
+                  heap_size: "normal",
+                  project: "jdk",
+                  package: {
+                    name: "java.zip",
+                    size: archive.length,
+                    checksum: createHash("sha256")
+                      .update(archive)
+                      .digest("hex"),
+                    link: "https://github.com/adoptium/temurin21-binaries/releases/download/test/java.zip",
+                  },
+                },
+              },
+            ]);
+          return new Response(archive);
+        },
+      },
+    });
+    const before = await f.request(
+      "/api/server-setup/java?gameVersion=1.21.1&provider=paper&build=selected",
+    );
+    assert.equal(before.body.installSupported, true);
+    assert.equal(before.body.requiredJavaVersion, 21);
+    assert.deepEqual(before.body.installations, []);
+    const accepted = await f.request(
+      "/api/server-setup/java/install",
+      json("POST", {
+        gameVersion: "1.21.1",
+        provider: "paper",
+        build: "selected",
+        requiredJavaVersion: 8,
+        url: "https://untrusted.invalid/download.exe",
+        javaPath: "C:/arbitrary.exe",
+      }),
+    );
+    assert.equal(accepted.status, 202, JSON.stringify(accepted.body));
+    let job;
+    for (let attempt = 0; attempt < 100; attempt++) {
+      job = (
+        await f.request(`/api/server-setup/java/jobs/${accepted.body.job.id}`)
+      ).body.job;
+      if (["failed", "completed"].includes(job.status)) break;
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.equal(job.status, "completed", JSON.stringify(job));
+    assert.equal(job.majorVersion, 21);
+    assert.ok(requested[0].includes("/latest/21/hotspot"), requested[0]);
+    assert.ok(job.java.path.startsWith(path.join(f.root, "java-runtimes")));
+    let choices = (
+      await f.request(
+        "/api/server-setup/java?gameVersion=1.21.1&provider=paper&build=selected&refresh=1",
+      )
+    ).body;
+    assert.deepEqual(
+      choices.installations.map((value) => value.path),
+      [job.java.path],
+    );
+    assert.equal((await f.request("/api/servers")).body.servers.length, 0);
+    await f.restart();
+    choices = (
+      await f.request(
+        "/api/server-setup/java?gameVersion=1.21.1&provider=paper&build=selected",
+      )
+    ).body;
+    assert.deepEqual(
+      choices.installations.map((value) => value.path),
+      [job.java.path],
+    );
+    assert.equal(choices.installJob, null);
+  },
+);
 
 test("bootstrap avoids a stale default path and review rechecks the selected executable", async (t) => {
   const selected = {

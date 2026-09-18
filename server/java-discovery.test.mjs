@@ -70,6 +70,24 @@ test("discovery respects root depth instead of searching arbitrary application d
   assert.deepEqual(candidates, [shallow.executable]);
 });
 
+test("managed Java discovery survives a fresh scan and excludes incomplete installation stages", async (t) => {
+  const f = await fixture(t);
+  const installed = await f.create(
+    "java-runtimes/temurin-21-windows-x64-0123456789abcdef/jdk-21",
+  );
+  await f.create("java-runtimes/.install-unfinished/runtime/jdk-21");
+  const options = {
+    env: {},
+    roots: [],
+    homeDir: f.root,
+    managedDir: path.join(f.root, "java-runtimes"),
+  };
+  assert.deepEqual(await findJavaCandidates(options), [installed.executable]);
+  assert.deepEqual(await findJavaCandidates({ ...options }), [
+    installed.executable,
+  ]);
+});
+
 test("validated discovery drops failed probes, deduplicates launch shims, caches and refreshes", async (t) => {
   const f = await fixture(t);
   const installed = await f.create("jdk21");

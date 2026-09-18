@@ -16,7 +16,7 @@ import {
   Terminal,
   X,
 } from "lucide-react";
-import { api } from "./api";
+import { api, formatBytes } from "./api";
 import type { ServerRecord } from "./ServerManager";
 import SearchField from "./SearchField";
 import { SoftwareIcon } from "./pages/Versions";
@@ -69,6 +69,18 @@ type JavaChoices = {
   requiredJavaVersion: number | null;
   requirement: string;
   warnings: string[];
+  installSupported?: boolean;
+  installMessage?: string;
+  installJob?: JavaInstallJob;
+};
+type JavaInstallJob = {
+  id: string;
+  status: "queued" | "running" | "completed" | "failed";
+  message: string;
+  majorVersion: number | null;
+  downloadedBytes: number;
+  totalBytes: number | null;
+  error?: string;
 };
 type Catalog = {
   providers: Provider[];
@@ -236,6 +248,10 @@ export default function NewServerWizard({
   const [javaError, setJavaError] = useState("");
   const [javaRefresh, setJavaRefresh] = useState(0);
   const [javaChoicesKey, setJavaChoicesKey] = useState("");
+  const [javaInstallJob, setJavaInstallJob] = useState<JavaInstallJob | null>(
+    null,
+  );
+  const [javaInstallError, setJavaInstallError] = useState("");
   const [port, setPort] = useState(() => {
     let next = 25565;
     while (servers.some((s) => s.port === next)) next++;
@@ -280,6 +296,7 @@ export default function NewServerWizard({
     gameVersion,
     provider: kind === "software" ? provider?.id || "" : packLoader,
     requiredJavaVersion: kind === "software" ? build?.javaVersion || "" : "",
+    build: kind === "software" ? buildId : "",
   });
   const selectedJava =
     javaChoicesKey === javaSelectionKey
@@ -287,6 +304,10 @@ export default function NewServerWizard({
           (item) => item.majorVersion === javaMajor,
         )
       : undefined;
+  const canInstallJava =
+    javaChoices?.installSupported &&
+    Number.isInteger(javaChoices.requiredJavaVersion) &&
+    (javaChoices.requiredJavaVersion ?? 0) >= 8;
   const displayStep = ["source", "catalog"].includes(step)
     ? 0
     : step === "configure"
@@ -353,6 +374,15 @@ export default function NewServerWizard({
               installations[0]?.majorVersion ||
               null,
         );
+        if (
+          result.installJob &&
+          ["queued", "running"].includes(result.installJob.status) &&
+          !installations.length &&
+          result.installJob.majorVersion === result.requiredJavaVersion &&
+          result.requiredJavaVersion !== null &&
+          !busyRef.current
+        )
+          void installJava(result.installJob);
       })
       .catch((cause) => {
         if (!cancel.signal.aborted) setJavaError(message(cause));
@@ -551,6 +581,45 @@ export default function NewServerWizard({
     setMemory(String(suggestion));
     setStep("configure");
     setError("");
+    setJavaInstallJob(null);
+    setJavaInstallError("");
+  }
+  async function installJava(resume?: JavaInstallJob) {
+    if (busyRef.current) return;
+    busyRef.current = true;
+    setBusy(true);
+    setJavaInstallError("");
+    try {
+      let job =
+        resume ||
+        (
+          await request<{ job: JavaInstallJob }>("/server-setup/java/install", {
+            gameVersion,
+            provider: kind === "software" ? provider?.id : packLoader,
+            ...(kind === "software" ? { build: buildId } : {}),
+          })
+        ).job;
+      setJavaInstallJob(job);
+      while (job.status === "queued" || job.status === "running") {
+        await wait(controller.current.signal);
+        const result = await request<{ job: JavaInstallJob }>(
+          `/server-setup/java/jobs/${encodeURIComponent(job.id)}`,
+        );
+        job = result.job;
+        setJavaInstallJob(job);
+      }
+      if (job.status === "failed")
+        throw new Error(
+          job.error || "Java could not be installed. Please try again.",
+        );
+      setJavaRefresh((value) => value + 1);
+    } catch (cause) {
+      if (!controller.current.signal.aborted)
+        setJavaInstallError(message(cause));
+    } finally {
+      busyRef.current = false;
+      if (!controller.current.signal.aborted) setBusy(false);
+    }
   }
   async function saveKey() {
     if (!apiKey.trim() || busyRef.current) return;
@@ -1535,8 +1604,67 @@ export default function NewServerWizard({
                   ? javaError
                   : javaChoices?.installations.length
                     ? javaChoices.requirement
-                    : `${javaChoices?.requirement || "A compatible Java runtime is required."} Install it on this PC, then select Refresh Java.`}
+                    : canInstallJava
+                      ? `${javaChoices.requirement} is needed for this Minecraft version.`
+                      : `${javaChoices?.requirement || "A compatible Java runtime is required."} Install it on this PC, then select Refresh Java.`}
             </small>
+            {!javaLoading && !selectedJava && canInstallJava && (
+              <div className="setup-java-install">
+                <button
+                  className="btn primary"
+                  type="button"
+                  disabled={busy}
+                  onClick={() =>
+                    void installJava(
+                      javaInstallJob &&
+                        ["queued", "running"].includes(javaInstallJob.status)
+                        ? javaInstallJob
+                        : undefined,
+                    )
+                  }
+                >
+                  {busy ? (
+                    <LoaderCircle size={15} className="spin" />
+                  ) : (
+                    <Download size={15} />
+                  )}
+                  {busy
+                    ? "Installing Java…"
+                    : `Install Java ${javaChoices.requiredJavaVersion}`}
+                </button>
+                <small>
+                  Downloads Eclipse Temurin for MC Panel. No administrator
+                  access needed.
+                </small>
+              </div>
+            )}
+            {!selectedJava && javaChoices?.installMessage && (
+              <small>{javaChoices.installMessage}</small>
+            )}
+            {javaInstallJob && (
+              <div
+                className="setup-java-progress"
+                role="status"
+                aria-live="polite"
+              >
+                <span>{javaInstallJob.message}</span>
+                {javaInstallJob.status === "running" &&
+                  javaInstallJob.totalBytes && (
+                    <>
+                      <progress
+                        value={javaInstallJob.downloadedBytes}
+                        max={javaInstallJob.totalBytes}
+                        aria-label="Java download progress"
+                      />
+                      <small>
+                        {formatBytes(javaInstallJob.downloadedBytes)} /{" "}
+                        {formatBytes(javaInstallJob.totalBytes)}
+                      </small>
+                    </>
+                  )}
+              </div>
+            )}
+            {javaInstallError && <small role="alert">{javaInstallError}</small>}
             {javaChoices?.warnings.map((warning) => (
               <small key={warning}>{warning}</small>
             ))}
