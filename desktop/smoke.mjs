@@ -36,10 +36,75 @@ let profileDirectory;
 let temporaryRoot;
 let currentOrigin;
 let downloadDirectory;
+let smokeProcessPath;
+let smokeProcessEvents;
 let failed = false;
 
 function step(message) {
   console.log(`[desktop smoke] ${message}`);
+}
+
+const serverButton = (page, id) =>
+  page.locator(`button[data-server-id="${id}"]`);
+async function selectSmokeServer(page, id) {
+  const selector = page.getByRole("button", {
+    name: "SERVER SELECTOR",
+    exact: true,
+  });
+  if ((await selector.getAttribute("aria-expanded")) === "false")
+    await selector.click();
+  await serverButton(page, id).click();
+  await ui(serverButton(page, id)).toHaveAttribute("aria-pressed", "true");
+}
+
+async function processEvents() {
+  const content = await fs
+    .readFile(smokeProcessEvents, "utf8")
+    .catch((cause) => {
+      if (cause.code === "ENOENT") return "";
+      throw cause;
+    });
+  return content
+    .split("\n")
+    .filter(Boolean)
+    .map((line) => JSON.parse(line));
+}
+
+async function assertSmokeProcessesStopped() {
+  await ui
+    .poll(
+      async () => {
+        const events = await processEvents();
+        return events
+          .filter((event) => event.type === "start")
+          .every((started) =>
+            events.some(
+              (event) =>
+                event.type === "exit" &&
+                event.pid === started.pid &&
+                event.code === 0,
+            ),
+          );
+      },
+      {
+        message:
+          "Every fixture process must exit gracefully with the packaged app.",
+      },
+    )
+    .toBe(true);
+}
+
+async function startSmokeServer(page, serverId) {
+  await selectSmokeServer(page, serverId);
+  await page.getByRole("button", { name: "Start", exact: true }).click();
+  await ui
+    .poll(
+      async () => (await browserApi(page, "/server", { serverId })).data.status,
+    )
+    .toBe("running");
+  await ui(
+    page.getByRole("button", { name: "Stop", exact: true }),
+  ).toBeEnabled();
 }
 
 async function bounded(promise, milliseconds, message) {
@@ -277,15 +342,13 @@ async function launchPackaged({ expectEmpty = false } = {}) {
     assert.deepEqual(
       servers.data.servers,
       [],
-      "A fresh desktop profile must not create a demonstration server.",
+      "A fresh desktop profile must not create a server automatically.",
     );
     assert.equal(servers.data.defaultServerId, null);
     await ui(
       page.getByRole("heading", { level: 1, name: "Console", exact: true }),
     ).toHaveCount(0);
-    await ui(
-      page.getByRole("combobox", { name: "Switch server", exact: true }),
-    ).toHaveCount(0);
+    await ui(page.locator("button[data-server-id]")).toHaveCount(0);
     const initialFiles = await fs.readdir(path.join(profileDirectory, "data"));
     assert.deepEqual(
       initialFiles.sort(),
@@ -296,8 +359,8 @@ async function launchPackaged({ expectEmpty = false } = {}) {
     assert.equal(servers.data.servers.length, 3);
     assert.deepEqual(
       servers.data.servers.map((server) => server.mode).sort(),
-      ["demo", "live", "live"],
-      "The smoke profile must retain its explicitly created demo, imported JAR server, and imported NeoForge server.",
+      ["live", "live", "live"],
+      "The smoke profile must retain its explicitly created process fixture, imported JAR server, and imported NeoForge server.",
     );
   }
   await installDownloadCapture(application, downloadDirectory);
@@ -307,7 +370,7 @@ async function launchPackaged({ expectEmpty = false } = {}) {
   return { page, serverId: servers.data.defaultServerId };
 }
 
-async function createSmokeDemo(page) {
+async function createSmokeServer(page) {
   step(
     "Verifying guided creation, then preparing an isolated API fixture for the smoke checks.",
   );
@@ -340,8 +403,11 @@ async function createSmokeDemo(page) {
   const fixture = await browserApi(page, "/servers", {
     method: "POST",
     body: {
-      name: "Desktop smoke demo",
-      mode: "demo",
+      name: "Desktop smoke process",
+      mode: "live",
+      launchType: "executable",
+      launchExecutable: process.execPath,
+      launchArgs: [smokeProcessPath],
       port: 25565,
       memoryLimitMB: 2048,
     },
@@ -352,14 +418,154 @@ async function createSmokeDemo(page) {
     page.getByRole("heading", { level: 1, name: "Console", exact: true }),
   ).toBeVisible();
   await ui(
-    page.getByRole("heading", { name: "Desktop smoke demo", exact: true }),
+    page.getByRole("heading", { name: "Desktop smoke process", exact: true }),
   ).toBeVisible();
   const result = await browserApi(page, "/servers");
   assert.equal(result.status, 200);
   assert.equal(result.data.servers.length, 1);
-  assert.equal(result.data.servers[0].mode, "demo");
+  assert.equal(result.data.servers[0].mode, "live");
+  assert.equal(result.data.servers[0].status, "offline");
   assert.equal(result.data.servers[0].id, result.data.defaultServerId);
+  const id = result.data.defaultServerId;
+  const blocked = await browserApi(page, "/server/power", {
+    method: "POST",
+    body: { action: "start" },
+    serverId: id,
+  });
+  assert.equal(blocked.status, 400);
+  assert.match(blocked.data.error, /EULA/);
+  assert.deepEqual(await processEvents(), []);
+  const eula = await browserApi(page, "/files/content", {
+    method: "PUT",
+    body: {
+      path: "eula.txt",
+      content: "# Accepted only for the isolated smoke fixture.\neula=true\n",
+    },
+    serverId: id,
+  });
+  assert.equal(eula.status, 200);
+  await startSmokeServer(page, id);
+  await ui
+    .poll(
+      async () =>
+        (await processEvents()).filter((event) => event.type === "start")
+          .length,
+    )
+    .toBe(1);
+  await page.getByRole("button", { name: "Restart", exact: true }).click();
+  await page
+    .getByRole("dialog", { name: "Restart your server?", exact: true })
+    .getByRole("button", { name: "Restart server", exact: true })
+    .click();
+  await ui
+    .poll(
+      async () =>
+        (await processEvents()).filter((event) => event.type === "start")
+          .length,
+    )
+    .toBe(2);
+  await ui
+    .poll(
+      async () =>
+        (await browserApi(page, "/server", { serverId: id })).data.status,
+    )
+    .toBe("running");
+  const events = await processEvents();
+  const first = events.find((event) => event.type === "start");
+  assert.ok(
+    events.some(
+      (event) =>
+        event.type === "exit" && event.pid === first.pid && event.code === 0,
+    ),
+  );
+  await page
+    .getByRole("textbox", { name: "Server command", exact: true })
+    .fill("say packaged-process-ready");
+  await page.getByRole("button", { name: "Send command", exact: true }).click();
+  await ui
+    .poll(async () =>
+      (await browserApi(page, "/console", { serverId: id })).data.lines.some(
+        (line) =>
+          line.message ===
+          "[Server thread/INFO]: [Server] packaged-process-ready",
+      ),
+    )
+    .toBe(true);
   return result.data.defaultServerId;
+}
+
+async function assertSmokeBackup(page, serverId) {
+  step(
+    "Checking real-process world-save backups, downloads, and archive recovery in the packaged app.",
+  );
+  const created = await browserApi(page, "/backups", {
+    method: "POST",
+    body: { name: "Desktop smoke archive" },
+    serverId,
+  });
+  assert.equal(created.status, 201);
+  const backup = created.data;
+  await page.goto(`${currentOrigin}/#backups`);
+  await page
+    .getByRole("link", { name: `Download backup ${backup.name}`, exact: true })
+    .click();
+  const bytes = await expectDownload(`${backup.name}.tar.gz`);
+  assert.deepEqual([...bytes.subarray(0, 2)], [31, 139]);
+  await page
+    .getByRole("button", { name: `Delete backup ${backup.name}`, exact: true })
+    .click();
+  const dialog = page.getByRole("dialog", {
+    name: "Move this backup to Recycle Bin?",
+    exact: true,
+  });
+  await dialog
+    .getByRole("button", { name: "Move to Recycle Bin", exact: true })
+    .click();
+  await ui(dialog).not.toBeVisible();
+  assert.deepEqual(
+    (await browserApi(page, "/backups", { serverId })).data.backups,
+    [],
+  );
+  await page.getByRole("link", { name: "File Manager", exact: true }).click();
+  await page
+    .getByRole("button", { name: "Open Recycle Bin", exact: true })
+    .click();
+  const row = page.getByRole("listitem", {
+    name: `Recycled backup ${backup.name}`,
+    exact: true,
+  });
+  await ui(row).toContainText("Restore to Backups");
+  await row
+    .getByRole("button", { name: `Restore ${backup.name}`, exact: true })
+    .click();
+  await ui(row).toHaveCount(0);
+  assert.deepEqual(
+    (await browserApi(page, "/backups", { serverId })).data.backups,
+    [backup],
+  );
+  const recovered = await page.evaluate(
+    async ({ id, serverId }) => {
+      const response = await fetch(
+        `/api/backups/${id}/download?serverId=${encodeURIComponent(serverId)}`,
+      );
+      return {
+        status: response.status,
+        bytes: Array.from(new Uint8Array(await response.arrayBuffer())),
+      };
+    },
+    { id: backup.id, serverId },
+  );
+  assert.equal(recovered.status, 200);
+  assert.deepEqual(Buffer.from(recovered.bytes), bytes);
+  assert.equal(
+    (
+      await browserApi(page, "/files/content?path=desktop-smoke.txt", {
+        serverId,
+      })
+    ).data.content,
+    textContents,
+  );
+  return backup;
 }
 
 async function assertExternalProjectLinks(page) {
@@ -797,14 +1003,35 @@ async function importSmokeNeoForge(page) {
   return { id: imported.id, directory, original, launchArgs };
 }
 
-async function quitPackaged(mode = "quit") {
+async function quitPackaged(mode = "quit", expectedRunning = []) {
   if (!application) return;
   const app = application;
+  for (const page of app.windows()) await page.unrouteAll({ behavior: "wait" });
   const child = app.process();
   const exit =
     child.exitCode === null
       ? once(child, "exit")
       : Promise.resolve([child.exitCode]);
+  if (mode === "quit") {
+    await app.evaluate(({ dialog }, waitForConfirmation) => {
+      // Keep native dialogs hidden in CI, but exercise and inspect the actual
+      // live-server quit confirmation before permitting the process to stop.
+      globalThis.__panelSmokeResolveQuit?.({ response: 1 });
+      globalThis.__panelSmokeQuitPrompt = undefined;
+      dialog.showMessageBox = async (_window, options) => {
+        if (
+          options.title !== "Quit MC Panel?" ||
+          options.buttons?.join("|") !== "Keep running|Stop servers and quit"
+        )
+          throw new Error(`Unexpected native quit dialog: ${options.title}`);
+        globalThis.__panelSmokeQuitPrompt = options;
+        if (!waitForConfirmation) return { response: 1 };
+        return new Promise((resolve) => {
+          globalThis.__panelSmokeResolveQuit = resolve;
+        });
+      };
+    }, expectedRunning.length > 0);
+  }
   await app
     .evaluate(({ app, BrowserWindow }, mode) => {
       if (mode === "query-session-end") {
@@ -825,6 +1052,23 @@ async function quitPackaged(mode = "quit") {
       )
         throw error;
     });
+  if (mode === "quit" && expectedRunning.length) {
+    await ui
+      .poll(() => app.evaluate(() => globalThis.__panelSmokeQuitPrompt))
+      .toMatchObject({
+        type: "question",
+        title: "Quit MC Panel?",
+        buttons: ["Keep running", "Stop servers and quit"],
+        defaultId: 0,
+        cancelId: 0,
+      });
+    const prompt = await app.evaluate(() => globalThis.__panelSmokeQuitPrompt);
+    for (const name of expectedRunning) assert.ok(prompt.detail.includes(name));
+    await app.evaluate(() => {
+      globalThis.__panelSmokeResolveQuit({ response: 1 });
+      globalThis.__panelSmokeResolveQuit = undefined;
+    });
+  }
   const [exitCode, signal] = await bounded(
     exit,
     25_000,
@@ -855,6 +1099,7 @@ async function quitPackaged(mode = "quit") {
     )
     .toBe("closed");
   application = undefined;
+  await assertSmokeProcessesStopped();
 }
 
 async function cleanupTemporaryProfile() {
@@ -899,12 +1144,26 @@ try {
   );
   profileDirectory = path.join(temporaryRoot, "profile");
   await fs.mkdir(profileDirectory);
+  smokeProcessPath = path.join(temporaryRoot, "minecraft-smoke-process.mjs");
+  smokeProcessEvents = path.join(temporaryRoot, "process-events.jsonl");
+  const processFixture = await fs.readFile(
+    path.join(projectDir, "tests", "fixtures", "minecraft-process.mjs"),
+    "utf8",
+  );
+  await fs.writeFile(
+    smokeProcessPath,
+    `import { appendFileSync } from "node:fs";
+const recordSmokeEvent = (event) => appendFileSync(${JSON.stringify(smokeProcessEvents)}, JSON.stringify({ ...event, pid: process.pid }) + "\\n");
+recordSmokeEvent({ type: "start" });
+process.on("exit", (code) => recordSmokeEvent({ type: "exit", code }));
+${processFixture}`,
+  );
   step(
     `Launching ${path.basename(executablePath)} with an isolated test profile.`,
   );
   let { page, serverId } = await launchPackaged({ expectEmpty: true });
   await assertDesktopUpdates(page);
-  serverId = await createSmokeDemo(page);
+  serverId = await createSmokeServer(page);
   await assertExternalProjectLinks(page);
 
   step(
@@ -981,6 +1240,7 @@ try {
     .click();
   assert.deepEqual(await expectDownload("desktop-smoke.bin"), uploadBytes);
   await capturePackaged("packaged-file-manager.png");
+  const backup = await assertSmokeBackup(page, serverId);
 
   step(
     "Checking the removed Databases route and preserving legacy SQLite storage.",
@@ -1020,9 +1280,10 @@ try {
 
   const imported = await importSmokeExisting(page);
   const neoForge = await importSmokeNeoForge(page);
-  await ui(
-    page.getByRole("combobox", { name: "Switch server", exact: true }),
-  ).toHaveValue(neoForge.id);
+  await ui(serverButton(page, neoForge.id)).toHaveAttribute(
+    "aria-pressed",
+    "true",
+  );
   await ui
     .poll(
       async () =>
@@ -1061,17 +1322,16 @@ try {
   assert.equal(application.process().exitCode, null);
 
   step("Quitting the app and confirming that its private API shuts down.");
-  await quitPackaged();
+  await quitPackaged("quit", ["Desktop smoke world"]);
   step(
     "Relaunching the same profile to verify saved worlds, files, and databases.",
   );
   ({ page } = await launchPackaged());
-  await ui(
-    page.getByRole("combobox", { name: "Switch server", exact: true }),
-  ).toHaveValue(neoForge.id);
-  await page
-    .getByRole("combobox", { name: "Switch server", exact: true })
-    .selectOption(serverId);
+  await ui(serverButton(page, neoForge.id)).toHaveAttribute(
+    "aria-pressed",
+    "true",
+  );
+  await selectSmokeServer(page, serverId);
   await ui(
     page.getByRole("heading", { name: "Desktop smoke world", exact: true }),
   ).toBeVisible();
@@ -1082,6 +1342,14 @@ try {
   );
   assert.equal(retainedText.status, 200);
   assert.equal(retainedText.data.content, textContents);
+  assert.deepEqual(
+    (await browserApi(page, "/backups", { serverId })).data.backups,
+    [backup],
+  );
+  assert.equal(
+    (await browserApi(page, "/server", { serverId })).data.status,
+    "offline",
+  );
   const retainedBytes = await page.evaluate(async (serverId) => {
     const response = await fetch(
       `/api/files/download?path=desktop-smoke.bin&serverId=${encodeURIComponent(serverId)}`,
@@ -1109,9 +1377,7 @@ try {
   assert.equal(retainedImport.serverDir, await fs.realpath(imported.directory));
   assert.equal(retainedImport.mode, "live");
   assert.equal(retainedImport.status, "offline");
-  await page
-    .getByRole("combobox", { name: "Switch server", exact: true })
-    .selectOption(imported.id);
+  await selectSmokeServer(page, imported.id);
   await ui(
     page.getByRole("heading", { name: "Desktop imported world", exact: true }),
   ).toBeVisible();
@@ -1148,12 +1414,14 @@ try {
     await snapshotSmokeFolder(neoForge.directory),
     neoForge.original,
   );
+  await startSmokeServer(page, serverId);
+  await selectSmokeServer(page, neoForge.id);
   step(
     "Simulating the window's Windows session-ending event and checking graceful exit.",
   );
   await quitPackaged("query-session-end");
   step(
-    `Passed: clean startup, read-only update status, catalog browser links and blocked external navigation, explicit creation, native folder picker cancellation/import, JAR and NeoForge imports, source/JVM/EULA preservation, isolation, authenticated API, sandboxing, uploads/downloads, SQLite, persistence, tray close, normal quit, and Windows-session shutdown. Artifacts: ${outputDirectory}`,
+    `Passed: clean startup, real process start/restart/commands, read-only update status, catalog browser links and blocked external navigation, explicit creation, native folder picker cancellation/import, JAR and NeoForge imports, source/JVM/EULA preservation, isolation, authenticated API, sandboxing, uploads/downloads, backup recovery, SQLite, persistence, tray close, normal quit, and Windows-session shutdown with owned-process exit. Artifacts: ${outputDirectory}`,
   );
 } catch (error) {
   failed = true;

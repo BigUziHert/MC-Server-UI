@@ -1,5 +1,11 @@
 import { test, expect, type Route } from "@playwright/test";
 
+test.afterEach(async ({ page }) => {
+  // Polling can still be inside route.fetch when the final assertion completes.
+  // Finish active handlers before Playwright disposes the request context.
+  await page.unrouteAll({ behavior: "wait" });
+});
+
 test("Versions refresh retains the selected release and an old dismissal cannot hide a new job", async ({
   page,
 }) => {
