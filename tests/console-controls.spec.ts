@@ -33,6 +33,195 @@ const test = base.extend<{ serverId: string }>({
   },
 });
 
+for (const width of [1348, 390]) {
+  test(`a stopping server offers a confirmed Force Stop and recovers at ${width}px`, async ({
+    page,
+    request,
+    serverId,
+  }) => {
+    await page.setViewportSize({ width, height: 1000 });
+    const seed = await (
+      await request.get("/api/server", { headers: { "X-Server-Id": serverId } })
+    ).json();
+    let status = "running";
+    const actions: Record<string, unknown>[] = [];
+    let finishForce!: () => void;
+    const forceGate = new Promise<void>((resolve) => {
+      finishForce = resolve;
+    });
+    await page.route("**/api/server", (route) =>
+      route.fulfill({ json: { ...seed, status } }),
+    );
+    await page.route("**/api/server/power", async (route) => {
+      const body = route.request().postDataJSON();
+      actions.push(body);
+      if (body.action === "force-stop") {
+        await forceGate;
+        status = "offline";
+      } else status = "stopping";
+      await route.fulfill({ json: { status } });
+    });
+    await page.addInitScript(
+      (id) => localStorage.setItem("mc-panel.active-server", id),
+      serverId,
+    );
+    await page.goto("/#console");
+    await page.getByRole("button", { name: "Stop", exact: true }).click();
+    await page
+      .getByRole("dialog")
+      .getByRole("button", { name: "Stop server", exact: true })
+      .click();
+    const force = page.getByRole("button", { name: "Force Stop", exact: true });
+    await expect(force).toBeEnabled();
+    await expect(
+      page.getByRole("button", { name: "Start", exact: true }),
+    ).toBeDisabled();
+    await expect(
+      page.getByRole("button", { name: "Restart", exact: true }),
+    ).toBeDisabled();
+    expect(actions).toEqual([{ action: "stop" }]);
+    await force.click();
+    let dialog = page.getByRole("dialog", { name: "Force stop your server?" });
+    await expect(dialog).toContainText(
+      "Unsaved progress may be lost or world files damaged",
+    );
+    await dialog.getByRole("button", { name: "Cancel", exact: true }).click();
+    expect(actions).toEqual([{ action: "stop" }]);
+    await force.click();
+    dialog = page.getByRole("dialog", { name: "Force stop your server?" });
+    await dialog
+      .getByRole("button", { name: "Force stop server", exact: true })
+      .click();
+    await expect(force).toBeDisabled();
+    await expect
+      .poll(() => actions)
+      .toEqual([{ action: "stop" }, { action: "force-stop", confirmed: true }]);
+    finishForce();
+    await expect(
+      page.getByRole("button", { name: "Start", exact: true }),
+    ).toBeEnabled();
+    await expect(
+      page.getByRole("button", { name: "Stop", exact: true }),
+    ).toBeDisabled();
+    expect(actions).toHaveLength(2);
+    expect(
+      await page.evaluate(() => document.documentElement.scrollWidth),
+    ).toBeLessThanOrEqual(width);
+  });
+}
+
+for (const stopSource of ["power", "console"] as const) {
+  test(`Force Stop recovers from a hung ${stopSource} Stop request and retries failed termination`, async ({
+    page,
+    request,
+    serverId,
+  }) => {
+    const seed = await (
+      await request.get("/api/server", { headers: { "X-Server-Id": serverId } })
+    ).json();
+    let status = "running",
+      forceAttempts = 0;
+    let finishStop!: () => void;
+    const stopGate = new Promise<void>((resolve) => {
+      finishStop = resolve;
+    });
+    await page.route("**/api/server", (route) =>
+      route.fulfill({ json: { ...seed, status } }),
+    );
+    await page.route("**/api/console/command", async (route) => {
+      expect(route.request().postDataJSON()).toEqual({ command: "stop" });
+      status = "stopping";
+      await stopGate;
+      await route.fulfill({
+        status: 503,
+        json: { error: "Late command failure" },
+      });
+    });
+    await page.route("**/api/server/power", async (route) => {
+      const { action, confirmed } = route.request().postDataJSON();
+      if (action === "stop") {
+        status = "stopping";
+        await stopGate;
+        await route.fulfill({ json: { status: "stopping" } });
+      } else {
+        expect(action).toBe("force-stop");
+        expect(confirmed).toBe(true);
+        if (++forceAttempts === 1) {
+          await route.fulfill({
+            status: 503,
+            json: { error: "Could not terminate the server. Try again." },
+          });
+        } else {
+          status = "offline";
+          await route.fulfill({ json: { status } });
+        }
+      }
+    });
+    await page.addInitScript(
+      (id) => localStorage.setItem("mc-panel.active-server", id),
+      serverId,
+    );
+    await page.goto("/#console");
+    if (stopSource === "console") {
+      const command = page.getByRole("textbox", {
+        name: "Server command",
+        exact: true,
+      });
+      await command.fill("stop");
+      await command.press("Enter");
+    } else {
+      await page.getByRole("button", { name: "Stop", exact: true }).click();
+      await page
+        .getByRole("button", { name: "Stop server", exact: true })
+        .click();
+    }
+    const force = page.getByRole("button", { name: "Force Stop", exact: true });
+    try {
+      await expect(force).toBeEnabled();
+      await force.click();
+      await page
+        .getByRole("button", { name: "Force stop server", exact: true })
+        .click();
+      await expect(
+        page.getByText("Could not terminate the server. Try again.", {
+          exact: true,
+        }),
+      ).toBeVisible();
+      await expect(force).toBeEnabled();
+      await force.click();
+      await page
+        .getByRole("button", { name: "Force stop server", exact: true })
+        .click();
+      await expect(
+        page.getByRole("button", { name: "Start", exact: true }),
+      ).toBeEnabled();
+      const stopResponse = page.waitForResponse((response) =>
+        response
+          .url()
+          .endsWith(
+            stopSource === "console"
+              ? "/api/console/command"
+              : "/api/server/power",
+          ),
+      );
+      finishStop();
+      await stopResponse;
+      await expect(
+        page.getByText("Server force stop requested.", { exact: true }),
+      ).toBeVisible();
+      await expect(
+        page.getByText("Late command failure", { exact: true }),
+      ).toHaveCount(0);
+      await expect(
+        page.getByRole("button", { name: "Start", exact: true }),
+      ).toBeEnabled();
+      expect(forceAttempts).toBe(2);
+    } finally {
+      finishStop();
+    }
+  });
+}
+
 test("server messaging sends say commands and preserves separate command/message drafts and history", async ({
   page,
   request,

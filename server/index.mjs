@@ -90,10 +90,16 @@ const exists = async (target) => {
 
 export async function terminateProcessTree(
   child,
-  { tree = false, platform = process.platform, spawnProcess = spawn } = {},
+  {
+    tree = false,
+    force = false,
+    platform = process.platform,
+    spawnProcess = spawn,
+    timeoutMs = 5000,
+  } = {},
 ) {
   if (!tree || !Number.isInteger(child.pid) || child.pid <= 0) {
-    child.kill();
+    child.kill(force ? "SIGKILL" : undefined);
     return;
   }
   if (platform === "win32") {
@@ -107,16 +113,32 @@ export async function terminateProcessTree(
         ["/PID", String(child.pid), "/T", "/F"],
         { shell: false, windowsHide: true, stdio: "ignore" },
       );
-      killer.once("error", reject);
-      killer.once("close", (code) =>
-        code === 0
-          ? resolve()
-          : reject(
-              new Error(
-                `Could not stop the server process tree (taskkill ${code}). Check the server before starting another copy.`,
-              ),
+      const timeout = setTimeout(() => {
+        reject(
+          new Error(
+            "Timed out stopping the server process tree. Try Force Stop again.",
+          ),
+        );
+        try {
+          killer.kill();
+        } catch {
+          /* The helper may have already exited. */
+        }
+      }, timeoutMs);
+      killer.once("error", (cause) => {
+        clearTimeout(timeout);
+        reject(cause);
+      });
+      killer.once("close", (code) => {
+        clearTimeout(timeout);
+        if (code === 0) resolve();
+        else
+          reject(
+            new Error(
+              `Could not stop the server process tree (taskkill ${code}). Check the server before starting another copy.`,
             ),
-      );
+          );
+      });
     });
   } else {
     try {
@@ -604,6 +626,7 @@ export async function createPanel(options = {}) {
   let processStopActor;
   let stopTimer;
   let terminationPromise;
+  let terminationFailure;
   let restartRequested = false;
   let closed = false;
   let closePromise;
@@ -1145,6 +1168,7 @@ export async function createPanel(options = {}) {
         append(`[Panel] Java failed: ${cause.message}`, "error");
       });
       child.on("close", (code) => {
+        if (processHandle !== child) return;
         void lifecycleAudit(
           !becameReady && !stop.requested
             ? "Server start failed"
@@ -1160,7 +1184,8 @@ export async function createPanel(options = {}) {
         processHandle = null;
         startupMetadataAt = 0;
         processStop = undefined;
-        status = terminationPromise ? "stopping" : "offline";
+        status =
+          terminationPromise || terminationFailure ? "stopping" : "offline";
         startedAt = null;
         clearPlayers();
         events.emit("server-exit", child);
@@ -1168,19 +1193,7 @@ export async function createPanel(options = {}) {
           `[Panel] Server process exited (code ${code ?? "unknown"}).`,
           code === 0 ? "info" : "error",
         );
-        const finishExit = () => {
-          terminationPromise = undefined;
-          status = "offline";
-          if (restartRequested && !closed) {
-            restartRequested = false;
-            startServer(true).catch((cause) => append(cause.message, "error"));
-          }
-        };
-        if (terminationPromise)
-          terminationPromise.then(finishExit, () => {
-            restartRequested = false;
-          });
-        else finishExit();
+        finishProcessExit();
       });
     } catch (cause) {
       status = "offline";
@@ -1190,9 +1203,141 @@ export async function createPanel(options = {}) {
     }
   }
 
-  async function power(action) {
-    if (!["start", "stop", "restart"].includes(action))
-      throw error(400, "Choose start, stop, or restart.");
+  function finishProcessExit() {
+    if (processHandle || terminationPromise || terminationFailure) return;
+    status = "offline";
+    if (restartRequested && !closed) {
+      restartRequested = false;
+      startServer(true).catch((cause) => append(cause.message, "error"));
+    }
+  }
+
+  function terminateServer(child, { explicit = false } = {}) {
+    if (terminationPromise) return terminationPromise;
+    let timeout;
+    let onClose;
+    let treeStopped = false;
+    const exited = new Promise((resolve) => {
+      onClose = resolve;
+      child.once("close", onClose);
+    });
+    // Assign the attempt before invoking a killer: even an immediate close must
+    // wait for successful tree termination before another server can start.
+    terminationFailure = undefined;
+    const attempt = Promise.resolve().then(async () => {
+      await terminateProcessTree(child, {
+        tree:
+          process.platform === "win32" ||
+          ["script", "executable"].includes(configuration.launchType),
+        force: true,
+        spawnProcess: options.spawnProcess,
+        timeoutMs: options.forceStopTimeoutMs ?? 5000,
+      });
+      treeStopped = true;
+      if (processHandle === child) {
+        await Promise.race([
+          exited,
+          new Promise((_resolve, reject) => {
+            timeout = setTimeout(
+              () =>
+                reject(
+                  error(
+                    504,
+                    "The server process has not exited. Try Force Stop again before starting another copy.",
+                  ),
+                ),
+              options.forceStopTimeoutMs ?? 5000,
+            );
+          }),
+        ]);
+      }
+    });
+    terminationPromise = attempt
+      .then(
+        async () => {
+          terminationPromise = undefined;
+          finishProcessExit();
+          if (explicit) {
+            append(
+              "[Panel] Server force stopped. Unsaved world changes may have been lost.",
+              "warn",
+            );
+            await lifecycleAudit(
+              "Server force stopped",
+              `${configuration.name} was terminated by the local administrator. Unsaved world changes may have been lost.`,
+            );
+          }
+        },
+        async (cause) => {
+          terminationPromise = undefined;
+          // A confirmed tree kill may deliver close late. Once that close arrives,
+          // it is safe to become offline; an unconfirmed tree must stay blocked.
+          terminationFailure = treeStopped ? undefined : cause;
+          restartRequested = false;
+          status = "stopping";
+          append(`[Panel] ${cause.message}`, "error");
+          if (explicit)
+            await lifecycleAudit("Server force stop failed", cause.message);
+          throw cause;
+        },
+      )
+      .finally(() => {
+        clearTimeout(timeout);
+        child.removeListener("close", onClose);
+      });
+    return terminationPromise;
+  }
+
+  async function power(action, { confirmed = false } = {}) {
+    if (!["start", "stop", "restart", "force-stop"].includes(action))
+      throw error(400, "Choose start, stop, restart, or force-stop.");
+    if (action === "force-stop") {
+      if (confirmed !== true)
+        throw error(
+          400,
+          "Confirm Force Stop. Unsaved world changes may be lost.",
+        );
+      if (status !== "stopping")
+        throw error(409, "Stop the server before using Force Stop.");
+      restartRequested = false;
+      clearTimeout(stopTimer);
+      if (mode === "demo") {
+        clearTimeout(demoTimer);
+        status = "offline";
+        startedAt = null;
+        await lifecycleAudit(
+          "Server force stopped",
+          "Simulated server force stopped.",
+        );
+        return;
+      }
+      if (!terminationPromise && !processHandle)
+        throw error(
+          409,
+          "The server process has exited, but its process tree could not be confirmed stopped. Check the server processes before restarting the panel.",
+        );
+      try {
+        if (terminationPromise) await terminationPromise;
+        else {
+          processStopActor = "Local administrator";
+          append(
+            "[Panel] Force stopping the server and its owned process tree…",
+            "warn",
+          );
+          await terminateServer(processHandle, { explicit: true });
+        }
+      } catch {
+        // Keep process/system details in the console and audit log while giving
+        // desktop users an actionable error without an API terminal dependency.
+        throw error(
+          503,
+          processHandle
+            ? "Could not force stop the server. It is still stopping. Try Force Stop again."
+            : "The server process exited, but its process tree could not be confirmed stopped. Check the server processes before restarting the panel.",
+        );
+      }
+      return;
+    }
     if (action === "start") await startServer();
     else {
       if (!["running", "starting"].includes(status))
@@ -1234,16 +1379,7 @@ export async function createPanel(options = {}) {
               "[Panel] The launcher did not exit after stop. Terminating its process tree…",
               "warn",
             );
-            terminationPromise = Promise.resolve().then(() =>
-              terminateProcessTree(child, {
-                tree: true,
-                spawnProcess: options.spawnProcess,
-              }),
-            );
-            terminationPromise.catch((cause) => {
-              restartRequested = false;
-              append(`[Panel] ${cause.message}`, "error");
-            });
+            void terminateServer(child).catch(() => {});
           }, options.stopTimeoutMs ?? 15000);
           stopTimer.unref();
         }
@@ -2199,7 +2335,7 @@ export async function createPanel(options = {}) {
   app.post(
     "/api/server/power",
     trackOperation(async (req, res) => {
-      await power(req.body?.action);
+      await power(req.body?.action, { confirmed: req.body?.confirmed });
       res.json({ status });
     }),
   );
@@ -3070,6 +3206,7 @@ export async function createFleet(options = {}) {
       spawnServer: options.spawnServer,
       spawnProcess: options.spawnProcess,
       stopTimeoutMs: options.stopTimeoutMs,
+      forceStopTimeoutMs: options.forceStopTimeoutMs,
       backupFlushTimeoutMs: options.backupFlushTimeoutMs,
       telemetry,
       publicAddress,

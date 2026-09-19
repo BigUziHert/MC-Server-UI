@@ -362,6 +362,133 @@ async function createSmokeDemo(page) {
   return result.data.defaultServerId;
 }
 
+async function assertExternalProjectLinks(page) {
+  step(
+    "Checking catalog project links open the browser without allowing external app navigation.",
+  );
+  const projects = [
+    ["modrinth", "Cloth Config API", "https://modrinth.com/mod/cloth-config"],
+    [
+      "curseforge",
+      "CurseForge project",
+      "https://www.curseforge.com/minecraft/mc-mods/cloth-config",
+    ],
+    ["spigot", "Spigot project", "https://www.spigotmc.org/resources/123/"],
+    ["ftb", "FTB project", "https://www.feed-the-beast.com/modpacks/123"],
+    [
+      "atlauncher",
+      "ATLauncher project",
+      "https://atlauncher.com/pack/TestPack",
+    ],
+    [
+      "voidswrath",
+      "Voids Wrath project",
+      "https://voidswrath.com/modpacks/test-pack/",
+    ],
+  ].map(([platform, title, url], index) => ({
+    platform,
+    title,
+    url,
+    id: `external-link-${index}`,
+    description: "Desktop link fixture",
+  }));
+  const routePattern = "**/api/launchpad**";
+  const handler = async (route) => {
+    const pathname = new URL(route.request().url()).pathname;
+    const json =
+      pathname === "/api/launchpad"
+        ? {
+            platforms: [
+              {
+                id: "modrinth",
+                name: "Modrinth",
+                available: true,
+                types: ["mod"],
+              },
+            ],
+            gameVersion: "1.21.1",
+            gameVersions: ["1.21.1"],
+            loader: "neoforge",
+            status: "offline",
+            warnings: [],
+          }
+        : pathname === "/api/launchpad/search"
+          ? {
+              projects,
+              total: projects.length,
+              offset: 0,
+              limit: 10,
+            }
+          : { items: [], warnings: [] };
+    await route.fulfill({ json });
+  };
+  await page.route(routePattern, handler);
+  // Replace only the OS browser call. The packaged production URL validation
+  // and Electron navigation/window-open handlers still handle the actual clicks.
+  await application.evaluate(({ shell }) => {
+    globalThis.__panelSmokeOpenExternal = shell.openExternal;
+    globalThis.__panelSmokeOpenedUrls = [];
+    shell.openExternal = async (url) => {
+      globalThis.__panelSmokeOpenedUrls.push(url);
+    };
+  });
+  try {
+    await page.goto(`${currentOrigin}/#launchpad`);
+    for (const project of projects)
+      await page
+        .getByRole("link", {
+          name: `Open ${project.title} project page`,
+          exact: true,
+        })
+        .click();
+    const openedUrls = () =>
+      application.evaluate(() => globalThis.__panelSmokeOpenedUrls);
+    await ui.poll(openedUrls).toEqual(projects.map((project) => project.url));
+    await page.evaluate((sentinel) => {
+      for (const url of [
+        "https://untrusted.example/project",
+        "https://modrinth.com.evil.example/project",
+        "http://modrinth.com/mod/cloth-config",
+        "file:///C:/Windows/notepad.exe",
+        sentinel,
+      ])
+        window.open(url, "_blank", "noopener,noreferrer");
+    }, projects[0].url);
+    await ui
+      .poll(openedUrls)
+      .toEqual([...projects.map((project) => project.url), projects[0].url]);
+    await page.evaluate((url) => {
+      const link = document.createElement("a");
+      link.href = url;
+      document.body.append(link);
+      link.click();
+      link.remove();
+    }, projects[1].url);
+    await ui
+      .poll(openedUrls)
+      .toEqual([
+        ...projects.map((project) => project.url),
+        projects[0].url,
+        projects[1].url,
+      ]);
+    assert.equal(page.url(), `${currentOrigin}/#launchpad`);
+    assert.equal(
+      await application.evaluate(
+        ({ BrowserWindow }) => BrowserWindow.getAllWindows().length,
+      ),
+      1,
+    );
+  } finally {
+    await page.goto(`${currentOrigin}/#console`);
+    await page.unroute(routePattern, handler);
+    await application.evaluate(({ shell }) => {
+      shell.openExternal = globalThis.__panelSmokeOpenExternal;
+      delete globalThis.__panelSmokeOpenExternal;
+      delete globalThis.__panelSmokeOpenedUrls;
+    });
+  }
+}
+
 async function assertDesktopUpdates(page) {
   step(
     "Checking packaged update status without contacting a release service or installing anything.",
@@ -778,6 +905,7 @@ try {
   let { page, serverId } = await launchPackaged({ expectEmpty: true });
   await assertDesktopUpdates(page);
   serverId = await createSmokeDemo(page);
+  await assertExternalProjectLinks(page);
 
   step(
     "Checking bundled Minecraft management pages and configuration modules.",
@@ -1025,7 +1153,7 @@ try {
   );
   await quitPackaged("query-session-end");
   step(
-    `Passed: clean startup, read-only update status, explicit creation, native folder picker cancellation/import, JAR and NeoForge imports, source/JVM/EULA preservation, isolation, authenticated API, sandboxing, uploads/downloads, SQLite, persistence, tray close, normal quit, and Windows-session shutdown. Artifacts: ${outputDirectory}`,
+    `Passed: clean startup, read-only update status, catalog browser links and blocked external navigation, explicit creation, native folder picker cancellation/import, JAR and NeoForge imports, source/JVM/EULA preservation, isolation, authenticated API, sandboxing, uploads/downloads, SQLite, persistence, tray close, normal quit, and Windows-session shutdown. Artifacts: ${outputDirectory}`,
   );
 } catch (error) {
   failed = true;

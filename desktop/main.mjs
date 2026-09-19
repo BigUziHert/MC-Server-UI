@@ -15,6 +15,10 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { startDesktopRuntime } from "./runtime.mjs";
 import { flushRendererSelection } from "./selection.mjs";
+import {
+  installExternalLinkHandlers,
+  openExternalWebsite,
+} from "./external-links.mjs";
 import updaterPackage from "electron-updater";
 import { applyDownloadedUpdate, createUpdateController } from "./updates.mjs";
 
@@ -65,20 +69,11 @@ function showWindow() {
   window.focus();
 }
 
-async function openDocumentation(url = documentation) {
-  // The renderer can open project documentation, but cannot invoke arbitrary protocols.
-  try {
-    const target = new URL(url);
-    if (
-      target.protocol !== "https:" ||
-      target.hostname !== "github.com" ||
-      !/^\/BigUziHert\/MC-Server-UI(?:\/|$)/i.test(target.pathname)
-    )
-      return;
-    await shell.openExternal(target.href);
-  } catch (cause) {
-    await logError(cause);
-  }
+function openWebsite(url = documentation) {
+  return openExternalWebsite(url, {
+    openExternal: (target) => shell.openExternal(target),
+    logError,
+  });
 }
 
 async function openFolder(folder) {
@@ -220,7 +215,7 @@ function createMenus() {
         updates?.check();
       },
     },
-    { label: "Help and documentation", click: () => void openDocumentation() },
+    { label: "Help and documentation", click: () => void openWebsite() },
     { label: "Quit MC Panel", click: () => void requestQuit() },
   ];
   Menu.setApplicationMenu(
@@ -348,15 +343,7 @@ async function launch() {
       spellcheck: false,
     },
   });
-  window.webContents.setWindowOpenHandler(({ url }) => {
-    void openDocumentation(url);
-    return { action: "deny" };
-  });
-  window.webContents.on("will-navigate", (event, url) => {
-    if (new URL(url).origin === runtime.url) return;
-    event.preventDefault();
-    void openDocumentation(url);
-  });
+  installExternalLinkHandlers(window.webContents, runtime.url, openWebsite);
   window.webContents.on("will-attach-webview", (event) =>
     event.preventDefault(),
   );

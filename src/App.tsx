@@ -971,11 +971,21 @@ function ConsolePage({
   const query = useDebouncedValue(search);
   const [showSearch, setShowSearch] = useState(false);
   const [autoScroll, setAutoScroll] = useState(true);
-  const [busy, setBusy] = useState(false);
-  const [confirmPower, setConfirmPower] = useState<"stop" | "restart" | null>(
-    null,
-  );
+  const [commandBusy, setCommandBusy] = useState(false);
+  const commandRequest = useRef(0);
+  const [powerAction, setPowerAction] = useState<
+    "start" | "stop" | "restart" | "force-stop" | null
+  >(null);
+  const powerRequest = useRef(0);
+  const busy = commandBusy || powerAction !== null;
+  const [confirmPower, setConfirmPower] = useState<
+    "stop" | "restart" | "force-stop" | null
+  >(null);
   useDialogFocus(confirmPower !== null, () => setConfirmPower(null));
+  useEffect(() => {
+    if (confirmPower === "force-stop" && server?.status !== "stopping")
+      setConfirmPower(null);
+  }, [confirmPower, server?.status]);
   const [hiddenUntil, setHiddenUntil] = useState<string | number | null>(null);
   const [logError, setLogError] = useState(false);
   const commandInput = useRef<HTMLInputElement>(null);
@@ -1014,41 +1024,58 @@ function ConsolePage({
     document.addEventListener("keydown", listener);
     return () => document.removeEventListener("keydown", listener);
   }, []);
-  async function power(action: "start" | "stop" | "restart") {
-    setBusy(true);
+  async function power(action: "start" | "stop" | "restart" | "force-stop") {
+    const token = ++powerRequest.current;
+    if (action === "force-stop") {
+      ++commandRequest.current;
+      setCommandBusy(false);
+    }
+    setPowerAction(action);
     setConfirmPower(null);
     try {
-      await post("/server/power", { action });
+      await post("/server/power", {
+        action,
+        ...(action === "force-stop" ? { confirmed: true } : {}),
+      });
+      if (token !== powerRequest.current) return;
       await refresh();
       await loadLogs();
+      if (token !== powerRequest.current) return;
       notify(
-        `Server ${action === "stop" ? "stop" : action === "restart" ? "restart" : "start"} requested.`,
+        `Server ${action === "force-stop" ? "force stop" : action} requested.`,
       );
     } catch (error) {
-      notify((error as Error).message, true);
+      if (token === powerRequest.current)
+        notify((error as Error).message, true);
     } finally {
-      setBusy(false);
+      if (token === powerRequest.current) setPowerAction(null);
     }
   }
   async function sendCommand(e: React.FormEvent) {
     e.preventDefault();
     if (!command.trim() || busy) return;
-    setBusy(true);
+    const token = ++commandRequest.current;
+    setCommandBusy(true);
     try {
       await post("/console/command", {
         command:
           inputMode === "message" ? `say ${command.trim()}` : command.trim(),
       });
+      if (token !== commandRequest.current) return;
       commandHistory.current[inputMode].unshift(command);
       historyIndex.current = -1;
       setCommand("");
       await loadLogs();
+      if (token !== commandRequest.current) return;
       await refresh();
     } catch (error) {
-      notify((error as Error).message, true);
+      if (token === commandRequest.current)
+        notify((error as Error).message, true);
     } finally {
-      setBusy(false);
-      commandInput.current?.focus();
+      if (token === commandRequest.current) {
+        setCommandBusy(false);
+        commandInput.current?.focus();
+      }
     }
   }
   async function copyAddress() {
@@ -1180,11 +1207,19 @@ function ConsolePage({
             </button>
             <button
               className="btn stop-button"
-              disabled={(!isRunning && server?.status !== "starting") || busy}
-              onClick={() => setConfirmPower("stop")}
+              disabled={
+                server?.status === "stopping"
+                  ? powerAction === "force-stop"
+                  : (!isRunning && server?.status !== "starting") || busy
+              }
+              onClick={() =>
+                setConfirmPower(
+                  server?.status === "stopping" ? "force-stop" : "stop",
+                )
+              }
             >
               <Square size={12} fill="currentColor" />
-              Stop
+              {server?.status === "stopping" ? "Force Stop" : "Stop"}
             </button>
           </div>
         </div>
@@ -1607,11 +1642,17 @@ function ConsolePage({
             aria-labelledby="power-title"
           >
             <h2 id="power-title">
-              {confirmPower === "stop" ? "Stop" : "Restart"} your server?
+              {confirmPower === "force-stop"
+                ? "Force stop"
+                : confirmPower === "stop"
+                  ? "Stop"
+                  : "Restart"}{" "}
+              your server?
             </h2>
             <p>
-              Connected players will be disconnected. The server will receive a
-              graceful stop command to save its world.
+              {confirmPower === "force-stop"
+                ? "This immediately ends the server process without waiting for saving to finish. Unsaved progress may be lost or world files damaged. Use this only if the server is stuck stopping. The server will stay stopped."
+                : "Connected players will be disconnected. The server will receive a graceful stop command to save its world."}
             </p>
             <div className="modal-actions">
               <button
@@ -1622,10 +1663,14 @@ function ConsolePage({
                 Cancel
               </button>
               <button
-                className={`btn ${confirmPower === "stop" ? "danger" : "restart-button"}`}
+                className={`btn ${confirmPower === "restart" ? "restart-button" : "danger"}`}
                 onClick={() => power(confirmPower)}
               >
-                {confirmPower === "stop" ? "Stop server" : "Restart server"}
+                {confirmPower === "force-stop"
+                  ? "Force stop server"
+                  : confirmPower === "stop"
+                    ? "Stop server"
+                    : "Restart server"}
               </button>
             </div>
           </section>
