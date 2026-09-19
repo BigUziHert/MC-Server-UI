@@ -1,5 +1,10 @@
+import {
+  createProcessServer,
+  selectServer,
+  serverButton,
+  removeTestServer,
+} from "./server-fixtures";
 import { test as base, expect } from "@playwright/test";
-import { removeTestServer } from "./server-fixtures";
 
 const test = base.extend<{ serverId: string }>({
   serverId: async ({ request }, use) => {
@@ -9,8 +14,8 @@ const test = base.extend<{ serverId: string }>({
       fleet.servers.some((server: { port: number }) => server.port === port)
     )
       port++;
-    const response = await request.post("/api/servers", {
-      data: { name: "Custom world", mode: "demo", port },
+    const response = await createProcessServer(request, {
+      data: { name: "Custom world", mode: "live", port },
     });
     expect(response.status()).toBe(201);
     const { server } = await response.json();
@@ -129,15 +134,11 @@ test("a server icon is cropped, saved, and hidden by a persistent panel preferen
     (server: { id: string }) => server.id !== serverId,
   );
   if (other) {
-    await page
-      .getByRole("combobox", { name: "Switch server", exact: true })
-      .selectOption(other.id);
+    await selectServer(page, other.id);
     await expect(
       page.getByRole("button", { name: "Edit server icon", exact: true }),
     ).toBeVisible();
-    await page
-      .getByRole("combobox", { name: "Switch server", exact: true })
-      .selectOption(serverId);
+    await selectServer(page, serverId);
     await expect(
       page.getByRole("button", { name: "Edit server icon", exact: true }),
     ).toBeVisible();
@@ -176,6 +177,9 @@ test("custom connection hostname persists while running without rewriting bind s
   serverId,
 }) => {
   const headers = { "X-Server-Id": serverId };
+  const originalAddress = (
+    await (await request.get("/api/server", { headers })).json()
+  ).address;
   const before = await (
     await request.get("/api/files/content?path=server.properties", { headers })
   ).json();
@@ -217,7 +221,7 @@ test("custom connection hostname persists while running without rewriting bind s
   await expect(dialog).not.toBeVisible();
   await expect(
     page.getByRole("button", { name: "Copy server address", exact: true }),
-  ).toContainText("localhost:");
+  ).toHaveText(originalAddress);
 });
 
 test("live telemetry renders memory against its allocation and CPU against whole-processor capacity", async ({
@@ -307,7 +311,26 @@ test("console shows detected NeoForge heap and version without substituting a de
     memoryLimitState: "started",
     software: "NeoForge",
     version: "21.1.250",
+    minecraftVersion: "1.21.1" as string | null,
   };
+  await page.route("**/api/servers", async (route) => {
+    const fleet = await (await route.fetch()).json();
+    await route.fulfill({
+      json: {
+        ...fleet,
+        servers: fleet.servers.map((entry: { id: string }) =>
+          entry.id === serverId
+            ? {
+                ...entry,
+                software: "NeoForge",
+                version: "21.1.250",
+                minecraftVersion: "1.21.1",
+              }
+            : entry,
+        ),
+      },
+    });
+  });
   await page.route("**/api/server", (route) =>
     route.fulfill({ json: reading }),
   );
@@ -321,6 +344,8 @@ test("console shows detected NeoForge heap and version without substituting a de
   await expect(memory).toContainText("startup heap limit");
   await expect(page.locator(".server-details")).toContainText("NeoForge");
   await expect(page.locator(".server-details")).toContainText("21.1.250");
+  await expect(serverButton(page, serverId)).toContainText("NeoForge 1.21.1");
+  await expect(serverButton(page, serverId)).not.toContainText("21.1.250");
 
   reading = {
     ...reading,
@@ -340,9 +365,11 @@ test("console shows detected NeoForge heap and version without substituting a de
     memoryLimitSource: "unknown",
     software: "Java",
     version: "Unknown",
+    minecraftVersion: null,
   };
   await expect(memory.locator(".metric-value")).toHaveText("11.20/ — GB");
   await expect(memory).toContainText("heap limit unknown");
   await expect(page.locator(".server-details")).toContainText("Unknown");
   await expect(page.locator(".server-details")).not.toContainText("21.1.250");
+  await expect(serverButton(page, serverId)).not.toContainText("1.21.1");
 });

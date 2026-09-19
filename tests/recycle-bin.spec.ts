@@ -1,10 +1,14 @@
 import {
+  createProcessServer,
+  selectServer,
+  removeTestServer,
+} from "./server-fixtures";
+import {
   test as base,
   expect,
   type APIRequestContext,
   type Page,
 } from "@playwright/test";
-import { removeTestServer } from "./server-fixtures";
 
 type BinFixture = {
   id: string;
@@ -19,10 +23,10 @@ const test = base.extend<{ bin: BinFixture }>({
     );
     let port = 29400;
     while (occupied.has(port)) port++;
-    const response = await request.post("/api/servers", {
+    const response = await createProcessServer(request, {
       data: {
         name: "Recycle Bin fixture",
-        mode: "demo",
+        mode: "live",
         port,
         memoryLimitMB: 1024,
       },
@@ -90,9 +94,7 @@ async function recycle(
 }
 async function openFiles(page: Page, bin: BinFixture) {
   await page.goto("/#files");
-  await page
-    .getByRole("combobox", { name: "Switch server", exact: true })
-    .selectOption(bin.id);
+  await selectServer(page, bin.id);
   await expect(
     page.getByRole("heading", { name: "File Manager", exact: true }),
   ).toBeVisible();
@@ -295,9 +297,7 @@ test("restore conflicts retain both versions and missing parent folders are recr
     remaining.items.some((item: { id: string }) => item.id === original.id),
   ).toBe(false);
   expect(remaining.items).toHaveLength(2);
-  await page
-    .getByRole("combobox", { name: "Switch server", exact: true })
-    .selectOption(bin.otherServerId);
+  await selectServer(page, bin.otherServerId);
   await openBin(page);
   await expect(
     page.getByRole("listitem", { name: "Recycled recovery", exact: true }),
@@ -684,9 +684,7 @@ test("permanent deletion confirms exact targets, retains failed selections, and 
       exact: true,
     })
     .check();
-  await page
-    .getByRole("combobox", { name: "Switch server", exact: true })
-    .selectOption(bin.otherServerId);
+  await selectServer(page, bin.otherServerId);
   await openBin(page);
   await expect(
     page.getByRole("region", { name: "Recycle Bin selection" }),

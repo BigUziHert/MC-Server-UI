@@ -39,6 +39,7 @@ async function fixture(t, mode = "live", fleet = false) {
   const settings = {
     dataDir: root,
     mode,
+    createDefaultServer: fleet,
     scheduler: false,
     useEnvironment: false,
     telemetry: { reset() {}, sample: async () => ({ available: false }) },
@@ -89,6 +90,9 @@ async function fixture(t, mode = "live", fleet = false) {
   return {
     root,
     commands,
+    serverDirFor(id) {
+      return panel.runtimes.get(id).serverDir;
+    },
     get serverDir() {
       return panel.serverDir;
     },
@@ -241,7 +245,7 @@ test("live rosters and whitelist toggle read authoritative files; requests never
     json("POST", blue),
   );
   assert.equal(add.status, 200);
-  assert.equal(add.body.simulated, false);
+  assert.equal(add.status, 200);
   assert.match(add.body.message, /Requested whitelist add/);
   assert.equal(panel.commands.at(-1), "whitelist add Blue_Player\n");
   assert.equal((await panel.request("/api/players")).body.whitelist.length, 1);
@@ -409,70 +413,46 @@ test("live whitelist rejects stale UUIDs and malformed lists/settings without hi
   );
 });
 
-test("demo whitelist and operator UUID changes persist separately from Minecraft files", async (t) => {
-  const panel = await fixture(t, "demo");
+test("whitelist and operator commands wait for Minecraft files, which persist across restart", async (t) => {
+  const panel = await fixture(t);
+  await panel.start();
   await fs.writeFile(
     path.join(panel.serverDir, "usercache.json"),
     JSON.stringify([blue]),
   );
-  const before = await Promise.all(
-    ["whitelist.json", "ops.json", "server.properties"].map((name) =>
-      fs.readFile(path.join(panel.serverDir, name), "utf8"),
-    ),
-  );
+  await fs.writeFile(path.join(panel.serverDir, "whitelist.json"), "[]\n");
+  await fs.writeFile(path.join(panel.serverDir, "ops.json"), "[]\n");
   assert.equal(
     (await panel.request("/api/players/whitelist/add", json("POST", blue)))
       .status,
     200,
   );
-  assert.equal(
-    (
-      await panel.request(
-        "/api/players/whitelist/add",
-        json("POST", { name: "First_Timer" }),
-      )
-    ).status,
-    200,
-  );
-  assert.equal(
-    (
-      await panel.request(
-        "/api/players/whitelist/state",
-        json("POST", { enabled: true }),
-      )
-    ).status,
-    200,
-  );
+  assert.equal(panel.commands.at(-1), "whitelist add Blue_Player\n");
   assert.equal(
     (await panel.request("/api/players/op", json("POST", blue))).status,
     200,
   );
+  assert.equal(panel.commands.at(-1), "op Blue_Player\n");
+  let data = (await panel.request("/api/players")).body;
+  assert.deepEqual(data.whitelist, []);
+  assert.deepEqual(data.operators, []);
+  await fs.writeFile(
+    path.join(panel.serverDir, "whitelist.json"),
+    JSON.stringify([blue]),
+  );
+  await fs.writeFile(
+    path.join(panel.serverDir, "ops.json"),
+    JSON.stringify([{ ...blue, level: 4 }]),
+  );
+  await fs.appendFile(
+    path.join(panel.serverDir, "server.properties"),
+    "\nwhite-list=true\n",
+  );
   await panel.restart();
-  const data = (await panel.request("/api/players")).body;
+  data = (await panel.request("/api/players")).body;
   assert.equal(data.whitelistEnabled, true);
-  assert.equal(data.whitelist.length, 2);
-  assert.equal(
-    data.whitelist.find((player) => player.name === blue.name).uuid,
-    blue.uuid,
-  );
+  assert.equal(data.whitelist[0].uuid, blue.uuid);
   assert.equal(data.operators[0].uuid, blue.uuid);
-  assert.equal(
-    (await panel.request("/api/players/deop", json("POST", blue))).status,
-    200,
-  );
-  assert.equal(
-    (await panel.request("/api/players/whitelist/remove", json("POST", blue)))
-      .status,
-    200,
-  );
-  assert.deepEqual(
-    await Promise.all(
-      ["whitelist.json", "ops.json", "server.properties"].map((name) =>
-        fs.readFile(path.join(panel.serverDir, name), "utf8"),
-      ),
-    ),
-    before,
-  );
 });
 
 test("deop UUID validation uses the current authoritative operator list", async (t) => {
@@ -608,34 +588,31 @@ test("whitelist reads reject junctions and valid actions respect the backup muta
 });
 
 test("whitelist settings and records stay selected-server scoped across a fleet restart", async (t) => {
-  const panel = await fixture(t, "demo", true);
+  const panel = await fixture(t, "live", true);
   const first = (await panel.request("/api/servers")).body.defaultServerId;
   const added = await panel.request(
     "/api/servers",
-    json("POST", { name: "Other world", mode: "demo", port: 25566 }),
+    json("POST", { name: "Other world", mode: "live", port: 25566 }),
   );
   assert.equal(added.status, 201);
   const second = added.body.server.id;
-  assert.equal(
-    (
-      await panel.request(
-        "/api/players/whitelist/add",
-        json("POST", { name: "First_Timer" }),
-        first,
-      )
-    ).status,
-    200,
+  await fs.writeFile(
+    path.join(panel.serverDirFor(first), "whitelist.json"),
+    JSON.stringify([{ name: "First_Timer", uuid: blue.uuid }]),
   );
-  assert.equal(
-    (
-      await panel.request(
-        "/api/players/whitelist/state",
-        json("POST", { enabled: true }),
-        first,
-      )
-    ).status,
-    200,
+  await fs.writeFile(
+    path.join(panel.serverDirFor(first), "server.properties"),
+    "white-list=true\n",
   );
+  await fs.writeFile(
+    path.join(panel.serverDirFor(second), "whitelist.json"),
+    "[]\n",
+  );
+  await fs.writeFile(
+    path.join(panel.serverDirFor(second), "server.properties"),
+    "white-list=false\n",
+  );
+
   assert.deepEqual(
     (await panel.request("/api/players", {}, second)).body.whitelist,
     [],

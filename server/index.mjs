@@ -23,6 +23,7 @@ import { createMinecraft } from "./minecraft.mjs";
 import { createServerSetup } from "./server-setup.mjs";
 import { auditEntry, auditHistory, contentKind } from "./audit.mjs";
 import { installedMinecraftMetadata } from "./installed-minecraft.mjs";
+import { minecraftGameVersion } from "./minecraft-version.mjs";
 import { createLauncherStop } from "./launcher-stop.mjs";
 import {
   createPlayerHistory,
@@ -222,8 +223,8 @@ export function validateServerConfiguration(
   } catch (cause) {
     throw error(400, cause.message);
   }
-  if (!["demo", "live"].includes(result.mode))
-    throw error(400, "Choose demo or live mode.");
+  if (result.mode !== "live")
+    throw error(400, "Only live Minecraft servers are supported.");
   if (
     !Number.isInteger(result.port) ||
     result.port < 1024 ||
@@ -450,6 +451,8 @@ async function directorySize(root) {
 }
 
 export async function createPanel(options = {}) {
+  if (options.mode !== undefined && options.mode !== "live")
+    throw error(400, "Only live Minecraft servers are supported.");
   const telemetry = options.telemetry ?? createProcessTelemetry();
   const publicAddress = options.publicAddress ?? createPublicAddressResolver();
   // A fleet passes every setting explicitly. Legacy callers may still use .env.
@@ -464,8 +467,7 @@ export async function createPanel(options = {}) {
     options.launchType && options.launchType !== "jar"
       ? ""
       : (options.jar ?? env.MC_SERVER_JAR) || "server.jar";
-  let mode =
-    options.mode ?? (options.jar || env.MC_SERVER_JAR ? "live" : "demo");
+  const mode = "live";
   let memoryLimit = Number(options.memoryLimit ?? env.MC_MEMORY_MB ?? 4096);
   let configuration = {
     name: options.name ?? env.MC_SERVER_NAME ?? "The Overworld",
@@ -485,14 +487,8 @@ export async function createPanel(options = {}) {
       options.address ??
       env.MC_SERVER_ADDRESS ??
       `localhost:${options.port ?? env.MC_PORT ?? 25565}`,
-    version:
-      options.version ??
-      env.MC_VERSION ??
-      (mode === "demo" ? "1.21.4" : "Configured JAR"),
-    software:
-      options.software ??
-      env.MC_SOFTWARE ??
-      (mode === "demo" ? "Paper" : "Java"),
+    version: options.version ?? env.MC_VERSION ?? "Configured JAR",
+    software: options.software ?? env.MC_SOFTWARE ?? "Java",
     maxPlayers: Number(options.maxPlayers ?? env.MC_MAX_PLAYERS ?? 20),
     minecraftVersion: options.minecraftVersion ?? null,
     motd: options.motd ?? "Welcome to the Overworld",
@@ -533,6 +529,7 @@ export async function createPanel(options = {}) {
   const recycleBin = await createRecycleBin({
     dataDir,
     serverDir,
+    backupDir,
     safePath,
   });
   let state = {
@@ -540,11 +537,7 @@ export async function createPanel(options = {}) {
     databases: [],
     backups: [],
     audit: [],
-    demoOperators: [],
     playerHistory: [],
-    demoPlayerBans: [],
-    demoWhitelist: [],
-    demoWhitelistEnabled: null,
     iconPreference: "server",
     schedule: { ...defaultSchedule },
   };
@@ -583,44 +576,26 @@ export async function createPanel(options = {}) {
     state.audit = state.audit.slice(0, 2000);
     await save();
   };
-
-  if (
-    mode === "demo" &&
-    serverDir === path.resolve(dataDir, "server") &&
-    !(await exists(path.join(dataDir, ".seeded")))
-  ) {
-    for (const dir of ["world", "plugins", "config", "logs"])
-      await fs.mkdir(path.join(serverDir, dir), { recursive: true });
-    const seed = {
-      "server.properties": `# Local demo configuration\nmotd=${escapeProperty(configuration.motd)}\nserver-port=${configuration.port}\nmax-players=20\ndifficulty=normal\ngamemode=survival\nonline-mode=true\nview-distance=10\n`,
-      "eula.txt":
-        "# Set eula=true yourself after reading https://aka.ms/MinecraftEULA.\neula=false\n",
-      "whitelist.json": "[]\n",
-      "ops.json": "[]\n",
-      "config/paper-global.yml":
-        "# Example configuration for the demo workspace\n_version: 29\n",
-      "plugins/README.txt":
-        "Upload your server plugins here. The demo does not execute plugins.\n",
-      "world/README.txt":
-        "This is an example world directory. No Minecraft world has been generated.\n",
-      "logs/latest.log":
-        "[Server thread/INFO]: Demonstration workspace initialized.\n",
-    };
-    for (const [name, content] of Object.entries(seed))
-      await fs
-        .writeFile(path.join(serverDir, name), content, { flag: "wx" })
-        .catch((cause) => {
-          if (cause.code !== "EEXIST") throw cause;
-        });
-    await fs.writeFile(
-      path.join(dataDir, ".seeded"),
-      "Demo data initialized.\n",
+  // A crash can occur after an archive enters the journal but before its active
+  // history is saved. Recovery records remain authoritative for missing files.
+  const recycledBackups = (await recycleBin.list()).filter(
+    (item) => item.kind === "backup" && item.status === "ready",
+  );
+  const removedBackupIds = new Set();
+  for (const item of recycledBackups) {
+    if (!(await exists(await safePath(backupDir, `${item.backup.id}.tar.gz`))))
+      removedBackupIds.add(item.backup.id);
+  }
+  if (state.backups.some((item) => removedBackupIds.has(item.id))) {
+    state.backups = state.backups.filter(
+      (item) => !removedBackupIds.has(item.id),
     );
+    await save();
   }
 
-  let status = mode === "demo" ? "running" : "offline";
+  let status = "offline";
   let configBusy = false;
-  let startedAt = mode === "demo" ? Date.now() - 3_600_000 : null;
+  let startedAt = null;
   let processHandle = null;
   let processStop;
   let processStopActor;
@@ -634,7 +609,7 @@ export async function createPanel(options = {}) {
   let startupMetadataAt = 0;
   let startupMetadataRead;
   const metadataFor = (config, detected = {}) =>
-    config.mode === "demo" || config.launchType === "jar"
+    config.launchType === "jar"
       ? {
           memoryLimitMB: config.memoryLimitMB,
           software: config.software,
@@ -653,7 +628,7 @@ export async function createPanel(options = {}) {
   async function refreshStartupMetadata(force = false) {
     // Once launched, these values describe that process. Editing @files while it
     // runs changes the next launch, not the heap/version of the running JVM.
-    if (processHandle || (mode === "live" && status !== "offline")) return;
+    if (processHandle || status !== "offline") return;
     if (
       !force &&
       Date.now() - startupMetadataAt < (options.startupMetadataTtlMs ?? 3000)
@@ -663,14 +638,14 @@ export async function createPanel(options = {}) {
     const current = configuration;
     startupMetadataRead = (async () => {
       let detected = {};
-      if (current.mode === "live" && current.launchType !== "jar") {
+      if (current.launchType !== "jar") {
         try {
           detected = await validateStartupFiles(serverDir, current);
         } catch {
           /* Missing startup files are reported on Start; metadata stays unknown. */
         }
       }
-      if (current.mode === "live" && !current.minecraftVersion) {
+      if (!current.minecraftVersion) {
         const installed = await installedMinecraftMetadata({
           serverDir,
           safePath,
@@ -679,11 +654,7 @@ export async function createPanel(options = {}) {
         });
         detected = { ...detected, ...installed };
       }
-      if (
-        configuration === current &&
-        !processHandle &&
-        (mode === "demo" || status === "offline")
-      ) {
+      if (configuration === current && !processHandle && status === "offline") {
         startupMetadata = {
           ...metadataFor(current, detected),
           ...(detected.gameVersion
@@ -727,7 +698,6 @@ export async function createPanel(options = {}) {
       req.panelMutationDone?.();
     }
   };
-  let demoTimer = null;
   let lineId = 0;
   const lines = [];
   const onlinePlayers = new Map();
@@ -815,27 +785,9 @@ export async function createPanel(options = {}) {
     );
     console.error("Panel state could not be saved:", cause);
   };
-  if (mode === "demo") {
-    append(
-      "[Panel] Demo mode — server activity and resource metrics are simulated.",
-      "warn",
-    );
-    append("[Server thread/INFO]: Starting minecraft server version 1.21.4");
-    append("[Server thread/INFO]: Loading properties");
-    append("[Server thread/INFO]: This server is running Paper");
-    append('[Server thread/INFO]: Preparing level "world"');
-    append(
-      "[Server thread/INFO]: Preparing start region for dimension minecraft:overworld",
-    );
-    append("[Server thread/INFO]: Time elapsed: 1428 ms");
-    append(
-      '[Server thread/INFO]: Done (2.314s)! For help, type "help"',
-      "success",
-    );
-  } else
-    append(
-      "[Panel] Live mode configured. Start the server when your JAR and EULA are ready.",
-    );
+  append(
+    "[Panel] Start the server when your startup files and EULA are ready.",
+  );
 
   async function writeProperties(updates) {
     const target = await safePath(serverDir, "server.properties");
@@ -862,6 +814,8 @@ export async function createPanel(options = {}) {
   }
 
   async function updateConfiguration(next, persist = async () => {}) {
+    if (next.mode !== "live")
+      throw error(400, "Only live Minecraft servers are supported.");
     if (configBusy || backupBusy || activeMutations)
       throw error(
         409,
@@ -921,7 +875,6 @@ export async function createPanel(options = {}) {
         throw cause;
       }
       const oldName = configuration.name;
-      const oldMode = configuration.mode;
       const changedJar =
         next.launchType === "jar" &&
         (configuration.launchType !== "jar" || next.jar !== configuration.jar);
@@ -934,18 +887,12 @@ export async function createPanel(options = {}) {
           ]),
         ),
       };
-      mode = configuration.mode;
       memoryLimit = configuration.memoryLimitMB;
       configuredJar = configuration.jar;
-      if (oldMode !== mode || changedJar) {
+      if (changedJar) {
         configuration.minecraftVersion = null;
-        configuration.version = mode === "demo" ? "1.21.4" : "Configured JAR";
-        configuration.software = mode === "demo" ? "Paper" : "Java";
-      }
-      if (oldMode !== mode) {
-        append(
-          `[Panel] ${mode === "demo" ? "Demo mode — activity is simulated" : "Live Java mode configured"}.`,
-        );
+        configuration.version = "Configured JAR";
+        configuration.software = "Java";
       }
       await refreshStartupMetadata(true);
       if (oldName !== configuration.name)
@@ -966,10 +913,16 @@ export async function createPanel(options = {}) {
     }
   }
 
+  const gameVersion = () =>
+    minecraftGameVersion({
+      ...startupMetadata,
+      minecraftVersion: configuration.minecraftVersion,
+    });
   const descriptor = () => ({
     ...configuration,
     version: startupMetadata.version,
     software: startupMetadata.software,
+    minecraftVersion: gameVersion(),
     configuredMemoryLimitMB: startupMetadata.memoryLimitMB,
     memoryLimitSource: startupMetadata.memoryLimitSource,
     memoryLimitState: processHandle ? "started" : "configured",
@@ -992,21 +945,6 @@ export async function createPanel(options = {}) {
     try {
       if (options.existingServerDir)
         await canonicalExternalDirectory(serverDir, { requireCanonical: true });
-      if (mode === "demo") {
-        status = "starting";
-        append("[Demo] Starting the Minecraft server…");
-        demoTimer = setTimeout(() => {
-          status = "running";
-          startedAt = Date.now();
-          append("[Demo] Done! Server is ready.", "success");
-          void lifecycleAudit(
-            restarting ? "Server restarted" : "Server started",
-            "Simulated server is ready.",
-          );
-        }, 900);
-        demoTimer.unref();
-        return;
-      }
       let launchArgs;
       let executable = configuration.javaPath;
       let windowsVerbatimArguments = false;
@@ -1301,16 +1239,6 @@ export async function createPanel(options = {}) {
         throw error(409, "Stop the server before using Force Stop.");
       restartRequested = false;
       clearTimeout(stopTimer);
-      if (mode === "demo") {
-        clearTimeout(demoTimer);
-        status = "offline";
-        startedAt = null;
-        await lifecycleAudit(
-          "Server force stopped",
-          "Simulated server force stopped.",
-        );
-        return;
-      }
       if (!terminationPromise && !processHandle)
         throw error(
           409,
@@ -1342,7 +1270,7 @@ export async function createPanel(options = {}) {
     else {
       if (!["running", "starting"].includes(status))
         throw error(409, "The server is not running.");
-      if (mode === "live" && !processHandle)
+      if (!processHandle)
         throw error(
           409,
           "Java is still being prepared. Wait for the process to start before stopping or restarting it.",
@@ -1351,40 +1279,25 @@ export async function createPanel(options = {}) {
       status = "stopping";
       clearPlayers();
       append(
-        `[${mode === "demo" ? "Demo" : "Panel"}] ${action === "restart" ? "Restarting" : "Stopping"} the server…`,
+        `[Panel] ${action === "restart" ? "Restarting" : "Stopping"} the server…`,
       );
-      if (mode === "demo") {
-        clearTimeout(demoTimer);
-        demoTimer = setTimeout(() => {
-          status = "offline";
-          startedAt = null;
-          append("[Demo] Server stopped.");
-          void lifecycleAudit("Server stopped", "Simulated server stopped.");
-          if (restartRequested) {
-            restartRequested = false;
-            startServer(true).catch((cause) => append(cause.message, "error"));
-          }
-        }, 650);
-        demoTimer.unref();
-      } else {
-        const child = processHandle;
-        const stop = processStop;
-        processStopActor = "Local administrator";
-        // Bound an unresponsive wrapper, but never interrupt Minecraft after it
-        // confirms graceful shutdown. A trailing batch pause is handled on stdout.
-        if (["script", "executable"].includes(configuration.launchType)) {
-          stopTimer = setTimeout(() => {
-            if (processHandle !== child || stop.shutdownStarted) return;
-            append(
-              "[Panel] The launcher did not exit after stop. Terminating its process tree…",
-              "warn",
-            );
-            void terminateServer(child).catch(() => {});
-          }, options.stopTimeoutMs ?? 15000);
-          stopTimer.unref();
-        }
-        stop.requestStop();
+      const child = processHandle;
+      const stop = processStop;
+      processStopActor = "Local administrator";
+      // Bound an unresponsive wrapper, but never interrupt Minecraft after it
+      // confirms graceful shutdown. A trailing batch pause is handled on stdout.
+      if (["script", "executable"].includes(configuration.launchType)) {
+        stopTimer = setTimeout(() => {
+          if (processHandle !== child || stop.shutdownStarted) return;
+          append(
+            "[Panel] The launcher did not exit after stop. Terminating its process tree…",
+            "warn",
+          );
+          void terminateServer(child).catch(() => {});
+        }, options.stopTimeoutMs ?? 15000);
+        stopTimer.unref();
       }
+      stop.requestStop();
     }
   }
 
@@ -1422,7 +1335,6 @@ export async function createPanel(options = {}) {
     else await validateStartupFiles(serverDir, next);
     await options.persistMinecraftConfiguration?.(next);
     configuration = next;
-    mode = next.mode;
     memoryLimit = next.memoryLimitMB;
     configuredJar = next.jar;
     await refreshStartupMetadata(true);
@@ -1449,24 +1361,6 @@ export async function createPanel(options = {}) {
         )
           ? software.toLowerCase()
           : null;
-      let gameVersion =
-        configuration.minecraftVersion ?? startupMetadata.gameVersion ?? null;
-      if (loader === "neoforge") {
-        const parts = /^(\d+)\.(\d+)\.(\d+)/.exec(version ?? "");
-        if (parts)
-          gameVersion =
-            Number(parts[1]) < 26
-              ? `1.${parts[1]}${parts[2] === "0" ? "" : "." + parts[2]}`
-              : `${parts[1]}.${parts[2]}${parts[3] === "0" ? "" : "." + parts[3]}`;
-      } else if (loader === "forge")
-        gameVersion =
-          /^(1\.\d+(?:\.\d+)?)-/.exec(version ?? "")?.[1] ?? gameVersion;
-      else if (
-        ["Paper", "Purpur", "Vanilla", "Spigot", "Folia"].includes(software)
-      )
-        gameVersion = /^\d+\.\d+(?:\.\d+)?$/.test(version ?? "")
-          ? version
-          : gameVersion;
       let world = "world";
       try {
         world =
@@ -1490,7 +1384,7 @@ export async function createPanel(options = {}) {
         mode,
         software,
         version,
-        gameVersion,
+        gameVersion: gameVersion(),
         loader,
         loaderVersion,
         world,
@@ -1569,6 +1463,23 @@ export async function createPanel(options = {}) {
       cleanup();
     }
   }
+  async function recycleBackup(
+    item,
+    actor = "Local administrator",
+    retention = false,
+  ) {
+    const recycled = await recycleBin.recycle(`backups/${item.id}.tar.gz`, {
+      backup: item,
+    });
+    state.backups = state.backups.filter((entry) => entry.id !== item.id);
+    await audit(
+      "backup",
+      "Backup moved to Recycle Bin",
+      `${item.name}${retention ? " (retention)" : ""}.`,
+      actor,
+    );
+    return recycled;
+  }
   async function createBackup(name, trigger = "manual") {
     if (configBusy)
       throw error(409, "Wait for the server settings to finish saving.");
@@ -1578,7 +1489,7 @@ export async function createPanel(options = {}) {
         409,
         "A file or server change is in progress. Try the backup again when it finishes.",
       );
-    if (mode === "live" && !["running", "offline"].includes(status))
+    if (!["running", "offline"].includes(status))
       throw error(
         409,
         "Wait for the server to finish starting or stopping before backing up.",
@@ -1589,8 +1500,7 @@ export async function createPanel(options = {}) {
     backupBusy = true;
     const id = randomUUID();
     const target = path.join(backupDir, `${id}.tar.gz`);
-    const liveChild =
-      mode === "live" && status === "running" ? processHandle : null;
+    const liveChild = status === "running" ? processHandle : null;
     try {
       if (liveChild) {
         append(
@@ -1629,16 +1539,7 @@ export async function createPanel(options = {}) {
           .filter((item) => item.trigger === "scheduled")
           .slice(state.schedule.retention);
         for (const old of obsolete) {
-          await fs.rm(path.join(backupDir, `${old.id}.tar.gz`), {
-            force: true,
-          });
-          state.backups = state.backups.filter((item) => item.id !== old.id);
-          await audit(
-            "backup",
-            "Backup deleted",
-            `${old.name} (retention).`,
-            "Scheduler",
-          );
+          await recycleBackup(old, "Scheduler", true);
         }
       }
       await audit(
@@ -1763,6 +1664,7 @@ export async function createPanel(options = {}) {
     const protectedMutation =
       !["GET", "HEAD", "OPTIONS"].includes(req.method) &&
       (/^\/api\/files(?:\/|$)/.test(req.path) ||
+        (req.method === "DELETE" && /^\/api\/backups\/[^/]+$/.test(req.path)) ||
         /^\/api\/players(?:\/|$)/.test(req.path) ||
         req.path === "/api/server/power" ||
         req.path === "/api/server/icon" ||
@@ -1788,6 +1690,7 @@ export async function createPanel(options = {}) {
         );
       const recycling =
         (req.method === "DELETE" && req.path === "/api/files") ||
+        (req.method === "DELETE" && /^\/api\/backups\/[^/]+$/.test(req.path)) ||
         (req.method === "DELETE" &&
           /^\/api\/files\/recycle-bin\/[^/]+$/.test(req.path)) ||
         (req.method === "POST" &&
@@ -1824,11 +1727,10 @@ export async function createPanel(options = {}) {
     await refreshStartupMetadata();
     if (Date.now() - diskCache.at > 10000)
       diskCache = { value: await directorySize(serverDir), at: Date.now() };
-    const active = status === "running";
     const storage = await fs.statfs(serverDir);
     const sampledChild = processHandle;
     const [sample, connection, icon] = await Promise.all([
-      mode === "live" && sampledChild && Number.isInteger(sampledChild.pid)
+      sampledChild && Number.isInteger(sampledChild.pid)
         ? telemetry.sample(sampledChild.pid)
         : null,
       advertisedConnection(configuration, publicAddress),
@@ -1840,7 +1742,7 @@ export async function createPanel(options = {}) {
       sampledChild.exitCode == null
         ? sample
         : null;
-    const liveIdle = mode === "live" && !processHandle && status === "offline";
+    const liveIdle = !processHandle && status === "offline";
     res.json({
       id: options.id,
       name: configuration.name,
@@ -1854,20 +1756,11 @@ export async function createPanel(options = {}) {
       mode,
       version: startupMetadata.version,
       software: startupMetadata.software,
+      minecraftVersion: gameVersion(),
       uptime: startedAt ? Math.floor((Date.now() - startedAt) / 1000) : 0,
       cpuCapacity: availableParallelism() * 100,
-      cpu:
-        mode === "demo" && active
-          ? Number((7.2 + Math.sin(Date.now() / 7000) * 2.6).toFixed(1))
-          : mode === "demo" || liveIdle
-            ? 0
-            : (currentSample?.cpu ?? null),
-      memory:
-        mode === "demo" && active
-          ? Math.round(1840 + Math.sin(Date.now() / 12000) * 60) * 1024 ** 2
-          : mode === "demo" || liveIdle
-            ? 0
-            : (currentSample?.memory ?? null),
+      cpu: liveIdle ? 0 : (currentSample?.cpu ?? null),
+      memory: liveIdle ? 0 : (currentSample?.memory ?? null),
       memoryLimit:
         startupMetadata.memoryLimitMB == null
           ? null
@@ -1881,8 +1774,7 @@ export async function createPanel(options = {}) {
         a.name.localeCompare(b.name),
       ),
       maxPlayers: configuration.maxPlayers,
-      metricsAvailable:
-        mode === "demo" || liveIdle || currentSample?.available === true,
+      metricsAvailable: liveIdle || currentSample?.available === true,
       metricsMessage: liveIdle
         ? "Server offline"
         : (currentSample?.error ??
@@ -1955,21 +1847,10 @@ export async function createPanel(options = {}) {
     playerHistory.seed(cache.records, "cache");
     playerHistory.seed(savedBans.records, "banned");
     playerHistory.seed(operators, "operator");
-    const whitelist =
-      mode === "demo" ? (state.demoWhitelist ?? []) : savedWhitelist.records;
+    const whitelist = savedWhitelist.records;
     playerHistory.seed(whitelist, "whitelist");
-    const whitelistAvailable = mode === "demo" || savedWhitelist.available;
-    let bans = savedBans.records;
-    if (mode === "demo") {
-      for (const change of state.demoPlayerBans ?? []) {
-        bans = bans.filter((entry) =>
-          change.uuid && entry.uuid
-            ? change.uuid !== entry.uuid
-            : change.name.toLowerCase() !== entry.name.toLowerCase(),
-        );
-        if (change.banned) bans.push(change);
-      }
-    }
+    const whitelistAvailable = savedWhitelist.available;
+    const bans = savedBans.records;
     const history = playerHistory.snapshot(
       onlinePlayers,
       bans,
@@ -2009,69 +1890,62 @@ export async function createPanel(options = {}) {
         ),
       })),
       whitelistAvailable,
-      whitelistEnabled:
-        mode === "demo" && typeof state.demoWhitelistEnabled === "boolean"
-          ? state.demoWhitelistEnabled
-          : settings.enabled,
-      whitelistSettingsAvailable:
-        (mode === "demo" && typeof state.demoWhitelistEnabled === "boolean") ||
-        settings.available,
+      whitelistEnabled: settings.enabled,
+      whitelistSettingsAvailable: settings.available,
       bansAvailable: savedBans.available,
       warnings: [
         cache.warning,
         savedBans.warning,
-        mode === "live" ? savedWhitelist.warning : null,
+        savedWhitelist.warning,
         settings.warning,
       ].filter(Boolean),
     };
   };
   const loadOperators = async () => {
-    let operators = state.demoOperators;
-    if (mode === "live") {
-      const target = await safePath(serverDir, "ops.json");
+    let operators;
+    const target = await safePath(serverDir, "ops.json");
+    try {
+      const stat = await fs.stat(target);
+      if (!stat.isFile() || stat.size > 1024 * 1024)
+        throw error(409, "ops.json must be a JSON file under 1 MB.");
       try {
-        const stat = await fs.stat(target);
-        if (!stat.isFile() || stat.size > 1024 * 1024)
-          throw error(409, "ops.json must be a JSON file under 1 MB.");
-        try {
-          operators = JSON.parse(await fs.readFile(target, "utf8"));
-        } catch (cause) {
-          if (!(cause instanceof SyntaxError)) throw cause;
-          throw error(
-            409,
-            "ops.json contains invalid JSON. Check the file or refresh after the server finishes writing it.",
-          );
-        }
-        if (
-          !Array.isArray(operators) ||
-          operators.some(
-            (entry) =>
-              !entry ||
-              typeof entry !== "object" ||
-              typeof entry.name !== "string" ||
-              !/^[A-Za-z0-9_]{3,16}$/.test(entry.name) ||
-              typeof entry.uuid !== "string" ||
-              !/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i.test(
-                entry.uuid,
-              ) ||
-              !Number.isInteger(entry.level) ||
-              entry.level < 1 ||
-              entry.level > 4,
-          )
-        )
-          throw error(
-            409,
-            "ops.json contains an invalid operator record. Check the server file before relying on this list.",
-          );
-        operators = operators.map(({ name, uuid, level }) => ({
-          name,
-          uuid,
-          level,
-        }));
+        operators = JSON.parse(await fs.readFile(target, "utf8"));
       } catch (cause) {
-        if (cause.code !== "ENOENT") throw cause;
-        operators = [];
+        if (!(cause instanceof SyntaxError)) throw cause;
+        throw error(
+          409,
+          "ops.json contains invalid JSON. Check the file or refresh after the server finishes writing it.",
+        );
       }
+      if (
+        !Array.isArray(operators) ||
+        operators.some(
+          (entry) =>
+            !entry ||
+            typeof entry !== "object" ||
+            typeof entry.name !== "string" ||
+            !/^[A-Za-z0-9_]{3,16}$/.test(entry.name) ||
+            typeof entry.uuid !== "string" ||
+            !/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i.test(
+              entry.uuid,
+            ) ||
+            !Number.isInteger(entry.level) ||
+            entry.level < 1 ||
+            entry.level > 4,
+        )
+      )
+        throw error(
+          409,
+          "ops.json contains an invalid operator record. Check the server file before relying on this list.",
+        );
+      operators = operators.map(({ name, uuid, level }) => ({
+        name,
+        uuid,
+        level,
+      }));
+    } catch (cause) {
+      if (cause.code !== "ENOENT") throw cause;
+      operators = [];
     }
     return operators;
   };
@@ -2154,45 +2028,14 @@ export async function createPanel(options = {}) {
             action === "remove" ? snapshot.whitelist : undefined,
           );
         }
-        if (mode === "live") {
-          if (!processHandle?.stdin.writable)
-            throw error(409, "The server is not ready to receive commands.");
-          await writeServer(processHandle, command);
-        } else if (action === "state")
-          state.demoWhitelistEnabled = req.body.enabled;
-        else {
-          state.demoWhitelist = (state.demoWhitelist ?? []).filter(
-            (player) =>
-              player.name.toLowerCase() !== req.body.name.toLowerCase(),
-          );
-          if (action === "add") {
-            const known = snapshot.history.filter(
-              (player) =>
-                player.name.toLowerCase() === req.body.name.toLowerCase(),
-            );
-            const uuid =
-              req.body.uuid?.toLowerCase() ??
-              (known.length === 1 ? known[0].uuid : undefined);
-            state.demoWhitelist.push({
-              name: req.body.name,
-              ...(uuid ? { uuid } : {}),
-            });
-          }
-        }
-        if (mode === "demo") await save();
-        append(
-          `[${mode === "demo" ? "Demo" : "Panel"}] ${mode === "demo" ? "Simulated" : "Requested"}: ${command}`,
-        );
-        const event = playerCommandAudit(command, {
-          simulated: mode === "demo",
-        });
+        if (!processHandle?.stdin.writable)
+          throw error(409, "The server is not ready to receive commands.");
+        await writeServer(processHandle, command);
+        append(`[Panel] Requested: ${command}`);
+        const event = playerCommandAudit(command);
         await audit("player", event.action, event.detail);
         res.json({
-          simulated: mode === "demo",
-          message:
-            mode === "demo"
-              ? `Demo: ${command} was simulated. No live whitelist or server properties were changed.`
-              : `Requested ${command}. Check Console for Minecraft's confirmation; the whitelist and setting update after the server writes its files.`,
+          message: `Requested ${command}. Check Console for Minecraft's confirmation; the whitelist and setting update after the server writes its files.`,
         });
       }),
     );
@@ -2237,39 +2080,14 @@ export async function createPanel(options = {}) {
             409,
             "This player is not in the saved ban list. Refresh the player list.",
           );
-        if (mode === "live") {
-          if (!processHandle?.stdin.writable)
-            throw error(409, "The server is not ready to receive commands.");
-          await writeServer(processHandle, command);
-        } else if (action === "kick") {
-          onlinePlayers.delete(name.toLowerCase());
-          playerHistory.observe(player);
-        } else {
-          state.demoPlayerBans = (state.demoPlayerBans ?? []).filter(
-            (entry) => entry.name.toLowerCase() !== name.toLowerCase(),
-          );
-          state.demoPlayerBans.push({
-            name,
-            ...(player.uuid ? { uuid: player.uuid } : {}),
-            banned: action === "ban",
-            reason: req.body.reason?.trim() ?? "",
-          });
-          if (action === "ban") onlinePlayers.delete(name.toLowerCase());
-        }
-        if (mode === "demo") await save();
-        append(
-          `[${mode === "demo" ? "Demo" : "Panel"}] ${mode === "demo" ? "Simulated" : "Requested"}: ${command}`,
-        );
-        const event = playerCommandAudit(command, {
-          simulated: mode === "demo",
-        });
+        if (!processHandle?.stdin.writable)
+          throw error(409, "The server is not ready to receive commands.");
+        await writeServer(processHandle, command);
+        append(`[Panel] Requested: ${command}`);
+        const event = playerCommandAudit(command);
         await audit("player", event.action, event.detail);
         res.json({
-          simulated: mode === "demo",
-          message:
-            mode === "demo"
-              ? `Demo: ${action} for ${name} was simulated. No live player or Minecraft ban file was changed.`
-              : `Requested ${command}. Check Console for Minecraft's confirmation; the saved player list updates after the server writes it.`,
+          message: `Requested ${command}. Check Console for Minecraft's confirmation; the saved player list updates after the server writes it.`,
         });
       }),
     );
@@ -2299,35 +2117,14 @@ export async function createPanel(options = {}) {
             "Start this server before changing in-game operators.",
           );
         const command = `${action} ${name}`;
-        if (mode === "live") {
-          if (!processHandle?.stdin.writable)
-            throw error(409, "The server is not ready to receive commands.");
-          await writeServer(processHandle, command);
-        } else {
-          state.demoOperators = state.demoOperators.filter(
-            (entry) => entry.name.toLowerCase() !== name.toLowerCase(),
-          );
-          if (action === "op")
-            state.demoOperators.push({
-              name,
-              level: 4,
-              ...(req.body.uuid ? { uuid: req.body.uuid.toLowerCase() } : {}),
-            });
-        }
-        if (mode === "demo") await save();
-        append(
-          `[${mode === "demo" ? "Demo" : "Panel"}] ${mode === "demo" ? "Simulated" : "Requested"}: ${command}`,
-        );
-        const event = playerCommandAudit(command, {
-          simulated: mode === "demo",
-        });
+        if (!processHandle?.stdin.writable)
+          throw error(409, "The server is not ready to receive commands.");
+        await writeServer(processHandle, command);
+        append(`[Panel] Requested: ${command}`);
+        const event = playerCommandAudit(command);
         await audit("player", event.action, event.detail);
         res.json({
-          simulated: mode === "demo",
-          message:
-            mode === "demo"
-              ? `Demo: ${name} ${action === "op" ? "was added as an operator" : "had operator access removed"}. No in-game permissions were changed.`
-              : `Requested ${command}. Check the console for Minecraft's confirmation; ops.json may update after the command completes.`,
+          message: `Requested ${command}. Check the console for Minecraft's confirmation; ops.json may update after the command completes.`,
         });
       }),
     );
@@ -2355,36 +2152,10 @@ export async function createPanel(options = {}) {
       const normalized = command.trim().replace(/^\//, "");
       append(`> ${normalized}`);
       if (normalized === "stop") await power("stop");
-      else if (mode === "live") await writeServer(processHandle, normalized);
-      else if (normalized === "help")
-        append(
-          "[Demo] Available examples: help, list, say <message>, save-all, time query daytime, stop.",
-        );
-      else if (normalized === "list")
-        append("[Demo] There are 0 of a max of 20 players online.");
-      else if (normalized.startsWith("say "))
-        append(`[Demo] [Server] ${normalized.slice(4)}`);
-      else if (normalized === "save-all")
-        append("[Demo] Saved the game (simulated).", "success");
-      else if (normalized === "time query daytime")
-        append("[Demo] The time is 6000.");
-      else
-        append(
-          `[Demo] Received “${normalized}”. Connect a live server to execute Minecraft commands.`,
-          "warn",
-        );
-      const playerEvent = playerCommandAudit(normalized, {
-        simulated: mode === "demo",
-        applied: false,
-      });
+      else await writeServer(processHandle, normalized);
+      const playerEvent = playerCommandAudit(normalized);
       if (playerEvent)
-        await audit(
-          "player",
-          playerEvent.action,
-          mode === "demo"
-            ? `Demo console command: ${normalized}. No live player state was changed.`
-            : playerEvent.detail,
-        );
+        await audit("player", playerEvent.action, playerEvent.detail);
       else if (normalized !== "stop")
         await audit("server", "Console command", normalized);
       res.json({ ok: true });
@@ -2401,9 +2172,12 @@ export async function createPanel(options = {}) {
         details: true,
       });
       await audit(
-        "file",
-        "Recycle Bin item permanently deleted",
-        removed.originalPath ??
+        removed.kind === "backup" ? "backup" : "file",
+        removed.kind === "backup"
+          ? "Backup permanently deleted"
+          : "Recycle Bin item permanently deleted",
+        removed.backup?.name ??
+          removed.originalPath ??
           `Recovery item ${req.params.id} (original path unavailable)`,
       );
       res.json({ ok: true, id: req.params.id });
@@ -2446,6 +2220,34 @@ export async function createPanel(options = {}) {
   app.post(
     "/api/files/recycle-bin/:id/restore",
     trackOperation(async (req, res) => {
+      const item = await recycleBin.inspect(req.params.id, { includeHash: false });
+      if (item.kind === "backup") {
+        // A failed final recycle journal write can leave a stale history row.
+        // The bin verifies the archive destination itself and refuses conflicts;
+        // an existing history ID must not prevent recovering its missing file.
+        await recycleBin.restore(req.params.id, {
+          commitBackup: async (backup) => {
+            const previous = state.backups;
+            state.backups = [
+              backup,
+              ...previous.filter((entry) => entry.id !== backup.id),
+            ].sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+            try {
+              await save();
+            } catch (cause) {
+              state.backups = previous;
+              throw cause;
+            }
+          },
+        });
+        await audit(
+          "backup",
+          "Backup restored",
+          `${item.backup.name} · restored from Recycle Bin.`,
+        );
+        res.json({ ok: true, kind: "backup", backup: item.backup });
+        return;
+      }
       const restoredPath = await recycleBin.restore(req.params.id);
       const restored = await fs.stat(await safePath(serverDir, restoredPath));
       const kind = await fileKind(
@@ -2707,10 +2509,8 @@ export async function createPanel(options = {}) {
       if (backupBusy)
         throw error(409, "Wait for the current backup to finish.");
       const item = getItem(state.backups, req.params.id);
-      await fs.rm(path.join(backupDir, `${item.id}.tar.gz`), { force: true });
-      state.backups = state.backups.filter((entry) => entry.id !== item.id);
-      await audit("backup", "Backup deleted", item.name);
-      res.json({ ok: true });
+      const recycled = await recycleBackup(item);
+      res.json({ ok: true, recycled });
     }),
   );
   app.get("/api/subusers", (_req, res) =>
@@ -2905,26 +2705,13 @@ export async function createPanel(options = {}) {
         clearPlayers();
         clearInterval(scheduler);
         if (!options.telemetry) telemetry.close();
-        clearTimeout(demoTimer);
         clearTimeout(stopTimer);
         closePromise = (async () => {
-          if (mode === "demo" && status !== "offline") {
-            await lifecycleAudit(
-              status === "starting"
-                ? "Server start cancelled"
-                : "Server stopped",
-              "Simulated server closed with the panel.",
-              "Server process",
-            );
-            status = "offline";
-            restartRequested = false;
-          }
           await minecraft.close();
           // An HTTP client can leave before its disk writes or backup finish.
           // Wait for the handler itself, including save-on and its audit write.
           while (inFlightTasks.size)
             await Promise.allSettled([...inFlightTasks]);
-          clearTimeout(demoTimer);
           clearTimeout(stopTimer);
           if (terminationPromise) await terminationPromise;
           if (processHandle) {
@@ -2992,6 +2779,8 @@ export async function createPanel(options = {}) {
 
 // Registry changes are serialized, but each server has its own process, state and scheduler.
 export async function createFleet(options = {}) {
+  if (options.mode !== undefined && options.mode !== "live")
+    throw error(400, "Only live Minecraft servers are supported.");
   const telemetry = options.telemetry ?? createProcessTelemetry();
   const publicAddress = options.publicAddress ?? createPublicAddressResolver();
   const env = options.useEnvironment === false ? {} : process.env;
@@ -3131,6 +2920,7 @@ export async function createFleet(options = {}) {
         address: entry.address,
         version: entry.version,
         software: entry.software,
+        minecraftVersion: minecraftGameVersion(entry),
         status: "offline",
         source: "imported",
         serverDir: entry.serverDir,
@@ -3250,6 +3040,7 @@ export async function createFleet(options = {}) {
       );
     const ids = new Set();
     const ports = new Set();
+    let migrated = false;
     for (const entry of registry.servers) {
       if (
         typeof entry.id !== "string" ||
@@ -3260,6 +3051,22 @@ export async function createFleet(options = {}) {
           "The server registry contains invalid or duplicate IDs.",
         );
       ids.add(entry.id);
+      // Older panels stored simulated workspaces in this same registry. Keep
+      // their files, backups, identity, and settings; only real processes can
+      // become running now. Discard the old synthetic metadata defaults.
+      if (entry.mode === "demo") {
+        entry.mode = "live";
+        if (
+          !entry.minecraftVersion &&
+          entry.software === "Paper" &&
+          entry.version === "1.21.4"
+        ) {
+          entry.software = "Java";
+          entry.version = "Configured JAR";
+        }
+        if (Object.hasOwn(entry, "status")) entry.status = "offline";
+        migrated = true;
+      }
       Object.assign(
         entry,
         validateServerConfiguration(
@@ -3301,6 +3108,7 @@ export async function createFleet(options = {}) {
         } else entry.serverDir = await safePath(entry.dataDir, "server");
       }
     }
+    if (migrated) await persist();
   } else if (
     options.createDefaultServer === false &&
     !(await hasLegacyWorkspace())
@@ -3324,8 +3132,7 @@ export async function createFleet(options = {}) {
       properties
         .match(new RegExp(`^\\s*${key}\\s*[=:](.*)$`, "m"))?.[1]
         ?.trim();
-    const mode =
-      options.mode ?? (options.jar || env.MC_SERVER_JAR ? "live" : "demo");
+    const mode = "live";
     const config = validateServerConfiguration({
       name: options.name ?? env.MC_SERVER_NAME ?? "The Overworld",
       mode,
@@ -3362,14 +3169,8 @@ export async function createFleet(options = {}) {
               property("max-players") ??
               20,
           ),
-          version:
-            options.version ??
-            env.MC_VERSION ??
-            (mode === "demo" ? "1.21.4" : "Configured JAR"),
-          software:
-            options.software ??
-            env.MC_SOFTWARE ??
-            (mode === "demo" ? "Paper" : "Java"),
+          version: options.version ?? env.MC_VERSION ?? "Configured JAR",
+          software: options.software ?? env.MC_SOFTWARE ?? "Java",
         },
       ],
     };
@@ -3652,24 +3453,22 @@ export async function createFleet(options = {}) {
       const serverDir = await safePath(instanceDir, "server");
       await fs.mkdir(serverDir);
       // EULA acceptance is only written after an explicit guided-review choice.
-      if (config.mode === "live") {
+      await fs.writeFile(
+        path.join(serverDir, "eula.txt"),
+        `# Read https://aka.ms/MinecraftEULA before accepting.\neula=${acceptedEula}\n`,
+        { flag: "wx" },
+      );
+      await fs.writeFile(
+        path.join(serverDir, "server.properties"),
+        `motd=${escapeProperty(config.motd)}\nserver-port=${config.port}\nmax-players=20\nonline-mode=true\n`,
+        { flag: "wx" },
+      );
+      if (requestId)
         await fs.writeFile(
-          path.join(serverDir, "eula.txt"),
-          `# Read https://aka.ms/MinecraftEULA before accepting.\neula=${acceptedEula}\n`,
+          path.join(serverDir, "user_jvm_args.txt"),
+          `# Memory selected during server setup.\n-Xms${Math.min(config.memoryLimitMB, 1024)}M\n-Xmx${config.memoryLimitMB}M\n`,
           { flag: "wx" },
         );
-        await fs.writeFile(
-          path.join(serverDir, "server.properties"),
-          `motd=${escapeProperty(config.motd)}\nserver-port=${config.port}\nmax-players=20\nonline-mode=true\n`,
-          { flag: "wx" },
-        );
-        if (requestId)
-          await fs.writeFile(
-            path.join(serverDir, "user_jvm_args.txt"),
-            `# Memory selected during server setup.\n-Xms${Math.min(config.memoryLimitMB, 1024)}M\n-Xmx${config.memoryLimitMB}M\n`,
-            { flag: "wx" },
-          );
-      }
       const entry = {
         ...config,
         id,
@@ -3677,8 +3476,8 @@ export async function createFleet(options = {}) {
         dataDir: instanceDir,
         serverDir,
         address: `localhost:${config.port}`,
-        version: config.mode === "demo" ? "1.21.4" : "Configured JAR",
-        software: config.mode === "demo" ? "Paper" : "Java",
+        version: "Configured JAR",
+        software: "Java",
         ...(requestId
           ? { setupRequestId: requestId, setupFingerprint: fingerprint }
           : {}),
@@ -3699,9 +3498,9 @@ export async function createFleet(options = {}) {
       await runtime.audit(
         "server",
         "Server created",
-        `${config.name} created in ${config.mode} mode on port ${config.port}.`,
+        `${config.name} created on port ${config.port}.`,
       );
-      if (config.mode === "live" && acceptedEula)
+      if (acceptedEula)
         await runtime.audit(
           "server",
           "EULA accepted",
@@ -3763,13 +3562,12 @@ export async function createFleet(options = {}) {
       const next = { ...entry, ...config };
       if (config.port !== entry.port) next.address = `localhost:${config.port}`;
       if (
-        config.mode !== entry.mode ||
-        (config.launchType === "jar" &&
-          (entry.launchType !== "jar" || config.jar !== entry.jar))
+        config.launchType === "jar" &&
+        (entry.launchType !== "jar" || config.jar !== entry.jar)
       ) {
         next.minecraftVersion = null;
-        next.version = config.mode === "demo" ? "1.21.4" : "Configured JAR";
-        next.software = config.mode === "demo" ? "Paper" : "Java";
+        next.version = "Configured JAR";
+        next.software = "Java";
       }
       return runtimes.get(entry.id).updateConfiguration(next, () =>
         persist({

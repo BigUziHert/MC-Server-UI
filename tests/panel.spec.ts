@@ -1,4 +1,10 @@
 import {
+  createProcessServer,
+  selectServer,
+  serverButton,
+  stopTestServer,
+} from "./server-fixtures";
+import {
   test,
   expect,
   type APIRequestContext,
@@ -17,7 +23,6 @@ import {
 import { tmpdir } from "node:os";
 import path from "node:path";
 import * as tar from "tar";
-import { stopTestServer } from "./server-fixtures";
 
 const minecraftHeadFixture =
   '<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 8 8"><path fill="#70513d" d="M0 0h8v8H0z"/><path fill="#c99777" d="M1 3h6v4H1z"/><path fill="#284c78" d="M1 3h2v1H1zm4 0h2v1H5z"/><path fill="#452c20" d="M2 6h4v1H2z"/></svg>';
@@ -53,7 +58,7 @@ async function openPage(page: Page, hash: string, heading: string) {
 }
 
 async function seedServerProperties(request: APIRequestContext) {
-  // File tests own their input; optional demo seeding is not a fixture contract.
+  // File tests own their input instead of relying on process startup files.
   const content =
     "# Browser test fixture\nserver-port=25565\nmotd=E2E file workspace\nmax-players=20\n";
   const created = await request.post("/api/files", {
@@ -67,7 +72,7 @@ async function seedServerProperties(request: APIRequestContext) {
   } else expect(created.status(), await created.text()).toBe(201);
 }
 
-test("console loads real API logs, sends commands, and controls the demo lifecycle", async ({
+test("console loads subprocess logs, sends commands, and controls its lifecycle", async ({
   page,
   request,
 }) => {
@@ -78,16 +83,13 @@ test("console loads real API logs, sends commands, and controls the demo lifecyc
   await expect(
     page.getByRole("heading", { name: "E2E Overworld" }),
   ).toBeVisible();
-  await expect(page.getByText("Demo workspace", { exact: true })).toBeVisible();
   const logs = page.getByRole("log", { name: "Server console output" });
   await expect(logs).toContainText("Done (2.314s)");
 
   const command = page.getByRole("textbox", { name: "Server command" });
   await command.fill("say Hello from the browser test");
   await page.getByRole("button", { name: "Send command", exact: true }).click();
-  await expect(logs).toContainText(
-    "[Demo] [Server] Hello from the browser test",
-  );
+  await expect(logs).toContainText("[Server] Hello from the browser test");
   await expect(command).toHaveValue("");
   const recorded = await (await request.get("/api/console")).json();
   expect(
@@ -115,7 +117,7 @@ test("console loads real API logs, sends commands, and controls the demo lifecyc
     page.getByRole("button", { name: "Stop", exact: true }),
   ).toBeEnabled();
   await expect(command).toBeEnabled();
-  await expect(logs).toContainText("[Demo] Done! Server is ready.");
+  await expect(logs).toContainText('Done (2.314s)! For help, type "help"');
   expect((await (await request.get("/api/server")).json()).status).toBe(
     "running",
   );
@@ -624,10 +626,10 @@ test("audit filters show file, server and player actions without databases", asy
   await filters.getByRole("button", { name: "Players", exact: true }).click();
   await expect(rows.filter({ hasText: "Audit_Player" })).toHaveCount(4);
   for (const action of [
-    "Player opped",
-    "Player deopped",
-    "Player banned",
-    "Player unbanned",
+    "Player op requested",
+    "Player deop requested",
+    "Player ban requested",
+    "Player unban requested",
   ])
     await expect(
       rows.filter({ hasText: "Audit_Player" }).filter({ hasText: action }),
@@ -737,8 +739,8 @@ async function createTestServer(
   name: string,
   port: number,
 ) {
-  const response = await request.post("/api/servers", {
-    data: { name, mode: "demo", port, memoryLimitMB: 2048 },
+  const response = await createProcessServer(request, {
+    data: { name, mode: "live", port, memoryLimitMB: 2048 },
   });
   expect(response.ok()).toBe(true);
   return (await response.json()).server as TestServer;
@@ -761,12 +763,8 @@ async function scopedGet(
 }
 
 async function switchServer(page: Page, id: string) {
-  await page
-    .getByRole("combobox", { name: "Switch server", exact: true })
-    .selectOption(id);
-  await expect(
-    page.getByRole("combobox", { name: "Switch server", exact: true }),
-  ).toHaveValue(id);
+  await selectServer(page, id);
+  await expect(serverButton(page, id)).toHaveAttribute("aria-pressed", "true");
 }
 
 async function chooseNewServer(page: Page) {
@@ -808,11 +806,10 @@ test("editable server names and the selected workspace persist across reloads", 
 }) => {
   const initial = await listServers(request);
   await page.goto("/");
-  const selector = page.getByRole("combobox", {
-    name: "Switch server",
-    exact: true,
-  });
-  await expect(selector).toHaveValue(initial.defaultServerId);
+  await expect(serverButton(page, initial.defaultServerId)).toHaveAttribute(
+    "aria-pressed",
+    "true",
+  );
   // Existing-workspace tests use isolated API fixtures; creation is covered by onboarding.spec.ts.
   const created = await createTestServer(request, "E2E Creative", 25671);
   await page.reload();
@@ -821,7 +818,7 @@ test("editable server names and the selected workspace persist across reloads", 
     page.getByRole("heading", { name: "E2E Creative", exact: true }),
   ).toBeVisible();
   expect(created).toMatchObject({
-    mode: "demo",
+    mode: "live",
     port: 25671,
     memoryLimitMB: 2048,
   });
@@ -849,11 +846,14 @@ test("editable server names and the selected workspace persist across reloads", 
   await expect(
     page.getByRole("heading", { name: "E2E Creative Lab", exact: true }),
   ).toBeVisible();
-  await expect(selector.locator("option:checked")).toHaveText(
-    "E2E Creative Lab",
+  await expect(serverButton(page, created.id)).toHaveAccessibleName(
+    "Select server E2E Creative Lab",
   );
   await page.reload();
-  await expect(selector).toHaveValue(created!.id);
+  await expect(serverButton(page, created!.id)).toHaveAttribute(
+    "aria-pressed",
+    "true",
+  );
   await expect(
     page.getByRole("heading", { name: "E2E Creative Lab", exact: true }),
   ).toBeVisible();
@@ -1112,7 +1112,7 @@ test("server selection scopes file edits and downloads, console commands, backup
     page.getByRole("row").filter({ hasText: "secondary-only@example.com" }),
   ).toHaveCount(0);
 });
-test("Players grants and removes simulated OP independently of panel access and other servers", async ({
+test("Players grants and removes OP through the subprocess independently of panel access and other servers", async ({
   page,
   request,
 }) => {
@@ -1151,9 +1151,6 @@ test("Players grants and removes simulated OP independently of panel access and 
   await switchServer(page, secondary.id);
   await expect(
     page.getByRole("heading", { level: 1, name: "Players", exact: true }),
-  ).toBeVisible();
-  await expect(
-    page.getByText("Demo mode · Simulated operators", { exact: true }),
   ).toBeVisible();
   await expect(
     page.getByRole("button", {
@@ -1204,9 +1201,10 @@ test("Players grants and removes simulated OP independently of panel access and 
     (await scopedGet(request, secondary.id, "/players")).operators,
   ).toHaveLength(1);
   await page.reload();
-  await expect(
-    page.getByRole("combobox", { name: "Switch server", exact: true }),
-  ).toHaveValue(secondary.id);
+  await expect(serverButton(page, secondary.id)).toHaveAttribute(
+    "aria-pressed",
+    "true",
+  );
   await expect(removeButton).toBeVisible();
 
   await switchServer(page, defaultServerId);
@@ -1333,8 +1331,11 @@ test("mobile navigation exposes server controls and the Players page without hor
   await page
     .getByRole("button", { name: "Open navigation", exact: true })
     .click();
+  await page
+    .locator('button[data-server-id][aria-pressed="true"]')
+    .scrollIntoViewIfNeeded();
   await expect(
-    page.getByRole("combobox", { name: "Switch server", exact: true }),
+    page.locator('button[data-server-id][aria-pressed="true"]'),
   ).toBeInViewport();
   await page.getByRole("button", { name: "Add server", exact: true }).click();
   let dialog = await chooseNewServer(page);
@@ -1437,7 +1438,7 @@ async function mockOperators(
 ) {
   await page.route("**/api/players", (route) =>
     route.fulfill({
-      json: { operators, mode: "demo", status: "running" },
+      json: { operators, mode: "live", status: "running" },
     }),
   );
 }
@@ -1699,9 +1700,7 @@ test("an empty fleet shows only guided creation and refreshes after a server is 
   await expect(
     page.getByRole("navigation", { name: "Main navigation", exact: true }),
   ).toHaveCount(0);
-  await expect(
-    page.getByRole("combobox", { name: "Switch server", exact: true }),
-  ).toHaveCount(0);
+  await expect(page.locator("button[data-server-id]")).toHaveCount(0);
   await expect(
     page.getByRole("heading", { level: 1, name: "Console", exact: true }),
   ).toHaveCount(0);
@@ -1890,9 +1889,7 @@ test("removing the last listed demo returns to onboarding and preserves its file
     exact: true,
   });
   await expect(welcome).toBeVisible();
-  await expect(
-    page.getByRole("combobox", { name: "Switch server", exact: true }),
-  ).toHaveCount(0);
+  await expect(page.locator("button[data-server-id]")).toHaveCount(0);
   expect(removalResult?.filesPreserved).toBe(true);
   expect(
     (await listServers(request)).servers.some(
@@ -2097,9 +2094,10 @@ test("imports an existing external server in place without changing its files or
       original["existing-world/level.dat"],
     );
     await page.reload();
-    await expect(
-      page.getByRole("combobox", { name: "Switch server", exact: true }),
-    ).toHaveValue(server.id);
+    await expect(serverButton(page, server.id)).toHaveAttribute(
+      "aria-pressed",
+      "true",
+    );
     expect(
       (await listServers(request)).servers.some(
         (item) => item.id === server.id,
@@ -2384,9 +2382,10 @@ test("detects NeoForge with joined nogui%* and preserves its script, JVM argumen
       original["existing-world/level.dat"],
     );
     await page.reload();
-    await expect(
-      page.getByRole("combobox", { name: "Switch server", exact: true }),
-    ).toHaveValue(server.id);
+    await expect(serverButton(page, server.id)).toHaveAttribute(
+      "aria-pressed",
+      "true",
+    );
     expect(
       (await listServers(request)).servers.find(
         (item) => item.id === server.id,

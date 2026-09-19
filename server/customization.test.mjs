@@ -195,8 +195,7 @@ test("connection addresses handle hostnames and IPv6 without changing the game p
     "play.example.com",
   );
   const noLookup = {
-    resolve: () =>
-      assert.fail("Custom and demo addresses do not need public lookup"),
+    resolve: () => assert.fail("Custom addresses do not need public lookup"),
   };
   assert.equal(
     (
@@ -210,8 +209,8 @@ test("connection addresses handle hostnames and IPv6 without changing the game p
   assert.equal(
     (
       await advertisedConnection(
-        { mode: "demo", address: "localhost:25565" },
-        noLookup,
+        { mode: "live", port: 25565 },
+        { resolve: async () => null },
       )
     ).address,
     "localhost:25565",

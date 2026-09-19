@@ -7,6 +7,7 @@ import { createPanel, createFleet } from "./index.mjs";
 import { promoteVersion } from "./minecraft.mjs";
 import { createRecycleBin } from "./recycle-bin.mjs";
 import { containedSourcePath } from "./import.mjs";
+import { processStartup } from "../tests/fixtures/process-options.mjs";
 
 const json = (method, body) => ({ method, body: JSON.stringify(body) });
 const selection = {
@@ -34,7 +35,13 @@ async function eventually(work) {
 }
 async function fixture(
   t,
-  { fleet = false, mode = "live", stage, persistMinecraftConfiguration } = {},
+  {
+    fleet = false,
+    mode = "live",
+    running = false,
+    stage,
+    persistMinecraftConfiguration,
+  } = {},
 ) {
   const temporary = await fs.realpath(os.tmpdir());
   const root = await fs.mkdtemp(path.join(temporary, "mc-minecraft-test-"));
@@ -60,6 +67,7 @@ async function fixture(
     publicAddress: { resolve: async () => null },
     telemetry: { reset() {}, sample: async () => null },
     persistMinecraftConfiguration,
+    ...(running ? processStartup : {}),
   };
   const open = async () => {
     panel = await (fleet ? createFleet(options) : createPanel(options));
@@ -96,6 +104,19 @@ async function fixture(
     assert.ok(path.basename(root).startsWith("mc-minecraft-test-"));
     await fs.rm(root, { recursive: true, force: true });
   });
+  if (running) {
+    await fs.writeFile(path.join(serverDir, "eula.txt"), "eula=true\n");
+    const base = `http://127.0.0.1:${listener.address().port}`;
+    const started = await fetch(`${base}/api/server/power`, {
+      ...json("POST", { action: "start" }),
+      headers: { "Content-Type": "application/json" },
+    });
+    assert.equal(started.status, 200);
+    await eventually(
+      async () =>
+        (await (await fetch(`${base}/api/server`)).json()).status === "running",
+    );
+  }
   return {
     root,
     serverDir,
@@ -388,7 +409,7 @@ test("malformed or duplicate promotion paths fail before replacing any source fi
 });
 
 test("version installation requires explicit confirmation and a stopped server", async (t) => {
-  const f = await fixture(t, { mode: "demo" });
+  const f = await fixture(t, { running: true });
   assert.equal(
     (
       await f.request(

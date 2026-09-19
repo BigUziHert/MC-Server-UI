@@ -1,46 +1,47 @@
 .fleet-switcher {
-  margin: 0 17px 8px;
+  margin: 4px 0 8px;
   min-width: 0;
 }
-.fleet-label {
-  display: flex;
-  justify-content: space-between;
-  font-size: 8px;
-  color: #969bb3;
-  font-weight: 600;
-  letter-spacing: 1.15px;
-  margin: 0 1px 8px;
+.fleet-server-list {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+  display: grid;
+  gap: 6px;
 }
-.fleet-select-wrap {
-  position: relative;
+.fleet-server-button {
+  width: 100%;
   display: flex;
   gap: 9px;
   align-items: center;
-  border: 1px solid #404356;
-  background: #20212b;
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--text);
+  text-align: left;
   border-radius: 8px;
   padding: 12px 9px;
+}
+.fleet-server-button:hover {
+  background: #20212b;
+}
+.fleet-server-button[aria-pressed="true"] {
+  border-color: #55503b;
+  background: #272833;
+}
+.fleet-server-button[aria-pressed="true"] .fleet-selection strong {
+  color: var(--accent);
 }
 .fleet-selection {
   flex: 1;
   min-width: 0;
 }
-.fleet-selection select {
-  width: 100%;
-  appearance: none;
-  background: none;
-  border: 0;
-  border-radius: 3px;
-  padding: 2px 17px 2px 0;
-  font-size: 11px;
-  font-weight: 550;
+.fleet-selection strong {
+  display: block;
+  font-size: 14px;
+  font-weight: 650;
   overflow: hidden;
   text-overflow: ellipsis;
-  cursor: pointer;
-}
-.fleet-selection select option {
-  background: #20212b;
-  font-size: 13px;
+  white-space: nowrap;
 }
 .fleet-selection > span {
   display: flex;
@@ -53,29 +54,18 @@
 }
 .fleet-mode {
   color: #969bb3;
-}
-.fleet-chevron {
-  position: absolute;
-  right: 10px;
-  top: 19px;
-  pointer-events: none;
-  color: #b1b6ce;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 .fleet-actions {
   display: flex;
-  justify-content: space-between;
-  gap: 8px;
+  flex-direction: column;
   margin-top: 8px;
 }
-.fleet-actions button {
-  display: flex;
-  align-items: center;
-  gap: 5px;
+.fleet-actions .nav-item {
+  width: 100%;
   background: transparent;
-  color: #b1b6ce;
-  font-size: 10px;
-  padding: 5px 3px;
-  border-radius: 4px;
 }
 .fleet-actions button:hover {
   color: #d4d8e9;
@@ -809,7 +799,7 @@
   align-items: center;
   gap: 7px;
 }
-.server-remove-demo {
+.server-remove {
   border-top: 1px solid #303140;
   margin-top: 20px;
   padding-top: 18px;
@@ -826,18 +816,18 @@
 .server-remove-link:hover {
   color: #f0b69b;
 }
-.server-remove-demo h3 {
+.server-remove h3 {
   color: #e7c1a7;
   font-size: 13px;
   margin: 0 0 8px;
 }
-.server-remove-demo p {
+.server-remove p {
   font-size: 12px;
   color: #b0a48f;
   line-height: 1.8;
   overflow-wrap: anywhere;
 }
-.server-remove-demo p strong {
+.server-remove p strong {
   color: #d7cdb9;
   font-weight: 550;
 }

@@ -670,7 +670,7 @@ test("fresh desktop stays empty across restarts and gives the first explicit ser
   await assert.rejects(fs.access(path.join(dataDir, "server")));
 });
 
-test("desktop preserves previously registered servers and their existing world files", async (t) => {
+test("desktop migrates previously registered demo servers to live/offline and preserves their existing world files", async (t) => {
   const { launch, dataDir } = await fixture(t);
   const previous = await createFleet({
     dataDir,
@@ -683,11 +683,22 @@ test("desktop preserves previously registered servers and their existing world f
     "existing installation",
   );
   await previous.close();
+  const registryPath = path.join(dataDir, "servers.json");
+  const registry = JSON.parse(await fs.readFile(registryPath, "utf8"));
+  Object.assign(registry.servers[0], {
+    mode: "demo",
+    software: "Paper",
+    version: "1.21.4",
+  });
+  await fs.writeFile(registryPath, JSON.stringify(registry));
   const runtime = await launch();
   const restored = await (await runtime.request("/api/servers")).json();
   assert.equal(restored.defaultServerId, id);
   assert.equal(restored.servers[0].name, "The Overworld");
-  assert.equal(restored.servers[0].mode, "demo");
+  assert.equal(restored.servers[0].mode, "live");
+  assert.equal(restored.servers[0].status, "offline");
+  assert.equal(restored.servers[0].software, "Java");
+  assert.equal(restored.servers[0].version, "Configured JAR");
   assert.equal(
     await (
       await runtime.request("/api/files/download?path=keep-world.txt")

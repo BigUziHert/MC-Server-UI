@@ -175,7 +175,6 @@ export default function Properties({ notify }: PageProps) {
     <div className="properties-page">
       <div className="page-heading">
         <div>
-          <p className="eyebrow">MINECRAFT</p>
           <h1>Properties</h1>
         </div>
         <button

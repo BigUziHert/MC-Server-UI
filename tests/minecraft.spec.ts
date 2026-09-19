@@ -1,5 +1,10 @@
+import {
+  createProcessServer,
+  selectServer,
+  removeTestServer,
+  stopTestServer,
+} from "./server-fixtures";
 import { test as base, expect, type Route, type Page } from "@playwright/test";
-import { removeTestServer, stopTestServer } from "./server-fixtures";
 
 const test = base.extend<{ serverId: string }>({
   serverId: async ({ request }, use) => {
@@ -9,8 +14,8 @@ const test = base.extend<{ serverId: string }>({
       fleet.servers.some((server: { port: number }) => server.port === port)
     )
       port++;
-    const created = await request.post("/api/servers", {
-      data: { name: "Minecraft tools fixture", mode: "demo", port },
+    const created = await createProcessServer(request, {
+      data: { name: "Minecraft tools fixture", mode: "live", port },
     });
     expect(created.status()).toBe(201);
     const { server } = await created.json();
@@ -3532,8 +3537,8 @@ test("Launchpad ignores delayed installed metadata after loader, version, type a
   let port = 29910;
   while (fleet.servers.some((server: { port: number }) => server.port === port))
     port++;
-  const created = await request.post("/api/servers", {
-    data: { name: "Launchpad second scope", mode: "demo", port },
+  const created = await createProcessServer(request, {
+    data: { name: "Launchpad second scope", mode: "live", port },
   });
   expect(created.status()).toBe(201);
   const second = (await created.json()).server;
@@ -3623,9 +3628,7 @@ test("Launchpad ignores delayed installed metadata after loader, version, type a
     await expectScope("First mod fabric 1.20.1");
     await page.getByRole("tab", { name: "Datapacks", exact: true }).click();
     await expectScope("First datapack datapack 1.20.1");
-    await page
-      .getByLabel("Switch server", { exact: true })
-      .selectOption(second.id);
+    await selectServer(page, second.id);
     await expect(page.getByLabel("Loader", { exact: true })).toHaveValue(
       "neoforge",
     );

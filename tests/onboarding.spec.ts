@@ -1,3 +1,4 @@
+import { serverButton, removeTestServer } from "./server-fixtures";
 import {
   test as base,
   expect,
@@ -6,7 +7,6 @@ import {
   type Route,
   type TestInfo,
 } from "@playwright/test";
-import { removeTestServer } from "./server-fixtures";
 
 type Server = { id: string; name: string; mode: string; status: string };
 type SetupFixture = {
@@ -984,6 +984,24 @@ test("an accepted installation with a lost response recovers its completed job a
   let installationCalls = 0;
   const recoveryScopes: string[] = [];
   const descriptorRequests: number[] = [];
+  const installedMetadata = {
+    software: "Paper",
+    version: "151",
+    minecraftVersion: "1.21.1",
+  };
+  await page.route("**/api/server", async (route) => {
+    if (
+      route.request().method() !== "GET" ||
+      !accepted ||
+      route.request().headers()["x-server-id"] !== setup.created[0]?.id
+    )
+      return route.continue();
+    const response = await route.fetch();
+    await route.fulfill({
+      response,
+      json: { ...(await response.json()), ...installedMetadata },
+    });
+  });
   await page.route("**/api/servers", async (route) => {
     if (route.request().method() !== "GET") return route.fallback();
     const fleet = await (await route.fetch()).json();
@@ -995,9 +1013,7 @@ test("an accepted installation with a lost response recovers its completed job a
         accepted
           ? {
               ...server,
-              software: "Paper",
-              version: "151",
-              minecraftVersion: "1.21.1",
+              ...installedMetadata,
             }
           : server,
       );
@@ -1050,10 +1066,13 @@ test("an accepted installation with a lost response recovers its completed job a
   await expect(
     page.getByRole("heading", { name: "Recovered Paper world", exact: true }),
   ).toBeVisible();
+  await expect(serverButton(page, setup.created[0].id)).toHaveAttribute(
+    "aria-pressed",
+    "true",
+  );
   await expect(
-    page.getByRole("combobox", { name: "Switch server", exact: true }),
-  ).toHaveValue(setup.created[0].id);
-  await expect(page.locator(".fleet-mode")).toContainText("Paper");
+    serverButton(page, setup.created[0].id).locator(".fleet-mode"),
+  ).toContainText("Paper 1.21.1");
   expect(setup.mutations.some((url) => url.endsWith("/power"))).toBe(false);
 });
 
@@ -1245,9 +1264,10 @@ test("modpack creation reviews an exact release and scopes runtime and pack inst
   await dialog
     .getByRole("button", { name: "Open Console", exact: true })
     .click();
-  await expect(
-    page.getByRole("combobox", { name: "Switch server", exact: true }),
-  ).toHaveValue(setup.created[0].id);
+  await expect(serverButton(page, setup.created[0].id)).toHaveAttribute(
+    "aria-pressed",
+    "true",
+  );
   await expect(
     page.getByRole("heading", { name: "Guided adventure pack", exact: true }),
   ).toBeVisible();

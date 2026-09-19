@@ -1,3 +1,4 @@
+import { createProcessServer, selectServer } from "./server-fixtures";
 import { test as base, expect, type Page } from "@playwright/test";
 
 const profile = {
@@ -17,8 +18,8 @@ const test = base.extend<{ server: { id: string; other: string } }>({
       fleet.servers.some((server: { port: number }) => server.port === port)
     )
       port++;
-    const created = await request.post("/api/servers", {
-      data: { name: "Player history fixture", mode: "demo", port },
+    const created = await createProcessServer(request, {
+      data: { name: "Player history fixture", mode: "live", port },
     });
     expect(created.status()).toBe(201);
     const { server } = await created.json();
@@ -119,7 +120,7 @@ async function open(page: Page, id: string) {
   ).toBeVisible();
 }
 
-test("known profiles show heads and unknown login dates; demo ban/unban persist without changing Minecraft files or another server", async ({
+test("known profiles show heads and unknown login dates; ban/unban persist in Minecraft files without changing another server", async ({
   page,
   request,
   server,
@@ -142,7 +143,6 @@ test("known profiles show heads and unknown login dates; demo ban/unban persist 
   ).toBeVisible();
   await row.getByRole("button", { name: "Ban History_Player" }).click();
   let dialog = page.getByRole("dialog", { name: "Ban player?", exact: true });
-  await expect(dialog).toContainText("This action is simulated");
   await dialog
     .getByLabel("Reason (optional)")
     .fill("Browser fixture moderation");
@@ -156,7 +156,7 @@ test("known profiles show heads and unknown login dates; demo ban/unban persist 
     .fill("Browser fixture moderation");
   await dialog.getByRole("button", { name: "Ban player", exact: true }).click();
   await expect(dialog).not.toBeVisible();
-  await expect(row).toContainText("Banned (simulated)");
+  await expect(row).toContainText("Banned");
   await expect(row).toContainText("Browser fixture moderation");
   await page.reload();
   await expect(
@@ -168,7 +168,15 @@ test("known profiles show heads and unknown login dates; demo ban/unban persist 
       headers,
     })
   ).json();
-  expect(JSON.parse(bans.content)).toEqual([banned]);
+  expect(JSON.parse(bans.content)).toEqual(
+    expect.arrayContaining([
+      banned,
+      expect.objectContaining({
+        ...profile,
+        reason: "Browser fixture moderation",
+      }),
+    ]),
+  );
   const other = await (
     await request.get("/api/players", {
       headers: { "X-Server-Id": server.other },
@@ -594,7 +602,7 @@ test("four compact rosters expose online actions and fit desktop and mobile layo
   });
 });
 
-test("whitelist membership and enable switch confirm changes and preserve demo source files", async ({
+test("whitelist membership and enable switch confirm changes and persist in Minecraft files", async ({
   page,
   request,
   server,
@@ -641,13 +649,16 @@ test("whitelist membership and enable switch confirm changes and preserve demo s
   const source = await (
     await request.get("/api/files/content?path=whitelist.json", { headers })
   ).json();
-  expect(JSON.parse(source.content)).toEqual([
-    { name: "White_Player", uuid: "42345678-1234-1234-1234-123456789abc" },
-  ]);
+  expect(JSON.parse(source.content)).toEqual(
+    expect.arrayContaining([
+      { name: "White_Player", uuid: "42345678-1234-1234-1234-123456789abc" },
+      expect.objectContaining({ name: "New_White_Player" }),
+    ]),
+  );
   const properties = await (
     await request.get("/api/files/content?path=server.properties", { headers })
   ).json();
-  expect(properties.content).toContain("white-list=false");
+  expect(properties.content).toContain("white-list=true");
   await roster
     .getByRole("button", {
       name: "Remove saved whitelist player New_White_Player",
@@ -760,7 +771,7 @@ function pagingProfiles(count: number, prefix = "Paging") {
 
 function pagingResponse(players: ReturnType<typeof pagingProfiles>) {
   return {
-    mode: "demo",
+    mode: "live",
     status: "running",
     maxPlayers: 150,
     online: players,
@@ -893,9 +904,7 @@ test("all five player lists page independently, remember row counts, and reset s
   await page
     .getByRole("button", { name: "Player history next page", exact: true })
     .click();
-  await page
-    .getByRole("combobox", { name: "Switch server", exact: true })
-    .selectOption(server.other);
+  await selectServer(page, server.other);
   for (const title of pagedLists) {
     const region = page.getByRole("region", { name: title, exact: true });
     await expect(region.getByRole("listitem").first()).toContainText(
@@ -929,7 +938,7 @@ test("removing the last player on a page clamps the roster and refreshed smaller
       (player) => player.name !== route.request().postDataJSON().name,
     );
     await route.fulfill({
-      json: { simulated: true, message: "Demo whitelist entry removed." },
+      json: { simulated: false, message: "Whitelist entry removed." },
     });
   });
   await open(page, server.id);

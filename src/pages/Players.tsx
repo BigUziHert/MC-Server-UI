@@ -10,7 +10,6 @@ import {
 import {
   AlertCircle,
   ArrowUpRight,
-  Check,
   Info,
   ShieldCheck,
   ShieldMinus,
@@ -49,7 +48,7 @@ type KnownPlayer = {
 type Moderation = { action: "kick" | "ban" | "unban"; player: KnownPlayer };
 type PlayersResponse = {
   operators: Operator[];
-  mode: "demo" | "live";
+  mode: "live";
   status: "running" | "offline" | "starting" | "stopping";
   history?: KnownPlayer[];
   warnings?: string[];
@@ -62,7 +61,7 @@ type PlayersResponse = {
   whitelistAvailable?: boolean;
   whitelistSettingsAvailable?: boolean;
 };
-type OperationResponse = { message: string; simulated: boolean };
+type OperationResponse = { message: string };
 type WhitelistAction =
   | { kind: "add" | "remove"; player?: Operator }
   | { kind: "state"; enabled: boolean };
@@ -293,7 +292,6 @@ export default function Players({ notify }: PageProps) {
     else whitelistDialog.current?.close();
   }, [whitelistAction]);
 
-  const simulated = data?.mode === "demo";
   const canManage = Boolean(data && !error && data.status === "running");
   const operators = data?.operators ?? [];
   const filtered = operators.filter((player) =>
@@ -543,33 +541,19 @@ export default function Players({ notify }: PageProps) {
     <div className="management-page players-page">
       <div className="page-heading management-heading">
         <div>
-          <p className="eyebrow">IN-GAME MANAGEMENT</p>
           <h1>Players</h1>
         </div>
       </div>
 
-      {data && simulated && (
-        <div className="management-notice">
-          <Info size={18} />
-          <div>
-            <strong>Demo mode · Simulated operators</strong>
-            <p>
-              Operator and moderation actions are simulated in this workspace.
-              No live players or Minecraft ban files are changed.
-            </p>
-          </div>
-        </div>
-      )}
       {data && data.status !== "running" && (
         <div className="management-notice players-offline-notice">
           <Terminal size={18} />
           <div>
             <strong>Start the server to manage operators</strong>
             <p>
-              {simulated ? "The demo server" : "The server"} is {data.status}.
-              {simulated
-                ? " Start it in Console to try simulated player commands."
-                : " You can view saved players and operators now. Start it before changing permissions, kicking, or managing bans."}
+              The server is {data.status}. You can view saved players and
+              operators now. Start it before changing permissions, kicking, or
+              managing bans.
             </p>
             <a href="#console">
               Go to Console <ArrowUpRight size={14} />
@@ -794,17 +778,12 @@ export default function Players({ notify }: PageProps) {
 
       {result && (
         <div className="players-result" role="status">
-          {result.simulated ? <Check size={17} /> : <Info size={17} />}
+          <Info size={17} />
           <div>
-            <strong>
-              {result.simulated
-                ? "Demo player action completed"
-                : "Player command requested"}
-            </strong>
+            <strong>Player command requested</strong>
             <p>
-              {result.message}
-              {!result.simulated &&
-                " Check Console for the command result. The list refreshes as Minecraft saves its player files."}
+              {result.message} Check Console for the command result. The list
+              refreshes as Minecraft saves its player files.
             </p>
           </div>
           <button
@@ -886,7 +865,6 @@ export default function Players({ notify }: PageProps) {
                       : player.banned === null
                         ? " · Ban status unavailable"
                         : ""}
-                    {simulated && player.banned ? " (simulated)" : ""}
                   </span>
                   {player.banReason && (
                     <span className="players-ban-reason">
@@ -1061,13 +1039,11 @@ export default function Players({ notify }: PageProps) {
             </div>
           )}
           <div className="players-permission-note">
-            {simulated ? <Info size={18} /> : <ShieldCheck size={18} />}
+            <ShieldCheck size={18} />
             <p>
-              {simulated
-                ? "This is a simulated change for this demo server. No live player permissions will change."
-                : removing
-                  ? "Minecraft will process a deop command. Check Console for confirmation."
-                  : "OP grants powerful in-game commands, including changes to the world and player management, according to your server’s operator level. Only grant it to someone you trust."}
+              {removing
+                ? "Minecraft will process a deop command. Check Console for confirmation."
+                : "OP grants powerful in-game commands, including changes to the world and player management, according to your server’s operator level. Only grant it to someone you trust."}
             </p>
           </div>
           {!canManage && (
@@ -1167,9 +1143,8 @@ export default function Players({ notify }: PageProps) {
           <div className="players-permission-note">
             <Info size={18} />
             <p>
-              {simulated
-                ? "This change is simulated. Minecraft’s whitelist and server settings files will not change."
-                : "The panel sends a Minecraft console command. The roster and switch update when the server saves the result."}
+              The panel sends a Minecraft console command. The roster and switch
+              update when the server saves the result.
             </p>
           </div>
           {(!canManage || formError) && (
@@ -1281,9 +1256,8 @@ export default function Players({ notify }: PageProps) {
           <div className="players-permission-note">
             <Info size={18} />
             <p>
-              {simulated
-                ? "This action is simulated. No live player or Minecraft ban file will change."
-                : "The panel sends a Minecraft console command. Check Console for confirmation; plugins may handle commands differently."}
+              The panel sends a Minecraft console command. Check Console for
+              confirmation; plugins may handle commands differently.
             </p>
           </div>
           {(!canManage || formError) && (

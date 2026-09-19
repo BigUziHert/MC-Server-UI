@@ -1,5 +1,10 @@
+import {
+  createProcessServer,
+  selectServer,
+  removeTestServer,
+  stopTestServer,
+} from "./server-fixtures";
 import { test as base, expect } from "@playwright/test";
-import { removeTestServer } from "./server-fixtures";
 
 const test = base.extend<{ serverId: string }>({
   serverId: async ({ request }, use) => {
@@ -9,8 +14,8 @@ const test = base.extend<{ serverId: string }>({
       fleet.servers.some((server: { port: number }) => server.port === port)
     )
       port++;
-    const response = await request.post("/api/servers", {
-      data: { name: "Console controls", mode: "demo", port },
+    const response = await createProcessServer(request, {
+      data: { name: "Console controls", mode: "live", port },
     });
     expect(response.status()).toBe(201);
     const { server } = await response.json();
@@ -66,6 +71,10 @@ for (const width of [1348, 390]) {
       serverId,
     );
     await page.goto("/#console");
+    if (width < 768)
+      await page
+        .getByRole("button", { name: "Open navigation", exact: true })
+        .click();
     await page.getByRole("button", { name: "Stop", exact: true }).click();
     await page
       .getByRole("dialog")
@@ -107,6 +116,116 @@ for (const width of [1348, 390]) {
     expect(
       await page.evaluate(() => document.documentElement.scrollWidth),
     ).toBeLessThanOrEqual(width);
+  });
+}
+
+for (const width of [1348, 390]) {
+  test(`sidebar power controls manage only the selected server from Properties at ${width}px`, async ({
+    page,
+    request,
+    serverId,
+  }) => {
+    await page.setViewportSize({ width, height: 844 });
+    const fleet = await (await request.get("/api/servers")).json();
+    let port = 29450;
+    while (
+      fleet.servers.some((server: { port: number }) => server.port === port)
+    )
+      port++;
+    const created = await createProcessServer(request, {
+      data: { name: "Sidebar power target", mode: "live", port },
+    });
+    expect(created.status()).toBe(201);
+    const { server: target } = await created.json();
+    try {
+      await stopTestServer(request, target.id);
+      await page.addInitScript(
+        (id) => localStorage.setItem("mc-panel.active-server", id),
+        serverId,
+      );
+      const actions: { id: string; action: string }[] = [];
+      page.on("request", (req) => {
+        if (
+          new URL(req.url()).pathname === "/api/server/power" &&
+          req.method() === "POST"
+        )
+          actions.push({
+            id: req.headers()["x-server-id"],
+            action: req.postDataJSON().action,
+          });
+      });
+      await page.goto("/#properties");
+      await expect(
+        page.getByRole("heading", { name: "Properties", exact: true }),
+      ).toBeVisible();
+      const sidebar = page.locator(".sidebar");
+      const openSidebar = async () => {
+        if (
+          width < 768 &&
+          !(await sidebar.evaluate((el) => el.classList.contains("is-open")))
+        )
+          await page
+            .getByRole("button", { name: "Open navigation", exact: true })
+            .click();
+      };
+      await openSidebar();
+      const start = sidebar.getByRole("button", { name: "Start", exact: true });
+      const restart = sidebar.getByRole("button", {
+        name: "Restart",
+        exact: true,
+      });
+      const stop = sidebar.getByRole("button", { name: "Stop", exact: true });
+      await expect(start).toBeDisabled();
+      await expect(stop).toBeEnabled();
+      await selectServer(page, target.id);
+      await openSidebar();
+      await expect(start).toBeEnabled();
+      await expect(restart).toBeDisabled();
+      await expect(stop).toBeDisabled();
+      await start.click();
+      await expect(stop).toBeEnabled();
+      await restart.click();
+      const restartDialog = page.getByRole("dialog", {
+        name: "Restart your server?",
+        exact: true,
+      });
+      await restartDialog
+        .getByRole("button", { name: "Cancel", exact: true })
+        .click();
+      expect(actions).toEqual([{ id: target.id, action: "start" }]);
+      await restart.click();
+      await restartDialog
+        .getByRole("button", { name: "Restart server", exact: true })
+        .click();
+      await expect(stop).toBeEnabled();
+      await stop.click();
+      await page
+        .getByRole("dialog", { name: "Stop your server?", exact: true })
+        .getByRole("button", { name: "Stop server", exact: true })
+        .click();
+      await expect(start).toBeEnabled();
+      expect(actions).toEqual([
+        { id: target.id, action: "start" },
+        { id: target.id, action: "restart" },
+        { id: target.id, action: "stop" },
+      ]);
+      expect(
+        (
+          await (
+            await request.get("/api/server", {
+              headers: { "X-Server-Id": serverId },
+            })
+          ).json()
+        ).status,
+      ).toBe("running");
+      await expect(page).toHaveURL(/#properties$/);
+      if (width < 768) await expect(sidebar).toHaveClass(/is-open/);
+      expect(
+        await page.evaluate(() => document.documentElement.scrollWidth),
+      ).toBeLessThanOrEqual(width);
+    } finally {
+      await removeTestServer(request, target.id);
+    }
   });
 }
 
@@ -287,7 +406,7 @@ test("server messaging sends say commands and preserves separate command/message
   });
   await expect(command).toHaveValue("time query daytime");
   await command.press("Enter");
-  await expect(page.getByRole("log")).toContainText("[Demo] The time is 6000.");
+  await expect(page.getByRole("log")).toContainText("The time is 6000.");
   await command.press("ArrowUp");
   await expect(command).toHaveValue("time query daytime");
   await page.reload();

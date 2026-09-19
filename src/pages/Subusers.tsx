@@ -217,7 +217,6 @@ export default function Subusers({ notify }: PageProps) {
     <div className="subusers-page">
       <header className="page-heading">
         <div>
-          <p className="eyebrow">MANAGEMENT</p>
           <h1>Subusers</h1>
         </div>
         <button className="btn primary" onClick={() => openEditor()}>

@@ -15,7 +15,7 @@ async function fixture(t, { fleet = false, ...options } = {}) {
   const open = async () => {
     panel = await (fleet ? createFleet : createPanel)({
       dataDir: root,
-      mode: "demo",
+      mode: "live",
       useEnvironment: false,
       scheduler: false,
       publicAddress: { resolve: async () => null },
@@ -23,14 +23,21 @@ async function fixture(t, { fleet = false, ...options } = {}) {
       catalogFetch: async () => Response.json([]),
       ...options,
     });
+    if (!fleet)
+      await fs.mkdir(path.join(panel.serverDir, "plugins"), {
+        recursive: true,
+      });
     listener = await new Promise((resolve) => {
       const server = panel.app.listen(0, "127.0.0.1", () => resolve(server));
     });
   };
   const close = async () => {
-    await panel.close();
-    listener.closeAllConnections();
-    await new Promise((resolve) => listener.close(resolve));
+    try {
+      await panel.close();
+    } finally {
+      listener.closeAllConnections();
+      await new Promise((resolve) => listener.close(resolve));
+    }
   };
   await open();
   t.after(async () => {
@@ -239,7 +246,7 @@ test("retention and scheduled creation identify the Scheduler actor", async (t) 
   assert.ok(
     events.some(
       (entry) =>
-        entry.action === "Backup deleted" &&
+        entry.action === "Backup moved to Recycle Bin" &&
         entry.detail.includes("retention") &&
         entry.actor === "Scheduler",
     ),
@@ -253,33 +260,16 @@ test("retention and scheduled creation identify the Scheduler actor", async (t) 
   );
 });
 
-test("demo console requests stay truthful and closing a pending start never creates a started event", async (t) => {
+test("offline console requests cannot fabricate player changes or audit success", async (t) => {
   const f = await fixture(t);
-  await f.request(
+  const response = await f.request(
     "/api/console/command",
     json("POST", { command: "op ExamplePlayer" }),
   );
+  assert.equal(response.status, 409);
   const events = (await f.request("/api/audit")).body.entries;
-  assert.ok(
-    events.some((entry) => entry.action === "Player op requested (simulated)"),
-  );
-  assert.ok(events.every((entry) => !entry.action.startsWith("Player opped")));
+  assert.ok(events.every((entry) => !entry.action.startsWith("Player op")));
   assert.deepEqual((await f.request("/api/players")).body.operators, []);
-  await f.request("/api/server/power", json("POST", { action: "stop" }));
-  await new Promise((resolve) => setTimeout(resolve, 700));
-  await f.request("/api/server/power", json("POST", { action: "start" }));
-  await f.panel.close();
-  const state = JSON.parse(
-    await fs.readFile(path.join(f.root, "panel.json"), "utf8"),
-  );
-  assert.ok(
-    state.audit.some(
-      (entry) =>
-        entry.action === "Server start cancelled" &&
-        entry.actor === "Server process",
-    ),
-  );
-  assert.ok(state.audit.every((entry) => entry.action !== "Server started"));
 });
 
 for (const scenario of [
@@ -290,25 +280,6 @@ for (const scenario of [
     body: {},
     action: "Default panel icon selected",
     check: (state) => assert.equal(state.iconPreference, "default"),
-  },
-  {
-    name: "demo whitelist",
-    route: "/api/players/whitelist/state",
-    method: "POST",
-    body: { enabled: true },
-    action: "Whitelist enabled (simulated)",
-    check: (state) => assert.equal(state.demoWhitelistEnabled, true),
-  },
-  {
-    name: "demo bans",
-    route: "/api/players/ban",
-    method: "POST",
-    body: { name: "ExamplePlayer", reason: "Fixture reason" },
-    action: "Player banned (simulated)",
-    check: (state) => {
-      assert.equal(state.demoPlayerBans[0].name, "ExamplePlayer");
-      assert.equal(state.demoPlayerBans[0].banned, true);
-    },
   },
 ]) {
   test(`${scenario.name} is durable even if its later audit write fails`, async (t) => {
@@ -349,6 +320,11 @@ for (const scenario of [
     const saved = JSON.parse(await fs.readFile(statePath, "utf8"));
     scenario.check(saved);
     assert.ok(saved.audit.every((entry) => entry.action !== scenario.action));
+    await f.panel.audit(
+      "server",
+      "Audit persistence recovered",
+      "Fixture disk is available again.",
+    );
   });
 }
 
@@ -356,7 +332,7 @@ test("removed-server events remain accessible after deleting the last server and
   const f = await fixture(t, { fleet: true });
   const created = await f.request(
     "/api/servers",
-    json("POST", { name: "Removed world", mode: "demo", port: 25565 }),
+    json("POST", { name: "Removed world", mode: "live", port: 25565 }),
   );
   assert.equal(created.status, 201);
   const id = created.body.server.id;

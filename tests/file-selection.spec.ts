@@ -1,10 +1,14 @@
 import {
+  createProcessServer,
+  selectServer,
+  removeTestServer,
+} from "./server-fixtures";
+import {
   test as base,
   expect,
   type APIRequestContext,
   type Page,
 } from "@playwright/test";
-import { removeTestServer } from "./server-fixtures";
 
 type FileFixture = { id: string; folder: string; otherServerId: string };
 const test = base.extend<{ files: FileFixture }>({
@@ -15,10 +19,10 @@ const test = base.extend<{ files: FileFixture }>({
     );
     let port = 29100;
     while (occupied.has(port)) port++;
-    const created = await request.post("/api/servers", {
+    const created = await createProcessServer(request, {
       data: {
         name: "Bulk file deletion fixture",
-        mode: "demo",
+        mode: "live",
         port,
         memoryLimitMB: 1024,
       },
@@ -59,9 +63,7 @@ const test = base.extend<{ files: FileFixture }>({
 
 async function openFiles(page: Page, fixture: FileFixture) {
   await page.goto("/#files");
-  await page
-    .getByRole("combobox", { name: "Switch server", exact: true })
-    .selectOption(fixture.id);
+  await selectServer(page, fixture.id);
   await expect(
     page.getByRole("heading", { name: "File Manager", exact: true }),
   ).toBeVisible();
@@ -295,9 +297,7 @@ test("select visible all respects filters and selection clears on directory and 
   await page
     .getByRole("button", { name: "Open navigation", exact: true })
     .click();
-  await page
-    .getByRole("combobox", { name: "Switch server", exact: true })
-    .selectOption(files.otherServerId);
+  await selectServer(page, files.otherServerId);
   await expect(selection).toHaveCount(0);
 });
 

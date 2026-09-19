@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useId, useRef, useState } from "react";
 import {
   Activity,
   ArrowDown,
@@ -78,8 +78,9 @@ type Server = {
   name: string;
   address: string;
   status: "running" | "offline" | "starting" | "stopping";
-  mode: "demo" | "live";
+  mode: "live";
   version: string | null;
+  minecraftVersion?: string | null;
   software: string;
   uptime: number;
   cpu: number | null;
@@ -109,6 +110,7 @@ type LogLine = {
   message: string;
 };
 const navigationGroups = [
+  { id: "servers", label: "SERVER SELECTOR" },
   { id: "server", label: "SERVER" },
   { id: "minecraft", label: "MINECRAFT" },
   { id: "management", label: "MANAGEMENT" },
@@ -124,9 +126,15 @@ function readCollapsedNavigation(): Record<NavigationGroup, boolean> {
       server: saved?.server === true,
       minecraft: saved?.minecraft === true,
       management: saved?.management === true,
+      servers: saved?.servers === true,
     };
   } catch {
-    return { server: false, minecraft: false, management: false };
+    return {
+      server: false,
+      minecraft: false,
+      management: false,
+      servers: false,
+    };
   }
 }
 const navigation = [
@@ -202,11 +210,12 @@ function useDialogFocus(open: boolean, onClose: () => void) {
 
 function Sparkline({
   values,
-  color = "#ffd000",
+  color = "#97b9f5",
 }: {
   values: number[];
   color?: string;
 }) {
+  const gradientId = useId();
   const max = Math.max(...values, 1) * 1.25;
   const points = values
     .map(
@@ -222,21 +231,12 @@ function Sparkline({
       aria-hidden="true"
     >
       <defs>
-        <linearGradient
-          id={`fade-${color.slice(1)}`}
-          x1="0"
-          y1="0"
-          x2="0"
-          y2="1"
-        >
+        <linearGradient id={gradientId} x1="0" y1="0" x2="0" y2="1">
           <stop offset="0%" stopColor={color} stopOpacity=".15" />
           <stop offset="100%" stopColor={color} stopOpacity="0" />
         </linearGradient>
       </defs>
-      <polygon
-        points={`0,50 ${points} 260,50`}
-        fill={`url(#fade-${color.slice(1)})`}
-      />
+      <polygon points={`0,50 ${points} 260,50`} fill={`url(#${gradientId})`} />
       <polyline
         points={points}
         fill="none"
@@ -594,6 +594,8 @@ function ServerWorkspace({
 }) {
   const { api } = useServerApi();
   const [page, setPage] = useState<Page>(getPage);
+  const [filePath, setFilePath] = useState("");
+  const [showingFileBin, setShowingFileBin] = useState(false);
   const [server, setServer] = useState<Server | null>(null);
   const [connectionError, setConnectionError] = useState("");
   const [toast, setToast] = useState<{
@@ -629,6 +631,7 @@ function ServerWorkspace({
       setConnectionError((error as Error).message);
     }
   }, [api]);
+  const controls = useServerPower(server, refresh, notify);
   useEffect(() => {
     void refresh();
     const timer = window.setInterval(refresh, 3000);
@@ -698,17 +701,16 @@ function ServerWorkspace({
             <small>YOUR WORLD. YOUR RULES.</small>
           </span>
         </a>
-        <ServerSwitcher
-          servers={servers}
-          selected={{
-            ...selected,
-            status: server?.status ?? selected.status,
-            iconVersion: server?.iconVersion,
-          }}
-          onSelect={onSelect}
-          onAdd={onAdd}
-          onSettings={() => onSettings(server?.status)}
-        />
+        <div
+          className="sidebar-power"
+          aria-label={`Power controls for ${selected.name}`}
+          role="group"
+        >
+          <span className="sidebar-power-name" title={selected.name}>
+            {selected.name}
+          </span>
+          <PowerButtons server={server} controls={controls} />
+        </div>
         <nav aria-label="Main navigation">
           {navigationGroups.map((group) => {
             const items = navigation.filter((item) => item.group === group.id);
@@ -747,6 +749,23 @@ function ServerWorkspace({
                   </button>
                 </h2>
                 <div id={`nav-links-${group.id}`} hidden={collapsed}>
+                  {group.id === "servers" && (
+                    <ServerSwitcher
+                      servers={servers}
+                      selected={{
+                        ...selected,
+                        status: server?.status ?? selected.status,
+                        iconVersion: server?.iconVersion,
+                        software: server?.software ?? selected.software,
+                        minecraftVersion: server
+                          ? server.minecraftVersion
+                          : selected.minecraftVersion,
+                      }}
+                      onSelect={onSelect}
+                      onAdd={onAdd}
+                      onSettings={() => onSettings(server?.status)}
+                    />
+                  )}
                   {items.map((item) => (
                     <a
                       key={item.id}
@@ -778,7 +797,7 @@ function ServerWorkspace({
       </aside>
       <div className="main-shell">
         <header className="topbar">
-          <div className="breadcrumbs">
+          <nav className="breadcrumbs" aria-label="Breadcrumb">
             <button
               className="btn icon mobile-menu"
               aria-label="Open navigation"
@@ -787,21 +806,65 @@ function ServerWorkspace({
               <Menu size={20} />
             </button>
             <Layers3 size={16} />
-            <span className="fleet-breadcrumb-name" title={selected.name}>
+            <button
+              className="fleet-breadcrumb-name"
+              title={selected.name}
+              onClick={() => navigate("console")}
+            >
               {selected.name}
-            </span>
+            </button>
             <ChevronRight size={14} />
-            <strong>{navigation.find((n) => n.id === page)?.label}</strong>
-          </div>
+            {page === "files" ? (
+              <>
+                <button
+                  onClick={() => {
+                    setFilePath("");
+                    setShowingFileBin(false);
+                  }}
+                  aria-current={
+                    !filePath && !showingFileBin ? "page" : undefined
+                  }
+                >
+                  File Manager
+                </button>
+                {showingFileBin ? (
+                  <span className="breadcrumb-segment">
+                    <ChevronRight size={14} />
+                    <strong aria-current="page">Recycle Bin</strong>
+                  </span>
+                ) : (
+                  filePath
+                    .split("/")
+                    .filter(Boolean)
+                    .map((part, index, parts) => (
+                      <span
+                        className="breadcrumb-segment"
+                        key={parts.slice(0, index + 1).join("/")}
+                      >
+                        <ChevronRight size={14} />
+                        <button
+                          title={part}
+                          aria-current={
+                            index === parts.length - 1 ? "page" : undefined
+                          }
+                          onClick={() =>
+                            setFilePath(parts.slice(0, index + 1).join("/"))
+                          }
+                        >
+                          {part}
+                        </button>
+                      </span>
+                    ))
+                )}
+              </>
+            ) : (
+              <strong aria-current="page">
+                {navigation.find((n) => n.id === page)?.label}
+              </strong>
+            )}
+          </nav>
           <div className="topbar-right">
             <DesktopUpdates />
-            <span className="environment-badge">
-              <span />
-              {(server?.mode ?? selected.mode) === "live"
-                ? "Local server"
-                : "Demo workspace"}
-            </span>
-            <span className="topbar-divider" />
             <button
               className="help-button"
               aria-label="Help and documentation"
@@ -832,9 +895,18 @@ function ServerWorkspace({
               refresh={refresh}
               navigate={navigate}
               onSettings={() => onSettings(server?.status)}
+              controls={controls}
             />
           )}
-          {page === "files" && <FileManager notify={notify} />}
+          {page === "files" && (
+            <FileManager
+              notify={notify}
+              path={filePath}
+              onPathChange={setFilePath}
+              showingBin={showingFileBin}
+              onBinChange={setShowingFileBin}
+            />
+          )}
           {page === "players" && <Players notify={notify} />}
           {page === "versions" && <Versions notify={notify} />}
           {page === "launchpad" && <Launchpad notify={notify} />}
@@ -844,10 +916,7 @@ function ServerWorkspace({
           {page === "audit" && <AuditLogs notify={notify} />}
           <footer className="footer">
             <span>
-              <Box size={13} /> MC Panel <span className="muted">/</span>{" "}
-              <span className="muted">
-                A little more control. A lot more play.
-              </span>
+              <Box size={13} /> MC Panel
             </span>
             <span className="muted">
               Development build{" "}
@@ -871,6 +940,7 @@ function ServerWorkspace({
           </button>
         </div>
       )}
+      <PowerConfirmation controls={controls} />
       {help && (
         <div className="modal-backdrop" onClick={() => setHelp(false)}>
           <section
@@ -945,7 +1015,166 @@ function ServerWorkspace({
   );
 }
 
+function useServerPower(
+  server: Server | null,
+  refresh: () => Promise<void>,
+  notify: (message: string, error?: boolean) => void,
+) {
+  const { post } = useServerApi();
+  const [commandBusy, setCommandBusy] = useState(false);
+  const commandRequest = useRef(0);
+  const [powerAction, setPowerAction] = useState<
+    "start" | "stop" | "restart" | "force-stop" | null
+  >(null);
+  const powerRequest = useRef(0);
+  const busy = commandBusy || powerAction !== null;
+  const [confirmPower, setConfirmPower] = useState<
+    "stop" | "restart" | "force-stop" | null
+  >(null);
+  useDialogFocus(confirmPower !== null, () => setConfirmPower(null));
+  useEffect(() => {
+    if (confirmPower === "force-stop" && server?.status !== "stopping")
+      setConfirmPower(null);
+  }, [confirmPower, server?.status]);
+  async function power(action: "start" | "stop" | "restart" | "force-stop") {
+    const token = ++powerRequest.current;
+    if (action === "force-stop") {
+      ++commandRequest.current;
+      setCommandBusy(false);
+    }
+    setPowerAction(action);
+    setConfirmPower(null);
+    try {
+      await post("/server/power", {
+        action,
+        ...(action === "force-stop" ? { confirmed: true } : {}),
+      });
+      if (token !== powerRequest.current) return;
+      await refresh();
+      if (token !== powerRequest.current) return;
+      notify(
+        `Server ${action === "force-stop" ? "force stop" : action} requested.`,
+      );
+    } catch (error) {
+      if (token === powerRequest.current)
+        notify((error as Error).message, true);
+    } finally {
+      if (token === powerRequest.current) setPowerAction(null);
+    }
+  }
+  return {
+    busy,
+    commandRequest,
+    setCommandBusy,
+    powerAction,
+    confirmPower,
+    setConfirmPower,
+    power,
+  };
+}
+
+function PowerButtons({
+  server,
+  controls,
+}: {
+  server: Server | null;
+  controls: ReturnType<typeof useServerPower>;
+}) {
+  const { busy, powerAction, setConfirmPower, power } = controls;
+  const isRunning = server?.status === "running";
+  return (
+    <div className="power-buttons">
+      <button
+        className="btn start-button"
+        disabled={!server || isRunning || busy || server.status !== "offline"}
+        onClick={() => power("start")}
+      >
+        <Play size={14} fill="currentColor" />
+        Start
+      </button>
+      <button
+        className="btn restart-button"
+        disabled={!isRunning || busy}
+        onClick={() => setConfirmPower("restart")}
+      >
+        <RotateCw size={14} />
+        Restart
+      </button>
+      <button
+        className="btn stop-button"
+        disabled={
+          server?.status === "stopping"
+            ? powerAction === "force-stop"
+            : (!isRunning && server?.status !== "starting") || busy
+        }
+        onClick={() =>
+          setConfirmPower(server?.status === "stopping" ? "force-stop" : "stop")
+        }
+      >
+        <Square size={12} fill="currentColor" />
+        {server?.status === "stopping" ? "Force Stop" : "Stop"}
+      </button>
+    </div>
+  );
+}
+
+function PowerConfirmation({
+  controls,
+}: {
+  controls: ReturnType<typeof useServerPower>;
+}) {
+  const { confirmPower, setConfirmPower, power } = controls;
+  return (
+    <>
+      {confirmPower && (
+        <div className="modal-backdrop">
+          <section
+            className="modal"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="power-title"
+          >
+            <h2 id="power-title">
+              {confirmPower === "force-stop"
+                ? "Force stop"
+                : confirmPower === "stop"
+                  ? "Stop"
+                  : "Restart"}{" "}
+              your server?
+            </h2>
+            <p>
+              {confirmPower === "force-stop"
+                ? "This immediately ends the server process without waiting for saving to finish. Unsaved progress may be lost or world files damaged. Use this only if the server is stuck stopping. The server will stay stopped."
+                : "Connected players will be disconnected. The server will receive a graceful stop command to save its world."}
+            </p>
+            <div className="modal-actions">
+              <button
+                className="btn"
+                autoFocus
+                onClick={() => setConfirmPower(null)}
+              >
+                Cancel
+              </button>
+              <button
+                className={`btn ${confirmPower === "restart" ? "restart-button" : "danger"}`}
+                onClick={() => power(confirmPower)}
+              >
+                {confirmPower === "force-stop"
+                  ? "Force stop server"
+                  : confirmPower === "stop"
+                    ? "Stop server"
+                    : "Restart server"}
+              </button>
+            </div>
+          </section>
+        </div>
+      )}
+    </>
+  );
+}
+
 function ConsolePage({
+  controls,
   server,
   history,
   notify,
@@ -955,6 +1184,7 @@ function ConsolePage({
 }: {
   server: Server | null;
   history: { cpu: number[]; memory: number[] };
+  controls: ReturnType<typeof useServerPower>;
   notify: (message: string, error?: boolean) => void;
   refresh: () => Promise<void>;
   navigate: (page: Page) => void;
@@ -971,21 +1201,7 @@ function ConsolePage({
   const query = useDebouncedValue(search);
   const [showSearch, setShowSearch] = useState(false);
   const [autoScroll, setAutoScroll] = useState(true);
-  const [commandBusy, setCommandBusy] = useState(false);
-  const commandRequest = useRef(0);
-  const [powerAction, setPowerAction] = useState<
-    "start" | "stop" | "restart" | "force-stop" | null
-  >(null);
-  const powerRequest = useRef(0);
-  const busy = commandBusy || powerAction !== null;
-  const [confirmPower, setConfirmPower] = useState<
-    "stop" | "restart" | "force-stop" | null
-  >(null);
-  useDialogFocus(confirmPower !== null, () => setConfirmPower(null));
-  useEffect(() => {
-    if (confirmPower === "force-stop" && server?.status !== "stopping")
-      setConfirmPower(null);
-  }, [confirmPower, server?.status]);
+  const { busy, commandRequest, setCommandBusy } = controls;
   const [hiddenUntil, setHiddenUntil] = useState<string | number | null>(null);
   const [logError, setLogError] = useState(false);
   const commandInput = useRef<HTMLInputElement>(null);
@@ -1019,38 +1235,10 @@ function ConsolePage({
         e.preventDefault();
         commandInput.current?.focus();
       }
-      if (e.key === "Escape") setConfirmPower(null);
     };
     document.addEventListener("keydown", listener);
     return () => document.removeEventListener("keydown", listener);
   }, []);
-  async function power(action: "start" | "stop" | "restart" | "force-stop") {
-    const token = ++powerRequest.current;
-    if (action === "force-stop") {
-      ++commandRequest.current;
-      setCommandBusy(false);
-    }
-    setPowerAction(action);
-    setConfirmPower(null);
-    try {
-      await post("/server/power", {
-        action,
-        ...(action === "force-stop" ? { confirmed: true } : {}),
-      });
-      if (token !== powerRequest.current) return;
-      await refresh();
-      await loadLogs();
-      if (token !== powerRequest.current) return;
-      notify(
-        `Server ${action === "force-stop" ? "force stop" : action} requested.`,
-      );
-    } catch (error) {
-      if (token === powerRequest.current)
-        notify((error as Error).message, true);
-    } finally {
-      if (token === powerRequest.current) setPowerAction(null);
-    }
-  }
   async function sendCommand(e: React.FormEvent) {
     e.preventDefault();
     if (!command.trim() || busy) return;
@@ -1126,16 +1314,7 @@ function ConsolePage({
     <>
       <div className="page-heading console-heading">
         <div>
-          <p className="eyebrow">SERVER OVERVIEW</p>
           <h1>Console</h1>
-        </div>
-        <div className="heading-meta">
-          <Clock3 size={14} />
-          <span>
-            {server?.mode === "demo"
-              ? "Simulated server activity"
-              : "Updated every 3 seconds"}
-          </span>
         </div>
       </div>
       <section className="server-banner">
@@ -1186,42 +1365,6 @@ function ConsolePage({
                   ? "Server stopping…"
                   : "Server offline"}
           </span>
-          <div className="power-buttons">
-            <button
-              className="btn start-button"
-              disabled={
-                !server || isRunning || busy || server.status !== "offline"
-              }
-              onClick={() => power("start")}
-            >
-              <Play size={14} fill="currentColor" />
-              Start
-            </button>
-            <button
-              className="btn restart-button"
-              disabled={!isRunning || busy}
-              onClick={() => setConfirmPower("restart")}
-            >
-              <RotateCw size={14} />
-              Restart
-            </button>
-            <button
-              className="btn stop-button"
-              disabled={
-                server?.status === "stopping"
-                  ? powerAction === "force-stop"
-                  : (!isRunning && server?.status !== "starting") || busy
-              }
-              onClick={() =>
-                setConfirmPower(
-                  server?.status === "stopping" ? "force-stop" : "stop",
-                )
-              }
-            >
-              <Square size={12} fill="currentColor" />
-              {server?.status === "stopping" ? "Force Stop" : "Stop"}
-            </button>
-          </div>
         </div>
       </section>
       <section className="metrics-grid" aria-label="Server resources">
@@ -1229,7 +1372,6 @@ function ConsolePage({
           <div className="metric-label">
             <Cpu size={15} />
             <span>CPU usage</span>
-            <span className="metric-indicator" />
           </div>
           <div className="metric-value cpu-value">
             {cpuUnavailable
@@ -1246,11 +1388,9 @@ function ConsolePage({
           <div className="metric-subtitle">
             {cpuUnavailable
               ? server?.metricsMessage || "Waiting for server process…"
-              : server?.mode === "demo"
-                ? "Simulated utilization"
-                : server?.status === "offline"
-                  ? "Server offline"
-                  : `Whole processor · ${cpuCapacity / 100} logical cores`}
+              : server?.status === "offline"
+                ? "Server offline"
+                : `Whole processor · ${cpuCapacity / 100} logical cores`}
           </div>
           {!cpuUnavailable && (
             <Sparkline values={history.cpu.map(normalizedCpu)} />
@@ -1282,15 +1422,13 @@ function ConsolePage({
           <div className="metric-subtitle">
             {unavailable
               ? server?.metricsMessage || "Waiting for server process…"
-              : server?.mode === "demo"
-                ? "Simulated usage · allocated memory"
-                : !server?.memoryLimit
-                  ? "Physical memory · heap limit unknown"
-                  : server?.status === "offline"
-                    ? "Server offline · next launch allocation"
-                    : server?.memoryLimitState === "started"
-                      ? "Physical memory · startup heap limit"
-                      : "Physical memory · configured heap limit"}
+              : !server?.memoryLimit
+                ? "Physical memory · heap limit unknown"
+                : server?.status === "offline"
+                  ? "Server offline · next launch allocation"
+                  : server?.memoryLimitState === "started"
+                    ? "Physical memory · startup heap limit"
+                    : "Physical memory · configured heap limit"}
           </div>
           {!unavailable && (
             <Sparkline values={history.memory} color="#97b9f5" />
@@ -1331,9 +1469,7 @@ function ConsolePage({
           <div className="metric-subtitle">
             {playersUnavailable
               ? "Player query not connected"
-              : server?.mode === "demo"
-                ? "Demo player list"
-                : "Connected to your world"}
+              : "Connected to your world"}
           </div>
         </div>
       </section>
@@ -1345,7 +1481,7 @@ function ConsolePage({
               <h2>Server console</h2>
               <span className="live-label">
                 <i />
-                {server?.mode === "demo" ? "DEMO" : "LIVE"}
+                LIVE
               </span>
             </div>
             <div className="console-tools">
@@ -1553,7 +1689,7 @@ function ConsolePage({
               </div>
               <div>
                 <dt>Environment</dt>
-                <dd>{server?.mode === "live" ? "Local Java" : "Demo"}</dd>
+                <dd>Local server</dd>
               </div>
               <div>
                 <dt>Connection</dt>
@@ -1603,11 +1739,9 @@ function ConsolePage({
               ) : (
                 <div className="players-empty">
                   <Users size={23} />
-                  <strong>
-                    {playersUnavailable
-                      ? "Player query not connected"
-                      : "A world of possibilities"}
-                  </strong>
+                  {playersUnavailable && (
+                    <strong>Player query not connected</strong>
+                  )}
                   <p>
                     {playersUnavailable ? (
                       "Live player tracking is not configured yet."
@@ -1628,54 +1762,10 @@ function ConsolePage({
       <div className="console-bottom-note">
         <ShieldCheck size={14} />
         <span>
-          {server?.mode === "demo"
-            ? "You’re in demo mode. Console activity is simulated; files and backups are real."
-            : "Your panel is running locally. Server commands are sent directly to the Java process."}
+          Your panel is running locally. Server commands are sent directly to
+          the server process.
         </span>
       </div>
-      {confirmPower && (
-        <div className="modal-backdrop">
-          <section
-            className="modal"
-            role="dialog"
-            aria-modal="true"
-            aria-labelledby="power-title"
-          >
-            <h2 id="power-title">
-              {confirmPower === "force-stop"
-                ? "Force stop"
-                : confirmPower === "stop"
-                  ? "Stop"
-                  : "Restart"}{" "}
-              your server?
-            </h2>
-            <p>
-              {confirmPower === "force-stop"
-                ? "This immediately ends the server process without waiting for saving to finish. Unsaved progress may be lost or world files damaged. Use this only if the server is stuck stopping. The server will stay stopped."
-                : "Connected players will be disconnected. The server will receive a graceful stop command to save its world."}
-            </p>
-            <div className="modal-actions">
-              <button
-                className="btn"
-                autoFocus
-                onClick={() => setConfirmPower(null)}
-              >
-                Cancel
-              </button>
-              <button
-                className={`btn ${confirmPower === "restart" ? "restart-button" : "danger"}`}
-                onClick={() => power(confirmPower)}
-              >
-                {confirmPower === "force-stop"
-                  ? "Force stop server"
-                  : confirmPower === "stop"
-                    ? "Stop server"
-                    : "Restart server"}
-              </button>
-            </div>
-          </section>
-        </div>
-      )}
     </>
   );
 }

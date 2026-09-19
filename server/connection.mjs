@@ -114,12 +114,6 @@ export async function advertisedConnection(configuration, resolver) {
       addressSource: "custom",
       addressNote: "Custom player connection address",
     };
-  if (configuration.mode === "demo")
-    return {
-      address: configuration.address,
-      addressSource: "local",
-      addressNote: "Demo connection address",
-    };
   const publicHost = await resolver.resolve();
   return publicHost
     ? {

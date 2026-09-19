@@ -565,12 +565,22 @@ test("databases are actual SQLite files and access records do not imply authenti
   );
 });
 
-test("console identifies simulation, accepts a single command, and tracks power state", async (t) => {
-  const { request } = await fixture(t);
-  assert.equal((await request("/api/server")).body.mode, "demo");
-  const lines = await request("/api/console");
-  assert.ok(
-    lines.body.lines.some((item) => item.message.includes("simulated")),
+test("console starts offline, delivers one command to the process, and tracks power state", async (t) => {
+  const java = fakeJava();
+  const { request, serverDir } = await fixture(t, {
+    jar: "server.jar",
+    spawnServer: java.spawnServer,
+  });
+  const initial = (await request("/api/server")).body;
+  assert.equal(initial.mode, "live");
+  assert.equal(initial.status, "offline");
+  assert.deepEqual(await fs.readdir(serverDir), []);
+  await fs.writeFile(path.join(serverDir, "server.jar"), "never executed");
+  await fs.writeFile(path.join(serverDir, "eula.txt"), "eula=true\n");
+  assert.equal(
+    (await request("/api/server/power", json("POST", { action: "start" })))
+      .status,
+    200,
   );
   assert.equal(
     (
@@ -590,9 +600,11 @@ test("console identifies simulation, accepts a single command, and tracks power 
     ).status,
     200,
   );
+  assert.deepEqual(java.commands, ["say hello"]);
+  java.child.stdout.write("[Server thread/INFO]: [Server] hello\n");
   assert.ok(
-    (await request("/api/console")).body.lines.some(
-      (item) => item.message === "[Demo] [Server] hello",
+    (await request("/api/console")).body.lines.some((item) =>
+      item.message.includes("[Server] hello"),
     ),
   );
   assert.equal(

@@ -2,14 +2,13 @@ import { useEffect, useRef, useState, type FormEvent } from "react";
 import {
   AlertCircle,
   Box,
-  ChevronDown,
   Plus,
   Save,
   Settings2,
   Trash2,
   X,
 } from "lucide-react";
-import { api, post } from "./api";
+import { api, post, ServerScope } from "./api";
 import AddServer from "./AddServer";
 import { ServerIconImage } from "./ServerIcon";
 import {
@@ -26,7 +25,7 @@ export type ServerRecord = {
   id: string;
   name: string;
   status: "running" | "offline" | "starting" | "stopping";
-  mode: "demo" | "live";
+  mode: "live";
   address: string;
   connectionHost?: string;
   iconVersion?: string | null;
@@ -40,6 +39,7 @@ export type ServerRecord = {
   launchArgs?: string[];
   motd?: string;
   version?: string;
+  minecraftVersion?: string | null;
   software?: string;
   source?: "imported" | "managed";
   serverDir?: string;
@@ -62,53 +62,59 @@ export function ServerSwitcher({
 }) {
   return (
     <div className="fleet-switcher">
-      <div className="fleet-label">
-        <span>YOUR SERVERS</span>
-        <span>{servers.length.toString().padStart(2, "0")}</span>
-      </div>
-      <div className="fleet-select-wrap">
-        <span className="server-mini">
-          <ServerIconImage
-            name={selected.name}
-            version={selected.iconVersion}
-          />
-        </span>
-        <div className="fleet-selection">
-          <select
-            aria-label="Switch server"
-            value={selected.id}
-            onChange={(e) => onSelect(e.target.value)}
-          >
-            {servers.map((server) => (
-              <option key={server.id} value={server.id}>
-                {server.name}
-              </option>
-            ))}
-          </select>
-          <span>
-            <i
-              className={`status-dot ${selected.status === "running" ? "" : "offline"}`}
-            />
-            {selected.status}{" "}
-            <span className="fleet-mode">
-              ·{" "}
-              {selected.mode === "demo" ? "Demo" : selected.software || "Live"}
-            </span>
-          </span>
-        </div>
-        <ChevronDown className="fleet-chevron" size={13} />
-      </div>
+      <ul className="fleet-server-list" aria-label="Your servers">
+        {servers.map((record) => {
+          const active = record.id === selected.id;
+          const server = active ? selected : record;
+          const software = [server.software || "Java", server.minecraftVersion]
+            .filter(Boolean)
+            .join(" ");
+          return (
+            <li key={server.id}>
+              <button
+                className="fleet-server-button"
+                aria-label={`Select server ${server.name}`}
+                data-server-id={server.id}
+                aria-pressed={active}
+                onClick={() => onSelect(server.id)}
+              >
+                <span className="server-mini">
+                  <ServerScope.Provider value={server.id}>
+                    <ServerIconImage
+                      name={server.name}
+                      version={server.iconVersion}
+                    />
+                  </ServerScope.Provider>
+                </span>
+                <span className="fleet-selection">
+                  <strong title={server.name}>{server.name}</strong>
+                  <span>
+                    <i
+                      className={`status-dot ${server.status === "running" ? "" : "offline"}`}
+                    />
+                    {server.status}
+                    <span className="fleet-mode" title={software}>
+                      · {software}
+                    </span>
+                  </span>
+                </span>
+              </button>
+            </li>
+          );
+        })}
+      </ul>
       <div className="fleet-actions">
-        <button onClick={onAdd}>
-          <Plus size={13} />
+        <button className="nav-item" onClick={onAdd}>
+          <Plus size={19} />
           Add server
         </button>
         <button
+          className="nav-item"
           aria-label="Server settings"
           title="Server settings"
           onClick={onSettings}
         >
-          <Settings2 size={14} />
+          <Settings2 size={19} />
           <span>Settings</span>
         </button>
       </div>
@@ -151,7 +157,6 @@ function ServerSettings({
   const [connectionHost, setConnectionHost] = useState(
     editing?.connectionHost ?? "",
   );
-  const mode = editing?.mode ?? "live";
   const [port, setPort] = useState(String(editing?.port ?? nextPort));
   const [memory, setMemory] = useState(String(editing?.memoryLimitMB ?? 4096));
   const [startup, setStartup] = useState(() =>
@@ -187,12 +192,12 @@ function ServerSettings({
     const settings = {
       name: name.trim(),
       connectionHost: connectionHost.trim(),
-      mode,
+      mode: "live",
       port: Number(port),
       ...(startup.launchType === "jar"
         ? { memoryLimitMB: Number(memory) }
         : {}),
-      ...startupPayload(mode === "live" ? startup : startupDraft()),
+      ...startupPayload(startup),
       motd,
     };
     try {
@@ -296,19 +301,13 @@ function ServerSettings({
             onChange={(event) => setConnectionHost(event.target.value)}
             disabled={busy}
             maxLength={253}
-            placeholder={
-              mode === "demo"
-                ? "Local demo address, or play.example.com"
-                : "Automatic public IP, or play.example.com"
-            }
+            placeholder="Automatic public IP, or play.example.com"
             spellCheck={false}
           />
           <small>
-            {mode === "demo"
-              ? "Leave blank to keep the local demo address."
-              : "Leave blank to detect the server PC’s public IP."}{" "}
-            Enter a hostname or IP without a port to override it. This does not
-            change server-ip or set up port forwarding.
+            Leave blank to detect the server PC’s public IP. Enter a hostname or
+            IP without a port to override it. This does not change server-ip or
+            set up port forwarding.
           </small>
         </div>
         {editing?.source === "imported" && editing.serverDir && (
@@ -368,43 +367,38 @@ function ServerSettings({
               Shown in Minecraft’s multiplayer server list after the next start.
             </small>
           </div>
-          {mode === "live" && (
-            <>
-              <LaunchMethodFields
-                idPrefix="server"
-                value={startup}
-                onChange={setStartup}
+          <LaunchMethodFields
+            idPrefix="server"
+            value={startup}
+            onChange={setStartup}
+          />
+          {startup.launchType === "jar" && (
+            <div className="form-field">
+              <label htmlFor="server-memory">Memory (MB)</label>
+              <input
+                id="server-memory"
+                type="number"
+                min={256}
+                max={262144}
+                step={1}
+                required
+                value={memory}
+                onChange={(e) => setMemory(e.target.value)}
               />
-              {startup.launchType === "jar" && (
-                <div className="form-field">
-                  <label htmlFor="server-memory">Memory (MB)</label>
-                  <input
-                    id="server-memory"
-                    type="number"
-                    min={256}
-                    max={262144}
-                    step={1}
-                    required
-                    value={memory}
-                    onChange={(e) => setMemory(e.target.value)}
-                  />
-                </div>
-              )}
-              <LaunchMemoryNote type={startup.launchType} />
-              <LaunchAdvancedFields
-                idPrefix="server"
-                value={startup}
-                onChange={setStartup}
-              />
-            </>
+            </div>
           )}
+          <LaunchMemoryNote type={startup.launchType} />
+          <LaunchAdvancedFields
+            idPrefix="server"
+            value={startup}
+            onChange={setStartup}
+          />
         </fieldset>
         <div className="server-setup-note">
           <Box size={17} />
           <p>
-            {mode === "demo"
-              ? "Console and player actions are simulated in demo mode. File operations and backups use real local files."
-              : "Startup changes take effect the next time you start this server. Its existing files and EULA remain in place."}
+            Startup changes take effect the next time you start this server. Its
+            existing files and EULA remain in place.
           </p>
         </div>
         {error && (
@@ -432,7 +426,7 @@ function ServerSettings({
           </button>
         </div>
         {editing && (
-          <div className="server-remove-demo">
+          <div className="server-remove">
             {confirmingRemoval ? (
               <div role="group" aria-labelledby="remove-server-title">
                 <h3 id="remove-server-title">

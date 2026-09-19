@@ -16,7 +16,7 @@ const uuid = "12345678-1234-1234-1234-123456789abc";
 const profile = { name: "History_Player", uuid };
 const json = (method, body) => ({ method, body: JSON.stringify(body) });
 
-test("moderation audit labels distinguish sent commands from simulated state changes", () => {
+test("moderation audit labels describe commands sent to Minecraft", () => {
   for (const [command, action] of [
     ["op Builder", "Player op requested"],
     ["deop Builder", "Player deop requested"],
@@ -33,15 +33,7 @@ test("moderation audit labels distinguish sent commands from simulated state cha
     assert.equal(event.action, action);
     assert.match(event.detail, /Sent to Minecraft:/);
   }
-  assert.equal(
-    playerCommandAudit("op Builder", { simulated: true }).action,
-    "Player opped (simulated)",
-  );
-  assert.equal(
-    playerCommandAudit("op Builder", { simulated: true, applied: false })
-      .action,
-    "Player op requested (simulated)",
-  );
+
   assert.equal(playerCommandAudit("say op Builder"), null);
   assert.equal(playerCommandAudit("whitelist list"), null);
   for (const command of [
@@ -162,7 +154,7 @@ test("moderation validates Java names, UUIDs and single-line reasons before gene
   });
 });
 
-async function fixture(t, mode = "demo") {
+async function fixture(t, mode = "live") {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "mc-player-history-"));
   const commands = [];
   let child;
@@ -201,6 +193,15 @@ async function fixture(t, mode = "demo") {
   let listener;
   const open = async () => {
     panel = await createPanel(options);
+    await fs
+      .writeFile(
+        path.join(panel.serverDir, "server.properties"),
+        "white-list=false\n",
+        { flag: "wx" },
+      )
+      .catch((cause) => {
+        if (cause.code !== "EEXIST") throw cause;
+      });
     listener = await new Promise((resolve) => {
       const value = panel.app.listen(0, "127.0.0.1", () => resolve(value));
     });
@@ -261,7 +262,7 @@ async function fixture(t, mode = "demo") {
   };
 }
 
-test("demo cache history and ban overrides persist across restart without touching Minecraft files", async (t) => {
+test("cache history and authoritative ban files persist across restart", async (t) => {
   const panel = await fixture(t);
   const cache = JSON.stringify([
     { ...profile, expiresOn: "2099-01-01 00:00:00 +0000" },
@@ -272,33 +273,36 @@ test("demo cache history and ban overrides persist across restart without touchi
   assert.equal(data.history[0].lastSeen, null);
   assert.equal(data.history[0].online, false);
   assert.equal(
-    (await panel.request("/api/players/kick", json("POST", profile))).status,
+    (
+      await panel.request(
+        "/api/players/ban",
+        json("POST", { ...profile, reason: "Fixture reason" }),
+      )
+    ).status,
     409,
   );
-  const banned = await panel.request(
-    "/api/players/ban",
-    json("POST", { ...profile, reason: "Fixture reason" }),
+  await fs.writeFile(
+    path.join(panel.serverDir, "banned-players.json"),
+    JSON.stringify([{ ...profile, reason: "Fixture reason" }]),
   );
-  assert.equal(banned.status, 200);
-  assert.equal(banned.body.simulated, true);
   await panel.restart();
   data = (await panel.request("/api/players")).body;
   assert.equal(data.history[0].banned, true);
   assert.equal(data.history[0].banReason, "Fixture reason");
+  await panel.start();
   assert.equal(
     (await panel.request("/api/players/unban", json("POST", profile))).status,
     200,
   );
+  assert.equal(panel.commands.at(-1), "pardon History_Player\n");
+  assert.equal(
+    (await panel.request("/api/players")).body.history[0].banned,
+    true,
+  );
+  await fs.writeFile(path.join(panel.serverDir, "banned-players.json"), "[]\n");
   assert.equal(
     (await panel.request("/api/players")).body.history[0].banned,
     false,
-  );
-  assert.equal(
-    await fs.readFile(
-      path.join(panel.serverDir, "banned-players.json"),
-      "utf8",
-    ),
-    "[]\n",
   );
   assert.equal(
     await fs.readFile(path.join(panel.serverDir, "usercache.json"), "utf8"),
@@ -306,8 +310,9 @@ test("demo cache history and ban overrides persist across restart without touchi
   );
 });
 
-test("operator requests from a known-player row validate its UUID and remain isolated demo changes", async (t) => {
+test("operator requests validate current UUIDs and wait for authoritative files", async (t) => {
   const panel = await fixture(t);
+  await panel.start();
   await fs.writeFile(
     path.join(panel.serverDir, "usercache.json"),
     JSON.stringify([profile]),
@@ -336,11 +341,8 @@ test("operator requests from a known-player row validate its UUID and remain iso
   );
   const grant = await panel.request("/api/players/op", json("POST", profile));
   assert.equal(grant.status, 200);
-  assert.equal(grant.body.simulated, true);
-  assert.equal(
-    (await panel.request("/api/players")).body.operators[0].name,
-    profile.name,
-  );
+  assert.equal(panel.commands.at(-1), "op History_Player\n");
+  assert.deepEqual((await panel.request("/api/players")).body.operators, []);
   assert.equal(
     await fs.readFile(path.join(panel.serverDir, "ops.json"), "utf8"),
     "[]\n",
@@ -398,7 +400,7 @@ test("live logger history ignores chat, supports Forge prefixes, and live modera
     "/api/players/ban",
     json("POST", { ...profile, reason: "Test ban" }),
   );
-  assert.equal(ban.body.simulated, false);
+  assert.equal(ban.status, 200);
   assert.equal(panel.commands.at(-1), "ban History_Player Test ban\n");
   assert.equal(
     (await panel.request("/api/players")).body.history[0].banned,

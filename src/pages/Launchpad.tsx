@@ -1460,7 +1460,6 @@ export default function Launchpad({ notify }: PageProps) {
     <div className="management-page launchpad-page">
       <div className="page-heading management-heading">
         <div>
-          <p className="eyebrow">MINECRAFT</p>
           <h1>Launchpad</h1>
         </div>
         <button

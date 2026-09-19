@@ -52,6 +52,7 @@ type BackupResult = {
   schedule: Schedule;
   timezone?: string;
 };
+type DeleteDialog = { backups: Backup[]; bulk: boolean };
 const defaults: Schedule = {
   enabled: false,
   type: "interval",
@@ -84,9 +85,11 @@ export default function Backups({ notify }: PageProps) {
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
   const [busy, setBusy] = useState(false);
-  const [dialog, setDialog] = useState<"create" | Backup | null>(null);
+  const [selected, setSelected] = useState<Set<string>>(new Set());
+  const [dialog, setDialog] = useState<"create" | DeleteDialog | null>(null);
   const [name, setName] = useState("");
   const [dialogError, setDialogError] = useState("");
+  const [deleteErrors, setDeleteErrors] = useState<string[]>([]);
   const dialogRef = useRef<HTMLDivElement>(null);
   const busyRef = useRef(false);
   const generation = useRef(0);
@@ -101,6 +104,10 @@ export default function Backups({ notify }: PageProps) {
         const result = await api<BackupResult>("/backups");
         if (token !== generation.current) return false;
         setBackups(result.backups);
+        const available = new Set(result.backups.map((backup) => backup.id));
+        setSelected(
+          (current) => new Set([...current].filter((id) => available.has(id))),
+        );
         setSavedSchedule(result.schedule);
         setTimezone(result.timezone || "server time");
         if (initial) setSchedule(result.schedule);
@@ -117,6 +124,11 @@ export default function Backups({ notify }: PageProps) {
   useEffect(() => {
     generation.current++;
     setBackups([]);
+    setSelected(new Set());
+    setDialog(null);
+    setDialogError("");
+    setDeleteErrors([]);
+    setBusy(false);
     setSchedule(defaults);
     setSavedSchedule(defaults);
     void load(true);
@@ -192,27 +204,81 @@ export default function Backups({ notify }: PageProps) {
   }
   async function submitDialog(event: FormEvent) {
     event.preventDefault();
-    if (!dialog) return;
+    if (!dialog || busyRef.current) return;
+    const token = generation.current;
+    busyRef.current = true;
     setBusy(true);
     setDialogError("");
+    setDeleteErrors([]);
     try {
       if (dialog === "create") {
         await post("/backups", { name: name.trim() || undefined });
+        if (token !== generation.current) return;
         notify("Backup created. Your server files are safely archived.");
       } else {
-        await api(`/backups/${encodeURIComponent(dialog.id)}`, {
-          method: "DELETE",
+        const deleted = new Set<string>();
+        const failed: Backup[] = [];
+        const failures: string[] = [];
+        for (const backup of dialog.backups) {
+          if (token !== generation.current) return;
+          try {
+            await api(`/backups/${encodeURIComponent(backup.id)}`, {
+              method: "DELETE",
+            });
+            deleted.add(backup.id);
+          } catch (failure) {
+            failed.push(backup);
+            failures.push(`${backup.name}: ${messageOf(failure)}`);
+          }
+        }
+        if (token !== generation.current) return;
+        setBackups((current) =>
+          current.filter((backup) => !deleted.has(backup.id)),
+        );
+        setSelected((current) => {
+          const remaining = new Set(
+            [...current].filter((id) => !deleted.has(id)),
+          );
+          if (dialog.bulk) failed.forEach((backup) => remaining.add(backup.id));
+          return remaining;
         });
-        notify("Backup deleted.");
+        if (failed.length) {
+          setDialog({ ...dialog, backups: failed });
+          setDialogError(
+            `${deleted.size} ${deleted.size === 1 ? "backup" : "backups"} moved to Recycle Bin. ${failed.length} ${failed.length === 1 ? "backup could" : "backups could"} not be moved${dialog.bulk ? (failed.length === 1 ? " and remains selected" : " and remain selected") : ""}.`,
+          );
+          setDeleteErrors(failures);
+          await load();
+          return;
+        }
+        notify(
+          deleted.size === 1
+            ? "Backup moved to Recycle Bin."
+            : `${deleted.size} backups moved to Recycle Bin.`,
+        );
       }
       setDialog(null);
       await load();
     } catch (failure) {
-      setDialogError(messageOf(failure));
+      if (token === generation.current) setDialogError(messageOf(failure));
     } finally {
-      setBusy(false);
+      if (token === generation.current) {
+        busyRef.current = false;
+        setBusy(false);
+      }
     }
   }
+
+  function confirmDelete(targets: Backup[], bulk = false) {
+    setDialogError("");
+    setDeleteErrors([]);
+    setDialog({ backups: targets, bulk });
+  }
+
+  const selectedBackups = backups.filter((backup) => selected.has(backup.id));
+  const allSelected =
+    backups.length > 0 && selectedBackups.length === backups.length;
+  const someSelected = selectedBackups.length > 0 && !allSelected;
 
   const totalSize = backups.reduce((sum, backup) => sum + backup.size, 0);
   const latest = [...backups].sort(
@@ -222,9 +288,7 @@ export default function Backups({ notify }: PageProps) {
     <div className="storage-page">
       <div className="page-heading">
         <div>
-          <p className="eyebrow">MANAGEMENT</p>
           <h1>Backups</h1>
-          <p>A little peace of mind for everything you've built.</p>
         </div>
         <button
           className="btn primary"
@@ -317,6 +381,46 @@ export default function Backups({ notify }: PageProps) {
                   successMessage="Backups refreshed."
                 />
               </div>
+              {backups.length > 0 && (
+                <div
+                  className="backup-selection"
+                  role="region"
+                  aria-label="Backup selection"
+                >
+                  <label className="backup-select-all">
+                    <input
+                      type="checkbox"
+                      className="backup-checkbox"
+                      aria-label="Select all backups"
+                      aria-checked={someSelected ? "mixed" : allSelected}
+                      checked={allSelected}
+                      ref={(element) => {
+                        if (element) element.indeterminate = someSelected;
+                      }}
+                      disabled={busy}
+                      onChange={(event) =>
+                        setSelected(
+                          event.target.checked
+                            ? new Set(backups.map((backup) => backup.id))
+                            : new Set(),
+                        )
+                      }
+                    />
+                    Select all
+                  </label>
+                  <span className="backup-selection-count" aria-live="polite">
+                    {selectedBackups.length} selected
+                  </span>
+                  <button
+                    className="btn small danger"
+                    disabled={busy || selectedBackups.length === 0}
+                    onClick={() => confirmDelete(selectedBackups, true)}
+                  >
+                    <Trash2 size={14} />
+                    Delete selected
+                  </button>
+                </div>
+              )}
               {!backups.length ? (
                 <StatePanel
                   variant="empty"
@@ -346,7 +450,26 @@ export default function Backups({ notify }: PageProps) {
                         new Date(a.createdAt).getTime(),
                     )
                     .map((backup) => (
-                      <article className="backup-item" key={backup.id}>
+                      <article
+                        className={`backup-item${selected.has(backup.id) ? " selected" : ""}`}
+                        key={backup.id}
+                      >
+                        <input
+                          type="checkbox"
+                          className="backup-checkbox"
+                          aria-label={`Select backup ${backup.name}`}
+                          checked={selected.has(backup.id)}
+                          disabled={busy}
+                          onChange={(event) => {
+                            const checked = event.target.checked;
+                            setSelected((current) => {
+                              const next = new Set(current);
+                              if (checked) next.add(backup.id);
+                              else next.delete(backup.id);
+                              return next;
+                            });
+                          }}
+                        />
                         <div className="backup-item-icon">
                           <Archive size={20} />
                         </div>
@@ -389,11 +512,9 @@ export default function Backups({ notify }: PageProps) {
                           <button
                             className="btn icon delete-action"
                             aria-label={`Delete backup ${backup.name}`}
-                            title="Delete backup"
-                            onClick={() => {
-                              setDialogError("");
-                              setDialog(backup);
-                            }}
+                            title="Move backup to Recycle Bin"
+                            disabled={busy}
+                            onClick={() => confirmDelete([backup])}
                           >
                             <Trash2 size={15} />
                           </button>
@@ -543,8 +664,9 @@ export default function Backups({ notify }: PageProps) {
                       </div>
                     </label>
                     <p className="schedule-retention-hint">
-                      The oldest scheduled backups are removed when this limit
-                      is reached. Manual backups stay until you delete them.
+                      Older scheduled backups move to Recycle Bin when this
+                      limit is reached. They use disk space until permanently
+                      deleted. Manual backups stay until you delete them.
                     </p>
                     <button
                       className="btn primary schedule-save"
@@ -621,12 +743,14 @@ export default function Backups({ notify }: PageProps) {
                   <h2 id="backup-dialog-title">
                     {dialog === "create"
                       ? "Create a backup"
-                      : "Delete this backup?"}
+                      : dialog.bulk
+                        ? "Move selected backups to Recycle Bin?"
+                        : "Move this backup to Recycle Bin?"}
                   </h2>
                   <p>
                     {dialog === "create"
                       ? "Save an archive of your current server files."
-                      : "This action cannot be undone."}
+                      : "You can restore these archives from File Manager → Recycle Bin."}
                   </p>
                 </div>
                 <button
@@ -667,10 +791,49 @@ export default function Backups({ notify }: PageProps) {
                   )}
                 </>
               ) : (
-                <p className="delete-description">
-                  Permanently delete <strong>{dialog.name}</strong>? Your
-                  current server files will stay as they are.
-                </p>
+                <>
+                  <p className="delete-description">
+                    {dialog.bulk ? (
+                      <>
+                        Move{" "}
+                        <strong>
+                          {dialog.backups.length} selected{" "}
+                          {dialog.backups.length === 1 ? "backup" : "backups"}
+                        </strong>{" "}
+                        to Recycle Bin?
+                      </>
+                    ) : (
+                      <>
+                        Move <strong>{dialog.backups[0].name}</strong> to
+                        Recycle Bin?
+                      </>
+                    )}{" "}
+                    Your current server files will stay as they are.
+                  </p>
+                  {dialog.bulk && (
+                    <ul
+                      className="backup-delete-targets"
+                      aria-label="Backups to recycle"
+                    >
+                      {dialog.backups.map((backup) => (
+                        <li key={backup.id}>
+                          <strong>{backup.name}</strong>
+                          <span>
+                            {fullDate(backup.createdAt)} ·{" "}
+                            {formatBytes(backup.size)}
+                          </span>
+                        </li>
+                      ))}
+                    </ul>
+                  )}
+                </>
+              )}
+              {dialog !== "create" && deleteErrors.length > 0 && (
+                <ul className="backup-delete-errors" aria-label="Move errors">
+                  {deleteErrors.map((failure, index) => (
+                    <li key={index}>{failure}</li>
+                  ))}
+                </ul>
               )}
               {dialogError && (
                 <p className="storage-form-error" role="alert">
@@ -695,7 +858,11 @@ export default function Backups({ notify }: PageProps) {
                     ? busy
                       ? "Creating backup…"
                       : "Create backup"
-                    : "Delete backup"}
+                    : busy
+                      ? "Moving backups…"
+                      : deleteErrors.length > 0
+                        ? "Retry failed moves"
+                        : "Move to Recycle Bin"}
                 </button>
               </div>
             </form>

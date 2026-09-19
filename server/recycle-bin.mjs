@@ -13,6 +13,19 @@ const phases = new Set([
   "restoring",
   "restored",
 ]);
+const validBackup = (backup) =>
+  backup &&
+  typeof backup === "object" &&
+  ids.test(backup.id) &&
+  typeof backup.name === "string" &&
+  backup.name.length > 0 &&
+  backup.name.length <= 255 &&
+  Number.isFinite(backup.size) &&
+  backup.size >= 0 &&
+  Number.isFinite(Date.parse(backup.createdAt)) &&
+  backup.status === "completed" &&
+  (backup.trigger === undefined ||
+    ["manual", "scheduled"].includes(backup.trigger));
 
 /** Private per-server recovery storage. The public file tree never contains it.
  * Each entry journals its intent before touching source data. A same-volume
@@ -23,6 +36,7 @@ const phases = new Set([
 export async function createRecycleBin({
   dataDir,
   serverDir,
+  backupDir,
   safePath,
   fileSystem = fs,
   now = () => new Date(),
@@ -54,6 +68,37 @@ export async function createRecycleBin({
     await assertServerRoot();
     return target;
   };
+  const backupRoot = backupDir ? await io.realpath(backupDir) : null;
+  const backupRootStat = backupDir ? await io.lstat(backupDir) : null;
+  const backupPath = async (relative) => {
+    if (!backupDir || !/^backups\/[a-f0-9-]{36}\.tar\.gz$/i.test(relative))
+      throw error(
+        409,
+        "The backup recovery path is invalid. Its archive has been retained.",
+      );
+    const assertRoot = async () => {
+      const checked = await safePath(dataDir, "backups");
+      const stat = await io.lstat(checked);
+      if (
+        !stat.isDirectory() ||
+        stat.isSymbolicLink() ||
+        stat.ino !== backupRootStat.ino ||
+        stat.dev !== backupRootStat.dev ||
+        stat.birthtimeMs !== backupRootStat.birthtimeMs ||
+        (await io.realpath(checked)) !== backupRoot
+      )
+        throw error(
+          409,
+          "The backup folder changed. Recovery archives have been retained; restore the original folder and restart the panel.",
+        );
+    };
+    await assertRoot();
+    const target = await safePath(backupDir, relative.slice("backups/".length));
+    await assertRoot();
+    return target;
+  };
+  const originalPathFor = (metadata) =>
+    metadata.kind === "backup" ? backupPath : serverPath;
   const relative = path.relative(originalRoot, directory);
   if (
     !relative ||
@@ -141,13 +186,18 @@ export async function createRecycleBin({
       !metadata.originalPath ||
       !Number.isFinite(metadata.size) ||
       metadata.size < 0 ||
-      !Number.isFinite(Date.parse(metadata.deletedAt))
+      !Number.isFinite(Date.parse(metadata.deletedAt)) ||
+      (metadata.kind !== undefined && metadata.kind !== "backup") ||
+      (metadata.kind === "backup" &&
+        (!validBackup(metadata.backup) ||
+          metadata.type !== "file" ||
+          metadata.originalPath !== `backups/${metadata.backup.id}.tar.gz`))
     )
       throw error(
         409,
         "This recovery record is incomplete. Its stored files have been retained.",
       );
-    await serverPath(metadata.originalPath);
+    await originalPathFor(metadata)(metadata.originalPath);
     return { entryDir, metadata, payload: await safePath(entryDir, "content") };
   };
   const walk = async (root, base = "", rows = []) => {
@@ -275,7 +325,11 @@ export async function createRecycleBin({
         "The source changed before removal. The original and recovery data have been retained.",
       );
   };
-  const removeVerifiedSource = async (originalPath, snapshot) => {
+  const removeVerifiedSource = async (
+    originalPath,
+    snapshot,
+    resolvePath = serverPath,
+  ) => {
     const changed = (relative) =>
       error(
         409,
@@ -315,7 +369,7 @@ export async function createRecycleBin({
     // here: a live server may have created new, unarchived files since verification.
     for (const row of [...snapshot.rows].reverse()) {
       const relative = [originalPath, row.path].filter(Boolean).join("/");
-      const target = await serverPath(relative);
+      const target = await resolvePath(relative);
       const stat = await io.lstat(target);
       if (!sameIdentity(stat, row)) throw changed(relative);
       if (row.type === "file") {
@@ -324,7 +378,7 @@ export async function createRecycleBin({
           (await hashFile(target)) !== snapshot.hashes.get(row.path)
         )
           throw changed(relative);
-        const checked = await serverPath(relative);
+        const checked = await resolvePath(relative);
         if (!sameFile(await io.lstat(checked), row)) throw changed(relative);
         try {
           await io.unlink(checked);
@@ -332,7 +386,7 @@ export async function createRecycleBin({
           throw removalFailure(cause, relative);
         }
       } else {
-        const checked = await serverPath(relative);
+        const checked = await resolvePath(relative);
         if (!sameIdentity(await io.lstat(checked), row))
           throw changed(relative);
         try {
@@ -356,11 +410,21 @@ export async function createRecycleBin({
       metadata.phase !== "restored";
     return {
       id: metadata.id,
-      name: path.posix.basename(metadata.originalPath),
+      name:
+        metadata.kind === "backup"
+          ? metadata.backup.name
+          : path.posix.basename(metadata.originalPath),
       originalPath: metadata.originalPath,
       type: metadata.type,
       size: metadata.size,
       deletedAt: metadata.deletedAt,
+      ...(metadata.kind === "backup"
+        ? {
+            kind: "backup",
+            backup: { ...metadata.backup },
+            restoring: metadata.phase === "restoring",
+          }
+        : {}),
       status: ready ? "ready" : "incomplete",
       ...(metadata.phase === "copied" || metadata.phase === "restoring"
         ? {
@@ -384,7 +448,7 @@ export async function createRecycleBin({
   };
   return {
     directory,
-    inspect(id, { signal } = {}) {
+    inspect(id, { signal, includeHash = true } = {}) {
       return exclusive(async () => {
         signal?.throwIfAborted();
         const record = await read(id);
@@ -393,7 +457,8 @@ export async function createRecycleBin({
         if (item.status !== "ready") throw error(409, item.message);
         return {
           ...item,
-          ...(item.type === "file" &&
+          ...(includeHash &&
+          item.type === "file" &&
           /^mods\/[^/]+\.jar(?:\.disabled)?$/i.test(item.originalPath) &&
           item.size <= 512 * 1024 ** 2
             ? { sha512: await hashFile(record.payload, "sha512", signal) }
@@ -433,8 +498,15 @@ export async function createRecycleBin({
       }
       return items.sort((a, b) => b.deletedAt.localeCompare(a.deletedAt));
     },
-    recycle(originalPath) {
+    recycle(originalPath, { backup } = {}) {
       return exclusive(async () => {
+        if (
+          backup &&
+          (!validBackup(backup) ||
+            originalPath !== `backups/${backup.id}.tar.gz`)
+        )
+          throw error(400, "Choose a completed backup from this server.");
+        const sourcePath = backup ? backupPath : serverPath;
         if (
           typeof originalPath !== "string" ||
           !originalPath ||
@@ -444,7 +516,7 @@ export async function createRecycleBin({
             400,
             "The server root cannot be moved to the Recycle Bin.",
           );
-        const source = await serverPath(originalPath);
+        const source = await sourcePath(originalPath);
         if (path.resolve(source) === originalRoot)
           throw error(
             400,
@@ -460,13 +532,19 @@ export async function createRecycleBin({
           size: rows.reduce((total, row) => total + row.size, 0),
           deletedAt: now().toISOString(),
           phase: "prepared",
+          ...(backup ? { kind: "backup", backup: { ...backup } } : {}),
         };
+        if (backup && rows[0].type !== "file")
+          throw error(
+            400,
+            "Only regular backup archives can be moved to the Recycle Bin.",
+          );
         const entryDir = await entryDirectory(metadata.id);
         await io.mkdir(entryDir);
         const payload = await safePath(entryDir, "content");
         await persist(entryDir, metadata);
         try {
-          await serverPath(originalPath);
+          await sourcePath(originalPath);
           try {
             await io.rename(source, payload);
           } catch (cause) {
@@ -481,9 +559,9 @@ export async function createRecycleBin({
             );
             metadata.phase = "copied";
             await persist(entryDir, metadata);
-            await serverPath(originalPath);
+            await sourcePath(originalPath);
             await verifySource(source, snapshot);
-            await removeVerifiedSource(originalPath, snapshot);
+            await removeVerifiedSource(originalPath, snapshot, sourcePath);
           }
           metadata.phase = "ready";
           await persist(entryDir, metadata);
@@ -498,35 +576,54 @@ export async function createRecycleBin({
         }
       });
     },
-    restore(id) {
+    restore(id, { commitBackup } = {}) {
       return exclusive(async () => {
         const record = await read(id);
         const { entryDir, payload, metadata } = record;
+        if (metadata.kind === "backup" && typeof commitBackup !== "function")
+          throw error(
+            409,
+            "Restore this backup through the Recycle Bin to return it to backup history.",
+          );
         if ((await view(record)).status !== "ready")
           throw error(
             409,
             "This recovery copy is incomplete and cannot be restored automatically.",
           );
         await walk(payload);
-        const destination = await serverPath(metadata.originalPath);
-        if (await lstat(destination))
+        const destinationPath = originalPathFor(metadata);
+        const destination = await destinationPath(metadata.originalPath);
+        const existing = await lstat(destination);
+        // A backup's archive and its history are committed separately. If the
+        // panel stopped between them, retry only our verified identical copy.
+        const resume =
+          metadata.kind === "backup" &&
+          metadata.phase === "restoring" &&
+          existing?.isFile() &&
+          !existing.isSymbolicLink() &&
+          existing.size === (await io.lstat(payload)).size &&
+          (await hashFile(destination)) === (await hashFile(payload));
+        if (existing && !resume)
           throw error(
             409,
             `“${metadata.originalPath}” already exists. Delete or move the existing file first.`,
           );
         const parent = path.posix.dirname(metadata.originalPath);
-        if (parent !== ".") {
-          const parentPath = await serverPath(parent);
+        if (parent !== "." && metadata.kind !== "backup") {
+          const parentPath = await destinationPath(parent);
           await io.mkdir(parentPath, { recursive: true });
-          await serverPath(parent);
+          await destinationPath(parent);
         }
         metadata.phase = "restoring";
         await persist(entryDir, metadata);
-        await copyVerified(payload, (relative) =>
-          serverPath(
-            [metadata.originalPath, relative].filter(Boolean).join("/"),
-          ),
-        );
+        if (!resume)
+          await copyVerified(payload, (relative) =>
+            destinationPath(
+              [metadata.originalPath, relative].filter(Boolean).join("/"),
+            ),
+          );
+        if (metadata.kind === "backup")
+          await commitBackup({ ...metadata.backup });
         metadata.phase = "restored";
         await persist(entryDir, metadata);
         // Restore cleanup removes its archived payload only after the destination
@@ -620,6 +717,9 @@ export async function createRecycleBin({
               id,
               originalPath: metadata?.originalPath ?? null,
               type: metadata?.type ?? null,
+              ...(metadata?.kind === "backup"
+                ? { kind: "backup", backup: { ...metadata.backup } }
+                : {}),
             }
           : id;
       });

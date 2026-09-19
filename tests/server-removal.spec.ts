@@ -1,4 +1,9 @@
 import {
+  selectServer,
+  serverButton,
+  createProcessServer,
+} from "./server-fixtures";
+import {
   test as base,
   expect,
   type APIRequestContext,
@@ -7,25 +12,26 @@ import {
 import { readFile } from "node:fs/promises";
 import path from "node:path";
 
-type FixtureServer = { id: string; name: string; mode: "live" | "demo" };
-type Factory = (mode: "live" | "demo", name: string) => Promise<FixtureServer>;
+type FixtureServer = { id: string; name: string; mode: "live" };
+type Factory = (running: boolean, name: string) => Promise<FixtureServer>;
 const test = base.extend<{ createServer: Factory }>({
   createServer: async ({ request }, use) => {
     const created: string[] = [];
     try {
-      await use(async (mode, name) => {
+      await use(async (running, name) => {
         const fleet = await (await request.get("/api/servers")).json();
         const occupied = new Set(
           fleet.servers.map((server: { port: number }) => server.port),
         );
         let port = 29500;
         while (occupied.has(port)) port++;
-        const response = await request.post("/api/servers", {
-          data: { name, mode, port, memoryLimitMB: 1024 },
+        const response = await createProcessServer(request, {
+          data: { name, port, memoryLimitMB: 1024 },
         });
         expect(response.status()).toBe(201);
         const { server } = await response.json();
         created.push(server.id);
+        if (!running) await stop(request, server.id);
         return server;
       });
     } finally {
@@ -62,9 +68,7 @@ async function stop(request: APIRequestContext, id: string) {
 }
 async function openSettings(page: Page, server: FixtureServer) {
   await page.goto("/#console");
-  await page
-    .getByRole("combobox", { name: "Switch server", exact: true })
-    .selectOption(server.id);
+  await selectServer(page, server.id);
   await page
     .getByRole("button", { name: "Server settings", exact: true })
     .click();
@@ -76,7 +80,7 @@ test("removing an offline live server confirms preserved files, handles errors a
   request,
   createServer,
 }, testInfo) => {
-  const server = await createServer("live", "World to remove from panel");
+  const server = await createServer(false, "World to remove from panel");
   const original = "Keep this Minecraft world on disk.\n";
   expect(
     (
@@ -114,9 +118,10 @@ test("removing an offline live server confirms preserved files, handles errors a
     .getByRole("button", { name: "Cancel removal", exact: true })
     .click();
   expect(requests).toBe(0);
-  await expect(
-    page.getByRole("combobox", { name: "Switch server", exact: true }),
-  ).toHaveValue(server.id);
+  await expect(serverButton(page, server.id)).toHaveAttribute(
+    "aria-pressed",
+    "true",
+  );
   await dialog
     .getByRole("button", { name: "Remove server", exact: true })
     .click();
@@ -141,16 +146,9 @@ test("removing an offline live server confirms preserved files, handles errors a
     .getByRole("button", { name: "Remove server", exact: true })
     .click();
   await expect(dialog).not.toBeVisible();
-  await expect(
-    page.getByRole("combobox", { name: "Switch server", exact: true }),
-  ).not.toHaveValue(server.id);
-  await expect(
-    page.getByRole("option", { name: server.name, exact: true }),
-  ).toHaveCount(0);
+  await expect(serverButton(page, server.id)).toHaveCount(0);
   await page.reload();
-  await expect(
-    page.getByRole("option", { name: server.name, exact: true }),
-  ).toHaveCount(0);
+  await expect(serverButton(page, server.id)).toHaveCount(0);
   expect(requests).toBe(2);
   expect(
     (
@@ -175,7 +173,7 @@ test("running servers cannot be removed and removing the final stopped server re
   request,
   createServer,
 }, testInfo) => {
-  const server = await createServer("demo", "Last visible server fixture");
+  const server = await createServer(true, "Last visible server fixture");
   // Present this test's registration as the entire fleet; the shared E2E default
   // and registrations used by other tests remain untouched on the server.
   await page.route("**/api/servers", async (route) => {
@@ -238,9 +236,7 @@ test("running servers cannot be removed and removing the final stopped server re
   await expect(
     page.getByRole("heading", { name: "Welcome to MC Panel", exact: true }),
   ).toBeVisible();
-  await expect(
-    page.getByRole("combobox", { name: "Switch server", exact: true }),
-  ).toHaveCount(0);
+  await expect(page.locator("button[data-server-id]")).toHaveCount(0);
   await page.reload();
   await expect(
     page.getByRole("heading", { name: "Welcome to MC Panel", exact: true }),

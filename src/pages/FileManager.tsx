@@ -50,6 +50,7 @@ type RecycledItem = {
   id: string;
   name: string;
   originalPath: string;
+  kind?: "backup";
   type: "file" | "directory";
   size: number;
   deletedAt: string;
@@ -84,10 +85,19 @@ function EntryIcon({ entry }: { entry: Entry }) {
   return editable(entry.name) ? <FileText size={18} /> : <FileIcon size={18} />;
 }
 
-export default function FileManager({ notify }: PageProps) {
+export default function FileManager({
+  notify,
+  path,
+  onPathChange: setPath,
+  showingBin,
+  onBinChange: setShowingBin,
+}: PageProps & {
+  path: string;
+  onPathChange: (path: string) => void;
+  showingBin: boolean;
+  onBinChange: (showing: boolean) => void;
+}) {
   const { api, post, downloadUrl } = useServerApi();
-  const [path, setPath] = useState("");
-  const [showingBin, setShowingBin] = useState(false);
   const [entries, setEntries] = useState<Entry[]>([]);
   const [query, setQuery] = useState("");
   const debouncedQuery = useDebouncedValue(query);
@@ -1077,8 +1087,10 @@ function RecycleBin({ notify, onBack }: PageProps & { onBack: () => void }) {
 
   async function checkRestore(targets: RecycledItem[]) {
     const warnings: string[] = [];
-    for (const item of targets.filter((value) =>
-      /^mods\/[^/]+\.jar$/i.test(value.originalPath),
+    for (const item of targets.filter(
+      (value) =>
+        value.kind !== "backup" &&
+        /^mods\/[^/]+\.jar$/i.test(value.originalPath),
     )) {
       try {
         const result = await api<{
@@ -1121,7 +1133,11 @@ function RecycleBin({ notify, onBack }: PageProps & { onBack: () => void }) {
       setSelected(
         (previous) => new Set([...previous].filter((id) => id !== item.id)),
       );
-      notify(`${item.name} restored to /${item.originalPath}.`);
+      notify(
+        item.kind === "backup"
+          ? `${item.name} restored to Backups.`
+          : `${item.name} restored to /${item.originalPath}.`,
+      );
       searchInput.current?.focus();
     } catch (failure) {
       setRestoreErrors((previous) => ({
@@ -1193,7 +1209,12 @@ function RecycleBin({ notify, onBack }: PageProps & { onBack: () => void }) {
         failures.forEach(({ item }) => remaining.add(item.id));
         return remaining;
       });
-      const summary = `${successes.size} ${successes.size === 1 ? "item" : "items"} ${action.type === "restore" ? "restored" : "permanently deleted"}.${failures.length ? ` ${failures.length} ${failures.length === 1 ? "item failed and remains" : "items failed and remain"} selected.` : ""}`;
+      const restoredBackups =
+        action.type === "restore" &&
+        action.targets.some(
+          (item) => item.kind === "backup" && successes.has(item.id),
+        );
+      const summary = `${successes.size} ${successes.size === 1 ? "item" : "items"} ${action.type === "restore" ? "restored" : "permanently deleted"}.${restoredBackups ? " Restored archives are available in Backups." : ""}${failures.length ? ` ${failures.length} ${failures.length === 1 ? "item failed and remains" : "items failed and remain"} selected.` : ""}`;
       notify(summary, failures.length > 0);
       if (failures.length) {
         setAction({
@@ -1214,7 +1235,7 @@ function RecycleBin({ notify, onBack }: PageProps & { onBack: () => void }) {
   }
 
   const visible = items.filter((item) =>
-    `${item.name} ${item.originalPath}`
+    `${item.name} ${item.originalPath} ${item.kind === "backup" ? "backup archive" : ""}`
       .toLowerCase()
       .includes(debouncedQuery.toLowerCase()),
   );
@@ -1238,7 +1259,10 @@ function RecycleBin({ notify, onBack }: PageProps & { onBack: () => void }) {
       <div className="page-heading">
         <div>
           <h1>Recycle Bin</h1>
-          <p>Restore deleted files or permanently remove recovery data.</p>
+          <p>
+            Restore deleted files and backup archives, or permanently remove
+            recovery data.
+          </p>
         </div>
         <button className="btn" onClick={onBack}>
           <Folder size={16} /> Back to files
@@ -1246,7 +1270,7 @@ function RecycleBin({ notify, onBack }: PageProps & { onBack: () => void }) {
       </div>
       <section
         className="panel files-panel"
-        aria-label="Recycled server files"
+        aria-label="Recycled server files and backups"
         onDragOver={(event) => event.preventDefault()}
         onDrop={(event) => event.preventDefault()}
       >
@@ -1278,9 +1302,10 @@ function RecycleBin({ notify, onBack }: PageProps & { onBack: () => void }) {
           <LockKeyhole size={18} />
           <p>
             Recycle Bin is protected and stored outside your server files.
-            Restore returns each item to its original path, including all folder
-            contents. Existing files are never overwritten. Incomplete items can
-            be permanently deleted, but cannot be restored.
+            Restore returns files and folders to their original paths and backup
+            archives to Backups. Restoring an archive does not change your
+            server files. Existing files are never overwritten. Incomplete items
+            can be permanently deleted, but cannot be restored.
           </p>
         </div>
         <div className="files-filter">
@@ -1346,7 +1371,7 @@ function RecycleBin({ notify, onBack }: PageProps & { onBack: () => void }) {
               title={
                 selectedItems.some((item) => item.status !== "ready")
                   ? "Incomplete items cannot be restored. Deselect them to restore other items."
-                  : "Restore selected items to their original paths"
+                  : "Restore files to their original paths and archives to Backups"
               }
               onClick={() => openAction("restore", selectedItems)}
             >
@@ -1383,7 +1408,7 @@ function RecycleBin({ notify, onBack }: PageProps & { onBack: () => void }) {
             message={
               query
                 ? "Try a different name or original path."
-                : "Deleted files and folders appear here so you can restore them."
+                : "Deleted files, folders, and backup archives appear here so you can restore them."
             }
           />
         ) : (
@@ -1392,7 +1417,11 @@ function RecycleBin({ notify, onBack }: PageProps & { onBack: () => void }) {
               <li
                 key={item.id}
                 className="recycle-bin-item"
-                aria-label={`Recycled ${item.originalPath}`}
+                aria-label={
+                  item.kind === "backup"
+                    ? `Recycled backup ${item.name}`
+                    : `Recycled ${item.originalPath}`
+                }
               >
                 <input
                   className="file-selection-checkbox recycle-item-checkbox"
@@ -1410,7 +1439,9 @@ function RecycleBin({ notify, onBack }: PageProps & { onBack: () => void }) {
                   }
                 />
                 <div className="recycle-bin-item-icon">
-                  {item.type === "directory" ? (
+                  {item.kind === "backup" ? (
+                    <FileArchive size={22} />
+                  ) : item.type === "directory" ? (
                     <Folder size={22} />
                   ) : (
                     <FileIcon size={22} />
@@ -1419,16 +1450,22 @@ function RecycleBin({ notify, onBack }: PageProps & { onBack: () => void }) {
                 <div className="recycle-bin-item-details">
                   <h2>{item.name}</h2>
                   <p className="recycle-bin-original-path">
-                    <span>Original path</span>{" "}
-                    {item.originalPath
-                      ? `/${item.originalPath}`
-                      : "Unavailable"}
+                    <span>
+                      {item.kind === "backup" ? "Restore to" : "Original path"}
+                    </span>{" "}
+                    {item.kind === "backup"
+                      ? "Backups"
+                      : item.originalPath
+                        ? `/${item.originalPath}`
+                        : "Unavailable"}
                   </p>
                   <p className="recycle-bin-item-meta">
                     <span>
-                      {item.type === "directory"
-                        ? "Folder · includes all contents"
-                        : "File"}
+                      {item.kind === "backup"
+                        ? "Backup archive"
+                        : item.type === "directory"
+                          ? "Folder · includes all contents"
+                          : "File"}
                     </span>
                     <span>{formatBytes(item.size)}</span>
                     <time
@@ -1504,7 +1541,9 @@ function RecycleBin({ notify, onBack }: PageProps & { onBack: () => void }) {
                 <p>
                   {action.type === "delete"
                     ? "This permanently removes the recovery data listed below. It cannot be undone."
-                    : "Restore these items to their original server paths. Existing files will not be overwritten."}
+                    : action.targets.some((item) => item.kind === "backup")
+                      ? "Restore backup archives to Backups and files to their original server paths. Restoring archives does not change your server files. Existing files will not be overwritten."
+                      : "Restore these items to their original server paths. Existing files will not be overwritten."}
                 </p>
               </div>
               <button
@@ -1523,7 +1562,9 @@ function RecycleBin({ notify, onBack }: PageProps & { onBack: () => void }) {
             >
               {action.targets.map((item) => (
                 <li key={item.id}>
-                  {item.type === "directory" ? (
+                  {item.kind === "backup" ? (
+                    <FileArchive size={18} />
+                  ) : item.type === "directory" ? (
                     <Folder size={18} />
                   ) : (
                     <FileIcon size={18} />
@@ -1531,14 +1572,18 @@ function RecycleBin({ notify, onBack }: PageProps & { onBack: () => void }) {
                   <div>
                     <strong>{item.name}</strong>
                     <span>
-                      {item.originalPath
-                        ? `/${item.originalPath}`
-                        : "Original path unavailable"}
+                      {item.kind === "backup"
+                        ? "Backups"
+                        : item.originalPath
+                          ? `/${item.originalPath}`
+                          : "Original path unavailable"}
                     </span>
                     <small>
-                      {item.type === "directory"
-                        ? "Folder · all remaining contents"
-                        : "File"}{" "}
+                      {item.kind === "backup"
+                        ? "Backup archive"
+                        : item.type === "directory"
+                          ? "Folder · all remaining contents"
+                          : "File"}{" "}
                       · {formatBytes(item.size)}
                     </small>
                     <small>

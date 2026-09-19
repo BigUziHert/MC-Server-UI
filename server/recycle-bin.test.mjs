@@ -1028,7 +1028,7 @@ test("fleet recycle data belongs only to its server", async (t) => {
       "/api/servers",
       json("POST", {
         name: "Second",
-        mode: "demo",
+        mode: "live",
         port: 25566,
         memoryLimitMB: 2048,
       }),

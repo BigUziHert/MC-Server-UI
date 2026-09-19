@@ -6,9 +6,40 @@ import os from "node:os";
 import { EventEmitter } from "node:events";
 import { PassThrough, Writable } from "node:stream";
 import { createFleet, createPanel } from "./index.mjs";
+import { processStartup } from "../tests/fixtures/process-options.mjs";
 
 const json = (method, body) => ({ method, body: JSON.stringify(body) });
+async function waitFor(check, message = "Fixture transition did not complete") {
+  for (let attempt = 0; attempt < 100; attempt++) {
+    if (await check()) return;
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  assert.fail(message);
+}
+async function startAndWait(panel, id) {
+  const configured = await panel.request(
+    `/api/servers/${id}`,
+    json("PATCH", processStartup),
+  );
+  assert.equal(configured.status, 200, JSON.stringify(configured.body));
+  await fs.writeFile(
+    path.join(panel.runtimes.get(id).serverDir, "eula.txt"),
+    "eula=true\n",
+  );
+  const started = await panel.request(
+    "/api/server/power",
+    json("POST", { action: "start" }),
+    id,
+  );
+  assert.equal(started.status, 200, JSON.stringify(started.body));
+  await waitFor(
+    async () =>
+      (await panel.request("/api/server", {}, id)).body.status === "running",
+  );
+}
 async function stopAndWait(panel, id) {
+  if ((await panel.request("/api/server", {}, id)).body.status === "offline")
+    return;
   const response = await panel.request(
     "/api/server/power",
     json("POST", { action: "stop" }),
@@ -29,6 +60,7 @@ async function fixture(t, settings = {}) {
   const boot = async (extra = {}) => {
     const fleet = await createFleet({
       dataDir,
+      createDefaultServer: true,
       scheduler: false,
       useEnvironment: false,
       publicAddress: { resolve: async () => null },
@@ -92,15 +124,57 @@ test("browser desktop-selection capability is independent of an empty fleet and 
   );
 });
 
+test("server registration accepts only live runtimes and leaves new servers stopped", async (t) => {
+  const { boot } = await fixture(t, { createDefaultServer: false });
+  const panel = await boot();
+  const rejected = await panel.request(
+    "/api/servers",
+    json("POST", { name: "Unsupported", mode: "demo" }),
+  );
+  assert.equal(rejected.status, 400);
+  assert.deepEqual((await panel.request("/api/servers")).body.servers, []);
+  const created = await panel.request(
+    "/api/servers",
+    json("POST", { name: "Configured server" }),
+  );
+  assert.equal(created.status, 201);
+  assert.equal(created.body.server.mode, "live");
+  assert.equal(created.body.server.status, "offline");
+  const id = created.body.server.id;
+  assert.equal(
+    (await panel.request(`/api/servers/${id}`, json("PATCH", { mode: "demo" })))
+      .status,
+    400,
+  );
+  assert.equal((await panel.request("/api/server", {}, id)).body.mode, "live");
+  assert.deepEqual(
+    (await panel.request("/api/server", {}, id)).body.players,
+    [],
+  );
+  const files = await fs.readdir(panel.runtimes.get(id).serverDir);
+  assert.deepEqual(files.sort(), ["eula.txt", "server.properties"]);
+  assert.equal(
+    (
+      await panel.request(
+        "/api/console/command",
+        json("POST", { command: "list" }),
+        id,
+      )
+    ).status,
+    409,
+  );
+});
+
 test("fleet scopes files, console, backups, schedules, users, databases and player permissions", async (t) => {
   const { boot } = await fixture(t);
-  const { request, base, tick } = await boot();
+  const panel = await boot();
+  const { request, base, tick } = panel;
   const first = (await request("/api/servers")).body.defaultServerId;
   const created = await request(
     "/api/servers",
     json("POST", {
       name: "Creative",
-      mode: "demo",
+      mode: "live",
       port: 25566,
       memoryLimitMB: 2048,
     }),
@@ -142,10 +216,17 @@ test("fleet scopes files, console, backups, schedules, users, databases and play
     ).status,
     404,
   );
-  await request(
+  await startAndWait(panel, first);
+  const said = await request(
     "/api/console/command",
     json("POST", { command: "say isolated first server" }),
     first,
+  );
+  assert.equal(said.status, 200);
+  await waitFor(async () =>
+    (await request("/api/console", {}, first)).body.lines.some((line) =>
+      line.message.includes("isolated first server"),
+    ),
   );
   assert.ok(
     !(await request("/api/console", {}, second)).body.lines.some((line) =>
@@ -218,15 +299,17 @@ test("fleet scopes files, console, backups, schedules, users, databases and play
     (await request("/api/databases", {}, second)).body.databases,
     [],
   );
-  assert.equal(
-    (
-      await request(
-        "/api/players/op",
-        json("POST", { name: "BuilderOne" }),
-        first,
-      )
-    ).body.simulated,
-    true,
+  const operated = await request(
+    "/api/players/op",
+    json("POST", { name: "BuilderOne" }),
+    first,
+  );
+  assert.equal(operated.status, 200);
+  assert.match(operated.body.message, /Requested op BuilderOne/);
+  await waitFor(async () =>
+    (await request("/api/players", {}, first)).body.operators.some(
+      (entry) => entry.name === "BuilderOne",
+    ),
   );
   assert.equal(
     (await request("/api/players", {}, first)).body.operators[0].name,
@@ -237,8 +320,11 @@ test("fleet scopes files, console, backups, schedules, users, databases and play
     [],
   );
   assert.equal(
-    (await request("/api/files/content?path=ops.json", {}, first)).body.content,
-    "[]\n",
+    JSON.parse(
+      (await request("/api/files/content?path=ops.json", {}, first)).body
+        .content,
+    )[0].name,
+    "BuilderOne",
   );
   assert.ok(
     !(await request("/api/audit", {}, second)).body.entries.some(
@@ -280,7 +366,7 @@ test("unknown and conflicting selectors fail closed, including direct downloads"
   );
 });
 
-test("legacy data stays in place, rename and simulated operators persist across restarts", async (t) => {
+test("legacy data stays in place, rename and saved operators persist across restarts", async (t) => {
   const { dataDir, boot } = await fixture(t);
   const legacy = await createPanel({
     dataDir,
@@ -304,15 +390,20 @@ test("legacy data stays in place, rename and simulated operators persist across 
     ).status,
     200,
   );
-  await panel.request(
-    "/api/players/op",
-    json("POST", { name: "BuilderOne" }),
-    id,
+  await fs.writeFile(
+    path.join(panel.runtimes.get(id).serverDir, "ops.json"),
+    JSON.stringify([
+      {
+        name: "BuilderOne",
+        uuid: "12345678-1234-1234-1234-123456789abc",
+        level: 4,
+      },
+    ]),
   );
   const second = (
     await panel.request(
       "/api/servers",
-      json("POST", { name: "Second", mode: "demo", port: 25566 }),
+      json("POST", { name: "Second", mode: "live", port: 25566 }),
     )
   ).body.server;
   await panel.close();
@@ -345,7 +436,8 @@ test("legacy data stays in place, rename and simulated operators persist across 
 
 test("concurrent creation reserves unique ports; config edits need a stopped server", async (t) => {
   const { boot, dataDir } = await fixture(t);
-  const { request } = await boot();
+  const panel = await boot();
+  const { request } = panel;
   const results = await Promise.all(
     ["One", "Two"].map((name) =>
       request(
@@ -385,6 +477,7 @@ test("concurrent creation reserves unique ports; config edits need a stopped ser
     /eula=false/,
   );
   const id = (await request("/api/servers")).body.defaultServerId;
+  await startAndWait(panel, id);
   assert.equal(
     (
       await request(
@@ -527,7 +620,7 @@ test("live player actions send validated single commands; ops.json remains autho
     json("POST", { name: "BuilderOne" }),
     live.id,
   );
-  assert.equal(opped.body.simulated, false);
+  assert.equal(opped.status, 200);
   assert.match(opped.body.message, /Requested op BuilderOne/);
   assert.deepEqual(
     (await request("/api/players", {}, live.id)).body.operators,
@@ -632,7 +725,7 @@ test("a failed registry write rolls server.properties back and leaves active set
   );
 });
 
-test("removing the last demo preserves its files and backups and leaves an empty registry after restart", async (t) => {
+test("removing the last server preserves its files and backups and leaves an empty registry after restart", async (t) => {
   const { boot, dataDir } = await fixture(t);
   const first = await boot();
   const id = (await first.request("/api/servers")).body.defaultServerId;
@@ -641,13 +734,14 @@ test("removing the last demo preserves its files and backups and leaves an empty
     json("POST", {
       name: "kept.txt",
       type: "file",
-      content: "do not delete this demo's files",
+      content: "do not delete this server's files",
     }),
   );
   const backup = await first.request(
     "/api/backups",
     json("POST", { name: "Retained backup" }),
   );
+  await startAndWait(first, id);
   assert.equal(
     (await first.request(`/api/servers/${id}`, { method: "DELETE" })).status,
     409,
@@ -666,7 +760,7 @@ test("removing the last demo preserves its files and backups and leaves an empty
   assert.equal(first.runtimes.size, 0);
   assert.equal(
     await fs.readFile(path.join(dataDir, "server", "kept.txt"), "utf8"),
-    "do not delete this demo's files",
+    "do not delete this server's files",
   );
   assert.ok(
     (await fs.stat(path.join(dataDir, "backups", `${backup.body.id}.tar.gz`)))

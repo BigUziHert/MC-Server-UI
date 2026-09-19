@@ -1,5 +1,10 @@
+import {
+  selectServer,
+  createProcessServer,
+  serverButton,
+  removeTestServer,
+} from "./server-fixtures";
 import { test as base, expect } from "@playwright/test";
-import { removeTestServer } from "./server-fixtures";
 
 const test = base.extend<{ serverId: string }>({
   serverId: async ({ request }, use) => {
@@ -9,8 +14,8 @@ const test = base.extend<{ serverId: string }>({
       fleet.servers.some((server: { port: number }) => server.port === port)
     )
       port++;
-    const created = await request.post("/api/servers", {
-      data: { name: "Navigation fixture", mode: "demo", port },
+    const created = await createProcessServer(request, {
+      data: { name: "Navigation fixture", mode: "live", port },
     });
     expect(created.status()).toBe(201);
     const { server } = await created.json();
@@ -67,24 +72,29 @@ test("desktop selection is restored before scoped requests and persists subseque
   ).toBeVisible();
   expect(scopedIds).toEqual([]);
   releaseSelection!();
-  const switcher = page.getByRole("combobox", {
-    name: "Switch server",
-    exact: true,
-  });
-  await expect(switcher).toHaveValue(other.id);
+  await expect(serverButton(page, other.id)).toHaveAttribute(
+    "aria-pressed",
+    "true",
+  );
   await expect.poll(() => scopedIds.length).toBeGreaterThan(0);
   expect(scopedIds.every((id) => id === other.id)).toBe(true);
   expect(writes).toEqual([]);
-  await switcher.selectOption(serverId);
+  await selectServer(page, serverId);
   await expect.poll(() => savedId).toBe(serverId);
   await page.reload();
-  await expect(switcher).toHaveValue(serverId);
+  await expect(serverButton(page, serverId)).toHaveAttribute(
+    "aria-pressed",
+    "true",
+  );
   expect(writes).toEqual([serverId]);
   // A stale desktop preference must not mount or scope requests to a removed ID.
   savedId = "00000000-0000-0000-0000-000000000000";
   scopedIds.length = 0;
   await page.reload();
-  await expect(switcher).toHaveValue(fleet.defaultServerId);
+  await expect(serverButton(page, fleet.defaultServerId)).toHaveAttribute(
+    "aria-pressed",
+    "true",
+  );
   await expect.poll(() => savedId).toBe(fleet.defaultServerId);
   expect(scopedIds).not.toContain("00000000-0000-0000-0000-000000000000");
 });
@@ -99,12 +109,11 @@ test("browser server selection survives reload and all new workspace requests ke
     (server: { id: string }) => server.id !== serverId,
   );
   await page.goto("/#console");
-  const switcher = page.getByRole("combobox", {
-    name: "Switch server",
-    exact: true,
-  });
-  await expect(switcher).toHaveValue(serverId);
-  await switcher.selectOption(other.id);
+  await expect(serverButton(page, serverId)).toHaveAttribute(
+    "aria-pressed",
+    "true",
+  );
+  await selectServer(page, other.id);
   await expect
     .poll(() =>
       page.evaluate(() => localStorage.getItem("mc-panel.active-server")),
@@ -116,7 +125,10 @@ test("browser server selection survives reload and all new workspace requests ke
       scopedIds.push(request.headers()["x-server-id"]);
   });
   await page.reload();
-  await expect(switcher).toHaveValue(other.id);
+  await expect(serverButton(page, other.id)).toHaveAttribute(
+    "aria-pressed",
+    "true",
+  );
   await expect.poll(() => scopedIds.length).toBeGreaterThan(0);
   expect(scopedIds.every((id) => id === other.id)).toBe(true);
 });
@@ -150,9 +162,10 @@ test("a failed desktop selection read waits for retry without opening the defaul
   await page
     .getByRole("button", { name: "Retry connection", exact: true })
     .click();
-  await expect(
-    page.getByRole("combobox", { name: "Switch server", exact: true }),
-  ).toHaveValue(serverId);
+  await expect(serverButton(page, serverId)).toHaveAttribute(
+    "aria-pressed",
+    "true",
+  );
 });
 
 test("native selection flush retries once after failure and drains choices queued while waiting", async ({
@@ -187,12 +200,11 @@ test("native selection flush retries once after failure and drains choices queue
     await route.fulfill({ json: { desktop: true, activeServerId: savedId } });
   });
   await page.goto("/");
-  const switcher = page.getByRole("combobox", {
-    name: "Switch server",
-    exact: true,
-  });
-  await expect(switcher).toHaveValue(other.id);
-  await switcher.selectOption(serverId);
+  await expect(serverButton(page, other.id)).toHaveAttribute(
+    "aria-pressed",
+    "true",
+  );
+  await selectServer(page, serverId);
   await expect(
     page.getByRole("status").filter({ hasText: "choice could not be saved" }),
   ).toBeVisible();
@@ -211,7 +223,7 @@ test("native selection flush retries once after failure and drains choices queue
   expect(attempts).toEqual([serverId, serverId, serverId]);
   expect(savedId).toBe(serverId);
   gated = true;
-  await switcher.selectOption(other.id);
+  await selectServer(page, other.id);
   await expect.poll(() => releases.length).toBe(1);
   let flushed = false;
   const flush = page
@@ -219,7 +231,7 @@ test("native selection flush retries once after failure and drains choices queue
     .then(() => {
       flushed = true;
     });
-  await switcher.selectOption(serverId);
+  await selectServer(page, serverId);
   releases[0]();
   await expect.poll(() => releases.length).toBe(2);
   expect(flushed).toBe(false);
@@ -233,13 +245,20 @@ test("navigation groups collapse independently, persist, and reopen for a newly 
 }) => {
   await page.goto("/#console");
   const nav = page.getByRole("navigation", { name: "Main navigation" });
-  const server = nav.getByRole("button", { name: "SERVER", exact: true });
+  const server = nav.getByRole("button", {
+    name: "SERVER",
+    exact: true,
+  });
   const minecraft = nav.getByRole("button", { name: "MINECRAFT", exact: true });
   const management = nav.getByRole("button", {
     name: "MANAGEMENT",
     exact: true,
   });
-  for (const heading of [server, minecraft, management]) {
+  const servers = nav.getByRole("button", {
+    name: "SERVER SELECTOR",
+    exact: true,
+  });
+  for (const heading of [server, minecraft, management, servers]) {
     await expect(heading).toHaveAttribute("aria-expanded", "true");
     const controlled = await heading.getAttribute("aria-controls");
     await expect(page.locator(`#${controlled}`)).toBeVisible();
@@ -285,6 +304,92 @@ test("navigation groups collapse independently, persist, and reopen for a newly 
     page.getByRole("heading", { name: "Console", exact: true }),
   ).toBeVisible();
 });
+
+for (const width of [1348, 390]) {
+  test(`Servers navigation preserves collapse state and opens Add server at ${width}px`, async ({
+    page,
+    serverId,
+  }) => {
+    await page.setViewportSize({ width, height: 667 });
+    await page.goto("/#properties");
+    const openSidebar = async () => {
+      if (width < 768)
+        await page
+          .getByRole("button", { name: "Open navigation", exact: true })
+          .click();
+    };
+    await openSidebar();
+    const nav = page.getByRole("navigation", { name: "Main navigation" });
+    const servers = nav.getByRole("button", {
+      name: "SERVER SELECTOR",
+      exact: true,
+    });
+    const switcher = serverButton(page, serverId);
+    const add = nav.getByRole("button", { name: "Add server", exact: true });
+    const settings = nav.getByRole("button", {
+      name: "Server settings",
+      exact: true,
+    });
+    await expect(servers).toHaveAttribute("aria-expanded", "true");
+    await expect(serverButton(page, serverId)).toHaveAttribute(
+      "aria-pressed",
+      "true",
+    );
+    await servers.click();
+    await expect(servers).toHaveAttribute("aria-expanded", "false");
+    await expect(switcher).toBeHidden();
+    await expect(add).toBeHidden();
+    await expect(settings).toBeHidden();
+    await expect(
+      nav.getByRole("link", { name: "Properties", exact: true }),
+    ).toBeVisible();
+    await page.reload();
+    await openSidebar();
+    await expect(servers).toHaveAttribute("aria-expanded", "false");
+    await servers.focus();
+    await servers.press("Enter");
+    await expect(servers).toHaveAttribute("aria-expanded", "true");
+    await add.scrollIntoViewIfNeeded();
+    await expect(add).toBeInViewport();
+    await add.click();
+    const dialog = page.getByRole("dialog", {
+      name: "Add a server",
+      exact: true,
+    });
+    await expect(dialog).toBeVisible();
+    await expect(
+      dialog.getByRole("button", { name: "Create a new server", exact: true }),
+    ).toBeVisible();
+    await expect(
+      dialog.getByRole("button", {
+        name: "Import an existing server",
+        exact: true,
+      }),
+    ).toBeVisible();
+    await dialog
+      .getByRole("button", { name: "Create a new server", exact: true })
+      .click();
+    const createDialog = page.getByRole("dialog", {
+      name: "What would you like to play?",
+      exact: true,
+    });
+    await expect(
+      createDialog.getByRole("button", {
+        name: "Server software",
+        exact: true,
+      }),
+    ).toBeVisible();
+    await expect(
+      createDialog.getByRole("button", { name: "Modpack", exact: true }),
+    ).toBeVisible();
+    await page.keyboard.press("Escape");
+    await expect(createDialog).toBeHidden();
+    await expect(page).toHaveURL(/#properties$/);
+    expect(
+      await page.evaluate(() => document.documentElement.scrollWidth),
+    ).toBeLessThanOrEqual(width);
+  });
+}
 
 test("Databases is absent and old bookmarks fall back to Console without database requests", async ({
   page,

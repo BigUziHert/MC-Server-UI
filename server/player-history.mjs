@@ -9,27 +9,24 @@ export const validPlayerUuid = (uuid) =>
   /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i.test(uuid);
 
 // Commands written to Java are requests, not proof that Minecraft accepted them.
-export function playerCommandAudit(
-  command,
-  { simulated = false, applied = simulated } = {},
-) {
+export function playerCommandAudit(command) {
   const normalized = command.trim().replace(/^\//, "");
   const [verb, argument] = normalized.replace(/^minecraft:/i, "").split(/\s+/);
   const labels = {
-    op: ["Player op requested", "Player opped"],
-    deop: ["Player deop requested", "Player deopped"],
-    ban: ["Player ban requested", "Player banned"],
-    pardon: ["Player unban requested", "Player unbanned"],
-    kick: ["Player kick requested", "Player kicked"],
-    "ban-ip": ["IP ban requested", "IP banned"],
-    "pardon-ip": ["IP unban requested", "IP unbanned"],
+    op: "Player op requested",
+    deop: "Player deop requested",
+    ban: "Player ban requested",
+    pardon: "Player unban requested",
+    kick: "Player kick requested",
+    "ban-ip": "IP ban requested",
+    "pardon-ip": "IP unban requested",
   };
   const whitelistLabels = {
-    add: ["Whitelist addition requested", "Player whitelisted"],
-    remove: ["Whitelist removal requested", "Player removed from whitelist"],
-    on: ["Whitelist enable requested", "Whitelist enabled"],
-    off: ["Whitelist disable requested", "Whitelist disabled"],
-    reload: ["Whitelist reload requested", "Whitelist reloaded"],
+    add: "Whitelist addition requested",
+    remove: "Whitelist removal requested",
+    on: "Whitelist enable requested",
+    off: "Whitelist disable requested",
+    reload: "Whitelist reload requested",
   };
   const label =
     verb === "whitelist"
@@ -37,8 +34,8 @@ export function playerCommandAudit(
       : Object.hasOwn(labels, verb) && labels[verb];
   if (!label) return null;
   return {
-    action: `${label[simulated && applied ? 1 : 0]}${simulated ? " (simulated)" : ""}`,
-    detail: `${simulated ? "Simulated" : "Sent to Minecraft"}: ${normalized}.`,
+    action: label,
+    detail: `Sent to Minecraft: ${normalized}.`,
   };
 }
 

@@ -1,11 +1,15 @@
 import {
+  createProcessServer,
+  selectServer,
+  removeTestServer,
+} from "./server-fixtures";
+import {
   test as base,
   expect,
   type APIRequestContext,
   type Page,
 } from "@playwright/test";
 import catalog from "../shared/subuser-permissions.json" with { type: "json" };
-import { removeTestServer } from "./server-fixtures";
 
 const permissionIds = catalog.groups.flatMap((group) =>
   group.permissions.map((permission) => permission.id),
@@ -19,10 +23,10 @@ const test = base.extend<{ server: Fixture }>({
     );
     let port = 29200;
     while (occupied.has(port)) port++;
-    const response = await request.post("/api/servers", {
+    const response = await createProcessServer(request, {
       data: {
         name: "Granular subusers fixture",
-        mode: "demo",
+        mode: "live",
         port,
         memoryLimitMB: 1024,
       },
@@ -39,9 +43,7 @@ const test = base.extend<{ server: Fixture }>({
 
 async function openSubusers(page: Page, id: string) {
   await page.goto("/#subusers");
-  await page
-    .getByRole("combobox", { name: "Switch server", exact: true })
-    .selectOption(id);
+  await selectServer(page, id);
   await expect(
     page.getByRole("heading", { name: "Subusers", exact: true }),
   ).toBeVisible();
@@ -278,9 +280,7 @@ test("permission groups and confirmation controls fit a mobile viewport", async 
   await page
     .getByRole("button", { name: "Open navigation", exact: true })
     .click();
-  await page
-    .getByRole("combobox", { name: "Switch server", exact: true })
-    .selectOption(server.id);
+  await selectServer(page, server.id);
   await page.getByRole("button", { name: "New user", exact: true }).click();
   const dialog = page.getByRole("dialog", {
     name: "Create new subuser",

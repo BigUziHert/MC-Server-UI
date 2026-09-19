@@ -157,9 +157,7 @@ export default function AuditLogs({
     <div className="management-page">
       <div className="page-heading management-heading">
         <div>
-          <p className="eyebrow">ACTIVITY & OVERSIGHT</p>
           <h1>Audit logs</h1>
-          <p>Every action has a story. Keep track of yours.</p>
         </div>
       </div>
 

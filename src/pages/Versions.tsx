@@ -40,7 +40,7 @@ type Current = {
   software: string;
   version: string;
   status: string;
-  mode: string;
+  mode: "live";
 };
 type RuntimeUpdate = {
   available: boolean;
@@ -412,9 +412,7 @@ export default function Versions({ notify }: PageProps) {
     <div className="management-page versions-page">
       <div className="page-heading">
         <div>
-          <p className="eyebrow">MINECRAFT</p>
           <h1>Versions</h1>
-          <p>Choose the software that runs your world.</p>
         </div>
       </div>
       {current && (

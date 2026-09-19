@@ -9,6 +9,7 @@ files:
   - server/index.mjs
   - server/audit.mjs
   - server/installed-minecraft.mjs
+  - server/minecraft-version.mjs
   - server/terminal-jobs.mjs
   - server/import.mjs
   - server/server-setup.mjs
