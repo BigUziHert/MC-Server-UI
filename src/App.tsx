@@ -1365,6 +1365,7 @@ function ConsolePage({
                   ? "Server stopping…"
                   : "Server offline"}
           </span>
+          <PowerButtons server={server} controls={controls} />
         </div>
       </section>
       <section className="metrics-grid" aria-label="Server resources">

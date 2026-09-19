@@ -96,14 +96,19 @@ async function assertSmokeProcessesStopped() {
 
 async function startSmokeServer(page, serverId) {
   await selectSmokeServer(page, serverId);
-  await page.getByRole("button", { name: "Start", exact: true }).click();
+  await page
+    .locator(".sidebar-power")
+    .getByRole("button", { name: "Start", exact: true })
+    .click();
   await ui
     .poll(
       async () => (await browserApi(page, "/server", { serverId })).data.status,
     )
     .toBe("running");
   await ui(
-    page.getByRole("button", { name: "Stop", exact: true }),
+    page
+      .locator(".sidebar-power")
+      .getByRole("button", { name: "Stop", exact: true }),
   ).toBeEnabled();
 }
 
@@ -452,7 +457,10 @@ async function createSmokeServer(page) {
           .length,
     )
     .toBe(1);
-  await page.getByRole("button", { name: "Restart", exact: true }).click();
+  await page
+    .locator(".server-power")
+    .getByRole("button", { name: "Restart", exact: true })
+    .click();
   await page
     .getByRole("dialog", { name: "Restart your server?", exact: true })
     .getByRole("button", { name: "Restart server", exact: true })

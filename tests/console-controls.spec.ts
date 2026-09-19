@@ -71,22 +71,46 @@ for (const width of [1348, 390]) {
       serverId,
     );
     await page.goto("/#console");
-    if (width < 768)
-      await page
-        .getByRole("button", { name: "Open navigation", exact: true })
-        .click();
-    await page.getByRole("button", { name: "Stop", exact: true }).click();
+    const consolePower = page.locator(".server-power");
+    const sidebarPower = page.locator(".sidebar-power");
+    await expect(consolePower.getByRole("button")).toHaveCount(3);
+    await expect(sidebarPower.getByRole("button")).toHaveCount(3);
+    for (const name of ["Start", "Restart", "Stop"])
+      await expect(
+        consolePower.getByRole("button", { name, exact: true }),
+      ).toBeVisible();
+    await consolePower
+      .getByRole("button", { name: "Stop", exact: true })
+      .click();
     await page
       .getByRole("dialog")
       .getByRole("button", { name: "Stop server", exact: true })
       .click();
-    const force = page.getByRole("button", { name: "Force Stop", exact: true });
+    const force = consolePower.getByRole("button", {
+      name: "Force Stop",
+      exact: true,
+    });
+    const sidebarForce = sidebarPower.getByRole("button", {
+      name: "Force Stop",
+      exact: true,
+    });
     await expect(force).toBeEnabled();
+    await expect(sidebarForce).toBeEnabled();
     await expect(
-      page.getByRole("button", { name: "Start", exact: true }),
+      page
+        .locator(".server-power")
+        .getByRole("button", { name: "Start", exact: true }),
     ).toBeDisabled();
     await expect(
-      page.getByRole("button", { name: "Restart", exact: true }),
+      page
+        .locator(".server-power")
+        .getByRole("button", { name: "Restart", exact: true }),
+    ).toBeDisabled();
+    await expect(
+      sidebarPower.getByRole("button", { name: "Start", exact: true }),
+    ).toBeDisabled();
+    await expect(
+      sidebarPower.getByRole("button", { name: "Restart", exact: true }),
     ).toBeDisabled();
     expect(actions).toEqual([{ action: "stop" }]);
     await force.click();
@@ -96,22 +120,43 @@ for (const width of [1348, 390]) {
     );
     await dialog.getByRole("button", { name: "Cancel", exact: true }).click();
     expect(actions).toEqual([{ action: "stop" }]);
-    await force.click();
+    if (width < 768)
+      await page
+        .getByRole("button", { name: "Open navigation", exact: true })
+        .click();
+    await sidebarForce.click();
     dialog = page.getByRole("dialog", { name: "Force stop your server?" });
+    await expect(page.getByRole("dialog")).toHaveCount(1);
     await dialog
       .getByRole("button", { name: "Force stop server", exact: true })
       .click();
     await expect(force).toBeDisabled();
+    await expect(sidebarForce).toBeDisabled();
     await expect
       .poll(() => actions)
       .toEqual([{ action: "stop" }, { action: "force-stop", confirmed: true }]);
     finishForce();
     await expect(
-      page.getByRole("button", { name: "Start", exact: true }),
+      page
+        .locator(".server-power")
+        .getByRole("button", { name: "Start", exact: true }),
     ).toBeEnabled();
     await expect(
-      page.getByRole("button", { name: "Stop", exact: true }),
+      page
+        .locator(".server-power")
+        .getByRole("button", { name: "Stop", exact: true }),
     ).toBeDisabled();
+    await expect(
+      sidebarPower.getByRole("button", { name: "Start", exact: true }),
+    ).toBeEnabled();
+    await expect(
+      sidebarPower.getByRole("button", { name: "Stop", exact: true }),
+    ).toBeDisabled();
+    if (width < 768)
+      await page.getByRole("link", { name: "Console", exact: true }).click();
+    await expect(
+      consolePower.getByRole("button", { name: "Start", exact: true }),
+    ).toBeVisible();
     expect(actions).toHaveLength(2);
     expect(
       await page.evaluate(() => document.documentElement.scrollWidth),
@@ -120,7 +165,7 @@ for (const width of [1348, 390]) {
 }
 
 for (const width of [1348, 390]) {
-  test(`sidebar power controls manage only the selected server from Properties at ${width}px`, async ({
+  test(`sidebar and Console power controls share the selected server at ${width}px`, async ({
     page,
     request,
     serverId,
@@ -184,7 +229,23 @@ for (const width of [1348, 390]) {
       await expect(stop).toBeDisabled();
       await start.click();
       await expect(stop).toBeEnabled();
-      await restart.click();
+      await page.getByRole("link", { name: "Console", exact: true }).click();
+      const consolePower = page.locator(".server-power");
+      const consoleStart = consolePower.getByRole("button", {
+        name: "Start",
+        exact: true,
+      });
+      const consoleRestart = consolePower.getByRole("button", {
+        name: "Restart",
+        exact: true,
+      });
+      const consoleStop = consolePower.getByRole("button", {
+        name: "Stop",
+        exact: true,
+      });
+      await expect(consoleStart).toBeDisabled();
+      await expect(consoleStop).toBeEnabled();
+      await consoleRestart.click();
       const restartDialog = page.getByRole("dialog", {
         name: "Restart your server?",
         exact: true,
@@ -193,17 +254,21 @@ for (const width of [1348, 390]) {
         .getByRole("button", { name: "Cancel", exact: true })
         .click();
       expect(actions).toEqual([{ id: target.id, action: "start" }]);
-      await restart.click();
+      await consoleRestart.click();
       await restartDialog
         .getByRole("button", { name: "Restart server", exact: true })
         .click();
       await expect(stop).toBeEnabled();
+      await expect(consoleStop).toBeEnabled();
+      await openSidebar();
       await stop.click();
       await page
         .getByRole("dialog", { name: "Stop your server?", exact: true })
         .getByRole("button", { name: "Stop server", exact: true })
         .click();
       await expect(start).toBeEnabled();
+      await expect(consoleStart).toBeEnabled();
+      await expect(consoleStop).toBeDisabled();
       expect(actions).toEqual([
         { id: target.id, action: "start" },
         { id: target.id, action: "restart" },
@@ -218,7 +283,7 @@ for (const width of [1348, 390]) {
           ).json()
         ).status,
       ).toBe("running");
-      await expect(page).toHaveURL(/#properties$/);
+      await expect(page).toHaveURL(/#console$/);
       if (width < 768) await expect(sidebar).toHaveClass(/is-open/);
       expect(
         await page.evaluate(() => document.documentElement.scrollWidth),
@@ -289,12 +354,17 @@ for (const stopSource of ["power", "console"] as const) {
       await command.fill("stop");
       await command.press("Enter");
     } else {
-      await page.getByRole("button", { name: "Stop", exact: true }).click();
+      await page
+        .locator(".server-power")
+        .getByRole("button", { name: "Stop", exact: true })
+        .click();
       await page
         .getByRole("button", { name: "Stop server", exact: true })
         .click();
     }
-    const force = page.getByRole("button", { name: "Force Stop", exact: true });
+    const force = page
+      .locator(".server-power")
+      .getByRole("button", { name: "Force Stop", exact: true });
     try {
       await expect(force).toBeEnabled();
       await force.click();
@@ -312,7 +382,9 @@ for (const stopSource of ["power", "console"] as const) {
         .getByRole("button", { name: "Force stop server", exact: true })
         .click();
       await expect(
-        page.getByRole("button", { name: "Start", exact: true }),
+        page
+          .locator(".server-power")
+          .getByRole("button", { name: "Start", exact: true }),
       ).toBeEnabled();
       const stopResponse = page.waitForResponse((response) =>
         response
@@ -332,7 +404,9 @@ for (const stopSource of ["power", "console"] as const) {
         page.getByText("Late command failure", { exact: true }),
       ).toHaveCount(0);
       await expect(
-        page.getByRole("button", { name: "Start", exact: true }),
+        page
+          .locator(".server-power")
+          .getByRole("button", { name: "Start", exact: true }),
       ).toBeEnabled();
       expect(forceAttempts).toBe(2);
     } finally {

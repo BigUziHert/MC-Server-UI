@@ -99,22 +99,32 @@ test("console loads subprocess logs, sends commands, and controls its lifecycle"
     ),
   ).toBe(true);
 
-  await page.getByRole("button", { name: "Stop", exact: true }).click();
+  await page
+    .locator(".server-power")
+    .getByRole("button", { name: "Stop", exact: true })
+    .click();
   await expect(
     page.getByRole("dialog", { name: "Stop your server?" }),
   ).toBeVisible();
   await page.getByRole("button", { name: "Stop server", exact: true }).click();
   await expect(
-    page.getByRole("button", { name: "Start", exact: true }),
+    page
+      .locator(".server-power")
+      .getByRole("button", { name: "Start", exact: true }),
   ).toBeEnabled();
   await expect(command).toBeDisabled();
   expect((await (await request.get("/api/server")).json()).status).toBe(
     "offline",
   );
 
-  await page.getByRole("button", { name: "Start", exact: true }).click();
+  await page
+    .locator(".server-power")
+    .getByRole("button", { name: "Start", exact: true })
+    .click();
   await expect(
-    page.getByRole("button", { name: "Stop", exact: true }),
+    page
+      .locator(".server-power")
+      .getByRole("button", { name: "Stop", exact: true }),
   ).toBeEnabled();
   await expect(command).toBeEnabled();
   await expect(logs).toContainText('Done (2.314s)! For help, type "help"');
@@ -1261,13 +1271,18 @@ test("Players grants and removes OP through the subprocess independently of pane
   ).toBeVisible();
 
   await openPage(page, "console", "Console");
-  await page.getByRole("button", { name: "Stop", exact: true }).click();
+  await page
+    .locator(".server-power")
+    .getByRole("button", { name: "Stop", exact: true })
+    .click();
   await page
     .getByRole("dialog", { name: "Stop your server?", exact: true })
     .getByRole("button", { name: "Stop server", exact: true })
     .click();
   await expect(
-    page.getByRole("button", { name: "Start", exact: true }),
+    page
+      .locator(".server-power")
+      .getByRole("button", { name: "Start", exact: true }),
   ).toBeEnabled();
   expect((await scopedGet(request, defaultServerId, "/server")).status).toBe(
     "running",
@@ -1278,9 +1293,14 @@ test("Players grants and removes OP through the subprocess independently of pane
   ).toBeVisible();
   await expect(grantButton).toBeDisabled();
   await page.getByRole("link", { name: "Go to Console", exact: false }).click();
-  await page.getByRole("button", { name: "Start", exact: true }).click();
+  await page
+    .locator(".server-power")
+    .getByRole("button", { name: "Start", exact: true })
+    .click();
   await expect(
-    page.getByRole("button", { name: "Stop", exact: true }),
+    page
+      .locator(".server-power")
+      .getByRole("button", { name: "Stop", exact: true }),
   ).toBeEnabled();
   await openPage(page, "players", "Players");
   await expect(grantButton).toBeEnabled();
@@ -1775,7 +1795,9 @@ test("an empty fleet shows only guided creation and refreshes after a server is 
     memoryLimitMB: 1024,
   });
   await expect(
-    page.getByRole("button", { name: "Start", exact: true }),
+    page
+      .locator(".server-power")
+      .getByRole("button", { name: "Start", exact: true }),
   ).toBeEnabled();
   await expect(page.locator(".online-players .player-row")).toHaveCount(0);
   await page.reload();
@@ -2059,7 +2081,9 @@ test("imports an existing external server in place without changing its files or
       page.getByRole("heading", { name: "E2E Imported World", exact: true }),
     ).toBeVisible();
     await expect(
-      page.getByRole("button", { name: "Start", exact: true }),
+      page
+        .locator(".server-power")
+        .getByRole("button", { name: "Start", exact: true }),
     ).toBeEnabled();
     expect((await scopedGet(request, server.id, "/server")).status).toBe(
       "offline",
