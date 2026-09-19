@@ -61,7 +61,7 @@ export function createModRemoval(ctx) {
       if (!before.isFile() || before.isSymbolicLink())
         throw error(
           409,
-          `${entry.name} is not a regular mod file. Review it in File Manager.`,
+          `${entry.name} is not a regular ${type} file. Review it in File Manager.`,
         );
       const sha512 = await ctx.fileHash(target);
       const row = {
@@ -84,7 +84,7 @@ export function createModRemoval(ctx) {
       if (ctx.fileStamp(before) !== ctx.fileStamp(await fs.lstat(target)))
         throw error(
           409,
-          "Installed mods changed while their dependencies were being checked. Review removal again.",
+          "Installed content changed while its dependencies were being checked. Review removal again.",
         );
       rows.push(row);
     }
@@ -119,13 +119,13 @@ export function createModRemoval(ctx) {
           input.path.includes("\\") ||
           !(type === "datapack" ? /\.zip$/i : /\.jar$/i).test(input.path)
         )
-          throw error(400, "Choose an installed mod to remove.");
+          throw error(400, `Choose an installed ${type} to remove.`);
         const rows = await inventory(current.loader, true, type, folder);
         const selected = rows.find((row) => row.path === input.path);
         if (!selected)
           throw error(
             404,
-            "This installed mod no longer exists. Refresh installed mods.",
+            `This installed ${type} no longer exists. Refresh installed ${type}s.`,
           );
         const provided = new Set(selected.provided ?? []);
         const dependents = rows
@@ -167,7 +167,7 @@ export function createModRemoval(ctx) {
     remove(input = {}) {
       return track(async () => {
         if (input.confirmed !== true)
-          throw error(400, "Review the mod removal and confirm it first.");
+          throw error(400, "Review the removal and confirm it first.");
         const planType = plans.get(input.planId)?.type ?? "mod";
         await available(planType);
         // Recheck after the async status read before claiming the operation.
@@ -181,7 +181,7 @@ export function createModRemoval(ctx) {
         if (!plan)
           throw error(
             409,
-            "This removal review expired. Review the mod again.",
+            "This removal review expired. Review the content again.",
           );
         busy = true;
         try {
@@ -199,24 +199,24 @@ export function createModRemoval(ctx) {
             )
               throw error(
                 409,
-                "Installed mods changed after this review. Review removal again.",
+                "Installed content changed after this review. Review removal again.",
               );
             plans.delete(input.planId);
             const recycled = await ctx.recycle(plan.path);
             try {
-              await ctx.onRemoved(plan.path);
+              await ctx.onRemoved(plan.path, plan.type);
             } catch (cause) {
               try {
                 await ctx.restore(recycled.id);
               } catch {
                 throw error(
                   409,
-                  "Removal could not finish. The original mod is preserved in Recycle Bin and needs restoring.",
+                  "Removal could not finish. The original file is preserved in Recycle Bin and needs restoring.",
                 );
               }
               throw error(
                 500,
-                "Removal could not be saved. The original mod was restored.",
+                "Removal could not be saved. The original file was restored.",
               );
             }
             return { ok: true, path: plan.path, recycled };

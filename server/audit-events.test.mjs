@@ -261,9 +261,10 @@ test("demo console requests stay truthful and closing a pending start never crea
   );
   const events = (await f.request("/api/audit")).body.entries;
   assert.ok(
-    events.some((entry) => entry.action === "Player op requested (demo)"),
+    events.some((entry) => entry.action === "Player op requested (simulated)"),
   );
   assert.ok(events.every((entry) => !entry.action.startsWith("Player opped")));
+  assert.deepEqual((await f.request("/api/players")).body.operators, []);
   await f.request("/api/server/power", json("POST", { action: "stop" }));
   await new Promise((resolve) => setTimeout(resolve, 700));
   await f.request("/api/server/power", json("POST", { action: "start" }));
@@ -280,6 +281,76 @@ test("demo console requests stay truthful and closing a pending start never crea
   );
   assert.ok(state.audit.every((entry) => entry.action !== "Server started"));
 });
+
+for (const scenario of [
+  {
+    name: "icon preference",
+    route: "/api/server/icon",
+    method: "DELETE",
+    body: {},
+    action: "Default panel icon selected",
+    check: (state) => assert.equal(state.iconPreference, "default"),
+  },
+  {
+    name: "demo whitelist",
+    route: "/api/players/whitelist/state",
+    method: "POST",
+    body: { enabled: true },
+    action: "Whitelist enabled (simulated)",
+    check: (state) => assert.equal(state.demoWhitelistEnabled, true),
+  },
+  {
+    name: "demo bans",
+    route: "/api/players/ban",
+    method: "POST",
+    body: { name: "ExamplePlayer", reason: "Fixture reason" },
+    action: "Player banned (simulated)",
+    check: (state) => {
+      assert.equal(state.demoPlayerBans[0].name, "ExamplePlayer");
+      assert.equal(state.demoPlayerBans[0].banned, true);
+    },
+  },
+]) {
+  test(`${scenario.name} is durable even if its later audit write fails`, async (t) => {
+    const f = await fixture(t);
+    await fs.writeFile(
+      path.join(f.panel.serverDir, "usercache.json"),
+      JSON.stringify([
+        {
+          name: "ExamplePlayer",
+          uuid: "12345678-1234-1234-1234-123456789abc",
+        },
+      ]),
+    );
+    const statePath = path.join(f.root, "panel.json");
+    const write = fs.writeFile;
+    let failed = false;
+    t.mock.method(console, "error", () => {});
+    t.mock.method(fs, "writeFile", async (target, data, ...args) => {
+      if (
+        !failed &&
+        String(target).startsWith(`${statePath}.`) &&
+        typeof data === "string" &&
+        JSON.parse(data).audit[0]?.action === scenario.action
+      ) {
+        failed = true;
+        throw Object.assign(new Error("Fixture audit write failure"), {
+          code: "EIO",
+        });
+      }
+      return write(target, data, ...args);
+    });
+    const result = await f.request(
+      scenario.route,
+      json(scenario.method, scenario.body),
+    );
+    assert.equal(result.status, 500);
+    assert.equal(failed, true);
+    const saved = JSON.parse(await fs.readFile(statePath, "utf8"));
+    scenario.check(saved);
+    assert.ok(saved.audit.every((entry) => entry.action !== scenario.action));
+  });
+}
 
 test("removed-server events remain accessible after deleting the last server and restarting", async (t) => {
   const f = await fixture(t, { fleet: true });

@@ -652,3 +652,34 @@ test("CurseForge file pagination retains older installed releases and requires e
     0,
   );
 });
+
+test("CurseForge bounds file pagination across all compatible loaders and never returns partial history", async () => {
+  for (const loader of ["neoforge", "quilt"]) {
+    const pages = [];
+    const p = createCoreProviders({
+      key: async () => "key",
+      fetch: async (url) => {
+        const query = new URL(url).searchParams;
+        const offset = Number(query.get("index"));
+        const selected = query.get("modLoaderType");
+        pages.push({ offset, selected });
+        const count = loader === "quilt" && selected === "5" ? 250 : 1000;
+        return json({
+          data: Array.from({ length: 50 }, (_, index) => ({
+            id: offset + index,
+          })),
+          pagination: { totalCount: count },
+        });
+      },
+    })[1];
+    await assert.rejects(
+      p.versions({ ...input, loader, projectId: "11" }),
+      /too many releases/,
+    );
+    assert.equal(pages.length, 10);
+    if (loader === "quilt") {
+      assert.equal(pages.filter((page) => page.selected === "5").length, 5);
+      assert.equal(pages.filter((page) => page.selected === "4").length, 5);
+    }
+  }
+});

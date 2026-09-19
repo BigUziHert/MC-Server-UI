@@ -177,7 +177,8 @@ export async function createRecycleBin({
     }
     return rows;
   };
-  const hashFile = async (target, algorithm = "sha256") => {
+  const hashFile = async (target, algorithm = "sha256", signal) => {
+    signal?.throwIfAborted();
     const before = await io.lstat(target);
     if (!before.isFile() || before.isSymbolicLink())
       throw error(400, "Only regular files can be recovered.");
@@ -196,7 +197,9 @@ export async function createRecycleBin({
       const hash = createHash(algorithm);
       const buffer = Buffer.allocUnsafe(128 * 1024);
       for (;;) {
+        signal?.throwIfAborted();
         const { bytesRead } = await handle.read(buffer, 0, buffer.length, null);
+        signal?.throwIfAborted();
         if (!bytesRead) break;
         hash.update(buffer.subarray(0, bytesRead));
       }
@@ -381,17 +384,19 @@ export async function createRecycleBin({
   };
   return {
     directory,
-    inspect(id) {
+    inspect(id, { signal } = {}) {
       return exclusive(async () => {
+        signal?.throwIfAborted();
         const record = await read(id);
         const item = await view(record);
+        signal?.throwIfAborted();
         if (item.status !== "ready") throw error(409, item.message);
         return {
           ...item,
           ...(item.type === "file" &&
           /^mods\/[^/]+\.jar(?:\.disabled)?$/i.test(item.originalPath) &&
           item.size <= 512 * 1024 ** 2
-            ? { sha512: await hashFile(record.payload, "sha512") }
+            ? { sha512: await hashFile(record.payload, "sha512", signal) }
             : {}),
         };
       });

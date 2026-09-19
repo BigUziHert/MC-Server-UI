@@ -14,7 +14,7 @@
     "dev": "concurrently -k -n api,web \"node --watch server/index.mjs\" \"vite --host 127.0.0.1\"",
     "build": "tsc -b && vite build",
     "start": "node server/index.mjs",
-    "test": "node --test --test-timeout=30000 server/*.test.mjs desktop/*.test.mjs",
+    "test": "node --test --test-timeout=30000 --test-reporter=spec server/*.test.mjs desktop/*.test.mjs",
     "test:e2e": "playwright test",
     "format": "prettier --write src server tests *.ts *.json *.md *.yaml index.html",
     "preview": "vite preview --host 127.0.0.1",

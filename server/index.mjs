@@ -1769,6 +1769,7 @@ export async function createPanel(options = {}) {
     trackOperation(async (req, res) => {
       await writeServerIcon(serverDir, decodeIcon(req.body?.image), safePath);
       state.iconPreference = "server";
+      await save();
       await audit(
         "server",
         "Server icon updated",
@@ -1781,6 +1782,7 @@ export async function createPanel(options = {}) {
     "/api/server/icon",
     trackOperation(async (_req, res) => {
       state.iconPreference = "default";
+      await save();
       await audit(
         "server",
         "Default panel icon selected",
@@ -1795,6 +1797,7 @@ export async function createPanel(options = {}) {
       if (req.body?.preference !== "server")
         throw error(400, "Choose the server icon display preference.");
       state.iconPreference = "server";
+      await save();
       await audit(
         "server",
         "Server icon display selected",
@@ -2040,6 +2043,7 @@ export async function createPanel(options = {}) {
             });
           }
         }
+        if (mode === "demo") await save();
         append(
           `[${mode === "demo" ? "Demo" : "Panel"}] ${mode === "demo" ? "Simulated" : "Requested"}: ${command}`,
         );
@@ -2116,6 +2120,7 @@ export async function createPanel(options = {}) {
           });
           if (action === "ban") onlinePlayers.delete(name.toLowerCase());
         }
+        if (mode === "demo") await save();
         append(
           `[${mode === "demo" ? "Demo" : "Panel"}] ${mode === "demo" ? "Simulated" : "Requested"}: ${command}`,
         );
@@ -2173,6 +2178,7 @@ export async function createPanel(options = {}) {
               ...(req.body.uuid ? { uuid: req.body.uuid.toLowerCase() } : {}),
             });
         }
+        if (mode === "demo") await save();
         append(
           `[${mode === "demo" ? "Demo" : "Panel"}] ${mode === "demo" ? "Simulated" : "Requested"}: ${command}`,
         );
@@ -2231,11 +2237,14 @@ export async function createPanel(options = {}) {
           `[Demo] Received “${normalized}”. Connect a live server to execute Minecraft commands.`,
           "warn",
         );
-      const playerEvent = playerCommandAudit(normalized);
+      const playerEvent = playerCommandAudit(normalized, {
+        simulated: mode === "demo",
+        applied: false,
+      });
       if (playerEvent)
         await audit(
           "player",
-          mode === "demo" ? `${playerEvent.action} (demo)` : playerEvent.action,
+          playerEvent.action,
           mode === "demo"
             ? `Demo console command: ${normalized}. No live player state was changed.`
             : playerEvent.detail,
@@ -2264,17 +2273,40 @@ export async function createPanel(options = {}) {
       res.json({ ok: true, id: req.params.id });
     }),
   );
-  app.get("/api/files/recycle-bin/:id/restore-preview", async (req, res) => {
-    const item = await recycleBin.inspect(req.params.id);
-    res.json(
-      item.sha512 && minecraft.duplicateCheck
-        ? await minecraft.duplicateCheck({
-            path: item.originalPath,
-            sha512: item.sha512,
-          })
-        : { duplicates: [], warnings: [] },
-    );
-  });
+  app.get(
+    "/api/files/recycle-bin/:id/restore-preview",
+    trackOperation(async (req, res) => {
+      const timeout = AbortSignal.timeout(10_000);
+      const disconnected = new AbortController();
+      const signal = AbortSignal.any([timeout, disconnected.signal]);
+      const cancel = () => {
+        if (!res.writableEnded)
+          disconnected.abort(error(400, "The restore preview was cancelled."));
+      };
+      req.once("aborted", cancel);
+      res.once("close", cancel);
+      try {
+        const item = await recycleBin.inspect(req.params.id, { signal });
+        const result =
+          item.sha512 && minecraft.duplicateCheck
+            ? await minecraft.duplicateCheck({
+                path: item.originalPath,
+                sha512: item.sha512,
+                signal,
+              })
+            : { duplicates: [], warnings: [] };
+        signal.throwIfAborted();
+        res.json(result);
+      } catch (cause) {
+        if (timeout.aborted)
+          throw error(408, "The restore preview took too long. Try again.");
+        throw cause;
+      } finally {
+        req.off("aborted", cancel);
+        res.off("close", cancel);
+      }
+    }),
+  );
   app.post(
     "/api/files/recycle-bin/:id/restore",
     trackOperation(async (req, res) => {

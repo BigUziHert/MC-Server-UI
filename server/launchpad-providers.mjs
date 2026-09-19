@@ -722,6 +722,7 @@ export function createCoreProviders({
   }
   const cfFiles = async (input) => {
     const result = [];
+    let pages = 0;
     // Quilt-compatible Fabric mods use the same compatibility policy for
     // listing, resolution and update checks. Packs keep their exact runtime.
     const requested =
@@ -729,7 +730,15 @@ export function createCoreProviders({
         ? ["quilt", "fabric"]
         : [input.loader];
     for (const loader of requested) {
-      for (let index = 0; index < 10000; index += 50) {
+      for (let index = 0; ; index += 50) {
+        input.signal?.throwIfAborted();
+        // Share the budget across compatible-loader queries; incomplete history
+        // cannot establish whether the installed release is up to date.
+        if (pages++ >= 10)
+          throw launchpadError(
+            502,
+            "CurseForge returned too many releases to verify the installed version. Narrow the Minecraft version or loader and try again.",
+          );
         const query = new URLSearchParams({
           pageSize: "50",
           index: String(index),
@@ -752,11 +761,6 @@ export function createCoreProviders({
           index + response.data.length >= response.pagination?.totalCount
         )
           break;
-        if (index === 9950)
-          throw launchpadError(
-            502,
-            "CurseForge returned too many releases to verify the installed version.",
-          );
       }
     }
     return [...new Map(result.map((file) => [String(file.id), file])).values()];

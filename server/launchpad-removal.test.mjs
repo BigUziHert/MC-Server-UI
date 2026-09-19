@@ -502,7 +502,7 @@ for (const change of ["add", "replace", "remove"]) {
       await fs.unlink(path.join(f.serverDir, "mods", "other.jar"));
     await assert.rejects(
       f.service.remove({ planId: plan.planId, confirmed: true }),
-      /Installed mods changed/,
+      /Installed content changed/,
     );
     assert.deepEqual(await f.read("mods/selected.jar"), selected);
     assert.deepEqual(await f.bin.list(), []);
@@ -608,7 +608,7 @@ test("receipt persistence failure restores the original mod and retains its save
   });
   await assert.rejects(
     f.service.remove({ planId: plan.planId, confirmed: true }),
-    /original mod was restored/,
+    /original file was restored/,
   );
   assert.deepEqual(await f.read("mods/installed.jar"), f.payload);
   assert.deepEqual(await f.receipts(), originalReceipts);
@@ -692,9 +692,11 @@ test("removal plans and recovery data belong only to their selected server", asy
 });
 
 test("plugins and datapacks can be reviewed and removed without scanning mod dependencies", async (t) => {
+  const events = [];
   const f = await fixture(t, {
     loader: "paper",
     files: { "unreadable.jar": "not a jar" },
+    audit: async (...event) => events.push(event),
   });
   for (const [type, relative] of [
     ["plugin", "plugins/example.jar"],
@@ -704,6 +706,10 @@ test("plugins and datapacks can be reviewed and removed without scanning mod dep
       recursive: true,
     });
     await f.write(relative, "installed package");
+    await assert.rejects(
+      f.service.removalPreview({ type, path: "mods/wrong.jar" }),
+      { message: `Choose an installed ${type} to remove.` },
+    );
     const plan = await f.service.removalPreview({ type, path: relative });
     assert.equal(plan.blocked, false);
     assert.deepEqual(plan.warnings, []);
@@ -713,6 +719,13 @@ test("plugins and datapacks can be reviewed and removed without scanning mod dep
     });
     assert.equal(result.path, relative);
     await assert.rejects(f.read(relative), { code: "ENOENT" });
+    assert.equal(
+      events.at(-1)[0],
+      `${type === "plugin" ? "Plugin" : "Datapack"} deleted`,
+    );
+    await assert.rejects(f.service.removalPreview({ type, path: relative }), {
+      message: `This installed ${type} no longer exists. Refresh installed ${type}s.`,
+    });
   }
   assert.equal((await f.read("mods/unreadable.jar")).toString(), "not a jar");
 });

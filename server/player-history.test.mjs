@@ -37,6 +37,11 @@ test("moderation audit labels distinguish sent commands from simulated state cha
     playerCommandAudit("op Builder", { simulated: true }).action,
     "Player opped (simulated)",
   );
+  assert.equal(
+    playerCommandAudit("op Builder", { simulated: true, applied: false })
+      .action,
+    "Player op requested (simulated)",
+  );
   assert.equal(playerCommandAudit("say op Builder"), null);
   assert.equal(playerCommandAudit("whitelist list"), null);
   for (const command of [

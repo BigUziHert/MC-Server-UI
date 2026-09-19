@@ -65,6 +65,52 @@ test("restore inspection hashes only the validated recycled mod and exposes no p
   );
 });
 
+test("cancelled restore inspection closes its file and releases the bin without finishing the hash", async (t) => {
+  const f = await fixture(t);
+  await fs.mkdir(path.join(f.serverDir, "mods"));
+  await fs.writeFile(
+    path.join(f.serverDir, "mods", "example.jar"),
+    Buffer.alloc(300_000),
+  );
+  const abort = new AbortController();
+  const reason = new Error("Fixture cancellation");
+  let reads = 0,
+    closed = false;
+  const bin = await f.boot({
+    fileSystem: {
+      ...fs,
+      open: async (...args) => {
+        const handle = await fs.open(...args);
+        if (path.basename(args[0]) !== "content" || args[1] !== "r")
+          return handle;
+        return {
+          stat: () => handle.stat(),
+          read: async (...readArgs) => {
+            reads++;
+            const result = await handle.read(...readArgs);
+            abort.abort(reason);
+            return result;
+          },
+          close: async () => {
+            await handle.close();
+            closed = true;
+          },
+        };
+      },
+    },
+  });
+  const entry = await bin.recycle("mods/example.jar");
+  await assert.rejects(
+    bin.inspect(entry.id, { signal: abort.signal }),
+    (cause) => cause === reason,
+  );
+  assert.equal(reads, 1);
+  assert.equal(closed, true);
+  // Deleting the record requires the same exclusive lock as inspection.
+  await bin.deletePermanently(entry.id);
+  assert.deepEqual(await bin.list(), []);
+});
+
 async function apiFixture(t, options = {}) {
   const f = await fixture(t);
   const runtimes = [];
@@ -112,6 +158,85 @@ async function apiFixture(t, options = {}) {
   };
   return { ...f, boot, close, releases };
 }
+
+test("restore preview enforces its deadline and shutdown drains the actual cancelled read", async (t) => {
+  const f = await apiFixture(t, { mode: "live" });
+  const entered = deferred(),
+    release = deferred();
+  f.releases.push(release.resolve);
+  try {
+    const panel = await f.boot();
+    await fs.mkdir(path.join(f.serverDir, "mods"));
+    await fs.writeFile(
+      path.join(f.serverDir, "mods", "example.jar"),
+      Buffer.alloc(300_000),
+    );
+    const deleted = await panel.request("/api/files?path=mods/example.jar", {
+      method: "DELETE",
+    });
+    assert.equal(deleted.status, 200);
+    const id = deleted.body.recycled.id;
+    const payload = path.join(f.dataDir, "recycle-bin", id, "content");
+    const open = fs.open;
+    let reads = 0,
+      handleClosed = false;
+    t.mock.method(fs, "open", async (...args) => {
+      const handle = await open(...args);
+      if (args[0] !== payload || args[1] !== "r") return handle;
+      return {
+        stat: () => handle.stat(),
+        read: async (...readArgs) => {
+          reads++;
+          entered.resolve();
+          await release.promise;
+          return handle.read(...readArgs);
+        },
+        close: async () => {
+          await handle.close();
+          handleClosed = true;
+        },
+      };
+    });
+    const deadline = new AbortController();
+    const timeout = AbortSignal.timeout.bind(AbortSignal);
+    t.mock.method(AbortSignal, "timeout", (duration) =>
+      duration === 10_000 ? deadline.signal : timeout(duration),
+    );
+    let finished = false;
+    const pending = panel
+      .request(`/api/files/recycle-bin/${id}/restore-preview`)
+      .then((result) => {
+        finished = true;
+        return result;
+      });
+    await entered.promise;
+    assert.throws(() => panel.assertRemovable(), /current operation/);
+    deadline.abort(
+      new DOMException("Fixture preview deadline", "TimeoutError"),
+    );
+    let closed = false;
+    const closing = panel.close().then(() => {
+      closed = true;
+    });
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    assert.equal(
+      finished,
+      false,
+      "deadline must not release a still-active file read",
+    );
+    assert.equal(closed, false, "shutdown must drain the tracked preview");
+    release.resolve();
+    const response = await pending;
+    assert.equal(response.status, 408);
+    assert.match(response.body.error, /restore preview took too long/i);
+    await closing;
+    assert.equal(reads, 1);
+    assert.equal(handleClosed, true);
+    assert.equal((await fs.stat(payload)).size, 300_000);
+  } finally {
+    await f.close();
+  }
+});
 
 function crossVolume(source, overrides = {}) {
   return {

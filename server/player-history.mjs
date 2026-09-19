@@ -9,7 +9,10 @@ export const validPlayerUuid = (uuid) =>
   /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i.test(uuid);
 
 // Commands written to Java are requests, not proof that Minecraft accepted them.
-export function playerCommandAudit(command, { simulated = false } = {}) {
+export function playerCommandAudit(
+  command,
+  { simulated = false, applied = simulated } = {},
+) {
   const normalized = command.trim().replace(/^\//, "");
   const [verb, argument] = normalized.replace(/^minecraft:/i, "").split(/\s+/);
   const labels = {
@@ -34,7 +37,7 @@ export function playerCommandAudit(command, { simulated = false } = {}) {
       : Object.hasOwn(labels, verb) && labels[verb];
   if (!label) return null;
   return {
-    action: simulated ? `${label[1]} (simulated)` : label[0],
+    action: `${label[simulated && applied ? 1 : 0]}${simulated ? " (simulated)" : ""}`,
     detail: `${simulated ? "Simulated" : "Sent to Minecraft"}: ${normalized}.`,
   };
 }

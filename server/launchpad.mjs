@@ -122,7 +122,8 @@ async function statOrNull(target) {
     throw cause;
   }
 }
-async function fileHash(target, algorithm = "sha512") {
+async function fileHash(target, algorithm = "sha512", signal) {
+  signal?.throwIfAborted();
   const before = await fs.lstat(target);
   if (
     !before.isFile() ||
@@ -142,8 +143,13 @@ async function fileHash(target, algorithm = "sha512") {
         409,
         "A file changed while it was being checked. Refresh and try again.",
       );
-    for await (const chunk of handle.createReadStream({ autoClose: false }))
+    for await (const chunk of handle.createReadStream({
+      autoClose: false,
+      signal,
+    })) {
+      signal?.throwIfAborted();
       hash.update(chunk);
+    }
     const after = await handle.stat();
     if (after.size !== before.size || after.mtimeMs !== before.mtimeMs)
       throw error(
@@ -345,7 +351,7 @@ export async function createLaunchpad(ctx) {
     withMinecraftMutation,
     signal: lifetime.signal,
     isBusy: () => Boolean(active || preparingInstall),
-    async onRemoved(relative) {
+    async onRemoved(relative, type) {
       const previous = receipts;
       replaceReceipts(receipts.filter((item) => item.path !== relative));
       try {
@@ -364,7 +370,7 @@ export async function createLaunchpad(ctx) {
           if (JSON.parse(key).at(-1) === removedHash) updateCache.delete(key);
       try {
         await ctx.audit?.(
-          `${relative.startsWith("mods/") ? "Mod" : relative.startsWith("plugins/") ? "Plugin" : "Datapack"} deleted`,
+          `${{ mod: "Mod", plugin: "Plugin", datapack: "Datapack" }[type]} deleted`,
           `${relative} moved to Recycle Bin.`,
         );
       } catch {
@@ -558,7 +564,13 @@ export async function createLaunchpad(ctx) {
       return true;
     return lower === "eula.txt";
   }
-  async function scan(type, signal = lifetime.signal, warnings = []) {
+  async function scan(
+    type,
+    signal = lifetime.signal,
+    warnings = [],
+    isolated = false,
+  ) {
+    signal.throwIfAborted();
     if (type === "modpack") return [];
     const relative = await destination(type);
     const directory = await safePath(serverDir, relative);
@@ -592,7 +604,16 @@ export async function createLaunchpad(ctx) {
         const stamp = fileStamp(stat);
         const cached = fileCache.get(relativePath);
         if (cached?.stamp === stamp) sha512 = cached.sha512;
-        else {
+        else if (isolated) {
+          sha512 = await fileHash(target, "sha512", signal);
+          signal.throwIfAborted();
+          if (fileStamp(await fs.lstat(target)) !== stamp)
+            throw error(
+              409,
+              `${file.name} changed while it was being checked. Refresh and try again.`,
+            );
+          remember(fileCache, relativePath, { stamp, sha512 });
+        } else {
           const flightKey = `${relativePath}:${stamp}`;
           let task = hashFlights.get(flightKey);
           if (!task) {
@@ -643,7 +664,9 @@ export async function createLaunchpad(ctx) {
         ...(known?.value?.platform ? known.value : {}),
       });
     }
-    await pruneReceipts();
+    // Restore previews are bounded, read-only checks; leave receipt cleanup to
+    // the regular inventory rather than starting a save after their deadline.
+    if (!isolated) await pruneReceipts();
     return rows;
   }
   async function pruneReceipts() {
@@ -775,7 +798,6 @@ export async function createLaunchpad(ctx) {
         if (enabled(input.refresh)) {
           for (const key of updateFailures.keys())
             if (key.startsWith(`${found.id}:`)) updateFailures.delete(key);
-          found.resetFailures?.();
         }
         const pending = [],
           missing = [];
@@ -795,8 +817,10 @@ export async function createLaunchpad(ctx) {
         const cooldown = updateFailures.get(found.id);
         if (cooldown?.until > Date.now()) {
           if (missing.length) warnings.push(cooldownMessage(cooldown));
-          for (const item of missing)
+          for (const item of missing) {
             item.updateIssue = cooldownMessage(cooldown);
+            item.updateCheck = "unavailable";
+          }
         } else if (missing.length && found.updates) {
           const work = (async () => {
             try {
@@ -850,6 +874,7 @@ export async function createLaunchpad(ctx) {
               if (cooldown?.until > Date.now()) {
                 warnings.push(cooldownMessage(cooldown));
                 item.updateIssue = cooldownMessage(cooldown);
+                item.updateCheck = "unavailable";
                 return;
               }
               const key = updateKey(input, item);
@@ -967,7 +992,10 @@ export async function createLaunchpad(ctx) {
             const result = await abortable(work, input.signal);
             if (result && Object.hasOwn(result, "value"))
               apply(item, result.value);
-            else if (result?.issue) item.updateIssue = result.issue;
+            else {
+              item.updateCheck = "unavailable";
+              if (result?.issue) item.updateIssue = result.issue;
+            }
           }),
         );
       }),
@@ -997,9 +1025,8 @@ export async function createLaunchpad(ctx) {
       !enabled(input.local) &&
       !input.identityOnly &&
       existingCheck &&
-      (!existingCheck.done || !enabled(input.refresh))
+      !existingCheck.done
     ) {
-      if (existingCheck.done) backgroundChecks.delete(scope);
       return structuredClone({
         items: existingCheck.items,
         warnings: [...new Set(existingCheck.warnings)],
@@ -1012,6 +1039,11 @@ export async function createLaunchpad(ctx) {
         },
       });
     }
+    const completedCheck =
+      !enabled(input.local) && !input.identityOnly && existingCheck?.done
+        ? existingCheck
+        : null;
+    if (completedCheck) backgroundChecks.delete(scope);
     const scanWarnings = [];
     const items =
       input.type === "modpack"
@@ -1031,6 +1063,36 @@ export async function createLaunchpad(ctx) {
     }
     markDuplicates(items);
     if (enabled(input.local)) return { items, warnings: scanWarnings };
+    if (completedCheck && !enabled(input.refresh)) {
+      const previous = new Map(
+        completedCheck.items.map((item) => [item.path, item]),
+      );
+      // The provider result only describes the files that existed when it began.
+      // Reuse it only after a fresh scan verifies the same paths and checksums.
+      if (
+        items.every(
+          (item) =>
+            item.sha512 && previous.get(item.path)?.sha512 === item.sha512,
+        )
+      ) {
+        for (const item of items) {
+          const checked = previous.get(item.path);
+          Object.assign(item, identityFields(checked), {
+            updateCheck: checked.updateCheck,
+          });
+          if (checked.update) item.update = checked.update;
+          else delete item.update;
+          if (checked.updateIssue) item.updateIssue = checked.updateIssue;
+        }
+        markDuplicates(items);
+        return structuredClone({
+          items,
+          warnings: [...new Set([...scanWarnings, ...completedCheck.warnings])],
+          checkingUpdates: false,
+          progress: { completed: items.length, total: items.length },
+        });
+      }
+    }
     const flightKey = JSON.stringify([
       input.type,
       input.gameVersion,
@@ -1088,11 +1150,24 @@ export async function createLaunchpad(ctx) {
     if (enabled(input.background) && enabled(input.refresh)) {
       const entry = { items, warnings: scanWarnings, done: false, task };
       backgroundChecks.set(scope, entry);
-      void task.then((result) => {
-        entry.items = result.items;
-        entry.warnings = result.warnings;
-        entry.done = true;
-      });
+      void task.then(
+        (result) => {
+          entry.items = result.items;
+          entry.warnings = result.warnings;
+          entry.done = true;
+        },
+        (cause) => {
+          for (const item of entry.items)
+            if (item.updateCheck === "pending")
+              item.updateCheck = "unavailable";
+          entry.warnings = [
+            ...entry.warnings,
+            cause?.message ||
+              "The update check could not finish. Refresh to retry.",
+          ];
+          entry.done = true;
+        },
+      );
       return structuredClone({
         items,
         warnings: scanWarnings,
@@ -1136,6 +1211,7 @@ export async function createLaunchpad(ctx) {
             });
         }
       } catch (cause) {
+        input.signal.throwIfAborted();
         warnings.push(`Modrinth identification: ${cause.message}`);
       }
     }
@@ -1154,7 +1230,9 @@ export async function createLaunchpad(ctx) {
             input.signal.throwIfAborted();
             const bytes = await fs.readFile(
               await safePath(serverDir, item.path),
+              { signal: input.signal },
             );
+            input.signal.throwIfAborted();
             if (
               createHash("sha512").update(bytes).digest("hex") !== item.sha512
             )
@@ -1196,6 +1274,7 @@ export async function createLaunchpad(ctx) {
               });
           }
         } catch (cause) {
+          input.signal.throwIfAborted();
           warnings.push(`CurseForge identification: ${cause.message}`);
         }
       }
@@ -2853,7 +2932,13 @@ export async function createLaunchpad(ctx) {
       }
       return { ok: true };
     },
-    async duplicateCheck({ path: originalPath, sha512 }) {
+    async duplicateCheck({
+      path: originalPath,
+      sha512,
+      signal = lifetime.signal,
+    }) {
+      signal = AbortSignal.any([lifetime.signal, signal]);
+      signal.throwIfAborted();
       if (!/^mods\/[^/\\]+\.jar$/i.test(originalPath ?? "") || !sha512)
         return { duplicates: [], warnings: [] };
       const known =
@@ -2866,15 +2951,23 @@ export async function createLaunchpad(ctx) {
             "The recycled mod could not be identified, so duplicates could not be checked.",
           ],
         };
-      const current = await getServer();
-      const inventory = await installed({
-        type: "mod",
-        loader: current.loader,
-        gameVersion: current.gameVersion,
-        identityOnly: true,
-      });
+      const current = await abortable(getServer(), signal);
+      const warnings = [];
+      const items = await scan("mod", signal, warnings, true);
+      await installedDetails(
+        {
+          type: "mod",
+          loader: current.loader,
+          gameVersion: current.gameVersion,
+          identityOnly: true,
+          signal,
+        },
+        items,
+        warnings,
+      );
+      signal.throwIfAborted();
       return {
-        duplicates: inventory.items
+        duplicates: items
           .filter(
             (item) =>
               item.path !== originalPath &&
@@ -2882,7 +2975,7 @@ export async function createLaunchpad(ctx) {
               item.projectId === known.projectId,
           )
           .map(({ path, title }) => ({ path, title })),
-        warnings: [],
+        warnings,
       };
     },
     removalPreview: removal.preview,

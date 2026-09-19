@@ -646,7 +646,7 @@ test("an unresponsive provider cannot hold installed rows past the overall remot
       }
     },
   });
-  const pending = f.service.installed(selection);
+  const pending = f.service.installed({ ...selection, refresh: true });
   await began;
   deadline.abort(new DOMException("Timed out", "TimeoutError"));
   const result = await pending;
@@ -4721,6 +4721,12 @@ test("explicit background refresh immediately publishes progress and coalesces p
   assert.equal(polled.checkingUpdates, true);
   assert.deepEqual(polled.progress, { completed: 0, total: 1 });
   assert.equal(checks, 2);
+  const refreshedWhileActive = await f.service.installed({
+    ...selection,
+    refresh: true,
+  });
+  assert.equal(refreshedWhileActive.checkingUpdates, true);
+  assert.equal(checks, 2, "manual refresh joins the active background check");
   release();
   let complete;
   for (let i = 0; i < 100; i++) {
@@ -4731,6 +4737,275 @@ test("explicit background refresh immediately publishes progress and coalesces p
   assert.equal(complete.checkingUpdates, false);
   assert.equal(complete.progress.completed, 1);
   assert.equal(complete.items[0].updateCheck, "checked");
+});
+
+test("completed background inventories reconcile deleted and replaced files before publishing", async (t) => {
+  for (const change of ["deleted", "replaced"]) {
+    const f = await fixture(t);
+    await f.service.installed(selection);
+    await f.service.installed({
+      ...selection,
+      refresh: true,
+      background: true,
+    });
+    // The mocked provider resolves immediately; let the background continuation finish.
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    const target = path.join(f.serverDir, "mods", "old.jar");
+    if (change === "deleted") await fs.unlink(target);
+    else
+      await fs.writeFile(
+        target,
+        "unidentified replacement with different bytes",
+      );
+    const next = await f.service.installed(selection);
+    if (change === "deleted") assert.deepEqual(next.items, []);
+    else {
+      assert.equal(next.items.length, 1);
+      assert.notEqual(next.items[0].sha512, hashes(f.old).sha512);
+      assert.equal(next.items[0].update, undefined);
+      assert.equal(next.items[0].platform, null);
+    }
+  }
+});
+
+test("restore duplicate checks stop hashing and close the file on cancellation", async (t) => {
+  const f = await fixture(t);
+  await f.service.installed(selection);
+  const target = path.join(f.serverDir, "mods", "unhashed.jar");
+  await fs.writeFile(target, Buffer.alloc(2 * 1024 ** 2, 7));
+  const controller = new AbortController();
+  const open = fs.open.bind(fs);
+  let started = false,
+    closed = false;
+  t.mock.method(fs, "open", async (...args) => {
+    const handle = await open(...args);
+    if (args[0] === target) {
+      const stream = handle.createReadStream.bind(handle);
+      const close = handle.close.bind(handle);
+      t.mock.method(handle, "createReadStream", (options) => {
+        const reader = stream(options);
+        reader.once("data", () => {
+          started = true;
+          controller.abort(
+            new DOMException("Fixture hash deadline", "TimeoutError"),
+          );
+        });
+        return reader;
+      });
+      t.mock.method(handle, "close", async () => {
+        await close();
+        closed = true;
+      });
+    }
+    return handle;
+  });
+  const requests = f.requests.length;
+  await assert.rejects(
+    f.service.duplicateCheck({
+      path: "mods/restored.jar",
+      sha512: hashes(f.old).sha512,
+      signal: controller.signal,
+    }),
+    { name: "TimeoutError" },
+  );
+  assert.equal(started, true);
+  assert.equal(
+    closed,
+    true,
+    "cancellation must drain the hashing operation before returning",
+  );
+  assert.equal(
+    f.requests.length,
+    requests,
+    "cancelled scans must not start identity requests",
+  );
+});
+
+test("a synchronous refresh supersedes a completed background result", async (t) => {
+  let nowCurrent = false;
+  const f = await fixture(t, {
+    request: async (url) => {
+      if (nowCurrent && new URL(url).pathname === "/v2/version_files/update")
+        return Response.json({ [hashes(f.old).sha512]: f.versions.old });
+    },
+  });
+  await f.service.installed(selection);
+  await f.service.installed({ ...selection, refresh: true, background: true });
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  nowCurrent = true;
+  const refreshed = await f.service.installed({ ...selection, refresh: true });
+  assert.equal(refreshed.items[0].update, undefined);
+  const next = await f.service.installed(selection);
+  assert.equal(
+    next.items[0].update,
+    undefined,
+    "an older completed snapshot must not restore the obsolete update",
+  );
+  assert.equal(next.items[0].updateCheck, "checked");
+});
+
+test("unexpected background finalization failures terminate polling with a warning", async (t) => {
+  const f = await fixture(t);
+  await f.service.installed(selection);
+  const originalSet = Map.prototype.set;
+  let injected = false;
+  t.mock.method(Map.prototype, "set", function (key, value) {
+    if (
+      !injected &&
+      key === hashes(f.old).sha512 &&
+      value?.value?.platform === "modrinth"
+    ) {
+      injected = true;
+      throw new Error("Fixture identity cache failure");
+    }
+    return originalSet.call(this, key, value);
+  });
+  await f.service.installed({ ...selection, refresh: true, background: true });
+  let result;
+  for (let i = 0; i < 100; i++) {
+    result = await f.service.installed(selection);
+    if (!result.checkingUpdates) break;
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  assert.equal(injected, true);
+  assert.equal(result.checkingUpdates, false);
+  assert.equal(result.progress.completed, 1);
+  assert.match(result.warnings.join(" "), /Fixture identity cache failure/);
+});
+
+test("failed bulk update checks advance progress while another provider is still pending", async (t) => {
+  const f = await fixture(t, {
+    request: async (url) => {
+      if (new URL(url).pathname === "/v2/version_files/update")
+        return Response.json({});
+    },
+  });
+  const extra = Buffer.from("another catalog's mod");
+  await fs.writeFile(path.join(f.serverDir, "mods", "extra.jar"), extra);
+  await fs.writeFile(
+    path.join(f.dataDir, "launchpad", "installed.json"),
+    JSON.stringify([
+      {
+        path: "mods/extra.jar",
+        sha512: hashes(extra).sha512,
+        platform: "fixture",
+        projectId: "other",
+        versionId: "old",
+        type: "mod",
+      },
+    ]),
+  );
+  let release;
+  const gate = new Promise((resolve) => {
+    release = resolve;
+  });
+  t.after(() => release());
+  const service = await f.boot({
+    extraProviders: [
+      {
+        id: "fixture",
+        name: "Fixture",
+        types: ["mod"],
+        async versions() {
+          await gate;
+          return [{ id: "old", publishedAt: "2026-01-01", downloadable: true }];
+        },
+      },
+    ],
+  });
+  await service.installed({ ...selection, refresh: true, background: true });
+  let progress;
+  for (let i = 0; i < 100; i++) {
+    progress = await service.installed(selection);
+    if (progress.progress.completed === 1) break;
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  assert.equal(progress.checkingUpdates, true);
+  assert.deepEqual(progress.progress, { completed: 1, total: 2 });
+  assert.equal(
+    progress.items.find((item) => item.platform === "modrinth").updateCheck,
+    "unavailable",
+  );
+  release();
+});
+
+test("manual refresh respects Modrinth rate limits and retries after their cooldown", async (t) => {
+  let now = Date.now(),
+    limited = true;
+  t.mock.method(Date, "now", () => now);
+  const f = await fixture(t, {
+    request: async (url) => {
+      if (limited && new URL(url).pathname === "/v2/version_files/update")
+        return new Response(null, { status: 429 });
+    },
+  });
+  const count = () =>
+    f.requests.filter(
+      ({ url }) => new URL(url).pathname === "/v2/version_files/update",
+    ).length;
+  const first = await f.service.installed(selection);
+  assert.equal(first.items[0].updateCheck, "unavailable");
+  limited = false;
+  const retry = await f.service.installed({ ...selection, refresh: true });
+  assert.equal(count(), 1);
+  assert.equal(retry.items[0].updateCheck, "unavailable");
+  assert.match(retry.items[0].updateIssue, /Retry in/);
+  now += 60_001;
+  const recovered = await f.service.installed({ ...selection, refresh: true });
+  assert.equal(count(), 2);
+  assert.equal(recovered.items[0].updateCheck, "checked");
+  assert.equal(recovered.items[0].update.id, "new");
+});
+
+test("restore duplicate checks cancel identity lookups and do not continue after their deadline", async (t) => {
+  let cancelLookup = false,
+    started;
+  const ready = new Promise((resolve) => {
+    started = resolve;
+  });
+  const controller = new AbortController();
+  const f = await fixture(t, {
+    request: async (url, options) => {
+      if (cancelLookup && new URL(url).pathname === "/v2/version_files") {
+        started();
+        return new Promise((resolve, reject) => {
+          options.signal.addEventListener(
+            "abort",
+            () => reject(options.signal.reason),
+            { once: true },
+          );
+        });
+      }
+    },
+  });
+  await f.service.installed(selection);
+  await fs.writeFile(
+    path.join(f.serverDir, "mods", "unknown.jar"),
+    "unknown installed mod",
+  );
+  cancelLookup = true;
+  const pending = f.service.duplicateCheck({
+    path: "mods/restored.jar",
+    sha512: hashes(f.old).sha512,
+    signal: controller.signal,
+  });
+  await ready;
+  controller.abort(
+    new DOMException("Fixture restore deadline", "TimeoutError"),
+  );
+  await assert.rejects(pending, { name: "TimeoutError" });
+  const requests = f.requests.length;
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(f.requests.length, requests);
+  await assert.rejects(
+    f.service.duplicateCheck({
+      path: "mods/restored.jar",
+      sha512: hashes(f.old).sha512,
+      signal: controller.signal,
+    }),
+    { name: "TimeoutError" },
+  );
+  assert.equal(f.requests.length, requests);
 });
 
 test("odd filenames produce a warning while valid installed mods remain listed", async (t) => {
