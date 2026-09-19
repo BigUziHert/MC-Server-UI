@@ -606,6 +606,7 @@ test("whitelist membership and enable switch confirm changes and preserve demo s
     exact: true,
   });
   await expect(toggle).toHaveAttribute("aria-checked", "false");
+  await expect(toggle).toHaveAttribute("title", "Whitelist disabled");
   await roster
     .getByRole("button", { name: "Add player to whitelist", exact: true })
     .click();
@@ -633,6 +634,7 @@ test("whitelist membership and enable switch confirm changes and preserve demo s
     .getByRole("button", { name: "Enable whitelist", exact: true })
     .click();
   await expect(toggle).toHaveAttribute("aria-checked", "true");
+  await expect(toggle).toHaveAttribute("title", "Whitelist enabled");
   await page.reload();
   await expect(toggle).toHaveAttribute("aria-checked", "true");
   const headers = { "X-Server-Id": server.id };

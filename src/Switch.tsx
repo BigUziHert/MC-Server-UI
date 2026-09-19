@@ -5,6 +5,7 @@ export default function Switch({
   label,
   disabled,
   id,
+  title,
   className = "",
   "aria-label": accessibleLabel,
 }: {
@@ -13,12 +14,14 @@ export default function Switch({
   label: ReactNode;
   disabled?: boolean;
   id?: string;
+  title?: string;
   className?: string;
   "aria-label"?: string;
 }) {
   return (
     <button
       id={id}
+      title={title}
       type="button"
       role="switch"
       aria-checked={checked}

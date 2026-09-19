@@ -133,6 +133,15 @@ export default function Properties({ notify }: PageProps) {
     setSelected(file);
     void load(file);
   };
+  const reload = async () => {
+    if (loading || saving || !selected) return false;
+    if (dirty) {
+      setPendingReload(true);
+      setPending(selected);
+      return false;
+    }
+    return load(selected, true);
+  };
   async function save() {
     if (!config || !dirty || saving) return;
     const id = session.current;
@@ -209,14 +218,7 @@ export default function Properties({ notify }: PageProps) {
         <RefreshButton
           label="Refresh properties"
           disabled={loading || saving || !selected}
-          onRefresh={async () => {
-            if (dirty) {
-              setPendingReload(true);
-              setPending(selected);
-              return false;
-            }
-            return load(selected, true);
-          }}
+          onRefresh={reload}
           notify={notify}
           successMessage="Properties refreshed."
         />
@@ -227,7 +229,7 @@ export default function Properties({ notify }: PageProps) {
           title="Unable to load properties"
           message={error}
           onRetry={() => {
-            if (selected) select(selected);
+            if (selected) void reload();
             else setCatalogReload((v) => v + 1);
           }}
         />

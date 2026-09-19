@@ -75,14 +75,6 @@
     justify-self: end;
   }
 }
-.launchpad-installed-toggle {
-  display: flex;
-  align-items: center;
-  gap: 9px;
-  color: var(--text);
-  font-size: 12px;
-  white-space: nowrap;
-}
 .launchpad-sort {
   display: flex;
   align-items: center;
@@ -100,40 +92,6 @@
   min-width: 0;
   min-height: 37px;
   font-size: 12px;
-}
-.launchpad-installed-toggle input {
-  width: 30px;
-  height: 17px;
-  accent-color: var(--accent);
-}
-.launchpad-pagination {
-  display: flex;
-  align-items: center;
-  flex-wrap: wrap;
-  gap: 8px;
-  color: var(--muted);
-  font-size: 11px;
-}
-.launchpad-pagination label {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-}
-.launchpad-pagination select {
-  padding: 7px;
-  min-height: 34px;
-  width: 62px;
-  font-size: 11px;
-}
-.launchpad-pagination .btn.icon {
-  width: 33px;
-  height: 34px;
-  padding: 6px;
-}
-.launchpad-pagination > span {
-  padding: 0 3px;
-  white-space: nowrap;
-  font-variant-numeric: tabular-nums;
 }
 .launchpad-results {
   display: grid;
@@ -605,15 +563,8 @@
   .launchpad-search {
     flex-basis: 100%;
   }
-  .launchpad-pagination {
-    flex-wrap: wrap;
-    width: 100%;
-  }
   .launchpad-sort {
     flex-basis: 100%;
-  }
-  .launchpad-pagination > span {
-    margin-left: auto;
   }
   .launchpad-project {
     gap: 13px;

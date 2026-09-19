@@ -753,6 +753,13 @@ export default function Players({ notify }: PageProps) {
               </button>
               <Switch
                 aria-label="Enable whitelist"
+                title={
+                  data?.whitelistEnabled == null
+                    ? "Whitelist setting unavailable"
+                    : data.whitelistEnabled
+                      ? "Whitelist enabled"
+                      : "Whitelist disabled"
+                }
                 label=""
                 checked={data?.whitelistEnabled ?? false}
                 disabled={

@@ -19,9 +19,6 @@
 .console-log-search-field {
   flex: 1;
 }
-.search-field-sm {
-  max-width: 240px;
-}
 .search-field > svg {
   width: 16px;
   height: 16px;

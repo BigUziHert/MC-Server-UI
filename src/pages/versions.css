@@ -88,9 +88,6 @@
   gap: 16px;
   margin: 22px 0;
 }
-.versions-toolbar > .management-search {
-  width: 310px;
-}
 .versions-toolbar > span {
   margin-left: auto;
   color: var(--muted);
@@ -210,15 +207,6 @@
   color: var(--muted);
   text-align: right;
 }
-.versions-loading {
-  min-height: 140px;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  gap: 10px;
-  color: var(--muted);
-  font-size: 13px;
-}
 
 .versions-browser {
   display: grid;
@@ -236,7 +224,7 @@
   gap: 8px;
   font-size: 11px;
   color: var(--muted);
-  padding: 0 16px 15px;
+  margin: 0 16px 15px;
 }
 .versions-toggle input,
 .versions-confirm input {
@@ -342,30 +330,6 @@
 .versions-build > .btn {
   font-size: 11px;
 }
-.versions-empty {
-  padding: 55px 25px;
-  text-align: center;
-  color: var(--muted);
-  font-size: 12px;
-  line-height: 1.7;
-}
-.versions-empty > svg {
-  color: var(--accent);
-  opacity: 0.6;
-  margin-bottom: 10px;
-}
-.versions-empty > .software-logo {
-  margin: 0 auto 10px;
-}
-.versions-empty h3 {
-  font-size: 15px;
-  color: var(--text);
-  font-weight: 500;
-}
-.versions-empty p {
-  max-width: 390px;
-  margin: 10px auto 0;
-}
 .versions-build-footer {
   display: flex;
   align-items: center;
@@ -417,9 +381,6 @@
   }
   .versions-toolbar {
     flex-wrap: wrap;
-  }
-  .versions-toolbar > .management-search {
-    width: 100%;
   }
   .versions-release-list {
     max-height: 220px;

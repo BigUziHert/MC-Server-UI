@@ -342,14 +342,16 @@ export default function Subusers({ notify }: PageProps) {
             </tbody>
           </table>
         )}
-        <Pagination
-          page={currentPage}
-          pageSize={pageSize}
-          total={filtered.length}
-          onPageChange={setPage}
-          onPageSizeChange={setPageSize}
-          label="subusers"
-        />
+        {filtered.length > 0 && (
+          <Pagination
+            page={currentPage}
+            pageSize={pageSize}
+            total={filtered.length}
+            onPageChange={setPage}
+            onPageSizeChange={setPageSize}
+            label="subusers"
+          />
+        )}
       </section>
 
       <dialog

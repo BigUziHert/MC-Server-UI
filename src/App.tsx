@@ -1412,7 +1412,13 @@ function ConsolePage({
             <div className="console-options">
               <Switch
                 aria-label="Server messaging"
-                label="Server messaging"
+                title="Send messages to every player without typing say"
+                label={
+                  <>
+                    <MessageSquare size={12} aria-hidden="true" /> Server
+                    messaging
+                  </>
+                }
                 checked={inputMode === "message"}
                 disabled={busy}
                 onCheckedChange={(enabled) => {

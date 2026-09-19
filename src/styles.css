@@ -479,11 +479,11 @@ input:disabled {
   margin-bottom: 0;
 }
 .eyebrow {
-  font-size: 9px;
+  font-size: 10px;
   color: #969bb3;
   letter-spacing: 1.65px;
   font-weight: 600;
-  margin-bottom: 9px;
+  margin: 0 0 9px;
 }
 .heading-meta {
   display: flex;
@@ -991,40 +991,6 @@ input:disabled {
   align-items: center;
   gap: 18px;
   margin-left: auto;
-}
-.message-toggle {
-  display: flex;
-  align-items: center;
-  gap: 5px;
-  padding: 0;
-  background: none;
-  color: var(--muted);
-  font-size: 9px;
-}
-.message-toggle.active {
-  color: var(--accent);
-}
-.message-toggle-track {
-  display: flex;
-  align-items: center;
-  width: 24px;
-  height: 14px;
-  padding: 2px;
-  border-radius: 8px;
-  background: #404356;
-}
-.message-toggle-track > span {
-  width: 10px;
-  height: 10px;
-  border-radius: 50%;
-  background: #dfe2f1;
-}
-.message-toggle.active .message-toggle-track {
-  background: var(--accent);
-  justify-content: flex-end;
-}
-.message-toggle.active .message-toggle-track > span {
-  background: #20212b;
 }
 .command-form {
   display: flex;
@@ -1874,6 +1840,11 @@ input:disabled {
   background: #3a3b4b;
   padding: 2px;
 }
+.shared-switch > span:last-child {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
 .shared-switch-track > span {
   display: block;
   width: 14px;
@@ -1915,12 +1886,6 @@ input:disabled {
 }
 .fleet-audit > .btn {
   margin-bottom: 22px;
-}
-.page-heading .eyebrow {
-  font-size: 10px;
-  margin: 0 0 9px;
-  font-weight: 600;
-  letter-spacing: 1.65px;
 }
 .launchpad-toolbar .pagination {
   padding: 0;

@@ -17,7 +17,6 @@ type SearchFieldProps = Omit<
   className?: string;
   iconSize?: number;
   clearLabel?: string;
-  size?: "sm" | "md";
   grow?: boolean;
 };
 
@@ -39,7 +38,6 @@ const SearchField = forwardRef<HTMLInputElement, SearchFieldProps>(
       iconSize = 16,
       clearLabel = "Clear search",
       disabled,
-      size = "md",
       grow = false,
       ...inputProps
     },
@@ -48,7 +46,7 @@ const SearchField = forwardRef<HTMLInputElement, SearchFieldProps>(
     const input = useRef<HTMLInputElement | null>(null);
     return (
       <div
-        className={`search-field search-field-${size} ${grow ? "search-field-grow" : ""} ${className}`}
+        className={`search-field ${grow ? "search-field-grow" : ""} ${className}`}
       >
         <Search size={iconSize} aria-hidden="true" />
         <div className="search-field-control">

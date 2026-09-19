@@ -72,43 +72,6 @@
   overscroll-behavior-y: contain;
   scrollbar-color: var(--border) transparent;
 }
-.players-pagination {
-  display: flex;
-  align-items: center;
-  flex-wrap: wrap;
-  gap: 8px;
-  min-height: 47px;
-  padding: 8px 10px;
-  border-top: 1px solid var(--border);
-  color: var(--muted);
-  font-size: 10px;
-}
-.players-pagination > label,
-.players-pagination > div {
-  display: flex;
-  align-items: center;
-  gap: 5px;
-}
-.players-pagination select {
-  width: 53px;
-  min-height: 29px;
-  padding: 4px;
-  font-size: 11px;
-}
-.players-pagination > span {
-  margin-left: auto;
-  white-space: nowrap;
-  font-variant-numeric: tabular-nums;
-}
-.players-pagination .btn.icon {
-  width: 28px;
-  height: 29px;
-  padding: 4px;
-}
-.players-history-panel > .players-pagination {
-  padding: 12px 23px;
-  font-size: 12px;
-}
 .players-roster-row.players-roster-row {
   display: flex;
   align-items: center;
@@ -149,46 +112,6 @@
   background: #303140;
   border-color: var(--border);
   color: var(--accent);
-}
-.players-roster-empty {
-  min-height: 64px;
-  margin: 0;
-  padding: 23px 14px;
-  text-align: center;
-  color: var(--muted);
-  font-size: 12px;
-  line-height: 1.5;
-}
-.players-whitelist-switch {
-  width: 34px;
-  height: 19px;
-  flex: 0 0 34px;
-  padding: 2px;
-  border-radius: 20px;
-  border: 1px solid #565a70;
-  background: #303140;
-  cursor: pointer;
-}
-.players-whitelist-switch span {
-  display: block;
-  width: 13px;
-  height: 13px;
-  border-radius: 50%;
-  background: #dfe2f1;
-  transform: translateX(0);
-  transition: transform 0.15s;
-}
-.players-whitelist-switch[aria-checked="true"] {
-  border-color: var(--accent);
-  background: var(--accent);
-}
-.players-whitelist-switch[aria-checked="true"] span {
-  transform: translateX(15px);
-  background: #20212b;
-}
-.players-whitelist-switch:disabled {
-  opacity: 0.45;
-  cursor: not-allowed;
 }
 @media (min-width: 1500px) {
   .players-rosters {
@@ -277,22 +200,6 @@
 }
 .players-history-actions .players-remove {
   margin-left: 0;
-}
-.players-history-empty {
-  padding: 36px 23px;
-  color: var(--muted);
-  text-align: center;
-  font-size: 12px;
-}
-.players-history-empty h3 {
-  color: var(--text);
-  font-size: 15px;
-  margin-bottom: 10px;
-}
-.players-history-empty p {
-  max-width: 520px;
-  margin: 0 auto;
-  line-height: 1.8;
 }
 .players-dialog {
   max-height: calc(100dvh - 32px);

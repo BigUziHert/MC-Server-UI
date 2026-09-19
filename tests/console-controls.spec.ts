@@ -44,6 +44,11 @@ test("server messaging sends say commands and preserves separate command/message
   );
   await page.goto("/#console");
   const toggle = page.getByRole("switch", { name: "Server messaging" });
+  await expect(toggle).toHaveAttribute(
+    "title",
+    "Send messages to every player without typing say",
+  );
+  await expect(toggle.locator("svg")).toHaveCount(1);
   await expect(toggle).not.toBeChecked();
   await page
     .getByRole("textbox", { name: "Server command", exact: true })

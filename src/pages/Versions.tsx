@@ -527,6 +527,7 @@ export default function Versions({ notify }: PageProps) {
             <SearchField
               className="management-search"
               aria-label="Search server software"
+              grow
               placeholder="Search server software…"
               value={search}
               onValueChange={setSearch}

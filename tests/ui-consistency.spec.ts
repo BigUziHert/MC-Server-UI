@@ -271,6 +271,69 @@ test("audit polling refreshes in place and panel history remains available with 
   ).toHaveCount(0);
 });
 
+test("manual audit refresh joins an active poll and reports its result", async ({
+  page,
+}) => {
+  await page.clock.install();
+  let reads = 0;
+  let held: Route | undefined;
+  await page.route("**/api/audit", (route) => {
+    if (++reads === 1) return route.fulfill({ json: { entries: [event] } });
+    held = route;
+  });
+  await page.route("**/api/panel/audit", (route) =>
+    route.fulfill({
+      json: { entries: [{ ...event, detail: "Panel activity" }] },
+    }),
+  );
+  await page.goto("/#audit");
+  const row = page.getByRole("row").filter({ hasText: event.detail });
+  await expect(row).toBeVisible();
+  await page.clock.runFor(10_100);
+  await expect.poll(() => Boolean(held)).toBe(true);
+  const refresh = page.getByRole("button", {
+    name: "Refresh audit logs",
+    exact: true,
+  });
+  await expect(refresh).toBeEnabled();
+  await refresh.click();
+  await expect(refresh).toBeDisabled();
+  await expect(row).toBeVisible();
+  expect(reads).toBe(2);
+  await held!.fulfill({
+    json: { entries: [{ ...event, detail: "Updated during the poll" }] },
+  });
+  await expect(
+    page.getByText("Updated during the poll", { exact: true }),
+  ).toBeVisible();
+  await expect(
+    page.getByText("Audit logs refreshed.", { exact: true }),
+  ).toBeVisible();
+  await expect(refresh).toBeEnabled();
+  expect(reads).toBe(2);
+  held = undefined;
+  await page.clock.runFor(10_100);
+  await expect.poll(() => Boolean(held)).toBe(true);
+  await refresh.click();
+  await expect(refresh).toBeDisabled();
+  await page
+    .getByRole("combobox", { name: "Audit scope", exact: true })
+    .selectOption("panel");
+  await expect(
+    page.getByRole("cell", { name: /Panel activity/ }),
+  ).toBeVisible();
+  await expect(refresh).toBeEnabled();
+  await held!.fulfill({
+    json: { entries: [{ ...event, detail: "Stale server activity" }] },
+  });
+  await expect(
+    page.getByText("Stale server activity", { exact: true }),
+  ).toHaveCount(0);
+  await expect(
+    page.getByText("Audit logs refreshed.", { exact: true }),
+  ).toHaveCount(0);
+});
+
 test("file pagination preserves selections across pages and resets after searching", async ({
   page,
 }) => {
@@ -334,6 +397,7 @@ test("dirty property refresh confirms reload and file changes clear the search",
   page,
 }) => {
   let reads = 0;
+  let failRead = false;
   await page.route("**/api/minecraft/properties", (route) =>
     route.fulfill({
       json: {
@@ -346,6 +410,13 @@ test("dirty property refresh confirms reload and file changes clear the search",
   );
   await page.route("**/api/minecraft/properties/file?*", (route) => {
     reads++;
+    if (failRead) {
+      failRead = false;
+      return route.fulfill({
+        status: 503,
+        json: { error: "Properties temporarily unavailable" },
+      });
+    }
     const path = new URL(route.request().url()).searchParams.get("path");
     return route.fulfill({
       json: {
@@ -401,6 +472,29 @@ test("dirty property refresh confirms reload and file changes clear the search",
   await page.getByRole("tab", { name: "bukkit.yml", exact: true }).click();
   await expect(search).toHaveValue("");
   await expect(field).toHaveValue("Bukkit message");
+  failRead = true;
+  await page
+    .getByRole("button", { name: "Refresh properties", exact: true })
+    .click();
+  await expect(page.getByRole("alert")).toContainText(
+    "Properties temporarily unavailable",
+  );
+  await field.fill("Keep this draft");
+  const readsBeforeRetry = reads;
+  await page.getByRole("button", { name: "Try again", exact: true }).click();
+  await expect(dialog).toBeVisible();
+  expect(reads).toBe(readsBeforeRetry);
+  await dialog
+    .getByRole("button", { name: "Keep editing", exact: true })
+    .click();
+  await expect(field).toHaveValue("Keep this draft");
+  await page.getByRole("button", { name: "Try again", exact: true }).click();
+  await dialog
+    .getByRole("button", { name: "Reload properties", exact: true })
+    .click();
+  await expect(field).toHaveValue("Bukkit message");
+  await expect(page.getByRole("alert")).toHaveCount(0);
+  expect(reads).toBe(readsBeforeRetry + 1);
 });
 
 test("restoring a mod previews duplicate copies before writing files", async ({

@@ -65,50 +65,54 @@ export default function AuditLogs({
   const [, tick] = useState(0);
   const generation = useRef(0),
     loaded = useRef(false),
-    inFlight = useRef(false);
+    inFlight = useRef<Promise<boolean> | null>(null);
   const refresh = useCallback(
     async (manual = false) => {
-      if (inFlight.current) return false;
-      inFlight.current = true;
+      if (manual) setRefreshing(true);
+      if (inFlight.current) return inFlight.current;
       const token = generation.current;
       if (!loaded.current) setLoading(true);
-      if (manual) setRefreshing(true);
       setError("");
-      try {
-        const data = await api<{ entries: AuditEntry[] }>(
-          activityScope === "panel" ? "/panel/audit" : "/audit",
-        );
-        if (token !== generation.current) return false;
-        setEntries(
-          data.entries.sort(
-            (a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt),
-          ),
-        );
-        loaded.current = true;
-        setUpdatedAt(new Date());
-        return true;
-      } catch (cause) {
-        if (token === generation.current)
-          setError(
-            cause instanceof Error
-              ? cause.message
-              : "Unable to load the audit log.",
+      const pending = (async () => {
+        try {
+          const data = await api<{ entries: AuditEntry[] }>(
+            activityScope === "panel" ? "/panel/audit" : "/audit",
           );
-        return false;
-      } finally {
-        if (token === generation.current) {
-          inFlight.current = false;
-          setLoading(false);
-          setRefreshing(false);
+          if (token !== generation.current) return false;
+          setEntries(
+            data.entries.sort(
+              (a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt),
+            ),
+          );
+          loaded.current = true;
+          setUpdatedAt(new Date());
+          return true;
+        } catch (cause) {
+          if (token === generation.current)
+            setError(
+              cause instanceof Error
+                ? cause.message
+                : "Unable to load the audit log.",
+            );
+          return false;
+        } finally {
+          if (token === generation.current) {
+            inFlight.current = null;
+            setLoading(false);
+            setRefreshing(false);
+          }
         }
-      }
+      })();
+      inFlight.current = pending;
+      return pending;
     },
     [api, activityScope],
   );
   useEffect(() => {
     generation.current++;
     loaded.current = false;
-    inFlight.current = false;
+    inFlight.current = null;
+    setRefreshing(false);
     setEntries([]);
     setUpdatedAt(null);
     setSearch("");
@@ -208,13 +212,15 @@ export default function AuditLogs({
               </select>
             )}
             <SearchField
-              className="management-search management-audit-search"
+              className="management-search"
+              grow
               aria-label="Search audit logs"
               placeholder="Search audit logs…"
               value={search}
               onValueChange={setSearch}
             />
             <RefreshButton
+              key={activityScope}
               label="Refresh audit logs"
               refreshing={refreshing}
               onRefresh={() => refresh(true)}
@@ -357,14 +363,16 @@ export default function AuditLogs({
             </table>
           </div>
         )}
-        <Pagination
-          page={currentPage}
-          pageSize={pageSize}
-          total={filtered.length}
-          onPageChange={setPage}
-          onPageSizeChange={setPageSize}
-          label="audit events"
-        />
+        {filtered.length > 0 && (
+          <Pagination
+            page={currentPage}
+            pageSize={pageSize}
+            total={filtered.length}
+            onPageChange={setPage}
+            onPageSizeChange={setPageSize}
+            label="audit events"
+          />
+        )}
         <div className="management-panel-footer management-audit-footer">
           <span>
             <Check size={14} />

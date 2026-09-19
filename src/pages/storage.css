@@ -563,33 +563,6 @@
   font-size: 10px;
   color: var(--storage-muted);
 }
-.storage-switch {
-  width: 36px;
-  height: 21px;
-  padding: 3px;
-  border: 1px solid #404356;
-  border-radius: 12px;
-  background: #272833;
-  cursor: pointer;
-  flex-shrink: 0;
-  transition: background 0.15s;
-}
-.storage-switch > span {
-  display: block;
-  width: 13px;
-  height: 13px;
-  border-radius: 50%;
-  background: #969bb3;
-  transition: transform 0.15s;
-}
-.storage-switch.enabled {
-  background: #ffd000;
-  border-color: #ffd000;
-}
-.storage-switch.enabled > span {
-  background: #272833;
-  transform: translateX(15px);
-}
 .schedule-fields {
   padding: 22px;
 }

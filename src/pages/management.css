@@ -876,8 +876,6 @@
   white-space: nowrap;
 }
 
-@media (prefers-reduced-motion: reduce) {
-}
 @media (max-width: 1100px) {
   .management-database-summary {
     gap: 22px;
@@ -1053,7 +1051,4 @@
   color: #82b7ff;
   border-color: #82b7ff40;
   background: #82b7ff12;
-}
-.management-audit-search {
-  width: 280px;
 }

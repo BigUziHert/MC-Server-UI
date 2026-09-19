@@ -414,9 +414,6 @@
 }
 
 @media (max-width: 650px) {
-  .subusers-heading h1 {
-    font-size: 23px;
-  }
   .subusers-toolbar {
     padding: 13px;
     flex-wrap: wrap;
@@ -499,6 +496,4 @@
   .subusers-dialog-actions .btn {
     flex: 1;
   }
-}
-@media (prefers-reduced-motion: reduce) {
 }

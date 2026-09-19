@@ -794,15 +794,17 @@ export default function FileManager({ notify }: PageProps) {
             )}
           </div>
         )}
-        <Pagination
-          page={currentPage}
-          pageSize={pageSize}
-          total={filtered.length}
-          onPageChange={setPage}
-          onPageSizeChange={setPageSize}
-          label="files"
-          disabled={saving}
-        />
+        {filtered.length > 0 && (
+          <Pagination
+            page={currentPage}
+            pageSize={pageSize}
+            total={filtered.length}
+            onPageChange={setPage}
+            onPageSizeChange={setPageSize}
+            label="files"
+            disabled={saving}
+          />
+        )}
         <div className="files-footer">
           <span>
             <span className="storage-status-dot" />

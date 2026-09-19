@@ -55,6 +55,33 @@ async function mockInstalledPage(page: Page, type = "mod", extra = {}) {
   );
 }
 
+test("Launchpad requests a Minecraft version and loader for installed files when the runtime is unknown", async ({
+  page,
+}) => {
+  await mockInstalledPage(page, "mod", { gameVersion: "", loader: "" });
+  await page.route("**/api/launchpad/installed?**", (route) =>
+    route.fulfill({ json: { items: [], warnings: [] } }),
+  );
+  await page.goto("/#launchpad");
+  await page.getByRole("switch", { name: "Show installed content" }).check();
+  const notice = page.getByText(
+    "Choose this server’s Minecraft version and loader above to check for updates.",
+    { exact: true },
+  );
+  await expect(notice).toBeVisible();
+  const version = page.getByRole("combobox", {
+    name: "Minecraft version",
+    exact: true,
+  });
+  const loader = page.getByRole("combobox", { name: "Loader", exact: true });
+  await expect(version).toHaveAttribute("aria-invalid", "true");
+  await expect(loader).toHaveAttribute("aria-invalid", "true");
+  await version.selectOption("1.21.1");
+  await expect(notice).toBeVisible();
+  await loader.selectOption("neoforge");
+  await expect(notice).toHaveCount(0);
+});
+
 test("Launchpad retains unchanged identity through stripped local refresh and reports background completion", async ({
   page,
 }) => {
@@ -145,7 +172,7 @@ test("Launchpad retains unchanged identity through stripped local refresh and re
   });
   await expect(
     page.getByRole("status", { name: "Installed content refresh" }),
-  ).toBeVisible();
+  ).toHaveText("Checking updates for 1 of 2…");
   await expect.poll(() => full).toBe(3);
   expect(requests.at(-1)?.searchParams.has("refresh")).toBe(false);
   await expect(
@@ -608,6 +635,9 @@ test("Versions updates an imported NeoForge runtime without a clean install and 
         },
         runtimeUpdate: {
           available: verifiable,
+          reason: verifiable
+            ? undefined
+            : "The installed runtime could not be identified from its launch files.",
           provider: detectedProvider,
           gameVersion: detectedMinecraft,
           build: "21.1.250",
@@ -664,6 +694,9 @@ test("Versions updates an imported NeoForge runtime without a clean install and 
   await expect(update).toBeDisabled();
   await expect(dialog).toContainText(
     "The current runtime changed or could not be verified",
+  );
+  await expect(dialog).toContainText(
+    "The installed runtime could not be identified from its launch files.",
   );
   await expect(dialog.getByRole("checkbox")).toHaveCount(0);
   expect(installations).toEqual([]);
@@ -2798,6 +2831,18 @@ test("Launchpad confines installed update issues to the matching files and platf
   ).toBeVisible();
   await expect(page.getByLabel("Platform", { exact: true })).toBeDisabled();
   await expect(page.getByLabel("Platform", { exact: true })).toHaveValue("all");
+  await expect(
+    page.getByLabel("Platform", { exact: true }).locator("option:checked"),
+  ).toHaveText("All platforms");
+  await expect(
+    healthyRow.locator(".launchpad-badge").filter({ hasText: /^Modrinth$/ }),
+  ).toBeVisible();
+  await expect(
+    page
+      .getByRole("article", { name: "Curse Addon", exact: true })
+      .locator(".launchpad-badge")
+      .filter({ hasText: /^CurseForge$/ }),
+  ).toBeVisible();
   await expect(
     page.getByRole("button", { name: `Update ${healthy.title}`, exact: true }),
   ).toBeEnabled();
