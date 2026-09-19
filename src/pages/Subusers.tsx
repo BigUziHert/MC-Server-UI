@@ -6,8 +6,22 @@ import {
   useState,
   type FormEvent,
 } from "react";
-import { AlertCircle, Pencil, Plus, Trash2, Users, X } from "lucide-react";
-import { useServerApi, relativeTime, type PageProps } from "../api";
+import {
+  AlertCircle,
+  Mail,
+  Pencil,
+  Plus,
+  ShieldCheck,
+  Trash2,
+  Users,
+  X,
+} from "lucide-react";
+import {
+  api as panelApi,
+  useServerApi,
+  relativeTime,
+  type PageProps,
+} from "../api";
 import SearchField, { useDebouncedValue } from "../SearchField";
 import RefreshButton from "../RefreshButton";
 import StatePanel from "../StatePanel";
@@ -21,7 +35,23 @@ type Subuser = {
   role?: string;
   permissions?: string[];
   createdAt: string;
+  inviteStatus?: "pending" | "accepted" | "expired" | "not-invited";
+  invitedAt?: string;
+  acceptedAt?: string;
 };
+type AccessSettings = {
+  enabled: boolean;
+  publicUrl: string;
+  from: string;
+  emailConfigured: boolean;
+  port: number;
+  ready: boolean;
+  listening?: boolean;
+  error?: string;
+};
+function accessReady(settings: AccessSettings | null) {
+  return !!settings?.ready && !settings.error && settings.listening !== false;
+}
 const permissionIds = catalog.groups.flatMap((group) =>
   group.permissions.map((permission) => permission.id),
 );
@@ -33,12 +63,282 @@ function permissionsFor(user: Subuser) {
   return permissionIds.filter((permission) => selected.has(permission));
 }
 
+function RemoteAccessSetup({
+  onSettings,
+  notify,
+}: {
+  onSettings: (settings: AccessSettings | null) => void;
+  notify: PageProps["notify"];
+}) {
+  const [settings, setSettings] = useState<AccessSettings | null>(null);
+  const [draft, setDraft] = useState({
+    enabled: false,
+    publicUrl: "",
+    from: "",
+    port: "3002",
+    apiKey: "",
+  });
+  const [loading, setLoading] = useState(true);
+  const [hidden, setHidden] = useState(false);
+  const [expanded, setExpanded] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState("");
+
+  const applySettings = useCallback(
+    (value: AccessSettings) => {
+      setSettings(value);
+      onSettings(value);
+      setDraft({
+        enabled: value.enabled,
+        publicUrl: value.publicUrl || "",
+        from: value.from || "",
+        port: String(value.port || 3002),
+        apiKey: "",
+      });
+    },
+    [onSettings],
+  );
+
+  const load = useCallback(
+    async (signal?: AbortSignal) => {
+      setLoading(true);
+      setError("");
+      try {
+        const result = await panelApi<AccessSettings>("/access/settings", {
+          signal,
+        });
+        if (signal?.aborted) return;
+        applySettings(result);
+        setExpanded(!accessReady(result));
+      } catch (cause) {
+        if (signal?.aborted) return;
+        if ((cause as { status?: number }).status === 403) {
+          setHidden(true);
+          onSettings(null);
+        } else
+          setError(
+            cause instanceof Error
+              ? cause.message
+              : "Unable to load invitation settings.",
+          );
+      } finally {
+        if (!signal?.aborted) setLoading(false);
+      }
+    },
+    [applySettings, onSettings],
+  );
+
+  useEffect(() => {
+    const controller = new AbortController();
+    void load(controller.signal);
+    return () => controller.abort();
+  }, [load]);
+
+  async function save(event: FormEvent) {
+    event.preventDefault();
+    if (saving) return;
+    setSaving(true);
+    setError("");
+    try {
+      const result = await panelApi<AccessSettings>("/access/settings", {
+        method: "PUT",
+        body: JSON.stringify({
+          enabled: draft.enabled,
+          publicUrl: draft.publicUrl.trim(),
+          from: draft.from.trim(),
+          port: Number(draft.port),
+          ...(draft.apiKey.trim() ? { apiKey: draft.apiKey.trim() } : {}),
+        }),
+      });
+      applySettings(result);
+      if (result.error) setError(result.error);
+      else notify("Remote access settings saved.");
+    } catch (cause) {
+      setError(
+        cause instanceof Error
+          ? cause.message
+          : "Unable to save remote access settings.",
+      );
+      // A failed listener restart can also disable remote access on the server.
+      // Refresh readiness while retaining the owner's draft for correction.
+      try {
+        const current = await panelApi<AccessSettings>("/access/settings");
+        setSettings(current);
+        onSettings(current);
+      } catch {
+        setSettings((current) =>
+          current ? { ...current, ready: false } : null,
+        );
+        onSettings(null);
+      }
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  if (hidden) return null;
+  if (loading)
+    return (
+      <section className="subusers-setup">
+        <StatePanel variant="loading" title="Loading invitation settings…" />
+      </section>
+    );
+  if (!settings)
+    return (
+      <section className="subusers-setup">
+        <StatePanel
+          variant="error"
+          title="Unable to load invitation settings"
+          message={error}
+          onRetry={() => void load()}
+        />
+      </section>
+    );
+  return (
+    <section className="subusers-setup" aria-label="Remote access setup">
+      <div className="subusers-setup-heading">
+        <ShieldCheck size={20} />
+        <div>
+          <h2>
+            {accessReady(settings)
+              ? "Invitations are configured"
+              : "Set up phone access"}
+          </h2>
+          <p>
+            {accessReady(settings)
+              ? "Invite someone by email to control this server with their own permissions."
+              : "Connect a public panel address and email delivery before sending invitations."}
+          </p>
+        </div>
+        <button
+          className="btn"
+          aria-expanded={expanded}
+          aria-controls="subusers-access-settings"
+          onClick={() => setExpanded(!expanded)}
+        >
+          {expanded ? "Hide setup" : "Edit setup"}
+        </button>
+      </div>
+      {expanded && (
+        <form
+          id="subusers-access-settings"
+          className="subusers-setup-form"
+          onSubmit={save}
+        >
+          <fieldset disabled={saving}>
+            <PermissionCheckbox
+              label="Enable remote access"
+              description="Allow invited people to sign in through the public panel address."
+              checked={draft.enabled}
+              onChange={() => setDraft({ ...draft, enabled: !draft.enabled })}
+            />
+            <div className="subusers-setup-grid">
+              <div className="subusers-setup-field">
+                <label htmlFor="subusers-public-url">HTTPS panel URL</label>
+                <input
+                  id="subusers-public-url"
+                  type="url"
+                  placeholder="https://panel.example.com"
+                  required={draft.enabled}
+                  value={draft.publicUrl}
+                  onChange={(event) =>
+                    setDraft({ ...draft, publicUrl: event.target.value })
+                  }
+                />
+                <small>
+                  The address invited people will open on their phone.
+                </small>
+              </div>
+              <div className="subusers-setup-field">
+                <label htmlFor="subusers-mail-from">Sending address</label>
+                <input
+                  id="subusers-mail-from"
+                  placeholder="Minecraft Panel <panel@example.com>"
+                  required={draft.enabled}
+                  value={draft.from}
+                  onChange={(event) =>
+                    setDraft({ ...draft, from: event.target.value })
+                  }
+                />
+                <small>Use a sender from a domain verified in Resend.</small>
+              </div>
+              <div className="subusers-setup-field">
+                <label htmlFor="subusers-mail-key">Resend API key</label>
+                <input
+                  id="subusers-mail-key"
+                  type="password"
+                  autoComplete="new-password"
+                  spellCheck={false}
+                  placeholder={
+                    settings.emailConfigured
+                      ? "Saved — leave blank to keep"
+                      : "re_…"
+                  }
+                  value={draft.apiKey}
+                  onChange={(event) =>
+                    setDraft({ ...draft, apiKey: event.target.value })
+                  }
+                />
+                <small>
+                  {settings.emailConfigured
+                    ? "A key is saved. Enter a new key only to replace it."
+                    : "Used to deliver invitation and sign-in emails. Leave blank to keep a saved key."}
+                </small>
+              </div>
+              <div className="subusers-setup-field">
+                <label htmlFor="subusers-remote-port">Remote access port</label>
+                <input
+                  id="subusers-remote-port"
+                  type="number"
+                  min={1024}
+                  max={65535}
+                  required
+                  value={draft.port}
+                  onChange={(event) =>
+                    setDraft({ ...draft, port: event.target.value })
+                  }
+                />
+                <small>A separate port for authenticated remote access.</small>
+              </div>
+            </div>
+            <p className="subusers-setup-guidance">
+              Point an HTTPS reverse proxy or tunnel at{" "}
+              <code>http://127.0.0.1:{draft.port || "3002"}</code>, then use its
+              public address above. Configure the domain and HTTPS with your
+              provider, and route to this remote access port. The desktop panel
+              port is for local owner access. Keep this computer and the panel
+              running so invitations and phone access work.
+            </p>
+            {(error || settings.error) && (
+              <p className="subusers-form-error" role="alert">
+                <AlertCircle size={16} />
+                {error || settings.error}
+              </p>
+            )}
+            <div className="subusers-setup-actions">
+              <span>
+                {accessReady(settings)
+                  ? "Settings saved. Check that the public address opens from your phone."
+                  : "Save the setup, then send an invitation below."}
+              </span>
+              <button className="btn primary" type="submit">
+                {saving ? "Saving…" : "Save access settings"}
+              </button>
+            </div>
+          </fieldset>
+        </form>
+      )}
+    </section>
+  );
+}
+
 function PermissionCheckbox({
   label,
   accessibleLabel,
   description,
   checked,
   mixed = false,
+  disabled = false,
   onChange,
 }: {
   label: string;
@@ -46,6 +346,7 @@ function PermissionCheckbox({
   description?: string;
   checked: boolean;
   mixed?: boolean;
+  disabled?: boolean;
   onChange: () => void;
 }) {
   const checkbox = useRef<HTMLInputElement>(null);
@@ -59,6 +360,7 @@ function PermissionCheckbox({
         ref={checkbox}
         type="checkbox"
         checked={checked}
+        disabled={disabled}
         aria-checked={mixed ? "mixed" : checked}
         aria-label={accessibleLabel ?? label}
         aria-describedby={description ? descriptionId : undefined}
@@ -89,6 +391,12 @@ export default function Subusers({ notify }: PageProps) {
   const [deleting, setDeleting] = useState<Subuser | null>(null);
   const [busy, setBusy] = useState(false);
   const [formError, setFormError] = useState("");
+  const [accessSettings, setAccessSettings] = useState<AccessSettings | null>(
+    null,
+  );
+  const [sendOnCreate, setSendOnCreate] = useState(false);
+  const [inviting, setInviting] = useState<string | null>(null);
+  const [invitationError, setInvitationError] = useState("");
   const dialog = useRef<HTMLDialogElement>(null);
   const emailInput = useRef<HTMLInputElement>(null);
   const cancelButton = useRef<HTMLButtonElement>(null);
@@ -154,7 +462,32 @@ export default function Subusers({ notify }: PageProps) {
     setEmail(user?.email ?? "");
     setSelected(user ? permissionsFor(user) : []);
     setFormError("");
+    setSendOnCreate(accessReady(accessSettings));
     setEditor(user ?? "create");
+  }
+  async function sendInvitation(user: Subuser) {
+    setInviting(user.id);
+    setInvitationError("");
+    try {
+      const result = await post<{ message: string; user: Subuser }>(
+        `/subusers/${encodeURIComponent(user.id)}/invite`,
+      );
+      setUsers((previous) =>
+        previous.map((item) => (item.id === user.id ? result.user : item)),
+      );
+      notify(result.message || `Invitation sent to ${user.email}.`);
+    } catch (cause) {
+      const message =
+        cause instanceof Error
+          ? cause.message
+          : "Unable to send the invitation.";
+      setInvitationError(
+        `The subuser is saved, but the invitation to ${user.email} was not sent. ${message} Use ${user.invitedAt ? "Invite again" : "Send invite"} to retry.`,
+      );
+      notify("Invitation was not sent. The subuser is still saved.", true);
+    } finally {
+      setInviting(null);
+    }
   }
   function togglePermissions(ids: string[]) {
     setSelected((previous) => {
@@ -177,16 +510,28 @@ export default function Subusers({ notify }: PageProps) {
         await api(`/subusers/${encodeURIComponent(deleting.id)}`, {
           method: "DELETE",
         });
-        notify("Local access record removed.");
+        notify("Subuser access revoked.");
       } else if (editing) {
         await api(`/subusers/${encodeURIComponent(editing.id)}`, {
           method: "PATCH",
           body: JSON.stringify({ permissions: selected }),
         });
-        notify("Subuser permissions saved locally.");
+        notify("Subuser permissions updated. Changes take effect immediately.");
       } else {
-        await post("/subusers", { email: email.trim(), permissions: selected });
-        notify("Local subuser record created.");
+        const result = await post<Subuser | { user: Subuser }>("/subusers", {
+          email: email.trim(),
+          permissions: selected,
+        });
+        // Creation has succeeded even if the separate email request fails.
+        setEditor(null);
+        await refresh();
+        if (sendOnCreate)
+          await sendInvitation("user" in result ? result.user : result);
+        else
+          notify(
+            "Subuser created. Send an invitation when access is configured.",
+          );
+        return;
       }
       setEditor(null);
       setDeleting(null);
@@ -218,12 +563,26 @@ export default function Subusers({ notify }: PageProps) {
       <header className="page-heading">
         <div>
           <h1>Subusers</h1>
+          <p className="subusers-page-description">
+            Invite people to manage this server from their phone or browser.
+          </p>
         </div>
-        <button className="btn primary" onClick={() => openEditor()}>
+        <button
+          className="btn primary"
+          disabled={busy || !!inviting}
+          onClick={() => openEditor()}
+        >
           <Plus size={16} />
           New user
         </button>
       </header>
+      <RemoteAccessSetup onSettings={setAccessSettings} notify={notify} />
+      {invitationError && (
+        <p className="subusers-form-error" role="alert">
+          <AlertCircle size={16} />
+          {invitationError}
+        </p>
+      )}
       <section className="subusers-list" aria-label="Subuser records">
         <div className="subusers-toolbar">
           <div className="subusers-list-title">
@@ -266,7 +625,7 @@ export default function Subusers({ notify }: PageProps) {
             message={
               search
                 ? "Try another email address."
-                : "Create a local record for someone who helps manage this server."
+                : "Add someone by email, choose their permissions, and send an invitation."
             }
           />
         ) : (
@@ -293,7 +652,21 @@ export default function Subusers({ notify }: PageProps) {
                         </span>
                         <div>
                           <strong>{user.email}</strong>
-                          <span>Local record</span>
+                          <span
+                            title={
+                              user.invitedAt
+                                ? `Last invitation sent ${new Date(user.invitedAt).toLocaleString()}`
+                                : undefined
+                            }
+                          >
+                            {user.inviteStatus === "accepted"
+                              ? "Access activated"
+                              : user.inviteStatus === "pending"
+                                ? "Invitation sent · awaiting sign-in"
+                                : user.inviteStatus === "expired"
+                                  ? "Invitation expired · send again"
+                                  : "Not invited"}
+                          </span>
                         </div>
                       </div>
                     </td>
@@ -315,9 +688,30 @@ export default function Subusers({ notify }: PageProps) {
                     <td className="subuser-row-actions">
                       <div>
                         <button
+                          className="btn subuser-invite"
+                          aria-label={`${user.invitedAt ? "Resend invitation to" : "Send invitation to"} ${user.email}`}
+                          title={
+                            accessReady(accessSettings)
+                              ? "Send a sign-in invitation by email"
+                              : "Complete remote access setup to send invitations"
+                          }
+                          disabled={
+                            busy || !!inviting || !accessReady(accessSettings)
+                          }
+                          onClick={() => void sendInvitation(user)}
+                        >
+                          <Mail size={14} />
+                          {inviting === user.id
+                            ? "Sending…"
+                            : user.invitedAt
+                              ? "Invite again"
+                              : "Send invite"}
+                        </button>
+                        <button
                           className="btn icon"
                           aria-label={`Edit permissions for ${user.email}`}
                           title="Edit permissions"
+                          disabled={busy || !!inviting}
                           onClick={() => openEditor(user)}
                         >
                           <Pencil size={15} />
@@ -325,7 +719,8 @@ export default function Subusers({ notify }: PageProps) {
                         <button
                           className="btn icon subuser-delete"
                           aria-label={`Remove access record for ${user.email}`}
-                          title="Remove local record"
+                          title="Revoke access"
+                          disabled={busy || !!inviting}
                           onClick={() => {
                             setFormError("");
                             setDeleting(user);
@@ -384,14 +779,16 @@ export default function Subusers({ notify }: PageProps) {
           <div className="subusers-editor-body">
             {deleting ? (
               <p className="subusers-delete-description">
-                Remove the local record for <strong>{deleting.email}</strong>?
-                You can add it again later.
+                Revoke access for <strong>{deleting.email}</strong>? Their
+                active sessions and invitation links will stop working for this
+                server. You can invite them again later.
               </p>
             ) : (
               <>
                 <p className="subusers-editor-notice">
-                  Permissions are saved locally. No invitation will be sent, and
-                  this record does not grant access.
+                  {editing
+                    ? "Permission changes apply immediately, including to active sessions."
+                    : "Choose what this person can do on this server. Their invitation opens the panel in their phone or browser."}
                 </p>
                 <div className="subusers-email">
                   <label htmlFor="subuser-email">Email address</label>
@@ -408,14 +805,54 @@ export default function Subusers({ notify }: PageProps) {
                     disabled={busy}
                   />
                 </div>
+                {!editing && (
+                  <div className="subusers-invitation-choice">
+                    <PermissionCheckbox
+                      label="Send invitation by email"
+                      disabled={busy || !accessReady(accessSettings)}
+                      description={
+                        accessReady(accessSettings)
+                          ? "Send a sign-in link as soon as this subuser is created."
+                          : "Complete remote access setup before sending invitations. You can create the subuser now and invite them later."
+                      }
+                      checked={sendOnCreate}
+                      onChange={() => setSendOnCreate(!sendOnCreate)}
+                    />
+                    {!accessReady(accessSettings) && (
+                      <small>
+                        No invitation will be sent until remote access is
+                        configured.
+                      </small>
+                    )}
+                  </div>
+                )}
                 <fieldset className="subusers-permissions" disabled={busy}>
                   <legend className="subusers-sr-only">
-                    Intended permissions
+                    Server permissions
                   </legend>
+                  <div className="subusers-preset">
+                    <div>
+                      <strong>Server controls</strong>
+                      <p>Start, stop, restart, and use the console.</p>
+                    </div>
+                    <button
+                      type="button"
+                      className="btn"
+                      onClick={() =>
+                        setSelected(
+                          permissionIds.filter((id) =>
+                            id.startsWith("control."),
+                          ),
+                        )
+                      }
+                    >
+                      Use Control preset
+                    </button>
+                  </div>
                   <div className="subusers-all-permissions">
                     <PermissionCheckbox
                       label="All permissions"
-                      description="Select every permission for this local record."
+                      description="Grant every listed permission for this server."
                       checked={selected.length === permissionIds.length}
                       mixed={
                         selected.length > 0 &&

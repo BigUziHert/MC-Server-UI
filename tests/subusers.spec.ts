@@ -74,6 +74,12 @@ test("granular subuser permissions persist, edit, and expose accurate mixed grou
     exact: true,
   });
   await expect(dialog).toContainText("No invitation will be sent");
+  await expect(
+    dialog.getByRole("checkbox", {
+      name: "Send invitation by email",
+      exact: true,
+    }),
+  ).toBeDisabled();
   await dialog.getByLabel("Email address", { exact: true }).fill(email);
   const all = dialog.getByRole("checkbox", {
     name: "All permissions",
@@ -138,6 +144,7 @@ test("granular subuser permissions persist, edit, and expose accurate mixed grou
     name: "Edit subuser permissions",
     exact: true,
   });
+  await expect(dialog).toContainText("Permission changes apply immediately");
   await expect(
     dialog.getByLabel("Email address", { exact: true }),
   ).toHaveJSProperty("readOnly", true);
@@ -271,6 +278,218 @@ test("subuser cancellation and save errors preserve deliberate selections withou
   });
 });
 
+test("a failed invitation preserves the created subuser and retry sends without duplicate creation", async ({
+  page,
+  request,
+  server,
+}) => {
+  await page.route("**/api/access/settings", (route) =>
+    route.fulfill({
+      json: {
+        enabled: true,
+        publicUrl: "https://panel.example.test",
+        from: "panel@example.test",
+        emailConfigured: true,
+        port: 3002,
+        ready: true,
+        listening: true,
+      },
+    }),
+  );
+  let creates = 0;
+  let invitations = 0;
+  await page.route("**/api/subusers", (route) => {
+    if (route.request().method() === "POST") creates++;
+    return route.continue();
+  });
+  await page.route("**/api/subusers/*/invite", async (route) => {
+    invitations++;
+    expect(route.request().headers()["x-server-id"]).toBe(server.id);
+    if (invitations === 1)
+      return route.fulfill({
+        status: 502,
+        json: { error: "Email delivery is unavailable." },
+      });
+    const user = (await users(request, server.id))[0];
+    return route.fulfill({
+      json: {
+        message: "Invitation sent.",
+        user: {
+          ...user,
+          inviteStatus: "pending",
+          invitedAt: new Date().toISOString(),
+        },
+      },
+    });
+  });
+  await openSubusers(page, server.id);
+  await expect(
+    page.getByRole("heading", {
+      name: "Invitations are configured",
+      exact: true,
+    }),
+  ).toBeVisible();
+  await page.getByRole("button", { name: "New user", exact: true }).click();
+  const dialog = page.getByRole("dialog", {
+    name: "Create new subuser",
+    exact: true,
+  });
+  await dialog
+    .getByLabel("Email address", { exact: true })
+    .fill("phone@example.test");
+  await expect(
+    dialog.getByRole("checkbox", {
+      name: "Send invitation by email",
+      exact: true,
+    }),
+  ).toBeChecked();
+  await dialog
+    .getByRole("button", { name: "Use Control preset", exact: true })
+    .click();
+  await dialog
+    .getByRole("button", { name: "Create subuser", exact: true })
+    .click();
+  await expect(dialog).not.toBeVisible();
+  await expect(
+    page.getByRole("alert").filter({ hasText: "The subuser is saved" }),
+  ).toContainText("Email delivery is unavailable.");
+  const saved = await users(request, server.id);
+  expect(saved).toHaveLength(1);
+  expect(saved[0].permissions).toEqual([
+    "control.console",
+    "control.start",
+    "control.stop",
+    "control.restart",
+  ]);
+  const row = page.getByRole("row").filter({ hasText: "phone@example.test" });
+  await expect(row).toContainText("Not invited");
+  await row
+    .getByRole("button", {
+      name: "Send invitation to phone@example.test",
+      exact: true,
+    })
+    .click();
+  await expect(row).toContainText("Invitation sent · awaiting sign-in");
+  await expect(
+    row.getByRole("button", {
+      name: "Resend invitation to phone@example.test",
+      exact: true,
+    }),
+  ).toBeEnabled();
+  await expect(
+    page.getByRole("alert").filter({ hasText: "The subuser is saved" }),
+  ).toHaveCount(0);
+  expect(creates).toBe(1);
+  expect(invitations).toBe(2);
+  expect(await users(request, server.id)).toHaveLength(1);
+});
+
+test("remote setup keeps saved email keys private and surfaces listener failures", async ({
+  page,
+  server,
+}, testInfo) => {
+  const changes: Record<string, unknown>[] = [];
+  const configured = {
+    enabled: true,
+    publicUrl: "https://panel.example.test",
+    from: "panel@example.test",
+    emailConfigured: true,
+    port: 3002,
+    ready: true,
+    listening: true,
+  };
+  await page.route("**/api/access/settings", async (route) => {
+    if (route.request().method() === "GET")
+      return route.fulfill({
+        json: {
+          ...configured,
+          ...(changes.length === 3
+            ? {
+                enabled: false,
+                ready: false,
+                listening: false,
+                error: "Remote access port is already in use.",
+              }
+            : {}),
+        },
+      });
+    const body = route.request().postDataJSON();
+    changes.push(body);
+    if (changes.length === 3)
+      return route.fulfill({
+        status: 409,
+        json: { error: "Remote access port is already in use." },
+      });
+    return route.fulfill({
+      json: {
+        ...configured,
+        ...body,
+        apiKey: undefined,
+      },
+    });
+  });
+  await openSubusers(page, server.id);
+  await page.getByRole("button", { name: "Edit setup", exact: true }).click();
+  const setup = page.getByRole("region", {
+    name: "Remote access setup",
+    exact: true,
+  });
+  await page.screenshot({
+    path: testInfo.outputPath("subusers-access-setup-desktop.png"),
+    fullPage: true,
+  });
+  await expect(setup.getByLabel("Resend API key", { exact: true })).toHaveValue(
+    "",
+  );
+  await setup
+    .getByLabel("Sending address", { exact: true })
+    .fill("MC Panel <new@example.test>");
+  await setup
+    .getByRole("button", { name: "Save access settings", exact: true })
+    .click();
+  await expect.poll(() => changes.length).toBe(1);
+  expect(changes[0]).toEqual({
+    enabled: true,
+    publicUrl: configured.publicUrl,
+    from: "MC Panel <new@example.test>",
+    port: 3002,
+  });
+  await expect(
+    setup.getByRole("button", { name: "Save access settings", exact: true }),
+  ).toBeEnabled();
+  await setup
+    .getByLabel("Resend API key", { exact: true })
+    .fill("re_fixture_replacement");
+  await setup
+    .getByRole("button", { name: "Save access settings", exact: true })
+    .click();
+  await expect.poll(() => changes.length).toBe(2);
+  expect(changes[1].apiKey).toBe("re_fixture_replacement");
+  await expect(setup.getByLabel("Resend API key", { exact: true })).toHaveValue(
+    "",
+  );
+  await setup.getByLabel("Remote access port", { exact: true }).fill("3003");
+  await setup
+    .getByRole("button", { name: "Save access settings", exact: true })
+    .click();
+  await expect.poll(() => changes.length).toBe(3);
+  await expect(setup.getByRole("alert")).toContainText(
+    "Remote access port is already in use.",
+  );
+  await expect(
+    setup.getByRole("heading", { name: "Set up phone access", exact: true }),
+  ).toBeVisible();
+  await expect(
+    setup.getByLabel("Remote access port", { exact: true }),
+  ).toHaveValue("3003");
+  await page.getByRole("button", { name: "New user", exact: true }).click();
+  await expect(
+    page
+      .getByRole("dialog")
+      .getByRole("checkbox", { name: "Send invitation by email", exact: true }),
+  ).toBeDisabled();
+});
+
 test("permission groups and confirmation controls fit a mobile viewport", async ({
   page,
   server,
@@ -281,6 +500,18 @@ test("permission groups and confirmation controls fit a mobile viewport", async 
     .getByRole("button", { name: "Open navigation", exact: true })
     .click();
   await selectServer(page, server.id);
+  await expect(
+    page.getByRole("region", { name: "Remote access setup", exact: true }),
+  ).toBeVisible();
+  expect(
+    await page.evaluate(
+      () => document.documentElement.scrollWidth - window.innerWidth,
+    ),
+  ).toBeLessThanOrEqual(1);
+  await page.screenshot({
+    path: testInfo.outputPath("subusers-access-setup-mobile.png"),
+    fullPage: true,
+  });
   await page.getByRole("button", { name: "New user", exact: true }).click();
   const dialog = page.getByRole("dialog", {
     name: "Create new subuser",

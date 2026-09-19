@@ -1,0 +1,524 @@
+.remote-access {
+  min-height: 100dvh;
+}
+.remote-access .btn {
+  min-height: 44px;
+}
+.remote-brand {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.remote-brand > span {
+  display: grid;
+  place-items: center;
+  width: 40px;
+  height: 40px;
+  border-radius: 12px;
+  background: var(--accent);
+  color: #18171a;
+}
+.remote-brand strong {
+  font-family: "Manrope", sans-serif;
+  font-size: 18px;
+  letter-spacing: -0.5px;
+}
+.remote-brand small {
+  color: var(--muted);
+  font-size: 10px;
+  letter-spacing: 1.4px;
+  border-left: 1px solid var(--border);
+  margin-left: 7px;
+  padding-left: 17px;
+}
+.remote-auth {
+  display: grid;
+  place-items: center;
+  padding: 32px 20px;
+  background:
+    radial-gradient(ellipse at top, #2b2a20 0, transparent 60%), var(--bg);
+}
+.remote-auth-card {
+  width: min(100%, 460px);
+  padding: 34px;
+  border: 1px solid var(--border);
+  border-radius: 20px;
+  background: #1c1d26;
+  box-shadow: 0 20px 80px #0003;
+}
+.remote-auth-card .remote-brand {
+  margin-bottom: 42px;
+}
+.remote-auth-card h1 {
+  font-size: 30px;
+  line-height: 1.25;
+  letter-spacing: -1px;
+  margin-bottom: 14px;
+}
+.remote-auth-card p {
+  font-size: 14px;
+}
+.remote-auth-icon {
+  display: grid;
+  place-items: center;
+  width: 62px;
+  height: 62px;
+  background: #ffd00012;
+  border: 1px solid #ffd00026;
+  border-radius: 17px;
+  color: var(--accent);
+  margin-bottom: 22px;
+}
+.remote-signin-form {
+  display: grid;
+  gap: 9px;
+  margin-top: 25px;
+}
+.remote-signin-form label {
+  font-size: 13px;
+  font-weight: 600;
+}
+.remote-signin-form input {
+  min-height: 48px;
+  font-size: 16px;
+}
+.remote-auth-submit {
+  margin-top: 13px;
+  width: 100%;
+  justify-content: center;
+  gap: 10px;
+}
+.remote-auth-submit > svg:last-child {
+  margin-left: auto;
+}
+.remote-auth-card .remote-auth-note {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  margin: 25px 0 0;
+  font-size: 12px;
+  line-height: 1.5;
+}
+.remote-auth-note svg {
+  margin-top: 2px;
+}
+.remote-notice {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  border: 1px solid #3b624b;
+  background: #23372b;
+  color: #c8ead2;
+  border-radius: 10px;
+  padding: 14px 16px;
+  margin-bottom: 18px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+.remote-notice .btn {
+  margin-left: auto;
+  flex-shrink: 0;
+}
+.remote-notice p {
+  color: inherit;
+  margin: 4px 0 0;
+}
+.remote-notice.is-error {
+  background: #3b252d;
+  border-color: #743344;
+  color: #f2b9c6;
+}
+.remote-loading {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.remote-header {
+  height: 80px;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 20px;
+  padding: 0 max(24px, calc((100% - 1080px) / 2));
+  border-bottom: 1px solid var(--border);
+  background: #1b1c25;
+}
+.remote-main {
+  max-width: 1080px;
+  margin: 0 auto;
+  padding: 24px 0 56px;
+}
+.remote-account {
+  display: flex;
+  justify-content: space-between;
+  gap: 15px;
+  color: var(--muted);
+  font-size: 12px;
+  margin-bottom: 30px;
+  overflow-wrap: anywhere;
+}
+.remote-account > span:last-child {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.remote-account strong {
+  font-weight: 500;
+  color: var(--text);
+}
+.remote-server-select {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  color: var(--muted);
+  margin-bottom: 24px;
+}
+.remote-server-select select {
+  min-height: 44px;
+  min-width: 220px;
+}
+.remote-server-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 24px;
+  margin-bottom: 28px;
+}
+.remote-server-heading > div {
+  min-width: 0;
+}
+.remote-server-heading p {
+  color: var(--muted);
+  letter-spacing: 1.5px;
+  font-size: 10px;
+  font-weight: 600;
+  margin-bottom: 7px;
+}
+.remote-server-heading h1 {
+  overflow-wrap: anywhere;
+}
+.remote-server-heading > div > span {
+  color: var(--muted);
+  font-size: 13px;
+}
+.remote-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  background: #ffffff08;
+  border: 1px solid var(--border);
+  padding: 8px 12px;
+  font-size: 12px;
+  border-radius: 30px;
+  text-transform: capitalize;
+  white-space: nowrap;
+}
+.remote-status i {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: #9ca2b8;
+}
+.remote-status.running {
+  border-color: #355d46;
+  color: #97dcb0;
+  background: #2a443020;
+}
+.remote-status.running i {
+  background: #79cd91;
+}
+.remote-status.starting i,
+.remote-status.stopping i {
+  background: #efc861;
+}
+.remote-card {
+  border: 1px solid var(--border);
+  background: var(--panel);
+  border-radius: 14px;
+  padding: 24px;
+}
+.remote-controls {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 24px;
+  margin-bottom: 18px;
+}
+.remote-controls h2 {
+  font-size: 16px;
+}
+.remote-controls p {
+  margin-bottom: 0;
+  font-size: 13px;
+}
+.remote-power-buttons {
+  display: flex;
+  flex-shrink: 0;
+  gap: 9px;
+}
+.remote-power-buttons .btn {
+  padding: 0 18px;
+  gap: 9px;
+}
+.remote-stats {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 18px;
+  margin-bottom: 18px;
+}
+.remote-stats .remote-card {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 8px;
+}
+.remote-stats span,
+.remote-stats small {
+  color: var(--muted);
+  font-size: 12px;
+}
+.remote-stats strong {
+  font-family: "Manrope", sans-serif;
+  font-size: 25px;
+  font-weight: 650;
+}
+.remote-stats small {
+  word-break: break-word;
+}
+.remote-console {
+  padding: 0;
+  overflow: hidden;
+}
+.remote-console > header {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 19px 22px;
+  border-bottom: 1px solid var(--border);
+}
+.remote-console h2 {
+  font-size: 15px;
+  margin: 0;
+}
+.remote-console > header > svg {
+  color: var(--muted);
+}
+.remote-console > header > span {
+  margin-left: auto;
+  color: var(--muted);
+  font-size: 11px;
+}
+.remote-console-output {
+  height: 360px;
+  background: #101117;
+  padding: 16px 20px;
+  overflow: auto;
+  overscroll-behavior: contain;
+  font:
+    11px/1.8 "JetBrains Mono",
+    monospace;
+}
+.remote-console-output > div {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+}
+.remote-console-output time {
+  color: #82899c;
+  flex-shrink: 0;
+}
+.remote-console-output span {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  min-width: 0;
+}
+.remote-console-output .error {
+  color: #f4a2b3;
+}
+.remote-console-output .warn {
+  color: #ebd388;
+}
+.remote-console-output p {
+  font: inherit;
+}
+.remote-command {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  border-top: 1px solid var(--border);
+  padding: 10px 14px;
+}
+.remote-command > svg {
+  color: var(--muted);
+}
+.remote-command input {
+  flex: 1;
+  width: 0;
+  min-height: 44px;
+  border: 0;
+  background: transparent;
+  font-family: "JetBrains Mono", monospace;
+  font-size: 13px;
+  padding: 10px 6px;
+}
+.remote-command .btn {
+  padding: 0 12px;
+}
+.remote-permission-note {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 20px 0 0;
+  font-size: 12px;
+  color: var(--muted);
+}
+.remote-tabs {
+  display: flex;
+  gap: 6px;
+  overflow-x: auto;
+  margin-bottom: 22px;
+  border-bottom: 1px solid var(--border);
+}
+.remote-tabs button {
+  min-height: 46px;
+  padding: 0 17px;
+  color: var(--muted);
+  background: transparent;
+  border-bottom: 2px solid transparent;
+}
+.remote-tabs button.active {
+  color: var(--accent);
+  border-bottom-color: var(--accent);
+}
+.remote-existing-page {
+  min-width: 0;
+}
+.remote-confirm {
+  width: min(440px, calc(100% - 32px));
+  padding: 26px;
+  background: var(--panel);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 14px;
+}
+.remote-confirm::backdrop {
+  background: #080910b8;
+}
+.remote-confirm > div {
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+  margin-top: 22px;
+}
+@media (max-width: 1128px) {
+  .remote-main {
+    margin: 0 24px;
+  }
+}
+@media (max-width: 680px) {
+  .remote-header {
+    height: 72px;
+    padding: 0 18px;
+  }
+  .remote-brand small {
+    display: none;
+  }
+  .remote-main {
+    margin: 0;
+    padding: 20px 16px 40px;
+  }
+  .remote-account {
+    margin-bottom: 26px;
+    font-size: 11px;
+  }
+  .remote-account > span:first-child {
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+  }
+  .remote-server-heading {
+    gap: 12px;
+    margin-bottom: 22px;
+    align-items: flex-start;
+  }
+  .remote-server-heading h1 {
+    font-size: 27px;
+    letter-spacing: -0.8px;
+  }
+  .remote-status {
+    margin-top: 24px;
+    padding: 6px 9px;
+    font-size: 11px;
+  }
+  .remote-controls {
+    display: block;
+    padding: 20px;
+  }
+  .remote-power-buttons {
+    margin-top: 20px;
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(80px, 1fr));
+  }
+  .remote-power-buttons .btn {
+    justify-content: center;
+    padding: 0 10px;
+    font-size: 13px;
+  }
+  .remote-stats {
+    gap: 12px;
+  }
+  .remote-stats .remote-card {
+    padding: 17px;
+  }
+  .remote-stats strong {
+    font-size: 22px;
+  }
+  .remote-console > header {
+    padding: 17px;
+  }
+  .remote-console-output {
+    height: 320px;
+    padding: 12px;
+    font-size: 10px;
+  }
+  .remote-console-output > div {
+    gap: 8px;
+  }
+  .remote-command {
+    padding: 8px;
+  }
+  .remote-command input {
+    font-size: 16px;
+  }
+  .remote-auth-card {
+    padding: 26px;
+    border-radius: 16px;
+  }
+  .remote-auth-card h1 {
+    font-size: 28px;
+  }
+  .remote-auth-card .remote-brand {
+    margin-bottom: 34px;
+  }
+  .remote-server-select {
+    display: grid;
+    gap: 7px;
+    font-size: 12px;
+  }
+  .remote-server-select select {
+    width: 100%;
+    font-size: 16px;
+  }
+  .remote-notice {
+    padding: 12px;
+    font-size: 13px;
+    flex-wrap: wrap;
+  }
+  .remote-existing-page .page-heading {
+    flex-wrap: wrap;
+    gap: 12px;
+  }
+  .remote-existing-page .page-heading h1 {
+    font-size: 25px;
+  }
+}

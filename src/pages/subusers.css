@@ -1,3 +1,135 @@
+.subusers-page-description {
+  margin: 9px 0 0;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.6;
+}
+.subusers-setup {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  margin-bottom: 22px;
+  min-width: 0;
+}
+.subusers-setup-heading {
+  display: flex;
+  align-items: center;
+  gap: 13px;
+  padding: 20px;
+}
+.subusers-setup-heading > svg {
+  flex-shrink: 0;
+  color: #a9b4e7;
+}
+.subusers-setup-heading > div {
+  flex: 1;
+  min-width: 0;
+}
+.subusers-setup-heading h2 {
+  margin: 0 0 7px;
+  font-size: 14px;
+  color: var(--text);
+}
+.subusers-setup-heading p,
+.subusers-preset p {
+  margin: 0;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.7;
+}
+.subusers-setup-heading .btn {
+  flex-shrink: 0;
+  font-size: 12px;
+}
+.subusers-setup-form {
+  border-top: 1px solid var(--border);
+  padding: 18px 20px 20px;
+}
+.subusers-setup-form fieldset {
+  min-width: 0;
+  border: 0;
+  padding: 0;
+  margin: 0;
+}
+.subusers-setup-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 18px 22px;
+  margin-top: 18px;
+}
+.subusers-setup-field {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-width: 0;
+}
+.subusers-setup-field label {
+  color: var(--text);
+  font-size: 12px;
+}
+.subusers-setup-field input {
+  min-width: 0;
+  width: 100%;
+  padding: 11px 12px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: #303140;
+  color: var(--text);
+  font-size: 12px;
+}
+.subusers-setup-field small,
+.subusers-setup-actions > span,
+.subusers-invitation-choice > small {
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.7;
+}
+.subusers-setup-guidance {
+  font-size: 12px;
+  line-height: 1.8;
+  color: var(--muted);
+  padding: 14px 16px;
+  margin: 21px 0;
+  background: #1d1e27;
+  border-radius: 4px;
+  overflow-wrap: anywhere;
+}
+.subusers-setup-guidance code {
+  color: #c5cbe1;
+}
+.subusers-setup-actions,
+.subusers-preset {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 18px;
+}
+.subusers-setup-actions .btn,
+.subusers-preset .btn {
+  flex-shrink: 0;
+  font-size: 12px;
+}
+.subusers-preset {
+  margin-bottom: 17px;
+  padding: 0 0 17px;
+  border-bottom: 1px solid var(--border);
+}
+.subusers-preset strong {
+  display: block;
+  margin-bottom: 4px;
+  font-size: 13px;
+  font-weight: 500;
+}
+.subusers-invitation-choice {
+  margin: 0 0 22px;
+}
+.subusers-invitation-choice > small {
+  display: block;
+  margin: 6px 8px 0 35px;
+}
+.subuser-permission:has(input:disabled) {
+  cursor: default;
+}
 .subusers-list {
   background: var(--panel);
   border: 1px solid var(--border);
@@ -97,7 +229,7 @@
   color: var(--muted);
 }
 .subusers-table .subuser-row-actions {
-  width: 116px;
+  width: 234px;
 }
 .subusers-table tbody tr:hover {
   background: #252633;
@@ -142,6 +274,13 @@
   display: flex;
   justify-content: flex-end;
   gap: 6px;
+}
+.subuser-invite {
+  font-size: 11px;
+  white-space: nowrap;
+}
+.subusers-form-error > svg {
+  flex-shrink: 0;
 }
 .subusers-page .subuser-delete:hover {
   background: #412b31;
@@ -414,6 +553,35 @@
 }
 
 @media (max-width: 650px) {
+  .subusers-page .page-heading {
+    align-items: flex-start;
+  }
+  .subusers-setup-heading {
+    flex-wrap: wrap;
+    align-items: flex-start;
+    padding: 16px;
+  }
+  .subusers-setup-heading > div {
+    flex-basis: calc(100% - 40px);
+  }
+  .subusers-setup-heading .btn {
+    margin-left: 33px;
+  }
+  .subusers-setup-form {
+    padding: 14px 16px 16px;
+  }
+  .subusers-setup-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .subusers-setup-actions,
+  .subusers-preset {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 12px;
+  }
+  .subusers-setup-actions .btn {
+    width: 100%;
+  }
   .subusers-toolbar {
     padding: 13px;
     flex-wrap: wrap;
@@ -443,16 +611,24 @@
     width: 81px;
   }
   .subusers-table .subuser-row-actions {
-    width: 88px;
+    width: 122px;
   }
   .subuser-avatar {
     display: none;
   }
   .subuser-row-actions > div {
+    display: grid;
+    grid-template-columns: repeat(2, 1fr);
     gap: 4px;
   }
+  .subuser-row-actions .subuser-invite {
+    grid-column: 1 / -1;
+    font-size: 10px;
+    padding: 6px;
+    min-height: 32px;
+  }
   .subusers-table .btn.icon {
-    width: 29px;
+    width: 100%;
     min-height: 31px;
     padding: 5px;
   }

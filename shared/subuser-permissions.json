@@ -31,27 +31,27 @@
     {
       "id": "user",
       "label": "User",
-      "description": "Manage subuser records and their intended permissions.",
+      "description": "Manage access for people helping with this server.",
       "permissions": [
         {
           "id": "user.read",
           "label": "View users",
-          "description": "View the server's subuser records."
+          "description": "View people with access to this server."
         },
         {
           "id": "user.create",
           "label": "Create users",
-          "description": "Add new subuser records."
+          "description": "Add and invite people with permissions you also have."
         },
         {
           "id": "user.update",
           "label": "Update users",
-          "description": "Change a subuser's intended permissions."
+          "description": "Change a subuser's permissions, within your own access."
         },
         {
           "id": "user.delete",
           "label": "Delete users",
-          "description": "Remove subuser records."
+          "description": "Revoke a subuser's access to this server."
         }
       ]
     },

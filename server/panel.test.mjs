@@ -550,7 +550,7 @@ test("databases are actual SQLite files and access records do not imply authenti
   const audit = await request("/api/audit");
   assert.ok(
     audit.body.entries.some((item) =>
-      item.detail.includes("No invitation was sent"),
+      item.detail.includes("Invitation not yet sent"),
     ),
   );
   assert.equal(

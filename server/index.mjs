@@ -25,6 +25,13 @@ import { auditEntry, auditHistory, contentKind } from "./audit.mjs";
 import { installedMinecraftMetadata } from "./installed-minecraft.mjs";
 import { minecraftGameVersion } from "./minecraft-version.mjs";
 import { createLauncherStop } from "./launcher-stop.mjs";
+import { createAccessService } from "./access.mjs";
+import {
+  createRemoteGateway,
+  createRemoteListener,
+  remotePrincipal,
+  requestActor,
+} from "./remote-access.mjs";
 import {
   createPlayerHistory,
   readPlayerRecords,
@@ -570,7 +577,7 @@ export async function createPanel(options = {}) {
     category,
     action,
     detail,
-    actor = "Local administrator",
+    actor = requestActor.getStore() ?? "Local administrator",
   ) => {
     state.audit.unshift(auditEntry(category, action, detail, actor));
     state.audit = state.audit.slice(0, 2000);
@@ -931,7 +938,11 @@ export async function createPanel(options = {}) {
     ...(options.source === "imported" ? { source: "imported", serverDir } : {}),
   });
 
-  const lifecycleAudit = (action, detail, actor = "Local administrator") => {
+  const lifecycleAudit = (
+    action,
+    detail,
+    actor = requestActor.getStore() ?? "Local administrator",
+  ) => {
     // saveChain drains these writes at shutdown. Audit I/O must not make a
     // stopped server appear busy or change the process outcome.
     return audit("server", action, detail, actor).catch(() => {});
@@ -1247,7 +1258,7 @@ export async function createPanel(options = {}) {
       try {
         if (terminationPromise) await terminationPromise;
         else {
-          processStopActor = "Local administrator";
+          processStopActor = requestActor.getStore() ?? "Local administrator";
           append(
             "[Panel] Force stopping the server and its owned process tree…",
             "warn",
@@ -1283,7 +1294,7 @@ export async function createPanel(options = {}) {
       );
       const child = processHandle;
       const stop = processStop;
-      processStopActor = "Local administrator";
+      processStopActor = requestActor.getStore() ?? "Local administrator";
       // Bound an unresponsive wrapper, but never interrupt Minecraft after it
       // confirms graceful shutdown. A trailing batch pause is handled on stdout.
       if (["script", "executable"].includes(configuration.launchType)) {
@@ -1465,7 +1476,7 @@ export async function createPanel(options = {}) {
   }
   async function recycleBackup(
     item,
-    actor = "Local administrator",
+    actor = requestActor.getStore() ?? "Local administrator",
     retention = false,
   ) {
     const recycled = await recycleBin.recycle(`backups/${item.id}.tar.gz`, {
@@ -1546,7 +1557,9 @@ export async function createPanel(options = {}) {
         "backup",
         "Backup created",
         `${backupName} (${trigger}).`,
-        trigger === "scheduled" ? "Scheduler" : "Local administrator",
+        trigger === "scheduled"
+          ? "Scheduler"
+          : (requestActor.getStore() ?? "Local administrator"),
       );
       return item;
     } catch (cause) {
@@ -1567,7 +1580,9 @@ export async function createPanel(options = {}) {
               "backup",
               "World save recovery failed",
               `Run save-on on the server: ${cause.message}`,
-              trigger === "scheduled" ? "Scheduler" : "Local administrator",
+              trigger === "scheduled"
+                ? "Scheduler"
+                : (requestActor.getStore() ?? "Local administrator"),
             );
           }
         }
@@ -1630,6 +1645,7 @@ export async function createPanel(options = {}) {
     res.setHeader("Referrer-Policy", "no-referrer");
     res.setHeader("Cache-Control", "no-store");
     if (closed) return next(error(503, "The panel is shutting down."));
+    if (req[remotePrincipal]) return next();
     const host = (() => {
       try {
         return new URL(`http://${req.headers.host}`).hostname;
@@ -2220,7 +2236,9 @@ export async function createPanel(options = {}) {
   app.post(
     "/api/files/recycle-bin/:id/restore",
     trackOperation(async (req, res) => {
-      const item = await recycleBin.inspect(req.params.id, { includeHash: false });
+      const item = await recycleBin.inspect(req.params.id, {
+        includeHash: false,
+      });
       if (item.kind === "backup") {
         // A failed final recycle journal write can leave a stale history row.
         // The bin verifies the archive destination itself and refuses conflicts;
@@ -2513,8 +2531,30 @@ export async function createPanel(options = {}) {
       res.json({ ok: true, recycled });
     }),
   );
+  const presentedUser = (user) => ({
+    ...userWithPermissions(user),
+    inviteStatus: "not-invited",
+    ...options.invitationState?.(user.id),
+  });
   app.get("/api/subusers", (_req, res) =>
-    res.json({ users: state.users.map(userWithPermissions) }),
+    res.json({ users: state.users.map(presentedUser) }),
+  );
+  app.post(
+    "/api/subusers/:id/invite",
+    trackOperation(async (req, res) => {
+      const user = getItem(state.users, req.params.id);
+      if (!options.inviteUser)
+        throw error(
+          503,
+          "Set up remote access in the panel before sending invitations.",
+        );
+      await options.inviteUser(userWithPermissions(user));
+      await audit("user", "Subuser invitation sent", user.email);
+      res.json({
+        message: "Invitation sent. Ask the recipient to check their inbox.",
+        user: presentedUser(user),
+      });
+    }),
   );
   app.post(
     "/api/subusers",
@@ -2528,7 +2568,7 @@ export async function createPanel(options = {}) {
       )
         throw error(400, "Enter a valid email address and role.");
       if (state.users.some((item) => item.email === email.toLowerCase()))
-        throw error(409, "This email already has a local access record.");
+        throw error(409, "This email already has access to this server.");
       const item = {
         id: randomUUID(),
         email: email.toLowerCase(),
@@ -2542,8 +2582,8 @@ export async function createPanel(options = {}) {
       state.users.push(item);
       await audit(
         "user",
-        "Local access record added",
-        `${item.email} · ${role}. No invitation was sent; authentication is not configured.`,
+        "Subuser added",
+        `${item.email} · ${item.permissions.length} permissions. Invitation not yet sent.`,
       );
       res.status(201).json(item);
     }),
@@ -2557,8 +2597,8 @@ export async function createPanel(options = {}) {
       item.role = "custom";
       await audit(
         "user",
-        "Local access permissions updated",
-        `${item.email} · ${permissions.length} intended permissions. Authentication is not configured.`,
+        "Subuser permissions updated",
+        `${item.email} · ${permissions.length} permissions. Changes apply to subsequent requests.`,
       );
       res.json(userWithPermissions(item));
     }),
@@ -2568,7 +2608,8 @@ export async function createPanel(options = {}) {
     trackOperation(async (req, res) => {
       const item = getItem(state.users, req.params.id);
       state.users = state.users.filter((entry) => entry.id !== item.id);
-      await audit("user", "Local access record removed", item.email);
+      await audit("user", "Subuser access revoked", item.email);
+      await options.revokeUser?.(item.id);
       res.json({ ok: true });
     }),
   );
@@ -2682,6 +2723,7 @@ export async function createPanel(options = {}) {
     serverDir,
     tick,
     descriptor,
+    subusers: () => state.users.map(userWithPermissions),
     refreshStartupMetadata,
     assertRemovable: () => {
       if (closed) throw error(409, "This server is already shutting down.");
@@ -2842,6 +2884,7 @@ export async function createFleet(options = {}) {
     }
   };
   const runtimes = new Map();
+  let access;
   let registry;
   let changeChain = Promise.resolve();
   let closed = false;
@@ -2991,6 +3034,14 @@ export async function createFleet(options = {}) {
       ...entry,
       memoryLimit: entry.memoryLimitMB,
       useEnvironment: false,
+      invitationState: (userId) => access?.invitationState(entry.id, userId),
+      inviteUser: (user) =>
+        access.invite({
+          serverId: entry.id,
+          user,
+          serverName: runtime.descriptor().name,
+        }),
+      revokeUser: (userId) => access.revoke(entry.id, userId),
       existingServerDir: entry.storage === "external",
       scheduler: options.scheduler,
       spawnServer: options.spawnServer,
@@ -3183,6 +3234,43 @@ export async function createFleet(options = {}) {
     throw cause;
   }
 
+  try {
+    access = await createAccessService({
+      dataDir,
+      sendMail: options.sendMail,
+      getUser: (serverId, userId) =>
+        runtimes
+          .get(serverId)
+          ?.subusers?.()
+          .find((user) => user.id === userId) ?? null,
+      listMemberships: (email) =>
+        [...runtimes].flatMap(([serverId, runtime]) =>
+          (runtime.subusers?.() ?? [])
+            .filter((user) => user.email === email)
+            .map((user) => ({
+              serverId,
+              user,
+              serverName: runtime.descriptor().name,
+            })),
+        ),
+    });
+  } catch (cause) {
+    await Promise.allSettled(
+      [...runtimes.values()].map((runtime) => runtime.close()),
+    );
+    if (!options.telemetry) telemetry.close();
+    throw cause;
+  }
+  const remoteApp = createRemoteGateway({
+    access,
+    runtimes,
+    distDir: path.join(projectDir, "dist"),
+  });
+  const remote = createRemoteListener({
+    app: remoteApp,
+    access,
+    listen: options.remoteListen !== false,
+  });
   const app = express();
   app.disable("x-powered-by");
   app.use((req, res, next) => {
@@ -3219,6 +3307,19 @@ export async function createFleet(options = {}) {
     next();
   });
   app.use(express.json({ limit: "2mb" }));
+  app.get("/api/access/session", (_req, res) => res.json({ role: "owner" }));
+  app.get("/api/access/settings", (_req, res) => res.json(remote.status()));
+  app.put("/api/access/settings", async (req, res) => {
+    const settings = await remote.configure(req.body ?? {});
+    await panelAudit(
+      "user",
+      "Remote access settings updated",
+      settings.enabled
+        ? "Authenticated remote access enabled."
+        : "Remote access disabled.",
+    );
+    res.json(settings);
+  });
   app.get("/api/panel/audit", (_req, res) =>
     res.json({ entries: auditHistory(panelAuditEntries) }),
   );
@@ -3673,19 +3774,24 @@ export async function createFleet(options = {}) {
           : cause.message,
     });
   });
+  await remote.start();
   return {
     app,
     dataDir,
     runtimes,
+    remoteApp,
+    access,
     tick: async (now) =>
       Promise.all([...runtimes.values()].map((runtime) => runtime.tick(now))),
     close: async (closeOptions = {}) => {
       closed = true;
+      await remote.close();
       await setup.close();
       await changeChain.catch(() => {});
       await Promise.all(
         [...runtimes.values()].map((runtime) => runtime.close(closeOptions)),
       );
+      await access.close();
       await panelAuditChain;
       if (!options.telemetry) telemetry.close();
     },

@@ -48,7 +48,8 @@ function actionLabel(action: string) {
 export default function AuditLogs({
   notify,
   scope = "server",
-}: PageProps & { scope?: "server" | "panel" }) {
+  serverOnly = false,
+}: PageProps & { scope?: "server" | "panel"; serverOnly?: boolean }) {
   const { api: serverApi } = useServerApi();
   const [activityScope, setActivityScope] = useState(scope);
   const api = activityScope === "panel" ? panelApi : serverApi;
@@ -197,7 +198,7 @@ export default function AuditLogs({
             <span className="management-count">{filtered.length}</span>
           </div>
           <div className="management-controls">
-            {scope !== "panel" && (
+            {scope !== "panel" && !serverOnly && (
               <select
                 aria-label="Audit scope"
                 value={activityScope}

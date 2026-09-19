@@ -447,7 +447,7 @@ test("manual backups download a real archive and automatic schedules persist", a
   });
 });
 
-test("subusers records are clearly local and can be added, searched, and removed", async ({
+test("subusers can be prepared before remote setup, searched, and revoked", async ({
   page,
   request,
 }) => {
@@ -455,6 +455,12 @@ test("subusers records are clearly local and can be added, searched, and removed
   await page.getByRole("button", { name: "New user", exact: true }).click();
   let dialog = page.getByRole("dialog", { name: "Create new subuser" });
   await expect(dialog.getByText(/No invitation will be sent/)).toBeVisible();
+  await expect(
+    dialog.getByRole("checkbox", {
+      name: "Send invitation by email",
+      exact: true,
+    }),
+  ).toBeDisabled();
   await dialog.getByLabel("Email address").fill("operator@example.com");
   await dialog
     .getByRole("checkbox", { name: "View audit logs", exact: true })
@@ -465,6 +471,7 @@ test("subusers records are clearly local and can be added, searched, and removed
   await expect(dialog).not.toBeVisible();
   const row = page.getByRole("row").filter({ hasText: "operator@example.com" });
   await expect(row).toContainText("1 selected");
+  await expect(row).toContainText("Not invited");
   expect((await (await request.get("/api/subusers")).json()).users).toEqual(
     expect.arrayContaining([
       expect.objectContaining({
@@ -490,6 +497,9 @@ test("subusers records are clearly local and can be added, searched, and removed
     })
     .click();
   dialog = page.getByRole("dialog", { name: "Remove access record?" });
+  await expect(dialog).toContainText(
+    "active sessions and invitation links will stop working",
+  );
   await dialog
     .getByRole("button", { name: "Remove record", exact: true })
     .click();

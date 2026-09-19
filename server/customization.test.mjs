@@ -707,8 +707,8 @@ test("legacy role-only subusers receive intended permission defaults and can be 
   assert.ok(
     audit.some(
       (entry) =>
-        entry.action === "Local access permissions updated" &&
-        entry.detail.includes("Authentication is not configured"),
+        entry.action === "Subuser permissions updated" &&
+        entry.detail.includes("Changes apply to subsequent requests"),
     ),
   );
 });
