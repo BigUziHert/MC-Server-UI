@@ -59,6 +59,7 @@ import Switch from "./Switch";
 import DesktopUpdates from "./DesktopUpdates";
 import ServerIcon, { ServerIconImage } from "./ServerIcon";
 import { copyText } from "./clipboard";
+import { readPreference, writePreference } from "./preferences";
 import PanelAccount, { type PanelSession } from "./PanelAccount";
 import { reportDesktopServers } from "./desktop-connections";
 import ConnectPanel, { type ConnectionMode } from "./ConnectPanel";
@@ -100,9 +101,11 @@ type Server = {
   memoryLimit: number | null;
   memoryLimitSource?: "panel" | "launch" | "unknown";
   memoryLimitState?: "configured" | "started";
-  disk: number;
-  diskLimit: number;
-  diskAvailable?: number;
+  disk: number | null;
+  diskLimit: number | null;
+  diskAvailable?: number | null;
+  unavailable?: boolean;
+  sourceError?: string | null;
   players: { name: string; uuid?: string; latency?: number | null }[];
   maxPlayers: number;
   metricsAvailable?: boolean;
@@ -124,9 +127,7 @@ type NavigationGroup = (typeof navigationGroups)[number]["id"];
 const navigationStorageKey = "mc-panel.navigation-collapsed";
 function readCollapsedNavigation(): Record<NavigationGroup, boolean> {
   try {
-    const saved = JSON.parse(
-      localStorage.getItem(navigationStorageKey) || "null",
-    );
+    const saved = JSON.parse(readPreference(navigationStorageKey) || "null");
     return {
       server: saved?.server === true,
       minecraft: saved?.minecraft === true,
@@ -159,7 +160,7 @@ const navigation = [
   { id: "audit", label: "Audit Logs", icon: FileText, group: "management" },
 ] as const;
 function getPage(): Page {
-  const hash = window.location.hash.slice(1);
+  const hash = window.location.hash.slice(1).split("?")[0];
   return navigation.some((n) => n.id === hash) ? (hash as Page) : "console";
 }
 const pagePermissions: Partial<Record<Page, string>> = {
@@ -295,7 +296,7 @@ export default function App({
   const [loading, setLoading] = useState(true);
   const [manager, setManager] = useState<{
     editing: ServerRecord | null;
-    initialStep?: "choice" | "create" | "import";
+    initialStep?: "choice" | "create" | "import" | "recover";
     firstServer?: boolean;
   } | null>(null);
   const [notice, setNotice] = useState("");
@@ -314,7 +315,8 @@ export default function App({
   const [selectionReady, setSelectionReady] = useState(false);
   const loadServers = useCallback(
     async (showLoading = false) => {
-      if (!sessionMounted.current || fleetInFlight.current) return;
+      if (!sessionMounted.current || (fleetInFlight.current && !showLoading))
+        return;
       fleetInFlight.current = true;
       const request = ++fleetRequest.current;
       if (showLoading) {
@@ -677,13 +679,13 @@ function EmptyFleet({
   session,
   onSignedOut,
 }: {
-  onAdd: (step: "create" | "import") => void;
+  onAdd: (step: "create" | "import" | "recover") => void;
   onConnect: (mode: ConnectionMode) => void;
   session?: PanelSession;
   onSignedOut?: () => void;
 }) {
   return (
-    <div className="fleet-welcome-shell fleet-welcome-simple">
+    <div className="fleet-welcome-shell">
       <header className="fleet-welcome-header">
         <div className="brand" aria-label="MC Panel">
           <span className="brand-icon">
@@ -756,6 +758,23 @@ function EmptyFleet({
                   </span>
                   <ArrowRight size={19} />
                 </button>
+                <button
+                  className="fleet-welcome-choice"
+                  aria-label="Recover a saved server"
+                  aria-describedby="welcome-recover-description"
+                  onClick={() => onAdd("recover")}
+                >
+                  <span className="fleet-welcome-choice-icon">
+                    <RotateCw size={23} />
+                  </span>
+                  <span>
+                    <strong>Recover a saved server</strong>
+                    <span id="welcome-recover-description">
+                      Add a previously removed server back to this panel.
+                    </span>
+                  </span>
+                  <ArrowRight size={19} />
+                </button>
               </div>
             )}
             <div className="welcome-remote-account">
@@ -818,7 +837,9 @@ function ServerWorkspace({
     ? requestedPage
     : "console";
   const [filePath, setFilePath] = useState("");
-  const [showingFileBin, setShowingFileBin] = useState(false);
+  const [showingFileBin, setShowingFileBin] = useState(
+    () => window.location.hash === "#files?recycle=1",
+  );
   const [server, setServer] = useState<Server | null>(null);
   const [connectionError, setConnectionError] = useState("");
   const [toast, setToast] = useState<{
@@ -922,6 +943,7 @@ function ServerWorkspace({
   useEffect(() => {
     const changed = () => {
       setPage(getPage());
+      if (window.location.hash === "#files?recycle=1") setShowingFileBin(true);
       setSidebar(false);
     };
     window.addEventListener("hashchange", changed);
@@ -937,7 +959,7 @@ function ServerWorkspace({
   }, [page]);
   useEffect(() => {
     try {
-      localStorage.setItem(
+      writePreference(
         navigationStorageKey,
         JSON.stringify(collapsedNavigation),
       );
@@ -1040,7 +1062,9 @@ function ServerWorkspace({
                       selected={{
                         ...selected,
                         status: server?.status ?? selected.status,
-                        iconVersion: server?.iconVersion,
+                        iconVersion: server
+                          ? server.iconVersion
+                          : selected.iconVersion,
                         software: server?.software ?? selected.software,
                         minecraftVersion: server
                           ? server.minecraftVersion
@@ -1182,6 +1206,7 @@ function ServerWorkspace({
           {page === "console" && (
             <ConsolePage
               server={server}
+              selected={selected}
               history={history}
               notify={notify}
               refresh={refresh}
@@ -1502,6 +1527,7 @@ function PowerConfirmation({
 function ConsolePage({
   controls,
   server,
+  selected,
   history,
   notify,
   refresh,
@@ -1511,6 +1537,7 @@ function ConsolePage({
   remote,
 }: {
   server: Server | null;
+  selected: ServerRecord;
   history: { cpu: number[]; memory: number[] };
   controls: ReturnType<typeof useServerPower>;
   notify: (message: string, error?: boolean) => void;
@@ -1535,6 +1562,7 @@ function ConsolePage({
   const [autoScroll, setAutoScroll] = useState(true);
   const { busy, commandRequest, setCommandBusy } = controls;
   const [hiddenUntil, setHiddenUntil] = useState<string | number | null>(null);
+  const lastLogId = useRef(0);
   const [logError, setLogError] = useState(false);
   const commandInput = useRef<HTMLInputElement>(null);
   const logContainer = useRef<HTMLDivElement>(null);
@@ -1547,6 +1575,9 @@ function ConsolePage({
     if (!canConsole) return;
     try {
       const result = await api<{ lines: LogLine[] }>("/console");
+      const latest = Number(result.lines.at(-1)?.id ?? 0);
+      if (latest && latest < lastLogId.current) setHiddenUntil(null);
+      if (latest) lastLogId.current = latest;
       setLines(result.lines);
       setLogError(false);
     } catch {
@@ -1635,10 +1666,10 @@ function ConsolePage({
     Math.min(100, Math.max(0, (value / cpuCapacity) * 100));
   const cpuUnavailable = unavailable || server?.cpu == null || cpuCapacity <= 0;
   const playersUnavailable = server?.playersAvailable === false;
-  const hiddenIndex =
-    hiddenUntil === null ? -1 : lines.findIndex((l) => l.id === hiddenUntil);
   const visibleLines = lines
-    .slice(hiddenIndex + 1)
+    .filter(
+      (line) => hiddenUntil === null || Number(line.id) > Number(hiddenUntil),
+    )
     .filter((line) =>
       `${line.message} ${line.level}`
         .toLowerCase()
@@ -1655,22 +1686,24 @@ function ConsolePage({
         <div className="server-identity">
           {onSettings ? (
             <ServerIcon
-              version={server?.iconVersion}
-              serverVersion={server?.serverIconVersion}
-              name={server?.name || "Minecraft server"}
+              version={server ? server.iconVersion : selected.iconVersion}
+              serverVersion={
+                server ? server.serverIconVersion : selected.serverIconVersion
+              }
+              name={server?.name || selected.name}
               onSaved={refresh}
             />
           ) : (
             <span className="world-icon">
               <ServerIconImage
-                version={server?.iconVersion}
-                name={server?.name || "Minecraft server"}
+                version={server ? server.iconVersion : selected.iconVersion}
+                name={server?.name || selected.name}
               />
             </span>
           )}
           <div>
             <div className="server-title">
-              <h2>{server?.name || "Minecraft Server"}</h2>
+              <h2>{server?.name || selected.name}</h2>
               {onSettings && (
                 <button
                   className="rename-server-button"
@@ -1699,6 +1732,7 @@ function ConsolePage({
             </button>
           </div>
         </div>
+        {server?.sourceError && <p role="status">{server.sourceError}</p>}
         <div className="server-power">
           <span className="uptime">
             <Clock3 size={13} />
@@ -1786,8 +1820,14 @@ function ConsolePage({
             <span>Storage</span>
           </div>
           <div className="metric-value">
-            {formatBytes(server?.disk || 0).split(" ")[0]}
-            <span>{formatBytes(server?.disk || 0).split(" ")[1]}</span>
+            {server?.disk == null
+              ? "—"
+              : formatBytes(server.disk).split(" ")[0]}
+            <span>
+              {server?.disk == null
+                ? ""
+                : formatBytes(server.disk).split(" ")[1]}
+            </span>
           </div>
           <div className="metric-subtitle">
             {server?.diskLimit
@@ -1815,7 +1855,9 @@ function ConsolePage({
           <div className="metric-subtitle">
             {playersUnavailable
               ? "Player query not connected"
-              : "Connected to your world"}
+              : isRunning
+                ? "Connected to your world"
+                : "Server offline"}
           </div>
         </div>
       </section>

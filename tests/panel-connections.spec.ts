@@ -38,10 +38,11 @@ async function desktopBridge(
     senderId?: string;
     localServers?: LocalServerDescriptor[];
     remoteServers?: Record<string, LocalServerDescriptor[]>;
+    listFailure?: "reject" | "hang";
   } = {},
 ) {
   await page.addInitScript(
-    ({ activeId, senderId, localServers, remoteServers }) => {
+    ({ activeId, senderId, localServers, remoteServers, listFailure }) => {
       // The sending renderer stays fixed when native activation hides its view.
       const state = {
         activeId,
@@ -100,7 +101,14 @@ async function desktopBridge(
         connectionFixture: { report },
       });
       window.mcPanelConnections = {
-        list: async () => snapshot(),
+        list: () =>
+          listFailure === "reject"
+            ? Promise.reject(
+                new Error("Native connection list is unavailable."),
+              )
+            : listFailure === "hang"
+              ? new Promise(() => {})
+              : Promise.resolve(snapshot()),
         open: async (url) => {
           calls.push({ action: "open", value: url });
           return snapshot();
@@ -146,6 +154,7 @@ async function desktopBridge(
       senderId: options.senderId ?? options.activeId ?? "local",
       localServers: options.localServers ?? [localServer],
       remoteServers: options.remoteServers ?? {},
+      listFailure: options.listFailure,
     },
   );
 }
@@ -231,6 +240,25 @@ async function openConnection(page: Page, invitation = false) {
   });
   await expect(dialog).toBeVisible();
   return dialog;
+}
+
+for (const failure of ["reject", "hang"] as const) {
+  test(`an unavailable desktop preference bridge does not block the owner panel (${failure})`, async ({
+    page,
+  }) => {
+    await desktopBridge(page, { listFailure: failure });
+    await localPanel(page, true);
+    const ownerPreferenceRequests: string[] = [];
+    page.on("request", (request) => {
+      if (new URL(request.url()).pathname === "/api/desktop/preferences")
+        ownerPreferenceRequests.push(request.method());
+    });
+    await page.goto("/#console");
+    await expect(
+      page.getByRole("heading", { name: localServer.name, exact: true }),
+    ).toBeVisible({ timeout: 10_000 });
+    expect(ownerPreferenceRequests).toEqual([]);
+  });
 }
 
 test("the account menu and connection dialog support Escape and restore keyboard focus", async ({

@@ -36,6 +36,13 @@ export function externalWebsite(value) {
       return null;
     if (websites.has(url.hostname)) return url.href;
     if (
+      url.hostname === "aka.ms" &&
+      url.pathname === "/MinecraftEULA" &&
+      !url.search &&
+      !url.hash
+    )
+      return url.href;
+    if (
       url.hostname === "github.com" &&
       /^\/(?:BigUziHert\/MC-Server-UI|IzzelAliz\/Arclight)(?:\/|$)/i.test(
         url.pathname,

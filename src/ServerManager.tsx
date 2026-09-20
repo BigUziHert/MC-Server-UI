@@ -1,9 +1,11 @@
 import { useEffect, useRef, useState, type FormEvent } from "react";
 import {
   AlertCircle,
+  ArrowLeft,
   Box,
   LoaderCircle,
   Plus,
+  RefreshCw,
   Save,
   Settings2,
   Trash2,
@@ -18,7 +20,9 @@ import {
   LaunchMemoryNote,
   LaunchMethodFields,
   startupDraft,
+  startupError,
   startupPayload,
+  type LaunchCandidate,
   type LaunchType,
 } from "./LaunchSettings";
 import "./servers.css";
@@ -32,6 +36,8 @@ export type ServerRecord = {
   address: string;
   connectionHost?: string;
   iconVersion?: string | null;
+  serverIconVersion?: string | null;
+  iconPreference?: "server" | "default";
   port: number;
   memoryLimitMB: number;
   jar: string;
@@ -383,7 +389,7 @@ export function ServerSwitcher({
 
 type ServerManagerProps = {
   editing: ServerRecord | null;
-  initialStep?: "choice" | "create" | "import";
+  initialStep?: "choice" | "create" | "import" | "recover";
   servers: ServerRecord[];
   onClose: () => void;
   onSaved: (server: ServerRecord) => void;
@@ -391,38 +397,400 @@ type ServerManagerProps = {
 };
 
 export default function ServerManager(props: ServerManagerProps) {
+  const [recovering, setRecovering] = useState(props.initialStep === "recover");
   return props.editing ? (
-    <ServerSettings {...props} />
-  ) : (
-    <AddServer
-      initialStep={props.initialStep}
+    <ServerSettings {...props} editing={props.editing} />
+  ) : recovering ? (
+    <RecoverServer
       servers={props.servers}
+      onBack={() => setRecovering(false)}
       onClose={props.onClose}
       onSaved={props.onSaved}
     />
+  ) : (
+    <AddServer
+      initialStep={
+        props.initialStep === "recover" ? "choice" : props.initialStep
+      }
+      servers={props.servers}
+      onClose={props.onClose}
+      onSaved={props.onSaved}
+      onRecover={() => setRecovering(true)}
+    />
+  );
+}
+
+type RecoveryCandidate = { id: string; name: string; directory: string };
+type RecoveryInspection = RecoveryCandidate & {
+  revision: string;
+  port: number;
+  memoryLimitMB?: number;
+  jars: string[];
+  jar: string | null;
+  launchType?: LaunchType;
+  launchScript?: string;
+  launchExecutable?: string;
+  launchArgs?: string[];
+  javaPath?: string;
+  launches?: LaunchCandidate[];
+  warnings: string[];
+};
+
+function RecoverServer({
+  servers,
+  onBack,
+  onClose,
+  onSaved,
+}: {
+  servers: ServerRecord[];
+  onBack: () => void;
+  onClose: () => void;
+  onSaved: (server: ServerRecord) => void;
+}) {
+  const [candidates, setCandidates] = useState<RecoveryCandidate[]>([]);
+  const [warnings, setWarnings] = useState<string[]>([]);
+  const [inspection, setInspection] = useState<RecoveryInspection | null>(null);
+  const [name, setName] = useState("");
+  const [port, setPort] = useState("25565");
+  const [memory, setMemory] = useState("4096");
+  const [startup, setStartup] = useState(() => startupDraft({ jar: "" }));
+  const [confirmed, setConfirmed] = useState(false);
+  const [work, setWork] = useState<"list" | "inspect" | "recover" | null>(
+    "list",
+  );
+  const [error, setError] = useState("");
+  const dialog = useRef<HTMLDialogElement>(null);
+  const operation = useRef(0);
+  const request = useRef<AbortController | null>(null);
+  const busy = work === "recover";
+  const conflict = servers.find((server) => server.port === Number(port));
+  const validStartup =
+    !startupError(startup) &&
+    (startup.launchType !== "jar" ||
+      Boolean(inspection?.jars.includes(startup.jar)));
+
+  async function load(id?: string) {
+    const current = ++operation.current;
+    request.current?.abort();
+    const controller = new AbortController();
+    request.current = controller;
+    setWork(id ? "inspect" : "list");
+    setInspection(null);
+    setConfirmed(false);
+    setError("");
+    try {
+      if (id) {
+        const value = await api<RecoveryInspection>(
+          `/server-recovery/${encodeURIComponent(id)}`,
+          { signal: controller.signal },
+        );
+        if (current !== operation.current) return;
+        setInspection(value);
+        setName(value.name);
+        setPort(String(value.port));
+        setMemory(String(value.memoryLimitMB ?? 4096));
+        setStartup(startupDraft(value));
+      } else {
+        const value = await api<{
+          candidates: RecoveryCandidate[];
+          warnings: string[];
+        }>("/server-recovery", { signal: controller.signal });
+        if (current !== operation.current) return;
+        setCandidates(value.candidates);
+        setWarnings(value.warnings);
+      }
+    } catch (cause) {
+      if (current === operation.current && !controller.signal.aborted)
+        setError(
+          cause instanceof Error
+            ? cause.message
+            : "Could not inspect saved servers. Try again.",
+        );
+    } finally {
+      if (current === operation.current) setWork(null);
+    }
+  }
+  useEffect(() => {
+    const element = dialog.current;
+    element?.showModal();
+    void load();
+    return () => {
+      operation.current++;
+      request.current?.abort();
+      element?.close();
+    };
+  }, []);
+
+  async function recover(event: FormEvent) {
+    event.preventDefault();
+    if (work || !inspection || !confirmed) return;
+    const selectedPort = Number(port),
+      selectedMemory = Number(memory);
+    if (
+      !name.trim() ||
+      !validStartup ||
+      !Number.isInteger(selectedPort) ||
+      selectedPort < 1024 ||
+      selectedPort > 65535 ||
+      conflict ||
+      (startup.launchType === "jar" &&
+        (!Number.isInteger(selectedMemory) ||
+          selectedMemory < 256 ||
+          selectedMemory > 262144))
+    ) {
+      setError(
+        startupError(startup) ||
+          "Choose a name, available port, and valid startup settings before recovering this server.",
+      );
+      return;
+    }
+    const current = ++operation.current;
+    setWork("recover");
+    setError("");
+    try {
+      const value = await post<{ server: ServerRecord }>(
+        `/server-recovery/${encodeURIComponent(inspection.id)}`,
+        {
+          confirmed: true,
+          revision: inspection.revision,
+          name: name.trim(),
+          port: selectedPort,
+          ...(startup.launchType === "jar"
+            ? { memoryLimitMB: selectedMemory }
+            : {}),
+          ...startupPayload(startup),
+        },
+      );
+      if (current === operation.current) onSaved(value.server);
+    } catch (cause) {
+      if (current === operation.current)
+        setError(
+          cause instanceof Error
+            ? cause.message
+            : "Could not recover this server. Inspect it again and retry.",
+        );
+    } finally {
+      if (current === operation.current) setWork(null);
+    }
+  }
+  return (
+    <dialog
+      ref={dialog}
+      className="server-dialog server-add-dialog"
+      aria-labelledby="recover-server-title"
+      onCancel={(event) => {
+        event.preventDefault();
+        if (!busy) onClose();
+      }}
+    >
+      <div className="server-dialog-top">
+        <button
+          type="button"
+          className="btn server-back-button"
+          disabled={busy}
+          onClick={() => (inspection ? void load() : onBack())}
+        >
+          <ArrowLeft size={16} /> Back
+        </button>
+        <button
+          type="button"
+          className="btn icon"
+          aria-label="Close server recovery"
+          disabled={busy}
+          onClick={onClose}
+        >
+          <X size={17} />
+        </button>
+      </div>
+      <h2 id="recover-server-title">Recover a saved server</h2>
+      <p>
+        Choose a server previously stored by this panel. Recovery keeps its
+        files, worlds, backups, and Recycle Bin, and leaves the server stopped.
+      </p>
+      {work === "list" || work === "inspect" ? (
+        <p role="status">
+          <LoaderCircle size={16} className="spin" />{" "}
+          {work === "list"
+            ? "Looking for saved servers…"
+            : "Inspecting the saved server…"}
+        </p>
+      ) : inspection ? (
+        <form onSubmit={recover}>
+          <fieldset disabled={busy} className="server-config-fields">
+            <div className="form-field">
+              <label htmlFor="recover-directory">Saved server folder</label>
+              <input
+                id="recover-directory"
+                value={inspection.directory}
+                readOnly
+              />
+            </div>
+            <div className="form-field">
+              <label htmlFor="recover-name">Server name</label>
+              <input
+                id="recover-name"
+                value={name}
+                maxLength={64}
+                required
+                onChange={(event) => setName(event.target.value)}
+              />
+            </div>
+            <LaunchMethodFields
+              idPrefix="recover"
+              value={startup}
+              onChange={setStartup}
+              jars={inspection.jars}
+              candidates={inspection.launches}
+            />
+            <div className="server-form-grid">
+              <div className="form-field">
+                <label htmlFor="recover-port">Server port</label>
+                <input
+                  id="recover-port"
+                  type="number"
+                  min={1024}
+                  max={65535}
+                  required
+                  value={port}
+                  onChange={(event) => setPort(event.target.value)}
+                />
+              </div>
+              {startup.launchType === "jar" && (
+                <div className="form-field">
+                  <label htmlFor="recover-memory">Memory (MB)</label>
+                  <input
+                    id="recover-memory"
+                    type="number"
+                    min={256}
+                    max={262144}
+                    required
+                    value={memory}
+                    onChange={(event) => setMemory(event.target.value)}
+                  />
+                </div>
+              )}
+            </div>
+            {conflict && (
+              <p className="server-import-port-warning">
+                Port {port} is used by {conflict.name}. Choose another port.
+              </p>
+            )}
+            <LaunchMemoryNote type={startup.launchType} />
+            <LaunchAdvancedFields
+              idPrefix="recover"
+              value={startup}
+              onChange={setStartup}
+            />
+            {inspection.warnings.length > 0 && (
+              <ul className="server-import-warnings">
+                {inspection.warnings.map((warning) => (
+                  <li key={warning}>{warning}</li>
+                ))}
+              </ul>
+            )}
+            <label className="setup-check">
+              <input
+                type="checkbox"
+                checked={confirmed}
+                onChange={(event) => setConfirmed(event.target.checked)}
+              />{" "}
+              Add this saved server back to the panel.
+            </label>
+          </fieldset>
+          <div className="server-dialog-actions">
+            <button
+              type="button"
+              className="btn"
+              disabled={busy}
+              onClick={() => void load(inspection.id)}
+            >
+              Inspect again
+            </button>
+            <button
+              type="submit"
+              className="btn primary"
+              disabled={
+                busy ||
+                !confirmed ||
+                !name.trim() ||
+                !validStartup ||
+                Boolean(conflict)
+              }
+            >
+              <RefreshCw size={15} /> {busy ? "Recovering…" : "Recover server"}
+            </button>
+          </div>
+        </form>
+      ) : (
+        <>
+          <div
+            className="server-add-choices"
+            aria-label="Saved servers available for recovery"
+          >
+            {candidates.map((candidate) => (
+              <button
+                type="button"
+                className="server-add-choice"
+                key={candidate.id}
+                aria-label={`Review saved server ${candidate.name}`}
+                onClick={() => void load(candidate.id)}
+              >
+                <span className="server-choice-icon">
+                  <Box size={20} />
+                </span>
+                <span>
+                  <strong>{candidate.name}</strong>
+                  <span style={{ overflowWrap: "anywhere" }}>
+                    {candidate.directory}
+                  </span>
+                </span>
+              </button>
+            ))}
+          </div>
+          {!candidates.length && !error && (
+            <p>No saved servers are waiting to be recovered.</p>
+          )}
+          {warnings.length > 0 && (
+            <ul className="server-import-warnings">
+              {warnings.map((warning) => (
+                <li key={warning}>{warning}</li>
+              ))}
+            </ul>
+          )}
+          <div className="server-dialog-actions">
+            <button type="button" className="btn" onClick={() => void load()}>
+              <RefreshCw size={15} /> Check again
+            </button>
+          </div>
+        </>
+      )}
+      {error && (
+        <div className="server-form-error" role="alert">
+          <AlertCircle size={16} />
+          {error}
+        </div>
+      )}
+    </dialog>
   );
 }
 
 function ServerSettings({
   editing,
-  servers,
   onClose,
   onSaved,
   onRemoved,
-}: ServerManagerProps) {
-  let nextPort = 25565;
-  while (servers.some((server) => server.port === nextPort)) nextPort++;
-  const [name, setName] = useState(editing?.name ?? "");
+}: Pick<ServerManagerProps, "onClose" | "onSaved" | "onRemoved"> & {
+  editing: ServerRecord;
+}) {
+  const [name, setName] = useState(editing.name);
   const [connectionHost, setConnectionHost] = useState(
-    editing?.connectionHost ?? "",
+    editing.connectionHost ?? "",
   );
-  const [port, setPort] = useState(String(editing?.port ?? nextPort));
-  const [memory, setMemory] = useState(String(editing?.memoryLimitMB ?? 4096));
-  const [startup, setStartup] = useState(() =>
-    startupDraft(editing ?? undefined),
-  );
+  const [port, setPort] = useState(String(editing.port));
+  const [memory, setMemory] = useState(String(editing.memoryLimitMB));
+  const [startup, setStartup] = useState(() => startupDraft(editing));
   const [motd, setMotd] = useState(
-    editing?.motd ?? "Welcome to our Minecraft server",
+    editing.motd ?? "Welcome to our Minecraft server",
   );
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
@@ -430,7 +798,7 @@ function ServerSettings({
   const dialog = useRef<HTMLDialogElement>(null);
   const removalCancel = useRef<HTMLButtonElement>(null);
   const errorMessage = useRef<HTMLDivElement>(null);
-  const running = !!editing && editing.status !== "offline";
+  const running = editing.status !== "offline";
   useEffect(() => {
     const element = dialog.current;
     element?.showModal();
@@ -460,19 +828,17 @@ function ServerSettings({
       motd,
     };
     try {
-      const result = editing
-        ? await api<{ server: ServerRecord }>(
-            `/servers/${encodeURIComponent(editing.id)}`,
-            {
-              method: "PATCH",
-              body: JSON.stringify(
-                running
-                  ? { name: name.trim(), connectionHost: connectionHost.trim() }
-                  : settings,
-              ),
-            },
-          )
-        : await post<{ server: ServerRecord }>("/servers", settings);
+      const result = await api<{ server: ServerRecord }>(
+        `/servers/${encodeURIComponent(editing.id)}`,
+        {
+          method: "PATCH",
+          body: JSON.stringify(
+            running
+              ? { name: name.trim(), connectionHost: connectionHost.trim() }
+              : settings,
+          ),
+        },
+      );
       onSaved(result.server);
     } catch (cause) {
       setError((cause as Error).message);
@@ -482,7 +848,7 @@ function ServerSettings({
   }
 
   async function removeServer() {
-    if (!editing || running || busy || !confirmingRemoval) return;
+    if (running || busy || !confirmingRemoval) return;
     setBusy(true);
     setError("");
     try {
@@ -526,16 +892,8 @@ function ServerSettings({
             <X size={17} />
           </button>
         </div>
-        <h2 id="server-dialog-title">
-          {editing ? "Server settings" : "Add a server"}
-        </h2>
-        <p>
-          {editing
-            ? "Give your world a name and configure how it runs."
-            : servers.length === 0
-              ? "Set up your first world. Your server gets its own files, console, and backups."
-              : "Another world, one familiar panel. Each server gets its own files, console, and backups."}
-        </p>
+        <h2 id="server-dialog-title">Server settings</h2>
+        <p>Give your world a name and configure how it runs.</p>
         <div className="form-field">
           <label htmlFor="server-name">Server name</label>
           <input
@@ -569,7 +927,7 @@ function ServerSettings({
             set up port forwarding.
           </small>
         </div>
-        {editing?.source === "imported" && editing.serverDir && (
+        {editing.source === "imported" && editing.serverDir && (
           <div className="form-field">
             <label htmlFor="saved-server-directory">Server folder</label>
             <input
@@ -584,7 +942,7 @@ function ServerSettings({
             </small>
           </div>
         )}
-        {editing?.sourceError && (
+        {editing.sourceError && (
           <div className="server-form-error server-source-error" role="alert">
             <AlertCircle size={17} />
             <span>{editing.sourceError}</span>
@@ -680,68 +1038,67 @@ function ServerSettings({
             disabled={busy || confirmingRemoval || !name.trim()}
             type="submit"
           >
-            {editing ? <Save size={15} /> : <Plus size={15} />}{" "}
-            {busy ? "Saving…" : editing ? "Save changes" : "Create server"}
+            <Save size={15} /> {busy ? "Saving…" : "Save changes"}
           </button>
         </div>
-        {editing && (
-          <div className="server-remove">
-            {confirmingRemoval ? (
-              <div role="group" aria-labelledby="remove-server-title">
-                <h3 id="remove-server-title">
-                  Remove this server from the panel?
-                </h3>
-                <p>
-                  <strong>{editing.name}</strong> will disappear from your
-                  server list, and its scheduled backups will stop. Its
-                  Minecraft server files, worlds, backups, and Recycle Bin data
-                  will stay on your computer. You can import the server folder
-                  again later.
-                </p>
-                <div className="server-remove-actions">
-                  <button
-                    ref={removalCancel}
-                    className="btn"
-                    type="button"
-                    disabled={busy}
-                    onClick={() => {
-                      setConfirmingRemoval(false);
-                      setError("");
-                    }}
-                  >
-                    Cancel removal
-                  </button>
-                  <button
-                    className="btn danger"
-                    type="button"
-                    disabled={busy || running}
-                    onClick={() => void removeServer()}
-                  >
-                    <Trash2 size={15} />
-                    {busy ? "Removing…" : "Remove server"}
-                  </button>
-                </div>
-              </div>
-            ) : (
-              <div>
+        <div className="server-remove">
+          {confirmingRemoval ? (
+            <div role="group" aria-labelledby="remove-server-title">
+              <h3 id="remove-server-title">
+                Remove this server from the panel?
+              </h3>
+              <p>
+                <strong>{editing.name}</strong> will disappear from your server
+                list, and its scheduled backups will stop. Its Minecraft server
+                files, worlds, backups, and Recycle Bin data will stay on your
+                computer.{" "}
+                {editing.source === "imported"
+                  ? "You can import the server folder again later."
+                  : "Use Recover a saved server to add it back later."}
+              </p>
+              <div className="server-remove-actions">
                 <button
-                  className="server-remove-link"
+                  ref={removalCancel}
+                  className="btn"
                   type="button"
-                  disabled={busy || running}
+                  disabled={busy}
                   onClick={() => {
-                    setConfirmingRemoval(true);
+                    setConfirmingRemoval(false);
                     setError("");
                   }}
                 >
-                  <Trash2 size={14} /> Remove server
+                  Cancel removal
                 </button>
-                {running && (
-                  <p>Stop this server from Console before removing it.</p>
-                )}
+                <button
+                  className="btn danger"
+                  type="button"
+                  disabled={busy || running}
+                  onClick={() => void removeServer()}
+                >
+                  <Trash2 size={15} />
+                  {busy ? "Removing…" : "Remove server"}
+                </button>
               </div>
-            )}
-          </div>
-        )}
+            </div>
+          ) : (
+            <div>
+              <button
+                className="server-remove-link"
+                type="button"
+                disabled={busy || running}
+                onClick={() => {
+                  setConfirmingRemoval(true);
+                  setError("");
+                }}
+              >
+                <Trash2 size={14} /> Remove server
+              </button>
+              {running && (
+                <p>Stop this server from Console before removing it.</p>
+              )}
+            </div>
+          )}
+        </div>
       </form>
     </dialog>
   );

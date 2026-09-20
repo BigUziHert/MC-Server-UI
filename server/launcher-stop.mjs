@@ -1,13 +1,17 @@
 // Minecraft emits this message before saving players/worlds. Only trust its
 // logger envelope; player chat or an echoed console command must not change the
 // process lifecycle. Forge/NeoForge add an optional logger category bracket.
-export function isMinecraftShutdownLine(text, { allowSaving = false } = {}) {
+export function minecraftServerMessage(text) {
   const clean = text.replace(/\x1b\[[0-9;]*m/g, "").trim();
   const java = clean.match(
-    /^(?:\[\d{2}:\d{2}:\d{2}\]\s*)?\[Server thread\/INFO\](?:\s*\[[^\]\r\n]{1,120}\])?:\s*(.+)$/,
+    /^(?:\[[^\]\r\n]{1,80}\]\s*)?\[Server thread\/INFO\](?:\s*\[[^\]\r\n]{1,120}\])?:\s*(.+)$/,
   );
   const paper = clean.match(/^\[\d{2}:\d{2}:\d{2} INFO\]:\s*(.+)$/);
-  const message = (java ?? paper)?.[1] ?? "";
+  return (java ?? paper)?.[1] ?? "";
+}
+
+export function isMinecraftShutdownLine(text, { allowSaving = false } = {}) {
+  const message = minecraftServerMessage(text);
   return (
     /^Stopping (?:the )?server[.!…]*$/i.test(message) ||
     (allowSaving && /^Saving (?:players|worlds)[.!…]*$/i.test(message))

@@ -4,6 +4,10 @@ import path from "node:path";
 import { createFleet } from "../server/index.mjs";
 import { createDesktopSelection, readSelectionBody } from "./selection.mjs";
 import { readPanelConnectionBody } from "./remote-panels.mjs";
+import {
+  createDesktopPreferences,
+  readPreferenceBody,
+} from "./preferences.mjs";
 
 export const DESKTOP_COOKIE_NAME = "mc-panel-desktop";
 
@@ -55,6 +59,7 @@ export async function startDesktopRuntime({
     dataDir: fleet.dataDir,
     hasServer: (id) => fleet.runtimes.has(id),
   });
+  const preferences = createDesktopPreferences({ dataDir: fleet.dataDir });
   let url;
   let host;
   let closing;
@@ -80,6 +85,35 @@ export async function startDesktopRuntime({
     if (!authenticated(req.headers.cookie, expectedToken))
       return reject(401, "An authenticated desktop session is required.");
     const requestPath = new URL(req.url, url).pathname;
+    if (requestPath === "/api/desktop/preferences") {
+      if (!["GET", "PUT"].includes(req.method))
+        return reject(
+          405,
+          "Use GET to read or PUT to save display preferences.",
+        );
+      void (async () => {
+        if (req.method === "GET") {
+          const result = await preferences.read();
+          res.writeHead(200, {
+            "Content-Type": "application/json; charset=utf-8",
+          });
+          res.end(JSON.stringify(result));
+        } else {
+          const { key, value } = await readPreferenceBody(req);
+          await preferences.save(key, value);
+          res.writeHead(204);
+          res.end();
+        }
+      })().catch((cause) =>
+        reject(
+          cause.status ?? 500,
+          cause.status
+            ? cause.message
+            : "Display preferences could not be saved or read.",
+        ),
+      );
+      return;
+    }
     if (requestPath === "/api/desktop/connections/open") {
       if (req.method !== "POST")
         return reject(405, "Use POST to open a remote panel.");
@@ -233,7 +267,7 @@ export async function startDesktopRuntime({
           // The fleet sends stop to its managed Java processes and waits for their exit.
           // Stop accepting HTTP first, but keep current responses alive during that shutdown.
           try {
-            await selection.close();
+            await Promise.all([selection.close(), preferences.close()]);
             await fleet.close({ gracefulOnly });
           } finally {
             listener.closeAllConnections();

@@ -88,9 +88,3 @@
   flex-wrap: wrap;
   justify-content: flex-end;
 }
-.address-source {
-  display: block;
-  color: var(--muted);
-  font-size: 9px;
-  margin-top: 5px;
-}

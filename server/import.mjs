@@ -77,7 +77,7 @@ export function parseProperties(text) {
   return values;
 }
 
-export function directoriesOverlap(first, second) {
+function directoriesOverlap(first, second) {
   const contains = (root, target) => {
     const relative = path.relative(root, target);
     return (

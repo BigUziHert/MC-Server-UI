@@ -29,22 +29,42 @@ export default function DesktopUpdates() {
         })
         .catch(() => {});
     void refresh();
+    const showUpdates = () => {
+      setOpen(true);
+      void refresh();
+    };
+    window.addEventListener("mc-panel-updates-open", showUpdates);
     const timer = setInterval(refresh, open ? 1000 : 30000);
     return () => {
       active = false;
       clearInterval(timer);
+      window.removeEventListener("mc-panel-updates-open", showUpdates);
     };
   }, [open]);
   useEffect(() => {
     if (open) dialog.current?.showModal();
     else dialog.current?.close();
-  }, [open]);
+  }, [open, state !== null]);
 
   async function action(name: "check" | "download" | "install") {
     setBusy(true);
     setError("");
     try {
-      if (name === "install") await flushDesktopSelection();
+      if (name === "install") {
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        try {
+          // Native Quit owns the final save barrier and offers an explicit
+          // override. An unavailable renderer save must still reach that flow.
+          await Promise.race([
+            flushDesktopSelection().catch(() => {}),
+            new Promise<void>((resolve) => {
+              timer = setTimeout(resolve, 4000);
+            }),
+          ]);
+        } finally {
+          clearTimeout(timer);
+        }
+      }
       setState(await post<UpdateState>(`/desktop/updates/${name}`));
     } catch (cause) {
       setError(
@@ -97,7 +117,7 @@ export default function DesktopUpdates() {
           </div>
           <div>
             <dt>Update channel</dt>
-            <dd>Dev</dd>
+            <dd>{state.channel === "dev" ? "Dev" : state.channel}</dd>
           </div>
           {state.availableVersion && (
             <div>
@@ -145,14 +165,16 @@ export default function DesktopUpdates() {
                 <ArrowDownToLine size={15} />
                 Download update
               </button>
-            ) : state.status === "downloaded" ? (
+            ) : ["downloaded", "shutdown-waiting"].includes(state.status) ? (
               <button
                 className="btn primary"
                 disabled={working}
                 onClick={() => void action("install")}
               >
                 <RefreshCw size={15} />
-                Restart to update
+                {state.status === "shutdown-waiting"
+                  ? "Show shutdown options"
+                  : "Restart to update"}
               </button>
             ) : (
               <button

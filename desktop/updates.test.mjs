@@ -140,6 +140,75 @@ test("portable and source copies never check, download, or launch installers", a
   controller.dispose();
 });
 
+test("a stalled install exposes shutdown options without starting a second installation or killing servers", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  let finish;
+  let installs = 0;
+  let shown = 0;
+  const { controller } = fixture({
+    installTimeoutMs: 100,
+    install: () => {
+      installs += 1;
+      return new Promise((resolve) => {
+        finish = resolve;
+      });
+    },
+    onInstallPending: () => {
+      shown += 1;
+    },
+  });
+  t.after(() => controller.dispose());
+  controller.check();
+  await tick();
+  controller.download();
+  await tick();
+  controller.install();
+  t.mock.timers.tick(150);
+  await tick();
+  t.mock.timers.tick(100);
+  assert.equal(controller.snapshot().status, "shutdown-waiting");
+  assert.equal(shown, 1);
+  controller.install();
+  assert.equal(shown, 2);
+  assert.equal(installs, 1);
+  finish(false);
+  await tick();
+  assert.equal(controller.snapshot().status, "downloaded");
+});
+
+test("disposing cancels pending install/watchdogs and removes only the controller's updater listeners", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const { updater, controller, counts } = fixture();
+  const unrelated = () => {};
+  updater.on("update-available", unrelated);
+  controller.check();
+  await tick();
+  controller.download();
+  await tick();
+  controller.install();
+  controller.dispose();
+  t.mock.timers.tick(1000000);
+  await tick();
+  assert.equal(counts().installs, 0);
+  assert.deepEqual(updater.listeners("update-available"), [unrelated]);
+  assert.equal(updater.listenerCount("checking-for-update"), 0);
+  assert.equal(updater.listenerCount("error"), 0);
+  controller.check();
+  controller.install();
+  await tick();
+  assert.equal(counts().checks, 1);
+  assert.equal(counts().installs, 0);
+  const pending = fixture();
+  pending.controller.check();
+  pending.controller.dispose();
+  await tick();
+  assert.equal(
+    pending.counts().checks,
+    0,
+    "disposed controllers must not start deferred network checks",
+  );
+});
+
 test("dev workflow versions increase for new builds and reruns without source version commits", () => {
   assert.equal(devVersion("0.1.3-dev.0", "2", "1"), "0.1.3-dev.2.1");
   assert.equal(devVersion("0.1.3-dev.0", "2", "2"), "0.1.3-dev.2.2");

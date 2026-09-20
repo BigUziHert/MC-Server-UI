@@ -26,6 +26,64 @@ const deferred = () => {
 };
 const pause = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
+test("resetting one fleet PID preserves another server's in-flight CPU baseline", async () => {
+  const gate = deferred();
+  let at = 0,
+    delayed = false;
+  const telemetry = createProcessTelemetry({
+    cacheMs: 0,
+    now: () => at,
+    readSnapshot: async () => {
+      if (delayed) await gate.promise;
+      return [row(10, 1, 100 + at / 2, 10), row(20, 1, 100 + at / 4, 20)];
+    },
+  });
+  try {
+    await Promise.all([telemetry.sample(10), telemetry.sample(20)]);
+    delayed = true;
+    at = 1000;
+    const pending = telemetry.sample(20);
+    telemetry.reset(10);
+    gate.resolve();
+    const sample = await pending;
+    assert.equal(sample.available, true);
+    assert.equal(sample.cpu, 25);
+  } finally {
+    gate.resolve();
+    telemetry.close();
+  }
+});
+
+test("a replacement PID waits for a post-reset snapshot without binding to the old identity", async () => {
+  const gate = deferred();
+  let reads = 0;
+  const telemetry = createProcessTelemetry({
+    cacheMs: 0,
+    readSnapshot: async () => {
+      if (++reads === 1) {
+        await gate.promise;
+        return [row(10, 1, 100, 111, 10, "old")];
+      }
+      return [row(10, 1, 0, 222, 20, "new")];
+    },
+  });
+  try {
+    const stale = telemetry.sample(10);
+    telemetry.reset(10);
+    const fresh = telemetry.sample(10);
+    gate.resolve();
+    assert.equal((await stale).available, false);
+    const replacement = await fresh;
+    assert.equal(replacement.available, true);
+    assert.equal(replacement.memory, 222);
+    assert.equal(replacement.cpu, null);
+    assert.equal((await telemetry.sample(10)).available, true);
+  } finally {
+    gate.resolve();
+    telemetry.close();
+  }
+});
+
 test("CPU deltas and resident memory cover only the owned tree, with 100% per logical core", async () => {
   let at = 0;
   let rows = [

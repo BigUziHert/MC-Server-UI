@@ -11,6 +11,7 @@ import {
 } from "@playwright/test";
 import { readFile } from "node:fs/promises";
 import path from "node:path";
+import { processStartup } from "./fixtures/process-options.mjs";
 
 type FixtureServer = { id: string; name: string; mode: "live" };
 type Factory = (running: boolean, name: string) => Promise<FixtureServer>;
@@ -244,4 +245,137 @@ test("running servers cannot be removed and removing the final stopped server re
   await expect(
     page.getByRole("button", { name: "Create a new server", exact: true }),
   ).toBeVisible();
+});
+
+test("the last removed managed server can be recovered from the welcome screen with its original identity and files", async ({
+  page,
+  request,
+  createServer,
+}) => {
+  const server = await createServer(false, "Saved world to recover");
+  // Present only this registration to the browser so removing it reaches the
+  // empty workspace without touching other tests' or the shared default server.
+  await page.route("**/api/servers", async (route) => {
+    if (route.request().method() !== "GET") return route.continue();
+    const fleet = await (await route.fetch()).json();
+    const entry = fleet.servers.find(
+      (item: { id: string }) => item.id === server.id,
+    );
+    await route.fulfill({
+      json: {
+        servers: entry ? [entry] : [],
+        defaultServerId: entry?.id ?? null,
+      },
+    });
+  });
+  const headers = { "X-Server-Id": server.id };
+  const original = "This world belongs to the original saved server.\n";
+  const proof = await request.post("/api/files", {
+    headers,
+    data: { name: "recovery-proof.txt", type: "file", content: original },
+  });
+  expect(proof.ok()).toBe(true);
+  const settings = await openSettings(page, server);
+  await settings
+    .getByRole("button", { name: "Remove server", exact: true })
+    .click();
+  const confirmation = settings.getByRole("group", {
+    name: "Remove this server from the panel?",
+    exact: true,
+  });
+  await expect(confirmation).toContainText(
+    "Use Recover a saved server to add it back later.",
+  );
+  await confirmation
+    .getByRole("button", { name: "Remove server", exact: true })
+    .click();
+  await expect(settings).not.toBeVisible();
+  await expect(serverButton(page, server.id)).toHaveCount(0);
+  expect((await request.get("/api/server", { headers })).status()).toBe(404);
+
+  const dataDir = process.env.PANEL_E2E_DATA_DIR!;
+  expect(path.basename(dataDir)).toMatch(/^mc-panel-e2e-/);
+  expect(server.id).toMatch(/^[a-f0-9-]{36}$/);
+  const savedDirectory = path.join(dataDir, "instances", server.id, "server");
+  const savedProof = path.join(savedDirectory, "recovery-proof.txt");
+  expect(await readFile(savedProof, "utf8")).toBe(original);
+
+  await expect(
+    page.getByRole("heading", { name: "Welcome to MC Panel", exact: true }),
+  ).toBeVisible();
+  await page.reload();
+  await expect(
+    page.getByRole("heading", { name: "Welcome to MC Panel", exact: true }),
+  ).toBeVisible();
+  await page
+    .getByRole("button", { name: "Recover a saved server", exact: true })
+    .click();
+  const recovery = page.getByRole("dialog", {
+    name: "Recover a saved server",
+    exact: true,
+  });
+  await recovery
+    .getByRole("button", {
+      name: `Review saved server Recovered server ${server.id.slice(0, 8)}`,
+      exact: true,
+    })
+    .click();
+  await expect(
+    recovery.getByLabel("Saved server folder", { exact: true }),
+  ).toHaveValue(savedDirectory);
+  const recover = recovery.getByRole("button", {
+    name: "Recover server",
+    exact: true,
+  });
+  await expect(recover).toBeDisabled();
+  await recovery.getByLabel("Server name", { exact: true }).fill(server.name);
+  // This fixture uses a real child process instead of downloading Minecraft.
+  // Explicitly review the original executable and arguments just as an owner
+  // would for a saved server whose custom startup cannot be auto-detected.
+  await recovery
+    .getByLabel("Launch method", { exact: true })
+    .selectOption("executable");
+  await recovery
+    .getByLabel("Server executable", { exact: true })
+    .fill(processStartup.launchExecutable);
+  await recovery
+    .getByLabel("Startup arguments", { exact: true })
+    .fill(processStartup.launchArgs.join("\n"));
+  await expect(recover).toBeDisabled();
+  await recovery
+    .getByRole("checkbox", {
+      name: "Add this saved server back to the panel.",
+      exact: true,
+    })
+    .check();
+  await expect(recover).toBeEnabled();
+  const responsePromise = page.waitForResponse(
+    (response) =>
+      response.url().endsWith(`/api/server-recovery/${server.id}`) &&
+      response.request().method() === "POST",
+  );
+  await recover.click();
+  const response = await responsePromise;
+  expect(response.status(), await response.text()).toBe(201);
+  expect((await response.json()).server.id).toBe(server.id);
+  await expect(recovery).not.toBeVisible();
+  await expect(serverButton(page, server.id)).toHaveAttribute(
+    "aria-pressed",
+    "true",
+  );
+  const restored = await (await request.get("/api/server", { headers })).json();
+  expect(restored.name).toBe(server.name);
+  expect(restored.status).toBe("offline");
+  expect(await readFile(savedProof, "utf8")).toBe(original);
+  const restoredFile = await request.get(
+    "/api/files/content?path=recovery-proof.txt",
+    { headers },
+  );
+  expect(restoredFile.ok()).toBe(true);
+  expect((await restoredFile.json()).content).toBe(original);
+  await page.reload();
+  await expect(serverButton(page, server.id)).toHaveAttribute(
+    "aria-pressed",
+    "true",
+  );
 });

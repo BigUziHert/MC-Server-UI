@@ -2,6 +2,7 @@ import fs from "node:fs/promises";
 import { createHash, randomUUID } from "node:crypto";
 import { parseDocument, isMap, isScalar } from "yaml";
 import { parseProperties } from "./import.mjs";
+import { decodeText } from "./text-encoding.mjs";
 
 const files = [
   "server.properties",
@@ -112,14 +113,7 @@ function decode(buffer) {
     );
   if (buffer.includes(0))
     throw fail(400, "Properties requires a plain text configuration file.");
-  try {
-    return {
-      text: new TextDecoder("utf-8", { fatal: true }).decode(buffer),
-      encoding: "utf8",
-    };
-  } catch {
-    return { text: buffer.toString("latin1"), encoding: "latin1" };
-  }
+  return decodeText(buffer);
 }
 function parse(filename, buffer) {
   const { text, encoding } = decode(buffer);

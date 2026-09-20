@@ -13,26 +13,44 @@ const root = await fs.mkdtemp(
 );
 let application;
 try {
+  const preferencesPath = path.join(
+    root,
+    "profile",
+    "data",
+    "desktop-preferences.json",
+  );
+  await fs.mkdir(path.dirname(preferencesPath), { recursive: true });
+  await fs.writeFile(
+    preferencesPath,
+    JSON.stringify({
+      "mc-panel.launchpad.rows": "25",
+      "mc-panel.navigation-collapsed": '{"server":true,"minecraft":false}',
+      "mc-panel.launchpad.view.default":
+        '{"platform":"modrinth","type":"mod","installedOnly":true}',
+    }),
+  );
   const environment = { ...process.env };
   delete environment.ELECTRON_RUN_AS_NODE;
   delete environment.NODE_OPTIONS;
-  application = await electron.launch({
-    executablePath: path.join(
-      project,
-      "node_modules",
-      "electron",
-      "dist",
-      "electron.exe",
-    ),
-    args: [
-      project,
-      `--user-data-dir=${path.join(root, "profile")}`,
-      "--smoke-test",
-    ],
-    cwd: project,
-    env: environment,
-    timeout: 30000,
-  });
+  const launch = () =>
+    electron.launch({
+      executablePath: path.join(
+        project,
+        "node_modules",
+        "electron",
+        "dist",
+        "electron.exe",
+      ),
+      args: [
+        project,
+        `--user-data-dir=${path.join(root, "profile")}`,
+        "--smoke-test",
+      ],
+      cwd: project,
+      env: environment,
+      timeout: 30000,
+    });
+  application = await launch();
   const page = await application.firstWindow();
   await expect
     .poll(() => page.evaluate(() => Boolean(window.mcPanelConnections)))
@@ -53,6 +71,31 @@ try {
   assert.equal(state.tray.alive, true);
   assert.ok(state.tray.actions.includes("Open MC Panel"));
   assert.ok(state.tray.actions.includes("Quit MC Panel"));
+  assert.deepEqual(
+    state.tray.items.find(
+      (item) => item.label === "Updates require the Setup edition",
+    ),
+    { label: "Updates require the Setup edition", enabled: false },
+  );
+  await expect
+    .poll(() =>
+      page.evaluate(() => localStorage.getItem("mc-panel.launchpad.rows")),
+    )
+    .toBe("25");
+  assert.equal(
+    await page.evaluate(() =>
+      sessionStorage.getItem("mc-panel.launchpad.view.default"),
+    ),
+    '{"platform":"modrinth","type":"mod","installedOnly":true}',
+  );
+  const firstToken = await application.evaluate(
+    async ({ BrowserWindow }) =>
+      (
+        await BrowserWindow.getAllWindows()[0].webContents.session.cookies.get({
+          name: "mc-panel-desktop",
+        })
+      )[0].value,
+  );
   await page.keyboard.press("Alt");
   state = await inspect();
   assert.equal(state.nativeMenu, false);
@@ -102,6 +145,16 @@ try {
   assert.equal(selection.activeId, "local");
   assert.equal(selection.localServers.length, 2);
   assert.deepEqual(selection.events, [{ serverId: selection.selected }]);
+  await expect(
+    page.getByRole("button", { name: "App updates", exact: true }),
+  ).toBeVisible();
+  await application.evaluate(({ BrowserWindow }) => {
+    BrowserWindow.getAllWindows()[0].webContents.send("mc-panel-updates-open");
+  });
+  await expect(
+    page.getByRole("dialog", { name: "App updates", exact: true }),
+  ).toBeVisible();
+  await page.getByRole("button", { name: "Close app updates" }).click();
   await application.evaluate(({ BrowserWindow }) =>
     BrowserWindow.getAllWindows()[0].close(),
   );
@@ -112,8 +165,51 @@ try {
     await page.evaluate(async () => (await fetch("/api/servers")).status),
     200,
   );
+  assert.equal(
+    await page.evaluate(
+      async () =>
+        (
+          await fetch("/api/desktop/preferences", {
+            method: "PUT",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              key: "mc-panel.launchpad.rows",
+              value: "75",
+            }),
+          })
+        ).status,
+    ),
+    204,
+  );
+  await application.close();
+  application = await launch();
+  const reopened = await application.firstWindow();
+  await expect
+    .poll(() =>
+      reopened.evaluate(() => localStorage.getItem("mc-panel.launchpad.rows")),
+    )
+    .toBe("75");
+  assert.equal(
+    await reopened.evaluate(() =>
+      sessionStorage.getItem("mc-panel.launchpad.view.default"),
+    ),
+    '{"platform":"modrinth","type":"mod","installedOnly":true}',
+  );
+  const secondToken = await application.evaluate(
+    async ({ BrowserWindow }) =>
+      (
+        await BrowserWindow.getAllWindows()[0].webContents.session.cookies.get({
+          name: "mc-panel-desktop",
+        })
+      )[0].value,
+  );
+  assert.notEqual(
+    firstToken,
+    secondToken,
+    "UI preference persistence must not persist the owner credential",
+  );
   console.log(
-    "Passed real Electron source smoke: native menu removed including Alt, tray lifecycle preserved, minimal local entries, and owner selection flush/persist/event ordering.",
+    "Passed real Electron source smoke: native menu removed including Alt, tray lifecycle preserved, unsupported updates disabled, immediate update dialog, local display preferences survive relaunch with a new private credential, and owner selection flush/persist/event ordering.",
   );
 } finally {
   if (application) await application.close().catch(() => {});

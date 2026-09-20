@@ -47,6 +47,83 @@ async function fixture(t, options = {}) {
 }
 const json = (method, body) => ({ method, body: JSON.stringify(body) });
 
+test("File Manager preserves Latin-1 bytes and rejects unrepresentable edits or changed encodings", async (t) => {
+  const { request, serverDir } = await fixture(t);
+  const target = path.join(serverDir, "legacy.txt");
+  const original = Buffer.from("caf\u00e9\r\n", "latin1");
+  await fs.writeFile(target, original);
+  const loaded = await request("/api/files/content?path=legacy.txt");
+  assert.deepEqual(loaded.body, {
+    content: "caf\u00e9\r\n",
+    encoding: "latin1",
+  });
+  assert.equal(
+    (
+      await request(
+        "/api/files/content",
+        json("PUT", { path: "legacy.txt", ...loaded.body }),
+      )
+    ).status,
+    200,
+  );
+  assert.deepEqual(await fs.readFile(target), original);
+  const rejected = await request(
+    "/api/files/content",
+    json("PUT", {
+      path: "legacy.txt",
+      content: "caf\u00e9 \u2603",
+      encoding: "latin1",
+    }),
+  );
+  assert.equal(rejected.status, 400);
+  assert.match(rejected.body.error, /Latin-1/);
+  assert.deepEqual(await fs.readFile(target), original);
+  await fs.writeFile(target, "UTF-8 now");
+  assert.equal(
+    (
+      await request(
+        "/api/files/content",
+        json("PUT", { path: "legacy.txt", ...loaded.body }),
+      )
+    ).status,
+    409,
+  );
+  assert.equal(await fs.readFile(target, "utf8"), "UTF-8 now");
+  const bom = Buffer.from("\ufeffUTF-8 text\r\n", "utf8");
+  await fs.writeFile(target, bom);
+  const utf = (await request("/api/files/content?path=legacy.txt")).body;
+  assert.equal(
+    (
+      await request(
+        "/api/files/content",
+        json("PUT", { path: "legacy.txt", ...utf }),
+      )
+    ).status,
+    200,
+  );
+  assert.deepEqual(await fs.readFile(target), bom);
+});
+
+test("file listing skips an entry removed after readdir without hiding remaining files", async (t) => {
+  const { request, serverDir } = await fixture(t);
+  await fs.mkdir(path.join(serverDir, "listing"));
+  await fs.writeFile(path.join(serverDir, "listing", "gone.txt"), "gone");
+  await fs.writeFile(path.join(serverDir, "listing", "keep.txt"), "keep");
+  const read = fs.readdir.bind(fs);
+  t.mock.method(fs, "readdir", async (target, options) => {
+    const entries = await read(target, options);
+    if (target === path.join(serverDir, "listing"))
+      await fs.rm(path.join(target, "gone.txt"), { force: true });
+    return entries;
+  });
+  const listed = await request("/api/files?path=listing");
+  assert.equal(listed.status, 200);
+  assert.deepEqual(
+    listed.body.entries.map((entry) => entry.name),
+    ["keep.txt"],
+  );
+});
+
 test("file operations upload and download original bytes, edit text, and reject overwrite", async (t) => {
   const { request, base } = await fixture(t);
   assert.equal(
@@ -582,7 +659,12 @@ test("console starts offline, delivers one command to the process, and tracks po
   );
 });
 
-function fakeJava({ confirm = true, flushDelay = 0, fakeChat = false } = {}) {
+function fakeJava({
+  confirm = true,
+  flushDelay = 0,
+  fakeChat = false,
+  saveLine = "[Server thread/INFO]: Saved the game",
+} = {}) {
   const commands = [];
   const child = new EventEmitter();
   child.stdout = new PassThrough();
@@ -593,10 +675,7 @@ function fakeJava({ confirm = true, flushDelay = 0, fakeChat = false } = {}) {
       const command = chunk.toString().trim();
       commands.push(command);
       if (command === "save-all flush" && confirm)
-        setTimeout(
-          () => child.stdout.write("[Server thread/INFO]: Saved the game\n"),
-          flushDelay,
-        );
+        setTimeout(() => child.stdout.write(saveLine + "\n"), flushDelay);
       if (command === "save-all flush" && fakeChat)
         setImmediate(() =>
           child.stdout.write(
@@ -676,8 +755,12 @@ test("live console waits for command delivery and rejects a failed or disconnect
   }
 });
 
-test("live online backup flushes, blocks concurrent writes, and restores automatic saves", async (t) => {
-  const java = fakeJava({ flushDelay: 120 });
+test("live online backup accepts NeoForge save confirmation, blocks concurrent writes, and restores automatic saves", async (t) => {
+  const java = fakeJava({
+    flushDelay: 120,
+    saveLine:
+      "[20Sep2026 21:54:10.471] [Server thread/INFO] [minecraft/MinecraftServer]: Saved the game",
+  });
   const { request, serverDir } = await fixture(t, {
     jar: "server.jar",
     spawnServer: java.spawnServer,

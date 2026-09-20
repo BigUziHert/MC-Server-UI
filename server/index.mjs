@@ -23,8 +23,13 @@ import { createServerSetup } from "./server-setup.mjs";
 import { auditEntry, auditHistory, contentKind } from "./audit.mjs";
 import { installedMinecraftMetadata } from "./installed-minecraft.mjs";
 import { minecraftGameVersion } from "./minecraft-version.mjs";
-import { createLauncherStop } from "./launcher-stop.mjs";
+import {
+  createLauncherStop,
+  minecraftServerMessage,
+} from "./launcher-stop.mjs";
+import { decodeText, encodeText } from "./text-encoding.mjs";
 import { createAccessService } from "./access.mjs";
+import { createPanelRecovery } from "./panel-recovery.mjs";
 import { localNetworkAddresses } from "./remote-tls.mjs";
 import {
   createRemoteGateway,
@@ -38,6 +43,7 @@ import {
   moderationCommand,
   playerCommandAudit,
   validPlayerUuid,
+  validPlayerName,
   whitelistCommand,
   readWhitelistSettings,
   samePlayer,
@@ -65,7 +71,9 @@ const permissionIds = new Set(
 const userWithPermissions = (user) => ({
   ...user,
   permissions: (
-    user.permissions ?? permissionsCatalog.roleDefaults[user.role] ?? []
+    user.permissions ??
+    permissionsCatalog.roleDefaults[user.role] ??
+    []
   ).filter((permission) => permissionIds.has(permission)),
 });
 function validatePermissions(value) {
@@ -97,6 +105,7 @@ const exists = async (target) => {
   }
 };
 
+// Exported for focused process lifecycle tests; production callers are local.
 export async function terminateProcessTree(
   child,
   {
@@ -167,8 +176,8 @@ const escapeProperty = (value) =>
       (char) => `\\u${char.charCodeAt(0).toString(16).padStart(4, "0")}`,
     );
 
-export function validatePlayerName(name) {
-  if (typeof name !== "string" || !/^[A-Za-z0-9_]{3,16}$/.test(name))
+function validatePlayerName(name) {
+  if (!validPlayerName(name))
     throw error(
       400,
       "Use a Minecraft Java username with 3–16 letters, numbers, or underscores.",
@@ -463,41 +472,35 @@ export async function createPanel(options = {}) {
     throw error(400, "Only live Minecraft servers are supported.");
   const telemetry = options.telemetry ?? createProcessTelemetry();
   const publicAddress = options.publicAddress ?? createPublicAddressResolver();
-  // A fleet passes every setting explicitly. Legacy callers may still use .env.
-  const env = options.useEnvironment === false ? {} : process.env;
   const dataDir = path.resolve(
-    options.dataDir ?? env.PANEL_DATA_DIR ?? path.join(projectDir, "data"),
+    options.dataDir ?? path.join(projectDir, "data"),
   );
   const serverDir = path.resolve(
-    options.serverDir ?? env.MC_SERVER_DIR ?? path.join(dataDir, "server"),
+    options.serverDir ?? path.join(dataDir, "server"),
   );
   let configuredJar =
     options.launchType && options.launchType !== "jar"
       ? ""
-      : (options.jar ?? env.MC_SERVER_JAR) || "server.jar";
+      : options.jar || "server.jar";
   const mode = "live";
-  let memoryLimit = Number(options.memoryLimit ?? env.MC_MEMORY_MB ?? 4096);
+  let memoryLimit = Number(options.memoryLimit ?? 4096);
   let configuration = {
-    name: options.name ?? env.MC_SERVER_NAME ?? "The Overworld",
+    name: options.name ?? "The Overworld",
     mode,
-    port: Number(options.port ?? env.MC_PORT ?? 25565),
+    port: Number(options.port ?? 25565),
     memoryLimitMB: memoryLimit,
     jar: configuredJar,
     launchType: options.launchType ?? "jar",
     launchScript: options.launchScript ?? "",
     launchArgs: options.launchArgs ?? [],
     launchExecutable: options.launchExecutable ?? "",
-    javaPath: options.javaPath ?? env.JAVA_PATH ?? "java",
+    javaPath: options.javaPath ?? "java",
     connectionHost:
-      options.connectionHost ??
-      legacyConnectionHost(options.address ?? env.MC_SERVER_ADDRESS),
-    address:
-      options.address ??
-      env.MC_SERVER_ADDRESS ??
-      `localhost:${options.port ?? env.MC_PORT ?? 25565}`,
-    version: options.version ?? env.MC_VERSION ?? "Configured JAR",
-    software: options.software ?? env.MC_SOFTWARE ?? "Java",
-    maxPlayers: Number(options.maxPlayers ?? env.MC_MAX_PLAYERS ?? 20),
+      options.connectionHost ?? legacyConnectionHost(options.address),
+    address: options.address ?? `localhost:${options.port ?? 25565}`,
+    version: options.version ?? "Configured JAR",
+    software: options.software ?? "Java",
+    maxPlayers: Number(options.maxPlayers ?? 20),
     minecraftVersion: options.minecraftVersion ?? null,
     motd: options.motd ?? "Welcome to the Overworld",
   };
@@ -506,7 +509,9 @@ export async function createPanel(options = {}) {
     memoryLimit < 256 ||
     memoryLimit > 262144
   )
-    throw new Error("MC_MEMORY_MB must be an integer between 256 and 262144.");
+    throw new Error(
+      "Server memory must be an integer between 256 and 262144 MB.",
+    );
   await fs.mkdir(dataDir, { recursive: true });
   const backupDir = await safePath(dataDir, "backups");
   const uploadDir = await safePath(dataDir, "uploads");
@@ -613,6 +618,27 @@ export async function createPanel(options = {}) {
   let startupMetadata = {};
   let startupMetadataAt = 0;
   let startupMetadataRead;
+  let cachedIcon = null;
+  let iconRead;
+  let iconReadAt = 0;
+  async function refreshIcon(force = false) {
+    if (!force && Date.now() - iconReadAt < 3000) return;
+    if (!force && iconRead) return iconRead;
+    // A mutation must read after any pre-write metadata read has settled.
+    while (iconRead) await iconRead;
+    iconRead = readServerIcon(serverDir, safePath)
+      .then((icon) => {
+        cachedIcon = icon;
+      })
+      .catch(() => {
+        /* Keep the last icon during a transient filesystem failure. */
+      })
+      .finally(() => {
+        iconReadAt = Date.now();
+        iconRead = undefined;
+      });
+    return iconRead;
+  }
   const metadataFor = (config, detected = {}) =>
     config.launchType === "jar"
       ? {
@@ -631,6 +657,7 @@ export async function createPanel(options = {}) {
             detected.memoryLimitMB == null ? "unknown" : "launch",
         };
   async function refreshStartupMetadata(force = false) {
+    await refreshIcon(force);
     // Once launched, these values describe that process. Editing @files while it
     // runs changes the next launch, not the heap/version of the running JVM.
     if (processHandle || status !== "offline") return;
@@ -931,6 +958,10 @@ export async function createPanel(options = {}) {
     configuredMemoryLimitMB: startupMetadata.memoryLimitMB,
     memoryLimitSource: startupMetadata.memoryLimitSource,
     memoryLimitState: processHandle ? "started" : "configured",
+    iconVersion:
+      state.iconPreference === "default" ? null : (cachedIcon?.version ?? null),
+    serverIconVersion: cachedIcon?.version ?? null,
+    iconPreference: state.iconPreference,
     id: options.id,
     status,
     ...(options.source === "imported" ? { source: "imported", serverDir } : {}),
@@ -1425,8 +1456,8 @@ export async function createPanel(options = {}) {
       const onLine = (line) => {
         // Only accept the exact server logger response, never chat or a command echo.
         if (
-          /^\s*(?:\[\d{2}:\d{2}:\d{2}\]\s*)?\[(?:Server thread\/INFO|\d{2}:\d{2}:\d{2} INFO)\]:\s*Saved the (?:game|world)[.!]?\s*$/i.test(
-            line.message,
+          /^Saved the (?:game|world)[.!]?\s*$/i.test(
+            minecraftServerMessage(line.message),
           ) &&
           child === processHandle
         ) {
@@ -1736,19 +1767,31 @@ export async function createPanel(options = {}) {
     next();
   });
 
-  let diskCache = { value: 0, at: 0 };
+  let diskCache = { value: null, at: 0 };
+  let diskScan;
+  let diskError = false;
   app.get("/api/server", async (_req, res) => {
     await refreshStartupMetadata();
-    if (Date.now() - diskCache.at > 10000)
-      diskCache = { value: await directorySize(serverDir), at: Date.now() };
-    const storage = await fs.statfs(serverDir);
+    if (!diskScan && Date.now() - diskCache.at > 10000)
+      diskScan = directorySize(serverDir)
+        .then((value) => {
+          diskCache = { value, at: Date.now() };
+          diskError = false;
+        })
+        .catch(() => {
+          diskCache.at = Date.now();
+          diskError = true;
+        })
+        .finally(() => {
+          diskScan = undefined;
+        });
+    const storage = await fs.statfs(serverDir).catch(() => null);
     const sampledChild = processHandle;
-    const [sample, connection, icon] = await Promise.all([
+    const [sample, connection] = await Promise.all([
       sampledChild && Number.isInteger(sampledChild.pid)
         ? telemetry.sample(sampledChild.pid)
         : null,
       advertisedConnection(configuration, publicAddress),
-      readServerIcon(serverDir, safePath),
     ]);
     const currentSample =
       sampledChild &&
@@ -1763,8 +1806,10 @@ export async function createPanel(options = {}) {
       address: configuration.address,
       ...connection,
       iconVersion:
-        state.iconPreference === "default" ? null : (icon?.version ?? null),
-      serverIconVersion: icon?.version ?? null,
+        state.iconPreference === "default"
+          ? null
+          : (cachedIcon?.version ?? null),
+      serverIconVersion: cachedIcon?.version ?? null,
       iconPreference: state.iconPreference,
       status,
       mode,
@@ -1782,8 +1827,13 @@ export async function createPanel(options = {}) {
       memoryLimitSource: startupMetadata.memoryLimitSource,
       memoryLimitState: processHandle ? "started" : "configured",
       disk: diskCache.value,
-      diskLimit: storage.blocks * storage.bsize,
-      diskAvailable: storage.bavail * storage.bsize,
+      diskLimit: storage ? storage.blocks * storage.bsize : null,
+      diskAvailable: storage ? storage.bavail * storage.bsize : null,
+      unavailable: !storage || diskError,
+      sourceError:
+        !storage || diskError
+          ? "Server folder unavailable. Restore access to its existing location and retry."
+          : null,
       players: [...onlinePlayers.values()].sort((a, b) =>
         a.name.localeCompare(b.name),
       ),
@@ -1802,7 +1852,8 @@ export async function createPanel(options = {}) {
     });
   });
   app.get("/api/server/icon", async (_req, res) => {
-    const icon = await readServerIcon(serverDir, safePath);
+    await refreshIcon(true);
+    const icon = cachedIcon;
     if (!icon) throw error(404, "No custom server icon.");
     res.set("Cache-Control", "no-cache").type("png").send(icon.bytes);
   });
@@ -1810,6 +1861,7 @@ export async function createPanel(options = {}) {
     "/api/server/icon",
     trackOperation(async (req, res) => {
       await writeServerIcon(serverDir, decodeIcon(req.body?.image), safePath);
+      await refreshIcon(true);
       state.iconPreference = "server";
       await save();
       await audit(
@@ -1824,6 +1876,7 @@ export async function createPanel(options = {}) {
     "/api/server/icon",
     trackOperation(async (_req, res) => {
       state.iconPreference = "default";
+      await refreshIcon(true);
       await save();
       await audit(
         "server",
@@ -1839,6 +1892,7 @@ export async function createPanel(options = {}) {
       if (req.body?.preference !== "server")
         throw error(400, "Choose the server icon display preference.");
       state.iconPreference = "server";
+      await refreshIcon(true);
       await save();
       await audit(
         "server",
@@ -2285,12 +2339,18 @@ export async function createPanel(options = {}) {
     const entries = [];
     for (const item of await fs.readdir(target, { withFileTypes: true })) {
       if (item.isSymbolicLink()) continue;
-      const stat = await fs.stat(path.join(target, item.name));
+      const stat = await fs
+        .lstat(path.join(target, item.name))
+        .catch((cause) => {
+          if (["ENOENT", "ENOTDIR"].includes(cause.code)) return null;
+          throw cause;
+        });
+      if (!stat || stat.isSymbolicLink()) continue;
       entries.push({
         name: item.name,
         path: [relative, item.name].filter(Boolean).join("/"),
-        type: item.isDirectory() ? "directory" : "file",
-        size: item.isDirectory() ? 0 : stat.size,
+        type: stat.isDirectory() ? "directory" : "file",
+        size: stat.isDirectory() ? 0 : stat.size,
         modified: stat.mtime.toISOString(),
       });
     }
@@ -2434,11 +2494,12 @@ export async function createPanel(options = {}) {
         400,
         "This appears to be a binary file. Download it instead.",
       );
-    return { target, content: buffer.toString("utf8") };
+    const { text, encoding } = decodeText(buffer);
+    return { target, content: text, encoding };
   };
   app.get("/api/files/content", async (req, res) => {
-    const { content } = await editable(req.query.path);
-    res.json({ content });
+    const { content, encoding } = await editable(req.query.path);
+    res.json({ content, encoding });
   });
   app.put(
     "/api/files/content",
@@ -2448,8 +2509,10 @@ export async function createPanel(options = {}) {
         Buffer.byteLength(req.body.content) > 1024 * 1024
       )
         throw error(400, "The editor supports text files up to 1 MB.");
-      const { target } = await editable(req.body.path);
-      await fs.writeFile(target, req.body.content);
+      const { target, encoding } = await editable(req.body.path);
+      if (req.body.encoding != null && req.body.encoding !== encoding)
+        throw error(409, "The file encoding changed. Reload it before saving.");
+      await fs.writeFile(target, encodeText(req.body.content, encoding));
       await audit("file", "File edited", req.body.path);
       diskCache.at = 0;
       res.json({ ok: true });
@@ -2625,11 +2688,6 @@ export async function createPanel(options = {}) {
   minecraft.mount(app);
   app.use("/api", (_req, _res, next) =>
     next(error(404, "API endpoint not found.")),
-  );
-  const distDir = path.join(projectDir, "dist");
-  app.use(express.static(distDir));
-  app.get("/{*path}", (_req, res) =>
-    res.sendFile(path.join(distDir, "index.html")),
   );
   app.use((cause, _req, res, _next) => {
     if (res.headersSent) return;
@@ -2860,7 +2918,14 @@ export async function createFleet(options = {}) {
             : [],
         ),
     );
-  const descriptor = (entry) => runtimes.get(entry.id).descriptor();
+  const descriptor = (entry) =>
+    (
+      runtimes.get(entry.id) ??
+      unavailableRuntime(
+        entry,
+        new Error("Restore access to its existing folder and retry."),
+      )
+    ).descriptor();
   const checkPort = (port, exceptId) => {
     if (
       registry.servers.some(
@@ -2883,7 +2948,7 @@ export async function createFleet(options = {}) {
       requireCanonical,
     });
   const unavailableRuntime = (entry, cause) => {
-    const sourceError = `Imported server unavailable: ${cause.message} Its existing folder has not been recreated or changed.`;
+    const sourceError = `${entry.storage === "external" ? "Imported server" : "Server"} unavailable: ${cause.message} Restore access to its existing folder and retry.`;
     const app = express();
     app.use((_req, res) => res.status(409).json({ error: sourceError }));
     return {
@@ -2898,8 +2963,11 @@ export async function createFleet(options = {}) {
         version: entry.version,
         software: entry.software,
         minecraftVersion: minecraftGameVersion(entry),
+        iconVersion: null,
+        serverIconVersion: null,
+        iconPreference: "server",
         status: "offline",
-        source: "imported",
+        source: entry.storage === "external" ? "imported" : "managed",
         serverDir: entry.serverDir,
         unavailable: true,
         sourceError,
@@ -2911,24 +2979,21 @@ export async function createFleet(options = {}) {
       close: async () => {},
     };
   };
-  const makeRuntime = async (entry, allowUnavailable = false) => {
+  const makeAvailableRuntime = async (entry, preserveFiles = false) => {
     if (entry.storage === "external") {
-      try {
-        const inspected = await inspectImport(entry.serverDir, entry.id, true);
-        if (entry.launchType !== "jar")
-          await validateStartupFiles(entry.serverDir, entry);
-        else if (!inspected.jars.includes(entry.jar))
-          throw error(
-            409,
-            "The selected server JAR is missing or is no longer a regular file in the source folder.",
-          );
-      } catch (cause) {
-        if (!allowUnavailable) throw cause;
-        const runtime = unavailableRuntime(entry, cause);
-        runtimes.set(entry.id, runtime);
-        return runtime;
-      }
-    } else await fs.mkdir(entry.serverDir, { recursive: true });
+      const inspected = await inspectImport(entry.serverDir, entry.id, true);
+      if (entry.launchType !== "jar")
+        await validateStartupFiles(entry.serverDir, entry);
+      else if (!inspected.jars.includes(entry.jar))
+        throw error(
+          409,
+          "The selected server JAR is missing or is no longer a regular file in the source folder.",
+        );
+    } else if (preserveFiles)
+      await canonicalExternalDirectory(entry.serverDir, {
+        requireCanonical: true,
+      });
+    else await fs.mkdir(entry.serverDir, { recursive: true });
     await fs.mkdir(entry.dataDir, { recursive: true });
     const actualServer = await fs.realpath(entry.serverDir);
     const contains = (root, target) => {
@@ -2975,7 +3040,7 @@ export async function createFleet(options = {}) {
           user,
         }),
       revokeUser: (userId) => access.revoke(entry.id, userId),
-      existingServerDir: entry.storage === "external",
+      existingServerDir: entry.storage === "external" || preserveFiles,
       scheduler: options.scheduler,
       spawnServer: options.spawnServer,
       spawnProcess: options.spawnProcess,
@@ -3007,6 +3072,24 @@ export async function createFleet(options = {}) {
     });
     runtimes.set(entry.id, runtime);
     return runtime;
+  };
+  const makeRuntime = async (
+    entry,
+    allowUnavailable = false,
+    preserveFiles = false,
+  ) => {
+    try {
+      return await makeAvailableRuntime(entry, preserveFiles);
+    } catch (cause) {
+      if (
+        !allowUnavailable ||
+        (entry.storage !== "external" && cause.status === 400)
+      )
+        throw cause;
+      const runtime = unavailableRuntime(entry, cause);
+      runtimes.set(entry.id, runtime);
+      return runtime;
+    }
   };
   if (await exists(registryPath)) {
     registry = JSON.parse(await fs.readFile(registryPath, "utf8"));
@@ -3282,6 +3365,87 @@ export async function createFleet(options = {}) {
   });
   app.post("/api/server-import/inspect", async (req, res) => {
     res.json(await inspectImport(req.body?.directory));
+  });
+  const recovery = createPanelRecovery({
+    dataDir,
+    registered: () => registry.servers,
+  });
+  app.get("/api/server-recovery", async (_req, res) =>
+    res.json(await recovery.list()),
+  );
+  app.get("/api/server-recovery/:id", async (req, res) =>
+    res.json(await recovery.inspect(req.params.id)),
+  );
+  app.post("/api/server-recovery/:id", async (req, res) => {
+    const server = await serialize(async () => {
+      const { confirmed, revision, ...input } = req.body ?? {};
+      if (confirmed !== true || typeof revision !== "string")
+        throw error(
+          400,
+          "Review and confirm the saved server before recovering it.",
+        );
+      const inspected = await recovery.inspect(req.params.id);
+      if (revision !== inspected.revision)
+        throw error(
+          409,
+          "The saved server changed. Review it again before recovering it.",
+        );
+      const config = validateServerConfiguration(
+        input,
+        {
+          name: inspected.name,
+          port: inspected.port,
+          motd: inspected.motd,
+          memoryLimitMB: inspected.memoryLimitMB ?? 4096,
+          javaPath: inspected.javaPath ?? "java",
+        },
+        true,
+      );
+      checkPort(config.port);
+      if (config.launchType === "jar" && !inspected.jars.includes(config.jar))
+        throw error(409, "Choose a server JAR from the reviewed folder.");
+      const startup = await validateStartupFiles(inspected.serverDir, config);
+      const current = await recovery.inspect(req.params.id);
+      if (revision !== current.revision)
+        throw error(
+          409,
+          "The saved server changed. Review it again before recovering it.",
+        );
+      const entry = {
+        ...config,
+        id: inspected.id,
+        storage: "instance",
+        dataDir: inspected.dataDir,
+        serverDir: inspected.serverDir,
+        address: `localhost:${config.port}`,
+        maxPlayers: inspected.maxPlayers,
+        version: startup.version ?? "Configured JAR",
+        software: startup.software ?? "Java",
+      };
+      const runtime = await makeRuntime(entry, false, true);
+      try {
+        await persist({
+          ...registry,
+          defaultServerId: registry.defaultServerId ?? entry.id,
+          servers: [...registry.servers, entry],
+        });
+      } catch (cause) {
+        runtimes.delete(entry.id);
+        await runtime.close();
+        throw cause;
+      }
+      await runtime
+        .audit(
+          "server",
+          "Saved server recovered",
+          "Recovered the existing Minecraft files, backups and Recycle Bin. The server remains stopped.",
+        )
+        .catch((cause) =>
+          console.error("Recovery audit could not be saved:", cause),
+        );
+      return runtime.descriptor();
+    });
+    res.status(201).json({ server });
   });
   app.post("/api/server-import", async (req, res) => {
     const server = await serialize(async () => {

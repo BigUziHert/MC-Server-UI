@@ -217,9 +217,20 @@ test("invited phone sessions are server-scoped, honor changed permissions, and r
     "/api/access/settings",
     "/api/audit?scope=panel",
     "/api/desktop/updates",
+    "/api/server-recovery",
+    `/api/server-recovery/${id}`,
     "/api/versions",
   ])
     assert.equal((await asUser(route)).status, 403, route);
+  assert.equal(
+    (
+      await asUser(
+        `/api/server-recovery/${id}`,
+        json("POST", { confirmed: true, revision: "forged" }),
+      )
+    ).status,
+    403,
+  );
   assert.equal(
     (
       await asUser("/api/server", {

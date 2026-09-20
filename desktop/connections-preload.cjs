@@ -1,6 +1,9 @@
 const { contextBridge, ipcRenderer } = require("electron");
 
 if (process.isMainFrame) {
+  ipcRenderer.on("mc-panel-updates-open", () => {
+    window.dispatchEvent(new Event("mc-panel-updates-open"));
+  });
   contextBridge.exposeInMainWorld("mcPanelConnections", {
     list: () => ipcRenderer.invoke("mc-panel-connections:list"),
     open: (url) => ipcRenderer.invoke("mc-panel-connections:open", url),

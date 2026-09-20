@@ -453,16 +453,6 @@ export async function createServerSetup({ dataDir, safePath, ...options }) {
       ),
     );
     app.get(
-      "/api/server-setup/versions",
-      endpoint(async (_req, res) =>
-        res.json({
-          providers: versions.listProviders(),
-          current: null,
-          job: null,
-        }),
-      ),
-    );
-    app.get(
       "/api/server-setup/versions/:provider/:version",
       endpoint(async (req, res) =>
         res.json(
@@ -475,10 +465,6 @@ export async function createServerSetup({ dataDir, safePath, ...options }) {
       endpoint(async (req, res) =>
         res.json(await versions.versions(req.params.provider)),
       ),
-    );
-    app.get(
-      "/api/server-setup/launchpad",
-      endpoint(async (_req, res) => res.json(await catalog.config())),
     );
     for (const method of ["search", "versions"])
       app.get(

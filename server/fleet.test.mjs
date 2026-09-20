@@ -712,6 +712,164 @@ test("a failed registry write rolls server.properties back and leaves active set
   );
 });
 
+test("explicit saved-server recovery preserves its original identity, files and backups", async (t) => {
+  const { boot } = await fixture(t);
+  const fleet = await boot();
+  const created = (
+    await fleet.request(
+      "/api/servers",
+      json("POST", { name: "Saved world", port: 25577 }),
+    )
+  ).body.server;
+  const runtime = fleet.runtimes.get(created.id);
+  await fs.writeFile(
+    path.join(runtime.serverDir, "server.jar"),
+    "fixture never executed",
+  );
+  await fs.writeFile(
+    path.join(runtime.serverDir, "precious-world.txt"),
+    "keep my world",
+  );
+  const properties = await fs.readFile(
+    path.join(runtime.serverDir, "server.properties"),
+  );
+  const backup = await fleet.request(
+    "/api/backups",
+    json("POST", { name: "Keep backup" }),
+    created.id,
+  );
+  assert.equal(backup.status, 201);
+  const backupFiles = await fs.readdir(path.join(runtime.dataDir, "backups"));
+  assert.equal(
+    (await fleet.request(`/api/servers/${created.id}`, { method: "DELETE" }))
+      .status,
+    200,
+  );
+  const candidates = await fleet.request("/api/server-recovery");
+  assert.ok(
+    candidates.body.candidates.some((entry) => entry.id === created.id),
+  );
+  const inspected = (await fleet.request(`/api/server-recovery/${created.id}`))
+    .body;
+  const input = {
+    confirmed: true,
+    revision: inspected.revision,
+    name: "Recovered world",
+    port: 25577,
+    jar: "server.jar",
+  };
+  assert.equal(
+    (
+      await fleet.request(
+        `/api/server-recovery/${created.id}`,
+        json("POST", { ...input, confirmed: false }),
+      )
+    ).status,
+    400,
+  );
+  await fs.writeFile(
+    path.join(runtime.serverDir, "changed.txt"),
+    "external change",
+  );
+  assert.equal(
+    (
+      await fleet.request(
+        `/api/server-recovery/${created.id}`,
+        json("POST", input),
+      )
+    ).status,
+    409,
+  );
+  input.revision = (
+    await fleet.request(`/api/server-recovery/${created.id}`)
+  ).body.revision;
+  assert.equal(
+    (
+      await fleet.request(
+        `/api/server-recovery/${created.id}`,
+        json("POST", { ...input, port: 25565 }),
+      )
+    ).status,
+    409,
+  );
+  const recovered = await fleet.request(
+    `/api/server-recovery/${created.id}`,
+    json("POST", input),
+  );
+  assert.equal(recovered.status, 201, JSON.stringify(recovered.body));
+  assert.equal(recovered.body.server.id, created.id);
+  assert.equal(recovered.body.server.status, "offline");
+  assert.deepEqual(
+    await fs.readFile(path.join(runtime.serverDir, "server.properties")),
+    properties,
+  );
+  assert.equal(
+    await fs.readFile(
+      path.join(runtime.serverDir, "precious-world.txt"),
+      "utf8",
+    ),
+    "keep my world",
+  );
+  assert.deepEqual(
+    await fs.readdir(path.join(runtime.dataDir, "backups")),
+    backupFiles,
+  );
+  assert.equal(
+    (await fleet.request("/api/backups", {}, created.id)).body.backups.length,
+    1,
+  );
+  assert.ok(
+    !(await fleet.request("/api/server-recovery")).body.candidates.some(
+      (entry) => entry.id === created.id,
+    ),
+  );
+});
+
+test("failed removal recovery retains an unavailable descriptor and other servers remain usable", async (t) => {
+  const { boot } = await fixture(t);
+  const fleet = await boot();
+  const originalId = (await fleet.request("/api/servers")).body.defaultServerId;
+  const created = (
+    await fleet.request(
+      "/api/servers",
+      json("POST", { name: "Disk trouble", port: 25577 }),
+    )
+  ).body.server;
+  const runtime = fleet.runtimes.get(created.id);
+  t.mock.method(console, "error", () => {});
+  t.mock.method(runtime, "audit", async () => {
+    throw new Error("Fixture audit disk unavailable");
+  });
+  const mkdir = fs.mkdir.bind(fs);
+  const mocked = t.mock.method(fs, "mkdir", async (target, options) => {
+    if (target === runtime.dataDir)
+      throw Object.assign(new Error("Fixture folder unavailable"), {
+        code: "EIO",
+      });
+    return mkdir(target, options);
+  });
+  assert.equal(
+    (await fleet.request(`/api/servers/${created.id}`, { method: "DELETE" }))
+      .status,
+    500,
+  );
+  const unavailable = (await fleet.request("/api/servers")).body.servers.find(
+    (entry) => entry.id === created.id,
+  );
+  assert.equal(unavailable.unavailable, true);
+  assert.equal(unavailable.source, "managed");
+  assert.equal(
+    (await fleet.request("/api/server", {}, originalId)).status,
+    200,
+  );
+  mocked.mock.restore();
+  assert.equal(
+    (await fleet.request("/api/server", {}, created.id)).status,
+    200,
+  );
+  assert.equal(fleet.runtimes.get(created.id).unavailable, undefined);
+});
+
 test("removing the last server preserves its files and backups and leaves an empty registry after restart", async (t) => {
   const { boot, dataDir } = await fixture(t);
   const first = await boot();

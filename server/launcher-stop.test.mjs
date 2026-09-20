@@ -15,6 +15,7 @@ test("only trusted shutdown lines protect a save; chat, commands and routine sav
   for (const line of [
     "[Server thread/INFO]: Stopping server",
     "[21:54:10] [Server thread/INFO] [minecraft/MinecraftServer]: Stopping server",
+    "[20Sep2026 21:54:10.471] [Server thread/INFO] [minecraft/MinecraftServer]: Stopping server",
     "[21:54:10 INFO]: Stopping server",
   ])
     assert.equal(isMinecraftShutdownLine(line), true, line);

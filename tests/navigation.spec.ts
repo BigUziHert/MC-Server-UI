@@ -168,6 +168,55 @@ test("a failed desktop selection read waits for retry without opening the defaul
   );
 });
 
+test("Retry connection supersedes a pending background fleet request", async ({
+  page,
+  request,
+  serverId,
+}) => {
+  const fleet = await (await request.get("/api/servers")).json();
+  let calls = 0;
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  await page.route("**/api/servers", async (route) => {
+    const count = ++calls;
+    if (count === 1)
+      return route.fulfill({
+        status: 503,
+        json: { error: "Disconnected fixture" },
+      });
+    if (count === 2) {
+      await gate;
+      return route
+        .fulfill({ status: 503, json: { error: "Stale background error" } })
+        .catch(() => {});
+    }
+    return route.fulfill({ json: fleet });
+  });
+  try {
+    await page.goto("/#console");
+    await expect(page.getByRole("alert")).toContainText("Disconnected fixture");
+    await expect.poll(() => calls).toBe(2);
+    await page
+      .getByRole("button", { name: "Retry connection", exact: true })
+      .click();
+    await expect(serverButton(page, serverId)).toHaveAttribute(
+      "aria-pressed",
+      "true",
+    );
+    release();
+    await expect(
+      page.getByRole("heading", { name: "Console", exact: true }),
+    ).toBeVisible();
+    await expect(
+      page.getByText("Stale background error", { exact: true }),
+    ).toHaveCount(0);
+  } finally {
+    release();
+  }
+});
+
 test("native selection flush retries once after failure and drains choices queued while waiting", async ({
   page,
   request,

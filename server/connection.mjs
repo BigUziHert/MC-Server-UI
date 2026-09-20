@@ -37,7 +37,7 @@ export function legacyConnectionHost(address) {
   return "";
 }
 
-export function isPublicIPv4(host) {
+function isPublicIPv4(host) {
   if (isIP(host) !== 4) return false;
   const [a, b] = host.split(".").map(Number);
   return !(

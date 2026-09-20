@@ -288,6 +288,7 @@ export function createProcessTelemetry({
   const states = new Map();
   let epoch = 0;
   let sequence = 0;
+  let snapshotSerial = 0;
   let cached;
   let active;
   let closed = false;
@@ -299,10 +300,27 @@ export function createProcessTelemetry({
     sampledAt,
     error: message,
   });
-  const snapshot = () => {
-    if (cached && now() - cached.at < cacheMs) return Promise.resolve(cached);
-    if (active) return active.result;
-    const operation = { epoch, controller: new AbortController() };
+  const snapshot = (minimumSerial = 0) => {
+    if (cached && cached.serial >= minimumSerial && now() - cached.at < cacheMs)
+      return Promise.resolve(cached);
+    if (active) {
+      if (active.serial >= minimumSerial) return active.result;
+      const previous = active;
+      return previous.result.then((result) =>
+        active === previous
+          ? {
+              ...result,
+              error:
+                "The previous telemetry reader has not finished. Retrying with the new server process.",
+            }
+          : snapshot(minimumSerial),
+      );
+    }
+    const operation = {
+      epoch,
+      serial: ++snapshotSerial,
+      controller: new AbortController(),
+    };
     active = operation;
     let timer;
     const work = Promise.resolve()
@@ -321,6 +339,7 @@ export function createProcessTelemetry({
           at: now(),
           sampledAt: wallNow(),
           sequence: ++sequence,
+          serial: operation.serial,
           epoch: operation.epoch,
         }),
         (cause) => ({
@@ -328,6 +347,7 @@ export function createProcessTelemetry({
           at: now(),
           sampledAt: wallNow(),
           sequence: ++sequence,
+          serial: operation.serial,
           epoch: operation.epoch,
         }),
       )
@@ -354,7 +374,7 @@ export function createProcessTelemetry({
         state = {};
         states.set(pid, state);
       }
-      const result = await snapshot();
+      const result = await snapshot(state.minimumSerial);
       if (closed || state !== states.get(pid) || result.epoch !== epoch)
         return unavailable(
           "The server process changed while telemetry was being read.",
@@ -402,10 +422,11 @@ export function createProcessTelemetry({
       return state.lastResult;
     },
     reset(pid) {
-      if (pid === undefined) states.clear();
-      else states.delete(pid);
+      if (pid === undefined) {
+        states.clear();
+        epoch++;
+      } else states.set(pid, { minimumSerial: snapshotSerial + 1 });
       cached = undefined;
-      epoch++;
     },
     close() {
       closed = true;

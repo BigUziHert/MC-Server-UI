@@ -301,6 +301,20 @@ test("server icon display preferences persist per server without deleting Minecr
   const firstVersion = (await panel.request("/api/server", {}, first)).body
     .iconVersion;
   assert.ok(firstVersion);
+  const listed = (await panel.request("/api/servers")).body.servers;
+  assert.equal(
+    listed.find((entry) => entry.id === first).iconVersion,
+    firstVersion,
+  );
+  assert.equal(
+    listed.find((entry) => entry.id === first).serverIconVersion,
+    firstVersion,
+  );
+  assert.equal(
+    listed.find((entry) => entry.id === first).iconPreference,
+    "server",
+  );
+  assert.equal(listed.find((entry) => entry.id === second).iconVersion, null);
   assert.equal(
     (
       await panel.request(
@@ -347,6 +361,12 @@ test("server icon display preferences persist per server without deleting Minecr
   let displayed = (await restarted.request("/api/server", {}, first)).body;
   assert.equal(displayed.iconPreference, "default");
   assert.ok(displayed.serverIconVersion);
+  const hidden = (await restarted.request("/api/servers")).body.servers.find(
+    (entry) => entry.id === first,
+  );
+  assert.equal(hidden.iconVersion, null);
+  assert.equal(hidden.serverIconVersion, displayed.serverIconVersion);
+  assert.equal(hidden.iconPreference, "default");
   assert.equal(
     (await restarted.request("/api/server", {}, second)).body.iconPreference,
     "server",
@@ -711,4 +731,118 @@ test("legacy role-only subusers receive intended permission defaults and can be 
         entry.detail.includes("Changes apply to subsequent requests"),
     ),
   );
+});
+
+test(
+  "server metrics return null or cached storage while a single directory scan is pending",
+  { timeout: 10000 },
+  async (t) => {
+    const { boot, cleanup } = await fixture(t);
+    const panel = await boot();
+    const id = await panel.create();
+    const serverDir = panel.runtimes.get(id).serverDir;
+    const probe = path.join(serverDir, "slow-storage-probe");
+    await fs.mkdir(probe);
+    await fs.writeFile(path.join(probe, "contents.bin"), Buffer.alloc(4096));
+    const first = deferred();
+    const second = deferred();
+    const entered = [deferred(), deferred()];
+    cleanup.push(() => {
+      first.resolve();
+      second.resolve();
+    });
+    const readdir = fs.readdir;
+    let scans = 0;
+    t.mock.method(fs, "readdir", async (target, ...options) => {
+      if (target === probe) {
+        const scan = scans++;
+        entered[scan]?.resolve();
+        await [first, second][scan]?.promise;
+      }
+      return readdir(target, ...options);
+    });
+    let now = Date.now();
+    t.mock.method(Date, "now", () => now);
+    const initialRequest = panel.request("/api/server", {}, id);
+    await entered[0].promise;
+    const initial = await initialRequest;
+    assert.equal(initial.status, 200);
+    assert.equal(initial.body.disk, null);
+    assert.equal(initial.body.sourceError, null);
+    const simultaneous = await Promise.all(
+      Array.from({ length: 3 }, () => panel.request("/api/server", {}, id)),
+    );
+    assert.ok(simultaneous.every((result) => result.body.disk === null));
+    assert.equal(scans, 1);
+    first.resolve();
+    let cached;
+    for (let attempt = 0; attempt < 100; attempt++) {
+      cached = (await panel.request("/api/server", {}, id)).body.disk;
+      if (cached !== null) break;
+    }
+    assert.ok(
+      cached >= 4096,
+      "the completed scan becomes the cached disk value",
+    );
+    await fs.writeFile(path.join(probe, "contents.bin"), Buffer.alloc(8192));
+    now += 10001;
+    const refreshRequest = panel.request("/api/server", {}, id);
+    await entered[1].promise;
+    assert.equal((await refreshRequest).body.disk, cached);
+    assert.equal(
+      (await panel.request("/api/server", {}, id)).body.disk,
+      cached,
+    );
+    assert.equal(scans, 2);
+    second.resolve();
+    let refreshed;
+    for (let attempt = 0; attempt < 100; attempt++) {
+      refreshed = (await panel.request("/api/server", {}, id)).body.disk;
+      if (refreshed > cached) break;
+    }
+    assert.equal(refreshed, cached + 4096);
+    assert.equal(scans, 2);
+  },
+);
+
+test("server metrics degrade without losing the server when its folder is absent", async (t) => {
+  const { boot } = await fixture(t);
+  const panel = await boot();
+  const id = await panel.create();
+  const serverDir = panel.runtimes.get(id).serverDir;
+  const moved = `${serverDir}-temporarily-unavailable`;
+  await fs.rename(serverDir, moved);
+  try {
+    const result = await panel.request("/api/server", {}, id);
+    assert.equal(result.status, 200);
+    assert.equal(result.body.name, "Our server");
+    assert.equal(result.body.unavailable, true);
+    assert.match(result.body.sourceError, /folder unavailable/i);
+    assert.equal(result.body.disk, null);
+    assert.equal(result.body.diskLimit, null);
+    assert.equal(result.body.diskAvailable, null);
+    await assert.rejects(fs.stat(serverDir), { code: "ENOENT" });
+  } finally {
+    await fs.rename(moved, serverDir);
+  }
+});
+
+test("unavailable filesystem capacity is reported while the existing server folder remains readable", async (t) => {
+  const { boot } = await fixture(t);
+  const panel = await boot();
+  const id = await panel.create();
+  const serverDir = panel.runtimes.get(id).serverDir;
+  const statfs = fs.statfs;
+  t.mock.method(fs, "statfs", async (target, ...options) => {
+    if (target === serverDir)
+      throw Object.assign(new Error("Capacity unavailable"), { code: "EIO" });
+    return statfs(target, ...options);
+  });
+  const result = await panel.request("/api/server", {}, id);
+  assert.equal(result.status, 200);
+  assert.equal(result.body.unavailable, true);
+  assert.match(result.body.sourceError, /folder unavailable/i);
+  assert.equal(result.body.diskLimit, null);
+  assert.equal(result.body.diskAvailable, null);
+  assert.ok((await fs.stat(serverDir)).isDirectory());
 });

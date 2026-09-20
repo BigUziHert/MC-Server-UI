@@ -7,14 +7,15 @@ export async function flushRendererSelection(
   { timeoutMs = 4000 } = {},
 ) {
   let timer;
+  let timedOut = false;
   try {
     await Promise.race([
       webContents.executeJavaScript("window.__mcPanelFlushSelection?.()"),
       new Promise((_, reject) => {
-        timer = setTimeout(
-          () => reject(new Error("The server selection save timed out.")),
-          timeoutMs,
-        );
+        timer = setTimeout(() => {
+          timedOut = true;
+          reject(new Error("The server selection save timed out."));
+        }, timeoutMs);
       }),
     ]);
   } catch (cause) {
@@ -24,6 +25,7 @@ export async function flushRendererSelection(
       }),
       {
         code: "PANEL_SELECTION_FLUSH_FAILED",
+        reason: timedOut ? "timeout" : "save-rejected",
       },
     );
   } finally {

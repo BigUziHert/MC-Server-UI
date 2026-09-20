@@ -21,6 +21,7 @@ import { createRemotePanelController } from "./remote-panels.mjs";
 import { installPanelPermissionHandlers } from "./permissions.mjs";
 import { installConnectionIpc } from "./connections-ipc.mjs";
 import { createConnectionStore } from "./connection-store.mjs";
+import { flushSelectionForQuit, waitForShutdown } from "./shutdown.mjs";
 import {
   installExternalLinkHandlers,
   openExternalWebsite,
@@ -112,6 +113,7 @@ async function selectServerDirectory() {
 async function requestQuit(installUpdate = false) {
   if (quitting || canQuit) return false;
   quitting = true;
+  let shutdownStarted = false;
   try {
     await startup;
     const running = [...(runtime?.fleet.runtimes.values() || [])]
@@ -141,15 +143,80 @@ async function requestQuit(installUpdate = false) {
       }
     }
     if (window && !window.isDestroyed()) {
-      await flushRendererSelection(window.webContents);
+      const proceed = await flushSelectionForQuit({
+        flush: () => flushRendererSelection(window.webContents),
+        log: logError,
+        confirm: async (cause) => {
+          const { response } = await dialog.showMessageBox(window, {
+            type: "warning",
+            title: "Server choice was not saved",
+            message:
+              cause.reason === "timeout"
+                ? "The panel window is not responding."
+                : "MC Panel could not save the selected server.",
+            detail:
+              "You can cancel and try again, or continue without saving this choice. Your server files will still be saved and stopped normally.",
+            buttons: [
+              "Cancel",
+              installUpdate
+                ? "Update without saving the server choice"
+                : "Quit without saving the server choice",
+            ],
+            defaultId: 0,
+            cancelId: 0,
+            noLink: true,
+          });
+          return response === 1;
+        },
+      });
+      if (!proceed) {
+        quitting = false;
+        return false;
+      }
+      await flushRendererSelection({
+        executeJavaScript: () =>
+          window.webContents.executeJavaScript(
+            "window.__mcPanelFlushPreferences?.()",
+          ),
+      }).catch(logError);
       window.setTitle("Shutting down · MC Panel");
     }
     tray?.setToolTip("MC Panel — shutting down servers");
-    await runtime?.close({ gracefulOnly: installUpdate });
-    removeConnectionIpc?.();
-    await remotePanels?.close();
-    clearTimeout(initialUpdateTimer);
-    clearInterval(updateTimer);
+    shutdownStarted = true;
+    const finished = await waitForShutdown(
+      (async () => {
+        await runtime?.close({ gracefulOnly: true });
+        removeConnectionIpc?.();
+        await remotePanels?.close();
+      })(),
+      {
+        prompt: async (signal) => {
+          showWindow();
+          const { response } = await dialog.showMessageBox(window, {
+            type: "warning",
+            title: "Shutdown is still waiting",
+            message: "A Minecraft server is still saving or stopping.",
+            detail:
+              "MC Panel will keep waiting without interrupting server writes. You can inspect desktop.log or explicitly exit now. Exiting now can interrupt a world save and does not install a pending update.",
+            buttons: ["Keep waiting", "Open log folder", "Exit now"],
+            defaultId: 0,
+            cancelId: 0,
+            noLink: true,
+            signal,
+          });
+          return ["wait", "logs", "exit"][response] ?? "wait";
+        },
+        openLogs: () => openFolder(userData),
+      },
+    );
+    if (!finished) {
+      updates?.dispose();
+      canQuit = true;
+      tray?.destroy();
+      app.exit(1);
+      return false;
+    }
+    updates?.dispose();
     tray?.destroy();
     canQuit = true;
     if (installUpdate)
@@ -167,13 +234,6 @@ async function requestQuit(installUpdate = false) {
   } catch (cause) {
     quitting = false;
     await logError(cause);
-    if (cause.code === "PANEL_SELECTION_FLUSH_FAILED") {
-      dialog.showErrorBox(
-        "Server choice was not saved",
-        "MC Panel could not save your selected server. The app and servers are still open. Try quitting or updating again.",
-      );
-      return false;
-    }
     const { response } = await dialog.showMessageBox(window, {
       type: "error",
       title: "Shutdown did not finish",
@@ -186,11 +246,17 @@ async function requestQuit(installUpdate = false) {
       noLink: true,
     });
     if (response === 1) {
+      updates?.dispose();
       canQuit = true;
       tray?.destroy();
       app.exit(1);
     } else await openFolder(userData);
     return false;
+  } finally {
+    if (shutdownStarted) {
+      clearTimeout(initialUpdateTimer);
+      clearInterval(updateTimer);
+    }
   }
 }
 
@@ -200,6 +266,9 @@ function endWindowsSession() {
   if (canQuit) return;
   quitting = true;
   canQuit = true;
+  clearTimeout(initialUpdateTimer);
+  clearInterval(updateTimer);
+  updates?.dispose();
   void Promise.all([runtime?.close(), remotePanels?.close()])
     .catch(logError)
     .finally(() => app.quit());
@@ -220,11 +289,15 @@ function createTray() {
     },
     { type: "separator" },
     {
-      label: "Check for updates",
+      label: updates?.snapshot().supported
+        ? "Check for updates"
+        : "Updates require the Setup edition",
+      enabled: updates?.snapshot().supported === true,
       click: () => {
         remotePanels?.activate("local");
         showWindow();
         updates?.check();
+        window?.webContents.send("mc-panel-updates-open");
       },
     },
     { label: "Help and documentation", click: () => void openWebsite() },
@@ -244,6 +317,10 @@ function createTray() {
       globalThis.__mcPanelTraySmoke = () => ({
         alive: !tray.isDestroyed(),
         actions: trayMenu.items.map((item) => item.label),
+        items: trayMenu.items.map((item) => ({
+          label: item.label,
+          enabled: item.enabled,
+        })),
       });
   } catch (cause) {
     void logError(cause);
@@ -273,6 +350,7 @@ async function launch() {
     reason:
       "Install the Setup edition once to enable in-app updates. Portable and unpacked copies do not update themselves.",
     install: () => requestQuit(true),
+    onInstallPending: showWindow,
     log: (cause) => void logError(cause),
   });
   runtime = await startDesktopRuntime({
@@ -416,6 +494,7 @@ if (!app.requestSingleInstanceLock()) {
       "The desktop app could not open its local server. Check desktop.log in your MC Panel app data folder for details.",
     );
     await runtime?.close().catch(logError);
+    updates?.dispose();
     canQuit = true;
     app.quit();
   });

@@ -3,31 +3,59 @@ import { Camera, Upload, X } from "lucide-react";
 import { useServerApi } from "./api";
 import "./server-icon.css";
 
-export function ServerIconImage({
-  version,
-  name,
-  className = "",
-}: {
-  version?: string | null;
-  name: string;
-  className?: string;
-}) {
-  const { downloadUrl } = useServerApi();
-  const [failed, setFailed] = useState(false);
-  useEffect(() => setFailed(false), [version, name]);
-  return version && !failed ? (
-    <img
-      className={`server-icon-image ${className}`}
-      src={downloadUrl(`/server/icon?v=${encodeURIComponent(version)}`)}
-      alt={`${name} server icon`}
-      onError={() => setFailed(true)}
-    />
-  ) : (
-    <span className={`pixel-world ${className}`} aria-hidden="true">
+function DefaultIcon() {
+  return (
+    <span className="pixel-world" aria-hidden="true">
       {Array.from({ length: 9 }, (_, i) => (
         <span key={i} />
       ))}
     </span>
+  );
+}
+
+function IconImage({ src, alt }: { src: string; alt: string }) {
+  const [failed, setFailed] = useState(false);
+  const [retried, setRetried] = useState(false);
+  useEffect(() => {
+    if (!failed || retried) return;
+    const timer = setTimeout(() => {
+      setRetried(true);
+      setFailed(false);
+    }, 750);
+    return () => clearTimeout(timer);
+  }, [failed, retried]);
+  return !failed ? (
+    <img
+      className="server-icon-image"
+      src={
+        retried && !src.startsWith("data:")
+          ? `${src}${src.includes("?") ? "&" : "?"}retry=1`
+          : src
+      }
+      alt={alt}
+      onError={() => setFailed(true)}
+    />
+  ) : (
+    <DefaultIcon />
+  );
+}
+
+export function ServerIconImage({
+  version,
+  name,
+}: {
+  version?: string | null;
+  name: string;
+}) {
+  const { downloadUrl } = useServerApi();
+  const src = version
+    ? downloadUrl(`/server/icon?v=${encodeURIComponent(version)}`)
+    : null;
+  // A different server or version gets its own retry state, even when names match.
+  return src ? (
+    <IconImage key={src} src={src} alt={`${name} server icon`} />
+  ) : (
+    <DefaultIcon />
   );
 }
 
@@ -185,7 +213,8 @@ export default function ServerIcon({
         </p>
         <div className="icon-editor-preview">
           {draft || previewVersion ? (
-            <img
+            <IconImage
+              key={draft || previewVersion}
               src={
                 draft ||
                 downloadUrl(

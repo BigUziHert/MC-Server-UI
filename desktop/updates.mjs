@@ -25,6 +25,8 @@ export function createUpdateController({
   reason = "",
   install,
   log = () => {},
+  onInstallPending = () => {},
+  installTimeoutMs = 125000,
 }) {
   let state = {
     desktop: true,
@@ -42,8 +44,16 @@ export function createUpdateController({
   let operation;
   let installing = false;
   let timer;
+  let watchdog;
+  let disposed = false;
+  const listeners = [];
+  const on = (event, callback) => {
+    updater.on(event, callback);
+    listeners.push([event, callback]);
+  };
   const snapshot = () => ({ ...state });
   const update = (changes) => {
+    if (disposed) return;
     state = { ...state, ...changes };
   };
   const failed = (cause) => {
@@ -68,13 +78,13 @@ export function createUpdateController({
     updater.allowDowngrade = false;
     updater.disableWebInstaller = true;
     updater.disableDifferentialDownload = true;
-    updater.on("checking-for-update", () =>
+    on("checking-for-update", () =>
       update({
         status: "checking",
         message: "Checking the latest successful dev build…",
       }),
     );
-    updater.on("update-available", (info) =>
+    on("update-available", (info) =>
       update({
         status: "available",
         availableVersion: info.version,
@@ -83,7 +93,7 @@ export function createUpdateController({
         message: "A new dev build is ready to download.",
       }),
     );
-    updater.on("update-not-available", () =>
+    on("update-not-available", () =>
       update({
         status: "current",
         availableVersion: null,
@@ -91,13 +101,13 @@ export function createUpdateController({
         message: "You have the latest published dev build.",
       }),
     );
-    updater.on("download-progress", (info) =>
+    on("download-progress", (info) =>
       update({
         status: "downloading",
         progress: Math.max(0, Math.min(100, Number(info.percent) || 0)),
       }),
     );
-    updater.on("update-downloaded", (info) =>
+    on("update-downloaded", (info) =>
       update({
         status: "downloaded",
         availableVersion: info.version,
@@ -106,12 +116,12 @@ export function createUpdateController({
           "Update downloaded. Restart MC Panel when you are ready to install it.",
       }),
     );
-    updater.on("error", failed);
+    on("error", failed);
   }
   const run = (action) => {
-    if (!supported || operation || installing) return snapshot();
+    if (disposed || !supported || operation || installing) return snapshot();
     operation = Promise.resolve()
-      .then(action)
+      .then(() => (disposed ? undefined : action()))
       .catch(failed)
       .finally(() => {
         operation = undefined;
@@ -136,7 +146,12 @@ export function createUpdateController({
       return run(() => updater.downloadUpdate());
     },
     install() {
+      if (!disposed && installing && state.status === "shutdown-waiting") {
+        onInstallPending();
+        return snapshot();
+      }
       if (
+        disposed ||
         !supported ||
         installing ||
         operation ||
@@ -150,6 +165,15 @@ export function createUpdateController({
       });
       // Yield the HTTP response before shutdown closes its authenticated runtime.
       timer = setTimeout(async () => {
+        watchdog = setTimeout(() => {
+          update({
+            status: "shutdown-waiting",
+            message:
+              "Shutdown is taking longer than expected. Use the desktop shutdown dialog to keep waiting, inspect the logs, or explicitly exit. The update will wait for a safe shutdown.",
+          });
+          onInstallPending();
+        }, installTimeoutMs);
+        watchdog.unref?.();
         try {
           if (!(await install()))
             update({
@@ -164,13 +188,18 @@ export function createUpdateController({
               "The update could not be installed. Your downloaded update is still available; check desktop.log and retry.",
           });
         } finally {
+          clearTimeout(watchdog);
           installing = false;
         }
       }, 150);
       return snapshot();
     },
     dispose() {
+      disposed = true;
       clearTimeout(timer);
+      clearTimeout(watchdog);
+      for (const [event, callback] of listeners) updater.off(event, callback);
+      listeners.length = 0;
     },
   };
 }

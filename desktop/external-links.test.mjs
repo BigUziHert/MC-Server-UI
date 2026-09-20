@@ -22,6 +22,7 @@ test("desktop permits all catalog project pages and every Versions official sour
     ...catalogLinks,
     ...versionProviders.map((provider) => provider.website),
     "https://github.com/BigUziHert/MC-Server-UI/tree/dev#readme",
+    "https://aka.ms/MinecraftEULA",
   ])
     assert.equal(externalWebsite(url), url, url);
 });
@@ -41,6 +42,9 @@ test("desktop blocks arbitrary protocols, credentials, unlisted hosts, and decep
     "https://127.0.0.1/",
     "https://github.com/BigUziHert/MC-Server-UI-evil",
     "https://github.com/untrusted/project",
+    "https://aka.ms/untrusted-link",
+    "https://aka.ms/MinecraftEULA?redirect=elsewhere",
+    "https://aka.ms/MinecraftEULA#fragment",
     "not a URL",
     "",
     null,

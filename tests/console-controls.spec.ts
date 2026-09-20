@@ -38,6 +38,43 @@ const test = base.extend<{ serverId: string }>({
   },
 });
 
+test("cleared console lines stay hidden when the marker is absent and recover after a new log sequence", async ({
+  page,
+  serverId,
+}) => {
+  const line = (id: number, message: string) => ({
+    id: String(id),
+    message,
+    level: "info",
+    time: "12:00:00",
+  });
+  let lines = [line(10, "Earlier message"), line(20, "Clear marker")];
+  await page.route("**/api/console", (route) =>
+    route.fulfill({ json: { lines } }),
+  );
+  await page.addInitScript(
+    (id) => localStorage.setItem("mc-panel.active-server", id),
+    serverId,
+  );
+  await page.goto("/#console");
+  await expect(page.locator(".console-output")).toContainText("Clear marker");
+  await page
+    .getByRole("button", { name: "Clear console view", exact: true })
+    .click();
+  await expect(page.locator(".console-output")).not.toContainText(
+    "Earlier message",
+  );
+  lines = [line(10, "Earlier message"), line(30, "New message")];
+  await expect(page.locator(".console-output")).toContainText("New message");
+  await expect(page.locator(".console-output")).not.toContainText(
+    "Earlier message",
+  );
+  lines = [line(1, "New runtime sequence")];
+  await expect(page.locator(".console-output")).toContainText(
+    "New runtime sequence",
+  );
+});
+
 for (const width of [1348, 390]) {
   test(`a stopping server offers a confirmed Force Stop and recovers at ${width}px`, async ({
     page,

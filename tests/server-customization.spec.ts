@@ -4,7 +4,7 @@ import {
   serverButton,
   removeTestServer,
 } from "./server-fixtures";
-import { test as base, expect } from "@playwright/test";
+import { test as base, expect, type Page } from "@playwright/test";
 
 const test = base.extend<{ serverId: string }>({
   serverId: async ({ request }, use) => {
@@ -25,6 +25,165 @@ const test = base.extend<{ serverId: string }>({
       await removeTestServer(request, server.id);
     }
   },
+});
+
+async function solidIcon(page: Page, color: string) {
+  return page.evaluate((fill) => {
+    const canvas = document.createElement("canvas");
+    canvas.width = canvas.height = 64;
+    const context = canvas.getContext("2d")!;
+    context.fillStyle = fill;
+    context.fillRect(0, 0, 64, 64);
+    return canvas.toDataURL("image/png");
+  }, color);
+}
+
+test("distinct server icons survive A to B to A switching while status responses are delayed", async ({
+  page,
+  request,
+  serverId,
+}) => {
+  const fleet = await (await request.get("/api/servers")).json();
+  let port = 29310;
+  while (fleet.servers.some((server: { port: number }) => server.port === port))
+    port++;
+  const second = await createProcessServer(request, {
+    data: { name: "Blue world", mode: "live", port },
+  });
+  const secondId = (await second.json()).server.id;
+  let release = () => {};
+  let gate: Promise<void> = Promise.resolve();
+  let heldId: string | null = null;
+  let heldRequests = 0;
+  try {
+    for (const [id, color] of [
+      [serverId, "#dc3456"],
+      [secondId, "#2476ce"],
+    ]) {
+      const response = await request.post("/api/server/icon", {
+        headers: { "X-Server-Id": id },
+        data: { image: await solidIcon(page, color) },
+      });
+      expect(response.status(), await response.text()).toBe(200);
+    }
+    await page.addInitScript(
+      (id) => localStorage.setItem("mc-panel.active-server", id),
+      serverId,
+    );
+    await page.route("**/api/server", async (route) => {
+      if (route.request().headers()["x-server-id"] === heldId) {
+        heldRequests++;
+        await gate;
+      }
+      await route.continue();
+    });
+    await page.goto("/#console");
+    const assertIcons = async (id: string, color: number[]) => {
+      for (const icon of [
+        serverButton(page, id).locator(".server-mini img"),
+        page.locator(".server-banner .world-icon img"),
+      ]) {
+        await expect(icon).toHaveAttribute("src", new RegExp(`serverId=${id}`));
+        await expect
+          .poll(() =>
+            icon.evaluate((element) => {
+              const image = element as HTMLImageElement;
+              if (!image.complete || image.naturalWidth !== 64) return null;
+              const canvas = document.createElement("canvas");
+              canvas.width = canvas.height = 1;
+              const context = canvas.getContext("2d")!;
+              context.drawImage(image, 0, 0);
+              return Array.from(context.getImageData(0, 0, 1, 1).data);
+            }),
+          )
+          .toEqual([...color, 255]);
+      }
+      await expect(serverButton(page, id).locator(".pixel-world")).toHaveCount(
+        0,
+      );
+      await expect(
+        page.locator(".server-banner .world-icon .pixel-world"),
+      ).toHaveCount(0);
+    };
+    await assertIcons(serverId, [220, 52, 86]);
+    for (const [id, color] of [
+      [secondId, [36, 118, 206]],
+      [serverId, [220, 52, 86]],
+    ] as const) {
+      heldRequests = 0;
+      heldId = id;
+      gate = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      await selectServer(page, id);
+      await expect.poll(() => heldRequests).toBeGreaterThan(0);
+      await assertIcons(id, [...color]);
+      heldId = null;
+      release();
+      await expect(page.locator(".server-banner .status-badge")).toHaveText(
+        "running",
+      );
+      await assertIcons(id, [...color]);
+    }
+  } finally {
+    heldId = null;
+    release();
+    await page.unrouteAll({ behavior: "wait" });
+    await removeTestServer(request, secondId);
+  }
+});
+
+test("a transient icon request retries and recovers without changing the saved icon", async ({
+  page,
+  request,
+  serverId,
+}) => {
+  const headers = { "X-Server-Id": serverId };
+  const uploaded = await request.post("/api/server/icon", {
+    headers,
+    data: { image: await solidIcon(page, "#14a878") },
+  });
+  expect(uploaded.status(), await uploaded.text()).toBe(200);
+  const before = await (await request.get("/api/server", { headers })).json();
+  let failed = 0;
+  let retried = 0;
+  await page.route("**/api/server/icon?*", async (route) => {
+    const url = new URL(route.request().url());
+    if (url.searchParams.get("serverId") !== serverId) return route.continue();
+    if (!url.searchParams.has("retry")) {
+      failed++;
+      return route.fulfill({
+        status: 503,
+        contentType: "application/json",
+        body: '{"error":"Temporary icon read failure"}',
+      });
+    }
+    retried++;
+    await route.continue();
+  });
+  await page.addInitScript(
+    (id) => localStorage.setItem("mc-panel.active-server", id),
+    serverId,
+  );
+  await page.goto("/#console");
+  await expect.poll(() => failed).toBeGreaterThan(0);
+  const icons = page.getByRole("img", {
+    name: "Custom world server icon",
+    exact: true,
+  });
+  await expect(icons).toHaveCount(2);
+  for (const icon of [icons.nth(0), icons.nth(1)]) {
+    await expect(icon).toHaveAttribute("src", /[?&]retry=1(?:&|$)/);
+    await expect
+      .poll(() =>
+        icon.evaluate((element) => (element as HTMLImageElement).naturalWidth),
+      )
+      .toBe(64);
+  }
+  expect(retried).toBeGreaterThan(0);
+  const after = await (await request.get("/api/server", { headers })).json();
+  expect(after.iconVersion).toBe(before.iconVersion);
+  expect(after.iconPreference).toBe("server");
 });
 
 test("a server icon is cropped, saved, and hidden by a persistent panel preference without deleting its file", async ({

@@ -7,6 +7,7 @@ directories:
 files:
   - dist/**/*
   - server/index.mjs
+  - server/panel-recovery.mjs
   - server/access.mjs
   - server/remote-access.mjs
   - server/remote-tls.mjs
@@ -29,6 +30,7 @@ files:
   - server/runtime-update.mjs
   - server/launchpad-pack-runtime.mjs
   - server/properties.mjs
+  - server/text-encoding.mjs
   - server/versions.mjs
   - server/launchpad.mjs
   - server/launchpad-network.mjs
@@ -45,6 +47,8 @@ files:
   - desktop/runtime.mjs
   - desktop/updates.mjs
   - desktop/selection.mjs
+  - desktop/preferences.mjs
+  - desktop/shutdown.mjs
   - desktop/external-links.mjs
   - desktop/remote-panels.mjs
   - desktop/permissions.mjs
