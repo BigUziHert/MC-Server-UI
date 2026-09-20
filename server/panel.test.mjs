@@ -109,14 +109,21 @@ test("file listing skips an entry removed after readdir without hiding remaining
   await fs.mkdir(path.join(serverDir, "listing"));
   await fs.writeFile(path.join(serverDir, "listing", "gone.txt"), "gone");
   await fs.writeFile(path.join(serverDir, "listing", "keep.txt"), "keep");
+  // safePath canonicalizes the root; Windows temp paths can use a short alias.
+  const directory = await fs.realpath(path.join(serverDir, "listing"));
   const read = fs.readdir.bind(fs);
+  let removedAfterRead = false;
   t.mock.method(fs, "readdir", async (target, options) => {
     const entries = await read(target, options);
-    if (target === path.join(serverDir, "listing"))
+    if (target === directory) {
+      assert.ok(entries.some((entry) => entry.name === "gone.txt"));
       await fs.rm(path.join(target, "gone.txt"), { force: true });
+      removedAfterRead = true;
+    }
     return entries;
   });
   const listed = await request("/api/files?path=listing");
+  assert.equal(removedAfterRead, true, "The removal race must be exercised.");
   assert.equal(listed.status, 200);
   assert.deepEqual(
     listed.body.entries.map((entry) => entry.name),
