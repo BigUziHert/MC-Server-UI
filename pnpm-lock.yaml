@@ -14,18 +14,9 @@ importers:
       express:
         specifier: ^5.1.0
         version: 5.2.1(supports-color@8.1.1)
-      lucide-react:
-        specifier: ^0.468.0
-        version: 0.468.0(react@19.3.0)
       multer:
         specifier: ^2.0.2
         version: 2.3.0
-      react:
-        specifier: ^19.1.1
-        version: 19.3.0
-      react-dom:
-        specifier: ^19.1.1
-        version: 19.3.0(react@19.3.0)
       selfsigned:
         specifier: 5.5.0
         version: 5.5.0
@@ -66,9 +57,18 @@ importers:
       electron-builder:
         specifier: 26.15.3
         version: 26.15.3(electron-builder-squirrel-windows@26.15.3)(supports-color@8.1.1)
+      lucide-react:
+        specifier: ^0.468.0
+        version: 0.468.0(react@19.3.0)
       prettier:
         specifier: ^3.9.6
         version: 3.9.6
+      react:
+        specifier: ^19.1.1
+        version: 19.3.0
+      react-dom:
+        specifier: ^19.1.1
+        version: 19.3.0(react@19.3.0)
       typescript:
         specifier: ^5.9.2
         version: 5.9.3
