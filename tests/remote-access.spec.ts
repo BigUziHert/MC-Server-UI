@@ -50,7 +50,7 @@ async function sharedEndpoints(page: Page, permissions = sister.permissions) {
 test("an invitation opens controls only after a password is chosen and explicitly submitted", async ({
   page,
 }, testInfo) => {
-  await page.setViewportSize({ width: 390, height: 844 });
+  await page.setViewportSize({ width: 320, height: 844 });
   await sharedEndpoints(page);
   await page.route("**/api/access/session", (route) =>
     route.fulfill({ json: { role: "guest" } }),
@@ -72,8 +72,33 @@ test("an invitation opens controls only after a password is chosen and explicitl
   await expect(
     page.getByRole("button", { name: "Start", exact: true }),
   ).toHaveCount(0);
-  await page.getByLabel("New password", { exact: true }).fill(password);
-  await page.getByLabel("Confirm password", { exact: true }).fill(password);
+  const newPassword = page.getByLabel("New password", { exact: true });
+  const confirmation = page.getByLabel("Confirm password", { exact: true });
+  await expect(newPassword).toHaveAttribute("type", "password");
+  await expect(confirmation).toHaveAttribute("type", "password");
+  await newPassword.fill(password);
+  await confirmation.fill(password);
+  await page
+    .getByRole("button", { name: "Show password", exact: true })
+    .click();
+  await expect(newPassword).toHaveAttribute("type", "text");
+  await expect(confirmation).toHaveAttribute("type", "password");
+  await page.getByRole("button", { name: "Show confirm password" }).click();
+  await expect(confirmation).toHaveAttribute("type", "text");
+  await page
+    .getByRole("button", { name: "Hide password", exact: true })
+    .click();
+  await page.getByRole("button", { name: "Hide confirm password" }).click();
+  await expect(newPassword).toHaveAttribute("type", "password");
+  await expect(confirmation).toHaveAttribute("type", "password");
+  await expect(newPassword).toHaveValue(password);
+  await expect(confirmation).toHaveValue(password);
+  expect(accepted).toEqual([]);
+  expect(
+    await page.evaluate(
+      () => document.documentElement.scrollWidth > window.innerWidth,
+    ),
+  ).toBe(false);
   await page.getByRole("button", { name: "Set password and continue" }).click();
   await expect(
     page.getByRole("heading", { name: "Family survival" }),
@@ -186,7 +211,7 @@ test("switching shared servers drops the previous console and uses the next memb
 test("email and password sign-in opens the shared panel and logout returns to sign-in", async ({
   page,
 }, testInfo) => {
-  await page.setViewportSize({ width: 390, height: 844 });
+  await page.setViewportSize({ width: 320, height: 844 });
   await sharedEndpoints(page);
   await page.route("**/api/access/session", (route) =>
     route.fulfill({ json: { role: "guest" } }),
@@ -206,7 +231,28 @@ test("email and password sign-in opens the shared panel and logout returns to si
     fullPage: true,
   });
   await page.getByLabel("Email address").fill("sister@example.com");
-  await page.getByLabel("Password", { exact: true }).fill(password);
+  const passwordInput = page.getByLabel("Password", { exact: true });
+  await expect(passwordInput).toHaveAttribute("type", "password");
+  await passwordInput.fill(password);
+  await page
+    .getByRole("button", { name: "Show password", exact: true })
+    .focus();
+  await page.keyboard.press("Space");
+  await expect(passwordInput).toHaveAttribute("type", "text");
+  await page
+    .getByRole("button", { name: "Hide password", exact: true })
+    .click();
+  await expect(passwordInput).toHaveAttribute("type", "password");
+  await expect(passwordInput).toHaveValue(password);
+  await page
+    .getByRole("button", { name: "Show password", exact: true })
+    .click();
+  expect(requestedCredentials).toBeUndefined();
+  expect(
+    await page.evaluate(
+      () => document.documentElement.scrollWidth > window.innerWidth,
+    ),
+  ).toBe(false);
   await page.getByRole("button", { name: "Sign in", exact: true }).click();
   await expect(
     page.getByRole("heading", { name: "Family survival" }),
@@ -223,9 +269,46 @@ test("email and password sign-in opens the shared panel and logout returns to si
     .click();
   await page.getByRole("menuitem", { name: "Sign out" }).click();
   await expect(page.getByLabel("Email address")).toBeVisible();
+  await expect(passwordInput).toHaveAttribute("type", "password");
+  await expect(passwordInput).toHaveValue("");
   await expect(
     page.getByRole("heading", { name: "Family survival" }),
   ).toHaveCount(0);
+});
+
+test("a new invitation and returning to sign-in hide and clear passwords", async ({
+  page,
+}) => {
+  await page.route("**/api/access/session", (route) =>
+    route.fulfill({ json: { role: "guest" } }),
+  );
+  await page.goto("/#invite=first-token");
+  for (const field of ["New password", "Confirm password"]) {
+    await page.getByLabel(field, { exact: true }).fill(password);
+  }
+  await page
+    .getByRole("button", { name: "Show password", exact: true })
+    .click();
+  await page.getByRole("button", { name: "Show confirm password" }).click();
+  await page.evaluate(() => {
+    window.location.hash = "invite=second-token";
+  });
+  for (const field of ["New password", "Confirm password"]) {
+    await expect(page.getByLabel(field, { exact: true })).toHaveAttribute(
+      "type",
+      "password",
+    );
+    await expect(page.getByLabel(field, { exact: true })).toHaveValue("");
+  }
+  await page
+    .getByRole("button", { name: "Show password", exact: true })
+    .click();
+  await page.getByRole("button", { name: "Back to sign in" }).click();
+  await expect(page.getByLabel("Password", { exact: true })).toHaveAttribute(
+    "type",
+    "password",
+  );
+  await expect(page.getByLabel("Password", { exact: true })).toHaveValue("");
 });
 
 test("an invitation validates password length and confirmation before sending credentials", async ({
@@ -352,6 +435,12 @@ test("leaving an invitation cancels a pending acceptance and ignores its late re
   await page.getByLabel("Confirm password", { exact: true }).fill(password);
   await page.getByRole("button", { name: "Set password and continue" }).click();
   await requestReceived;
+  await expect(
+    page.getByRole("button", { name: "Show password", exact: true }),
+  ).toBeDisabled();
+  await expect(
+    page.getByRole("button", { name: "Show confirm password" }),
+  ).toBeDisabled();
   await page.getByRole("button", { name: "Back to sign in" }).click();
   await expect(page.getByLabel("Email address")).toBeVisible();
   finishAcceptance?.();

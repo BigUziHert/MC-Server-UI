@@ -59,6 +59,7 @@ import SearchField, { useDebouncedValue } from "./SearchField";
 import Switch from "./Switch";
 import DesktopUpdates from "./DesktopUpdates";
 import ServerIcon from "./ServerIcon";
+import { copyText } from "./clipboard";
 import AccountMenu from "./AccountMenu";
 import ConnectPanel, { type ConnectionMode } from "./ConnectPanel";
 import { version as appVersion } from "../package.json";
@@ -1302,7 +1303,7 @@ function ConsolePage({
   }
   async function copyAddress() {
     try {
-      await navigator.clipboard.writeText(server?.address || "localhost:25565");
+      await copyText(server?.address || "localhost:25565");
       notify("Server address copied.");
     } catch {
       notify("Could not access the clipboard.", true);

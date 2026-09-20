@@ -4,12 +4,15 @@ import {
   useRef,
   useState,
   type FormEvent,
+  type InputHTMLAttributes,
 } from "react";
 import {
   ArrowRight,
   Box,
   ChevronRight,
   Cloud,
+  Eye,
+  EyeOff,
   FileText,
   FolderOpen,
   Gamepad2,
@@ -158,6 +161,43 @@ function Brand() {
   );
 }
 
+function PasswordInput({
+  visibilityLabel = "password",
+  ...props
+}: Omit<InputHTMLAttributes<HTMLInputElement>, "type"> & {
+  visibilityLabel?: string;
+}) {
+  const [visible, setVisible] = useState(false);
+  const toggleLabel = `${visible ? "Hide" : "Show"} ${visibilityLabel}`;
+  return (
+    <div className="remote-password-field">
+      <input
+        {...props}
+        type={visible ? "text" : "password"}
+        spellCheck={false}
+        autoCapitalize="none"
+        autoCorrect="off"
+      />
+      <button
+        className="remote-password-toggle"
+        type="button"
+        aria-label={toggleLabel}
+        aria-controls={props.id}
+        aria-pressed={visible}
+        title={toggleLabel}
+        disabled={props.disabled}
+        onClick={() => setVisible((value) => !value)}
+      >
+        {visible ? (
+          <EyeOff size={18} aria-hidden="true" />
+        ) : (
+          <Eye size={18} aria-hidden="true" />
+        )}
+      </button>
+    </div>
+  );
+}
+
 function SignIn({
   token,
   onBackToSignIn,
@@ -273,9 +313,8 @@ function SignIn({
             <label htmlFor="remote-password">
               {token ? "New password" : "Password"}
             </label>
-            <input
+            <PasswordInput
               id="remote-password"
-              type="password"
               autoComplete={token ? "new-password" : "current-password"}
               required
               minLength={token ? 12 : undefined}
@@ -293,9 +332,9 @@ function SignIn({
                 <label htmlFor="remote-password-confirmation">
                   Confirm password
                 </label>
-                <input
+                <PasswordInput
                   id="remote-password-confirmation"
-                  type="password"
+                  visibilityLabel="confirm password"
                   autoComplete="new-password"
                   required
                   maxLength={128}

@@ -224,6 +224,50 @@ test("custom connection hostname persists while running without rewriting bind s
   ).toHaveText(originalAddress);
 });
 
+test("copying the server address falls back when the clipboard API is denied and restores focus", async ({
+  page,
+  serverId,
+}) => {
+  await page.addInitScript((id) => {
+    localStorage.setItem("mc-panel.active-server", id);
+    Object.defineProperty(navigator, "clipboard", {
+      configurable: true,
+      value: {
+        writeText: async () => {
+          throw new Error("Clipboard unavailable");
+        },
+      },
+    });
+    document.execCommand = (command) => {
+      const field = document.activeElement;
+      if (command !== "copy" || !(field instanceof HTMLTextAreaElement))
+        return false;
+      (window as unknown as { copiedAddress: string }).copiedAddress =
+        field.value.slice(field.selectionStart, field.selectionEnd);
+      return true;
+    };
+  }, serverId);
+  await page.goto("/#console");
+  await expect(
+    page.getByRole("heading", { name: "Custom world", exact: true }),
+  ).toBeVisible();
+  const copy = page.getByRole("button", {
+    name: "Copy server address",
+    exact: true,
+  });
+  const displayed = await copy.innerText();
+  await copy.click();
+  await expect(page.getByRole("status")).toContainText(
+    "Server address copied.",
+  );
+  expect(
+    await page.evaluate(
+      () => (window as unknown as { copiedAddress: string }).copiedAddress,
+    ),
+  ).toBe(displayed);
+  await expect(copy).toBeFocused();
+});
+
 test("live telemetry renders memory against its allocation and CPU against whole-processor capacity", async ({
   page,
   request,

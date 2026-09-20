@@ -47,6 +47,7 @@ files:
   - desktop/selection.mjs
   - desktop/external-links.mjs
   - desktop/remote-panels.mjs
+  - desktop/permissions.mjs
   - desktop/assets/**/*
   - package.json
 asar: true

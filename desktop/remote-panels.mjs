@@ -2,6 +2,7 @@ import { randomUUID, X509Certificate } from "node:crypto";
 import { isIP } from "node:net";
 import path from "node:path";
 import { normalizePanelConnectionUrl } from "../shared/panel-connection.mjs";
+import { installPanelPermissionHandlers } from "./permissions.mjs";
 
 const failure = (status, message) =>
   Object.assign(new Error(message), { status });
@@ -74,10 +75,6 @@ export function createRemotePanelController({
       const url = normalizePanelConnectionUrl(input);
       const { origin, host, hostname } = new URL(url);
       const remoteSession = session.fromPartition(`mc-remote-${randomUUID()}`);
-      remoteSession.setPermissionRequestHandler(
-        (_contents, _permission, done) => done(false),
-      );
-      remoteSession.setPermissionCheckHandler(() => false);
       const remoteWindow = new BrowserWindow({
         title: `${host} · MC Panel remote`,
         width: 1200,
@@ -102,6 +99,7 @@ export function createRemotePanelController({
       remoteWindow.setMenu(null);
       windows.add(remoteWindow);
       const contents = remoteWindow.webContents;
+      installPanelPermissionHandlers(remoteSession, origin, () => contents);
       let trustedFingerprint;
       let pendingTrust;
       let canceled = false;

@@ -26,6 +26,7 @@ import {
 import SearchField, { useDebouncedValue } from "../SearchField";
 import RefreshButton from "../RefreshButton";
 import StatePanel from "../StatePanel";
+import { copyText } from "../clipboard";
 import Pagination from "../Pagination";
 import catalog from "../../shared/subuser-permissions.json";
 import "./subusers.css";
@@ -494,7 +495,7 @@ function InvitationDialog({
   }, []);
   async function copy() {
     try {
-      await navigator.clipboard.writeText(invitation.invitationUrl);
+      await copyText(invitation.invitationUrl, link.current);
       setCopyStatus("Invitation link copied.");
     } catch {
       link.current?.focus();

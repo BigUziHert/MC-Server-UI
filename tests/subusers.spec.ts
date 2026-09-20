@@ -286,6 +286,9 @@ test("a failed invitation preserves the subuser and clipboard retries keep the s
   const invitationUrl =
     "https://203.0.113.10:3002/#invite=fixture-secret-token";
   await page.addInitScript(() => {
+    const originalCommand = document.execCommand.bind(document);
+    document.execCommand = (command, ...args) =>
+      command === "copy" ? false : originalCommand(command, ...args);
     Object.defineProperty(navigator, "clipboard", {
       configurable: true,
       value: {
@@ -421,6 +424,33 @@ test("a failed invitation preserves the subuser and clipboard retries keep the s
   expect(
     await page.evaluate(() => (window as unknown as { copied: string }).copied),
   ).toBe(invitationUrl);
+  // Embedded browsers may not expose the async API. Copy must still select
+  // the invitation inside the open modal, without creating another invite.
+  await page.evaluate(() => {
+    Object.defineProperty(navigator, "clipboard", {
+      configurable: true,
+      value: undefined,
+    });
+    document.execCommand = (command) => {
+      const field = document.activeElement;
+      if (command !== "copy" || !(field instanceof HTMLTextAreaElement))
+        return false;
+      (window as unknown as { fallbackCopy: unknown }).fallbackCopy = {
+        value: field.value.slice(field.selectionStart, field.selectionEnd),
+        inDialog: Boolean(field.closest("dialog[open]")),
+      };
+      return true;
+    };
+  });
+  await dialog.getByRole("button", { name: "Copy link", exact: true }).click();
+  await expect(dialog.getByRole("status")).toHaveText(
+    "Invitation link copied.",
+  );
+  expect(
+    await page.evaluate(
+      () => (window as unknown as { fallbackCopy: unknown }).fallbackCopy,
+    ),
+  ).toEqual({ value: invitationUrl, inDialog: true });
   expect(creates).toBe(1);
   expect(invitations).toBe(2);
   expect(await users(request, server.id)).toHaveLength(1);

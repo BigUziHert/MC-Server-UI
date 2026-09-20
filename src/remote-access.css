@@ -212,6 +212,37 @@
 .remote-signin-form input + label {
   margin-top: 9px;
 }
+.remote-password-field {
+  position: relative;
+  min-width: 0;
+}
+.remote-password-field input {
+  width: 100%;
+  padding-right: 52px;
+}
+.remote-password-field input::-ms-reveal {
+  display: none;
+}
+.remote-password-toggle {
+  position: absolute;
+  top: 2px;
+  right: 2px;
+  bottom: 2px;
+  display: grid;
+  place-items: center;
+  width: 44px;
+  padding: 0;
+  border-radius: 5px;
+  background: transparent;
+  color: var(--muted);
+}
+.remote-password-toggle:hover:not(:disabled) {
+  background: #272833;
+  color: var(--text);
+}
+.remote-password-toggle:focus-visible {
+  outline-offset: -3px;
+}
 .remote-auth-card .remote-field-hint {
   margin: 0 0 9px;
   font-size: 12px;

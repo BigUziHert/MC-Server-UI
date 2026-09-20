@@ -16,6 +16,7 @@ import { fileURLToPath } from "node:url";
 import { startDesktopRuntime } from "./runtime.mjs";
 import { flushRendererSelection } from "./selection.mjs";
 import { createRemotePanelController } from "./remote-panels.mjs";
+import { installPanelPermissionHandlers } from "./permissions.mjs";
 import {
   installExternalLinkHandlers,
   openExternalWebsite,
@@ -311,10 +312,6 @@ async function launch() {
     sameSite: "strict",
     path: "/",
   });
-  panelSession.setPermissionRequestHandler((_contents, _permission, callback) =>
-    callback(false),
-  );
-  panelSession.setPermissionCheckHandler(() => false);
   panelSession.webRequest.onHeadersReceived((details, callback) => {
     if (new URL(details.url).origin !== runtime.url)
       return callback({ responseHeaders: details.responseHeaders });
@@ -360,6 +357,11 @@ async function launch() {
       spellcheck: false,
     },
   });
+  installPanelPermissionHandlers(
+    panelSession,
+    runtime.url,
+    () => window?.webContents,
+  );
   installExternalLinkHandlers(window.webContents, runtime.url, openWebsite);
   window.webContents.on("will-attach-webview", (event) =>
     event.preventDefault(),

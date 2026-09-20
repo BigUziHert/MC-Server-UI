@@ -16,6 +16,7 @@ async function fixture() {
   const { app, BrowserWindow, session } = await import("electron");
   const { default: selfsigned } = await import("selfsigned");
   const { createRemotePanelController } = await import("./remote-panels.mjs");
+  const { installPanelPermissionHandlers } = await import("./permissions.mjs");
   const { startDesktopRuntime, DESKTOP_COOKIE_NAME } =
     await import("./runtime.mjs");
   const root = app.commandLine.getSwitchValue("remote-smoke-root");
@@ -53,7 +54,8 @@ async function fixture() {
       );
       res.setHeader("Content-Type", "text/html; charset=utf-8");
       res.end(
-        "<!doctype html><title>Fixture cannot replace native host title</title><h1>Remote fixture panel</h1><p>This page is served by the loopback HTTPS test fixture.</p>",
+        "<!doctype html><title>Fixture cannot replace native host title</title><h1>Remote fixture panel</h1><p>This page is served by the loopback HTTPS test fixture.</p>" +
+          (req.url === "/" ? '<iframe src="/embedded"></iframe>' : ""),
       );
     },
   );
@@ -114,7 +116,22 @@ async function fixture() {
       nodeIntegration: false,
     },
   });
+  installPanelPermissionHandlers(
+    ownerSession,
+    runtime.url,
+    () => ownerWindow.webContents,
+  );
   await ownerWindow.loadURL(`${runtime.url}/api/access/session`);
+  // Query Chromium's real permission path without reading or overwriting the
+  // user's OS clipboard. The renderer copy/fallback flow is covered in e2e.
+  const clipboardPermissions = (contents) =>
+    contents.executeJavaScript(`(async () => ({
+      write: (await navigator.permissions.query({name: 'clipboard-write'})).state,
+      read: (await navigator.permissions.query({name: 'clipboard-read'})).state,
+      embeddedWrite: document.querySelector('iframe')
+        ? (await document.querySelector('iframe').contentWindow.navigator.permissions.query({name: 'clipboard-write'})).state
+        : null
+    }))()`);
   const privateRequest = (route, options = {}) =>
     fetch(runtime.url + route, {
       ...options,
@@ -163,6 +180,10 @@ async function fixture() {
           webSecurity: preferences.webSecurity,
           preload: preferences.preload || "",
         },
+        ownerClipboard: await clipboardPermissions(ownerWindow.webContents),
+        remoteClipboard: active
+          ? await clipboardPermissions(window.webContents)
+          : null,
         document: active
           ? await window.webContents.executeJavaScript(
               "({heading:document.querySelector('h1')?.textContent,require:typeof require,process:typeof process})",
@@ -171,7 +192,11 @@ async function fixture() {
       };
     },
     closeRemote() {
-      remoteWindows.at(-1).close();
+      const window = remoteWindows.at(-1);
+      return new Promise((resolve) => {
+        window.once("closed", resolve);
+        window.close();
+      });
     },
     async stop() {
       controller.close();
@@ -263,6 +288,16 @@ async function smoke() {
     });
     assert.equal(state.ownerCookie, true);
     assert.equal(state.separateSession, true);
+    assert.deepEqual(state.ownerClipboard, {
+      write: "granted",
+      read: "denied",
+      embeddedWrite: null,
+    });
+    assert.deepEqual(state.remoteClipboard, {
+      write: "granted",
+      read: "denied",
+      embeddedWrite: "denied",
+    });
     assert.ok(state.cookies.some((item) => item.name === "remote-fixture"));
     assert.ok(state.cookies.every((item) => item.name !== "mc-panel-desktop"));
     assert.ok(
@@ -297,7 +332,7 @@ async function smoke() {
       "A new window must not inherit the previous remote session.",
     );
     console.log(
-      "Passed real Electron remote smoke: certificate cancel/accept, HTTPS rendering, sandbox/no Node bridge, isolated cookies, new-window trust, and local runtime survives remote close.",
+      "Passed real Electron remote smoke: certificate cancel/accept, HTTPS rendering, sandbox/no Node bridge, isolated cookies, new-window trust, clipboard writes granted only to main documents with reads denied (OS clipboard untouched), and local runtime survives remote close.",
     );
   } catch (cause) {
     if (stderr) console.error(stderr);
