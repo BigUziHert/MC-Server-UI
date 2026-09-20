@@ -553,11 +553,28 @@ test("audit filters show file, server and player actions", async ({
     ).toBe(true);
     await expect.poll(serverStatus).toBe("running");
   }
-  for (const action of ["op", "ban", "unban", "deop"]) {
+  for (const [action, state] of [
+    ["op", { operator: true }],
+    ["ban", { banned: true }],
+    ["unban", { banned: false }],
+    ["deop", { operator: false }],
+  ] as const) {
     const response = await request.post(`/api/players/${action}`, {
       data: { name: "Audit_Player" },
     });
-    expect(response.ok(), await response.text()).toBe(true);
+    expect(response.ok(), `${action}: ${await response.text()}`).toBe(true);
+    // A command response only confirms submission. Wait for the subprocess's
+    // saved player state before sending a command that depends on it.
+    await expect
+      .poll(async () => {
+        const response = await request.get("/api/players");
+        if (!response.ok()) return undefined;
+        const players = await response.json();
+        return players.history.find(
+          (player: { name: string }) => player.name === "Audit_Player",
+        );
+      })
+      .toMatchObject(state);
   }
   await openPage(page, "audit", "Audit logs");
   const filters = page.getByRole("group", {
