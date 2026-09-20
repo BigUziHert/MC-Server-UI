@@ -61,6 +61,41 @@ async function users(request: APIRequestContext, id: string) {
   }[];
 }
 
+test("permission presets select explicit grantable permissions", async ({
+  page,
+  request,
+  server,
+}) => {
+  await openSubusers(page, server.id);
+  await page.getByRole("button", { name: "New user", exact: true }).click();
+  const dialog = page.getByRole("dialog", {
+    name: "Create new subuser",
+    exact: true,
+  });
+  await dialog
+    .getByLabel("Email address", { exact: true })
+    .fill("viewer-preset@example.test");
+  await dialog
+    .getByRole("button", { name: "Use Viewer preset", exact: true })
+    .click();
+  await expect(
+    dialog.getByRole("checkbox", { name: "Start", exact: true }),
+  ).not.toBeChecked();
+  await expect(
+    dialog.getByRole("checkbox", { name: "View audit logs", exact: true }),
+  ).toBeChecked();
+  await dialog
+    .getByRole("button", { name: "Create subuser", exact: true })
+    .click();
+  await expect(dialog).not.toBeVisible();
+  expect(
+    (await users(request, server.id))
+      .find((user) => user.email === "viewer-preset@example.test")
+      ?.permissions.slice()
+      .sort(),
+  ).toEqual(catalog.roleDefaults.viewer.slice().sort());
+});
+
 test("granular subuser permissions persist, edit, and expose accurate mixed group states", async ({
   page,
   request,

@@ -23,6 +23,19 @@ type Config = {
   fields: Field[];
   status: string;
 };
+
+function numberError(field: Field, value: string | number | boolean) {
+  if (field.type !== "number") return "";
+  if (typeof value !== "number" || !Number.isFinite(value))
+    return "Enter a number.";
+  if ((field.min != null || field.max != null) && !Number.isInteger(value))
+    return "Enter a whole number.";
+  if (field.min != null && value < field.min)
+    return `Enter a number of at least ${field.min}.`;
+  if (field.max != null && value > field.max)
+    return `Enter a number no greater than ${field.max}.`;
+  return "";
+}
 export default function Properties({
   notify,
   permissions,
@@ -49,10 +62,20 @@ export default function Properties({
   const request = useRef(0),
     session = useRef(0),
     dialog = useRef<HTMLDialogElement>(null);
-  const changes = (config?.fields ?? [])
-    .filter((field) => values[field.key] !== field.value)
+  const edited = (config?.fields ?? []).filter(
+    (field) => values[field.key] !== field.value,
+  );
+  const invalid = Object.fromEntries(
+    edited.flatMap((field) => {
+      const message = numberError(field, values[field.key]);
+      return message ? [[field.key, message]] : [];
+    }),
+  );
+  const invalidCount = Object.keys(invalid).length;
+  const changes = edited
+    .filter((field) => !invalid[field.key])
     .map((field) => ({ key: field.key, value: values[field.key] }));
-  const dirty = changes.length > 0;
+  const dirty = edited.length > 0;
   const load = useCallback(
     async (file: string, preserve = false) => {
       if (!canRead) return false;
@@ -155,7 +178,7 @@ export default function Properties({
     return load(selected, true);
   };
   async function save() {
-    if (!canWrite || !config || !dirty || saving) return;
+    if (!canWrite || !config || !dirty || invalidCount > 0 || saving) return;
     const id = session.current;
     setSaving(true);
     setError("");
@@ -200,11 +223,13 @@ export default function Properties({
         <button
           className="btn primary"
           onClick={() => void save()}
-          disabled={!canWrite || !dirty || saving || loading}
+          disabled={
+            !canWrite || !dirty || invalidCount > 0 || saving || loading
+          }
         >
           <Save size={15} />
           {saving ? "Saving…" : "Save changes"}
-          {dirty ? ` (${changes.length})` : ""}
+          {dirty ? ` (${edited.length})` : ""}
         </button>
       </div>
       <div
@@ -252,6 +277,12 @@ export default function Properties({
             else setCatalogReload((v) => v + 1);
           }}
         />
+      )}
+      {invalidCount > 0 && (
+        <p className="property-error">
+          Correct {invalidCount} invalid{" "}
+          {invalidCount === 1 ? "number" : "numbers"} before saving.
+        </p>
       )}
       {loading && !config ? (
         <StatePanel
@@ -315,6 +346,13 @@ export default function Properties({
                       }
                       min={field.min}
                       max={field.max}
+                      step={field.min != null || field.max != null ? 1 : "any"}
+                      aria-invalid={invalid[field.key] ? true : undefined}
+                      aria-describedby={
+                        invalid[field.key]
+                          ? `property-error-${encodeURIComponent(field.key)}`
+                          : undefined
+                      }
                       autoComplete="off"
                       spellCheck={false}
                       disabled={!canWrite || saving || loading}
@@ -331,6 +369,15 @@ export default function Properties({
                         }))
                       }
                     />
+                  )}
+                  {invalid[field.key] && (
+                    <small
+                      className="property-error"
+                      role="alert"
+                      id={`property-error-${encodeURIComponent(field.key)}`}
+                    >
+                      {invalid[field.key]}
+                    </small>
                   )}
                 </label>
               ))}
@@ -372,13 +419,13 @@ export default function Properties({
       >
         <h2 id="discard-properties-title">
           {pendingReload
-            ? `Reload and discard ${changes.length} unsaved changes?`
+            ? `Reload and discard ${edited.length} unsaved changes?`
             : "Discard unsaved changes?"}
         </h2>
         <p>
           {pendingReload
             ? "Reloading replaces your edits with the saved file."
-            : `Your ${changes.length} unsaved changes will be discarded.`}
+            : `Your ${edited.length} unsaved changes will be discarded.`}
         </p>
         <div className="modal-actions">
           <button className="btn" onClick={() => setPending(null)}>

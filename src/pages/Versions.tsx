@@ -156,6 +156,14 @@ export default function Versions({
     runtimeUpdate.gameVersion === version,
   );
   const updating = installMode === "update";
+  const updateReason = canUpdate
+    ? ""
+    : runtimeUpdate?.reason ||
+      (runtimeUpdate?.available && runtimeUpdate.provider !== selected?.id
+        ? "Runtime updates require the same server software. Changing software requires a clean install."
+        : runtimeUpdate?.available && runtimeUpdate.gameVersion !== version
+          ? `Runtime updates are available for Minecraft ${runtimeUpdate.gameVersion}. Changing the Minecraft release requires a clean install.`
+          : "");
 
   const refresh = useCallback(
     async (manual = false) => {
@@ -681,6 +689,15 @@ export default function Versions({
                   <span className="count-badge">{shownBuilds.length}</span>
                 )}
               </div>
+              {version && updateReason && (
+                <p
+                  className="versions-filter-notice"
+                  id="runtime-update-reason"
+                >
+                  <Info size={16} aria-hidden="true" />
+                  <span>{updateReason}</span>
+                </p>
+              )}
               {version &&
                 !loadingBuilds &&
                 !showExperimental &&
@@ -750,6 +767,9 @@ export default function Versions({
                       </div>
                       <button
                         className="btn primary"
+                        aria-describedby={
+                          updateReason ? "runtime-update-reason" : undefined
+                        }
                         disabled={
                           !allowChanges ||
                           jobBusy ||
@@ -823,10 +843,8 @@ export default function Versions({
           for Minecraft {version}. The server will remain stopped when
           installation finishes.
         </p>
-        {!canUpdate && runtimeUpdate?.reason && (
-          <p className="management-dialog-description">
-            {runtimeUpdate.reason}
-          </p>
+        {updateReason && (
+          <p className="management-dialog-description">{updateReason}</p>
         )}
         {(canUpdate || updating) && (
           <fieldset className="versions-install-mode" disabled={submitting}>

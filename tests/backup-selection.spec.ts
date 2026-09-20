@@ -76,6 +76,69 @@ async function backupNames(request: APIRequestContext, fixture: BackupFixture) {
     .sort();
 }
 
+test("backup dialogs use native modal focus, restore the trigger, and stay open while saving", async ({
+  page,
+  backups,
+}) => {
+  await openBackups(page, backups);
+  const trigger = page.getByRole("button", {
+    name: "Create backup",
+    exact: true,
+  });
+  await trigger.click();
+  const dialog = page.getByRole("dialog", {
+    name: "Create a backup",
+    exact: true,
+  });
+  await expect
+    .poll(() => dialog.evaluate((element) => element.matches("dialog:modal")))
+    .toBe(true);
+  await expect(dialog.getByRole("textbox")).toBeFocused();
+  await page.keyboard.press("Shift+Tab");
+  await expect(
+    dialog.getByRole("button", { name: "Close dialog" }),
+  ).toBeFocused();
+  await page.keyboard.press("Shift+Tab");
+  // Chromium may send the boundary tab stop to browser chrome. The page
+  // underneath the native modal must still never receive keyboard focus.
+  expect(
+    await dialog.evaluate(
+      (element) =>
+        document.activeElement === document.body ||
+        element.contains(document.activeElement),
+    ),
+  ).toBe(true);
+  await page.keyboard.press("Tab");
+  await expect(
+    dialog.getByRole("button", { name: "Close dialog" }),
+  ).toBeFocused();
+  await page.keyboard.press("Escape");
+  await expect(dialog).not.toBeVisible();
+  await expect(trigger).toBeFocused();
+
+  let release: (() => void) | undefined;
+  const pending = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  await page.route("**/api/backups", async (route) => {
+    if (route.request().method() !== "POST") return route.continue();
+    await pending;
+    await route.fulfill({ json: {} });
+  });
+  await trigger.click();
+  await dialog
+    .getByRole("button", { name: "Create backup", exact: true })
+    .click();
+  await expect(
+    dialog.getByRole("button", { name: "Creating backup…", exact: true }),
+  ).toBeDisabled();
+  await page.keyboard.press("Escape");
+  await expect(dialog).toBeVisible();
+  release!();
+  await expect(dialog).not.toBeVisible();
+  await expect(trigger).toBeFocused();
+});
+
 test("specific backups confirm exact targets and preserve unselected archives", async ({
   page,
   request,

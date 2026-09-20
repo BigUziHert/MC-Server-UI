@@ -602,6 +602,62 @@ test("Properties reports external file changes without overwriting them", async 
     ).content,
   ).toContain("# changed elsewhere");
 });
+test("Properties validates empty, fractional, and out-of-range numbers before saving other edits", async ({
+  page,
+  serverId,
+}) => {
+  const submitted: { changes: { key: string; value: unknown }[] }[] = [];
+  page.on("request", (request) => {
+    if (
+      request.method() === "POST" &&
+      request.url().endsWith("/api/minecraft/properties/save")
+    ) {
+      expect(request.headers()["x-server-id"]).toBe(serverId);
+      submitted.push(request.postDataJSON());
+    }
+  });
+  await page.goto("/#properties");
+  const field = page.getByRole("spinbutton", {
+    name: "max players",
+    exact: true,
+  });
+  await field.fill("");
+  await page
+    .getByRole("switch", { name: "online mode", exact: true })
+    .uncheck();
+  const save = page.getByRole("button", {
+    name: "Save changes (2)",
+    exact: true,
+  });
+  await expect(field).toHaveAttribute("aria-invalid", "true");
+  await expect(field).toHaveAccessibleDescription("Enter a number.");
+  await expect(save).toBeDisabled();
+  await field.fill("0");
+  await expect(field).toHaveAccessibleDescription(
+    "Enter a number of at least 1.",
+  );
+  await field.fill("2.5");
+  await expect(field).toHaveAccessibleDescription("Enter a whole number.");
+  await field.fill("100001");
+  await expect(field).toHaveAccessibleDescription(
+    "Enter a number no greater than 100000.",
+  );
+  expect(submitted).toEqual([]);
+  await field.fill("25");
+  await expect(field).not.toHaveAttribute("aria-invalid", "true");
+  await expect(save).toBeEnabled();
+  await save.click();
+  await expect(
+    page.getByRole("button", { name: "Save changes", exact: true }),
+  ).toBeDisabled();
+  expect(submitted).toHaveLength(1);
+  expect(submitted[0].changes).toEqual(
+    expect.arrayContaining([
+      { key: "max-players", value: 25 },
+      { key: "online-mode", value: false },
+    ]),
+  );
+});
 test("Versions updates an imported NeoForge runtime without a clean install and keeps clean install explicit", async ({
   page,
   serverId,
@@ -729,7 +785,15 @@ test("Versions updates an imported NeoForge runtime without a clean install and 
     await expect(
       page.getByRole("button", { name: "Install", exact: true }),
     ).toBeVisible();
+    const explanation =
+      provider === "fabric"
+        ? "Runtime updates require the same server software. Changing software requires a clean install."
+        : `Runtime updates are available for Minecraft ${minecraft}. Changing the Minecraft release requires a clean install.`;
+    await expect(page.locator("#runtime-update-reason")).toHaveText(
+      explanation,
+    );
     await page.getByRole("button", { name: "Install", exact: true }).click();
+    await expect(dialog).toContainText(explanation);
     await expect(dialog.getByRole("radio")).toHaveCount(0);
     await expect(
       dialog.getByRole("button", { name: "Install version", exact: true }),
@@ -1080,8 +1144,8 @@ test("Launchpad exposes six platforms, only four content tabs, and a reviewed in
     )
     .toBe(true);
   await page
-    .getByRole("button", { name: /Update/ })
-    .first()
+    .getByRole("article", { name: "Better Mod", exact: true })
+    .getByRole("button", { name: "Update Better Mod", exact: true })
     .click();
   const dialog = page.getByRole("dialog");
   await expect(dialog).toBeVisible();
@@ -1281,7 +1345,7 @@ for (const viewport of [
       "A required server library could not be checked.",
     );
     await expect(dialog).toContainText(
-      "All current files will be removed, including worlds, mods, plugins and settings.",
+      "Existing files, including worlds, mods, plugins and settings, will move to Recycle Bin for recovery.",
     );
     const acknowledgement = dialog.getByRole("checkbox", {
       name: "I understand this replaces all files in this server’s folder.",
@@ -1606,7 +1670,9 @@ test("Launchpad installed updates sort before pagination and keep priority when 
     "zeta Mod 1",
   ];
   await expect(names).toHaveText(first);
-  await expect(page.getByRole("button", { name: /^Update / })).toHaveCount(5);
+  await expect(
+    page.getByRole("article").getByRole("button", { name: /^Update / }),
+  ).toHaveCount(5);
   await expect(page.getByRole("status", { name: "Launchpad page" })).toHaveText(
     "Page 1 of 3",
   );
@@ -1620,7 +1686,9 @@ test("Launchpad installed updates sort before pagination and keep priority when 
     "alpha Mod 2",
     "Alpha Mod 10",
   ]);
-  await expect(page.getByRole("button", { name: /^Update / })).toHaveCount(2);
+  await expect(
+    page.getByRole("article").getByRole("button", { name: /^Update / }),
+  ).toHaveCount(2);
   await page.setViewportSize({ width: 390, height: 844 });
   const search = page.getByLabel("Search Launchpad", { exact: true });
   const searchField = search.locator("xpath=../..");
@@ -1654,7 +1722,8 @@ test("Launchpad installed updates sort before pagination and keep priority when 
   await expect(search).toHaveCSS("border-color", unfocusedInputBorder);
   await expect(searchField).toHaveCSS("border-color", "rgb(48, 49, 64)");
   await expect(searchField).toHaveCSS("box-shadow", "none");
-  await expect(searchField).toHaveCSS("outline-style", "none");
+  await expect(searchField).toHaveCSS("outline-style", "solid");
+  await expect(searchField).toHaveCSS("outline-width", "2px");
   await expect(names).toHaveText(first);
   await expect(page.getByRole("status", { name: "Launchpad page" })).toHaveText(
     "Page 1 of 3",
@@ -2411,8 +2480,11 @@ test("Launchpad preserves known updates and exposes successful-response provider
   expect(
     fullRequests.map((url) => url.searchParams.get("refresh") === "true"),
   ).toEqual([false, true, false, true]);
-  // An intentional "All loaders" selection must survive reentry as well.
-  await page.getByLabel("Loader", { exact: true }).selectOption("");
+  // Installed updates stay tied to the configured server loader across reentry.
+  await expect(page.getByLabel("Loader", { exact: true })).toHaveValue(
+    "neoforge",
+  );
+  await expect(page.getByLabel("Loader", { exact: true })).toBeDisabled();
   await expect(update).toBeEnabled();
   await expect(
     companion.getByText("Up to date", { exact: true }),
@@ -2423,7 +2495,10 @@ test("Launchpad preserves known updates and exposes successful-response provider
   ).toBeVisible();
   await page.getByRole("link", { name: "Launchpad", exact: true }).click();
   await expect(installedToggle).toBeChecked();
-  await expect(page.getByLabel("Loader", { exact: true })).toHaveValue("");
+  await expect(page.getByLabel("Loader", { exact: true })).toHaveValue(
+    "neoforge",
+  );
+  await expect(page.getByLabel("Loader", { exact: true })).toBeDisabled();
   await expect.poll(() => fullRequests.length).toBe(5);
   expect(Object.fromEntries(fullRequests[4].searchParams)).toMatchObject({
     gameVersion: "1.21.1",
@@ -2608,8 +2683,10 @@ for (const browse of [
     const browseVersion = page.getByLabel("Minecraft version", { exact: true });
     const browseLoader = page.getByLabel("Loader", { exact: true });
     await expect(installedToggle).toBeChecked();
-    await expect(browseVersion).toHaveValue(browse.gameVersion);
-    await expect(browseLoader).toHaveValue(browse.loader);
+    await expect(browseVersion).toHaveValue("1.21.1");
+    await expect(browseLoader).toHaveValue("neoforge");
+    await expect(browseVersion).toBeDisabled();
+    await expect(browseLoader).toBeDisabled();
     const jei = page.getByRole("article", { name: "JEI", exact: true });
     const companion = page.getByRole("article", {
       name: "Companion Mod",
@@ -2640,8 +2717,10 @@ for (const browse of [
     await expect(page).toHaveURL(/#files$/);
     await page.getByRole("link", { name: "Launchpad", exact: true }).click();
     await expect(installedToggle).toBeChecked();
-    await expect(browseVersion).toHaveValue(browse.gameVersion);
-    await expect(browseLoader).toHaveValue(browse.loader);
+    await expect(browseVersion).toHaveValue("1.21.1");
+    await expect(browseLoader).toHaveValue("neoforge");
+    await expect(browseVersion).toBeDisabled();
+    await expect(browseLoader).toBeDisabled();
     await expect(jei).toContainText("mods/jei-older.jar");
     await expect(jei).toContainText("Available: 19.56.0.439");
     await expect(update).toBeEnabled();
@@ -2675,6 +2754,11 @@ for (const browse of [
         gameVersion: "1.21.1",
         loader: "neoforge",
       });
+    await installedToggle.uncheck();
+    await expect(browseVersion).toBeEnabled();
+    await expect(browseLoader).toBeEnabled();
+    await expect(browseVersion).toHaveValue(browse.gameVersion);
+    await expect(browseLoader).toHaveValue(browse.loader);
   });
 }
 
@@ -4311,7 +4395,7 @@ for (const blockedBy of ["none", "dependent", "unreadable"]) {
       reviews++;
       return route.fulfill({
         json: {
-          ...(blockedBy === "none"
+          ...(blockedBy !== "dependent"
             ? {
                 planId: `removal-${reviews}`,
                 expiresAt: "2099-01-01T00:00:00Z",
@@ -4327,7 +4411,8 @@ for (const blockedBy of ["none", "dependent", "unreadable"]) {
             blockedBy === "unreadable"
               ? ["mods/unknown.jar could not be checked for dependencies."]
               : [],
-          blocked: blockedBy !== "none",
+          blocked: blockedBy === "dependent",
+          requiresAcknowledgement: blockedBy === "unreadable",
         },
       });
     });
@@ -4368,56 +4453,57 @@ for (const blockedBy of ["none", "dependent", "unreadable"]) {
     await expect(files).toContainText("mods/target.jar");
     await expect(files).not.toContainText("library.jar");
     expect(removals).toHaveLength(0);
-    if (blockedBy !== "none") {
+    if (blockedBy === "dependent") {
       await expect(
         dialog.getByRole("heading", {
-          name:
-            blockedBy === "dependent"
-              ? "Mod removal blocked"
-              : "Dependency check incomplete",
+          name: "Mod removal blocked",
         }),
       ).toBeVisible();
       await expect(
         dialog.getByRole("button", { name: "Remove mod", exact: true }),
       ).toHaveCount(0);
-      if (blockedBy === "dependent") {
-        await expect(
-          dialog.getByRole("list", { name: "Mods requiring this mod" }),
-        ).toContainText("Dependent Add-on");
-        await expect(dialog).toContainText("Remove these dependent mods first");
-      } else {
-        await expect(dialog).toContainText(
-          "Their requirements are still unknown.",
-        );
-        const issues = dialog.getByRole("list", {
-          name: "Files with unreadable dependencies",
-        });
-        await expect(issues).not.toBeVisible();
-        await dialog.getByText("View affected files", { exact: true }).click();
-        await expect(issues).toBeVisible();
-        await expect(issues).toContainText(
-          "mods/unknown.jar could not be checked",
-        );
-        await page.setViewportSize({ width: 390, height: 844 });
-        await page.screenshot({
-          path: testInfo.outputPath("removal-incomplete-check-mobile.png"),
-          animations: "disabled",
-        });
-        await dialog
-          .getByRole("button", { name: "Try again", exact: true })
-          .click();
-        await expect.poll(() => reviews).toBe(2);
-        await expect(
-          dialog.getByRole("heading", { name: "Dependency check incomplete" }),
-        ).toBeVisible();
-        await expect(
-          dialog.getByRole("button", { name: "Remove mod", exact: true }),
-        ).toHaveCount(0);
-      }
+      await expect(
+        dialog.getByRole("list", { name: "Mods requiring this mod" }),
+      ).toContainText("Dependent Add-on");
+      await expect(dialog).toContainText("Remove these dependent mods first");
+      await expect(dialog.getByRole("checkbox")).toHaveCount(0);
       await dialog.getByRole("button", { name: "Close", exact: true }).click();
       expect(removals).toHaveLength(0);
       return;
     }
+    const acknowledgeRemoval = async () => {
+      if (blockedBy !== "unreadable") return;
+      const acknowledgement = dialog.getByRole("checkbox", {
+        name: "I understand that unreadable dependencies may require this file.",
+        exact: true,
+      });
+      await expect(acknowledgement).not.toBeChecked();
+      await expect(
+        dialog.getByRole("button", { name: "Remove mod", exact: true }),
+      ).toBeDisabled();
+      await acknowledgement.check();
+      await expect(
+        dialog.getByRole("button", { name: "Remove mod", exact: true }),
+      ).toBeEnabled();
+    };
+    if (blockedBy === "unreadable") {
+      await expect(
+        dialog.getByRole("heading", { name: "Remove mod", exact: true }),
+      ).toBeVisible();
+      await expect(dialog).toContainText(
+        "Their requirements are still unknown.",
+      );
+      const issues = dialog.getByRole("list", {
+        name: "Files with unreadable dependencies",
+      });
+      await expect(issues).not.toBeVisible();
+      await dialog.getByText("View affected files", { exact: true }).click();
+      await expect(issues).toBeVisible();
+      await expect(issues).toContainText(
+        "mods/unknown.jar could not be checked",
+      );
+    }
+    await acknowledgeRemoval();
     await expect(dialog).toContainText("Recycle Bin");
     await expect(dialog).toContainText("Other files will stay installed");
     await page.setViewportSize({ width: 390, height: 844 });
@@ -4428,6 +4514,7 @@ for (const blockedBy of ["none", "dependent", "unreadable"]) {
     await dialog.getByRole("button", { name: "Cancel", exact: true }).click();
     expect(removals).toHaveLength(0);
     await remove.click();
+    await acknowledgeRemoval();
     await dialog
       .getByRole("button", { name: "Remove mod", exact: true })
       .click();
@@ -4440,13 +4527,26 @@ for (const blockedBy of ["none", "dependent", "unreadable"]) {
     await dialog
       .getByRole("button", { name: "Try again", exact: true })
       .click();
+    await acknowledgeRemoval();
     await dialog
       .getByRole("button", { name: "Remove mod", exact: true })
       .click();
     await expect(dialog).not.toBeVisible();
     expect(removals).toEqual([
-      { planId: "removal-2", confirmed: true },
-      { planId: "removal-3", confirmed: true },
+      {
+        planId: "removal-2",
+        confirmed: true,
+        ...(blockedBy === "unreadable"
+          ? { acknowledgedUnreadableDependencies: true }
+          : {}),
+      },
+      {
+        planId: "removal-3",
+        confirmed: true,
+        ...(blockedBy === "unreadable"
+          ? { acknowledgedUnreadableDependencies: true }
+          : {}),
+      },
     ]);
     await expect(
       page.getByRole("article", { name: "Target Mod", exact: true }),

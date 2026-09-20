@@ -23,9 +23,11 @@ import {
   useServerApi,
   formatBytes,
   relativeTime,
+  messageOf,
   type PageProps,
 } from "../api";
 import "./storage.css";
+import "./storage-dialog.css";
 import RefreshButton from "../RefreshButton";
 import StatePanel from "../StatePanel";
 import Switch from "../Switch";
@@ -62,10 +64,6 @@ const defaults: Schedule = {
   retention: 7,
   nextRun: null,
 };
-const messageOf = (error: unknown) =>
-  error instanceof Error
-    ? error.message
-    : "Something went wrong. Please try again.";
 const fullDate = (date: string) =>
   new Date(date).toLocaleString(undefined, {
     month: "short",
@@ -103,7 +101,8 @@ export default function Backups({
   const [name, setName] = useState("");
   const [dialogError, setDialogError] = useState("");
   const [deleteErrors, setDeleteErrors] = useState<string[]>([]);
-  const dialogRef = useRef<HTMLDivElement>(null);
+  const dialogRef = useRef<HTMLDialogElement>(null);
+  const headingRef = useRef<HTMLHeadingElement>(null);
   const busyRef = useRef(false);
   const generation = useRef(0);
   busyRef.current = busy;
@@ -156,44 +155,15 @@ export default function Backups({
   useEffect(() => {
     if (!dialog) return;
     const previous = document.activeElement as HTMLElement | null;
-    const focusable = () =>
-      Array.from(
-        dialogRef.current?.querySelectorAll<HTMLElement>(
-          "button:not(:disabled), input:not(:disabled)",
-        ) || [],
-      );
-    const items = focusable();
-    (items.find((element) => element.tagName === "INPUT") || items[0])?.focus();
-    const onKey = (event: KeyboardEvent) => {
-      if (event.key === "Escape" && !busyRef.current) {
-        event.preventDefault();
-        setDialog(null);
-      }
-      if (event.key === "Tab") {
-        const current = focusable();
-        const first = current[0];
-        const last = current[current.length - 1];
-        if (!current.length) {
-          event.preventDefault();
-          dialogRef.current?.focus();
-        } else if (!dialogRef.current?.contains(document.activeElement)) {
-          event.preventDefault();
-          (event.shiftKey ? last : first)?.focus();
-        } else if (event.shiftKey && document.activeElement === first) {
-          event.preventDefault();
-          last?.focus();
-        } else if (!event.shiftKey && document.activeElement === last) {
-          event.preventDefault();
-          first?.focus();
-        }
-      }
-    };
-    document.addEventListener("keydown", onKey);
+    const element = dialogRef.current;
+    element?.showModal();
+    element?.querySelector<HTMLInputElement>("input:not(:disabled)")?.focus();
     return () => {
-      document.removeEventListener("keydown", onKey);
-      previous?.focus();
+      element?.close();
+      if (previous?.isConnected) previous.focus();
+      if (document.activeElement !== previous) headingRef.current?.focus();
     };
-  }, [dialog]);
+  }, [dialog !== null]);
 
   function updateSchedule(patch: Partial<Schedule>) {
     if (!canSchedule) return;
@@ -281,8 +251,8 @@ export default function Backups({
             : `${deleted.size} backups moved to Recycle Bin.`,
         );
       }
-      setDialog(null);
       await load();
+      if (token === generation.current) setDialog(null);
     } catch (failure) {
       if (token === generation.current) setDialogError(messageOf(failure));
     } finally {
@@ -321,7 +291,9 @@ export default function Backups({
     <div className="storage-page">
       <div className="page-heading">
         <div>
-          <h1>Backups</h1>
+          <h1 ref={headingRef} tabIndex={-1}>
+            Backups
+          </h1>
         </div>
         <button
           className="btn primary"
@@ -761,153 +733,159 @@ export default function Backups({
       )}
 
       {dialog && (
-        <div
-          className="modal-backdrop"
+        <dialog
+          className="modal storage-modal storage-native-dialog"
+          ref={dialogRef}
+          aria-labelledby="backup-dialog-title"
+          aria-describedby="backup-dialog-description"
+          onCancel={(event) => {
+            event.preventDefault();
+            if (!busyRef.current) setDialog(null);
+          }}
           onMouseDown={(event) => {
-            if (event.target === event.currentTarget && !busy) setDialog(null);
+            if (event.target !== event.currentTarget || busyRef.current) return;
+            const bounds = event.currentTarget.getBoundingClientRect();
+            if (
+              event.clientX < bounds.left ||
+              event.clientX > bounds.right ||
+              event.clientY < bounds.top ||
+              event.clientY > bounds.bottom
+            )
+              setDialog(null);
           }}
         >
-          <div
-            className="modal storage-modal"
-            ref={dialogRef}
-            role="dialog"
-            tabIndex={-1}
-            aria-modal="true"
-            aria-labelledby="backup-dialog-title"
-          >
-            <form onSubmit={submitDialog}>
-              <div className="storage-modal-heading">
-                <div>
-                  <h2 id="backup-dialog-title">
-                    {dialog === "create"
-                      ? "Create a backup"
-                      : dialog.bulk
-                        ? "Move selected backups to Recycle Bin?"
-                        : "Move this backup to Recycle Bin?"}
-                  </h2>
+          <form onSubmit={submitDialog}>
+            <div className="storage-modal-heading">
+              <div>
+                <h2 id="backup-dialog-title">
+                  {dialog === "create"
+                    ? "Create a backup"
+                    : dialog.bulk
+                      ? "Move selected backups to Recycle Bin?"
+                      : "Move this backup to Recycle Bin?"}
+                </h2>
+                <p id="backup-dialog-description">
+                  {dialog === "create"
+                    ? "Save an archive of your current server files."
+                    : "You can restore these archives from File Manager → Recycle Bin."}
+                </p>
+              </div>
+              <button
+                type="button"
+                className="btn icon"
+                aria-label="Close dialog"
+                onClick={() => setDialog(null)}
+                disabled={busy}
+              >
+                <X size={18} />
+              </button>
+            </div>
+            {dialog === "create" ? (
+              <>
+                <label className="form-field">
+                  Backup name <span className="muted">(optional)</span>
+                  <input
+                    value={name}
+                    onChange={(event) => setName(event.target.value)}
+                    placeholder="Before the next big adventure"
+                    maxLength={100}
+                    disabled={busy}
+                  />
+                </label>
+                <div className="backup-create-note">
+                  <ShieldCheck size={17} />
                   <p>
-                    {dialog === "create"
-                      ? "Save an archive of your current server files."
-                      : "You can restore these archives from File Manager → Recycle Bin."}
+                    Your server can stay online. Live backups save the world,
+                    pause automatic saves while archiving, then resume saving.
                   </p>
                 </div>
-                <button
-                  type="button"
-                  className="btn icon"
-                  aria-label="Close dialog"
-                  onClick={() => setDialog(null)}
-                  disabled={busy}
-                >
-                  <X size={18} />
-                </button>
-              </div>
-              {dialog === "create" ? (
-                <>
-                  <label className="form-field">
-                    Backup name <span className="muted">(optional)</span>
-                    <input
-                      value={name}
-                      onChange={(event) => setName(event.target.value)}
-                      placeholder="Before the next big adventure"
-                      maxLength={100}
-                      disabled={busy}
-                    />
-                  </label>
-                  <div className="backup-create-note">
-                    <ShieldCheck size={17} />
-                    <p>
-                      Your server can stay online. Live backups save the world,
-                      pause automatic saves while archiving, then resume saving.
-                    </p>
-                  </div>
-                  {busy && (
-                    <p className="backup-create-progress" role="status">
-                      <LoaderCircle size={15} className="spin" />
-                      Preparing and archiving your files. Large worlds can take
-                      a little longer.
-                    </p>
-                  )}
-                </>
-              ) : (
-                <>
-                  <p className="delete-description">
-                    {dialog.bulk ? (
-                      <>
-                        Move{" "}
-                        <strong>
-                          {dialog.backups.length} selected{" "}
-                          {dialog.backups.length === 1 ? "backup" : "backups"}
-                        </strong>{" "}
-                        to Recycle Bin?
-                      </>
-                    ) : (
-                      <>
-                        Move <strong>{dialog.backups[0].name}</strong> to
-                        Recycle Bin?
-                      </>
-                    )}{" "}
-                    Your current server files will stay as they are.
+                {busy && (
+                  <p className="backup-create-progress" role="status">
+                    <LoaderCircle size={15} className="spin" />
+                    Preparing and archiving your files. Large worlds can take a
+                    little longer.
                   </p>
-                  {dialog.bulk && (
-                    <ul
-                      className="backup-delete-targets"
-                      aria-label="Backups to recycle"
-                    >
-                      {dialog.backups.map((backup) => (
-                        <li key={backup.id}>
-                          <strong>{backup.name}</strong>
-                          <span>
-                            {fullDate(backup.createdAt)} ·{" "}
-                            {formatBytes(backup.size)}
-                          </span>
-                        </li>
-                      ))}
-                    </ul>
-                  )}
-                </>
-              )}
-              {dialog !== "create" && deleteErrors.length > 0 && (
-                <ul className="backup-delete-errors" aria-label="Move errors">
-                  {deleteErrors.map((failure, index) => (
-                    <li key={index}>{failure}</li>
-                  ))}
-                </ul>
-              )}
-              {dialogError && (
-                <p className="storage-form-error" role="alert">
-                  {dialogError}
+                )}
+              </>
+            ) : (
+              <>
+                <p className="delete-description">
+                  {dialog.bulk ? (
+                    <>
+                      Move{" "}
+                      <strong>
+                        {dialog.backups.length} selected{" "}
+                        {dialog.backups.length === 1 ? "backup" : "backups"}
+                      </strong>{" "}
+                      to Recycle Bin?
+                    </>
+                  ) : (
+                    <>
+                      Move <strong>{dialog.backups[0].name}</strong> to Recycle
+                      Bin?
+                    </>
+                  )}{" "}
+                  Your current server files will stay as they are.
                 </p>
-              )}
-              <div className="storage-modal-footer">
-                <button
-                  type="button"
-                  className="btn"
-                  onClick={() => setDialog(null)}
-                  disabled={busy}
-                >
-                  Cancel
-                </button>
-                <button
-                  className={`btn ${dialog === "create" ? "primary" : "danger"}`}
-                  disabled={
-                    busy || (dialog === "create" ? !canCreate : !canDelete)
-                  }
-                >
-                  {busy && <LoaderCircle size={15} className="spin" />}
-                  {dialog === "create"
-                    ? busy
-                      ? "Creating backup…"
-                      : "Create backup"
-                    : busy
-                      ? "Moving backups…"
-                      : deleteErrors.length > 0
-                        ? "Retry failed moves"
-                        : "Move to Recycle Bin"}
-                </button>
-              </div>
-            </form>
-          </div>
-        </div>
+                {dialog.bulk && (
+                  <ul
+                    className="backup-delete-targets"
+                    aria-label="Backups to recycle"
+                  >
+                    {dialog.backups.map((backup) => (
+                      <li key={backup.id}>
+                        <strong>{backup.name}</strong>
+                        <span>
+                          {fullDate(backup.createdAt)} ·{" "}
+                          {formatBytes(backup.size)}
+                        </span>
+                      </li>
+                    ))}
+                  </ul>
+                )}
+              </>
+            )}
+            {dialog !== "create" && deleteErrors.length > 0 && (
+              <ul className="backup-delete-errors" aria-label="Move errors">
+                {deleteErrors.map((failure, index) => (
+                  <li key={index}>{failure}</li>
+                ))}
+              </ul>
+            )}
+            {dialogError && (
+              <p className="storage-form-error" role="alert">
+                {dialogError}
+              </p>
+            )}
+            <div className="storage-modal-footer">
+              <button
+                type="button"
+                className="btn"
+                onClick={() => setDialog(null)}
+                disabled={busy}
+              >
+                Cancel
+              </button>
+              <button
+                className={`btn ${dialog === "create" ? "primary" : "danger"}`}
+                disabled={
+                  busy || (dialog === "create" ? !canCreate : !canDelete)
+                }
+              >
+                {busy && <LoaderCircle size={15} className="spin" />}
+                {dialog === "create"
+                  ? busy
+                    ? "Creating backup…"
+                    : "Create backup"
+                  : busy
+                    ? "Moving backups…"
+                    : deleteErrors.length > 0
+                      ? "Retry failed moves"
+                      : "Move to Recycle Bin"}
+              </button>
+            </div>
+          </form>
+        </dialog>
       )}
     </div>
   );

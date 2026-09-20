@@ -15,6 +15,10 @@
   outline: none;
   box-shadow: none;
 }
+.search-field:has(:focus-visible) {
+  outline: 2px solid #969bb3;
+  outline-offset: 2px;
+}
 .search-field-grow,
 .console-log-search-field {
   flex: 1;

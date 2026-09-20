@@ -18,7 +18,7 @@ import {
 } from "lucide-react";
 import App from "./App";
 import { DesktopPanelReturn } from "./PanelAccount";
-import { api } from "./api";
+import { api, messageOf } from "./api";
 import { reportDesktopServers } from "./desktop-connections";
 import "./remote-access.css";
 
@@ -30,10 +30,6 @@ type SubuserSession = {
   permissions: string[];
 };
 type Session = { role: "owner" } | { role: "guest" } | SubuserSession;
-const messageOf = (cause: unknown) =>
-  cause instanceof Error
-    ? cause.message
-    : "Unable to connect. Please try again.";
 const unauthorized = (cause: unknown) =>
   (cause as { status?: number })?.status === 401;
 

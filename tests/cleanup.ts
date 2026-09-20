@@ -30,13 +30,20 @@ export default async function cleanup() {
       "Content-Type": "application/json",
     };
     const status = async () => {
-      const response = await fetch("http://127.0.0.1:3111/api/server", {
+      // Fleet descriptors report lifecycle without the per-process telemetry
+      // collector, whose 5-second budget can exceed teardown's request timeout.
+      const response = await fetch("http://127.0.0.1:3111/api/servers", {
         headers,
         signal: AbortSignal.timeout(3_000),
       });
       if (response.status === 404) return "offline";
       if (!response.ok) throw new Error(await response.text());
-      return (await response.json()).status;
+      const fleet = await response.json();
+      return (
+        fleet.servers.find(
+          (entry: { id: string; status: string }) => entry.id === server.id,
+        )?.status ?? "offline"
+      );
     };
     let current: string;
     try {

@@ -28,9 +28,11 @@ import {
   useServerApi,
   formatBytes,
   relativeTime,
+  messageOf,
   type PageProps,
 } from "../api";
 import "./storage.css";
+import "./storage-dialog.css";
 import SearchField, { useDebouncedValue } from "../SearchField";
 import RefreshButton from "../RefreshButton";
 import StatePanel from "../StatePanel";
@@ -66,10 +68,6 @@ type FileDialog =
       entries: Entry[];
       failures?: { entry: Entry; message: string }[];
     };
-const messageOf = (error: unknown) =>
-  error instanceof Error
-    ? error.message
-    : "Something went wrong. Please try again.";
 const editable = (name: string) =>
   /\.(txt|log|json|ya?ml|toml|properties|conf|cfg|ini|md|xml|csv|js|ts|sh|bat|mcmeta)$/i.test(
     name,
@@ -133,6 +131,7 @@ export default function FileManager({
         : canDelete;
   const [name, setName] = useState("");
   const [content, setContent] = useState("");
+  const [encoding, setEncoding] = useState<"utf8" | "latin1">("utf8");
   const [saving, setSaving] = useState(false);
   const [reading, setReading] = useState(false);
   const [readFailed, setReadFailed] = useState(false);
@@ -142,7 +141,8 @@ export default function FileManager({
   const uploadInput = useRef<HTMLInputElement>(null);
   const searchInput = useRef<HTMLInputElement>(null);
   const requestId = useRef(0);
-  const dialogRef = useRef<HTMLDivElement>(null);
+  const dialogRef = useRef<HTMLDialogElement>(null);
+  const focusSearchAfterClose = useRef(false);
   const dragDepth = useRef(0);
   const editRequestId = useRef(0);
   const savingRef = useRef(false);
@@ -199,49 +199,24 @@ export default function FileManager({
   useEffect(() => {
     if (!dialog) return;
     const previous = document.activeElement as HTMLElement | null;
-    const focusable = () =>
-      Array.from(
-        dialogRef.current?.querySelectorAll<HTMLElement>(
-          "button:not(:disabled), input:not(:disabled), textarea:not(:disabled), a[href]",
-        ) || [],
-      );
-    focusable()
-      .find(
-        (element) =>
-          element.tagName === "INPUT" || element.tagName === "TEXTAREA",
+    const element = dialogRef.current;
+    element?.showModal();
+    element
+      ?.querySelector<HTMLElement>(
+        "input:not(:disabled), textarea:not(:disabled)",
       )
       ?.focus();
-    if (!dialogRef.current?.contains(document.activeElement))
-      focusable()[0]?.focus();
-    const onKey = (event: KeyboardEvent) => {
-      if (event.key === "Escape" && !savingRef.current) {
-        event.preventDefault();
-        closeDialog();
-      }
-      if (event.key === "Tab") {
-        const items = focusable();
-        const first = items[0];
-        const last = items[items.length - 1];
-        if (!items.length) {
-          event.preventDefault();
-          dialogRef.current?.focus();
-        } else if (!dialogRef.current?.contains(document.activeElement)) {
-          event.preventDefault();
-          (event.shiftKey ? last : first)?.focus();
-        } else if (event.shiftKey && document.activeElement === first) {
-          event.preventDefault();
-          last?.focus();
-        } else if (!event.shiftKey && document.activeElement === last) {
-          event.preventDefault();
-          first?.focus();
-        }
-      }
-    };
-    document.addEventListener("keydown", onKey);
     return () => {
-      document.removeEventListener("keydown", onKey);
-      if (previous?.isConnected) previous.focus();
-      else searchInput.current?.focus();
+      element?.close();
+      if (!focusSearchAfterClose.current && previous?.isConnected)
+        previous.focus();
+      if (
+        (focusSearchAfterClose.current ||
+          document.activeElement !== previous) &&
+        searchInput.current?.isConnected
+      )
+        searchInput.current.focus();
+      focusSearchAfterClose.current = false;
     };
   }, [dialog]);
 
@@ -309,10 +284,14 @@ export default function FileManager({
     setReading(true);
     setDialog({ type: "edit", entry });
     try {
-      const result = await api<{ content: string }>(
-        `/files/content?path=${encodeURIComponent(entry.path)}`,
-      );
-      if (id === editRequestId.current) setContent(result.content);
+      const result = await api<{
+        content: string;
+        encoding?: "utf8" | "latin1";
+      }>(`/files/content?path=${encodeURIComponent(entry.path)}`);
+      if (id === editRequestId.current) {
+        setContent(result.content);
+        setEncoding(result.encoding ?? "utf8");
+      }
     } catch (failure) {
       if (id === editRequestId.current) {
         setDialogError(messageOf(failure));
@@ -390,7 +369,10 @@ export default function FileManager({
             failures,
           });
           setDialogError(summary);
-        } else closeDialog();
+        } else {
+          focusSearchAfterClose.current = true;
+          closeDialog();
+        }
         await load();
         return;
       } else if (dialog.type === "create") {
@@ -404,7 +386,7 @@ export default function FileManager({
       } else if (dialog.type === "edit") {
         await api("/files/content", {
           method: "PUT",
-          body: JSON.stringify({ path: dialog.entry.path, content }),
+          body: JSON.stringify({ path: dialog.entry.path, content, encoding }),
         });
         notify(`${dialog.entry.name} saved.`);
       } else {
@@ -413,6 +395,7 @@ export default function FileManager({
         });
         notify(`${dialog.entry.name} moved to Recycle Bin.`);
       }
+      if (dialog.type === "delete") focusSearchAfterClose.current = true;
       closeDialog();
       await load();
     } catch (failure) {
@@ -881,185 +864,186 @@ export default function FileManager({
       </div>
 
       {dialog && (
-        <div
-          className="modal-backdrop"
+        <dialog
+          ref={dialogRef}
+          className={`modal storage-modal storage-native-dialog ${dialog.type === "edit" ? "editor-modal" : ""}`}
+          aria-labelledby="file-dialog-title"
+          aria-describedby="file-dialog-description"
+          onCancel={(event) => {
+            event.preventDefault();
+            if (!savingRef.current) closeDialog();
+          }}
           onMouseDown={(event) => {
-            if (event.target === event.currentTarget && !saving) closeDialog();
+            if (event.target !== event.currentTarget || savingRef.current)
+              return;
+            const bounds = event.currentTarget.getBoundingClientRect();
+            if (
+              event.clientX < bounds.left ||
+              event.clientX > bounds.right ||
+              event.clientY < bounds.top ||
+              event.clientY > bounds.bottom
+            )
+              closeDialog();
           }}
         >
-          <div
-            ref={dialogRef}
-            className={`modal storage-modal ${dialog.type === "edit" ? "editor-modal" : ""}`}
-            role="dialog"
-            tabIndex={-1}
-            aria-modal="true"
-            aria-labelledby="file-dialog-title"
-          >
-            <form onSubmit={submitDialog}>
-              <div className="storage-modal-heading">
-                <div>
-                  <h2 id="file-dialog-title">
-                    {dialog.type === "create"
-                      ? `New ${dialog.kind === "directory" ? "folder" : "file"}`
-                      : dialog.type === "edit"
-                        ? dialog.entry.name
-                        : dialog.type === "delete-many"
-                          ? "Move selected items to Recycle Bin?"
-                          : "Move this item to Recycle Bin?"}
-                  </h2>
-                  <p>
-                    {dialog.type === "create"
-                      ? `Create in /${path || "server"}`
-                      : dialog.type === "edit"
-                        ? `/${dialog.entry.path}`
-                        : "You can restore these items from Recycle Bin."}
-                  </p>
-                </div>
-                <button
-                  type="button"
-                  className="btn icon"
-                  aria-label="Close dialog"
-                  disabled={saving}
-                  onClick={closeDialog}
-                >
-                  <X size={18} />
-                </button>
-              </div>
-              {dialog.type === "create" && (
-                <label className="form-field">
-                  {dialog.kind === "directory" ? "Folder name" : "File name"}
-                  <input
-                    required
-                    autoFocus
-                    value={name}
-                    onChange={(event) => setName(event.target.value)}
-                    placeholder={
-                      dialog.kind === "directory"
-                        ? "my-plugins"
-                        : "server.properties"
-                    }
-                    maxLength={180}
-                    disabled={saving}
-                  />
-                </label>
-              )}
-              {(dialog.type === "edit" ||
-                (dialog.type === "create" && dialog.kind === "file")) && (
-                <label className="form-field">
-                  {dialog.type === "edit"
-                    ? "File contents"
-                    : "Contents (optional)"}
-                  {reading ? (
-                    <div className="editor-loading">
-                      <LoaderCircle size={18} className="spin" />
-                      Reading file…
-                    </div>
-                  ) : (
-                    <textarea
-                      className="file-editor"
-                      readOnly={dialog.type === "edit" && !canUpdate}
-                      value={content}
-                      onChange={(event) => setContent(event.target.value)}
-                      spellCheck={false}
-                      disabled={saving}
-                      rows={dialog.type === "edit" ? 18 : 6}
-                    />
-                  )}
-                </label>
-              )}
-              {dialog.type === "delete" && (
-                <p className="delete-description">
-                  Move <strong>{dialog.entry.name}</strong>
-                  {dialog.entry.type === "directory"
-                    ? " and everything inside it"
-                    : ""}{" "}
-                  to Recycle Bin? It will be removed from your server files
-                  until restored.
+          <form onSubmit={submitDialog}>
+            <div className="storage-modal-heading">
+              <div>
+                <h2 id="file-dialog-title">
+                  {dialog.type === "create"
+                    ? `New ${dialog.kind === "directory" ? "folder" : "file"}`
+                    : dialog.type === "edit"
+                      ? dialog.entry.name
+                      : dialog.type === "delete-many"
+                        ? "Move selected items to Recycle Bin?"
+                        : "Move this item to Recycle Bin?"}
+                </h2>
+                <p id="file-dialog-description">
+                  {dialog.type === "create"
+                    ? `Create in /${path || "server"}`
+                    : dialog.type === "edit"
+                      ? `/${dialog.entry.path}`
+                      : "You can restore these items from Recycle Bin."}
                 </p>
-              )}
-              {dialog.type === "delete-many" && (
-                <div className="file-bulk-confirmation">
-                  <p>
-                    Move these {dialog.entries.length}{" "}
-                    {dialog.entries.length === 1 ? "item" : "items"} to Recycle
-                    Bin?
+              </div>
+              <button
+                type="button"
+                className="btn icon"
+                aria-label="Close dialog"
+                disabled={saving}
+                onClick={closeDialog}
+              >
+                <X size={18} />
+              </button>
+            </div>
+            {dialog.type === "create" && (
+              <label className="form-field">
+                {dialog.kind === "directory" ? "Folder name" : "File name"}
+                <input
+                  required
+                  value={name}
+                  onChange={(event) => setName(event.target.value)}
+                  placeholder={
+                    dialog.kind === "directory"
+                      ? "my-plugins"
+                      : "server.properties"
+                  }
+                  maxLength={180}
+                  disabled={saving}
+                />
+              </label>
+            )}
+            {(dialog.type === "edit" ||
+              (dialog.type === "create" && dialog.kind === "file")) && (
+              <label className="form-field">
+                {dialog.type === "edit"
+                  ? "File contents"
+                  : "Contents (optional)"}
+                {reading ? (
+                  <div className="editor-loading">
+                    <LoaderCircle size={18} className="spin" />
+                    Reading file…
+                  </div>
+                ) : (
+                  <textarea
+                    className="file-editor"
+                    readOnly={dialog.type === "edit" && !canUpdate}
+                    value={content}
+                    onChange={(event) => setContent(event.target.value)}
+                    spellCheck={false}
+                    disabled={saving}
+                    rows={dialog.type === "edit" ? 18 : 6}
+                  />
+                )}
+              </label>
+            )}
+            {dialog.type === "delete" && (
+              <p className="delete-description">
+                Move <strong>{dialog.entry.name}</strong>
+                {dialog.entry.type === "directory"
+                  ? " and everything inside it"
+                  : ""}{" "}
+                to Recycle Bin? It will be removed from your server files until
+                restored.
+              </p>
+            )}
+            {dialog.type === "delete-many" && (
+              <div className="file-bulk-confirmation">
+                <p>
+                  Move these {dialog.entries.length}{" "}
+                  {dialog.entries.length === 1 ? "item" : "items"} to Recycle
+                  Bin?
+                </p>
+                {dialog.entries.some((entry) => entry.type === "directory") && (
+                  <p className="file-bulk-folder-warning">
+                    Selected folders and everything inside them will be moved
+                    together, including nested files and folders.
                   </p>
-                  {dialog.entries.some(
-                    (entry) => entry.type === "directory",
-                  ) && (
-                    <p className="file-bulk-folder-warning">
-                      Selected folders and everything inside them will be moved
-                      together, including nested files and folders.
-                    </p>
-                  )}
-                  <ul
-                    className="file-bulk-targets"
-                    aria-label="Items to recycle"
-                  >
-                    {dialog.entries.map((entry) => (
+                )}
+                <ul className="file-bulk-targets" aria-label="Items to recycle">
+                  {dialog.entries.map((entry) => (
+                    <li key={entry.path}>
+                      <EntryIcon entry={entry} />
+                      <div>
+                        <strong>{entry.name}</strong>
+                        <span>/{entry.path}</span>
+                        {entry.type === "directory" && (
+                          <small>Folder · includes all contents</small>
+                        )}
+                      </div>
+                    </li>
+                  ))}
+                </ul>
+                {!!dialog.failures?.length && (
+                  <ul className="file-bulk-errors" aria-label="Move errors">
+                    {dialog.failures.map(({ entry, message }) => (
                       <li key={entry.path}>
-                        <EntryIcon entry={entry} />
-                        <div>
-                          <strong>{entry.name}</strong>
-                          <span>/{entry.path}</span>
-                          {entry.type === "directory" && (
-                            <small>Folder · includes all contents</small>
-                          )}
-                        </div>
+                        <strong>{entry.name}:</strong> {message}
                       </li>
                     ))}
                   </ul>
-                  {!!dialog.failures?.length && (
-                    <ul className="file-bulk-errors" aria-label="Move errors">
-                      {dialog.failures.map(({ entry, message }) => (
-                        <li key={entry.path}>
-                          <strong>{entry.name}:</strong> {message}
-                        </li>
-                      ))}
-                    </ul>
-                  )}
-                </div>
-              )}
-              {dialogError && (
-                <p className="storage-form-error" role="alert">
-                  {dialogError}
-                </p>
-              )}
-              <div className="storage-modal-footer">
-                <button
-                  type="button"
-                  className="btn"
-                  disabled={saving}
-                  onClick={closeDialog}
-                >
-                  Cancel
-                </button>
-                <button
-                  className={`btn ${dialog.type === "delete" || dialog.type === "delete-many" ? "danger" : "primary"}`}
-                  disabled={
-                    !canSubmitDialog ||
-                    saving ||
-                    (dialog.type === "edit" && (reading || readFailed)) ||
-                    (dialog.type === "create" && !name.trim())
-                  }
-                >
-                  {saving && <LoaderCircle size={15} className="spin" />}
-                  {dialog.type === "delete-many"
-                    ? saving && deleteProgress !== null
-                      ? `Moving ${deleteProgress} of ${dialog.entries.length}…`
-                      : dialog.failures?.length
-                        ? "Retry failed moves"
-                        : "Move to Recycle Bin"
-                    : dialog.type === "delete"
-                      ? "Move to Recycle Bin"
-                      : dialog.type === "edit"
-                        ? "Save changes"
-                        : `Create ${dialog.kind === "directory" ? "folder" : "file"}`}
-                </button>
+                )}
               </div>
-            </form>
-          </div>
-        </div>
+            )}
+            {dialogError && (
+              <p className="storage-form-error" role="alert">
+                {dialogError}
+              </p>
+            )}
+            <div className="storage-modal-footer">
+              <button
+                type="button"
+                className="btn"
+                disabled={saving}
+                onClick={closeDialog}
+              >
+                Cancel
+              </button>
+              <button
+                className={`btn ${dialog.type === "delete" || dialog.type === "delete-many" ? "danger" : "primary"}`}
+                disabled={
+                  !canSubmitDialog ||
+                  saving ||
+                  (dialog.type === "edit" && (reading || readFailed)) ||
+                  (dialog.type === "create" && !name.trim())
+                }
+              >
+                {saving && <LoaderCircle size={15} className="spin" />}
+                {dialog.type === "delete-many"
+                  ? saving && deleteProgress !== null
+                    ? `Moving ${deleteProgress} of ${dialog.entries.length}…`
+                    : dialog.failures?.length
+                      ? "Retry failed moves"
+                      : "Move to Recycle Bin"
+                  : dialog.type === "delete"
+                    ? "Move to Recycle Bin"
+                    : dialog.type === "edit"
+                      ? "Save changes"
+                      : `Create ${dialog.kind === "directory" ? "folder" : "file"}`}
+              </button>
+            </div>
+          </form>
+        </dialog>
       )}
     </div>
   );

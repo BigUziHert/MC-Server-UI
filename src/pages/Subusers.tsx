@@ -1165,6 +1165,30 @@ export default function Subusers({
                       {selected.length} / {grantablePermissions.length}
                     </span>
                   </div>
+                  <div
+                    className="subusers-preset"
+                    role="group"
+                    aria-label="Permission presets"
+                  >
+                    {(["admin", "operator", "viewer"] as const).map((role) => (
+                      <button
+                        key={role}
+                        type="button"
+                        className="btn"
+                        onClick={() =>
+                          setSelected(catalog.roleDefaults[role].filter(can))
+                        }
+                      >
+                        Use{" "}
+                        {role === "admin"
+                          ? "Admin"
+                          : role === "operator"
+                            ? "Operator"
+                            : "Viewer"}{" "}
+                        preset
+                      </button>
+                    ))}
+                  </div>
                   {groups.map((group) => {
                     const ids = group.permissions.map(
                       (permission) => permission.id,

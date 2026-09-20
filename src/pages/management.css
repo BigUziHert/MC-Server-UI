@@ -63,51 +63,6 @@
   color: #ffd000;
   flex-shrink: 0;
 }
-.role-overview {
-  display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
-  gap: 16px;
-}
-.role-overview-item {
-  display: flex;
-  align-items: center;
-  gap: 13px;
-  padding: 19px 20px;
-  border: 1px solid #272833;
-  border-radius: 10px;
-  background: #15151d;
-}
-.role-overview-item > div {
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-  min-width: 0;
-}
-.role-overview-item strong {
-  font-size: 13px;
-  color: #eef0f8;
-  font-weight: 550;
-}
-.role-overview-item > div > span {
-  font-size: 11px;
-  color: #969bb3;
-}
-.role-count {
-  margin-left: auto;
-  color: #eef0f8;
-  font-size: 24px;
-  font-weight: 600;
-}
-.role-overview .role-operator {
-  background: #272833;
-  border-color: #303140;
-  color: #b1b6ce;
-}
-.role-overview .role-viewer {
-  background: #272831;
-  border-color: #373843;
-  color: #b0afca;
-}
 .management-list {
   overflow: hidden;
   min-width: 0;
@@ -179,97 +134,6 @@
 .management-table tbody tr:hover {
   background: #20212b;
 }
-.management-person {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  min-width: 170px;
-}
-.management-person > div {
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-}
-.management-person strong {
-  font-size: 12px;
-  font-weight: 550;
-  color: #eef0f8;
-  overflow-wrap: anywhere;
-}
-.management-person > div > span {
-  font-size: 10px;
-  color: #969bb3;
-}
-.management-avatar {
-  height: 35px;
-  width: 35px;
-  border-radius: 9px;
-  border: 1px solid #303140;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  background: #272833;
-  color: #d4d8e9;
-  font-size: 10px;
-  font-weight: 600;
-  flex-shrink: 0;
-}
-.management-role-badge {
-  display: inline-flex;
-  font-size: 10px;
-  line-height: 23px;
-  font-weight: 550;
-  padding: 0 9px;
-  border-radius: 5px;
-  border: 1px solid #303140;
-  background: #272833;
-  color: #d4d8e9;
-  white-space: nowrap;
-}
-.management-role-badge.role-operator {
-  color: #b1b6ce;
-  background: #272833;
-  border-color: #404356;
-}
-.management-role-badge.role-viewer {
-  color: #b7b5ce;
-  background: #292935;
-  border-color: #3d3c4a;
-}
-.management-record-status,
-.management-engine-label {
-  display: flex;
-  gap: 7px;
-  align-items: center;
-  color: #b1b6ce;
-  font-size: 11px;
-  white-space: nowrap;
-}
-.management-record-status > span,
-.management-engine-label > span {
-  width: 5px;
-  height: 5px;
-  background: #969bb3;
-  border-radius: 50%;
-}
-.management-actions {
-  text-align: right !important;
-  width: 70px;
-  white-space: nowrap;
-}
-.management-actions > div {
-  display: flex;
-  gap: 5px;
-  justify-content: flex-end;
-}
-.management-delete {
-  color: #969bb3 !important;
-}
-.management-delete:hover {
-  background: #38231f !important;
-  border-color: #62362c !important;
-  color: #ec9b84 !important;
-}
 .management-panel-footer {
   min-height: 49px;
   display: flex;
@@ -283,67 +147,6 @@
 }
 .management-panel-footer > svg {
   flex-shrink: 0;
-}
-.management-loading {
-  min-height: 260px;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  gap: 12px;
-  font-size: 12px;
-  color: #969bb3;
-}
-.management-error {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  gap: 12px;
-  min-height: 180px;
-  padding: 24px;
-  color: #e8a48e;
-  font-size: 12px;
-  flex-wrap: wrap;
-}
-.management-error > .btn {
-  margin-left: 8px;
-}
-.management-empty {
-  padding: 52px 24px !important;
-  min-height: 290px;
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  justify-content: center;
-  text-align: center;
-}
-.management-empty-icon {
-  width: 62px;
-  height: 62px;
-  background: #272833;
-  border: 1px solid #303140;
-  border-radius: 17px;
-  color: #969bb3;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  margin-bottom: 20px;
-  box-shadow: 0 0 0 7px #20212b44;
-}
-.management-empty h3 {
-  color: #eef0f8;
-  font-size: 16px;
-  font-weight: 550;
-  margin: 0 0 10px;
-}
-.management-empty p {
-  color: #969bb3;
-  font-size: 12px;
-  max-width: 360px;
-  line-height: 1.8;
-  margin: 0 0 21px;
-}
-.management-empty .btn {
-  font-size: 11px;
 }
 .management-dialog {
   position: fixed;
@@ -421,87 +224,6 @@
 .management-dialog .form-field input::placeholder {
   color: #71778f;
 }
-.management-role-options {
-  border: 0;
-  padding: 0;
-  margin: 0;
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-}
-.management-role-options legend {
-  font-size: 11px;
-  color: #d4d8e9;
-  margin-bottom: 10px;
-  padding: 0;
-  width: 100%;
-}
-.management-role-options legend span {
-  float: right;
-  color: #71778f;
-  font-size: 10px;
-}
-.management-role-option {
-  position: relative;
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  padding: 13px;
-  border: 1px solid #303140;
-  border-radius: 7px;
-  color: #969bb3;
-  cursor: pointer;
-}
-.management-role-option.selected {
-  border-color: #71778f;
-  background: #272833;
-  color: #ffd000;
-}
-.management-role-option:focus-within {
-  outline: 2px solid #ffd000;
-  outline-offset: 2px;
-}
-.management-role-option input {
-  position: absolute;
-  opacity: 0;
-  width: 1px;
-  height: 1px;
-}
-.management-role-option > svg {
-  flex-shrink: 0;
-}
-.management-role-option > div {
-  display: flex;
-  flex-direction: column;
-  gap: 5px;
-}
-.management-role-option strong {
-  font-size: 11px;
-  font-weight: 550;
-  color: #d4d8e9;
-}
-.management-role-option > div > span {
-  font-size: 10px;
-  color: #969bb3;
-  line-height: 1.5;
-}
-.management-radio-indicator {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  flex-shrink: 0;
-  margin-left: auto;
-  width: 17px;
-  height: 17px;
-  border: 1px solid #404356;
-  border-radius: 50%;
-  box-sizing: border-box;
-}
-.selected .management-radio-indicator {
-  background: #ffd000;
-  border-color: #ffd000;
-  color: #20212b;
-}
 .management-dialog-actions {
   display: flex;
   align-items: center;
@@ -519,16 +241,6 @@
   line-height: 1.6;
   color: #ecaa92;
   margin: 18px 0 0;
-}
-.management-arrow {
-  transform: rotate(-90deg);
-}
-.management-input-hint {
-  display: block;
-  font-size: 10px;
-  line-height: 1.7;
-  color: #969bb3;
-  margin-top: 8px;
 }
 .management-audit-overview {
   display: flex;
@@ -753,14 +465,6 @@
   line-height: 1.8;
   margin: -9px 0 0;
 }
-.management-sr-only {
-  position: absolute;
-  width: 1px;
-  height: 1px;
-  overflow: hidden;
-  clip: rect(0, 0, 0, 0);
-  white-space: nowrap;
-}
 
 @media (max-width: 1100px) {
   .management-table td,
@@ -774,13 +478,6 @@
   }
   .management-audit-overview {
     gap: 15px;
-  }
-  .role-overview-item {
-    padding: 16px 13px;
-    gap: 10px;
-  }
-  .role-overview-item > div > span {
-    font-size: 10px;
   }
 }
 @media (max-width: 800px) {
@@ -803,12 +500,6 @@
   }
   .management-controls .management-search {
     flex: 1;
-  }
-  .role-overview {
-    grid-template-columns: 1fr;
-  }
-  .role-overview-item {
-    padding: 15px 18px;
   }
   .management-audit-overview {
     flex-wrap: wrap;
@@ -867,13 +558,6 @@
   }
   .management-dialog-actions .btn {
     font-size: 11px;
-  }
-  .management-role-option {
-    padding: 11px;
-    gap: 9px;
-  }
-  .management-role-option > div > span {
-    font-size: 9px;
   }
 }
 

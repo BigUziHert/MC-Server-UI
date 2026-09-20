@@ -349,6 +349,29 @@ test("offline and unreadable ban states retain history but disable unsafe player
   ).toBeVisible();
 });
 
+test("Add operator accepts a new username without changing known-player identity confirmation", async ({
+  page,
+  server,
+}) => {
+  let sent: unknown;
+  await page.route("**/api/players/op", (route) => {
+    sent = route.request().postDataJSON();
+    return route.fulfill({ json: { message: "Requested op New_Player" } });
+  });
+  await open(page, server.id);
+  await page.getByRole("button", { name: "Add operator", exact: true }).click();
+  const dialog = page.getByRole("dialog", {
+    name: "Grant operator permissions",
+    exact: true,
+  });
+  const input = dialog.getByLabel("Minecraft username", { exact: true });
+  await expect(input).toBeEditable();
+  await input.fill("New_Player");
+  await dialog.getByRole("button", { name: "Grant OP", exact: true }).click();
+  await expect(dialog).not.toBeVisible();
+  expect(sent).toEqual({ name: "New_Player" });
+});
+
 test("Grant OP belongs to a known-player row and guards the selected identity and existing operator", async ({
   page,
   request,

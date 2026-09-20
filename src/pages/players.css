@@ -236,11 +236,6 @@
     flex-basis: calc(100% - 52px);
   }
 }
-.players-overview {
-  display: grid;
-  grid-template-columns: minmax(260px, 0.9fr) minmax(0, 1.5fr);
-  gap: 18px;
-}
 .players-summary,
 .players-about {
   display: flex;
@@ -325,19 +320,6 @@
   font-size: 11px;
   line-height: 1.5;
 }
-.players-op-badge {
-  display: inline-flex;
-  align-items: center;
-  gap: 5px;
-  padding: 5px 8px;
-  border: 1px solid #404356;
-  border-radius: 5px;
-  background: #272833;
-  color: #b1b6ce;
-  font-size: 10px;
-  font-weight: 600;
-  margin-right: 24px;
-}
 .players-remove {
   flex-shrink: 0;
 }
@@ -412,19 +394,12 @@
   line-height: 1.75;
 }
 @media (max-width: 1000px) {
-  .players-overview {
-    grid-template-columns: 1fr;
-    gap: 14px;
-  }
   .players-summary,
   .players-about {
     padding: 20px;
   }
   .players-summary small {
     max-width: none;
-  }
-  .players-op-badge {
-    margin-right: 0;
   }
 }
 @media (max-width: 500px) {
@@ -438,9 +413,6 @@
   }
   .players-remove {
     margin-left: 53px;
-  }
-  .players-op-badge {
-    margin-left: auto;
   }
   .players-result {
     padding: 15px;

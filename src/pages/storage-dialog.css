@@ -1,0 +1,13 @@
+dialog.storage-native-dialog {
+  color: var(--text);
+  margin: auto;
+  width: calc(100vw - 32px);
+  max-width: 480px;
+}
+dialog.storage-native-dialog.editor-modal {
+  max-width: 850px;
+}
+dialog.storage-native-dialog::backdrop {
+  background: #101016c9;
+  backdrop-filter: blur(5px);
+}

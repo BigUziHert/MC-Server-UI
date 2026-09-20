@@ -31,6 +31,7 @@ import RefreshButton from "../RefreshButton";
 import StatePanel from "../StatePanel";
 import SharedPagination from "../Pagination";
 import Switch from "../Switch";
+import { readPreference, writePreference } from "../preferences";
 import "./management.css";
 import "./players.css";
 
@@ -74,7 +75,7 @@ function usePlayerPagination<T>(id: string, players: T[], filter = "") {
   const storageKey = `mc-panel.players.rows.${id}`;
   const [pageSize, setPageSize] = useState(() => {
     try {
-      const saved = Number(localStorage.getItem(storageKey));
+      const saved = Number(readPreference(storageKey));
       return pageSizes.includes(saved) ? saved : 5;
     } catch {
       return 5;
@@ -98,7 +99,7 @@ function usePlayerPagination<T>(id: string, players: T[], filter = "") {
     setPageSize(value);
     setPosition({ resetKey, page: 0 });
     try {
-      localStorage.setItem(storageKey, String(value));
+      writePreference(storageKey, String(value));
     } catch {
       // Pagination still works when browser storage is unavailable.
     }
@@ -221,6 +222,7 @@ export default function Players({
   const [moderating, setModerating] = useState<Moderation | null>(null);
   const [reason, setReason] = useState("");
   const [granting, setGranting] = useState(false);
+  const [manualGrant, setManualGrant] = useState(false);
   const [removing, setRemoving] = useState<Operator | null>(null);
   const [name, setName] = useState("");
   const [grantUuid, setGrantUuid] = useState<string | undefined>();
@@ -405,6 +407,7 @@ export default function Players({
 
   function openGrant(player: KnownPlayer) {
     if (!canManage) return;
+    setManualGrant(false);
     setName(player.name);
     setGrantUuid(player.uuid);
     setFormError("");
@@ -723,6 +726,19 @@ export default function Players({
               onValueChange={setSearch}
             />
           )}
+          <button
+            className="btn"
+            disabled={!canManage || busy}
+            onClick={() => {
+              setName("");
+              setGrantUuid(undefined);
+              setManualGrant(true);
+              setFormError("");
+              setGranting(true);
+            }}
+          >
+            <ShieldPlus size={14} /> Add operator
+          </button>
         </Roster>
         <Roster
           id="whitelist"
@@ -1020,7 +1036,13 @@ export default function Players({
               </>
             ) : (
               <>
-                Grant OP to <strong>{name}</strong> on this server?
+                {manualGrant ? (
+                  "Enter the Minecraft username to make an operator on this server."
+                ) : (
+                  <>
+                    Grant OP to <strong>{name}</strong> on this server?
+                  </>
+                )}
               </>
             )}
           </p>
@@ -1041,7 +1063,10 @@ export default function Players({
                 spellCheck={false}
                 placeholder="Player_username"
                 value={name}
-                readOnly
+                readOnly={!manualGrant}
+                onChange={(event) => {
+                  if (manualGrant) setName(event.target.value);
+                }}
                 disabled={busy}
                 aria-describedby="operator-username-hint"
               />

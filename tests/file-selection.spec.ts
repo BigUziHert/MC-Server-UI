@@ -83,6 +83,64 @@ async function fileNames(request: APIRequestContext, fixture: FileFixture) {
   return result.entries.map((entry: { name: string }) => entry.name).sort();
 }
 
+test("file dialogs keep native modal focus and restore search when the deleted trigger disappears", async ({
+  page,
+  files,
+}) => {
+  await openFiles(page, files);
+  const create = page.getByRole("button", { name: "New file", exact: true });
+  await create.click();
+  let dialog = page.getByRole("dialog", { name: "New file", exact: true });
+  await expect
+    .poll(() => dialog.evaluate((element) => element.matches("dialog:modal")))
+    .toBe(true);
+  await expect(
+    dialog.getByRole("textbox", { name: "File name", exact: true }),
+  ).toBeFocused();
+  await dialog.getByRole("button", { name: "Cancel", exact: true }).click();
+  await expect(dialog).not.toBeVisible();
+  await expect(create).toBeFocused();
+
+  let release: (() => void) | undefined;
+  const pending = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  await page.route("**/api/files?**", async (route) => {
+    if (route.request().method() !== "DELETE") return route.continue();
+    await pending;
+    await route.fulfill({ response: await route.fetch() });
+  });
+  await page
+    .getByRole("button", { name: "Delete beta.txt", exact: true })
+    .click();
+  dialog = page.getByRole("dialog", {
+    name: "Move this item to Recycle Bin?",
+    exact: true,
+  });
+  await expect
+    .poll(() => dialog.evaluate((element) => element.matches("dialog:modal")))
+    .toBe(true);
+  await dialog
+    .getByRole("button", { name: "Move to Recycle Bin", exact: true })
+    .click();
+  await expect(
+    dialog.getByRole("button", { name: "Cancel", exact: true }),
+  ).toBeDisabled();
+  await page.keyboard.press("Escape");
+  await expect(dialog).toBeVisible();
+  release!();
+  await expect(dialog).not.toBeVisible();
+  await expect(
+    page.getByRole("button", { name: "Delete beta.txt", exact: true }),
+  ).toHaveCount(0);
+  await expect(
+    page.getByRole("textbox", {
+      name: "Search files and folders",
+      exact: true,
+    }),
+  ).toBeFocused();
+});
+
 test("selected file and folder deletion confirms exact targets and preserves unselected items", async ({
   page,
   request,
@@ -235,7 +293,8 @@ test("select visible all respects filters and selection clears on directory and 
   await expect(search).toHaveCSS("border-color", unfocusedInputBorder);
   await expect(searchField).toHaveCSS("border-color", unfocusedBorder);
   await expect(searchField).toHaveCSS("box-shadow", "none");
-  await expect(searchField).toHaveCSS("outline-style", "none");
+  await expect(searchField).toHaveCSS("outline-style", "solid");
+  await expect(searchField).toHaveCSS("outline-width", "2px");
   await expect(all).toHaveAttribute("aria-checked", "mixed");
   await expect(
     page.getByRole("checkbox", { name: "Select beta.txt", exact: true }),
