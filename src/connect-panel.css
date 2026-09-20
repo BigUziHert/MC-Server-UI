@@ -1,0 +1,154 @@
+.connect-panel {
+  position: fixed;
+  inset: 0;
+  margin: auto;
+  width: min(520px, calc(100vw - 32px));
+  max-height: calc(100dvh - 32px);
+  padding: 30px;
+  overflow: auto;
+  border: 1px solid #393b4b;
+  border-radius: 16px;
+  background: #1b1c25;
+  color: var(--text);
+  box-shadow: 0 28px 100px #0008;
+}
+.connect-panel::backdrop {
+  background: #08090db8;
+  backdrop-filter: blur(4px);
+}
+.connect-panel-close {
+  position: absolute;
+  right: 16px;
+  top: 16px;
+}
+.connect-panel-icon {
+  display: grid;
+  place-items: center;
+  width: 52px;
+  height: 52px;
+  border-radius: 13px;
+  color: var(--accent);
+  background: #ffd00012;
+  border: 1px solid #ffd00026;
+  margin-bottom: 22px;
+}
+.connect-panel-eyebrow {
+  font-size: 10px;
+  font-weight: 650;
+  letter-spacing: 1.6px;
+  color: var(--accent);
+  margin-bottom: 9px;
+}
+.connect-panel h2 {
+  font-size: 26px;
+  letter-spacing: -0.8px;
+  margin-bottom: 12px;
+}
+.connect-panel > p:not(.connect-panel-eyebrow) {
+  font-size: 13px;
+}
+.connect-panel-modes {
+  display: flex;
+  padding: 4px;
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  background: #101016;
+  gap: 4px;
+  margin: 24px 0;
+}
+.connect-panel-modes button {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  min-height: 38px;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--muted);
+  font-size: 12px;
+}
+.connect-panel-modes button[aria-pressed="true"] {
+  background: #2a2b37;
+  color: #eef0f8;
+}
+.connect-panel form > label {
+  display: block;
+  font-size: 12px;
+  font-weight: 600;
+  margin-bottom: 9px;
+}
+.connect-panel form > input {
+  width: 100%;
+  min-height: 46px;
+  font-size: 14px;
+}
+.connect-panel .connect-panel-hint {
+  font-size: 11px;
+  margin: 9px 0 0;
+}
+.connect-panel-error {
+  padding: 10px 12px;
+  background: #3b252d;
+  border: 1px solid #743344;
+  border-radius: 7px;
+  color: #f2b9c6;
+  font-size: 12px;
+  margin: 14px 0 0;
+  overflow-wrap: anywhere;
+}
+.connect-panel-destination {
+  display: flex;
+  align-items: flex-start;
+  gap: 7px;
+  font-size: 12px;
+  margin: 17px 0 0;
+  overflow-wrap: anywhere;
+}
+.connect-panel-destination > svg {
+  margin-top: 2px;
+  color: #8dcea6;
+}
+.connect-panel-destination strong {
+  color: #eef0f8;
+  font-weight: 500;
+}
+.connect-panel-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+  margin-top: 27px;
+}
+.connect-panel-actions .btn {
+  min-height: 42px;
+}
+.connect-panel > .connect-panel-note {
+  font-size: 11px !important;
+  margin: 20px 0 0;
+  padding-top: 17px;
+  border-top: 1px solid var(--border);
+}
+.welcome-remote-account {
+  width: 270px;
+  max-width: 100%;
+  margin: 25px auto 0;
+  text-align: left;
+}
+@media (max-width: 500px) {
+  .connect-panel {
+    padding: 25px 20px;
+  }
+  .connect-panel h2 {
+    font-size: 24px;
+  }
+  .connect-panel form > input {
+    font-size: 16px;
+  }
+  .connect-panel-actions {
+    flex-wrap: wrap;
+  }
+  .connect-panel-actions .primary {
+    flex: 1;
+    justify-content: center;
+  }
+}

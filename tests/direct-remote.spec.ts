@@ -151,7 +151,10 @@ test("a copied invitation works over direct HTTPS through password setup, sign-i
     await expect(
       phone.getByRole("heading", { name: serverName, exact: true }),
     ).toBeVisible();
-    await phone.getByRole("button", { name: "Sign out" }).click();
+    await phone
+      .getByRole("button", { name: "Account menu for sister@example.test" })
+      .click();
+    await phone.getByRole("menuitem", { name: "Sign out" }).click();
     await expect(phone.getByLabel("Email address")).toBeVisible();
     expect(
       (await context.cookies(publicUrl)).some(

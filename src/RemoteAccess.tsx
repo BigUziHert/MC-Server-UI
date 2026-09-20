@@ -7,8 +7,13 @@ import {
 } from "react";
 import {
   ArrowRight,
+  Box,
   ChevronRight,
+  Cloud,
+  FileText,
+  FolderOpen,
   Gamepad2,
+  Globe2,
   LoaderCircle,
   LogOut,
   LockKeyhole,
@@ -19,6 +24,7 @@ import {
   Terminal,
 } from "lucide-react";
 import App from "./App";
+import AccountMenu from "./AccountMenu";
 import { api, post, ServerScope, useServerApi, formatBytes } from "./api";
 import FileManager from "./pages/FileManager";
 import Backups from "./pages/Backups";
@@ -214,6 +220,9 @@ function SignIn({
     <main className="remote-access remote-auth">
       <section className="remote-auth-card">
         <Brand />
+        <p className="remote-signin-address">
+          <Globe2 size={14} /> {window.location.host}
+        </p>
         <div className="remote-auth-icon">
           {token ? <ShieldCheck size={30} /> : <LockKeyhole size={30} />}
         </div>
@@ -341,7 +350,9 @@ function SharedPanel({
   const [selected, setSelected] = useState(session.serverId);
   const [error, setError] = useState("");
   const [loggingOut, setLoggingOut] = useState(false);
+  const [logoutError, setLogoutError] = useState("");
   const [attempt, setAttempt] = useState(0);
+  const [tab, setTab] = useState("overview");
   useEffect(() => {
     const controller = new AbortController();
     let timer: ReturnType<typeof setTimeout>;
@@ -377,11 +388,13 @@ function SharedPanel({
   async function logout() {
     if (loggingOut) return;
     setLoggingOut(true);
+    setLogoutError("");
     try {
       await post("/access/logout");
       onSignedOut();
     } catch (cause) {
-      setError(messageOf(cause));
+      if (unauthorized(cause)) onSignedOut();
+      else setLogoutError(messageOf(cause));
     } finally {
       setLoggingOut(false);
     }
@@ -390,79 +403,144 @@ function SharedPanel({
   const permissions =
     server?.accessPermissions ??
     (server?.id === session.serverId ? session.permissions : []);
+  const pages = [
+    { id: "overview", label: "Overview", icon: Terminal },
+    ...(permissions.includes("file.read")
+      ? [{ id: "files", label: "Files", icon: FolderOpen }]
+      : []),
+    ...(permissions.includes("backup.read")
+      ? [{ id: "backups", label: "Backups", icon: Cloud }]
+      : []),
+    ...(permissions.includes("audit.read")
+      ? [{ id: "audit", label: "Activity", icon: FileText }]
+      : []),
+  ];
+  const currentTab = pages.some((page) => page.id === tab) ? tab : "overview";
   return (
     <div className="remote-access remote-shell">
-      <header className="remote-header">
-        <Brand />
-        <button
-          className="btn remote-signout"
-          onClick={logout}
-          disabled={loggingOut}
-        >
-          <LogOut size={17} /> Sign out
-        </button>
-      </header>
-      <main className="remote-main">
-        <div className="remote-account">
-          <span>
-            Signed in as <strong>{session.email}</strong>
+      <aside className="remote-sidebar">
+        <div className="brand remote-sidebar-brand" aria-label="MC Panel">
+          <span className="brand-icon">
+            <Box size={24} />
           </span>
           <span>
-            <ShieldCheck size={14} /> Subuser
+            MC<span className="brand-light">PANEL</span>
+            <small>YOUR WORLD. YOUR RULES.</small>
           </span>
         </div>
-        {error && (
-          <div className="remote-notice is-error" role="alert">
-            {error}
+        <div className="remote-sidebar-info">
+          <span>
+            <Globe2 size={14} /> Connected panel
+          </span>
+          <strong title={window.location.host}>{window.location.host}</strong>
+        </div>
+        <nav className="remote-side-nav" aria-label="Server pages">
+          {pages.map((item) => (
             <button
-              className="btn"
-              onClick={() => setAttempt((value) => value + 1)}
+              key={item.id}
+              className={`nav-item ${currentTab === item.id ? "active" : ""}`}
+              onClick={() => setTab(item.id)}
+              aria-current={currentTab === item.id ? "page" : undefined}
             >
-              Retry
+              <item.icon size={18} /> <span>{item.label}</span>
             </button>
+          ))}
+        </nav>
+        <div className="remote-profile">
+          <AccountMenu
+            identity={{ name: session.email, detail: window.location.host }}
+            status={{ label: "Signed in · Shared access", tone: "active" }}
+            actions={[
+              {
+                id: "signout",
+                label: "Sign out",
+                icon: <LogOut size={16} />,
+                busy: loggingOut,
+                onSelect: () => void logout(),
+              },
+            ]}
+          />
+        </div>
+      </aside>
+      <div className="remote-content">
+        <main className="remote-main">
+          <div className="remote-account">
+            <span>
+              Signed in as <strong>{session.email}</strong>
+            </span>
+            <span>
+              <ShieldCheck size={14} /> Subuser
+            </span>
           </div>
-        )}
-        {servers && servers.length > 1 && (
-          <label className="remote-server-select">
-            Your servers
-            <select
-              aria-label="Select shared server"
-              value={selected}
-              onChange={(event) => setSelected(event.target.value)}
-            >
-              {servers.map((record) => (
-                <option key={record.id} value={record.id}>
-                  {record.name}
-                </option>
-              ))}
-            </select>
-          </label>
-        )}
-        {!servers && !error && (
-          <p className="remote-loading" role="status">
-            <LoaderCircle size={20} className="spin" /> Loading your servers…
-          </p>
-        )}
-        {servers?.length === 0 && (
-          <section className="remote-card">
-            <h1>No shared servers</h1>
-            <p>
-              Your access may have been removed. Ask the server owner for a new
-              invitation.
+          {logoutError && (
+            <div className="remote-notice is-error" role="alert">
+              {logoutError}
+              <button
+                className="btn"
+                onClick={() => void logout()}
+                disabled={loggingOut}
+              >
+                Retry sign out
+              </button>
+            </div>
+          )}
+          {error && (
+            <div className="remote-notice is-error" role="alert">
+              {error}
+              <button
+                className="btn"
+                onClick={() => setAttempt((value) => value + 1)}
+              >
+                Retry
+              </button>
+            </div>
+          )}
+          {servers && servers.length > 1 && (
+            <label className="remote-server-select">
+              Your servers
+              <select
+                aria-label="Select shared server"
+                value={selected}
+                onChange={(event) => {
+                  setSelected(event.target.value);
+                  setTab("overview");
+                }}
+              >
+                {servers.map((record) => (
+                  <option key={record.id} value={record.id}>
+                    {record.name}
+                  </option>
+                ))}
+              </select>
+            </label>
+          )}
+          {!servers && !error && (
+            <p className="remote-loading" role="status">
+              <LoaderCircle size={20} className="spin" /> Loading your servers…
             </p>
-          </section>
-        )}
-        {server && (
-          <ServerScope.Provider value={server.id}>
-            <SharedWorkspace
-              key={`${server.id}:${permissions.join(",")}`}
-              record={server}
-              permissions={permissions}
-              onSignedOut={onSignedOut}
-            />
-          </ServerScope.Provider>
-        )}
-      </main>
+          )}
+          {servers?.length === 0 && (
+            <section className="remote-card">
+              <h1>No shared servers</h1>
+              <p>
+                Your access may have been removed. Ask the server owner for a
+                new invitation.
+              </p>
+            </section>
+          )}
+          {server && (
+            <ServerScope.Provider value={server.id}>
+              <SharedWorkspace
+                key={`${server.id}:${permissions.join(",")}`}
+                record={server}
+                permissions={permissions}
+                tab={currentTab}
+                onSignedOut={onSignedOut}
+              />
+            </ServerScope.Provider>
+          )}
+        </main>
+      </div>
     </div>
   );
 }
@@ -470,10 +548,12 @@ function SharedPanel({
 function SharedWorkspace({
   record,
   permissions,
+  tab,
   onSignedOut,
 }: {
   record: SharedServer;
   permissions: string[];
+  tab: string;
   onSignedOut: () => void;
 }) {
   const { api: serverApi, post: serverPost } = useServerApi();
@@ -486,7 +566,6 @@ function SharedWorkspace({
     message: string;
     error?: boolean;
   } | null>(null);
-  const [tab, setTab] = useState("overview");
   const [path, setPath] = useState("");
   const [showingBin, setShowingBin] = useState(false);
   const [command, setCommand] = useState("");
@@ -595,12 +674,6 @@ function SharedWorkspace({
     }
   }
   const status = server?.status || record.status;
-  const tabs = [
-    { id: "overview", label: "Overview" },
-    ...(can("file.read") ? [{ id: "files", label: "Files" }] : []),
-    ...(can("backup.read") ? [{ id: "backups", label: "Backups" }] : []),
-    ...(can("audit.read") ? [{ id: "audit", label: "Activity" }] : []),
-  ];
   return (
     <>
       <section className="remote-server-heading">
@@ -632,20 +705,6 @@ function SharedWorkspace({
             Dismiss
           </button>
         </div>
-      )}
-      {tabs.length > 1 && (
-        <nav className="remote-tabs" aria-label="Server pages">
-          {tabs.map((item) => (
-            <button
-              key={item.id}
-              className={item.id === tab ? "active" : ""}
-              onClick={() => setTab(item.id)}
-              aria-current={item.id === tab ? "page" : undefined}
-            >
-              {item.label}
-            </button>
-          ))}
-        </nav>
       )}
       {tab === "overview" && (
         <>

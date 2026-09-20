@@ -18,6 +18,8 @@ import {
   FolderOpen,
   HardDrive,
   Layers3,
+  KeyRound,
+  LogIn,
   ListFilter,
   Menu,
   MessageSquare,
@@ -57,6 +59,8 @@ import SearchField, { useDebouncedValue } from "./SearchField";
 import Switch from "./Switch";
 import DesktopUpdates from "./DesktopUpdates";
 import ServerIcon from "./ServerIcon";
+import AccountMenu from "./AccountMenu";
+import ConnectPanel, { type ConnectionMode } from "./ConnectPanel";
 import { version as appVersion } from "../package.json";
 import ServerManager, {
   ServerSwitcher,
@@ -249,6 +253,7 @@ function Sparkline({
 }
 
 export default function App() {
+  const [connection, setConnection] = useState<ConnectionMode | null>(null);
   const [servers, setServers] = useState<ServerRecord[]>([]);
   const [activeId, setActiveId] = useState(() => {
     try {
@@ -416,6 +421,7 @@ export default function App() {
             servers={servers}
             selected={active}
             onSelect={setActiveId}
+            onConnect={setConnection}
             onAdd={() => setManager({ editing: null, initialStep: "choice" })}
             onSettings={(status) =>
               setManager({
@@ -445,9 +451,21 @@ export default function App() {
         </div>
       ) : (
         <EmptyFleet
+          onConnect={setConnection}
           onAdd={(initialStep) =>
             setManager({ editing: null, initialStep, firstServer: true })
           }
+        />
+      )}
+      {connection && (
+        <ConnectPanel
+          desktop={desktopSelection.current === true}
+          initialMode={connection}
+          onClose={() => setConnection(null)}
+          onOpened={() => {
+            setConnection(null);
+            setNotice("The remote panel opened in its own window.");
+          }}
         />
       )}
       {manager && (
@@ -479,7 +497,44 @@ export default function App() {
   );
 }
 
-function EmptyFleet({ onAdd }: { onAdd: (step: "create" | "import") => void }) {
+function LocalAccount({
+  onConnect,
+}: {
+  onConnect: (mode: ConnectionMode) => void;
+}) {
+  return (
+    <AccountMenu
+      identity={{
+        name: "Local administrator",
+        detail: "This computer",
+        initial: "L",
+      }}
+      status={{ label: "Local access", tone: "neutral" }}
+      actions={[
+        {
+          id: "signin",
+          label: "Sign in to another panel",
+          icon: <LogIn size={16} />,
+          onSelect: () => onConnect("signin"),
+        },
+        {
+          id: "invitation",
+          label: "Accept an invitation",
+          icon: <KeyRound size={16} />,
+          onSelect: () => onConnect("invitation"),
+        },
+      ]}
+    />
+  );
+}
+
+function EmptyFleet({
+  onAdd,
+  onConnect,
+}: {
+  onAdd: (step: "create" | "import") => void;
+  onConnect: (mode: ConnectionMode) => void;
+}) {
   return (
     <div className="fleet-welcome-shell fleet-welcome-simple">
       <header className="fleet-welcome-header">
@@ -548,6 +603,9 @@ function EmptyFleet({ onAdd }: { onAdd: (step: "create" | "import") => void }) {
                 <ArrowRight size={19} />
               </button>
             </div>
+            <div className="welcome-remote-account">
+              <LocalAccount onConnect={onConnect} />
+            </div>
           </div>
         </section>
       </main>
@@ -566,12 +624,14 @@ function ServerWorkspace({
   onSelect,
   onAdd,
   onSettings,
+  onConnect,
 }: {
   servers: ServerRecord[];
   selected: ServerRecord;
   onSelect: (id: string) => void;
   onAdd: () => void;
   onSettings: (status?: ServerRecord["status"]) => void;
+  onConnect: (mode: ConnectionMode) => void;
 }) {
   const { api } = useServerApi();
   const [page, setPage] = useState<Page>(getPage);
@@ -766,14 +826,7 @@ function ServerWorkspace({
           })}
         </nav>
         <div className="sidebar-bottom">
-          <div className="profile">
-            <div className="avatar">C</div>
-            <div>
-              <strong>Local administrator</strong>
-              <small>Development workspace</small>
-            </div>
-            <span className="profile-dot" />
-          </div>
+          <LocalAccount onConnect={onConnect} />
         </div>
       </aside>
       <div className="main-shell">

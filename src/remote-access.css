@@ -4,6 +4,133 @@
 .remote-access .btn {
   min-height: 44px;
 }
+.remote-signin-address {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  overflow-wrap: anywhere;
+  margin: -22px 0 24px;
+  font-size: 12px !important;
+}
+.remote-sidebar {
+  position: fixed;
+  inset: 0 auto 0 0;
+  width: 232px;
+  display: flex;
+  flex-direction: column;
+  background: #101016;
+  border-right: 1px solid var(--border);
+  z-index: 30;
+}
+.remote-sidebar-info {
+  margin: 8px 17px 24px;
+  padding: 14px 13px;
+  border: 1px solid var(--border);
+  background: #1b1c25;
+  border-radius: 8px;
+  min-width: 0;
+}
+.remote-sidebar-info > span {
+  display: flex;
+  gap: 7px;
+  align-items: center;
+  color: var(--muted);
+  font-size: 10px;
+  margin-bottom: 7px;
+}
+.remote-sidebar-info > strong {
+  display: block;
+  color: #d4d8e9;
+  font-size: 12px;
+  font-weight: 500;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.remote-side-nav {
+  padding: 0 14px;
+  overflow-y: auto;
+}
+.remote-side-nav .nav-item {
+  width: 100%;
+  background: transparent;
+  text-align: left;
+  margin-bottom: 5px;
+}
+.remote-side-nav .nav-item.active {
+  background: #272833;
+}
+.remote-profile {
+  margin-top: auto;
+}
+.remote-content {
+  margin-left: 232px;
+  padding: 10px 32px 0;
+}
+@media (max-width: 760px) {
+  .remote-sidebar {
+    position: relative;
+    width: 100%;
+    border-right: 0;
+    border-bottom: 1px solid var(--border);
+  }
+  .remote-sidebar .remote-sidebar-brand {
+    height: 80px;
+    padding: 0 16px;
+    font-size: 17px;
+    gap: 9px;
+  }
+  .remote-sidebar .remote-sidebar-brand .brand-icon {
+    width: 32px;
+    height: 32px;
+  }
+  .remote-sidebar .remote-sidebar-brand small {
+    display: none;
+  }
+  .remote-sidebar-info {
+    display: none;
+  }
+  .remote-profile {
+    position: absolute;
+    top: 0;
+    right: 4px;
+    width: min(190px, 51%);
+  }
+  .remote-profile .account-menu-trigger {
+    padding: 12px 10px;
+    min-height: 80px;
+    border-top: 0;
+    gap: 7px;
+  }
+  .remote-profile .account-menu-avatar {
+    width: 27px;
+    height: 27px;
+  }
+  .remote-content {
+    margin-left: 0;
+    padding: 0;
+  }
+  .remote-side-nav {
+    display: flex;
+    gap: 5px;
+    padding: 0 12px 10px;
+    overflow-x: auto;
+  }
+  .remote-side-nav .nav-item {
+    flex: 1;
+    width: auto;
+    min-height: 40px;
+    justify-content: center;
+    padding: 9px 8px;
+    margin: 0;
+    font-size: 11px;
+    gap: 6px;
+  }
+  .remote-side-nav .nav-item svg {
+    width: 15px;
+    height: 15px;
+  }
+}
 .remote-brand {
   display: flex;
   align-items: center;

@@ -40,11 +40,13 @@ files:
   - server/launchpad-providers.mjs
   - server/launchpad-extra.mjs
   - shared/subuser-permissions.json
+  - shared/panel-connection.mjs
   - desktop/main.mjs
   - desktop/runtime.mjs
   - desktop/updates.mjs
   - desktop/selection.mjs
   - desktop/external-links.mjs
+  - desktop/remote-panels.mjs
   - desktop/assets/**/*
   - package.json
 asar: true

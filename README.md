@@ -4,7 +4,7 @@ A local Minecraft server panel inspired by the navigation and console layout of 
 
 ## Windows desktop app
 
-**MC Panel runs in its own Windows window and includes its Node.js runtime.** End users do not need to install Node.js, use a terminal, or start a separate web server. Running a real Minecraft server still requires the Java version expected by its server software. Configure the Java executable and startup settings, and accept the Minecraft EULA yourself. Install the desktop app on the computer that will run Minecraft; it cannot attach to a Java process on another PC.
+**MC Panel runs in its own Windows window and includes its Node.js runtime.** End users do not need to install Node.js, use a terminal, or start a separate web server. Running a real Minecraft server still requires the Java version expected by its server software. Configure the Java executable and startup settings, and accept the Minecraft EULA yourself. Install MC Panel on the computer hosting Minecraft. You can also connect from another desktop app to that host's remote panel; the host still runs Minecraft and manages its Java process.
 
 A fresh desktop workspace starts with **Welcome to MC Panel** and two choices: **Create a new server** or **Import an existing server**. No server is registered until you confirm its setup.
 
@@ -18,6 +18,16 @@ The Windows x64 build produces two executables in `release/`:
 The version in each filename follows `package.json`. These development builds are unsigned, so Windows may report an unknown publisher or show a SmartScreen notice. A code-signing certificate is not configured.
 
 Closing the window keeps MC Panel in the Windows notification area so running servers and backup schedules can continue. Reopen it from its tray icon. Choose **Quit MC Panel** in the desktop or tray menu to exit completely; when Java servers are running, the app asks before stopping them and shutting down. Quit waits for active backups and file changes to finish before stopping Java. Servers and schedules run only while the app is running. Saved Java servers stay stopped after you reopen the app until you choose **Start**. Press **Alt** to show the desktop menu. Its **Panel** menu also provides **Open server data folder**, **Open downloads folder**, and **Help and documentation**.
+
+### Connect to another panel
+
+Open the account menu at the bottom of the sidebar and choose **Sign in to another panel**. Enter the other panel's HTTPS address, then choose **Continue to sign in**. If you have an invitation, choose **Accept an invitation** and paste the complete link. The welcome screen also has this account menu, so you can connect without creating a local server or installing Java on the connecting computer.
+
+The desktop app opens the remote panel in a separate window. The browser edition opens it in the current tab. Sign in with the account that host invited; accepting an invitation creates access and lets you choose a password. Accounts belong to the hosting panel. There is no public registration or universal MC Panel account. The local administrator entry identifies access to this computer and is not a remote account.
+
+For a self-signed certificate, the desktop app displays the destination and certificate's SHA-256 fingerprint. Compare it with the fingerprint supplied by the owner through a trusted channel before choosing **Fingerprint matches — connect**. Cancel is the default. Trust is limited to the current window and that exact certificate; expired certificates and certificates for a different address are rejected. Browser connections use the browser's certificate handling.
+
+The remote account menu shows your email and panel address and provides **Sign out**. Desktop connections have separate temporary sessions; closing a remote window clears its local session, and opening another window requires signing in again. Signing out or closing the remote window leaves the host's Minecraft servers running. The host must keep MC Panel running with remote access enabled and reachable. Remote users retain their assigned server permissions; connecting from the desktop does not grant local owner access.
 
 ### Desktop data
 
@@ -85,6 +95,8 @@ pnpm desktop:dist
 `desktop:pack` creates an unpacked Windows app under `release/win-unpacked/`. Keep the entire directory together when running its executable. `desktop:dist` builds the installer and portable executable listed above. These commands prepare the Electron runtime automatically. Generated executables and packaging output stay in `release/` and are not committed to Git.
 
 After `desktop:pack` or `desktop:dist`, run `pnpm test:desktop` to smoke-test the packaged app. It uses an isolated temporary workspace so it does not change your normal desktop server data.
+
+Run `node desktop/remote-panels.smoke.mjs` to check remote connections with the installed Electron runtime. This uses hidden test windows, a temporary profile, and a loopback HTTPS fixture to verify certificate confirmation, session isolation, and that closing a remote window preserves the local panel.
 
 The [Windows desktop workflow](.github/workflows/windows-desktop.yml) runs on pushes to `dev` and can also be started manually. It builds both executables, runs backend and desktop unit tests, browser tests, and the packaged-app smoke test. A successful current `dev` build publishes a GitHub prerelease with a unique version, such as `0.1.3-dev.12.1`, the installer, portable copy, and updater metadata. Other branches produce workflow artifacts only. Incomplete builds remain unpublished, superseded commits are skipped, and older reruns cannot replace a newer dev update. Workflow artifacts expire after 14 days; published releases remain available.
 

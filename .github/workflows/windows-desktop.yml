@@ -66,6 +66,9 @@ jobs:
       - name: Run browser tests
         run: pnpm test:e2e
 
+      - name: Smoke-test remote panel connections
+        run: node desktop/remote-panels.smoke.mjs
+
       - name: Smoke-test the packaged desktop app
         run: pnpm test:desktop
 

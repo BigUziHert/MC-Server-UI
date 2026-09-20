@@ -218,7 +218,10 @@ test("email and password sign-in opens the shared panel and logout returns to si
   await page.route("**/api/access/logout", (route) =>
     route.fulfill({ json: { ok: true } }),
   );
-  await page.getByRole("button", { name: "Sign out" }).click();
+  await page
+    .getByRole("button", { name: "Account menu for sister@example.com" })
+    .click();
+  await page.getByRole("menuitem", { name: "Sign out" }).click();
   await expect(page.getByLabel("Email address")).toBeVisible();
   await expect(
     page.getByRole("heading", { name: "Family survival" }),
@@ -376,4 +379,53 @@ test("an unavailable session endpoint never opens owner controls", async ({
   await expect(
     page.getByRole("navigation", { name: "Main navigation" }),
   ).toHaveCount(0);
+});
+
+test("the mobile account menu stays onscreen and a failed sign-out can be retried", async ({
+  page,
+}, testInfo) => {
+  await page.setViewportSize({ width: 320, height: 720 });
+  await sharedEndpoints(page);
+  await page.route("**/api/access/session", (route) =>
+    route.fulfill({ json: sister }),
+  );
+  let attempts = 0;
+  await page.route("**/api/access/logout", (route) => {
+    attempts++;
+    return attempts === 1
+      ? route.fulfill({
+          status: 503,
+          json: { error: "Sign-out could not complete. Try again." },
+        })
+      : route.fulfill({ json: { ok: true } });
+  });
+  await page.goto("/");
+  const account = page.getByRole("button", {
+    name: `Account menu for ${sister.email}`,
+  });
+  await account.click();
+  const menu = page.getByRole("menu", { name: "Account", exact: true });
+  await expect(menu).toContainText(sister.email);
+  const anchor = await account.boundingBox();
+  const bounds = await menu.boundingBox();
+  expect(bounds).not.toBeNull();
+  expect(bounds!.y).toBeGreaterThanOrEqual(anchor!.y + anchor!.height);
+  expect(bounds!.x).toBeGreaterThanOrEqual(0);
+  expect(bounds!.x + bounds!.width).toBeLessThanOrEqual(320);
+  expect(bounds!.y + bounds!.height).toBeLessThanOrEqual(720);
+  await page.screenshot({
+    path: testInfo.outputPath("mobile-account-menu.png"),
+  });
+  await page.getByRole("menuitem", { name: "Sign out" }).click();
+  await expect(page.getByRole("alert")).toContainText(
+    "Sign-out could not complete. Try again.",
+  );
+  await expect(
+    page.getByRole("heading", { name: "Family survival" }),
+  ).toBeVisible();
+  await account.click();
+  await page.getByRole("menuitem", { name: "Sign out" }).click();
+  await expect(page.getByLabel("Email address")).toBeVisible();
+  await expect(account).toHaveCount(0);
+  expect(attempts).toBe(2);
 });

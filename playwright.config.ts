@@ -27,6 +27,7 @@ export default defineConfig({
     "file-selection.spec.ts",
     "subusers.spec.ts",
     "remote-access.spec.ts",
+    "panel-connections.spec.ts",
     "direct-remote.spec.ts",
     "server-customization.spec.ts",
     "console-controls.spec.ts",

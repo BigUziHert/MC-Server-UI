@@ -15,6 +15,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { startDesktopRuntime } from "./runtime.mjs";
 import { flushRendererSelection } from "./selection.mjs";
+import { createRemotePanelController } from "./remote-panels.mjs";
 import {
   installExternalLinkHandlers,
   openExternalWebsite,
@@ -49,6 +50,7 @@ let directoryDialog;
 let updates;
 let updateTimer;
 let initialUpdateTimer;
+let remotePanels;
 
 async function logError(cause) {
   const message =
@@ -137,6 +139,7 @@ async function requestQuit(installUpdate = false) {
     }
     tray?.setToolTip("MC Panel — shutting down servers");
     await runtime?.close({ gracefulOnly: installUpdate });
+    remotePanels?.close();
     clearTimeout(initialUpdateTimer);
     clearInterval(updateTimer);
     tray?.destroy();
@@ -284,6 +287,20 @@ async function launch() {
     dataDir: path.join(userData, "data"),
     selectServerDirectory,
     updates,
+    openRemotePanel: (url) => {
+      if (quitting)
+        throw Object.assign(new Error("MC Panel is shutting down."), {
+          status: 503,
+        });
+      return remotePanels.open(url);
+    },
+  });
+  remotePanels = createRemotePanelController({
+    BrowserWindow,
+    session,
+    dialog,
+    downloadsDirectory: app.getPath("downloads"),
+    icon: path.join(desktopDir, "assets", "icon.ico"),
   });
   const panelSession = session.fromPartition(`mc-panel-${randomUUID()}`);
   await panelSession.cookies.set({

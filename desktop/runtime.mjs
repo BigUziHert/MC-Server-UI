@@ -3,6 +3,7 @@ import { randomBytes, timingSafeEqual } from "node:crypto";
 import path from "node:path";
 import { createFleet } from "../server/index.mjs";
 import { createDesktopSelection, readSelectionBody } from "./selection.mjs";
+import { readPanelConnectionBody } from "./remote-panels.mjs";
 
 export const DESKTOP_COOKIE_NAME = "mc-panel-desktop";
 
@@ -33,6 +34,7 @@ export async function startDesktopRuntime({
   backupFlushTimeoutMs,
   selectServerDirectory,
   updates,
+  openRemotePanel,
 } = {}) {
   if (typeof dataDir !== "string" || !path.isAbsolute(dataDir))
     throw new Error(
@@ -78,6 +80,33 @@ export async function startDesktopRuntime({
     if (!authenticated(req.headers.cookie, expectedToken))
       return reject(401, "An authenticated desktop session is required.");
     const requestPath = new URL(req.url, url).pathname;
+    if (requestPath === "/api/desktop/connections/open") {
+      if (req.method !== "POST")
+        return reject(405, "Use POST to open a remote panel.");
+      void (async () => {
+        const target = await readPanelConnectionBody(req);
+        if (!openRemotePanel)
+          throw Object.assign(
+            new Error("Remote panel windows require the desktop app."),
+            { status: 409 },
+          );
+        if (closing)
+          throw Object.assign(new Error("The desktop panel is closing."), {
+            status: 503,
+          });
+        await openRemotePanel(target);
+        res.writeHead(200, {
+          "Content-Type": "application/json; charset=utf-8",
+        });
+        res.end(JSON.stringify({ opened: true, url: target }));
+      })().catch((cause) =>
+        reject(
+          cause.status ?? 502,
+          cause.status ? cause.message : "Could not open the remote panel.",
+        ),
+      );
+      return;
+    }
     if (requestPath === "/api/desktop/selection") {
       if (!["GET", "PUT"].includes(req.method))
         return reject(

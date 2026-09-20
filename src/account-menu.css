@@ -1,0 +1,159 @@
+.account-menu {
+  width: 100%;
+}
+
+.account-menu .account-menu-trigger {
+  width: 100%;
+  min-height: 75px;
+  padding: 18px 16px;
+  background: transparent;
+  text-align: left;
+  border-bottom: 0;
+  border-left: 0;
+  border-right: 0;
+  border-radius: 0;
+}
+
+.account-menu-trigger:hover,
+.account-menu-trigger[aria-expanded="true"] {
+  background: #20212b;
+}
+
+.account-menu-trigger:focus-visible {
+  outline-offset: -4px;
+}
+
+.account-menu-avatar {
+  flex-shrink: 0;
+}
+
+.account-menu-identity {
+  min-width: 0;
+  flex: 1;
+}
+
+.account-menu-identity strong,
+.account-menu-identity small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.account-menu-chevron {
+  color: var(--muted);
+  transition: transform 0.16s;
+}
+
+.account-menu-trigger[aria-expanded="true"] .account-menu-chevron {
+  color: var(--accent);
+  transform: rotate(180deg);
+}
+
+.account-menu-popover {
+  position: fixed;
+  z-index: 60;
+  width: 260px;
+  max-width: calc(100vw - 16px);
+  max-height: calc(100dvh - 96px);
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  background: #1b1c25;
+  border: 1px solid #3d3f50;
+  border-radius: 10px;
+  box-shadow: 0 12px 36px #0008;
+}
+
+.account-menu-heading {
+  padding: 17px 17px 15px;
+  border-bottom: 1px solid #303140;
+  overflow-wrap: anywhere;
+}
+
+.account-menu-eyebrow {
+  display: block;
+  margin-bottom: 9px;
+  color: var(--muted);
+  font-size: 9px;
+  font-weight: 650;
+  letter-spacing: 1.1px;
+  text-transform: uppercase;
+}
+
+.account-menu-heading > strong {
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.account-menu-heading p {
+  margin: 4px 0 0;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.account-menu-status {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 10px;
+  font-size: 10px;
+  color: #b1b6ce;
+}
+
+.account-menu-status-dot {
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: var(--muted);
+  flex-shrink: 0;
+}
+
+.account-menu-status-dot.active {
+  background: #59c887;
+}
+
+.account-menu-actions {
+  padding: 6px;
+}
+
+.account-menu-action {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  min-height: 41px;
+  padding: 10px 11px;
+  border-radius: 5px;
+  background: transparent;
+  text-align: left;
+  color: var(--text);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.account-menu-action-icon {
+  display: flex;
+  align-items: center;
+  color: var(--muted);
+}
+
+.account-menu-action-icon svg {
+  width: 16px;
+  height: 16px;
+}
+
+.account-menu-action:not(:disabled):hover,
+.account-menu-action:not(:disabled):focus-visible {
+  background: #2b2c38;
+  color: #fff;
+}
+
+.account-menu-action:focus-visible {
+  outline-offset: -2px;
+}
+
+@media (max-width: 760px) {
+  .account-menu .account-menu-trigger {
+    min-height: 70px;
+  }
+}
