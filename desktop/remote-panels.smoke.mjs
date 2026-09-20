@@ -60,6 +60,7 @@ async function fixture() {
         res.end(
           "<!doctype html><title>Fixture cannot replace native host title</title><h1>Remote fixture panel</h1><p>This page is served by the loopback HTTPS test fixture.</p>" +
             '<script>window.__localServerSelections=[];addEventListener("mc-panel-local-server-selected",event=>window.__localServerSelections.push(event.detail))</script>' +
+            '<script>window.__remoteServerSelections=[];addEventListener("mc-panel-remote-server-selected",event=>window.__remoteServerSelections.push(event.detail))</script>' +
             (req.url === "/" ? '<iframe src="/embedded"></iframe>' : ""),
         );
       },
@@ -150,6 +151,9 @@ async function fixture() {
   await ownerWindow.webContents.executeJavaScript(
     'window.__localServerSelections=[];addEventListener("mc-panel-local-server-selected",event=>window.__localServerSelections.push(event.detail))',
   );
+  await ownerWindow.webContents.executeJavaScript(
+    'window.__remoteServerSelections=[];addEventListener("mc-panel-remote-server-selected",event=>window.__remoteServerSelections.push(event.detail));window.__connectionChanges=0;addEventListener("mc-panel-connections-changed",()=>window.__connectionChanges++)',
+  );
   // Query Chromium's real permission path without reading or overwriting the
   // user's OS clipboard. The renderer copy/fallback flow is covered in e2e.
   const clipboardPermissions = (contents) =>
@@ -187,10 +191,13 @@ async function fixture() {
       });
       return { status: response.status, body: await response.json() };
     },
-    invoke(action, value, fromRemote = false) {
-      const contents = fromRemote
-        ? remoteContents.at(-1)
-        : ownerWindow.webContents;
+    invoke(action, value, fromRemote = false, other) {
+      const contents =
+        typeof fromRemote === "number"
+          ? remoteContents[fromRemote]
+          : fromRemote
+            ? remoteContents.at(-1)
+            : ownerWindow.webContents;
       assert.ok(
         [
           "list",
@@ -198,10 +205,12 @@ async function fixture() {
           "activate",
           "disconnect",
           "selectLocalServer",
+          "reportServers",
+          "selectRemoteServer",
         ].includes(action),
       );
       return contents.executeJavaScript(
-        `window.mcPanelConnections[${JSON.stringify(action)}](${JSON.stringify(value)})`,
+        `window.mcPanelConnections[${JSON.stringify(action)}](${JSON.stringify(value)},${JSON.stringify(other)})`,
       );
     },
     async inspect() {
@@ -213,6 +222,20 @@ async function fixture() {
         requests,
         nativeWindows: BrowserWindow.getAllWindows().length,
         context: controller.list(),
+        connectionChanges: await ownerWindow.webContents.executeJavaScript(
+          "window.__connectionChanges",
+        ),
+        ownerRemoteSelectionEvents:
+          await ownerWindow.webContents.executeJavaScript(
+            "window.__remoteServerSelections",
+          ),
+        remoteServerSelectionEvents: await Promise.all(
+          remoteContents.map(async (item) =>
+            item.isDestroyed()
+              ? []
+              : item.executeJavaScript("window.__remoteServerSelections"),
+          ),
+        ),
         localSelection: (
           await (await privateRequest("/api/desktop/selection")).json()
         ).activeServerId,
@@ -337,7 +360,15 @@ async function smoke() {
       heading: "Remote fixture panel",
       require: "undefined",
       process: "undefined",
-      bridge: ["list", "open", "activate", "disconnect", "selectLocalServer"],
+      bridge: [
+        "list",
+        "open",
+        "activate",
+        "disconnect",
+        "selectLocalServer",
+        "reportServers",
+        "selectRemoteServer",
+      ],
       frameBridge: "undefined",
     });
     assert.deepEqual(state.preferences, {
@@ -365,6 +396,20 @@ async function smoke() {
     );
     assert.match(state.title, /^127\.0\.0\.1:\d+ · MC Panel$/);
     const firstId = state.context.activeId;
+    const firstRoster = [
+      {
+        id: "remote-world",
+        name: "Remote survival",
+        status: "running",
+        software: "Paper",
+        minecraftVersion: "1.21.8",
+      },
+    ];
+    await application.evaluate(
+      (_electron, roster) =>
+        globalThis.__remotePanelSmoke.invoke("reportServers", roster, true),
+      firstRoster,
+    );
     const firstCookie = state.cookies.find(
       (item) => item.name === "remote-fixture",
     ).value;
@@ -377,6 +422,14 @@ async function smoke() {
       ),
     );
     const secondId = second.activeId;
+    const secondRoster = [
+      { id: "remote-world", name: "Remote creative", status: "offline" },
+    ];
+    await application.evaluate(
+      (_electron, roster) =>
+        globalThis.__remotePanelSmoke.invoke("reportServers", roster, true),
+      secondRoster,
+    );
     assert.notEqual(firstId, secondId);
     state = await application.evaluate(() =>
       globalThis.__remotePanelSmoke.inspect(),
@@ -424,6 +477,47 @@ async function smoke() {
       [],
       "local selection notifications must only reach the owner renderer",
     );
+    assert.deepEqual(
+      state.context.panels.find((panel) => panel.id === firstId).servers,
+      firstRoster,
+    );
+    assert.deepEqual(
+      state.context.panels.find((panel) => panel.id === secondId).servers,
+      secondRoster,
+    );
+    const beforeSameReport = state.connectionChanges;
+    await application.evaluate(
+      (_electron, roster) =>
+        globalThis.__remotePanelSmoke.invoke("reportServers", roster, 1),
+      firstRoster,
+    );
+    state = await application.evaluate(() =>
+      globalThis.__remotePanelSmoke.inspect(),
+    );
+    assert.equal(
+      state.connectionChanges,
+      beforeSameReport,
+      "identical reports must not cause refresh loops",
+    );
+    const selectedRemote = await application.evaluate(
+      (_electron, panelId) =>
+        globalThis.__remotePanelSmoke.invoke(
+          "selectRemoteServer",
+          panelId,
+          false,
+          "remote-world",
+        ),
+      firstId,
+    );
+    assert.equal(selectedRemote.activeId, firstId);
+    state = await application.evaluate(() =>
+      globalThis.__remotePanelSmoke.inspect(),
+    );
+    assert.deepEqual(state.remoteServerSelectionEvents[1], [
+      { serverId: "remote-world" },
+    ]);
+    assert.deepEqual(state.remoteServerSelectionEvents[2], []);
+    assert.deepEqual(state.ownerRemoteSelectionEvents, []);
     const resumed = await application.evaluate(() =>
       globalThis.__remotePanelSmoke.invoke(
         "open",
@@ -448,6 +542,26 @@ async function smoke() {
       state.prompts,
       [0, 1, 1],
       "switching must preserve the certificate decision",
+    );
+    await application.evaluate(() =>
+      globalThis.__remotePanelSmoke.invoke("reportServers", null, 1),
+    );
+    state = await application.evaluate(() =>
+      globalThis.__remotePanelSmoke.inspect(),
+    );
+    assert.deepEqual(
+      state.context.panels.find((panel) => panel.id === firstId).servers,
+      [],
+    );
+    assert.deepEqual(
+      state.context.panels.find((panel) => panel.id === secondId).servers,
+      secondRoster,
+    );
+    assert.equal(
+      state.remoteCookies[1].find((item) => item.name === "remote-fixture")
+        .value,
+      firstCookie,
+      "roster logout reporting must not discard or replace native sessions",
     );
     await application.evaluate(
       (_electron, id) => globalThis.__remotePanelSmoke.invoke("disconnect", id),
@@ -485,7 +599,7 @@ async function smoke() {
       "A reconnected view must not inherit the disconnected session.",
     );
     console.log(
-      "Passed real Electron remote smoke: one native window, two isolated remote views, scoped preload, minimal local server entries, owner-only persisted selection, switching with cookies/trust preserved, disconnect/reconnect cleanup, local runtime survival, certificate validation, and clipboard permission checks (OS clipboard untouched).",
+      "Passed real Electron remote smoke: one native window, two isolated remote views, retained remote rosters across local switches, scoped signout clearing/selection events, minimal local entries, owner-only persisted selection, cookies/trust preserved, disconnect cleanup, local runtime survival, and clipboard permission checks (OS clipboard untouched).",
     );
   } catch (cause) {
     if (stderr) console.error(stderr);

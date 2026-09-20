@@ -5,6 +5,9 @@
 .fleet-server-group {
   margin-bottom: 18px;
 }
+.fleet-cached-server-group {
+  margin-top: 18px;
+}
 .fleet-server-group-heading {
   margin: 8px 9px;
   color: var(--muted);

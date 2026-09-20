@@ -19,6 +19,7 @@ import {
 import App from "./App";
 import { DesktopPanelReturn } from "./PanelAccount";
 import { api } from "./api";
+import { reportDesktopServers } from "./desktop-connections";
 import "./remote-access.css";
 
 type SubuserSession = {
@@ -45,7 +46,45 @@ export default function RemoteAccess() {
   const [error, setError] = useState("");
   const [attempt, setAttempt] = useState(0);
   const [token, setToken] = useState(invitationToken);
-  const signedOut = useCallback(() => setSession({ role: "guest" }), []);
+  const [requestedRemoteServer, setRequestedRemoteServer] = useState<{
+    serverId: string;
+    sequence: number;
+  } | null>(null);
+  const signedOut = useCallback(() => {
+    setRequestedRemoteServer(null);
+    setSession({ role: "guest" });
+  }, []);
+  useEffect(() => {
+    if (session?.role === "guest")
+      void reportDesktopServers(null).catch(() => {});
+  }, [session]);
+  useEffect(() => {
+    if (!window.mcPanelConnections || session?.role === "owner") return;
+    const selectedRemotely = (event: Event) => {
+      const serverId = (event as CustomEvent<{ serverId?: unknown }>).detail
+        ?.serverId;
+      if (typeof serverId !== "string" || !serverId.trim()) return;
+      setRequestedRemoteServer((previous) => ({
+        serverId,
+        sequence: (previous?.sequence ?? 0) + 1,
+      }));
+      setToken("");
+      window.history.replaceState(
+        null,
+        "",
+        `${window.location.pathname}${window.location.search}#console`,
+      );
+    };
+    window.addEventListener(
+      "mc-panel-remote-server-selected",
+      selectedRemotely,
+    );
+    return () =>
+      window.removeEventListener(
+        "mc-panel-remote-server-selected",
+        selectedRemotely,
+      );
+  }, [session]);
   useEffect(() => {
     const changed = () => setToken(invitationToken());
     window.addEventListener("hashchange", changed);
@@ -59,7 +98,10 @@ export default function RemoteAccess() {
         if (!controller.signal.aborted) setSession(value);
       })
       .catch((cause) => {
-        if (!controller.signal.aborted) setError(messageOf(cause));
+        if (!controller.signal.aborted) {
+          if (unauthorized(cause)) setSession({ role: "guest" });
+          else setError(messageOf(cause));
+        }
       });
     return () => controller.abort();
   }, [attempt]);
@@ -108,7 +150,14 @@ export default function RemoteAccess() {
         }}
       />
     );
-  return <App key={session.userId} session={session} onSignedOut={signedOut} />;
+  return (
+    <App
+      key={session.userId}
+      session={session}
+      onSignedOut={signedOut}
+      requestedRemoteServer={requestedRemoteServer}
+    />
+  );
 }
 
 function Brand() {

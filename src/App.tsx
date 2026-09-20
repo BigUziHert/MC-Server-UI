@@ -60,6 +60,7 @@ import DesktopUpdates from "./DesktopUpdates";
 import ServerIcon, { ServerIconImage } from "./ServerIcon";
 import { copyText } from "./clipboard";
 import PanelAccount, { type PanelSession } from "./PanelAccount";
+import { reportDesktopServers } from "./desktop-connections";
 import ConnectPanel, { type ConnectionMode } from "./ConnectPanel";
 import { version as appVersion } from "../package.json";
 import ServerManager, {
@@ -264,9 +265,11 @@ function Sparkline({
 export default function App({
   session,
   onSignedOut,
+  requestedRemoteServer,
 }: {
   session?: PanelSession;
   onSignedOut?: () => void;
+  requestedRemoteServer?: { serverId: string; sequence: number } | null;
 }) {
   const remote = Boolean(session);
   const sessionMounted = useRef(true);
@@ -276,9 +279,6 @@ export default function App({
       sessionMounted.current = false;
     };
   }, []);
-  const expireSession = useCallback(() => {
-    if (sessionMounted.current) onSignedOut?.();
-  }, [onSignedOut]);
   const selectionKey = session
     ? `mc-panel.active-server.${session.email}`
     : "mc-panel.active-server";
@@ -304,10 +304,17 @@ export default function App({
   const desktopSelection = useRef<boolean | null>(null);
   const persistedSelection = useRef("");
   const nativeSelection = useRef<string | null>(null);
+  const expireSession = useCallback(() => {
+    if (!sessionMounted.current) return;
+    sessionMounted.current = false;
+    fleetRequest.current++;
+    fleetInFlight.current = false;
+    onSignedOut?.();
+  }, [onSignedOut]);
   const [selectionReady, setSelectionReady] = useState(false);
   const loadServers = useCallback(
     async (showLoading = false) => {
-      if (fleetInFlight.current) return;
+      if (!sessionMounted.current || fleetInFlight.current) return;
       fleetInFlight.current = true;
       const request = ++fleetRequest.current;
       if (showLoading) {
@@ -333,7 +340,39 @@ export default function App({
               })
             : Promise.resolve(null),
         ]);
-        if (request !== fleetRequest.current) return;
+        if (request !== fleetRequest.current || !sessionMounted.current) return;
+        if (remote) {
+          const optionalText = (value: unknown) =>
+            typeof value === "string" && value.trim()
+              ? value.trim().slice(0, 128)
+              : undefined;
+          const roster = result.servers
+            .filter(
+              (server) =>
+                typeof server.id === "string" &&
+                server.id.length > 0 &&
+                server.id.length <= 128,
+            )
+            .slice(0, 500)
+            .map((server) => ({
+              id: server.id,
+              name: (typeof server.name === "string" && server.name.trim()
+                ? server.name.trim()
+                : server.id
+              ).slice(0, 180),
+              status: (typeof server.status === "string" && server.status.trim()
+                ? server.status.trim()
+                : "unknown"
+              ).slice(0, 32),
+              ...(optionalText(server.software)
+                ? { software: optionalText(server.software) }
+                : {}),
+              ...(optionalText(server.minecraftVersion)
+                ? { minecraftVersion: optionalText(server.minecraftVersion) }
+                : {}),
+            }));
+          void reportDesktopServers(roster).catch(() => {});
+        }
         if (desktopSelection.current === null) {
           desktopSelection.current = selection?.desktop === true;
           persistedSelection.current = selection?.activeServerId ?? "";
@@ -356,7 +395,11 @@ export default function App({
           nativePreferred &&
           !result.servers.some((server) => server.id === nativePreferred)
         )
-          setNotice("The selected local server is no longer available.");
+          setNotice(
+            remote
+              ? "That server is no longer shared with you."
+              : "The selected local server is no longer available.",
+          );
         setSelectionReady(true);
         setError("");
       } catch (cause) {
@@ -382,6 +425,19 @@ export default function App({
     },
     [remote, expireSession],
   );
+  useEffect(() => {
+    if (!remote || !requestedRemoteServer || !sessionMounted.current) return;
+    nativeSelection.current = requestedRemoteServer.serverId;
+    fleetRequest.current++;
+    fleetInFlight.current = false;
+    setSelectionReady(false);
+    // Revalidate this membership before mounting any of its controls.
+    setActiveId("");
+    setManager(null);
+    setConnection(null);
+    window.location.hash = "console";
+    void loadServers(true);
+  }, [remote, requestedRemoteServer, loadServers]);
   useEffect(() => {
     if (remote || !window.mcPanelConnections) return;
     const selectedLocally = (event: Event) => {
@@ -703,11 +759,11 @@ function EmptyFleet({
               </div>
             )}
             <div className="welcome-remote-account">
-              {session && window.mcPanelConnections && (
+              {window.mcPanelConnections && (
                 <div className="fleet-available-servers">
                   <ServerSwitcher
                     servers={[]}
-                    remoteHost={window.location.host}
+                    remoteHost={session ? window.location.host : undefined}
                     onSelect={() => {}}
                   />
                 </div>

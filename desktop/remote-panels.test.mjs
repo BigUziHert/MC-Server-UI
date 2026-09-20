@@ -33,6 +33,7 @@ function harness({
     value.mainFrame = { url: "", origin: "null" };
     value.getURL = () => value.url;
     value.isDestroyed = () => Boolean(value.destroyed);
+    value.isLoadingMainFrame = () => Boolean(value.loading);
     value.focus = () => {
       value.focused = true;
     };
@@ -234,7 +235,13 @@ test("remote views share one window, isolate sessions, reject external navigatio
       origin: "http://127.0.0.1:3001",
       local: true,
     },
-    { id: firstId, label: "panel.example:3002", origin, local: false },
+    {
+      id: firstId,
+      label: "panel.example:3002",
+      origin,
+      local: false,
+      servers: [],
+    },
   ]);
   const secondContext = await h.controller.open("https://other.example:3002/");
   const secondId = secondContext.activeId;
@@ -539,6 +546,300 @@ test("local server selection exposes only display fields and notifies only the o
     ),
   );
   assert.equal(remote.isDestroyed(), false);
+  await h.controller.close();
+});
+
+test("remote rosters stay with their sending sessions across local switches and clear only on that session's signout", async () => {
+  const h = harness();
+  const handlers = new Map();
+  installConnectionIpc(
+    { handle: (channel, callback) => handlers.set(channel, callback) },
+    h.controller,
+  );
+  const first = await h.controller.open(origin);
+  const firstContents = h.views[0].webContents;
+  const second = await h.controller.open("https://other.example:3002");
+  const secondContents = h.views[1].webContents;
+  const invoke = (action, sender, value, other) =>
+    handlers.get(CONNECTION_CHANNELS[action])(
+      { sender, senderFrame: sender.mainFrame },
+      value,
+      other,
+    );
+  const changedCount = () =>
+    h.owner.webContents.sent.filter(
+      ([channel]) => channel === "mc-panel-connections:changed",
+    ).length;
+  const roster = (id) =>
+    h.controller.list().panels.find((panel) => panel.id === id)?.servers;
+  const firstServer = {
+    id: "shared-id",
+    name: "Survival",
+    status: "running",
+    software: "Paper",
+    minecraftVersion: "1.21.8",
+  };
+  const secondServer = { id: "shared-id", name: "Creative", status: "offline" };
+  const beforeReport = changedCount();
+  assert.equal(
+    invoke("reportServers", firstContents, [
+      {
+        ...firstServer,
+        serverDir: "C:/private/world",
+        address: "192.0.2.1",
+        token: "private-token",
+      },
+      firstServer,
+    ]),
+    undefined,
+  );
+  assert.equal(changedCount(), beforeReport + 1);
+  assert.deepEqual(roster(first.activeId), [firstServer]);
+  assert.deepEqual(
+    roster(second.activeId),
+    [],
+    "the active panel must not acquire another sender's roster",
+  );
+  invoke("reportServers", secondContents, [
+    { ...secondServer, software: null, minecraftVersion: null },
+  ]);
+  h.controller.activate("local");
+  assert.deepEqual(roster(first.activeId), [firstServer]);
+  assert.deepEqual(roster(second.activeId), [secondServer]);
+  const beforeSame = changedCount();
+  invoke("reportServers", firstContents, [firstServer]);
+  assert.equal(
+    changedCount(),
+    beforeSame,
+    "unchanged polling must not create a changed-event feedback loop",
+  );
+  const copy = h.controller.list();
+  copy.panels.find((panel) => panel.id === first.activeId).servers[0].name =
+    "modified outside controller";
+  assert.deepEqual(roster(first.activeId), [firstServer]);
+  const selected = invoke(
+    "selectRemoteServer",
+    h.owner.webContents,
+    first.activeId,
+    "shared-id",
+  );
+  assert.equal(selected.activeId, first.activeId);
+  assert.deepEqual(
+    firstContents.sent.filter(
+      ([channel]) => channel === "mc-panel-remote-server-selected",
+    ),
+    [["mc-panel-remote-server-selected", "shared-id"]],
+  );
+  assert.ok(
+    secondContents.sent.every(
+      ([channel]) => channel !== "mc-panel-remote-server-selected",
+    ),
+  );
+  assert.ok(
+    h.owner.webContents.sent.every(
+      ([channel]) => channel !== "mc-panel-remote-server-selected",
+    ),
+  );
+  assert.equal(firstContents.isDestroyed(), false);
+  assert.equal(h.views[0].loads.length, 1);
+  assert.equal(h.partitions[0].cleared, undefined);
+  h.controller.activate("local");
+  invoke("reportServers", firstContents, null);
+  assert.deepEqual(roster(first.activeId), []);
+  assert.deepEqual(roster(second.activeId), [secondServer]);
+  const beforeClearAgain = changedCount();
+  invoke("reportServers", firstContents, null);
+  assert.equal(changedCount(), beforeClearAgain);
+  assert.throws(
+    () =>
+      invoke(
+        "selectRemoteServer",
+        h.owner.webContents,
+        first.activeId,
+        "shared-id",
+      ),
+    { status: 404 },
+  );
+  assert.throws(
+    () =>
+      invoke("selectRemoteServer", h.owner.webContents, "local", "shared-id"),
+    { status: 404 },
+  );
+  assert.throws(
+    () =>
+      invoke("selectRemoteServer", h.owner.webContents, "missing", "shared-id"),
+    { status: 404 },
+  );
+  assert.throws(
+    () =>
+      invoke(
+        "selectRemoteServer",
+        h.owner.webContents,
+        second.activeId,
+        "missing",
+      ),
+    { status: 404 },
+  );
+  assert.equal(h.controller.list().activeId, "local");
+  await h.controller.disconnect(second.activeId);
+  assert.throws(
+    () => invoke("reportServers", secondContents, [secondServer]),
+    /cannot manage/,
+  );
+  const reconnected = await h.controller.open("https://other.example:3002");
+  assert.deepEqual(roster(reconnected.activeId), []);
+  await h.controller.close();
+});
+
+test("remote server selections queued during reload wait for an authenticated renderer report and clear on signout", async () => {
+  const h = harness();
+  const connected = await h.controller.open(origin);
+  const contents = h.views[0].webContents;
+  const sender = { sender: contents, senderFrame: contents.mainFrame };
+  const servers = [
+    { id: "a", name: "A", status: "offline" },
+    { id: "b", name: "B", status: "offline" },
+  ];
+  h.controller.reportServers(sender, servers);
+  contents.loading = true;
+  h.controller.selectRemoteServer(connected.activeId, "a");
+  h.controller.selectRemoteServer(connected.activeId, "b");
+  const events = () =>
+    contents.sent.filter(
+      ([channel]) => channel === "mc-panel-remote-server-selected",
+    );
+  assert.deepEqual(events(), []);
+  contents.loading = false;
+  contents.emit("did-finish-load");
+  assert.deepEqual(
+    events(),
+    [],
+    "native load completion does not prove React's selection listener is mounted",
+  );
+  const beforeReady = h.owner.webContents.sent.length;
+  h.controller.reportServers(sender, servers);
+  assert.deepEqual(events(), [["mc-panel-remote-server-selected", "b"]]);
+  assert.equal(
+    h.owner.webContents.sent.length,
+    beforeReady,
+    "an unchanged readiness report must not broadcast a roster change",
+  );
+  h.controller.reportServers(sender, servers);
+  assert.equal(
+    events().length,
+    1,
+    "readiness delivery must not repeat on the next poll",
+  );
+  contents.loading = true;
+  h.controller.selectRemoteServer(connected.activeId, "a");
+  h.controller.reportServers(sender, null);
+  contents.loading = false;
+  contents.emit("did-finish-load");
+  assert.equal(events().length, 1, "signout clears a pending selection");
+  h.controller.reportServers(sender, servers);
+  assert.equal(
+    events().length,
+    1,
+    "a later login must not replay the signed-out user's pending selection",
+  );
+  contents.loading = true;
+  h.controller.selectRemoteServer(connected.activeId, "a");
+  contents.loading = false;
+  h.controller.reportServers(
+    sender,
+    servers.filter((server) => server.id !== "a"),
+  );
+  assert.equal(
+    events().length,
+    1,
+    "a refreshed roster must still contain the queued target",
+  );
+  h.controller.reportServers(sender, servers);
+  contents.loading = true;
+  h.controller.selectRemoteServer(connected.activeId, "a");
+  contents.mainFrame.origin = "https://evil.example";
+  contents.loading = false;
+  contents.emit("did-finish-load");
+  assert.throws(() => h.controller.reportServers(sender, servers), {
+    status: 403,
+  });
+  assert.equal(
+    events().length,
+    1,
+    "a different document origin must never receive the target server ID",
+  );
+  await h.controller.close();
+});
+
+test("remote roster reports and selection reject untrusted scopes and invalid bounded fields without mutating cache", async () => {
+  const h = harness();
+  const handlers = new Map();
+  installConnectionIpc(
+    { handle: (channel, callback) => handlers.set(channel, callback) },
+    h.controller,
+  );
+  const connected = await h.controller.open(origin);
+  const remote = h.views[0].webContents;
+  const sender = { sender: remote, senderFrame: remote.mainFrame };
+  const report = handlers.get(CONNECTION_CHANNELS.reportServers);
+  const server = { id: "world", name: "Survival", status: "offline" };
+  report(sender, [server]);
+  const snapshot = h.controller.list();
+  for (const value of [
+    undefined,
+    {},
+    "servers",
+    1,
+    [null],
+    [[]],
+    [{}],
+    Array(501).fill(server),
+    [{ ...server, id: "" }],
+    [{ ...server, id: "a".repeat(129) }],
+    [{ ...server, name: "a".repeat(181) }],
+    [{ ...server, status: "a".repeat(33) }],
+    [{ ...server, software: { secret: true } }],
+    [{ ...server, minecraftVersion: "a".repeat(129) }],
+  ])
+    assert.throws(() => report(sender, value), { status: 400 });
+  assert.throws(
+    () =>
+      report(
+        {
+          sender: h.owner.webContents,
+          senderFrame: h.owner.webContents.mainFrame,
+        },
+        null,
+      ),
+    { status: 403 },
+  );
+  assert.throws(
+    () => report({ ...sender, senderFrame: { ...remote.mainFrame } }, [server]),
+    /cannot manage/,
+  );
+  const oldOrigin = remote.mainFrame.origin;
+  remote.mainFrame.origin = "https://evil.example";
+  assert.throws(() => report(sender, [server]), /cannot manage/);
+  remote.mainFrame.origin = oldOrigin;
+  assert.throws(
+    () =>
+      report({ sender: { ...remote }, senderFrame: remote.mainFrame }, [
+        server,
+      ]),
+    /cannot manage/,
+  );
+  const select = handlers.get(CONNECTION_CHANNELS.selectRemoteServer);
+  for (const args of [
+    [null, "world"],
+    [connected.activeId, {}],
+    [connected.activeId, "x".repeat(129)],
+  ])
+    assert.throws(() => select(sender, ...args), /valid remote panel/);
+  assert.throws(
+    () => select({ ...sender, senderFrame: null }, connected.activeId, "world"),
+    /cannot manage/,
+  );
+  assert.deepEqual(h.controller.list(), snapshot);
   await h.controller.close();
 });
 

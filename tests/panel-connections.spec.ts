@@ -33,10 +33,16 @@ type LocalServerDescriptor = {
 
 async function desktopBridge(
   page: Page,
-  options: { activeId?: string; localServers?: LocalServerDescriptor[] } = {},
+  options: {
+    activeId?: string;
+    senderId?: string;
+    localServers?: LocalServerDescriptor[];
+    remoteServers?: Record<string, LocalServerDescriptor[]>;
+  } = {},
 ) {
   await page.addInitScript(
-    ({ activeId, localServers }) => {
+    ({ activeId, senderId, localServers, remoteServers }) => {
+      // The sending renderer stays fixed when native activation hides its view.
       const state = {
         activeId,
         localServers,
@@ -44,52 +50,102 @@ async function desktopBridge(
           {
             id: "local",
             label: "This computer",
-            origin: location.origin,
+            origin:
+              senderId === "local" ? location.origin : "http://127.0.0.1:41234",
             local: true,
           },
           {
             id: "pc-one",
             label: "pc-one.example:3002",
-            origin: "https://pc-one.example:3002",
+            origin:
+              senderId === "pc-one"
+                ? location.origin
+                : "https://pc-one.example:3002",
             local: false,
+            servers: remoteServers["pc-one"],
           },
           {
             id: "pc-two",
             label: "pc-two.example:3002",
-            origin: "https://pc-two.example:3002",
+            origin:
+              senderId === "pc-two"
+                ? location.origin
+                : "https://pc-two.example:3002",
             local: false,
+            servers: remoteServers["pc-two"],
           },
         ],
       };
       const calls: { action: string; value: string }[] = [];
-      Object.assign(window, { connectionCalls: calls });
+      const reports: {
+        panelId: string;
+        servers: LocalServerDescriptor[] | null;
+      }[] = [];
+      const snapshot = () => structuredClone(state);
+      const changed = () =>
+        window.dispatchEvent(new Event("mc-panel-connections-changed"));
+      const report = (
+        panelId: string,
+        servers: LocalServerDescriptor[] | null,
+      ) => {
+        const panel = state.panels.find((item) => item.id === panelId);
+        if (!panel || panel.local) return;
+        panel.servers = servers ?? undefined;
+        reports.push({ panelId, servers });
+        changed();
+      };
+      Object.assign(window, {
+        connectionCalls: calls,
+        connectionReports: reports,
+        connectionFixture: { report },
+      });
       window.mcPanelConnections = {
-        list: async () => state,
+        list: async () => snapshot(),
         open: async (url) => {
           calls.push({ action: "open", value: url });
-          return state;
+          return snapshot();
         },
         activate: async (id) => {
           calls.push({ action: "activate", value: id });
           state.activeId = id;
-          window.dispatchEvent(new Event("mc-panel-connections-changed"));
-          return state;
+          changed();
+          return snapshot();
         },
         disconnect: async (id) => {
           calls.push({ action: "disconnect", value: id });
-          return state;
+          return snapshot();
         },
         selectLocalServer: async (id) => {
           calls.push({ action: "selectLocalServer", value: id });
           state.activeId = "local";
-          window.dispatchEvent(new Event("mc-panel-connections-changed"));
-          return state;
+          changed();
+          return snapshot();
+        },
+        reportServers: async (servers) => {
+          report(senderId, servers);
+        },
+        selectRemoteServer: async (panelId, serverId) => {
+          calls.push({
+            action: "selectRemoteServer",
+            value: `${panelId}:${serverId}`,
+          });
+          state.activeId = panelId;
+          if (panelId === senderId)
+            window.dispatchEvent(
+              new CustomEvent("mc-panel-remote-server-selected", {
+                detail: { serverId },
+              }),
+            );
+          changed();
+          return snapshot();
         },
       };
     },
     {
       activeId: options.activeId ?? "local",
+      senderId: options.senderId ?? options.activeId ?? "local",
       localServers: options.localServers ?? [localServer],
+      remoteServers: options.remoteServers ?? {},
     },
   );
 }
@@ -124,6 +180,37 @@ async function localPanel(page: Page, desktop = false) {
   });
   return { localCredentials };
 }
+
+type ConnectionMock = Window & {
+  connectionReports: {
+    panelId: string;
+    servers: LocalServerDescriptor[] | null;
+  }[];
+  connectionFixture: {
+    report: (panelId: string, servers: LocalServerDescriptor[] | null) => void;
+  };
+};
+
+const cachedRemoteServers = {
+  "pc-one": [
+    {
+      id: localServer.id,
+      name: "Family survival world",
+      status: "offline" as const,
+      software: "Paper",
+      minecraftVersion: "1.21.1",
+    },
+  ],
+  "pc-two": [
+    {
+      id: localServer.id,
+      name: "Friends creative world",
+      status: "offline" as const,
+      software: "Paper",
+      minecraftVersion: "1.21.1",
+    },
+  ],
+};
 
 async function openConnection(page: Page, invitation = false) {
   await page
@@ -624,6 +711,344 @@ test("a local server selection event switches the owner workspace and scopes sub
     ),
   ).toEqual([]);
 });
+
+test("returning to this computer keeps each remote roster and selects colliding IDs in the correct panel", async ({
+  page,
+}, testInfo) => {
+  await desktopBridge(page, {
+    activeId: "pc-one",
+    senderId: "local",
+    remoteServers: cachedRemoteServers,
+  });
+  await localPanel(page, true);
+  const requests: { url: string; method: string; serverId: string | null }[] =
+    [];
+  page.on("request", (request) => {
+    const url = new URL(request.url());
+    if (url.pathname.startsWith("/api/"))
+      requests.push({
+        url: request.url(),
+        method: request.method(),
+        serverId:
+          request.headers()["x-server-id"] ?? url.searchParams.get("serverId"),
+      });
+  });
+  await page.goto("/#console");
+  await expect(
+    page.getByRole("heading", { name: localServer.name, exact: true }),
+  ).toBeVisible();
+  await page.evaluate(async (serverId) => {
+    await window.mcPanelConnections!.selectLocalServer(serverId);
+    window.dispatchEvent(
+      new CustomEvent("mc-panel-local-server-selected", {
+        detail: { serverId },
+      }),
+    );
+  }, localServer.id);
+  const localList = page.getByRole("list", {
+    name: "Servers on this computer",
+    exact: true,
+  });
+  const family = page.getByRole("list", {
+    name: "Servers on pc-one.example:3002",
+    exact: true,
+  });
+  const friends = page.getByRole("list", {
+    name: "Servers on pc-two.example:3002",
+    exact: true,
+  });
+  await expect(
+    localList.getByRole("button", {
+      name: `Select server ${localServer.name}`,
+      exact: true,
+    }),
+  ).toHaveAttribute("aria-pressed", "true");
+  for (const [list, panelId, server] of [
+    [family, "pc-one", cachedRemoteServers["pc-one"][0]],
+    [friends, "pc-two", cachedRemoteServers["pc-two"][0]],
+  ] as const) {
+    const row = list.getByRole("button");
+    await expect(row).toHaveAttribute("data-remote-panel-id", panelId);
+    await expect(row).toHaveAttribute("data-remote-server-id", server.id);
+    await expect(row).toContainText(server.name);
+    await expect(list.locator("img, [data-server-id]")).toHaveCount(0);
+  }
+  await page.screenshot({
+    path: testInfo.outputPath("local-with-connected-remote-servers.png"),
+    fullPage: true,
+    animations: "disabled",
+  });
+  const beforeSelection = requests.length;
+  await family.getByRole("button").click();
+  await friends.getByRole("button").click();
+  await expect
+    .poll(() =>
+      page.evaluate(
+        () =>
+          (window as unknown as { connectionCalls: unknown }).connectionCalls,
+      ),
+    )
+    .toEqual([
+      { action: "selectLocalServer", value: localServer.id },
+      { action: "selectRemoteServer", value: `pc-one:${localServer.id}` },
+      { action: "selectRemoteServer", value: `pc-two:${localServer.id}` },
+    ]);
+  expect(requests.slice(beforeSelection)).toEqual([]);
+  expect(
+    requests.every(
+      (request) => new URL(request.url).origin === new URL(page.url()).origin,
+    ),
+  ).toBe(true);
+  await expect(family).toBeVisible();
+  await expect(friends).toBeVisible();
+  expect(
+    await page.evaluate(() => localStorage.getItem("mc-panel.active-server")),
+  ).toBe(localServer.id);
+  // A successful sign-out in one hidden remote renderer clears only its report.
+  await page.evaluate(() =>
+    (window as ConnectionMock).connectionFixture.report("pc-one", null),
+  );
+  await expect(family).toHaveCount(0);
+  await expect(friends.getByRole("button")).toBeVisible();
+  await expect(localList.getByRole("button")).toBeVisible();
+});
+
+test("an empty local workspace keeps connected remote servers available without local server requests", async ({
+  page,
+}) => {
+  await desktopBridge(page, {
+    localServers: [],
+    remoteServers: cachedRemoteServers,
+  });
+  await localPanel(page, true);
+  await page.route("**/api/servers", (route) =>
+    route.fulfill({ json: { servers: [], defaultServerId: null } }),
+  );
+  const scopedRequests: string[] = [];
+  page.on("request", (request) => {
+    if (/\/api\/(?:server|console)(?:\?|$|\/)/.test(request.url()))
+      scopedRequests.push(request.url());
+  });
+  await page.goto("/");
+  await expect(
+    page.getByRole("heading", { name: "Welcome to MC Panel", exact: true }),
+  ).toBeVisible();
+  await page
+    .getByRole("button", {
+      name: "Open remote server Friends creative world on pc-two.example:3002",
+      exact: true,
+    })
+    .click();
+  expect(
+    await page.evaluate(
+      () => (window as unknown as { connectionCalls: unknown }).connectionCalls,
+    ),
+  ).toEqual([
+    { action: "selectRemoteServer", value: `pc-two:${localServer.id}` },
+  ]);
+  expect(scopedRequests).toEqual([]);
+});
+
+for (const reason of ["sign-out", "expired session"] as const) {
+  test(`remote rosters survive hiding and transient failures, then clear on ${reason} without late republishing`, async ({
+    page,
+  }) => {
+    const server = {
+      ...localServer,
+      name: "Authenticated family world",
+      accessPermissions: ["control.console"],
+    };
+    await desktopBridge(page, {
+      activeId: "pc-one",
+      remoteServers: { "pc-two": cachedRemoteServers["pc-two"] },
+    });
+    let fleetMode: "ready" | "unavailable" | "pending" = "ready";
+    let expired = false;
+    let failedReads = 0;
+    let pendingReads = 0;
+    let holdStatusRead = false;
+    let heldStatusReads = 0;
+    let release!: () => void;
+    const pending = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let releaseStatus!: () => void;
+    const pendingStatus = new Promise<void>((resolve) => {
+      releaseStatus = resolve;
+    });
+    await page.route("**/api/**", async (route) => {
+      const path = new URL(route.request().url()).pathname;
+      if (path === "/api/access/session")
+        return route.fulfill({
+          json: {
+            role: "subuser",
+            email: "sister@example.test",
+            userId: "sister",
+            serverId: server.id,
+            permissions: ["control.console"],
+          },
+        });
+      if (path === "/api/servers") {
+        if (fleetMode === "unavailable") {
+          failedReads++;
+          return route.fulfill({
+            status: 503,
+            json: { error: "Temporary connection interruption." },
+          });
+        }
+        if (fleetMode === "pending") {
+          pendingReads++;
+          await pending;
+        }
+        return route.fulfill({
+          json: { servers: [server], defaultServerId: server.id },
+        });
+      }
+      if (path === "/api/access/logout")
+        return route.fulfill({ json: { ok: true } });
+      if (path === "/api/server" && holdStatusRead) {
+        heldStatusReads++;
+        await pendingStatus;
+      }
+      if (expired && ["/api/server", "/api/console"].includes(path))
+        return route.fulfill({
+          status: 401,
+          json: { error: "Session expired." },
+        });
+      if (path === "/api/server") return route.fulfill({ json: server });
+      if (path === "/api/console")
+        return route.fulfill({ json: { lines: [] } });
+      return route.fulfill({
+        status: 404,
+        json: { error: "Unavailable in remote fixture." },
+      });
+    });
+    const roster = () =>
+      page.evaluate(
+        async () =>
+          (await window.mcPanelConnections!.list()).panels.find(
+            (panel) => panel.id === "pc-one",
+          )?.servers ?? [],
+      );
+    const refreshSelected = () =>
+      page.evaluate(
+        (serverId) =>
+          window.dispatchEvent(
+            new CustomEvent("mc-panel-remote-server-selected", {
+              detail: { serverId },
+            }),
+          ),
+        server.id,
+      );
+    await page.goto("/#console");
+    await expect.poll(roster).toEqual([
+      {
+        id: server.id,
+        name: server.name,
+        status: "offline",
+        software: "Paper",
+        minecraftVersion: "1.21.1",
+      },
+    ]);
+    await page
+      .getByRole("button", {
+        name: "Account menu for sister@example.test",
+        exact: true,
+      })
+      .click();
+    await page
+      .getByRole("menuitem", { name: "Switch to this computer", exact: true })
+      .click();
+    expect((await roster()).map((item) => item.id)).toEqual([server.id]);
+    fleetMode = "unavailable";
+    await refreshSelected();
+    await expect.poll(() => failedReads).toBeGreaterThan(0);
+    expect((await roster()).map((item) => item.id)).toEqual([server.id]);
+    const cachedRetry = page.getByRole("button", {
+      name: `Open remote server ${server.name} on pc-one.example:3002`,
+      exact: true,
+    });
+    await expect(cachedRetry).toBeVisible();
+    await expect(cachedRetry).toHaveAttribute("data-remote-panel-id", "pc-one");
+    await expect(cachedRetry).toHaveAttribute(
+      "data-remote-server-id",
+      server.id,
+    );
+    fleetMode = "ready";
+    await cachedRetry.click();
+    expect(
+      await page.evaluate(() =>
+        (
+          window as unknown as {
+            connectionCalls: { action: string; value: string }[];
+          }
+        ).connectionCalls.filter(
+          (call) => call.action === "selectRemoteServer",
+        ),
+      ),
+    ).toEqual([{ action: "selectRemoteServer", value: `pc-one:${server.id}` }]);
+    await expect(
+      page.getByRole("heading", { name: server.name, exact: true }),
+    ).toBeVisible();
+    if (reason === "expired session") {
+      // Capture a real workspace poll before target selection unmounts it.
+      holdStatusRead = true;
+      await expect.poll(() => heldStatusReads).toBeGreaterThan(0);
+    }
+    fleetMode = "pending";
+    await refreshSelected();
+    await expect.poll(() => pendingReads).toBeGreaterThan(0);
+    try {
+      if (reason === "sign-out") {
+        await page
+          .getByRole("button", {
+            name: "Account menu for sister@example.test",
+            exact: true,
+          })
+          .click();
+        await page
+          .getByRole("menuitem", { name: "Sign out", exact: true })
+          .click();
+      } else {
+        expired = true;
+        releaseStatus();
+      }
+      await expect(page.getByLabel("Password", { exact: true })).toBeVisible();
+      await expect.poll(roster).toEqual([]);
+      const responseArrived = page.waitForResponse(
+        (response) =>
+          new URL(response.url()).pathname === "/api/servers" &&
+          response.status() === 200,
+      );
+      release();
+      await (await responseArrived).finished();
+      await page.evaluate(
+        () =>
+          new Promise<void>((resolve) =>
+            requestAnimationFrame(() => resolve()),
+          ),
+      );
+      expect(await roster()).toEqual([]);
+      const reports = await page.evaluate(() =>
+        (window as ConnectionMock).connectionReports.filter(
+          (report) => report.panelId === "pc-one",
+        ),
+      );
+      expect(reports.at(-1)?.servers).toBeNull();
+      expect(
+        await page.evaluate(
+          async () =>
+            (await window.mcPanelConnections!.list()).panels.find(
+              (panel) => panel.id === "pc-two",
+            )?.servers,
+        ),
+      ).toEqual(cachedRemoteServers["pc-two"]);
+    } finally {
+      release();
+      releaseStatus();
+    }
+  });
+}
 
 test("desktop invitations use the scoped connection bridge and keep credentials on the destination", async ({
   page,

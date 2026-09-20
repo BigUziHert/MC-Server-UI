@@ -65,9 +65,32 @@ export function ServerSwitcher({
   onSettings?: () => void;
   remoteHost?: string;
 }) {
-  const connections = useDesktopConnections(Boolean(remoteHost));
-  const grouped = Boolean(remoteHost && window.mcPanelConnections);
+  const connections = useDesktopConnections();
+  const grouped = Boolean(window.mcPanelConnections);
+  const cachedPanels = (connections?.panels ?? []).filter(
+    (panel) =>
+      !panel.local &&
+      panel.servers?.length &&
+      !(
+        remoteHost &&
+        servers.length &&
+        panel.origin === window.location.origin
+      ),
+  );
+  const showCurrentRoster = !(
+    remoteHost &&
+    !servers.length &&
+    cachedPanels.some((panel) => panel.origin === window.location.origin)
+  );
   const [openingLocal, setOpeningLocal] = useState<string | null>(null);
+  const [openingRemote, setOpeningRemote] = useState<{
+    panelId: string;
+    serverId: string;
+  } | null>(null);
+  const [remoteError, setRemoteError] = useState<{
+    panelId: string;
+    message: string;
+  } | null>(null);
   const [localError, setLocalError] = useState("");
   const localRequest = useRef(false);
   const mounted = useRef(true);
@@ -82,6 +105,7 @@ export function ServerSwitcher({
     localRequest.current = true;
     setOpeningLocal(serverId);
     setLocalError("");
+    setRemoteError(null);
     try {
       const bridge = window.mcPanelConnections;
       if (!bridge?.selectLocalServer)
@@ -101,9 +125,36 @@ export function ServerSwitcher({
       if (mounted.current) setOpeningLocal(null);
     }
   }
+  async function openRemote(panelId: string, serverId: string) {
+    if (localRequest.current) return;
+    localRequest.current = true;
+    setOpeningRemote({ panelId, serverId });
+    setRemoteError(null);
+    setLocalError("");
+    try {
+      const bridge = window.mcPanelConnections;
+      if (!bridge?.selectRemoteServer)
+        throw new Error(
+          "Update the desktop app to open a saved remote server.",
+        );
+      await bridge.selectRemoteServer(panelId, serverId);
+    } catch (cause) {
+      if (mounted.current)
+        setRemoteError({
+          panelId,
+          message:
+            cause instanceof Error
+              ? cause.message
+              : "Could not open the remote server. Try again.",
+        });
+    } finally {
+      localRequest.current = false;
+      if (mounted.current) setOpeningRemote(null);
+    }
+  }
   return (
     <div className="fleet-switcher">
-      {grouped && (
+      {grouped && remoteHost && (
         <div className="fleet-server-group">
           <h3 className="fleet-server-group-heading">This computer</h3>
           <ul
@@ -125,7 +176,7 @@ export function ServerSwitcher({
                     aria-label={`Open local server ${server.name}`}
                     data-local-server-id={server.id}
                     data-server-scope="local"
-                    disabled={openingLocal !== null}
+                    disabled={openingLocal !== null || openingRemote !== null}
                     aria-busy={openingLocal === server.id || undefined}
                     onClick={() => void openLocal(server.id)}
                   >
@@ -169,61 +220,142 @@ export function ServerSwitcher({
           )}
         </div>
       )}
-      {grouped && (
-        <h3 className="fleet-server-group-heading" title={remoteHost}>
-          {remoteHost}
-        </h3>
-      )}
-      <ul
-        className="fleet-server-list"
-        aria-label={grouped ? `Servers on ${remoteHost}` : "Your servers"}
-      >
-        {servers.map((record) => {
-          const active = record.id === selected?.id;
-          const server = active && selected ? selected : record;
-          const software = [server.software || "Java", server.minecraftVersion]
-            .filter(Boolean)
-            .join(" ");
-          return (
-            <li key={server.id}>
-              <button
-                className="fleet-server-button"
-                aria-label={`Select server ${server.name}`}
-                data-server-id={server.id}
-                data-server-scope="panel"
-                aria-pressed={active}
-                onClick={() => onSelect(server.id)}
-              >
-                <span className="server-mini">
-                  <ServerScope.Provider value={server.id}>
-                    <ServerIconImage
-                      name={server.name}
-                      version={server.iconVersion}
-                    />
-                  </ServerScope.Provider>
-                </span>
-                <span className="fleet-selection">
-                  <strong title={server.name}>{server.name}</strong>
-                  <span>
-                    <i
-                      className={`status-dot ${server.status === "running" ? "" : "offline"}`}
-                    />
-                    {server.status}
-                    <span className="fleet-mode" title={software}>
-                      · {software}
+      {showCurrentRoster && (
+        <>
+          {grouped && (
+            <h3 className="fleet-server-group-heading" title={remoteHost}>
+              {remoteHost || "This computer"}
+            </h3>
+          )}
+          <ul
+            className="fleet-server-list"
+            aria-label={
+              grouped
+                ? remoteHost
+                  ? `Servers on ${remoteHost}`
+                  : "Servers on this computer"
+                : "Your servers"
+            }
+          >
+            {servers.map((record) => {
+              const active = record.id === selected?.id;
+              const server = active && selected ? selected : record;
+              const software = [
+                server.software || "Java",
+                server.minecraftVersion,
+              ]
+                .filter(Boolean)
+                .join(" ");
+              return (
+                <li key={server.id}>
+                  <button
+                    className="fleet-server-button"
+                    aria-label={`Select server ${server.name}`}
+                    data-server-id={server.id}
+                    data-server-scope={remoteHost ? "panel" : "local"}
+                    aria-pressed={active}
+                    onClick={() => onSelect(server.id)}
+                  >
+                    <span className="server-mini">
+                      <ServerScope.Provider value={server.id}>
+                        <ServerIconImage
+                          name={server.name}
+                          version={server.iconVersion}
+                        />
+                      </ServerScope.Provider>
                     </span>
-                  </span>
-                </span>
-              </button>
-            </li>
-          );
-        })}
-      </ul>
-      {grouped && !servers.length && (
-        <p className="fleet-server-group-note">
-          No shared servers on this panel.
-        </p>
+                    <span className="fleet-selection">
+                      <strong title={server.name}>{server.name}</strong>
+                      <span>
+                        <i
+                          className={`status-dot ${server.status === "running" ? "" : "offline"}`}
+                        />
+                        {server.status}
+                        <span className="fleet-mode" title={software}>
+                          · {software}
+                        </span>
+                      </span>
+                    </span>
+                  </button>
+                </li>
+              );
+            })}
+          </ul>
+          {grouped && !servers.length && (
+            <p className="fleet-server-group-note">
+              {remoteHost
+                ? "No shared servers on this panel."
+                : "No servers on this computer."}
+            </p>
+          )}
+        </>
       )}
+      {cachedPanels.map((panel) => (
+        <div
+          className="fleet-server-group fleet-cached-server-group"
+          key={panel.id}
+        >
+          <h3 className="fleet-server-group-heading" title={panel.label}>
+            {panel.label}
+          </h3>
+          <ul
+            className="fleet-server-list"
+            aria-label={`Servers on ${panel.label}`}
+          >
+            {panel.servers!.map((server) => {
+              const software = [
+                server.software || "Java",
+                server.minecraftVersion,
+              ]
+                .filter(Boolean)
+                .join(" ");
+              const opening =
+                openingRemote?.panelId === panel.id &&
+                openingRemote.serverId === server.id;
+              return (
+                <li key={server.id}>
+                  <button
+                    type="button"
+                    className="fleet-server-button"
+                    aria-label={`Open remote server ${server.name} on ${panel.label}`}
+                    data-remote-panel-id={panel.id}
+                    data-remote-server-id={server.id}
+                    data-server-scope="remote"
+                    disabled={openingLocal !== null || openingRemote !== null}
+                    aria-busy={opening || undefined}
+                    onClick={() => void openRemote(panel.id, server.id)}
+                  >
+                    <span className="server-mini" aria-hidden="true">
+                      {opening ? (
+                        <LoaderCircle size={18} className="spin" />
+                      ) : (
+                        <Box size={18} />
+                      )}
+                    </span>
+                    <span className="fleet-selection">
+                      <strong title={server.name}>{server.name}</strong>
+                      <span>
+                        <i
+                          className={`status-dot ${server.status === "running" ? "" : "offline"}`}
+                        />
+                        {server.status}
+                        <span className="fleet-mode" title={software}>
+                          · {software}
+                        </span>
+                      </span>
+                    </span>
+                  </button>
+                </li>
+              );
+            })}
+          </ul>
+          {remoteError?.panelId === panel.id && (
+            <p className="fleet-server-group-error" role="alert">
+              {remoteError.message}
+            </p>
+          )}
+        </div>
+      ))}
       {(onAdd || onSettings) && (
         <div className="fleet-actions">
           {onAdd && (

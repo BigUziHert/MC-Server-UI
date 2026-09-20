@@ -9,6 +9,14 @@ if (process.isMainFrame) {
       ipcRenderer.invoke("mc-panel-connections:disconnect", id),
     selectLocalServer: (id) =>
       ipcRenderer.invoke("mc-panel-connections:select-local-server", id),
+    reportServers: (servers) =>
+      ipcRenderer.invoke("mc-panel-connections:report-servers", servers),
+    selectRemoteServer: (panelId, serverId) =>
+      ipcRenderer.invoke(
+        "mc-panel-connections:select-remote-server",
+        panelId,
+        serverId,
+      ),
   });
   ipcRenderer.on("mc-panel-connections:changed", () => {
     window.dispatchEvent(new Event("mc-panel-connections-changed"));
@@ -17,6 +25,14 @@ if (process.isMainFrame) {
     if (typeof serverId === "string")
       window.dispatchEvent(
         new CustomEvent("mc-panel-local-server-selected", {
+          detail: { serverId },
+        }),
+      );
+  });
+  ipcRenderer.on("mc-panel-remote-server-selected", (_event, serverId) => {
+    if (typeof serverId === "string")
+      window.dispatchEvent(
+        new CustomEvent("mc-panel-remote-server-selected", {
           detail: { serverId },
         }),
       );

@@ -11,6 +11,40 @@ import {
 const failure = (status, message) =>
   Object.assign(new Error(message), { status });
 
+function serverRoster(value) {
+  if (value === null) return [];
+  if (!Array.isArray(value) || value.length > 500)
+    throw failure(400, "Provide a valid, bounded server list.");
+  const text = (value, maximum) =>
+    typeof value === "string" && value.length > 0 && value.length <= maximum;
+  const result = [];
+  const ids = new Set();
+  for (const server of value) {
+    if (
+      !server ||
+      typeof server !== "object" ||
+      Array.isArray(server) ||
+      !text(server.id, 128) ||
+      !text(server.name, 180) ||
+      !text(server.status, 32) ||
+      (server.software != null && !text(server.software, 128)) ||
+      (server.minecraftVersion != null && !text(server.minecraftVersion, 128))
+    )
+      throw failure(400, "Provide valid server display fields.");
+    if (ids.has(server.id)) continue;
+    ids.add(server.id);
+    const { id, name, status, software, minecraftVersion } = server;
+    result.push({
+      id,
+      name,
+      status,
+      ...(typeof software === "string" ? { software } : {}),
+      ...(typeof minecraftVersion === "string" ? { minecraftVersion } : {}),
+    });
+  }
+  return result;
+}
+
 export async function readPanelConnectionBody(req) {
   if (!/^application\/json(?:\s*;|$)/i.test(req.headers["content-type"] || ""))
     throw failure(400, "Provide the panel address as JSON.");
@@ -114,12 +148,17 @@ export function createRemotePanelController({
     activeId,
     // Only the selector's display fields may cross into remote renderers.
     localServers: localServerEntries(),
-    panels: [...panels.values()].map(({ id, label, origin, local }) => ({
-      id,
-      label,
-      origin,
-      local,
-    })),
+    panels: [...panels.values()].map(
+      ({ id, label, origin, local, servers }) => ({
+        id,
+        label,
+        origin,
+        local,
+        ...(!local
+          ? { servers: servers.map((server) => ({ ...server })) }
+          : {}),
+      }),
+    ),
   });
   const changed = () => {
     const context = list();
@@ -139,6 +178,29 @@ export function createRemotePanelController({
   const ensureOpen = () => {
     if (closed || window.isDestroyed())
       throw failure(503, "MC Panel is shutting down.");
+  };
+  const deliverRemoteSelection = (panel) => {
+    const id = panel.pendingServerId;
+    const contents = panel.contents;
+    if (
+      !id ||
+      !panels.has(panel.id) ||
+      contents.isDestroyed() ||
+      panel.selectionNeedsReport
+    )
+      return;
+    const frame = contents.mainFrame;
+    if (
+      !frame ||
+      frame.origin !== panel.origin ||
+      !sameOrigin(frame.url, panel.origin) ||
+      !sameOrigin(contents.getURL(), panel.origin)
+    )
+      return;
+    panel.pendingServerId = undefined;
+    panel.selectionNeedsReport = false;
+    if (panel.servers.some((server) => server.id === id))
+      contents.send("mc-panel-remote-server-selected", id);
   };
   const activate = (id) => {
     ensureOpen();
@@ -164,6 +226,7 @@ export function createRemotePanelController({
     }
     panels.delete(panel.id);
     panel.trustedFingerprint = undefined;
+    panel.pendingServerId = undefined;
     if (attached === panel.view) {
       if (!window.isDestroyed()) window.contentView.removeChildView(attached);
       attached = undefined;
@@ -184,6 +247,47 @@ export function createRemotePanelController({
   const controller = {
     list,
     activate,
+    reportServers(event, value) {
+      if (!controller.isManagedSender(event))
+        throw failure(403, "This page cannot report remote servers.");
+      const panel = [...panels.values()].find(
+        (item) => item.contents === event.sender,
+      );
+      if (panel.local)
+        throw failure(
+          403,
+          "Only a connected remote panel can report its servers.",
+        );
+      const servers = serverRoster(value);
+      const rosterChanged =
+        JSON.stringify(panel.servers) !== JSON.stringify(servers);
+      panel.servers = servers;
+      if (value === null) panel.pendingServerId = undefined;
+      // An authenticated renderer report proves the app has mounted after a
+      // reload. did-finish-load alone can precede its selection listener.
+      panel.selectionNeedsReport = false;
+      deliverRemoteSelection(panel);
+      if (rosterChanged) changed();
+    },
+    selectRemoteServer(panelId, serverId) {
+      ensureOpen();
+      const panel = panels.get(panelId);
+      if (
+        !panel ||
+        panel.local ||
+        panel.contents.isDestroyed() ||
+        typeof serverId !== "string" ||
+        !panel.servers.some((server) => server.id === serverId)
+      )
+        throw failure(
+          404,
+          "This remote server is no longer available in the connected panel.",
+        );
+      panel.pendingServerId = serverId;
+      panel.selectionNeedsReport ||= panel.contents.isLoadingMainFrame();
+      deliverRemoteSelection(panel);
+      return activate(panel.id);
+    },
     async selectLocalServer(id) {
       ensureOpen();
       if (
@@ -247,6 +351,7 @@ export function createRemotePanelController({
         label: host,
         origin,
         local: false,
+        servers: [],
         view,
         contents,
         session: remoteSession,
