@@ -223,15 +223,9 @@ test("audit refresh retains rows and reports failure without a success notificat
   ).toBeVisible();
 });
 
-test("audit polling refreshes in place and panel history remains available with no servers", async ({
+test("panel audit polling refreshes in place and retains removed-server history", async ({
   page,
 }) => {
-  await page.route("**/api/servers", (route) =>
-    route.fulfill({ json: { servers: [], defaultServerId: null } }),
-  );
-  await page.route("**/api/desktop/selection", (route) =>
-    route.fulfill({ json: { desktop: false, activeServerId: null } }),
-  );
   await page.clock.install();
   let polls = 0;
   await page.route("**/api/panel/audit", (route) =>
@@ -251,10 +245,10 @@ test("audit polling refreshes in place and panel history remains available with 
       },
     }),
   );
-  await page.goto("/");
+  await page.goto("/#audit");
   await page
-    .getByRole("button", { name: "Panel audit logs", exact: true })
-    .click();
+    .getByRole("combobox", { name: "Audit scope" })
+    .selectOption("panel");
   await expect(
     page.getByRole("heading", { name: "Audit logs", exact: true }),
   ).toBeVisible();
@@ -272,9 +266,6 @@ test("audit polling refreshes in place and panel history remains available with 
       exact: true,
     }),
   ).toBeVisible();
-  await expect(
-    page.getByRole("button", { name: "Databases", exact: true }),
-  ).toHaveCount(0);
 });
 
 test("manual audit refresh joins an active poll and reports its result", async ({

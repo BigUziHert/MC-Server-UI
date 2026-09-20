@@ -265,7 +265,6 @@ export default function App() {
     firstServer?: boolean;
   } | null>(null);
   const [notice, setNotice] = useState("");
-  const [showPanelAudit, setShowPanelAudit] = useState(false);
   const fleetRequest = useRef(0);
   const fleetInFlight = useRef(false);
   const desktopSelection = useRef<boolean | null>(null);
@@ -444,16 +443,8 @@ export default function App() {
             </button>
           )}
         </div>
-      ) : showPanelAudit && !firstServerSetup ? (
-        <main className="fleet-audit">
-          <button className="btn" onClick={() => setShowPanelAudit(false)}>
-            Back to welcome
-          </button>
-          <AuditLogs scope="panel" notify={(message) => setNotice(message)} />
-        </main>
       ) : (
         <EmptyFleet
-          onAudit={() => setShowPanelAudit(true)}
           onAdd={(initialStep) =>
             setManager({ editing: null, initialStep, firstServer: true })
           }
@@ -488,13 +479,7 @@ export default function App() {
   );
 }
 
-function EmptyFleet({
-  onAdd,
-  onAudit,
-}: {
-  onAdd: (step: "create" | "import") => void;
-  onAudit: () => void;
-}) {
+function EmptyFleet({ onAdd }: { onAdd: (step: "create" | "import") => void }) {
   return (
     <div className="fleet-welcome-shell fleet-welcome-simple">
       <header className="fleet-welcome-header">
@@ -507,10 +492,6 @@ function EmptyFleet({
           </span>
         </div>
         <div className="welcome-header-actions">
-          <button className="btn" onClick={onAudit}>
-            <FileText size={16} />
-            Panel audit logs
-          </button>
           <DesktopUpdates />
           <a
             className="help-button"

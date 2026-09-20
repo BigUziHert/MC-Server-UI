@@ -1953,14 +1953,6 @@ input:disabled {
   }
 }
 
-.fleet-audit {
-  max-width: 1300px;
-  margin: 0 auto;
-  padding: 32px;
-}
-.fleet-audit > .btn {
-  margin-bottom: 22px;
-}
 .launchpad-toolbar .pagination {
   padding: 0;
   border: 0;
@@ -1970,9 +1962,4 @@ input:disabled {
 }
 .players-roster-search {
   margin: 10px;
-}
-@media (max-width: 600px) {
-  .fleet-audit {
-    padding: 16px;
-  }
 }
