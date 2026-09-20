@@ -26,6 +26,7 @@ import { installedMinecraftMetadata } from "./installed-minecraft.mjs";
 import { minecraftGameVersion } from "./minecraft-version.mjs";
 import { createLauncherStop } from "./launcher-stop.mjs";
 import { createAccessService } from "./access.mjs";
+import { localNetworkAddresses } from "./remote-tls.mjs";
 import {
   createRemoteGateway,
   createRemoteListener,
@@ -2546,13 +2547,16 @@ export async function createPanel(options = {}) {
       if (!options.inviteUser)
         throw error(
           503,
-          "Set up remote access in the panel before sending invitations.",
+          "Set up remote access in the panel before creating invitations.",
         );
-      await options.inviteUser(userWithPermissions(user));
-      await audit("user", "Subuser invitation sent", user.email);
+      const invitation = await options.inviteUser(userWithPermissions(user));
+      await audit("user", "Subuser invitation link created", user.email);
       res.json({
-        message: "Invitation sent. Ask the recipient to check their inbox.",
+        message:
+          "Invitation link created. Copy it and send it to the recipient.",
         user: presentedUser(user),
+        invitationUrl: invitation.invitationUrl,
+        inviteExpiresAt: invitation.inviteExpiresAt,
       });
     }),
   );
@@ -3039,7 +3043,6 @@ export async function createFleet(options = {}) {
         access.invite({
           serverId: entry.id,
           user,
-          serverName: runtime.descriptor().name,
         }),
       revokeUser: (userId) => access.revoke(entry.id, userId),
       existingServerDir: entry.storage === "external",
@@ -3237,22 +3240,11 @@ export async function createFleet(options = {}) {
   try {
     access = await createAccessService({
       dataDir,
-      sendMail: options.sendMail,
       getUser: (serverId, userId) =>
         runtimes
           .get(serverId)
           ?.subusers?.()
           .find((user) => user.id === userId) ?? null,
-      listMemberships: (email) =>
-        [...runtimes].flatMap(([serverId, runtime]) =>
-          (runtime.subusers?.() ?? [])
-            .filter((user) => user.email === email)
-            .map((user) => ({
-              serverId,
-              user,
-              serverName: runtime.descriptor().name,
-            })),
-        ),
     });
   } catch (cause) {
     await Promise.allSettled(
@@ -3265,10 +3257,14 @@ export async function createFleet(options = {}) {
     access,
     runtimes,
     distDir: path.join(projectDir, "dist"),
+    localAddresses: options.localAddresses,
   });
   const remote = createRemoteListener({
     app: remoteApp,
     access,
+    dataDir,
+    localAddresses: options.localAddresses,
+    bindHost: options.remoteBindHost,
     listen: options.remoteListen !== false,
   });
   const app = express();
@@ -3309,6 +3305,13 @@ export async function createFleet(options = {}) {
   app.use(express.json({ limit: "2mb" }));
   app.get("/api/access/session", (_req, res) => res.json({ role: "owner" }));
   app.get("/api/access/settings", (_req, res) => res.json(remote.status()));
+  app.get("/api/access/network", async (_req, res) =>
+    res.json({
+      publicIp: await publicAddress.resolve(),
+      localAddresses: (options.localAddresses ?? localNetworkAddresses)(),
+      port: access.status().port,
+    }),
+  );
   app.put("/api/access/settings", async (req, res) => {
     const settings = await remote.configure(req.body ?? {});
     await panelAudit(

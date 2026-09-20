@@ -9,6 +9,7 @@ files:
   - server/index.mjs
   - server/access.mjs
   - server/remote-access.mjs
+  - server/remote-tls.mjs
   - server/audit.mjs
   - server/installed-minecraft.mjs
   - server/minecraft-version.mjs

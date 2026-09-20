@@ -4,6 +4,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import http from "node:http";
+import https from "node:https";
 import { createAccessService } from "./access.mjs";
 import { createRemoteListener } from "./remote-access.mjs";
 
@@ -26,10 +27,16 @@ const freePort = async () => {
   await stop(server);
   return port;
 };
-const read = (port) =>
+const read = (port, ca) =>
   new Promise((resolve, reject) => {
-    const request = http.get(
-      { host: "127.0.0.1", port, path: "/", agent: false },
+    const request = (ca ? https : http).get(
+      {
+        host: "127.0.0.1",
+        port,
+        path: "/",
+        agent: false,
+        ...(ca ? { ca } : {}),
+      },
       (response) => {
         let body = "";
         response.setEncoding("utf8");
@@ -49,7 +56,13 @@ const read = (port) =>
 
 async function fixture(
   t,
-  { enabled = false, port, listen = true, delayListening } = {},
+  {
+    enabled = false,
+    port,
+    listen = true,
+    delayListening,
+    transport = "proxy",
+  } = {},
 ) {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "mc-remote-listener-"));
   const servers = [],
@@ -58,39 +71,42 @@ async function fixture(
     dataDir: root,
     getUser: () => null,
     listMemberships: () => [],
-    sendMail: async () => {
-      throw new Error("Tests must not send email.");
-    },
   });
   await access.configure({
     enabled,
     publicUrl: "https://panel.example.test",
-    from: "panel@example.test",
-    apiKey: "fixture-private-key",
+    transport,
     port: port ?? (await freePort()),
   });
-  const app = {
-    listen(requestedPort, host, callback) {
-      assert.equal(
-        host,
-        "0.0.0.0",
-        "production listener explicitly uses its separate remote interface",
-      );
-      const server = http.createServer((_req, res) =>
-        res.end("remote listener fixture"),
-      );
+  const app = (_req, res) => res.end("remote listener fixture");
+  const remote = createRemoteListener({
+    app,
+    access,
+    dataDir: root,
+    listen,
+    bindHost: "127.0.0.1",
+    localAddresses: () => ["192.168.10.20"],
+    createServer(settings, tlsOptions, handler) {
+      const server =
+        settings.transport === "direct"
+          ? https.createServer(tlsOptions, handler)
+          : http.createServer(handler);
+      const requestedPort = settings.port;
+      const originalListen = server.listen.bind(server);
+      server.listen = (actualPort, host, callback) => {
+        assert.equal(host, "127.0.0.1", "tests bind only to loopback");
+        assert.equal(actualPort, requestedPort);
+        return originalListen(actualPort, host, async () => {
+          events.push(`listening:${requestedPort}`);
+          if (delayListening) await delayListening();
+          callback();
+        });
+      };
       server.on("close", () => events.push(`closed:${requestedPort}`));
       servers.push(server);
-      // Exercise real sockets without exposing even the test handler to the LAN.
-      server.listen(requestedPort, "127.0.0.1", async () => {
-        events.push(`listening:${requestedPort}`);
-        if (delayListening) await delayListening();
-        callback();
-      });
       return server;
     },
-  };
-  const remote = createRemoteListener({ app, access, listen });
+  });
   t.after(async () => {
     await remote.close();
     await access.close();
@@ -113,11 +129,11 @@ test("remote listener enables, disables, reuses its configured port, and closes 
     body: "remote listener fixture",
   });
   assert.equal(f.remote.status().ready, true);
-  await f.remote.configure({ from: "Server <panel@example.test>" });
+  await f.remote.configure({ publicUrl: "https://new-panel.example.test" });
   assert.equal(
     f.servers.length,
     1,
-    "sender changes do not unnecessarily replace the socket",
+    "a proxy origin change does not unnecessarily replace the socket",
   );
   await f.remote.configure({ enabled: false });
   assert.equal(f.remote.status().listening, false);
@@ -162,7 +178,7 @@ test("a conflicting port disables remote access, stops the old socket, and permi
   assert.equal(f.remote.status().ready, false);
   assert.equal(f.remote.status().listening, false);
   assert.equal(
-    JSON.stringify(f.remote.status()).includes("fixture-private-key"),
+    JSON.stringify(f.remote.status()).includes("PRIVATE KEY"),
     false,
   );
   assert.equal(
@@ -223,8 +239,55 @@ test("shutdown drains an in-flight settings change without leaving a new listene
 test("test-mode remote listener preserves settings without opening sockets", async (t) => {
   const f = await fixture(t, { enabled: true, listen: false });
   await f.remote.start();
-  await f.remote.configure({ from: "Other <panel@example.test>" });
+  await f.remote.configure({ publicUrl: "https://other-panel.example.test" });
   assert.equal(f.remote.status().listening, false);
   assert.equal(f.servers.length, 0);
-  assert.equal(f.remote.status().from, "Other <panel@example.test>");
+  assert.equal(f.remote.status().publicUrl, "https://other-panel.example.test");
+});
+
+test("direct access serves verified HTTPS, preserves its certificate, and can switch to proxy on the same port", async (t) => {
+  const f = await fixture(t, { enabled: true, transport: "direct" });
+  await f.remote.start();
+  assert.equal(f.remote.status().ready, true);
+  const saved = JSON.parse(
+    await fs.readFile(path.join(f.root, "remote-tls.json"), "utf8"),
+  );
+  assert.deepEqual(await read(f.port, saved.cert), {
+    status: 200,
+    body: "remote listener fixture",
+  });
+  // HTTPS clients must actually trust the self-signed certificate to connect.
+  await assert.rejects(
+    new Promise((resolve, reject) => {
+      const request = https.get(
+        { host: "127.0.0.1", port: f.port, path: "/", agent: false },
+        resolve,
+      );
+      request.once("error", reject);
+    }),
+    { code: "DEPTH_ZERO_SELF_SIGNED_CERT" },
+  );
+  assert.equal(
+    JSON.stringify(f.remote.status()).includes("PRIVATE KEY"),
+    false,
+  );
+  await f.remote.configure({ enabled: false });
+  await f.remote.configure({ enabled: true });
+  assert.equal((await read(f.port, saved.cert)).status, 200);
+  const restarted = JSON.parse(
+    await fs.readFile(path.join(f.root, "remote-tls.json"), "utf8"),
+  );
+  assert.equal(restarted.cert, saved.cert);
+  assert.equal(restarted.key, saved.key);
+  await f.remote.configure({ transport: "proxy" });
+  assert.equal(f.remote.status().transport, "proxy");
+  assert.equal(f.remote.status().ready, true);
+  assert.equal((await read(f.port)).status, 200);
+  assert.deepEqual(f.events, [
+    `listening:${f.port}`,
+    `closed:${f.port}`,
+    `listening:${f.port}`,
+    `closed:${f.port}`,
+    `listening:${f.port}`,
+  ]);
 });

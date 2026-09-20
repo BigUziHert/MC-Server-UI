@@ -8,7 +8,8 @@ import {
 } from "react";
 import {
   AlertCircle,
-  Mail,
+  Copy,
+  Link,
   Pencil,
   Plus,
   ShieldCheck,
@@ -42,12 +43,22 @@ type Subuser = {
 type AccessSettings = {
   enabled: boolean;
   publicUrl: string;
-  from: string;
-  emailConfigured: boolean;
+  transport: "direct" | "proxy";
   port: number;
   ready: boolean;
   listening?: boolean;
   error?: string;
+  certificate?: { fingerprint256: string; validTo: string; hosts: string[] };
+};
+type NetworkInfo = {
+  publicIp: string | null;
+  localAddresses: string[];
+  port: number;
+};
+type Invitation = {
+  user: Subuser;
+  invitationUrl: string;
+  inviteExpiresAt: string;
 };
 function accessReady(settings: AccessSettings | null) {
   return !!settings?.ready && !settings.error && settings.listening !== false;
@@ -74,15 +85,17 @@ function RemoteAccessSetup({
   const [draft, setDraft] = useState({
     enabled: false,
     publicUrl: "",
-    from: "",
+    transport: "direct" as "direct" | "proxy",
     port: "3002",
-    apiKey: "",
   });
   const [loading, setLoading] = useState(true);
   const [hidden, setHidden] = useState(false);
   const [expanded, setExpanded] = useState(false);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
+  const [network, setNetwork] = useState<NetworkInfo | null>(null);
+  const [discovering, setDiscovering] = useState(false);
+  const [networkError, setNetworkError] = useState("");
 
   const applySettings = useCallback(
     (value: AccessSettings) => {
@@ -91,9 +104,8 @@ function RemoteAccessSetup({
       setDraft({
         enabled: value.enabled,
         publicUrl: value.publicUrl || "",
-        from: value.from || "",
+        transport: value.transport || "direct",
         port: String(value.port || 3002),
-        apiKey: "",
       });
     },
     [onSettings],
@@ -134,6 +146,35 @@ function RemoteAccessSetup({
     return () => controller.abort();
   }, [load]);
 
+  async function discoverAddress() {
+    setDiscovering(true);
+    setNetworkError("");
+    try {
+      const value = await panelApi<NetworkInfo>("/access/network");
+      setNetwork(value);
+      if (value.publicIp) {
+        const host = value.publicIp.includes(":")
+          ? `[${value.publicIp}]`
+          : value.publicIp;
+        setDraft((current) => ({
+          ...current,
+          publicUrl: `https://${host}:${current.port || 3002}`,
+        }));
+      } else
+        setNetworkError(
+          "Your public IP could not be detected. Enter the public address shown by your router.",
+        );
+    } catch (cause) {
+      setNetworkError(
+        cause instanceof Error
+          ? cause.message
+          : "Unable to detect your public IP. Enter it manually.",
+      );
+    } finally {
+      setDiscovering(false);
+    }
+  }
+
   async function save(event: FormEvent) {
     event.preventDefault();
     if (saving) return;
@@ -145,9 +186,8 @@ function RemoteAccessSetup({
         body: JSON.stringify({
           enabled: draft.enabled,
           publicUrl: draft.publicUrl.trim(),
-          from: draft.from.trim(),
+          transport: draft.transport,
           port: Number(draft.port),
-          ...(draft.apiKey.trim() ? { apiKey: draft.apiKey.trim() } : {}),
         }),
       });
       applySettings(result);
@@ -201,13 +241,13 @@ function RemoteAccessSetup({
         <div>
           <h2>
             {accessReady(settings)
-              ? "Invitations are configured"
+              ? "Remote access is configured"
               : "Set up phone access"}
           </h2>
           <p>
             {accessReady(settings)
-              ? "Invite someone by email to control this server with their own permissions."
-              : "Connect a public panel address and email delivery before sending invitations."}
+              ? "Create an invitation link and send it yourself by text or email."
+              : "Use your public IP and a forwarded port. No domain or email service needed."}
           </p>
         </div>
         <button
@@ -225,7 +265,7 @@ function RemoteAccessSetup({
           className="subusers-setup-form"
           onSubmit={save}
         >
-          <fieldset disabled={saving}>
+          <fieldset disabled={saving || discovering}>
             <PermissionCheckbox
               label="Enable remote access"
               description="Allow invited people to sign in through the public panel address."
@@ -234,11 +274,13 @@ function RemoteAccessSetup({
             />
             <div className="subusers-setup-grid">
               <div className="subusers-setup-field">
-                <label htmlFor="subusers-public-url">HTTPS panel URL</label>
+                <label htmlFor="subusers-public-url">
+                  Public panel address
+                </label>
                 <input
                   id="subusers-public-url"
                   type="url"
-                  placeholder="https://panel.example.com"
+                  placeholder="https://203.0.113.10:3002"
                   required={draft.enabled}
                   value={draft.publicUrl}
                   onChange={(event) =>
@@ -246,44 +288,15 @@ function RemoteAccessSetup({
                   }
                 />
                 <small>
-                  The address invited people will open on their phone.
+                  Your public IP and forwarded port, starting with https://.
                 </small>
-              </div>
-              <div className="subusers-setup-field">
-                <label htmlFor="subusers-mail-from">Sending address</label>
-                <input
-                  id="subusers-mail-from"
-                  placeholder="Minecraft Panel <panel@example.com>"
-                  required={draft.enabled}
-                  value={draft.from}
-                  onChange={(event) =>
-                    setDraft({ ...draft, from: event.target.value })
-                  }
-                />
-                <small>Use a sender from a domain verified in Resend.</small>
-              </div>
-              <div className="subusers-setup-field">
-                <label htmlFor="subusers-mail-key">Resend API key</label>
-                <input
-                  id="subusers-mail-key"
-                  type="password"
-                  autoComplete="new-password"
-                  spellCheck={false}
-                  placeholder={
-                    settings.emailConfigured
-                      ? "Saved — leave blank to keep"
-                      : "re_…"
-                  }
-                  value={draft.apiKey}
-                  onChange={(event) =>
-                    setDraft({ ...draft, apiKey: event.target.value })
-                  }
-                />
-                <small>
-                  {settings.emailConfigured
-                    ? "A key is saved. Enter a new key only to replace it."
-                    : "Used to deliver invitation and sign-in emails. Leave blank to keep a saved key."}
-                </small>
+                <button
+                  type="button"
+                  className="btn subusers-detect"
+                  onClick={() => void discoverAddress()}
+                >
+                  {discovering ? "Detecting…" : "Use my public IP"}
+                </button>
               </div>
               <div className="subusers-setup-field">
                 <label htmlFor="subusers-remote-port">Remote access port</label>
@@ -301,14 +314,104 @@ function RemoteAccessSetup({
                 <small>A separate port for authenticated remote access.</small>
               </div>
             </div>
-            <p className="subusers-setup-guidance">
-              Point an HTTPS reverse proxy or tunnel at{" "}
-              <code>http://127.0.0.1:{draft.port || "3002"}</code>, then use its
-              public address above. Configure the domain and HTTPS with your
-              provider, and route to this remote access port. The desktop panel
-              port is for local owner access. Keep this computer and the panel
-              running so invitations and phone access work.
-            </p>
+            {networkError && (
+              <p className="subusers-form-error" role="alert">
+                {networkError}
+              </p>
+            )}
+            <details
+              className="subusers-advanced"
+              open={draft.transport === "proxy" || undefined}
+            >
+              <summary>Advanced connection options</summary>
+              <PermissionCheckbox
+                label="HTTPS handled by a proxy"
+                checked={draft.transport === "proxy"}
+                description="Use an existing HTTPS reverse proxy or tunnel instead of the panel’s built-in HTTPS."
+                onChange={() =>
+                  setDraft({
+                    ...draft,
+                    transport:
+                      draft.transport === "direct" ? "proxy" : "direct",
+                  })
+                }
+              />
+            </details>
+            <div className="subusers-setup-guidance">
+              {draft.transport === "direct" ? (
+                <>
+                  <strong>Connect from outside your home</strong>
+                  <ol>
+                    <li>
+                      Forward TCP port <code>{draft.port || "3002"}</code> on
+                      your router to this computer’s local IP, using the same
+                      port. Allow that port through Windows Firewall.
+                    </li>
+                    <li>
+                      Save these settings, then open the public panel address on
+                      your phone using mobile data.
+                    </li>
+                    <li>
+                      Keep this computer and MC Panel running. Update the
+                      address here if your public IP changes.
+                    </li>
+                  </ol>
+                  {network?.localAddresses.length ? (
+                    <p>
+                      This computer’s local addresses:{" "}
+                      <code>{network.localAddresses.join(", ")}</code>. Choose
+                      the address on your router’s network and reserve it in the
+                      router.
+                    </p>
+                  ) : null}
+                  <p>
+                    MC Panel provides HTTPS and generates its own certificate.
+                    Browsers will show a certificate warning. Compare the
+                    certificate’s SHA-256 fingerprint with the one below through
+                    a trusted channel before trusting it. If they differ, stop
+                    and check the connection.
+                  </p>
+                  <p>
+                    These settings do not open router or firewall ports. If your
+                    provider uses shared public addresses (CGNAT), port
+                    forwarding may require a public IP from your provider or an
+                    HTTPS tunnel.
+                  </p>
+                </>
+              ) : (
+                <p>
+                  Point your HTTPS proxy or tunnel at{" "}
+                  <code>http://127.0.0.1:{draft.port || "3002"}</code> and
+                  preserve the public Host header. Keep the proxy and MC Panel
+                  running.
+                </p>
+              )}
+              <p>
+                Forward only the remote access port. The Minecraft game port and
+                local owner panel port are separate.
+              </p>
+            </div>
+            {draft.transport === "direct" && settings.certificate && (
+              <div className="subusers-setup-field subusers-certificate">
+                <label htmlFor="subusers-fingerprint">
+                  Certificate SHA-256 fingerprint
+                </label>
+                <textarea
+                  id="subusers-fingerprint"
+                  rows={3}
+                  readOnly
+                  value={settings.certificate.fingerprint256}
+                  onFocus={(event) => event.target.select()}
+                />
+                <small>
+                  Share this with your recipient so they can verify the
+                  certificate. Valid until{" "}
+                  {new Date(settings.certificate.validTo).toLocaleDateString()}.
+                  A changed public address may create a new certificate after
+                  saving.
+                </small>
+              </div>
+            )}
             {(error || settings.error) && (
               <p className="subusers-form-error" role="alert">
                 <AlertCircle size={16} />
@@ -319,7 +422,7 @@ function RemoteAccessSetup({
               <span>
                 {accessReady(settings)
                   ? "Settings saved. Check that the public address opens from your phone."
-                  : "Save the setup, then send an invitation below."}
+                  : "Save the setup, then create an invitation link below."}
               </span>
               <button className="btn primary" type="submit">
                 {saving ? "Saving…" : "Save access settings"}
@@ -374,6 +477,103 @@ function PermissionCheckbox({
   );
 }
 
+function InvitationDialog({
+  invitation,
+  onClose,
+}: {
+  invitation: Invitation;
+  onClose: () => void;
+}) {
+  const dialog = useRef<HTMLDialogElement>(null);
+  const link = useRef<HTMLTextAreaElement>(null);
+  const [copyStatus, setCopyStatus] = useState("");
+  useEffect(() => {
+    dialog.current?.showModal();
+    link.current?.focus();
+    link.current?.select();
+  }, []);
+  async function copy() {
+    try {
+      await navigator.clipboard.writeText(invitation.invitationUrl);
+      setCopyStatus("Invitation link copied.");
+    } catch {
+      link.current?.focus();
+      link.current?.select();
+      setCopyStatus(
+        "Clipboard access is unavailable. Copy the selected link manually, or try Copy link again.",
+      );
+    }
+  }
+  return (
+    <dialog
+      ref={dialog}
+      className="subusers-dialog subusers-link-dialog"
+      aria-labelledby="subuser-link-title"
+      onCancel={(event) => {
+        event.preventDefault();
+        onClose();
+      }}
+    >
+      <div className="subusers-link-content">
+        <header className="subusers-dialog-heading">
+          <h2 id="subuser-link-title">Share invitation link</h2>
+          <button
+            className="btn icon"
+            aria-label="Close invitation"
+            onClick={onClose}
+          >
+            <X size={18} />
+          </button>
+        </header>
+        <div className="subusers-editor-body">
+          <p className="subusers-editor-notice">
+            Send this link privately to <strong>{invitation.user.email}</strong>{" "}
+            using your own text or email app. MC Panel does not send an email.
+          </p>
+          <div className="subusers-setup-field">
+            <label htmlFor="subuser-invitation-url">Invitation link</label>
+            <textarea
+              ref={link}
+              id="subuser-invitation-url"
+              rows={4}
+              readOnly
+              value={invitation.invitationUrl}
+              onFocus={(event) => event.target.select()}
+            />
+            <small>
+              Works once. Expires{" "}
+              {new Date(invitation.inviteExpiresAt).toLocaleString()}.
+            </small>
+          </div>
+          <p className="subusers-editor-notice subusers-link-explanation">
+            The recipient chooses a password of at least 12 characters, then
+            signs in with their email and password. Creating another link
+            invalidates their previous unused link. Resetting access disables
+            their previous password and signs them out of this server
+            immediately. They regain access after accepting the new link.
+          </p>
+          {copyStatus && (
+            <p role="status" className="subusers-copy-status">
+              {copyStatus}
+            </p>
+          )}
+        </div>
+        <footer className="subusers-dialog-actions">
+          <span>Copy the link before closing this window.</span>
+          <div>
+            <button className="btn" onClick={onClose}>
+              Done
+            </button>
+            <button className="btn primary" onClick={() => void copy()}>
+              <Copy size={15} /> Copy link
+            </button>
+          </div>
+        </footer>
+      </div>
+    </dialog>
+  );
+}
+
 export default function Subusers({ notify }: PageProps) {
   const { api, post } = useServerApi();
   const [users, setUsers] = useState<Subuser[]>([]);
@@ -389,14 +589,16 @@ export default function Subusers({ notify }: PageProps) {
   const [email, setEmail] = useState("");
   const [selected, setSelected] = useState<string[]>([]);
   const [deleting, setDeleting] = useState<Subuser | null>(null);
+  const [resetting, setResetting] = useState<Subuser | null>(null);
   const [busy, setBusy] = useState(false);
   const [formError, setFormError] = useState("");
   const [accessSettings, setAccessSettings] = useState<AccessSettings | null>(
     null,
   );
-  const [sendOnCreate, setSendOnCreate] = useState(false);
+  const [inviteOnCreate, setInviteOnCreate] = useState(false);
   const [inviting, setInviting] = useState<string | null>(null);
   const [invitationError, setInvitationError] = useState("");
+  const [invitation, setInvitation] = useState<Invitation | null>(null);
   const dialog = useRef<HTMLDialogElement>(null);
   const emailInput = useRef<HTMLInputElement>(null);
   const cancelButton = useRef<HTMLButtonElement>(null);
@@ -433,21 +635,23 @@ export default function Subusers({ notify }: PageProps) {
     setUsers([]);
     setSearch("");
     setPage(1);
+    setInvitation(null);
+    setInvitationError("");
     void refresh();
     return () => request.current?.abort();
   }, [refresh]);
   useEffect(() => {
     const element = dialog.current;
-    if (editor || deleting) {
+    if (editor || deleting || resetting) {
       element?.showModal();
-      if (deleting) cancelButton.current?.focus();
+      if (deleting || resetting) cancelButton.current?.focus();
       else if (editor === "create") emailInput.current?.focus();
       else
         element
           ?.querySelector<HTMLInputElement>('input[type="checkbox"]')
           ?.focus();
     } else element?.close();
-  }, [editor, deleting]);
+  }, [editor, deleting, resetting]);
   useEffect(() => {
     if (formError) errorMessage.current?.scrollIntoView({ block: "nearest" });
   }, [formError]);
@@ -456,35 +660,39 @@ export default function Subusers({ notify }: PageProps) {
     if (busy) return;
     setEditor(null);
     setDeleting(null);
+    setResetting(null);
     setFormError("");
   }
   function openEditor(user?: Subuser) {
     setEmail(user?.email ?? "");
     setSelected(user ? permissionsFor(user) : []);
     setFormError("");
-    setSendOnCreate(accessReady(accessSettings));
+    setInviteOnCreate(accessReady(accessSettings));
     setEditor(user ?? "create");
   }
-  async function sendInvitation(user: Subuser) {
+  async function createInvitation(user: Subuser) {
     setInviting(user.id);
     setInvitationError("");
     try {
-      const result = await post<{ message: string; user: Subuser }>(
+      const result = await post<Invitation & { message: string }>(
         `/subusers/${encodeURIComponent(user.id)}/invite`,
       );
       setUsers((previous) =>
         previous.map((item) => (item.id === user.id ? result.user : item)),
       );
-      notify(result.message || `Invitation sent to ${user.email}.`);
+      setInvitation(result);
     } catch (cause) {
       const message =
         cause instanceof Error
           ? cause.message
-          : "Unable to send the invitation.";
+          : "Unable to create the invitation link.";
       setInvitationError(
-        `The subuser is saved, but the invitation to ${user.email} was not sent. ${message} Use ${user.invitedAt ? "Invite again" : "Send invite"} to retry.`,
+        `The subuser is saved, but an invitation link for ${user.email} could not be created. ${message} Use ${user.inviteStatus === "accepted" ? "Reset access" : "Create invite link"} to retry.`,
       );
-      notify("Invitation was not sent. The subuser is still saved.", true);
+      notify(
+        "Invitation link could not be created. The subuser is still saved.",
+        true,
+      );
     } finally {
       setInviting(null);
     }
@@ -506,7 +714,11 @@ export default function Subusers({ notify }: PageProps) {
     setBusy(true);
     setFormError("");
     try {
-      if (deleting) {
+      if (resetting) {
+        await createInvitation(resetting);
+        setResetting(null);
+        return;
+      } else if (deleting) {
         await api(`/subusers/${encodeURIComponent(deleting.id)}`, {
           method: "DELETE",
         });
@@ -522,14 +734,14 @@ export default function Subusers({ notify }: PageProps) {
           email: email.trim(),
           permissions: selected,
         });
-        // Creation has succeeded even if the separate email request fails.
+        // Creation has succeeded even if the separate invitation request fails.
         setEditor(null);
         await refresh();
-        if (sendOnCreate)
-          await sendInvitation("user" in result ? result.user : result);
+        if (inviteOnCreate)
+          await createInvitation("user" in result ? result.user : result);
         else
           notify(
-            "Subuser created. Send an invitation when access is configured.",
+            "Subuser created. Create an invitation link when access is configured.",
           );
         return;
       }
@@ -625,7 +837,7 @@ export default function Subusers({ notify }: PageProps) {
             message={
               search
                 ? "Try another email address."
-                : "Add someone by email, choose their permissions, and send an invitation."
+                : "Add someone, choose their permissions, and share an invitation link."
             }
           />
         ) : (
@@ -655,16 +867,16 @@ export default function Subusers({ notify }: PageProps) {
                           <span
                             title={
                               user.invitedAt
-                                ? `Last invitation sent ${new Date(user.invitedAt).toLocaleString()}`
+                                ? `Last invitation created ${new Date(user.invitedAt).toLocaleString()}`
                                 : undefined
                             }
                           >
                             {user.inviteStatus === "accepted"
                               ? "Access activated"
                               : user.inviteStatus === "pending"
-                                ? "Invitation sent · awaiting sign-in"
+                                ? "Link created · awaiting acceptance"
                                 : user.inviteStatus === "expired"
-                                  ? "Invitation expired · send again"
+                                  ? "Invitation expired · create a new link"
                                   : "Not invited"}
                           </span>
                         </div>
@@ -689,23 +901,27 @@ export default function Subusers({ notify }: PageProps) {
                       <div>
                         <button
                           className="btn subuser-invite"
-                          aria-label={`${user.invitedAt ? "Resend invitation to" : "Send invitation to"} ${user.email}`}
+                          aria-label={`${user.inviteStatus === "accepted" ? "Reset access for" : "Create invite link for"} ${user.email}`}
                           title={
                             accessReady(accessSettings)
-                              ? "Send a sign-in invitation by email"
-                              : "Complete remote access setup to send invitations"
+                              ? "Create a one-time link. Any previous unused link will stop working."
+                              : "Complete remote access setup to create invitation links"
                           }
                           disabled={
                             busy || !!inviting || !accessReady(accessSettings)
                           }
-                          onClick={() => void sendInvitation(user)}
+                          onClick={() =>
+                            user.inviteStatus === "accepted"
+                              ? setResetting(user)
+                              : void createInvitation(user)
+                          }
                         >
-                          <Mail size={14} />
+                          <Link size={14} />
                           {inviting === user.id
-                            ? "Sending…"
-                            : user.invitedAt
-                              ? "Invite again"
-                              : "Send invite"}
+                            ? "Creating…"
+                            : user.inviteStatus === "accepted"
+                              ? "Reset access"
+                              : "Create invite link"}
                         </button>
                         <button
                           className="btn icon"
@@ -750,7 +966,7 @@ export default function Subusers({ notify }: PageProps) {
 
       <dialog
         ref={dialog}
-        className={`subusers-dialog ${deleting ? "subusers-delete-dialog" : ""}`}
+        className={`subusers-dialog ${deleting || resetting ? "subusers-delete-dialog" : ""}`}
         aria-labelledby="subuser-dialog-title"
         onCancel={(event) => {
           event.preventDefault();
@@ -762,9 +978,11 @@ export default function Subusers({ notify }: PageProps) {
             <h2 id="subuser-dialog-title">
               {deleting
                 ? "Remove access record?"
-                : editing
-                  ? "Edit subuser permissions"
-                  : "Create new subuser"}
+                : resetting
+                  ? "Reset subuser access?"
+                  : editing
+                    ? "Edit subuser permissions"
+                    : "Create new subuser"}
             </h2>
             <button
               type="button"
@@ -777,7 +995,14 @@ export default function Subusers({ notify }: PageProps) {
             </button>
           </header>
           <div className="subusers-editor-body">
-            {deleting ? (
+            {resetting ? (
+              <p className="subusers-delete-description">
+                Reset access for <strong>{resetting.email}</strong> to this
+                server? Their current password and sessions stop working
+                immediately. Share the new link so they can choose a new
+                password and regain access.
+              </p>
+            ) : deleting ? (
               <p className="subusers-delete-description">
                 Revoke access for <strong>{deleting.email}</strong>? Their
                 active sessions and invitation links will stop working for this
@@ -804,23 +1029,29 @@ export default function Subusers({ notify }: PageProps) {
                     readOnly={!!editing}
                     disabled={busy}
                   />
+                  {!editing && (
+                    <small className="subusers-email-help">
+                      Used for sign-in. You will share the invitation link
+                      yourself; no email is sent.
+                    </small>
+                  )}
                 </div>
                 {!editing && (
                   <div className="subusers-invitation-choice">
                     <PermissionCheckbox
-                      label="Send invitation by email"
+                      label="Create invitation link"
                       disabled={busy || !accessReady(accessSettings)}
                       description={
                         accessReady(accessSettings)
-                          ? "Send a sign-in link as soon as this subuser is created."
-                          : "Complete remote access setup before sending invitations. You can create the subuser now and invite them later."
+                          ? "Show a one-time link to copy after this subuser is created."
+                          : "Complete remote access setup before creating links. You can save the subuser now and invite them later."
                       }
-                      checked={sendOnCreate}
-                      onChange={() => setSendOnCreate(!sendOnCreate)}
+                      checked={inviteOnCreate}
+                      onChange={() => setInviteOnCreate(!inviteOnCreate)}
                     />
                     {!accessReady(accessSettings) && (
                       <small>
-                        No invitation will be sent until remote access is
+                        No invitation link can be created until remote access is
                         configured.
                       </small>
                     )}
@@ -923,7 +1154,7 @@ export default function Subusers({ notify }: PageProps) {
             )}
           </div>
           <footer className="subusers-dialog-actions">
-            {!deleting && (
+            {!deleting && !resetting && (
               <span>
                 {selected.length}{" "}
                 {selected.length === 1 ? "permission" : "permissions"} selected
@@ -941,21 +1172,29 @@ export default function Subusers({ notify }: PageProps) {
               </button>
               <button
                 type="submit"
-                className={`btn ${deleting ? "danger" : "primary"}`}
+                className={`btn ${deleting || resetting ? "danger" : "primary"}`}
                 disabled={busy}
               >
                 {busy
                   ? "Saving…"
                   : deleting
                     ? "Remove record"
-                    : editing
-                      ? "Save permissions"
-                      : "Create subuser"}
+                    : resetting
+                      ? "Reset and create link"
+                      : editing
+                        ? "Save permissions"
+                        : "Create subuser"}
               </button>
             </div>
           </footer>
         </form>
       </dialog>
+      {invitation && (
+        <InvitationDialog
+          invitation={invitation}
+          onClose={() => setInvitation(null)}
+        />
+      )}
     </div>
   );
 }

@@ -454,10 +454,12 @@ test("subusers can be prepared before remote setup, searched, and revoked", asyn
   await openPage(page, "subusers", "Subusers");
   await page.getByRole("button", { name: "New user", exact: true }).click();
   let dialog = page.getByRole("dialog", { name: "Create new subuser" });
-  await expect(dialog.getByText(/No invitation will be sent/)).toBeVisible();
+  await expect(
+    dialog.getByText(/No invitation link can be created/),
+  ).toBeVisible();
   await expect(
     dialog.getByRole("checkbox", {
-      name: "Send invitation by email",
+      name: "Create invitation link",
       exact: true,
     }),
   ).toBeDisabled();

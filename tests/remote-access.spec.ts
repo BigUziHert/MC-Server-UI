@@ -12,6 +12,7 @@ const sister = {
     "control.console",
   ],
 };
+const password = "family server password";
 const server = {
   id: "family",
   name: "Family survival",
@@ -46,7 +47,7 @@ async function sharedEndpoints(page: Page, permissions = sister.permissions) {
   );
 }
 
-test("an invitation opens controls only after an explicit acceptance", async ({
+test("an invitation opens controls only after a password is chosen and explicitly submitted", async ({
   page,
 }, testInfo) => {
   await page.setViewportSize({ width: 390, height: 844 });
@@ -61,7 +62,7 @@ test("an invitation opens controls only after an explicit acceptance", async ({
   });
   await page.goto("/#invite=one-time-test-token");
   await expect(
-    page.getByRole("button", { name: "Accept invitation" }),
+    page.getByRole("button", { name: "Set password and continue" }),
   ).toBeVisible();
   await page.screenshot({
     path: testInfo.outputPath("mobile-invitation.png"),
@@ -71,11 +72,13 @@ test("an invitation opens controls only after an explicit acceptance", async ({
   await expect(
     page.getByRole("button", { name: "Start", exact: true }),
   ).toHaveCount(0);
-  await page.getByRole("button", { name: "Accept invitation" }).click();
+  await page.getByLabel("New password", { exact: true }).fill(password);
+  await page.getByLabel("Confirm password", { exact: true }).fill(password);
+  await page.getByRole("button", { name: "Set password and continue" }).click();
   await expect(
     page.getByRole("heading", { name: "Family survival" }),
   ).toBeVisible();
-  expect(accepted).toEqual([{ token: "one-time-test-token" }]);
+  expect(accepted).toEqual([{ token: "one-time-test-token", password }]);
   await expect(page).not.toHaveURL(/invite=/);
   await expect(
     page.getByRole("button", { name: "Start", exact: true }),
@@ -180,37 +183,183 @@ test("switching shared servers drops the previous console and uses the next memb
   ).toBeEnabled();
 });
 
-test("email sign-in gives a generic confirmation and logout returns to sign-in", async ({
+test("email and password sign-in opens the shared panel and logout returns to sign-in", async ({
   page,
-}) => {
+}, testInfo) => {
+  await page.setViewportSize({ width: 390, height: 844 });
+  await sharedEndpoints(page);
   await page.route("**/api/access/session", (route) =>
     route.fulfill({ json: { role: "guest" } }),
   );
-  let requestedEmail = "";
+  let requestedCredentials: unknown;
   await page.route("**/api/access/login", async (route) => {
-    requestedEmail = route.request().postDataJSON().email;
-    await route.fulfill({ json: { ok: true } });
+    requestedCredentials = route.request().postDataJSON();
+    await route.fulfill({ json: sister });
   });
   await page.goto("/");
+  await expect(page.getByLabel("Password", { exact: true })).toHaveAttribute(
+    "autocomplete",
+    "current-password",
+  );
+  await page.screenshot({
+    path: testInfo.outputPath("mobile-sign-in.png"),
+    fullPage: true,
+  });
   await page.getByLabel("Email address").fill("sister@example.com");
-  await page.getByRole("button", { name: "Email me a sign-in link" }).click();
-  await expect(page.getByRole("status")).toContainText(
-    "If this email has access",
-  );
-  expect(requestedEmail).toBe("sister@example.com");
-  await sharedEndpoints(page);
-  await page.route("**/api/access/session", (route) =>
-    route.fulfill({ json: sister }),
-  );
+  await page.getByLabel("Password", { exact: true }).fill(password);
+  await page.getByRole("button", { name: "Sign in", exact: true }).click();
+  await expect(
+    page.getByRole("heading", { name: "Family survival" }),
+  ).toBeVisible();
+  expect(requestedCredentials).toEqual({
+    email: "sister@example.com",
+    password,
+  });
   await page.route("**/api/access/logout", (route) =>
     route.fulfill({ json: { ok: true } }),
   );
-  await page.reload();
   await page.getByRole("button", { name: "Sign out" }).click();
   await expect(page.getByLabel("Email address")).toBeVisible();
   await expect(
     page.getByRole("heading", { name: "Family survival" }),
   ).toHaveCount(0);
+});
+
+test("an invitation validates password length and confirmation before sending credentials", async ({
+  page,
+}) => {
+  await page.route("**/api/access/session", (route) =>
+    route.fulfill({ json: { role: "guest" } }),
+  );
+  let acceptRequests = 0;
+  await page.route("**/api/access/accept", (route) => {
+    acceptRequests++;
+    return route.fulfill({ json: sister });
+  });
+  await page.goto("/#invite=password-validation-token");
+  const newPassword = page.getByLabel("New password", { exact: true });
+  const confirmation = page.getByLabel("Confirm password", { exact: true });
+  await expect(newPassword).toHaveAttribute("autocomplete", "new-password");
+  await newPassword.fill("too short");
+  await confirmation.fill("too short");
+  await page.getByRole("button", { name: "Set password and continue" }).click();
+  await expect(page.getByRole("alert")).toContainText("12 and 128 characters");
+  await newPassword.fill(password);
+  await confirmation.fill("another password");
+  await page.getByRole("button", { name: "Set password and continue" }).click();
+  await expect(page.getByRole("alert")).toContainText("passwords do not match");
+  expect(acceptRequests).toBe(0);
+  await expect(page).toHaveURL(/invite=password-validation-token/);
+});
+
+test("an expired invitation keeps its URL and offers a clear way back to sign-in", async ({
+  page,
+}) => {
+  await page.route("**/api/access/session", (route) =>
+    route.fulfill({ json: { role: "guest" } }),
+  );
+  await page.route("**/api/access/accept", (route) =>
+    route.fulfill({
+      status: 401,
+      json: { error: "This invitation link is invalid or expired." },
+    }),
+  );
+  await page.goto("/#invite=expired-token");
+  await page.getByLabel("New password", { exact: true }).fill(password);
+  await page.getByLabel("Confirm password", { exact: true }).fill(password);
+  await page.getByRole("button", { name: "Set password and continue" }).click();
+  await expect(
+    page.getByRole("heading", { name: "This invitation is unavailable" }),
+  ).toBeVisible();
+  await expect(
+    page.getByText("Ask the server owner for a new invitation link.", {
+      exact: false,
+    }),
+  ).toBeVisible();
+  await expect(page.getByRole("alert")).toContainText("invalid or expired");
+  await expect(page).toHaveURL(/invite=expired-token/);
+  await expect(page.getByLabel("Email address")).toHaveCount(0);
+  await page.getByRole("button", { name: "Back to sign in" }).click();
+  await expect(
+    page.getByRole("heading", { name: "Welcome to your server" }),
+  ).toBeVisible();
+  await expect(page.getByLabel("Email address")).toBeVisible();
+  await expect(page.getByRole("alert")).toHaveCount(0);
+  await expect(page).toHaveURL(/invite=expired-token/);
+});
+
+test("failed credentials stay on sign-in with the generic server error and allow a retry", async ({
+  page,
+}) => {
+  await sharedEndpoints(page);
+  await page.route("**/api/access/session", (route) =>
+    route.fulfill({ json: { role: "guest" } }),
+  );
+  let attempts = 0;
+  await page.route("**/api/access/login", (route) => {
+    attempts++;
+    return attempts === 1
+      ? route.fulfill({
+          status: 401,
+          json: { error: "Email or password is incorrect." },
+        })
+      : route.fulfill({ json: sister });
+  });
+  await page.goto("/");
+  await page.getByLabel("Email address").fill("sister@example.com");
+  await page.getByLabel("Password", { exact: true }).fill("incorrect password");
+  await page.getByRole("button", { name: "Sign in", exact: true }).click();
+  await expect(page.getByRole("alert")).toHaveText(
+    "Email or password is incorrect.",
+  );
+  await expect(
+    page.getByRole("heading", { name: "Family survival" }),
+  ).toHaveCount(0);
+  await page.getByLabel("Password", { exact: true }).fill(password);
+  await page.getByRole("button", { name: "Sign in", exact: true }).click();
+  await expect(
+    page.getByRole("heading", { name: "Family survival" }),
+  ).toBeVisible();
+});
+
+test("leaving an invitation cancels a pending acceptance and ignores its late result", async ({
+  page,
+}) => {
+  await page.route("**/api/access/session", (route) =>
+    route.fulfill({ json: { role: "guest" } }),
+  );
+  let finishAcceptance: (() => void) | undefined;
+  let received: (() => void) | undefined;
+  const requestReceived = new Promise<void>((resolve) => {
+    received = resolve;
+  });
+  const responseReady = new Promise<void>((resolve) => {
+    finishAcceptance = resolve;
+  });
+  const routeDone = new Promise<void>((resolve) => {
+    void page.route("**/api/access/accept", async (route) => {
+      received?.();
+      await responseReady;
+      await route.fulfill({ json: sister }).catch(() => {});
+      resolve();
+    });
+  });
+  await page.goto("/#invite=pending-token");
+  await page.getByLabel("New password", { exact: true }).fill(password);
+  await page.getByLabel("Confirm password", { exact: true }).fill(password);
+  await page.getByRole("button", { name: "Set password and continue" }).click();
+  await requestReceived;
+  await page.getByRole("button", { name: "Back to sign in" }).click();
+  await expect(page.getByLabel("Email address")).toBeVisible();
+  finishAcceptance?.();
+  await routeDone;
+  await expect(
+    page.getByRole("heading", { name: "Welcome to your server" }),
+  ).toBeVisible();
+  await expect(
+    page.getByRole("heading", { name: "Family survival" }),
+  ).toHaveCount(0);
+  await expect(page).toHaveURL(/invite=pending-token/);
 });
 
 test("an unavailable session endpoint never opens owner controls", async ({

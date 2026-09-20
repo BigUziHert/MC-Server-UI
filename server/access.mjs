@@ -1,15 +1,21 @@
-import { createHash, randomBytes, randomUUID } from "node:crypto";
+import {
+  createHash,
+  randomBytes,
+  randomUUID,
+  scrypt,
+  timingSafeEqual,
+} from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
+import { promisify } from "node:util";
 
 export const SUBUSER_COOKIE = "__Host-mc-subuser";
 const invitationLifetime = 24 * 60 * 60 * 1000;
-const loginLifetime = 15 * 60 * 1000;
 const sessionLifetime = 7 * 24 * 60 * 60 * 1000;
+const maxEmailMemberships = 32;
 const invalidLink =
-  "This sign-in link is invalid or expired. Request a new email.";
-const loginMessage =
-  "If this email has an invitation, a sign-in link has been sent.";
+  "This invitation link is invalid or expired. Ask the server owner for a new link.";
+const invalidLogin = "The email or password is incorrect.";
 const fail = (status, message) => Object.assign(new Error(message), { status });
 const digest = (value) => createHash("sha256").update(value).digest("hex");
 const secret = () => randomBytes(32).toString("base64url");
@@ -19,16 +25,39 @@ const normalizedEmail = (value) =>
   typeof value === "string" ? value.trim().toLowerCase() : "";
 const validEmail = (value) =>
   value.length <= 254 && /^[^\s@<>]+@[^\s@<>]+\.[^\s@<>]+$/.test(value);
-const escapeHtml = (value) =>
-  String(value).replace(
-    /[&<>"']/g,
-    (character) =>
-      ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[
-        character
-      ],
-  );
+const validPassword = (value) =>
+  typeof value === "string" && value.length >= 12 && value.length <= 128;
 const membershipKey = (serverId, userId) => JSON.stringify([serverId, userId]);
+const scopeKey = (record) => membershipKey(record.serverId, record.userId);
 const clearCookie = `${SUBUSER_COOKIE}=; Path=/; HttpOnly; SameSite=Strict; Secure; Max-Age=0`;
+const derivePassword = promisify(scrypt);
+const passwordOptions = { N: 16384, r: 8, p: 1, maxmem: 64 * 1024 * 1024 };
+const dummyPassword = {
+  salt: randomBytes(32).toString("hex"),
+  hash: randomBytes(64).toString("hex"),
+};
+
+async function hashPassword(password) {
+  const salt = randomBytes(32).toString("hex");
+  const hash = await derivePassword(password, salt, 64, passwordOptions);
+  return { algorithm: "scrypt", salt, hash: hash.toString("hex") };
+}
+
+async function matchesPassword(password, stored) {
+  if (
+    !stored ||
+    !/^[a-f0-9]{64}$/.test(stored.salt) ||
+    !/^[a-f0-9]{128}$/.test(stored.hash)
+  )
+    return false;
+  const actual = await derivePassword(
+    password,
+    stored.salt,
+    64,
+    passwordOptions,
+  );
+  return timingSafeEqual(actual, Buffer.from(stored.hash, "hex"));
+}
 
 function cookieSecret(req) {
   const value = req?.headers?.cookie;
@@ -42,10 +71,16 @@ function cookieSecret(req) {
   return validSecret(token) ? token : null;
 }
 
-function validateConfiguration(input, current) {
+// Allowlisted configuration drops retired email provider credentials during migration.
+export function validateAccessConfiguration(input, current = {}) {
   if (!input || typeof input !== "object" || Array.isArray(input))
     throw fail(400, "Enter valid remote access settings.");
-  const result = { ...current };
+  const result = {
+    enabled: current.enabled ?? false,
+    publicUrl: current.publicUrl ?? "",
+    port: current.port ?? 3002,
+    transport: current.transport ?? "direct",
+  };
   if (Object.hasOwn(input, "enabled")) {
     if (typeof input.enabled !== "boolean")
       throw fail(400, "Choose whether remote access is enabled.");
@@ -60,9 +95,14 @@ function validateConfiguration(input, current) {
       throw fail(400, "Choose a remote access port from 1024 to 65535.");
     result.port = input.port;
   }
+  if (Object.hasOwn(input, "transport")) {
+    if (input.transport !== "direct" && input.transport !== "proxy")
+      throw fail(400, "Choose direct HTTPS or an HTTPS reverse proxy.");
+    result.transport = input.transport;
+  }
   if (Object.hasOwn(input, "publicUrl")) {
     if (typeof input.publicUrl !== "string" || input.publicUrl.length > 2048)
-      throw fail(400, "Enter the HTTPS origin of your remote panel.");
+      throw fail(400, "Enter the HTTPS address of your remote panel.");
     const text = input.publicUrl.trim();
     if (!text) result.publicUrl = "";
     else {
@@ -70,11 +110,12 @@ function validateConfiguration(input, current) {
       try {
         url = new URL(text);
       } catch {
-        /* Report a safe validation error. */
+        /* Report safe validation errors. */
       }
       if (
         !url ||
         url.protocol !== "https:" ||
+        !url.hostname ||
         url.username ||
         url.password ||
         url.pathname !== "/" ||
@@ -83,93 +124,29 @@ function validateConfiguration(input, current) {
       )
         throw fail(
           400,
-          "Enter an HTTPS origin without a path, query, or credentials.",
+          "Enter an HTTPS address without a path, query, or credentials.",
         );
       result.publicUrl = url.origin;
     }
   }
-  if (Object.hasOwn(input, "from")) {
-    if (
-      typeof input.from !== "string" ||
-      input.from.length > 320 ||
-      /[\r\n]/.test(input.from)
-    )
-      throw fail(400, "Enter a valid verified sender email address.");
-    const sender = input.from.trim();
-    const displayAddress = /^[^<>]+<([^<>]+)>$/.exec(sender);
-    if (sender && !validEmail(displayAddress?.[1] ?? sender))
-      throw fail(400, "Enter a valid verified sender email address.");
-    result.from = sender;
-  }
-  if (Object.hasOwn(input, "apiKey")) {
-    if (
-      typeof input.apiKey !== "string" ||
-      input.apiKey.length > 512 ||
-      /[\r\n]/.test(input.apiKey)
-    )
-      throw fail(400, "Enter a valid Resend API key.");
-    if (input.apiKey.trim()) result.apiKey = input.apiKey.trim();
-  }
-  if (input.clearApiKey === true) result.apiKey = "";
-  if (result.enabled && (!result.publicUrl || !result.from || !result.apiKey))
+  if (result.enabled && !result.publicUrl)
     throw fail(
       400,
-      "Enter the HTTPS panel address, verified sender, and Resend API key before enabling remote access.",
+      "Enter the HTTPS panel address before enabling remote access.",
     );
   return result;
 }
 
-// The provider URL is fixed: settings cannot redirect API credentials elsewhere.
-// API reference: https://resend.com/docs/api-reference/emails/send-email
-export function createResendSender({ fetchMail = fetch } = {}) {
-  return async (message, { apiKey }) => {
-    try {
-      const response = await fetchMail("https://api.resend.com/emails", {
-        method: "POST",
-        redirect: "error",
-        signal: AbortSignal.timeout(10_000),
-        headers: {
-          Authorization: `Bearer ${apiKey}`,
-          "Content-Type": "application/json",
-          "User-Agent": "MC-Server-UI",
-        },
-        body: JSON.stringify(message),
-      });
-      // Provider response bodies can contain submitted credentials or addresses.
-      // Neither they nor transport errors are exposed to clients or logs.
-      await response.body?.cancel().catch(() => {});
-      if (!response.ok) throw new Error("Email provider rejected the request.");
-    } catch {
-      throw fail(
-        502,
-        "The invitation email could not be sent. Check the sender and email provider settings.",
-      );
-    }
-  };
-}
-
-/**
- * getUser(serverId, userId) must return the current user with resolved permissions.
- * listMemberships(email) returns [{ serverId, user, serverName }]. These callbacks
- * must read current records so deletion and permission changes take effect at once.
- */
+/** getUser reads current memberships and permissions. Email never proves access to other memberships. */
 export async function createAccessService({
   dataDir,
   getUser,
-  listMemberships,
-  sendMail = createResendSender(),
   now = Date.now,
 }) {
   const storage = path.join(dataDir, "remote-access.json");
   let state = {
-    version: 1,
-    configuration: {
-      enabled: false,
-      publicUrl: "",
-      from: "",
-      apiKey: "",
-      port: 3002,
-    },
+    version: 2,
+    configuration: validateAccessConfiguration({}),
     memberships: [],
     tokens: [],
     sessions: [],
@@ -177,18 +154,25 @@ export async function createAccessService({
   try {
     const saved = JSON.parse(await fs.readFile(storage, "utf8"));
     if (
-      saved.version !== 1 ||
+      ![1, 2].includes(saved.version) ||
       !Array.isArray(saved.memberships) ||
       !Array.isArray(saved.tokens) ||
       !Array.isArray(saved.sessions)
     )
       throw new Error("Invalid access storage.");
+    const configuration = { ...saved.configuration };
+    if (
+      saved.version === 1 &&
+      (Object.hasOwn(configuration, "from") ||
+        Object.hasOwn(configuration, "apiKey"))
+    )
+      configuration.transport ??= "proxy";
     state = {
-      ...saved,
-      configuration: validateConfiguration(
-        saved.configuration,
-        state.configuration,
-      ),
+      version: 2,
+      configuration: validateAccessConfiguration(configuration),
+      memberships: saved.memberships,
+      tokens: saved.tokens,
+      sessions: saved.sessions,
     };
   } catch (cause) {
     if (cause.code !== "ENOENT")
@@ -199,12 +183,27 @@ export async function createAccessService({
   }
   let queue = Promise.resolve();
   let closing = false;
+  let pendingAuthentications = 0;
   const serialize = (operation) => {
     if (closing)
       return Promise.reject(fail(503, "Remote access is shutting down."));
     const pending = queue.then(operation);
     queue = pending.catch(() => {});
     return pending;
+  };
+  // Bound expensive password work across all peer addresses as well as the
+  // gateway's per-peer limits. Owner settings cannot acquire an endless queue.
+  const serializeAuthentication = (operation) => {
+    if (closing)
+      return Promise.reject(fail(503, "Remote access is shutting down."));
+    if (pendingAuthentications >= 16)
+      return Promise.reject(
+        fail(429, "Too many sign-in attempts. Try again later."),
+      );
+    pendingAuthentications += 1;
+    return serialize(operation).finally(() => {
+      pendingAuthentications -= 1;
+    });
   };
   const persist = async (next) => {
     const temporary = `${storage}.${randomUUID()}.tmp`;
@@ -227,134 +226,73 @@ export async function createAccessService({
   const cleaned = () => ({
     ...state,
     tokens: state.tokens.filter(
-      (token) => token.expiresAt > now() && token.sent,
+      (token) => token.expiresAt > now() && token.sent !== false,
     ),
     sessions: state.sessions.filter((session) => session.expiresAt > now()),
   });
-  const status = () => {
-    const { enabled, publicUrl, from, apiKey, port } = state.configuration;
-    const emailConfigured = Boolean(from && apiKey);
-    return {
-      enabled,
-      publicUrl,
-      from,
-      emailConfigured,
-      port,
-      ready: Boolean(enabled && publicUrl && emailConfigured),
-    };
-  };
+  const status = () => ({
+    ...state.configuration,
+    ready: Boolean(
+      state.configuration.enabled && state.configuration.publicUrl,
+    ),
+  });
   const requireReady = () => {
     if (!status().ready)
       throw fail(
         409,
-        "Configure the HTTPS panel address and email sender, then enable remote access before inviting a subuser.",
+        "Configure the HTTPS panel address and enable remote access before creating an invitation link.",
       );
   };
   const liveUser = async (record) => {
     const user = await getUser(record.serverId, record.userId);
     return user && normalizedEmail(user.email) === record.email ? user : null;
   };
-  const sessionView = (record, user) => ({
+  const enrolled = (record) =>
+    state.memberships.some(
+      (item) =>
+        scopeKey(item) === scopeKey(record) && item.email === record.email,
+    );
+  const sessionScopes = (record) =>
+    Array.isArray(record.memberships)
+      ? record.memberships
+      : [{ serverId: record.serverId, userId: record.userId }];
+  const sessionIncludes = (record, key) =>
+    sessionScopes(record).some((scope) => scopeKey(scope) === key);
+  const sessionView = (record, user, memberships) => ({
     role: "subuser",
     email: record.email,
     serverId: record.serverId,
     userId: record.userId,
     permissions: Array.isArray(user.permissions) ? [...user.permissions] : [],
+    memberships: memberships.map(({ serverId, userId }) => ({
+      serverId,
+      userId,
+    })),
   });
-  const sendInvitation = async (
-    { serverId, user, serverName },
-    isLogin = false,
-  ) => {
-    requireReady();
-    const email = normalizedEmail(user?.email);
-    const record = { serverId, userId: user?.id, email };
-    if (
-      typeof serverId !== "string" ||
-      !serverId ||
-      typeof user?.id !== "string" ||
-      !validEmail(email) ||
-      !(await liveUser(record))
-    )
-      throw fail(404, "This subuser no longer exists.");
-    const token = secret();
-    const key = membershipKey(serverId, user.id);
-    const createdAt = now();
-    const expiresAt =
-      createdAt + (isLogin ? loginLifetime : invitationLifetime);
-    const pendingToken = {
-      ...record,
-      hash: digest(token),
-      createdAt,
-      expiresAt,
-      sent: false,
+  const createSession = (records) => {
+    const value = secret();
+    const { serverId, userId, email } = records[0];
+    const session = {
+      serverId,
+      userId,
+      email,
+      memberships: records.map(({ serverId: id, userId: memberId }) => ({
+        serverId: id,
+        userId: memberId,
+      })),
+      hash: digest(value),
+      expiresAt: now() + sessionLifetime,
     };
-    const previous = cleaned();
-    // Persist before contacting the mail service; a crash cannot create a usable
-    // email token whose state was never recorded. Unconfirmed sends stay unusable.
-    await persist({ ...previous, tokens: [...previous.tokens, pendingToken] });
-    const link = `${state.configuration.publicUrl}/#invite=${token}`;
-    const name = String(serverName || "your Minecraft server")
-      .replace(/[\r\n]/g, " ")
-      .slice(0, 160);
-    const subject = isLogin
-      ? `Sign in to ${name}`
-      : `You are invited to control ${name}`;
-    const introduction = isLogin
-      ? `Sign in to ${name}.`
-      : `You have been invited to manage ${name} from your phone or browser.`;
-    const expiry = isLogin ? "15 minutes" : "24 hours";
-    try {
-      await sendMail(
-        {
-          from: state.configuration.from,
-          to: [email],
-          subject,
-          text: `${introduction}\n\nOpen this link to sign in:\n${link}\n\nThis link works once and expires in ${expiry}. Keep it private. If you did not expect this email, you can ignore it.`,
-          html: `<p>${escapeHtml(introduction)}</p><p><a href="${escapeHtml(link)}">Open server controls</a></p><p>This link works once and expires in ${expiry}. Keep it private. If you did not expect this email, you can ignore it.</p>`,
-        },
-        { apiKey: state.configuration.apiKey },
-      );
-    } catch {
-      await persist(previous);
-      throw fail(
-        502,
-        "The invitation email could not be sent. Check the sender and email provider settings.",
-      );
-    }
-    // Successful resends replace outstanding links, while current sessions remain.
-    const priorMembership = previous.memberships.find(
-      (item) =>
-        membershipKey(item.serverId, item.userId) === key &&
-        item.email === email,
-    );
-    const memberships = previous.memberships.filter(
-      (item) => membershipKey(item.serverId, item.userId) !== key,
-    );
-    memberships.push({
-      ...record,
-      invitedAt: createdAt,
-      ...(priorMembership?.acceptedAt
-        ? { acceptedAt: priorMembership.acceptedAt }
-        : {}),
-    });
-    await persist({
-      ...previous,
-      memberships,
-      tokens: [
-        ...previous.tokens.filter(
-          (item) => membershipKey(item.serverId, item.userId) !== key,
-        ),
-        { ...pendingToken, sent: true },
-      ],
-    });
     return {
-      invitedAt: new Date(createdAt).toISOString(),
-      inviteExpiresAt: new Date(expiresAt).toISOString(),
+      session,
+      cookie: `${SUBUSER_COOKIE}=${value}; Path=/; HttpOnly; SameSite=Strict; Secure; Max-Age=${sessionLifetime / 1000}`,
     };
   };
 
   return {
     status,
+    validateConfiguration: (input) =>
+      validateAccessConfiguration(input, state.configuration),
     async close() {
       closing = true;
       await queue;
@@ -368,7 +306,7 @@ export async function createAccessService({
         (item) =>
           item.serverId === serverId &&
           item.userId === userId &&
-          item.sent &&
+          item.sent !== false &&
           item.expiresAt > now(),
       );
       return {
@@ -377,15 +315,14 @@ export async function createAccessService({
         acceptedAt: invited.acceptedAt
           ? new Date(invited.acceptedAt).toISOString()
           : null,
-        inviteStatus: invited.acceptedAt
-          ? "accepted"
-          : token
-            ? "pending"
+        inviteStatus: token
+          ? "pending"
+          : invited.acceptedAt
+            ? "accepted"
             : "expired",
       };
     },
-    // This enrollment lookup is synchronous for fleet filtering. The caller must
-    // pair it with the current user record; authentication always does that itself.
+    // Enrollment alone never grants a browser session another membership's scope.
     membershipAllowed(serverId, userId, email) {
       return state.memberships.some(
         (item) =>
@@ -396,11 +333,14 @@ export async function createAccessService({
     },
     configure: (input) =>
       serialize(async () => {
-        const configuration = validateConfiguration(input, state.configuration);
-        // Disabling access or changing the origin invalidates existing browser sessions.
+        const configuration = validateAccessConfiguration(
+          input,
+          state.configuration,
+        );
         const reset =
           !configuration.enabled ||
-          configuration.publicUrl !== state.configuration.publicUrl;
+          configuration.publicUrl !== state.configuration.publicUrl ||
+          configuration.transport !== state.configuration.transport;
         await persist({
           ...cleaned(),
           configuration,
@@ -408,40 +348,131 @@ export async function createAccessService({
         });
         return status();
       }),
-    invite: (membership) => serialize(() => sendInvitation(membership)),
-    accept: (token) =>
+    invite: ({ serverId, user }) =>
       serialize(async () => {
+        requireReady();
+        const email = normalizedEmail(user?.email);
+        const record = { serverId, userId: user?.id, email };
+        if (
+          typeof serverId !== "string" ||
+          !serverId ||
+          typeof user?.id !== "string" ||
+          !user.id ||
+          !validEmail(email) ||
+          !(await liveUser(record))
+        )
+          throw fail(404, "This subuser no longer exists.");
+        const key = scopeKey(record);
+        const previous = cleaned();
+        if (
+          previous.memberships.filter(
+            (item) => item.email === email && scopeKey(item) !== key,
+          ).length >= maxEmailMemberships
+        )
+          throw fail(
+            400,
+            "This email has reached the limit of 32 remote server memberships.",
+          );
+        const token = secret();
+        const createdAt = now();
+        const expiresAt = createdAt + invitationLifetime;
+        await persist({
+          ...previous,
+          memberships: [
+            ...previous.memberships.filter((item) => scopeKey(item) !== key),
+            { ...record, invitedAt: createdAt },
+          ],
+          tokens: [
+            ...previous.tokens.filter((item) => scopeKey(item) !== key),
+            { ...record, hash: digest(token), createdAt, expiresAt },
+          ],
+          // A fresh link resets the password and every session including this member.
+          sessions: previous.sessions.filter(
+            (session) => !sessionIncludes(session, key),
+          ),
+        });
+        return {
+          invitationUrl: `${state.configuration.publicUrl}/#invite=${token}`,
+          invitedAt: new Date(createdAt).toISOString(),
+          inviteExpiresAt: new Date(expiresAt).toISOString(),
+        };
+      }),
+    accept: (token, password) =>
+      serializeAuthentication(async () => {
         if (!status().ready || !validSecret(token))
           throw fail(401, invalidLink);
         const hash = digest(token);
         const record = state.tokens.find(
-          (item) => item.hash === hash && item.sent && item.expiresAt > now(),
+          (item) =>
+            item.hash === hash && item.sent !== false && item.expiresAt > now(),
         );
-        if (!record) throw fail(401, invalidLink);
+        if (!record || !enrolled(record)) throw fail(401, invalidLink);
         const user = await liveUser(record);
         if (!user) throw fail(401, invalidLink);
-        const value = secret();
-        const session = {
-          serverId: record.serverId,
-          userId: record.userId,
-          email: record.email,
-          hash: digest(value),
-          expiresAt: now() + sessionLifetime,
-        };
+        if (!validPassword(password))
+          throw fail(400, "Choose a password with 12 to 128 characters.");
+        const passwordHash = await hashPassword(password);
+        const issued = createSession([record]);
         const next = cleaned();
+        const key = scopeKey(record);
         await persist({
           ...next,
           memberships: next.memberships.map((item) =>
-            item.serverId === record.serverId && item.userId === record.userId
-              ? { ...item, acceptedAt: now() }
+            scopeKey(item) === key
+              ? { ...item, acceptedAt: now(), password: passwordHash }
               : item,
           ),
-          tokens: next.tokens.filter((item) => item.hash !== hash),
-          sessions: [...next.sessions, session],
+          tokens: next.tokens.filter((item) => scopeKey(item) !== key),
+          sessions: [
+            ...next.sessions.filter(
+              (session) => !sessionIncludes(session, key),
+            ),
+            issued.session,
+          ],
         });
         return {
-          cookie: `${SUBUSER_COOKIE}=${value}; Path=/; HttpOnly; SameSite=Strict; Secure; Max-Age=${sessionLifetime / 1000}`,
-          session: sessionView(session, user),
+          cookie: issued.cookie,
+          session: sessionView(
+            issued.session,
+            user,
+            issued.session.memberships,
+          ),
+        };
+      }),
+    login: (input) =>
+      serializeAuthentication(async () => {
+        const email = normalizedEmail(input?.email);
+        const password = input?.password;
+        if (!status().ready || !validEmail(email) || !validPassword(password))
+          throw fail(401, invalidLogin);
+        const candidates = state.memberships
+          .filter((item) => item.email === email && item.password)
+          .slice(0, maxEmailMemberships);
+        const matched = [];
+        let primaryUser;
+        for (const record of candidates) {
+          const user = await liveUser(record);
+          if (await matchesPassword(password, record.password)) {
+            if (!user) continue;
+            primaryUser ??= user;
+            matched.push(record);
+          }
+        }
+        if (!candidates.length) await matchesPassword(password, dummyPassword);
+        if (!matched.length) throw fail(401, invalidLogin);
+        const issued = createSession(matched);
+        const next = cleaned();
+        await persist({
+          ...next,
+          sessions: [...next.sessions, issued.session],
+        });
+        return {
+          cookie: issued.cookie,
+          session: sessionView(
+            issued.session,
+            primaryUser,
+            issued.session.memberships,
+          ),
         };
       }),
     async authenticate(req) {
@@ -452,64 +483,57 @@ export async function createAccessService({
         (item) => item.hash === digest(token) && item.expiresAt > now(),
       );
       if (!record) return null;
+      const memberships = [];
+      for (const scope of sessionScopes(record).slice(0, maxEmailMemberships)) {
+        const membership = { ...scope, email: record.email };
+        if (enrolled(membership) && (await liveUser(membership)))
+          memberships.push(scope);
+      }
+      // A deleted primary invalidates the session; never expand or rehome it.
+      if (!memberships.some((scope) => scopeKey(scope) === scopeKey(record)))
+        return null;
       const user = await liveUser(record);
-      return user ? sessionView(record, user) : null;
+      return user ? sessionView(record, user, memberships) : null;
     },
-    logout: (req) =>
-      serialize(async () => {
-        const token = cookieSecret(req);
-        if (token) {
-          const hash = digest(token);
+    logout: (req) => {
+      if (closing)
+        return Promise.reject(fail(503, "Remote access is shutting down."));
+      const token = cookieSecret(req);
+      const hash = token ? digest(token) : null;
+      // Unknown cookies need no queued disk write. Check again after acquiring
+      // the queue so concurrent logout requests only invalidate the session once.
+      if (!hash || !state.sessions.some((item) => item.hash === hash))
+        return Promise.resolve(clearCookie);
+      return serialize(async () => {
+        if (state.sessions.some((item) => item.hash === hash)) {
+          const next = cleaned();
           await persist({
-            ...cleaned(),
-            sessions: state.sessions.filter(
-              (item) => item.hash !== hash && item.expiresAt > now(),
-            ),
+            ...next,
+            sessions: next.sessions.filter((item) => item.hash !== hash),
           });
         }
         return clearCookie;
-      }),
+      });
+    },
     revoke: (serverId, userId) =>
       serialize(async () => {
         const key = membershipKey(serverId, userId);
-        const keep = (record) =>
-          membershipKey(record.serverId, record.userId) !== key;
         const next = cleaned();
         await persist({
           ...next,
-          memberships: next.memberships.filter(keep),
-          tokens: next.tokens.filter(keep),
-          sessions: next.sessions.filter(keep),
+          memberships: next.memberships.filter(
+            (item) => scopeKey(item) !== key,
+          ),
+          tokens: next.tokens.filter((item) => scopeKey(item) !== key),
+          sessions: next.sessions.filter(
+            (session) => !sessionIncludes(session, key),
+          ),
         });
-      }),
-    requestLogin: (input) =>
-      serialize(async () => {
-        const email = normalizedEmail(input);
-        if (status().ready && validEmail(email)) {
-          const memberships = await listMemberships(email);
-          for (const membership of memberships) {
-            const invited = state.memberships.some(
-              (item) =>
-                item.email === email &&
-                item.serverId === membership.serverId &&
-                item.userId === membership.user?.id,
-            );
-            if (!invited) continue;
-            try {
-              await sendInvitation(membership, true);
-            } catch {
-              /* Keep outward responses identical for unknown or undeliverable mail. */
-            }
-          }
-        }
-        return { message: loginMessage };
       }),
   };
 }
 
-// Keep the gateway's actual peer address: arbitrary X-Forwarded-For headers must
-// not let unauthenticated callers bypass limits. A proxy shares one conservative
-// bucket unless the deployment adds a separately authenticated proxy boundary.
+// Ignore spoofed forwarding headers: only the gateway's actual peer is trusted.
 export function createAccessRateLimiter({
   limit = 10,
   windowMs = 15 * 60 * 1000,

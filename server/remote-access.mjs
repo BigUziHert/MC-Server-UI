@@ -1,7 +1,14 @@
 import express from "express";
 import path from "node:path";
 import { AsyncLocalStorage } from "node:async_hooks";
+import http from "node:http";
+import https from "node:https";
 import { createAccessRateLimiter } from "./access.mjs";
+import {
+  createRemoteTls,
+  addressHost,
+  localNetworkAddresses,
+} from "./remote-tls.mjs";
 import catalog from "../shared/subuser-permissions.json" with { type: "json" };
 
 // Only the authenticated gateway can attach this marker. HTTP headers cannot
@@ -109,7 +116,13 @@ function preventEscalation(req, runtime, permissions) {
     );
 }
 
-export function createRemoteGateway({ access, runtimes, distDir, accepted }) {
+export function createRemoteGateway({
+  access,
+  runtimes,
+  distDir,
+  accepted,
+  localAddresses = localNetworkAddresses,
+}) {
   const app = express();
   app.disable("x-powered-by");
   app.use((req, res, next) => {
@@ -126,9 +139,11 @@ export function createRemoteGateway({ access, runtimes, distDir, accepted }) {
         failure(503, "Remote access is disabled. Contact the panel owner."),
       );
     const origin = new URL(settings.publicUrl).origin;
+    if (settings.transport === "direct" && !req.socket.encrypted)
+      return next(failure(400, "Use HTTPS to connect to this panel."));
     let host;
     try {
-      host = new URL(`http://${req.headers.host}`).host;
+      host = new URL(`https://${req.headers.host}`).host;
     } catch {
       /* invalid */
     }
@@ -136,6 +151,13 @@ export function createRemoteGateway({ access, runtimes, distDir, accepted }) {
       new URL(origin).host,
       `127.0.0.1:${settings.port}`,
       `localhost:${settings.port}`,
+      `[::1]:${settings.port}`,
+      ...(settings.transport === "direct"
+        ? localAddresses().map(
+            (address) =>
+              new URL(`https://${addressHost(address)}:${settings.port}`).host,
+          )
+        : []),
     ];
     if (!allowedHosts.includes(host))
       return next(
@@ -143,7 +165,8 @@ export function createRemoteGateway({ access, runtimes, distDir, accepted }) {
       );
     if (
       !read(req) &&
-      (req.headers.origin !== origin ||
+      (req.headers.origin !==
+        (settings.transport === "direct" ? `https://${host}` : origin) ||
         req.headers["sec-fetch-site"] === "cross-site")
     )
       return next(
@@ -161,14 +184,12 @@ export function createRemoteGateway({ access, runtimes, distDir, accepted }) {
     res.json((await access.authenticate(req)) ?? { role: "guest" });
   });
   app.post("/api/access/login", loginLimit, async (req, res) => {
-    await access.requestLogin(req.body?.email);
-    res.json({
-      message:
-        "If this email has an invitation, a sign-in link will arrive shortly.",
-    });
+    const result = await access.login(req.body ?? {});
+    res.setHeader("Set-Cookie", result.cookie);
+    res.json(result.session);
   });
   app.post("/api/access/accept", acceptLimit, async (req, res) => {
-    const result = await access.accept(req.body?.token);
+    const result = await access.accept(req.body?.token, req.body?.password);
     await accepted?.(result.session);
     res.setHeader("Set-Cookie", result.cookie);
     res.json(result.session);
@@ -181,12 +202,19 @@ export function createRemoteGateway({ access, runtimes, distDir, accepted }) {
     if (!/^\/api(?:\/|$)/i.test(req.path)) return next();
     const session = await access.authenticate(req);
     if (!session)
-      throw failure(401, "Sign in using the link in your invitation email.");
+      throw failure(401, "Sign in with your email address and password.");
+    const authorized = session.memberships ?? [
+      { serverId: session.serverId, userId: session.userId },
+    ];
     const memberships = [...runtimes].flatMap(([serverId, runtime]) =>
       (runtime.subusers?.() ?? [])
         .filter(
           (user) =>
             user.email === session.email &&
+            authorized.some(
+              (member) =>
+                member.serverId === serverId && member.userId === user.id,
+            ) &&
             access.membershipAllowed(serverId, user.id, user.email),
         )
         .map((user) => ({ serverId, user, runtime })),
@@ -254,12 +282,26 @@ export function createRemoteGateway({ access, runtimes, distDir, accepted }) {
   return app;
 }
 
-export function createRemoteListener({ app, access, listen = true }) {
+export function createRemoteListener({
+  app,
+  access,
+  dataDir,
+  listen = true,
+  localAddresses = localNetworkAddresses,
+  bindHost,
+  createServer = (settings, tlsOptions, handler) =>
+    settings.transport === "direct"
+      ? https.createServer({ ...tlsOptions, minVersion: "TLSv1.2" }, handler)
+      : http.createServer(handler),
+}) {
   let listener;
   let listenerPort;
+  let listenerTransport;
+  let certificate;
   let listenerError = "";
   let chain = Promise.resolve();
   let closed = false;
+  const tls = dataDir ? createRemoteTls({ dataDir, localAddresses }) : null;
   const stop = async (current) => {
     if (!current) return;
     current.closeAllConnections();
@@ -272,35 +314,78 @@ export function createRemoteListener({ app, access, listen = true }) {
       listener = undefined;
       return;
     }
-    if (!listen || (listener && listenerPort === settings.port)) return;
+    if (!listen) return;
+    const tlsOptions =
+      settings.transport === "direct"
+        ? await tls.ensure(settings.publicUrl)
+        : undefined;
+    if (closed) return;
+    if (
+      listener &&
+      listenerPort === settings.port &&
+      listenerTransport === settings.transport
+    ) {
+      if (
+        tlsOptions &&
+        certificate?.fingerprint256 !== tlsOptions.certificate.fingerprint256
+      )
+        listener.setSecureContext({
+          key: tlsOptions.key,
+          cert: tlsOptions.cert,
+          minVersion: "TLSv1.2",
+        });
+      certificate = tlsOptions?.certificate;
+      return;
+    }
+    // A transport change on the same port must release the previous socket.
+    if (listener && listenerPort === settings.port) {
+      await stop(listener);
+      listener = undefined;
+    }
     const next = await new Promise((resolve, reject) => {
-      const candidate = app.listen(settings.port, "0.0.0.0", () =>
-        resolve(candidate),
-      );
+      const candidate = createServer(settings, tlsOptions, app);
       candidate.once("error", reject);
+      // Node uses the available IPv6/IPv4 wildcard in direct mode; a proxy's
+      // unencrypted upstream is accessible only on this computer.
+      candidate.listen(
+        settings.port,
+        bindHost ?? (settings.transport === "proxy" ? "127.0.0.1" : undefined),
+        () => resolve(candidate),
+      );
     });
     const previous = listener;
     listener = next;
     listenerPort = settings.port;
+    listenerTransport = settings.transport;
+    certificate = tlsOptions?.certificate;
     await stop(previous);
   };
   const status = () => ({
     ...access.status(),
     ready: access.status().ready && !listenerError,
     listening: !!listener,
+    ...(access.status().transport === "direct" && certificate
+      ? { certificate }
+      : {}),
     ...(listenerError ? { error: listenerError } : {}),
   });
+  const failed = async (cause) => {
+    listenerError = ["EADDRINUSE", "EACCES", "EADDRNOTAVAIL"].includes(
+      cause.code,
+    )
+      ? "The remote port is unavailable. Choose another port and save remote access settings."
+      : "Remote HTTPS could not start. Check that the panel can write its data folder and that remote-tls.json contains a valid certificate and private key.";
+    await access.configure({ enabled: false });
+    await stop(listener);
+    listener = undefined;
+  };
   return {
     status,
     async start() {
       try {
         await sync();
-      } catch {
-        listenerError =
-          "The remote port is unavailable. Choose another port and save remote access settings.";
-        await access.configure({ enabled: false });
-        await stop(listener);
-        listener = undefined;
+      } catch (cause) {
+        await failed(cause);
       }
     },
     configure(input) {
@@ -312,11 +397,8 @@ export function createRemoteListener({ app, access, listen = true }) {
           try {
             await sync();
             listenerError = "";
-          } catch {
-            listenerError =
-              "The remote port is unavailable. Choose another port and save remote access settings.";
-            await access.configure({ enabled: false });
-            await sync();
+          } catch (cause) {
+            await failed(cause);
             throw failure(409, listenerError);
           }
           return status();

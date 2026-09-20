@@ -7,12 +7,11 @@ import {
 } from "react";
 import {
   ArrowRight,
-  Check,
   ChevronRight,
   Gamepad2,
   LoaderCircle,
   LogOut,
-  Mail,
+  LockKeyhole,
   Play,
   RotateCw,
   ShieldCheck,
@@ -118,13 +117,16 @@ export default function RemoteAccess() {
   if (session.role === "guest" || token)
     return (
       <SignIn
+        key={token}
         token={token}
-        onSignedIn={(value) => {
-          window.history.replaceState(
-            null,
-            "",
-            `${window.location.pathname}${window.location.search}`,
-          );
+        onBackToSignIn={() => setToken("")}
+        onSignedIn={(value, acceptedInvitation) => {
+          if (acceptedInvitation || invitationToken())
+            window.history.replaceState(
+              null,
+              "",
+              `${window.location.pathname}${window.location.search}`,
+            );
           setToken("");
           setSession(value);
         }}
@@ -152,40 +154,60 @@ function Brand() {
 
 function SignIn({
   token,
+  onBackToSignIn,
   onSignedIn,
 }: {
   token: string;
-  onSignedIn: (session: SubuserSession) => void;
+  onBackToSignIn: () => void;
+  onSignedIn: (session: SubuserSession, acceptedInvitation: boolean) => void;
 }) {
   const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
+  const [confirmation, setConfirmation] = useState("");
   const [busy, setBusy] = useState(false);
-  const [sent, setSent] = useState(false);
   const [error, setError] = useState("");
-  async function accept() {
-    if (busy) return;
-    setBusy(true);
-    setError("");
-    try {
-      const result = await post<SubuserSession>("/access/accept", { token });
-      onSignedIn(result);
-    } catch (cause) {
-      setError(messageOf(cause));
-    } finally {
-      setBusy(false);
-    }
-  }
-  async function requestLink(event: FormEvent) {
+  const [invalidInvitation, setInvalidInvitation] = useState(false);
+  const request = useRef<AbortController | null>(null);
+  useEffect(() => () => request.current?.abort(), []);
+  async function signIn(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    if (busy || !email.trim()) return;
-    setBusy(true);
+    if (request.current) return;
     setError("");
+    if (token && (password.length < 12 || password.length > 128)) {
+      setError("Use between 12 and 128 characters for your password.");
+      return;
+    }
+    if (token && password !== confirmation) {
+      setError("Your passwords do not match. Enter the same password twice.");
+      return;
+    }
+    if (!event.currentTarget.reportValidity()) return;
+    const controller = new AbortController();
+    request.current = controller;
+    setBusy(true);
     try {
-      await post("/access/login", { email: email.trim() });
-      setSent(true);
+      const result = await api<SubuserSession>(
+        token ? "/access/accept" : "/access/login",
+        {
+          method: "POST",
+          body: JSON.stringify(
+            token ? { token, password } : { email: email.trim(), password },
+          ),
+          signal: controller.signal,
+        },
+      );
+      if (!controller.signal.aborted && request.current === controller)
+        onSignedIn(result, Boolean(token));
     } catch (cause) {
-      setError(messageOf(cause));
+      if (!controller.signal.aborted && request.current === controller) {
+        setError(messageOf(cause));
+        if (token && unauthorized(cause)) setInvalidInvitation(true);
+      }
     } finally {
-      setBusy(false);
+      if (!controller.signal.aborted && request.current === controller) {
+        request.current = null;
+        setBusy(false);
+      }
     }
   }
   return (
@@ -193,69 +215,111 @@ function SignIn({
       <section className="remote-auth-card">
         <Brand />
         <div className="remote-auth-icon">
-          {token ? <ShieldCheck size={30} /> : <Mail size={30} />}
+          {token ? <ShieldCheck size={30} /> : <LockKeyhole size={30} />}
         </div>
         <h1>
-          {token ? "Your server is one tap away" : "Welcome to your server"}
+          {invalidInvitation
+            ? "This invitation is unavailable"
+            : token
+              ? "Set up your server access"
+              : "Welcome to your server"}
         </h1>
         <p>
-          {token
-            ? "Accept your invitation to open the server controls shared with you."
-            : "Enter your invited email address. We’ll send you a link to sign in, with no password to remember."}
+          {invalidInvitation
+            ? "Ask the server owner for a new invitation link. If you already have a password, you can sign in below."
+            : token
+              ? "Choose a password to accept this invitation. Next time, sign in with the email address your server owner added and this password."
+              : "Sign in with your email address and the password you set when you accepted your invitation."}
         </p>
         {error && (
-          <p className="remote-notice is-error" role="alert">
+          <p
+            id="remote-auth-error"
+            className="remote-notice is-error"
+            role="alert"
+          >
             {error}
           </p>
         )}
-        {token && !error ? (
-          <button
-            className="btn primary remote-auth-submit"
-            disabled={busy}
-            onClick={accept}
-          >
-            {busy ? (
-              <LoaderCircle size={18} className="spin" />
-            ) : (
-              <ShieldCheck size={18} />
-            )}{" "}
-            Accept invitation <ArrowRight size={18} />
-          </button>
-        ) : sent ? (
-          <div className="remote-notice" role="status">
-            <Check size={20} />
-            <div>
-              <strong>Check your inbox</strong>
-              <p>
-                If this email has access, a sign-in link is on its way. Open it
-                on this device.
-              </p>
-            </div>
-          </div>
-        ) : (
-          <form className="remote-signin-form" onSubmit={requestLink}>
-            <label htmlFor="remote-email">Email address</label>
+        {!invalidInvitation && (
+          <form className="remote-signin-form" onSubmit={signIn} noValidate>
+            {!token && (
+              <>
+                <label htmlFor="remote-email">Email address</label>
+                <input
+                  id="remote-email"
+                  type="email"
+                  autoComplete="username"
+                  inputMode="email"
+                  autoCapitalize="none"
+                  spellCheck={false}
+                  required
+                  maxLength={254}
+                  value={email}
+                  onChange={(event) => setEmail(event.target.value)}
+                  placeholder="you@example.com"
+                  disabled={busy}
+                />
+              </>
+            )}
+            <label htmlFor="remote-password">
+              {token ? "New password" : "Password"}
+            </label>
             <input
-              id="remote-email"
-              type="email"
-              autoComplete="email"
-              inputMode="email"
+              id="remote-password"
+              type="password"
+              autoComplete={token ? "new-password" : "current-password"}
               required
-              maxLength={254}
-              value={email}
-              onChange={(event) => setEmail(event.target.value)}
-              placeholder="you@example.com"
+              minLength={token ? 12 : undefined}
+              maxLength={128}
+              value={password}
+              onChange={(event) => setPassword(event.target.value)}
+              aria-describedby={token ? "remote-password-hint" : undefined}
               disabled={busy}
             />
+            {token && (
+              <>
+                <p id="remote-password-hint" className="remote-field-hint">
+                  Use 12–128 characters. A few memorable words work well.
+                </p>
+                <label htmlFor="remote-password-confirmation">
+                  Confirm password
+                </label>
+                <input
+                  id="remote-password-confirmation"
+                  type="password"
+                  autoComplete="new-password"
+                  required
+                  maxLength={128}
+                  value={confirmation}
+                  onChange={(event) => setConfirmation(event.target.value)}
+                  disabled={busy}
+                />
+              </>
+            )}
             <button className="btn primary remote-auth-submit" disabled={busy}>
               {busy ? (
                 <LoaderCircle size={18} className="spin" />
               ) : (
-                <Mail size={18} />
+                <LockKeyhole size={18} />
               )}{" "}
-              Email me a sign-in link <ArrowRight size={18} />
+              {token ? "Set password and continue" : "Sign in"}{" "}
+              <ArrowRight size={18} />
             </button>
           </form>
+        )}
+        {token ? (
+          <button
+            className="btn remote-auth-back"
+            type="button"
+            onClick={onBackToSignIn}
+          >
+            Back to sign in
+          </button>
+        ) : (
+          <p className="remote-signin-help">
+            First time here or forgot your password? Ask the server owner for a
+            new invitation link.
+          </p>
         )}
         <p className="remote-auth-note">
           <ShieldCheck size={15} /> Access is limited to the permissions your

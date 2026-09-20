@@ -12,15 +12,14 @@ const origin = "https://panel.example.test";
 const json = (method, body) => ({ method, body: JSON.stringify(body) });
 async function fixture(t) {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "mc-remote-access-"));
-  const messages = [];
   const fleet = await createFleet({
     dataDir: root,
     useEnvironment: false,
     createDefaultServer: true,
     scheduler: false,
     remoteListen: false,
-    publicAddress: { resolve: async () => null },
-    sendMail: async (message) => messages.push(message),
+    publicAddress: { resolve: async () => "203.0.113.4" },
+    localAddresses: () => ["192.168.1.50"],
   });
   const listen = (app) =>
     new Promise((resolve) => {
@@ -82,8 +81,7 @@ async function fixture(t) {
         json("PUT", {
           enabled: true,
           publicUrl: origin,
-          from: "panel@example.test",
-          apiKey: "fixture-email-key",
+          transport: "proxy",
         }),
       )
     ).status,
@@ -94,6 +92,7 @@ async function fixture(t) {
     permissions,
     email = "sister@example.test",
     serverId = id,
+    password = "Correct-test-password!",
   ) => {
     const response = await local("/api/subusers", {
       ...json("POST", { email, permissions }),
@@ -106,8 +105,13 @@ async function fixture(t) {
       headers: { "X-Server-Id": serverId },
     });
     assert.equal(sent.status, 200, JSON.stringify(sent.body));
-    const token = /#invite=([A-Za-z0-9_-]+)/.exec(messages.at(-1).text)[1];
-    const signed = await guest("/api/access/accept", json("POST", { token }));
+    const token = new URL(sent.body.invitationUrl).hash.slice(
+      "#invite=".length,
+    );
+    const signed = await guest(
+      "/api/access/accept",
+      json("POST", { token, password }),
+    );
     assert.equal(signed.status, 200, JSON.stringify(signed.body));
     const cookie = signed.cookie.split(";")[0];
     const asUser = request(remote, {
@@ -117,7 +121,7 @@ async function fixture(t) {
     });
     return { user, cookie, token, asUser };
   };
-  return { fleet, root, id, local, guest, invite, messages };
+  return { fleet, root, id, local, guest, invite };
 }
 
 test("remote gateway never grants owner access, even with forged headers or a localhost Host", async (t) => {
@@ -131,6 +135,7 @@ test("remote gateway never grants owner access, even with forged headers or a lo
   for (const route of [
     "/api/servers",
     "/api/access/settings",
+    "/api/access/network",
     "/api/files/download?path=server.properties",
   ])
     assert.equal(
@@ -172,7 +177,12 @@ test("invited phone sessions are server-scoped, honor changed permissions, and r
     "control.start",
   ]);
   assert.equal(
-    (await guest("/api/access/accept", json("POST", { token }))).status,
+    (
+      await guest(
+        "/api/access/accept",
+        json("POST", { token, password: "Correct-test-password!" }),
+      )
+    ).status,
     401,
   );
   const fleet = (await asUser("/api/servers")).body;
@@ -405,4 +415,62 @@ test("remote route permissions fail closed for unassigned routes and distinguish
       () => requiredPermissions({ method: "POST", path, query: {} }),
       { status: 403 },
     );
+});
+
+test("network discovery is owner-only and does not claim the forwarded port is reachable", async (t) => {
+  const { local, invite } = await fixture(t);
+  assert.deepEqual((await local("/api/access/network")).body, {
+    publicIp: "203.0.113.4",
+    localAddresses: ["192.168.1.50"],
+    port: 3002,
+  });
+  const { asUser } = await invite([]);
+  assert.equal((await asUser("/api/access/network")).status, 403);
+});
+
+test("manual invitations never grant other servers merely because their email matches", async (t) => {
+  const { local, invite, id, guest } = await fixture(t);
+  const created = await local(
+    "/api/servers",
+    json("POST", { name: "Private world", port: 25566 }),
+  );
+  assert.equal(created.status, 201, JSON.stringify(created.body));
+  const secondId = created.body.server.id;
+  const first = await invite(["control.console"]);
+  const second = await invite(
+    ["control.console"],
+    "sister@example.test",
+    secondId,
+    "Different-test-password!",
+  );
+  for (const [member, expectedId, deniedId] of [
+    [first, id, secondId],
+    [second, secondId, id],
+  ]) {
+    assert.deepEqual(
+      (await member.asUser("/api/servers")).body.servers.map(
+        (server) => server.id,
+      ),
+      [expectedId],
+    );
+    assert.equal(
+      (
+        await member.asUser("/api/console", {
+          headers: { "X-Server-Id": deniedId },
+        })
+      ).status,
+      403,
+    );
+  }
+  const login = await guest(
+    "/api/access/login",
+    json("POST", {
+      email: "sister@example.test",
+      password: "Correct-test-password!",
+    }),
+  );
+  assert.equal(login.status, 200);
+  assert.deepEqual(login.body.memberships, [
+    { serverId: id, userId: first.user.id },
+  ]);
 });

@@ -82,6 +82,24 @@
   min-height: 48px;
   font-size: 16px;
 }
+.remote-signin-form input + label {
+  margin-top: 9px;
+}
+.remote-auth-card .remote-field-hint {
+  margin: 0 0 9px;
+  font-size: 12px;
+  line-height: 1.5;
+}
+.remote-auth-back {
+  width: 100%;
+  margin-top: 12px;
+  justify-content: center;
+}
+.remote-auth-card .remote-signin-help {
+  margin: 18px 0 0;
+  font-size: 12px;
+  line-height: 1.5;
+}
 .remote-auth-submit {
   margin-top: 13px;
   width: 100%;

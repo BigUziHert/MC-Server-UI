@@ -67,7 +67,8 @@
   color: var(--text);
   font-size: 12px;
 }
-.subusers-setup-field input {
+.subusers-setup-field input,
+.subusers-setup-field textarea {
   min-width: 0;
   width: 100%;
   padding: 11px 12px;
@@ -77,9 +78,45 @@
   color: var(--text);
   font-size: 12px;
 }
+.subusers-setup-field textarea {
+  resize: vertical;
+  min-height: 64px;
+  overflow-wrap: anywhere;
+  line-height: 1.7;
+}
+.subusers-detect {
+  align-self: flex-start;
+  font-size: 12px;
+}
+.subusers-advanced {
+  margin-top: 21px;
+  color: var(--muted);
+  font-size: 12px;
+}
+.subusers-advanced summary {
+  cursor: pointer;
+  margin-bottom: 10px;
+}
+.subusers-certificate {
+  margin: 0 0 20px;
+}
+.subusers-setup-guidance strong {
+  color: var(--text);
+  font-weight: 500;
+}
+.subusers-setup-guidance ol {
+  padding-left: 20px;
+}
+.subusers-setup-guidance li + li {
+  margin-top: 5px;
+}
+.subusers-setup-guidance p:last-child {
+  margin-bottom: 0;
+}
 .subusers-setup-field small,
 .subusers-setup-actions > span,
-.subusers-invitation-choice > small {
+.subusers-invitation-choice > small,
+.subusers-email-help {
   color: var(--muted);
   font-size: 11px;
   line-height: 1.7;
@@ -229,7 +266,7 @@
   color: var(--muted);
 }
 .subusers-table .subuser-row-actions {
-  width: 234px;
+  width: 260px;
 }
 .subusers-table tbody tr:hover {
   background: #252633;
@@ -315,11 +352,24 @@
 .subusers-dialog:not([open]) {
   display: none;
 }
-.subusers-dialog > form {
+.subusers-dialog > form,
+.subusers-link-content {
   display: flex;
   flex-direction: column;
   max-height: inherit;
   min-height: 0;
+}
+.subusers-link-dialog {
+  width: min(650px, calc(100vw - 32px));
+}
+.subusers-link-explanation {
+  margin: 19px 0;
+}
+.subusers-copy-status {
+  color: var(--text);
+  font-size: 12px;
+  line-height: 1.7;
+  margin: 0 0 16px;
 }
 .subusers-dialog-heading {
   display: flex;
@@ -626,6 +676,7 @@
     font-size: 10px;
     padding: 6px;
     min-height: 32px;
+    white-space: normal;
   }
   .subusers-table .btn.icon {
     width: 100%;
