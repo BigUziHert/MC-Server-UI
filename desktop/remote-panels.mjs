@@ -109,6 +109,9 @@ export function createRemotePanelController({
   openWebsite = () => {},
   listLocalServers = () => [],
   selectLocalServer,
+  store,
+  onError = () => {},
+  restoreTimeoutMs = 10000,
   onChange = () => {},
 }) {
   const panels = new Map();
@@ -121,9 +124,60 @@ export function createRemotePanelController({
   };
   panels.set(local.id, local);
   let activeId = local.id;
+  let preferredActiveId = local.id;
+  let activationVersion = 0;
+  let restoring;
+  let restoreRead;
+  let savedWrites = Promise.resolve();
   let attached;
   let closed = false;
+  let closing;
   const cleanups = new Set();
+  // Saved connections outlive their views, including a quit while the initial
+  // registry read or an offline host's background load is still pending.
+  const registry = new Map();
+  const readRegistry = () => {
+    if (!store) return Promise.resolve({ activeId: "local", panels: [] });
+    if (!restoreRead) {
+      const untouched = activationVersion;
+      restoreRead = store.read().then((saved) => {
+        for (const entry of saved.panels) registry.set(entry.id, { ...entry });
+        if (untouched === 0 && activationVersion === untouched)
+          preferredActiveId = saved.activeId;
+        return saved;
+      });
+    }
+    return restoreRead;
+  };
+  const remember = (panel) => {
+    const { id, origin, trustedFingerprint } = panel;
+    registry.set(id, {
+      id,
+      origin,
+      ...(trustedFingerprint ? { trustedFingerprint } : {}),
+    });
+  };
+  const persist = () => {
+    if (!store) return Promise.resolve();
+    const write = savedWrites
+      .catch(() => {})
+      .then(async () => {
+        await readRegistry();
+        const savedPanels = [...registry.values()];
+        return store.save({
+          activeId: savedPanels.some((panel) => panel.id === preferredActiveId)
+            ? preferredActiveId
+            : "local",
+          panels: savedPanels.map(({ id, origin, trustedFingerprint }) => ({
+            id,
+            origin,
+            ...(trustedFingerprint ? { trustedFingerprint } : {}),
+          })),
+        });
+      });
+    savedWrites = write;
+    return write;
+  };
   const localServerEntries = () =>
     listLocalServers().flatMap((server) => {
       if (
@@ -202,11 +256,26 @@ export function createRemotePanelController({
     if (panel.servers.some((server) => server.id === id))
       contents.send("mc-panel-remote-server-selected", id);
   };
-  const activate = (id) => {
+  const activate = (id, { restored = false } = {}) => {
     ensureOpen();
     const panel = panels.get(id);
     if (!panel || panel.contents.isDestroyed())
       throw failure(404, "This panel connection is no longer available.");
+    if (!restored) {
+      preferredActiveId = id;
+      activationVersion += 1;
+    }
+    if (panel.failed) {
+      const requestedAt = activationVersion;
+      return Promise.resolve(panel.loading)
+        .catch(() => {})
+        .then(async () => {
+          if (panel.failed) await panel.load(`${panel.origin}/`);
+          return activationVersion === requestedAt
+            ? activate(id, { restored: true })
+            : list();
+        });
+    }
     if (attached) window.contentView.removeChildView(attached);
     attached = panel.view;
     if (attached) {
@@ -216,10 +285,12 @@ export function createRemotePanelController({
     activeId = id;
     window.setTitle(panel.local ? "MC Panel" : `${panel.label} · MC Panel`);
     panel.contents.focus();
+    if (!closed) void persist().catch(onError);
     return changed();
   };
   const dispose = (panel) => {
     if (panel.disposing) return panel.disposing;
+    panel.removed = true;
     if (activeId === panel.id) {
       if (!closed && !window.isDestroyed()) activate(local.id);
       else activeId = local.id;
@@ -310,6 +381,7 @@ export function createRemotePanelController({
       const frame = event.senderFrame;
       return Boolean(
         panel &&
+        !panel.removed &&
         frame &&
         frame === event.sender.mainFrame &&
         frame.origin === panel.origin &&
@@ -317,21 +389,79 @@ export function createRemotePanelController({
         sameOrigin(event.sender.getURL(), panel.origin),
       );
     },
-    async open(input) {
+    async restore() {
+      if (!store) return list();
+      if (restoring) return restoring;
+      const untouched = activationVersion;
+      restoring = (async () => {
+        const saved = await readRegistry();
+        ensureOpen();
+        await Promise.allSettled(
+          saved.panels.map(async (entry) => {
+            await controller.open(entry.origin, {
+              savedEntry: entry,
+              background: true,
+            });
+            if (
+              !closed &&
+              untouched === 0 &&
+              entry.id === saved.activeId &&
+              activationVersion === untouched
+            )
+              activate(entry.id, { restored: true });
+          }),
+        );
+        return list();
+      })();
+      return restoring;
+    },
+    async open(input, { savedEntry, background = false } = {}) {
+      ensureOpen();
+      const requestedAt = background ? activationVersion : ++activationVersion;
+      try {
+        await readRegistry();
+      } catch (error) {
+        onError(error);
+        throw failure(
+          503,
+          "Saved panel connections are unavailable. Restart MC Panel and try again.",
+        );
+      }
       ensureOpen();
       const url = normalizePanelConnectionUrl(input);
       const { origin, host, hostname, hash } = new URL(url);
+      savedEntry ??= [...registry.values()].find(
+        (entry) => entry.origin === origin,
+      );
       let existing = [...panels.values()].find(
-        (panel) => !panel.local && panel.origin === origin,
+        (panel) => !panel.local && !panel.removed && panel.origin === origin,
       );
       if (existing) {
-        if (existing.loading) await existing.loading;
+        if (existing.loading) await existing.loading.catch(() => {});
         ensureOpen();
-        if (hash && existing.contents.getURL() !== url)
-          await existing.contents.loadURL(url);
-        return activate(existing.id);
+        if (existing.failed || (hash && existing.contents.getURL() !== url))
+          await existing.load(url, { quiet: background });
+        return !background && requestedAt === activationVersion
+          ? activate(existing.id)
+          : list();
       }
-      const remoteSession = session.fromPartition(`mc-remote-${randomUUID()}`);
+      if (
+        !savedEntry &&
+        new Set([
+          ...registry.keys(),
+          ...[...panels.values()]
+            .filter((panel) => !panel.local)
+            .map((panel) => panel.id),
+        ]).size >= 50
+      )
+        throw failure(
+          409,
+          "Disconnect a panel before adding another connection.",
+        );
+      const id = savedEntry?.id ?? randomUUID();
+      const remoteSession = session.fromPartition(
+        `${store ? "persist:" : ""}mc-remote-${id}`,
+      );
       const view = new WebContentsView({
         webPreferences: {
           session: remoteSession,
@@ -347,7 +477,7 @@ export function createRemotePanelController({
       view.setBackgroundColor("#101211");
       const contents = view.webContents;
       const panel = {
-        id: randomUUID(),
+        id,
         label: host,
         origin,
         local: false,
@@ -355,6 +485,10 @@ export function createRemotePanelController({
         view,
         contents,
         session: remoteSession,
+        saved: Boolean(savedEntry),
+        trustedFingerprint: savedEntry?.trustedFingerprint,
+        failed: true,
+        allowCertificatePrompt: !background,
       };
       panels.set(panel.id, panel);
       installPanelPermissionHandlers(remoteSession, origin, () => contents);
@@ -406,9 +540,15 @@ export function createRemotePanelController({
             error === "net::ERR_CERT_AUTHORITY_INVALID"
               ? selfSignedFingerprint(cert, hostname)
               : null;
-          if (!fingerprint || contents.isDestroyed() || !panels.has(panel.id))
+          if (
+            !fingerprint ||
+            panel.removed ||
+            contents.isDestroyed() ||
+            !panels.has(panel.id)
+          )
             return done(false);
           if (fingerprint === panel.trustedFingerprint) return done(true);
+          if (!panel.allowCertificatePrompt) return done(false);
           if (pendingTrust && pendingTrust.fingerprint !== fingerprint)
             return done(false);
           if (!pendingTrust) {
@@ -426,10 +566,16 @@ export function createRemotePanelController({
               .then(({ response }) => {
                 const accepted =
                   response === 1 &&
+                  !panel.removed &&
                   !contents.isDestroyed() &&
                   panels.has(panel.id);
-                if (accepted) panel.trustedFingerprint = fingerprint;
-                else canceled = true;
+                if (accepted) {
+                  panel.trustedFingerprint = fingerprint;
+                  if (panel.saved) {
+                    remember(panel);
+                    void persist().catch(onError);
+                  }
+                } else canceled = true;
                 return accepted;
               })
               .catch(() => {
@@ -444,22 +590,63 @@ export function createRemotePanelController({
           void pendingTrust.verification.then((accepted) => done(accepted));
         },
       );
-      try {
-        panel.loading = contents.loadURL(url);
-        await panel.loading;
-        panel.loading = undefined;
+      panel.load = async (target, { quiet = false } = {}) => {
         ensureOpen();
-        return activate(panel.id);
-      } catch {
-        await dispose(panel);
-        changed();
-        throw failure(
-          canceled ? 409 : 502,
-          canceled
-            ? "Connection canceled. Verify the fingerprint with the server owner before trying again."
-            : "Could not open the remote panel. Check its HTTPS address, certificate, and whether the host is online.",
-        );
-      }
+        if (panel.removed || contents.isDestroyed() || panels.get(id) !== panel)
+          throw failure(404, "This panel connection is no longer available.");
+        canceled = false;
+        panel.allowCertificatePrompt = !quiet;
+        if (panel.pendingServerId) panel.selectionNeedsReport = true;
+        let timeout;
+        panel.loading = (async () => {
+          try {
+            await Promise.race([
+              contents.loadURL(target),
+              new Promise((_, reject) => {
+                timeout = setTimeout(
+                  () => {
+                    contents.stop();
+                    reject(failure(502, "The remote panel did not respond."));
+                  },
+                  quiet ? restoreTimeoutMs : 30000,
+                );
+              }),
+            ]);
+            ensureOpen();
+            if (
+              panel.removed ||
+              contents.isDestroyed() ||
+              panels.get(id) !== panel
+            )
+              throw failure(
+                404,
+                "This panel connection is no longer available.",
+              );
+            panel.failed = false;
+            panel.saved = Boolean(store);
+            if (store) remember(panel);
+            await persist();
+          } catch {
+            panel.failed = true;
+            if (!panel.saved) await dispose(panel);
+            changed();
+            throw failure(
+              canceled ? 409 : 502,
+              canceled
+                ? "Connection canceled. Verify the fingerprint with the server owner before trying again."
+                : "Could not open the remote panel. Check its HTTPS address, certificate, and whether the host is online.",
+            );
+          } finally {
+            clearTimeout(timeout);
+            panel.loading = undefined;
+          }
+        })();
+        return panel.loading;
+      };
+      await panel.load(url, { quiet: background });
+      return background || requestedAt !== activationVersion
+        ? changed()
+        : activate(panel.id);
     },
     async disconnect(id) {
       ensureOpen();
@@ -469,16 +656,63 @@ export function createRemotePanelController({
       if (panel.local)
         throw failure(400, "The local panel cannot be disconnected.");
       if (activeId === id) activate(local.id);
-      await dispose(panel);
+      if (preferredActiveId === id) preferredActiveId = "local";
+      panel.removed = true;
+      panel.saved = false;
+      registry.delete(id);
+      try {
+        await persist();
+      } catch (error) {
+        onError(error);
+        throw failure(500, "The saved connection could not be removed.");
+      } finally {
+        await dispose(panel);
+      }
       return changed();
     },
-    async close() {
+    close() {
+      if (closing) return closing;
       closed = true;
       window.off("resize", resize);
-      await Promise.all(
-        [...panels.values()].filter((panel) => !panel.local).map(dispose),
-      );
-      await Promise.all([...cleanups]);
+      closing = (async () => {
+        const remote = [...panels.values()].filter((panel) => !panel.local);
+        if (store) {
+          const results = await Promise.allSettled([
+            persist(),
+            ...remote.map(async (panel) => {
+              if (!panel.contents.isDestroyed()) {
+                panel.contents.stop();
+                panel.contents.close();
+              }
+              const flushed = await Promise.allSettled([
+                Promise.resolve().then(() => panel.session.flushStorageData()),
+                Promise.resolve().then(() =>
+                  panel.session.cookies.flushStore(),
+                ),
+                Promise.resolve().then(() =>
+                  panel.session.closeAllConnections(),
+                ),
+              ]);
+              const failed = flushed.find(
+                (result) => result.status === "rejected",
+              );
+              if (failed) throw failed.reason;
+            }),
+          ]);
+          const drained = await Promise.allSettled([
+            store.close(),
+            ...cleanups,
+          ]);
+          const failed = [...results, ...drained].find(
+            (result) => result.status === "rejected",
+          );
+          if (failed) throw failed.reason;
+        } else {
+          await Promise.all(remote.map(dispose));
+          await Promise.all([...cleanups]);
+        }
+      })();
+      return closing;
     },
   };
   return controller;

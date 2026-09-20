@@ -49,6 +49,7 @@ files:
   - desktop/remote-panels.mjs
   - desktop/permissions.mjs
   - desktop/connections-ipc.mjs
+  - desktop/connection-store.mjs
   - desktop/connections-preload.cjs
   - desktop/assets/**/*
   - package.json

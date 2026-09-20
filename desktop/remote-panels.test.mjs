@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
+import { randomUUID, X509Certificate } from "node:crypto";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -22,6 +23,9 @@ function harness({
   load,
   localServers = [],
   selectLocalServer,
+  store,
+  restoreTimeoutMs,
+  onError,
 } = {}) {
   const views = [];
   const partitions = [];
@@ -34,6 +38,9 @@ function harness({
     value.getURL = () => value.url;
     value.isDestroyed = () => Boolean(value.destroyed);
     value.isLoadingMainFrame = () => Boolean(value.loading);
+    value.stop = () => {
+      value.stopped = true;
+    };
     value.focus = () => {
       value.focused = true;
     };
@@ -94,6 +101,9 @@ function harness({
     openWebsite: (url) => openedWebsites.push(url),
     listLocalServers: () => localServers,
     selectLocalServer,
+    store,
+    restoreTimeoutMs,
+    onError,
     session: {
       fromPartition(name) {
         const value = new EventEmitter();
@@ -118,6 +128,14 @@ function harness({
         value.closeAllConnections = async () => {
           value.disconnected = true;
         };
+        value.flushStorageData = () => {
+          value.storageFlushed = true;
+        };
+        value.cookies = {
+          flushStore: async () => {
+            value.cookiesFlushed = true;
+          },
+        };
         partitions.push(value);
         return value;
       },
@@ -131,6 +149,19 @@ function harness({
     downloadsDirectory: path.join(os.tmpdir(), "remote-downloads"),
   });
   return { controller, views, owner, partitions, prompts, openedWebsites };
+}
+
+function memoryStore(snapshot = { activeId: "local", panels: [] }) {
+  return {
+    snapshot: structuredClone(snapshot),
+    read: async () => structuredClone(snapshot),
+    async save(value) {
+      this.snapshot = structuredClone(value);
+    },
+    async close() {
+      this.closed = true;
+    },
+  };
 }
 
 function event() {
@@ -895,6 +926,322 @@ test("connection IPC validates managed sender, main frame, origin and bounded ar
   assert.throws(() => invoke("list", local), /cannot manage/);
   remove();
   assert.equal(handlers.size, 0);
+});
+
+test("persistent connections save only origins/trust and preserve the same partitions through shutdown and restore", async () => {
+  const cert = await certificate();
+  const store = memoryStore();
+  const h = harness({
+    store,
+    responses: [1],
+    load: async (view) => {
+      assert.equal(await verify(view, cert), true);
+    },
+  });
+  const connected = await h.controller.open(`${origin}/#invite=${invite}`);
+  await h.controller.close();
+  assert.deepEqual(store.snapshot, {
+    activeId: connected.activeId,
+    panels: [
+      {
+        id: connected.activeId,
+        origin,
+        trustedFingerprint: new X509Certificate(cert).fingerprint256,
+      },
+    ],
+  });
+  assert.equal(h.partitions[0].name, `persist:mc-remote-${connected.activeId}`);
+  assert.equal(h.partitions[0].cookiesFlushed, true);
+  assert.equal(h.partitions[0].storageFlushed, true);
+  assert.equal(h.partitions[0].cleared, undefined);
+  assert.equal(h.partitions[0].cacheCleared, undefined);
+  assert.equal(h.views[0].webContents.isDestroyed(), true);
+  assert.equal(store.closed, true);
+  const secondStore = memoryStore(store.snapshot);
+  const second = harness({
+    store: secondStore,
+    load: async (view) => {
+      assert.equal(await verify(view, cert), true);
+    },
+  });
+  const restored = await second.controller.restore();
+  assert.equal(restored.activeId, connected.activeId);
+  assert.equal(second.partitions[0].name, h.partitions[0].name);
+  assert.deepEqual(
+    second.views[0].loads,
+    [`${origin}/`],
+    "invitation hashes never restore",
+  );
+  assert.deepEqual(
+    second.prompts,
+    [],
+    "matching valid remembered certificate needs no new prompt",
+  );
+  assert.ok(
+    restored.panels.every(
+      (entry) => !Object.hasOwn(entry, "trustedFingerprint"),
+    ),
+  );
+  await second.controller.disconnect(connected.activeId);
+  assert.deepEqual(secondStore.snapshot, { activeId: "local", panels: [] });
+  assert.equal(second.partitions[0].cleared, true);
+  assert.equal(second.partitions[0].cacheCleared, true);
+  await second.controller.close();
+});
+
+test("offline restores keep retryable entries, suppress certificate dialogs, and preserve other connections", async () => {
+  const cert = await certificate();
+  const id = randomUUID();
+  const other = randomUUID();
+  let online = false;
+  const store = memoryStore({
+    activeId: id,
+    panels: [
+      { id, origin, trustedFingerprint: "AA:".repeat(31) + "AA" },
+      { id: other, origin: "https://other.example:3002" },
+    ],
+  });
+  const h = harness({
+    store,
+    responses: [1],
+    load: async (view) => {
+      if (view.webContents.getURL().startsWith(origin)) {
+        if (!online) throw new Error("Offline");
+        if (!(await verify(view, cert)))
+          throw new Error("Certificate rejected");
+      }
+    },
+  });
+  const restored = await h.controller.restore();
+  assert.equal(restored.activeId, "local");
+  assert.equal(restored.panels.length, 3);
+  assert.equal(h.prompts.length, 0);
+  assert.equal(h.partitions[0].cleared, undefined);
+  online = true;
+  const retried = await h.controller.activate(id);
+  assert.equal(retried.activeId, id);
+  assert.equal(
+    h.prompts.length,
+    1,
+    "explicit retry asks about a changed certificate",
+  );
+  assert.equal(h.views.length, 2);
+  await h.controller.close();
+  assert.equal(store.snapshot.panels.length, 2);
+});
+
+test("background certificate changes are rejected without prompts until an explicit retry", async () => {
+  const cert = await certificate();
+  const id = randomUUID();
+  const store = memoryStore({
+    activeId: id,
+    panels: [{ id, origin, trustedFingerprint: "AA:".repeat(31) + "AA" }],
+  });
+  const h = harness({
+    store,
+    responses: [1],
+    load: async (view) => {
+      if (!(await verify(view, cert))) throw new Error("Certificate rejected");
+    },
+  });
+  await h.controller.restore();
+  assert.equal(h.prompts.length, 0);
+  assert.equal(h.controller.list().activeId, "local");
+  assert.equal((await h.controller.open(origin)).activeId, id);
+  assert.equal(h.prompts.length, 1);
+  await h.controller.close();
+});
+
+test("restore and retry completion cannot steal focus after newer user navigation", async () => {
+  const id = randomUUID();
+  const saved = { activeId: id, panels: [{ id, origin }] };
+  let finishRead;
+  const store = memoryStore(saved);
+  store.read = () =>
+    new Promise((resolve) => {
+      finishRead = resolve;
+    });
+  const h = harness({ store });
+  const restoring = h.controller.restore();
+  h.controller.activate("local");
+  finishRead(saved);
+  await restoring;
+  assert.equal(h.controller.list().activeId, "local");
+  await h.controller.close();
+  assert.equal(store.snapshot.activeId, "local");
+
+  let finishLoad;
+  let failing = true;
+  const second = harness({
+    store: memoryStore(saved),
+    load: async () => {
+      if (failing) throw new Error("Offline");
+      await new Promise((resolve) => {
+        finishLoad = resolve;
+      });
+    },
+  });
+  await second.controller.restore();
+  failing = false;
+  const retry = second.controller.activate(id);
+  await new Promise((resolve) => setImmediate(resolve));
+  second.controller.activate("local");
+  finishLoad();
+  await retry;
+  assert.equal(second.controller.list().activeId, "local");
+  await second.controller.close();
+});
+
+test("quitting during the initial registry read preserves saved hosts without creating views", async () => {
+  const id = randomUUID();
+  const saved = { activeId: id, panels: [{ id, origin }] };
+  const store = memoryStore(saved);
+  let finishRead;
+  store.read = () =>
+    new Promise((resolve) => {
+      finishRead = resolve;
+    });
+  const h = harness({ store });
+  const restoring = assert.rejects(h.controller.restore(), { status: 503 });
+  const closing = h.controller.close();
+  finishRead(saved);
+  await Promise.all([restoring, closing]);
+  assert.deepEqual(store.snapshot, saved);
+  assert.equal(store.closed, true);
+  assert.equal(h.views.length, 0);
+});
+
+test("opening a new host while the registry loads merges saved hosts and retains the newer selection", async () => {
+  const id = randomUUID();
+  const saved = { activeId: id, panels: [{ id, origin }] };
+  const store = memoryStore(saved);
+  let finishRead;
+  store.read = () =>
+    new Promise((resolve) => {
+      finishRead = resolve;
+    });
+  const h = harness({ store });
+  const restoring = h.controller.restore();
+  const opening = h.controller.open("https://new.example:3002");
+  finishRead(saved);
+  const [, connected] = await Promise.all([restoring, opening]);
+  await h.controller.close();
+  assert.equal(store.snapshot.activeId, connected.activeId);
+  assert.notEqual(connected.activeId, id);
+  assert.deepEqual(
+    new Set(store.snapshot.panels.map((entry) => entry.origin)),
+    new Set([origin, "https://new.example:3002"]),
+  );
+  assert.ok(store.snapshot.panels.some((entry) => entry.id === id));
+
+  const selectedLocal = harness({ store: memoryStore(saved) });
+  selectedLocal.controller.activate("local");
+  await selectedLocal.controller.restore();
+  assert.equal(selectedLocal.controller.list().activeId, "local");
+  await selectedLocal.controller.close();
+});
+
+test("unreadable saved connections cannot be overwritten and read errors stay out of renderer responses", async () => {
+  const privateFailure = new Error(
+    "Cannot read C:/private/profile/desktop-connections.json",
+  );
+  const errors = [];
+  const store = memoryStore();
+  let writes = 0;
+  store.read = async () => {
+    throw privateFailure;
+  };
+  store.save = async () => {
+    writes += 1;
+  };
+  const h = harness({ store, onError: (error) => errors.push(error) });
+  await assert.rejects(h.controller.restore(), privateFailure);
+  await assert.rejects(h.controller.open(origin), (error) => {
+    assert.equal(error.status, 503);
+    assert.doesNotMatch(error.message, /private|profile|\.json/);
+    return true;
+  });
+  await assert.rejects(h.controller.close(), privateFailure);
+  assert.equal(writes, 0);
+  assert.equal(store.closed, true);
+  assert.equal(h.views.length, 0);
+  assert.deepEqual(errors, [privateFailure]);
+});
+
+test("shutdown flushes persistent sessions after save failures and disconnect hides private failure details", async () => {
+  const privateFailure = new Error(
+    "Cannot write C:/private/profile/desktop-connections.json",
+  );
+  const store = memoryStore();
+  const h = harness({ store });
+  await h.controller.open(origin);
+  store.save = async () => {
+    throw privateFailure;
+  };
+  await assert.rejects(h.controller.close(), privateFailure);
+  assert.equal(h.views[0].webContents.isDestroyed(), true);
+  assert.equal(h.partitions[0].storageFlushed, true);
+  assert.equal(h.partitions[0].cookiesFlushed, true);
+  assert.equal(h.partitions[0].disconnected, true);
+  assert.equal(h.partitions[0].cleared, undefined);
+  assert.equal(store.closed, true);
+
+  const secondStore = memoryStore();
+  const errors = [];
+  const second = harness({
+    store: secondStore,
+    onError: (error) => errors.push(error),
+  });
+  const connected = await second.controller.open(origin);
+  secondStore.save = async () => {
+    throw privateFailure;
+  };
+  await assert.rejects(
+    second.controller.disconnect(connected.activeId),
+    (error) => {
+      assert.equal(error.status, 500);
+      assert.doesNotMatch(error.message, /private|profile|\.json/);
+      return true;
+    },
+  );
+  assert.equal(second.views[0].webContents.isDestroyed(), true);
+  assert.equal(second.partitions[0].cleared, true);
+  assert.equal(second.partitions[0].cacheCleared, true);
+  assert.ok(errors.includes(privateFailure));
+  await assert.rejects(second.controller.close(), privateFailure);
+});
+
+test("disconnect during a restored host load cannot recreate the forgotten registry entry", async () => {
+  const id = randomUUID();
+  const saved = { activeId: id, panels: [{ id, origin }] };
+  const store = memoryStore(saved);
+  let finishLoad;
+  let finishSave;
+  const saving = new Promise((resolve) => {
+    finishSave = resolve;
+  });
+  store.save = async (snapshot) => {
+    await saving;
+    store.snapshot = structuredClone(snapshot);
+  };
+  const h = harness({
+    store,
+    load: () =>
+      new Promise((resolve) => {
+        finishLoad = resolve;
+      }),
+  });
+  const restoring = h.controller.restore();
+  await new Promise((resolve) => setImmediate(resolve));
+  const disconnecting = h.controller.disconnect(id);
+  finishLoad();
+  await new Promise((resolve) => setImmediate(resolve));
+  finishSave();
+  await Promise.all([restoring, disconnecting]);
+  await h.controller.close();
+  assert.deepEqual(store.snapshot, { activeId: "local", panels: [] });
+  assert.equal(h.controller.list().panels.length, 1);
+  assert.equal(h.partitions[0].cleared, true);
 });
 
 test("desktop connection endpoint requires owner session, valid origin, method, and address", async (t) => {

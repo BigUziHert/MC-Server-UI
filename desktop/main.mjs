@@ -20,6 +20,7 @@ import { flushRendererSelection } from "./selection.mjs";
 import { createRemotePanelController } from "./remote-panels.mjs";
 import { installPanelPermissionHandlers } from "./permissions.mjs";
 import { installConnectionIpc } from "./connections-ipc.mjs";
+import { createConnectionStore } from "./connection-store.mjs";
 import {
   installExternalLinkHandlers,
   openExternalWebsite,
@@ -43,6 +44,7 @@ if (!path.isAbsolute(userData))
   throw new Error("The user data directory must be an absolute path.");
 mkdirSync(userData, { recursive: true });
 app.setPath("userData", userData);
+app.setPath("sessionData", userData);
 
 let window;
 let tray;
@@ -198,7 +200,7 @@ function endWindowsSession() {
   if (canQuit) return;
   quitting = true;
   canQuit = true;
-  void Promise.resolve(runtime?.close())
+  void Promise.all([runtime?.close(), remotePanels?.close()])
     .catch(logError)
     .finally(() => app.quit());
 }
@@ -349,6 +351,8 @@ async function launch() {
     downloadsDirectory: app.getPath("downloads"),
     preload: path.join(desktopDir, "connections-preload.cjs"),
     openWebsite,
+    store: createConnectionStore({ dataDir: path.join(userData, "data") }),
+    onError: (cause) => void logError(cause),
     listLocalServers: () => runtime.listLocalServers(),
     selectLocalServer: async (id) => {
       await flushRendererSelection(window.webContents);
@@ -378,6 +382,9 @@ async function launch() {
   window.on("session-end", endWindowsSession);
   createTray();
   await window.loadURL(runtime.url);
+  // The owner UI and servers are ready before any saved remote host is tried.
+  // Independent restore attempts never hold startup or the local view hostage.
+  void remotePanels.restore().catch(logError);
   if (supported) {
     initialUpdateTimer = setTimeout(() => updates.check(), 30000);
     updateTimer = setInterval(() => updates.check(), 4 * 60 * 60 * 1000);
