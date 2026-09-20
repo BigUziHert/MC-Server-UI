@@ -1,6 +1,9 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
+import fs from "node:fs/promises";
+import path from "node:path";
 import {
   checkedProviderUrl,
+  createDownloadDeadline,
   launchpadError as error,
   providerJson,
   strongestHash,
@@ -128,16 +131,27 @@ const requiredType = (input, type) => {
 };
 async function pooled(values, fn, concurrency = 5) {
   const output = new Array(values.length);
-  let next = 0;
+  let next = 0,
+    failure,
+    failed = false;
   await Promise.all(
     Array.from({ length: Math.min(concurrency, values.length) }, async () => {
       for (;;) {
         const index = next++;
-        if (index >= values.length) return;
-        output[index] = await fn(values[index], index);
+        if (index >= values.length || failed) return;
+        try {
+          output[index] = await fn(values[index], index);
+        } catch (cause) {
+          if (!failed) failure = cause;
+          failed = true;
+          return;
+        }
       }
     }),
   );
+  // A rejected worker must not leave another pin writing after the plan owner
+  // starts removing its stage. Let already-started workers finish first.
+  if (failed) throw failure;
   return output;
 }
 
@@ -145,9 +159,9 @@ async function pooled(values, fn, concurrency = 5) {
 // checked before fetching, and catalog bodies and pinning downloads are bounded.
 export function createExtraProviders({ fetch: request = fetch, json } = {}) {
   const cache = new Map();
-  async function response(url, hosts, method = "GET", timeout = 60000) {
+  async function response(url, hosts, method = "GET", callerSignal) {
     let address = checkedProviderUrl(url, hosts);
-    const signal = AbortSignal.timeout(timeout);
+    const signal = callerSignal ?? AbortSignal.timeout(60000);
     for (let redirects = 0; redirects <= 4; redirects++) {
       let reply;
       try {
@@ -158,6 +172,10 @@ export function createExtraProviders({ fetch: request = fetch, json } = {}) {
           headers: { "User-Agent": USER_AGENT },
         });
       } catch {
+        if (signal.aborted)
+          throw callerSignal
+            ? signal.reason
+            : error(504, "The platform request timed out. Try again shortly.");
         throw error(
           502,
           "The platform could not be reached. Please try again shortly.",
@@ -185,31 +203,46 @@ export function createExtraProviders({ fetch: request = fetch, json } = {}) {
     throw error(502, "The platform redirected this download too many times.");
   }
   async function read(url, hosts) {
-    const { reply } = await response(url, hosts);
-    const chunks = [];
-    let size = 0;
-    for await (const chunk of reply.body) {
-      size += chunk.length;
-      if (size > 12 * 1024 ** 2)
-        throw error(502, "The platform returned too much catalog data.");
-      chunks.push(chunk);
+    const deadline = createDownloadDeadline();
+    try {
+      const { reply } = await response(url, hosts, "GET", deadline.signal);
+      const chunks = [];
+      let size = 0;
+      for await (const chunk of reply.body) {
+        deadline.signal.throwIfAborted();
+        deadline.progress();
+        size += chunk.length;
+        if (size > 12 * 1024 ** 2)
+          throw error(502, "The platform returned too much catalog data.");
+        chunks.push(chunk);
+      }
+      deadline.signal.throwIfAborted();
+      return {
+        body: Buffer.concat(chunks).toString("utf8"),
+        headers: reply.headers,
+      };
+    } catch (cause) {
+      throw deadline.reason(cause);
+    } finally {
+      deadline.close();
     }
-    return {
-      body: Buffer.concat(chunks).toString("utf8"),
-      headers: reply.headers,
-    };
   }
   function remember(key, load, duration = 5 * 60 * 1000) {
     const existing = cache.get(key);
-    if (existing?.until > Date.now()) return existing.value;
-    if (cache.size > 1000) cache.delete(cache.keys().next().value);
+    if (existing?.until > Date.now()) {
+      cache.delete(key);
+      cache.set(key, existing);
+      return existing.value;
+    }
+    cache.delete(key);
     const value = Promise.resolve()
       .then(load)
       .catch((cause) => {
-        cache.delete(key);
+        if (cache.get(key)?.value === value) cache.delete(key);
         throw cause;
       });
     cache.set(key, { until: Date.now() + duration, value });
+    while (cache.size > 1000) cache.delete(cache.keys().next().value);
     return value;
   }
   const apiJson = (url) =>
@@ -225,56 +258,127 @@ export function createExtraProviders({ fetch: request = fetch, json } = {}) {
         throw error(502, "ATLauncher returned invalid package metadata.");
       }
     });
-  async function pin(url, hosts, expected = {}) {
+  async function pin(url, hosts, expected = {}, { stage, signal } = {}) {
+    if (typeof stage !== "string" || !path.isAbsolute(stage))
+      throw error(
+        500,
+        "A private review folder is required to pin this download.",
+      );
+    const stageStat = await fs.lstat(stage);
+    if (!stageStat.isDirectory() || stageStat.isSymbolicLink())
+      throw error(
+        409,
+        "The private review folder changed. Review the installation again.",
+      );
+    const directory = await fs.realpath(stage);
+    const stagedPath = path.join(directory, `pinned-${randomUUID()}`);
+    const unchangedStage = async () => {
+      const current = await fs.lstat(stage).catch(() => null);
+      return Boolean(
+        current?.isDirectory() &&
+        !current.isSymbolicLink() &&
+        current.ino === stageStat.ino &&
+        current.dev === stageStat.dev &&
+        current.birthtimeMs === stageStat.birthtimeMs &&
+        (await fs.realpath(stage)) === directory,
+      );
+    };
     const maximum = expected.archive ? MAX_ARCHIVE : MAX_FILE;
     const limitName = expected.archive ? "2 GB archive" : "512 MB file";
-    const { reply, url: finalUrl } = await response(
-      url,
-      hosts,
-      "GET",
-      expected.archive ? 300000 : 60000,
-    );
-    const declared = Number(reply.headers.get("content-length"));
-    if (declared > maximum) {
-      await reply.body?.cancel();
-      throw error(
-        400,
-        `This download exceeds the supported ${limitName} size. Download the author’s server pack manually and import its folder.`,
+    const deadline = createDownloadDeadline(signal);
+    let handle,
+      complete = false;
+    try {
+      deadline.signal.throwIfAborted();
+      const { reply, url: finalUrl } = await response(
+        url,
+        hosts,
+        "GET",
+        deadline.signal,
       );
-    }
-    const sha512 = createHash("sha512");
-    const md5 = expected.md5 ? createHash("md5") : null;
-    let size = 0;
-    let signature = Buffer.alloc(0);
-    for await (const chunk of reply.body) {
-      size += chunk.length;
-      if (size > maximum)
+      const declared = Number(reply.headers.get("content-length"));
+      if (declared > maximum) {
+        await reply.body?.cancel();
         throw error(
           400,
-          `This download exceeds the supported ${limitName} limit.`,
+          `This download exceeds the supported ${limitName} size. Download the author’s server pack manually and import its folder.`,
         );
-      if (signature.length < 4)
-        signature = Buffer.concat([signature, chunk]).subarray(0, 4);
-      sha512.update(chunk);
-      md5?.update(chunk);
+      }
+      const sha512 = createHash("sha512");
+      const md5 = expected.md5 ? createHash("md5") : null;
+      try {
+        if (!(await unchangedStage()))
+          throw error(
+            409,
+            "The private review folder changed. Review the installation again.",
+          );
+        handle = await fs.open(stagedPath, "wx");
+      } catch (cause) {
+        await reply.body?.cancel().catch(() => {});
+        throw cause;
+      }
+      let size = 0;
+      let signature = Buffer.alloc(0);
+      for await (const chunk of reply.body) {
+        deadline.signal.throwIfAborted();
+        deadline.progress();
+        size += chunk.length;
+        if (size > maximum)
+          throw error(
+            400,
+            `This download exceeds the supported ${limitName} limit.`,
+          );
+        if (signature.length < 4)
+          signature = Buffer.concat([signature, chunk]).subarray(0, 4);
+        sha512.update(chunk);
+        md5?.update(chunk);
+        await handle.writeFile(chunk);
+      }
+      deadline.signal.throwIfAborted();
+      if (
+        expected.zip &&
+        !["504b0304", "504b0506", "504b0708"].includes(
+          signature.toString("hex"),
+        )
+      )
+        throw error(
+          502,
+          "The platform did not return a JAR or ZIP file. Download it manually from the author’s website.",
+        );
+      if (
+        (expected.size != null && size !== expected.size) ||
+        (md5 && md5.digest("hex") !== expected.md5.toLowerCase())
+      )
+        throw error(
+          502,
+          "The package does not match the platform’s file metadata. No server files were changed.",
+        );
+      await handle.sync();
+      if (!(await unchangedStage()))
+        throw error(
+          409,
+          "The private review folder changed. Review the installation again.",
+        );
+      complete = true;
+      return {
+        url: finalUrl,
+        size,
+        hashes: { sha512: sha512.digest("hex") },
+        stagedPath,
+      };
+    } catch (cause) {
+      throw deadline.reason(cause);
+    } finally {
+      deadline.close();
+      await handle?.close();
+      if (handle && !complete) {
+        try {
+          if (await unchangedStage()) await fs.rm(stagedPath, { force: true });
+        } catch {
+          // Never follow a replaced stage or mask the original cancellation.
+        }
+      }
     }
-    if (
-      expected.zip &&
-      !["504b0304", "504b0506", "504b0708"].includes(signature.toString("hex"))
-    )
-      throw error(
-        502,
-        "The platform did not return a JAR or ZIP file. Download it manually from the author’s website.",
-      );
-    if (
-      (expected.size != null && size !== expected.size) ||
-      (md5 && md5.digest("hex") !== expected.md5.toLowerCase())
-    )
-      throw error(
-        502,
-        "The package does not match the platform’s file metadata. No server files were changed.",
-      );
-    return { url: finalUrl, size, hashes: { sha512: sha512.digest("hex") } };
   }
   const basename = (value) => {
     const name = safeInstallPath(value);
@@ -336,22 +440,33 @@ export function createExtraProviders({ fetch: request = fetch, json } = {}) {
     downloadHosts: ftbHosts,
     async search(input) {
       requiredType(input, "modpack");
-      const index = await apiJson(
-        input.query
-          ? `${FTB}/search/500?term=${enc(input.query)}`
-          : `${FTB}/popular/installs/500`,
-      );
-      if (!Array.isArray(index.packs))
-        throw error(502, "Feed The Beast returned an invalid pack catalog.");
-      const packs = await pooled(index.packs.slice(0, 500), (id) =>
-        ftbPack(String(id)),
-      );
-      const matching = packs.filter(
-        (pack) =>
-          !pack.private &&
-          (pack.versions ?? []).some((version) =>
-            compatible(ftbVersion(version), input),
-          ),
+      const matching = await remember(
+        `ftb-matching:${JSON.stringify([input.query, input.gameVersion, input.loader])}`,
+        async () => {
+          const index = await apiJson(
+            input.query
+              ? `${FTB}/search/500?term=${enc(input.query)}`
+              : `${FTB}/popular/installs/500`,
+          );
+          if (!Array.isArray(index.packs))
+            throw error(
+              502,
+              "Feed The Beast returned an invalid pack catalog.",
+            );
+          const packs = await pooled(
+            index.packs.slice(0, 500),
+            (id) => ftbPack(String(id)),
+            20,
+          );
+          return packs.filter(
+            (pack) =>
+              !pack.private &&
+              (pack.versions ?? []).some((version) =>
+                compatible(ftbVersion(version), input),
+              ),
+          );
+        },
+        20 * 60 * 1000,
       );
       const projects = sortCatalog(matching, input.sort, {
         downloads: (pack) => pack.installs,
@@ -432,6 +547,7 @@ export function createExtraProviders({ fetch: request = fetch, json } = {}) {
       }
       return {
         title: pack.name,
+        url: `https://www.feed-the-beast.com/modpacks/${numeric(input.projectId)}`,
         versionName: manifest.name,
         files,
         loaderInstall: {
@@ -532,33 +648,43 @@ export function createExtraProviders({ fetch: request = fetch, json } = {}) {
     },
     async versions(input) {
       requiredType(input, "modpack");
-      const pack = await atPack(input.projectId);
-      const values = (pack.versions ?? [])
-        .filter(
-          (version) =>
-            !input.gameVersion || version.minecraft === input.gameVersion,
-        )
-        .slice(0, 100);
-      const versions = await pooled(values, async (version) => {
-        try {
-          return await atVersion(pack, version);
-        } catch (cause) {
-          if (cause.status === 404)
-            return {
-              id: version.version,
-              name: version.version,
-              version: version.version,
-              gameVersions: [version.minecraft],
-              loaders: [],
-              publishedAt: date(version.published),
-              downloadable: false,
-            };
-          throw cause;
-        }
-      });
-      return versions
-        .filter((version) => compatible(version, input))
-        .sort((a, b) => b.publishedAt.localeCompare(a.publishedAt));
+      return remember(
+        `at-versions:${JSON.stringify([token(input.projectId), input.gameVersion, input.loader])}`,
+        async () => {
+          const pack = await atPack(input.projectId);
+          const values = (pack.versions ?? [])
+            .filter(
+              (version) =>
+                !input.gameVersion || version.minecraft === input.gameVersion,
+            )
+            .slice(0, 100);
+          const versions = await pooled(
+            values,
+            async (version) => {
+              try {
+                return await atVersion(pack, version);
+              } catch (cause) {
+                if (cause.status === 404)
+                  return {
+                    id: version.version,
+                    name: version.version,
+                    version: version.version,
+                    gameVersions: [version.minecraft],
+                    loaders: [],
+                    publishedAt: date(version.published),
+                    downloadable: false,
+                  };
+                throw cause;
+              }
+            },
+            20,
+          );
+          return versions
+            .filter((version) => compatible(version, input))
+            .sort((a, b) => b.publishedAt.localeCompare(a.publishedAt));
+        },
+        20 * 60 * 1000,
+      );
     },
     async resolve(input) {
       requiredType(input, "modpack");
@@ -622,11 +748,16 @@ export function createExtraProviders({ fetch: request = fetch, json } = {}) {
             const md5 = separate ? mod.serverMD5 : mod.md5;
             if (md5 && !/^[a-f0-9]{32}$/i.test(md5))
               throw error(400, "ATLauncher supplied an invalid checksum.");
-            downloadFile = await pin(url, atHosts, {
-              ...(md5 ? { md5 } : {}),
-              ...(!separate && mod.filesize ? { size: mod.filesize } : {}),
-              zip: true,
-            });
+            downloadFile = await pin(
+              url,
+              atHosts,
+              {
+                ...(md5 ? { md5 } : {}),
+                ...(!separate && mod.filesize ? { size: mod.filesize } : {}),
+                zip: true,
+              },
+              input,
+            );
           }
           return {
             path: `mods/${manifest.caseAllFiles === "lower" ? name.toLowerCase() : name}`,
@@ -650,6 +781,7 @@ export function createExtraProviders({ fetch: request = fetch, json } = {}) {
           };
       return {
         title: pack.name,
+        url: `https://atlauncher.com/pack/${enc(token(pack.safeName))}`,
         versionName: selected.version,
         files,
         archive,
@@ -693,6 +825,30 @@ export function createExtraProviders({ fetch: request = fetch, json } = {}) {
       { id: "name", label: "Name (A–Z)" },
     ],
     downloadHosts: spigotHosts,
+    async installedVersion({ projectId, versionId, signal }) {
+      const project = numeric(projectId),
+        id = numeric(versionId);
+      const url = `${SPIGOT}/resources/${project}/versions/${id}`;
+      const value = await remember(url, () =>
+        json
+          ? json(url, { signal })
+          : providerJson(url, { fetch: request, signal }),
+      );
+      if (String(value.id) !== id || String(value.resource) !== project)
+        throw error(
+          502,
+          "Spigot returned metadata for a different plugin release.",
+        );
+      return {
+        id,
+        name: text(value.name),
+        version: text(value.name),
+        gameVersions: [],
+        loaders: pluginLoaders,
+        publishedAt: date(value.releaseDate),
+        downloadable: false,
+      };
+    },
     async search(input) {
       requiredType(input, "plugin");
       if (input.loader && !pluginLoaders.includes(input.loader))
@@ -831,6 +987,7 @@ export function createExtraProviders({ fetch: request = fetch, json } = {}) {
         `${SPIGOT}/resources/${numeric(input.projectId)}/download`,
         spigotHosts,
         { zip: true },
+        input,
       );
       // Bypass metadata cache to reject an update racing the unversioned CDN URL.
       const latest = json
@@ -848,6 +1005,7 @@ export function createExtraProviders({ fetch: request = fetch, json } = {}) {
         );
       return {
         title: text(pack.name),
+        url: `https://www.spigotmc.org/resources/${numeric(input.projectId)}/`,
         versionName: text(version.name),
         files: [
           {
@@ -996,11 +1154,16 @@ export function createExtraProviders({ fetch: request = fetch, json } = {}) {
           400,
           "This server ZIP exceeds the supported 2 GB archive size. Download it from the author and import the extracted folder.",
         );
-      const archive = await pin(download.url, voidHosts, {
-        ...(download.size ? { size: download.size } : {}),
-        zip: true,
-        archive: true,
-      });
+      const archive = await pin(
+        download.url,
+        voidHosts,
+        {
+          ...(download.size ? { size: download.size } : {}),
+          zip: true,
+          archive: true,
+        },
+        input,
+      );
       cache.delete("void-catalog");
       const current = await voidPack(input.projectId);
       if (
@@ -1013,6 +1176,7 @@ export function createExtraProviders({ fetch: request = fetch, json } = {}) {
         );
       return {
         title: pack.title,
+        url: pack.url,
         versionName: pack.version,
         archive: { format: "server-zip", ...archive },
         warnings: [pinWarning],

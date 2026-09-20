@@ -5,7 +5,8 @@ import { launchpadError as error } from "./launchpad-network.mjs";
 
 export function createModRemoval(ctx) {
   const plans = new Map(),
-    pending = new Set();
+    pending = new Set(),
+    metadata = new Map();
   let busy = false,
     closing = false;
   const track = (work) => {
@@ -34,7 +35,13 @@ export function createModRemoval(ctx) {
       );
     return current;
   };
-  const inventory = async (loader, inspect, type = "mod", folder = "mods") => {
+  const inventory = async (
+    loader,
+    inspect,
+    type = "mod",
+    folder = "mods",
+    selectedPath,
+  ) => {
     const directory = await ctx.safePath(ctx.serverDir, folder);
     const entries = await fs
       .readdir(directory, { withFileTypes: true })
@@ -63,19 +70,32 @@ export function createModRemoval(ctx) {
           409,
           `${entry.name} is not a regular ${type} file. Review it in File Manager.`,
         );
-      const sha512 = await ctx.fileHash(target);
+      const stamp = ctx.fileStamp(before);
+      // The selected file is always hashed afresh; other files use their full
+      // identity/timestamps to invalidate the reviewed dependency snapshot.
+      const sha512 =
+        relative === selectedPath ? await ctx.fileHash(target) : null;
       const row = {
         path: relative,
         title: entry.name,
         size: before.size,
         sha512,
+        stamp,
       };
       if (inspect && type === "mod") {
         try {
-          Object.assign(
-            row,
-            await inspectInstalledMod(target, { loader, signal: ctx.signal }),
-          );
+          const key = `${loader}:${relative}:${stamp}`;
+          let cached = metadata.get(key);
+          if (!cached) {
+            cached = await inspectInstalledMod(target, {
+              loader,
+              signal: ctx.signal,
+            });
+            metadata.set(key, cached);
+            while (metadata.size > 1000)
+              metadata.delete(metadata.keys().next().value);
+          }
+          Object.assign(row, cached);
         } catch (cause) {
           ctx.signal.throwIfAborted();
           row.issue = `${entry.name}: ${cause.message}`;
@@ -91,7 +111,9 @@ export function createModRemoval(ctx) {
     return rows;
   };
   const snapshot = (rows) =>
-    JSON.stringify(rows.map(({ path, sha512 }) => [path, sha512]));
+    JSON.stringify(
+      rows.map(({ path, sha512, stamp }) => [path, sha512, stamp]),
+    );
   const prune = () => {
     for (const [id, plan] of plans)
       if (plan.expires <= Date.now()) plans.delete(id);
@@ -120,7 +142,13 @@ export function createModRemoval(ctx) {
           !(type === "datapack" ? /\.zip$/i : /\.jar$/i).test(input.path)
         )
           throw error(400, `Choose an installed ${type} to remove.`);
-        const rows = await inventory(current.loader, true, type, folder);
+        const rows = await inventory(
+          current.loader,
+          true,
+          type,
+          folder,
+          input.path,
+        );
         const selected = rows.find((row) => row.path === input.path);
         if (!selected)
           throw error(
@@ -142,7 +170,8 @@ export function createModRemoval(ctx) {
           files: [{ path: selected.path, size: selected.size }],
           dependents,
           warnings,
-          blocked: dependents.length > 0 || warnings.length > 0,
+          blocked: dependents.length > 0,
+          requiresAcknowledgement: warnings.length > 0,
         };
         if (result.blocked) return result;
         prune();
@@ -155,6 +184,7 @@ export function createModRemoval(ctx) {
           path: selected.path,
           loader: current.loader,
           snapshot: snapshot(rows),
+          requiresAcknowledgement: result.requiresAcknowledgement,
           expires,
         });
         return {
@@ -183,7 +213,16 @@ export function createModRemoval(ctx) {
             409,
             "This removal review expired. Review the content again.",
           );
+        if (
+          plan.requiresAcknowledgement &&
+          input.acknowledgedUnreadableDependencies !== true
+        )
+          throw error(
+            400,
+            "Acknowledge that unreadable mod metadata prevents a complete dependency check, or repair the listed files in File Manager first.",
+          );
         busy = true;
+        ctx.onBusyChange?.();
         try {
           return await ctx.withMinecraftMutation(async () => {
             const current = await ctx.getServer();
@@ -194,7 +233,13 @@ export function createModRemoval(ctx) {
               );
             if (
               snapshot(
-                await inventory(plan.loader, false, plan.type, plan.folder),
+                await inventory(
+                  plan.loader,
+                  false,
+                  plan.type,
+                  plan.folder,
+                  plan.path,
+                ),
               ) !== plan.snapshot
             )
               throw error(
@@ -202,6 +247,7 @@ export function createModRemoval(ctx) {
                 "Installed content changed after this review. Review removal again.",
               );
             plans.delete(input.planId);
+            metadata.clear();
             const recycled = await ctx.recycle(plan.path);
             try {
               await ctx.onRemoved(plan.path, plan.type);
@@ -223,6 +269,7 @@ export function createModRemoval(ctx) {
           });
         } finally {
           busy = false;
+          ctx.onBusyChange?.();
         }
       });
     },
@@ -230,10 +277,14 @@ export function createModRemoval(ctx) {
       plans.delete(id);
       return { ok: true };
     },
+    invalidate() {
+      metadata.clear();
+    },
     async close() {
       closing = true;
       await Promise.allSettled([...pending]);
       plans.clear();
+      metadata.clear();
     },
   };
 }

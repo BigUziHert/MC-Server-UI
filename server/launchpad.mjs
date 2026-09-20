@@ -122,14 +122,15 @@ async function statOrNull(target) {
     throw cause;
   }
 }
-async function fileHash(target, algorithm = "sha512", signal) {
+async function fileHash(
+  target,
+  algorithm = "sha512",
+  signal,
+  maximum = 512 * 1024 ** 2,
+) {
   signal?.throwIfAborted();
   const before = await fs.lstat(target);
-  if (
-    !before.isFile() ||
-    before.isSymbolicLink() ||
-    before.size > 512 * 1024 ** 2
-  )
+  if (!before.isFile() || before.isSymbolicLink() || before.size > maximum)
     throw error(
       400,
       "Only regular files under 512 MB can be managed by Launchpad.",
@@ -170,6 +171,16 @@ const publicVersion = (value) => ({
   publishedAt: value.publishedAt,
   downloadable: value.downloadable !== false,
 });
+const projectUrl = (value) => {
+  try {
+    const url = new URL(value);
+    return url.protocol === "https:" && !url.username && !url.password
+      ? url.href
+      : undefined;
+  } catch {
+    return undefined;
+  }
+};
 
 // CurseForge's fingerprint is only a lookup hint. Matches below are additionally
 // verified against the API's SHA-1 file hash before an update can be offered.
@@ -310,6 +321,7 @@ export async function createLaunchpad(ctx) {
         "title",
         "iconUrl",
         "author",
+        "url",
       ]
         .filter((key) => item[key] !== undefined)
         .map((key) => [key, item[key]]),
@@ -317,8 +329,8 @@ export async function createLaunchpad(ctx) {
   const updateKey = (input, item) =>
     JSON.stringify([
       input.type,
-      input.gameVersion,
-      input.loader,
+      input.type === "modpack" ? "" : input.gameVersion,
+      input.type === "modpack" ? "" : input.loader,
       item.platform,
       item.projectId,
       item.versionId,
@@ -335,11 +347,29 @@ export async function createLaunchpad(ctx) {
     ? null
     : await terminalJobs(await privatePath("last-job.json"));
   if (terminal?.get()) {
-    const job = terminal.get();
+    const job = { ...terminal.get(), retryable: false };
     jobs.set(job.id, job);
     lastJob = job.id;
   }
   const backgroundChecks = new Map();
+  const publicJob = (job) => ({
+    ...job,
+    ...(job?.retryable
+      ? {
+          retryable: Boolean(
+            plans.has(job.planId) && Date.parse(job.expiresAt) > Date.now(),
+          ),
+        }
+      : {}),
+  });
+  let reportedBusy = false;
+  const notifyBusy = () => {
+    const busy = Boolean(active || preparingInstall || removal.busy);
+    if (busy !== reportedBusy) {
+      reportedBusy = busy;
+      ctx.onBusyChange?.(busy);
+    }
+  };
   const removal = createModRemoval({
     serverDir,
     safePath,
@@ -351,6 +381,7 @@ export async function createLaunchpad(ctx) {
     withMinecraftMutation,
     signal: lifetime.signal,
     isBusy: () => Boolean(active || preparingInstall),
+    onBusyChange: notifyBusy,
     async onRemoved(relative, type) {
       const previous = receipts;
       replaceReceipts(receipts.filter((item) => item.path !== relative));
@@ -711,6 +742,7 @@ export async function createLaunchpad(ctx) {
     items,
     warnings,
     signal = lifetime.signal,
+    urlField = "url",
   ) {
     await Promise.all(
       providers.map(async (found) => {
@@ -733,6 +765,8 @@ export async function createLaunchpad(ctx) {
             if (typeof project?.title === "string" && project.title.trim())
               item.title = project.title;
             if (project?.iconUrl) item.iconUrl = project.iconUrl;
+            if (projectUrl(project?.url))
+              item[urlField] = projectUrl(project.url);
             if (typeof project?.author === "string" && project.author.trim())
               item.author = project.author;
           }
@@ -748,7 +782,7 @@ export async function createLaunchpad(ctx) {
     );
   }
   async function checkUpdates(input, items, warnings) {
-    if (!input.gameVersion || !input.loader) {
+    if (input.type !== "modpack" && (!input.gameVersion || !input.loader)) {
       warnings.push(
         "Choose this server's Minecraft version and loader above to check for updates.",
       );
@@ -821,7 +855,11 @@ export async function createLaunchpad(ctx) {
             item.updateIssue = cooldownMessage(cooldown);
             item.updateCheck = "unavailable";
           }
-        } else if (missing.length && found.updates) {
+        } else if (
+          missing.length &&
+          found.updates &&
+          input.type !== "modpack"
+        ) {
           const work = (async () => {
             try {
               const result = await abortable(
@@ -940,10 +978,43 @@ export async function createLaunchpad(ctx) {
                           a.publishedAt ?? "",
                         ),
                       );
-                    const current = versions.find(
-                        (value) => String(value.id) === item.versionId,
-                      ),
-                      newest = versions[0];
+                    let current = cached.versions.find(
+                      (value) => String(value.id) === item.versionId,
+                    );
+                    const newest = versions[0];
+                    if (!current && found.installedVersion) {
+                      const installedKey = JSON.stringify([
+                        found.id,
+                        "installed",
+                        item.projectId,
+                        item.versionId,
+                      ]);
+                      let installed = versionCache.get(installedKey);
+                      if (!(installed?.expiresAt > Date.now())) {
+                        const signal = AbortSignal.any([
+                          input.signal,
+                          AbortSignal.timeout(8000),
+                        ]);
+                        installed = {
+                          value: await fallbackRequest(
+                            () =>
+                              abortable(
+                                found.installedVersion({
+                                  ...input,
+                                  projectId: item.projectId,
+                                  versionId: item.versionId,
+                                  signal,
+                                }),
+                                signal,
+                              ),
+                            signal,
+                          ),
+                          expiresAt: Date.now() + 5 * 60_000,
+                        };
+                        remember(versionCache, installedKey, installed);
+                      }
+                      current = installed.value;
+                    }
                     if (!newest || !current)
                       throw error(
                         404,
@@ -951,12 +1022,20 @@ export async function createLaunchpad(ctx) {
                           ? "No compatible downloadable releases were returned. Update status could not be checked."
                           : "The installed release was not found in the compatible catalog. Update status could not be checked.",
                       );
-                    const value =
-                      newest &&
+                    const latestDate = Date.parse(newest.publishedAt),
+                      currentDate = Date.parse(current.publishedAt);
+                    if (
                       String(newest.id) !== item.versionId &&
-                      (!current ||
-                        (newest.publishedAt ?? "") >
-                          (current.publishedAt ?? ""))
+                      (!Number.isFinite(latestDate) ||
+                        !Number.isFinite(currentDate))
+                    )
+                      throw error(
+                        409,
+                        "The release dates could not be verified. Update status could not be checked.",
+                      );
+                    const value =
+                      String(newest.id) !== item.versionId &&
+                      latestDate > currentDate
                         ? publicVersion(newest)
                         : null;
                     remember(updateCache, key, {
@@ -1129,13 +1208,16 @@ export async function createLaunchpad(ctx) {
           if (!item.sha512) continue;
           if (
             item.platform ||
-            (!identities.get(item.sha512)?.value?.platform &&
-              !signal.aborted &&
-              !warnings.some((message) => /identification:/i.test(message)))
+            (!identities.get(item.sha512)?.value?.platform && !signal.aborted)
           )
             remember(identities, item.sha512, {
               value: identityFields(item),
               expiresAt: Date.now() + (item.platform ? 10 * 60_000 : 60_000),
+              warning: !item.platform
+                ? warnings
+                    .filter((message) => /identification:/i.test(message))
+                    .join(" ")
+                : undefined,
             });
         }
         markDuplicates(items);
@@ -1181,6 +1263,12 @@ export async function createLaunchpad(ctx) {
     if (input.type === "modpack") {
       await enrichProjectMetadata(items, warnings, input.signal);
       for (const item of items) item.name = item.title;
+      if (!input.identityOnly)
+        await checkUpdates(
+          { ...input, gameVersion: "", loader: "" },
+          items,
+          warnings,
+        );
       return;
     }
     const unknown = items.filter(
@@ -1189,6 +1277,11 @@ export async function createLaunchpad(ctx) {
         !item.platform &&
         !(identities.get(item.sha512)?.expiresAt > Date.now()),
     );
+    for (const item of items) {
+      const cached = identities.get(item.sha512);
+      if (cached?.expiresAt > Date.now() && cached.warning)
+        warnings.push(cached.warning);
+    }
     const modrinth = providers.find((value) => value.id === "modrinth");
     if (unknown.length) {
       try {
@@ -1228,21 +1321,41 @@ export async function createLaunchpad(ctx) {
           const fingerprints = new Map();
           for (const item of candidates) {
             input.signal.throwIfAborted();
-            const bytes = await fs.readFile(
-              await safePath(serverDir, item.path),
-              { signal: input.signal },
-            );
+            const target = await safePath(serverDir, item.path);
+            const stamp = fileStamp(await fs.lstat(target));
+            const cached = fileCache.get(item.path);
+            if (
+              cached?.stamp === stamp &&
+              cached.sha512 === item.sha512 &&
+              cached.sha1 &&
+              cached.fingerprint !== undefined
+            ) {
+              fingerprints.set(item, {
+                fingerprint: cached.fingerprint,
+                sha1: cached.sha1,
+              });
+              continue;
+            }
+            const bytes = await fs.readFile(target, { signal: input.signal });
             input.signal.throwIfAborted();
             if (
-              createHash("sha512").update(bytes).digest("hex") !== item.sha512
+              createHash("sha512").update(bytes).digest("hex") !==
+                item.sha512 ||
+              fileStamp(await fs.lstat(target)) !== stamp
             )
               throw error(
                 409,
                 `${item.name} changed while checking its identity.`,
               );
-            fingerprints.set(item, {
+            const digest = {
               fingerprint: curseFingerprint(bytes),
               sha1: createHash("sha1").update(bytes).digest("hex"),
+            };
+            fingerprints.set(item, digest);
+            remember(fileCache, item.path, {
+              stamp,
+              sha512: item.sha512,
+              ...digest,
             });
           }
           const result = await abortable(
@@ -1330,7 +1443,7 @@ export async function createLaunchpad(ctx) {
       warnings,
       job:
         lastJob && terminal?.visible(jobs.get(lastJob))
-          ? { ...jobs.get(lastJob) }
+          ? publicJob(jobs.get(lastJob))
           : null,
     };
   }
@@ -1377,6 +1490,7 @@ export async function createLaunchpad(ctx) {
         throw fail();
       const result = await found.resolve({
         ...value,
+        stage,
         versionId: existing.versionId,
       });
       if (result.archive || result.files?.length !== 1) throw fail();
@@ -1444,6 +1558,7 @@ export async function createLaunchpad(ctx) {
         );
       }
       if (
+        !(await verifyStaged(parent, stage, input.signal)) ||
         !(await installedDependencySatisfies(parent.stagedPath, source, {
           loader: input.loader,
           signal: input.signal,
@@ -1510,7 +1625,7 @@ export async function createLaunchpad(ctx) {
         )
           return;
         try {
-          result = await found.resolve(value);
+          result = await found.resolve({ ...value, stage });
         } catch (cause) {
           if (
             !depth ||
@@ -1529,6 +1644,7 @@ export async function createLaunchpad(ctx) {
           // Resolve the actual target-loader artifact and its dependencies.
           // The publisher's incorrect pin must never enter the install plan.
           result = await found.resolve({
+            stage,
             ...value,
             expectedVersionNumber: compatible.version,
           });
@@ -1606,6 +1722,7 @@ export async function createLaunchpad(ctx) {
           title: result.title,
           iconUrl: result.iconUrl,
           author: result.author,
+          projectUrl: projectUrl(result.url),
           type: value.type,
           hosts: found.downloadHosts,
         };
@@ -1640,10 +1757,12 @@ export async function createLaunchpad(ctx) {
       [rootMetadata, ...files],
       warnings,
       input.signal,
+      "projectUrl",
     );
     return {
       ...rootResult,
       author: rootMetadata.author,
+      url: rootMetadata.projectUrl ?? projectUrl(rootResult.url),
       files,
       warnings,
       unavailableDependencies,
@@ -1710,6 +1829,9 @@ export async function createLaunchpad(ctx) {
             409,
             `${file.installedPath} changed since review. Review the installation again.`,
           );
+      } else if (file.stagedPath) {
+        await verifyStaged(file, stage, input.signal);
+        source = file.stagedPath;
       } else {
         source = path.join(stage, `dependency-inspection-${index}.jar`);
         await downloadVerified(file, source, file.hosts, request, {
@@ -1827,16 +1949,51 @@ export async function createLaunchpad(ctx) {
         ),
     );
   }
+  async function verifyStaged(file, stage, signal, archive = false) {
+    if (
+      typeof file.stagedPath !== "string" ||
+      !path.isAbsolute(file.stagedPath)
+    )
+      throw error(409, "A staged download is outside its installation review.");
+    const relative = path.relative(stage, file.stagedPath);
+    if (
+      !relative ||
+      path.isAbsolute(relative) ||
+      relative.split(path.sep).includes("..")
+    )
+      throw error(409, "A staged download is outside its installation review.");
+    const target = await safePath(stage, relative.split(path.sep).join("/"));
+    const size = (await fs.lstat(target)).size;
+    const [algorithm, expected] = strongestHash(file.hashes);
+    const maximum = (archive ? 2 * 1024 : 512) * 1024 ** 2;
+    const actual = await fileHash(target, algorithm, signal, maximum);
+    if ((file.size != null && size !== file.size) || actual !== expected)
+      throw error(
+        502,
+        "A staged download failed its size or checksum check. No server files were changed.",
+      );
+    return {
+      size,
+      sha512:
+        algorithm === "sha512"
+          ? actual
+          : await fileHash(target, "sha512", signal, maximum),
+    };
+  }
   async function unpackPack(result, input, stage) {
     const found = await provider(input.platform);
-    const archive = path.join(stage, "package.zip");
-    await downloadVerified(
-      { ...result.archive, archive: true },
-      archive,
-      found.downloadHosts,
-      request,
-      { signal: input.signal },
-    );
+    const archive =
+      result.archive.stagedPath ?? path.join(stage, "package.zip");
+    if (result.archive.stagedPath)
+      await verifyStaged(result.archive, stage, input.signal, true);
+    else
+      await downloadVerified(
+        { ...result.archive, archive: true },
+        archive,
+        found.downloadHosts,
+        request,
+        { signal: input.signal },
+      );
     const extracted = path.join(stage, "archive");
     await fs.mkdir(extracted);
     const entries = await unpackProviderZip(archive, extracted, undefined, {
@@ -2114,7 +2271,48 @@ export async function createLaunchpad(ctx) {
       }
     }
     if (plans.size >= 8) await cancelPreview(plans.keys().next().value);
-    const input = selection(raw, true);
+    const bulk = raw.updates !== undefined;
+    if (
+      bulk &&
+      (!Array.isArray(raw.updates) ||
+        !raw.updates.length ||
+        raw.updates.length > 50 ||
+        raw.type === "modpack")
+    )
+      throw error(
+        400,
+        "Choose between one and 50 installed mods, plugins, or datapacks to update.",
+      );
+    const roots = bulk
+      ? raw.updates.map((value) => {
+          if (!value || typeof value.replacePath !== "string")
+            throw error(400, "Each update must identify its installed file.");
+          return {
+            ...selection(
+              {
+                type: raw.type,
+                gameVersion: raw.gameVersion,
+                loader: raw.loader,
+                platform: value.platform,
+                projectId: value.projectId,
+                versionId: value.versionId,
+                signal: raw.signal,
+              },
+              true,
+            ),
+            replacePath: safeInstallPath(value.replacePath),
+          };
+        })
+      : [{ ...selection(raw, true), replacePath: raw.replacePath }];
+    const rootKeys = roots.map(
+      (value) => `${value.platform}:${value.projectId}`,
+    );
+    if (new Set(rootKeys).size !== roots.length)
+      throw error(
+        400,
+        "Choose each installed project only once in an update review.",
+      );
+    const input = roots[0];
     input.signal.throwIfAborted();
     await assertCompatibility(input);
     const found = await provider(input.platform);
@@ -2122,11 +2320,84 @@ export async function createLaunchpad(ctx) {
     const stage = await privatePath(planId);
     await fs.mkdir(stage);
     try {
-      const local =
+      const identified =
         input.type === "modpack"
-          ? []
-          : (await installed({ ...input, identityOnly: true })).items;
-      const result = await resolveTree(input, stage, local);
+          ? { items: [], warnings: [] }
+          : await installed({ ...input, identityOnly: true });
+      const local = identified.items;
+      const trees = [];
+      for (const [index, root] of roots.entries()) {
+        if (
+          bulk &&
+          !local.some(
+            (item) =>
+              item.path === root.replacePath &&
+              item.platform === root.platform &&
+              item.projectId === root.projectId,
+          )
+        )
+          throw error(
+            409,
+            `The installed file ${root.replacePath} could not be verified as this project. ${identified.warnings.join(" ")} Refresh installed files.`,
+          );
+        const rootStage = bulk ? path.join(stage, `item-${index}`) : stage;
+        if (bulk) await fs.mkdir(rootStage);
+        const tree = await resolveTree(root, rootStage, local);
+        if (bulk && tree.archive)
+          throw error(
+            400,
+            "Modpacks require their own clean installation review.",
+          );
+        trees.push(tree);
+        if (
+          trees.reduce((total, value) => total + value.files.length, 0) > 10000
+        )
+          throw error(400, "This update selection contains too many files.");
+      }
+      const result = trees[0];
+      if (bulk) {
+        const files = new Map(),
+          versions = new Map();
+        for (const tree of trees)
+          for (const file of tree.files) {
+            const project = `${file.platform}:${file.projectId}`;
+            if (
+              versions.has(project) &&
+              versions.get(project) !== file.versionId
+            )
+              throw error(
+                409,
+                "Selected updates require conflicting versions of the same dependency. Update these projects separately after resolving their requirements.",
+              );
+            versions.set(project, file.versionId);
+            const folded = file.path.toLowerCase(),
+              previous = files.get(folded);
+            if (
+              previous &&
+              (previous.platform !== file.platform ||
+                previous.projectId !== file.projectId ||
+                previous.versionId !== file.versionId ||
+                JSON.stringify(strongestHash(previous.hashes)) !==
+                  JSON.stringify(strongestHash(file.hashes)))
+            )
+              throw error(
+                409,
+                "Selected updates resolve to conflicting destination files.",
+              );
+            if (!previous) files.set(folded, file);
+          }
+        result.files = [...files.values()];
+        result.title = `${roots.length} content updates`;
+        result.versionName = "Reviewed together";
+        result.warnings = trees.flatMap((tree) => tree.warnings);
+        result.unavailableDependencies = trees.flatMap(
+          (tree) => tree.unavailableDependencies,
+        );
+        result.recoveredDependencies = new Set(
+          trees.flatMap((tree) => [...tree.recoveredDependencies]),
+        );
+      }
+      result.warnings.push(...identified.warnings);
       if (result.archive) {
         const pack = await unpackPack(result, input, stage);
         result.files.push(
@@ -2218,13 +2489,18 @@ export async function createLaunchpad(ctx) {
             `${file.title} is already installed at a different version. This project's dependency link needs correction; Launchpad cannot safely replace the installed dependency automatically.`,
           );
         let oldPath = matches[0]?.path;
-        if (raw.replacePath && file.projectId === input.projectId) {
-          if (oldPath !== raw.replacePath)
+        const selectedRoot = roots.find(
+          (root) =>
+            root.platform === file.platform &&
+            root.projectId === file.projectId,
+        );
+        if (selectedRoot?.replacePath) {
+          if (oldPath !== selectedRoot.replacePath)
             throw error(
               409,
-              "The selected installed file could not be verified as this project. Refresh installed files.",
+              `The selected installed file could not be verified as this project. ${identified.warnings.length ? identified.warnings.join(" ") + " " : ""}Refresh installed files.`,
             );
-          oldPath = raw.replacePath;
+          oldPath = selectedRoot.replacePath;
         }
         const target = await safePath(serverDir, file.path);
         const current = await statOrNull(target);
@@ -2287,6 +2563,24 @@ export async function createLaunchpad(ctx) {
         });
       }
       result.files = [...files, ...unchanged];
+      // Promotion recycles each original immediately before writing its new
+      // file. An original claimed by another item must never remove an output
+      // already installed earlier in the same review (or an unchanged file).
+      const claimedPaths = new Map();
+      for (const file of result.files)
+        for (const relative of [
+          file.path,
+          file.previous?.path,
+          file.installedPath,
+        ].filter(Boolean)) {
+          const folded = relative.toLowerCase();
+          if (claimedPaths.has(folded) && claimedPaths.get(folded) !== file)
+            throw error(
+              409,
+              `Selected files have overlapping installation and replacement paths (${relative}). Resolve the conflicting package filenames before installing.`,
+            );
+          claimedPaths.set(folded, file);
+        }
       await inspectUnavailableDependencies(result, input, stage);
       const expiresAt = new Date(Date.now() + 15 * 60 * 1000).toISOString();
       const plan = {
@@ -2296,6 +2590,7 @@ export async function createLaunchpad(ctx) {
         files,
         unchanged,
         title: result.title,
+        url: result.url,
         iconUrl: result.iconUrl,
         author:
           result.author ||
@@ -2343,6 +2638,7 @@ export async function createLaunchpad(ctx) {
         ...(input.type === "modpack"
           ? {
               cleanInstall: true,
+              hasExistingContent: (await fs.readdir(serverDir)).length > 0,
               runtime: plan.runtime,
               summary: {
                 fileCount: files.length,
@@ -2452,6 +2748,7 @@ export async function createLaunchpad(ctx) {
               title: file.title,
               iconUrl: file.iconUrl,
               author: file.author,
+              url: file.projectUrl,
               type: file.type,
               installedAt: new Date().toISOString(),
             },
@@ -2614,6 +2911,7 @@ export async function createLaunchpad(ctx) {
               title: plan.title,
               iconUrl: plan.iconUrl,
               author: plan.author,
+              url: plan.url,
               versionName: plan.versionName,
               path: "",
               installedAt: new Date().toISOString(),
@@ -2689,6 +2987,7 @@ export async function createLaunchpad(ctx) {
         "Review the unavailable required dependencies and confirm that you will manage them yourself before installing.",
       );
     preparingInstall = true;
+    notifyBusy();
     // Claim the review synchronously before status validation yields. A close
     // or Back request may dispose unclaimed reviews, never an accepted stage.
     plan.reserved = true;
@@ -2699,6 +2998,7 @@ export async function createLaunchpad(ctx) {
     } catch (cause) {
       plan.reserved = false;
       preparingInstall = false;
+      notifyBusy();
       throw cause;
     }
     backgroundChecks.clear();
@@ -2713,46 +3013,42 @@ export async function createLaunchpad(ctx) {
     };
     jobs.set(job.id, job);
     lastJob = job.id;
+    for (const [id, previous] of jobs) {
+      if (jobs.size <= 30) break;
+      if (id !== lastJob && ["completed", "failed"].includes(previous.status))
+        jobs.delete(id);
+    }
     const controller = new AbortController();
     activeController = controller;
     let operation;
     try {
       operation = withMinecraftMutation(async () => {
         job.status = "running";
-        let outcome;
+        let failedFile;
+        let outcome,
+          phase = "verify",
+          retained = false;
         try {
           let downloaded = 0;
           for (const [index, file] of plan.files.entries()) {
             controller.signal.throwIfAborted();
+            failedFile = file.path;
             job.message = `Verifying ${file.path}`;
-            const alreadyStaged = Boolean(file.stagedPath);
             if (!file.stagedPath) {
-              file.stagedPath = path.join(plan.stage, `download-${index}`);
-              await downloadVerified(
-                file,
-                file.stagedPath,
-                file.hosts,
-                request,
-                {
-                  signal: controller.signal,
-                },
-              );
+              phase = "download";
+              const destination = path.join(plan.stage, `download-${index}`);
+              await downloadVerified(file, destination, file.hosts, request, {
+                signal: controller.signal,
+              });
+              file.stagedPath = destination;
             }
-            const stagedSize = (await fs.stat(file.stagedPath)).size;
-            const [algorithm, expectedHash] = strongestHash(file.hashes);
-            const stagedHash = alreadyStaged
-              ? await fileHash(file.stagedPath, algorithm)
-              : null;
-            if (
-              alreadyStaged &&
-              ((file.size != null && stagedSize !== file.size) ||
-                stagedHash !== expectedHash)
-            )
-              throw error(
-                502,
-                "A staged download failed its size or checksum check. No server files were changed.",
-              );
-            downloaded += stagedSize;
+            phase = "verify";
+            const verified = await verifyStaged(
+              file,
+              plan.stage,
+              controller.signal,
+            );
+            downloaded += verified.size;
             if (
               downloaded >
               (plan.input.type === "modpack" ? 4 : 2) * 1024 ** 3
@@ -2761,30 +3057,70 @@ export async function createLaunchpad(ctx) {
                 400,
                 `This installation exceeds the ${plan.input.type === "modpack" ? 4 : 2} GB total size limit.`,
               );
-            file.sha512 =
-              algorithm === "sha512" && stagedHash
-                ? stagedHash
-                : await fileHash(file.stagedPath);
+            file.sha512 = verified.sha512;
           }
           controller.signal.throwIfAborted();
+          phase = "promote";
           await promote(plan, job);
+          removal.invalidate();
           outcome = {
             status: "completed",
             message: `${plan.title} installed. Replaced files remain recoverable in Recycle Bin.`,
           };
         } catch (cause) {
+          if (
+            phase === "download" &&
+            !closing &&
+            !lifetime.signal.aborted &&
+            !controller.signal.aborted &&
+            (cause.status === undefined ||
+              cause.status === 429 ||
+              cause.status >= 500) &&
+            !/checksum|size|redirect|unsupported host|allowed host|ZIP|signature/i.test(
+              cause.message,
+            )
+          ) {
+            plan.reserved = false;
+            plan.expiresAt = new Date(Date.now() + 15 * 60_000).toISOString();
+            plans.set(plan.id, plan);
+            retained = true;
+          }
           outcome = {
             status: "failed",
-            error: cause.message,
-            message: cause.message,
+            error:
+              phase !== "promote" && failedFile
+                ? `${failedFile}: ${cause.message}`
+                : cause.message,
+            message:
+              phase !== "promote" && failedFile
+                ? `${failedFile}: ${cause.message}`
+                : cause.message,
+            retryable: retained,
+            ...(retained
+              ? {
+                  planId: plan.id,
+                  expiresAt: plan.expiresAt,
+                  retryInput: {
+                    planId: plan.id,
+                    confirmed: true,
+                    ...(input.cleanInstall === true
+                      ? { cleanInstall: true }
+                      : {}),
+                    ...(input.acknowledgedUnavailableDependencies === true
+                      ? { acknowledgedUnavailableDependencies: true }
+                      : {}),
+                  },
+                }
+              : {}),
           };
         } finally {
           job.message = "Finishing installation cleanup…";
           try {
-            await fs.rm(await privatePath(plan.id), {
-              recursive: true,
-              force: true,
-            });
+            if (!retained)
+              await fs.rm(await privatePath(plan.id), {
+                recursive: true,
+                force: true,
+              });
           } catch {
             // A leftover private stage must not keep the completed job active.
           }
@@ -2797,6 +3133,7 @@ export async function createLaunchpad(ctx) {
       jobs.delete(job.id);
       lastJob = terminal?.get()?.id ?? null;
       preparingInstall = false;
+      notifyBusy();
       activeController = null;
       throw cause;
     }
@@ -2815,6 +3152,7 @@ export async function createLaunchpad(ctx) {
         active = null;
         activeController = null;
         Object.assign(job, final);
+        notifyBusy();
       },
       async (cause) => {
         const final = {
@@ -2831,9 +3169,11 @@ export async function createLaunchpad(ctx) {
         active = null;
         activeController = null;
         Object.assign(job, final);
+        notifyBusy();
       },
     );
     preparingInstall = false;
+    notifyBusy();
     return { job: { ...job } };
   }
   async function cancelPreview(id) {
@@ -2846,6 +3186,7 @@ export async function createLaunchpad(ctx) {
     return { ok: true };
   }
   const api = {
+    isBusy: () => Boolean(active || preparingInstall || removal.busy),
     config,
     async settings(input) {
       const value = input?.curseforgeApiKey;
@@ -2902,9 +3243,15 @@ export async function createLaunchpad(ctx) {
     },
     installed,
     preview,
+    previewUpdates: (input) => {
+      if (!input || !Array.isArray(input.updates))
+        throw error(400, "Choose installed content updates to review.");
+      return preview(input);
+    },
     install,
     snapshotInstalled: () => [...receipts],
     clearInstalled: async () => {
+      removal.invalidate();
       replaceReceipts([]);
       backgroundChecks.clear();
       await saveReceipts();
@@ -2914,6 +3261,7 @@ export async function createLaunchpad(ctx) {
       updateFailures.clear();
     },
     restoreInstalled: async (value) => {
+      removal.invalidate();
       replaceReceipts([...value]);
       backgroundChecks.clear();
       await saveReceipts();
@@ -2986,7 +3334,7 @@ export async function createLaunchpad(ctx) {
           404,
           "This Launchpad job was not found for the selected server.",
         );
-      return { job: { ...jobs.get(id) } };
+      return { job: publicJob(jobs.get(id)) };
     },
     async close() {
       closing = true;

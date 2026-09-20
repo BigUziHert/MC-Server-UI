@@ -1,6 +1,9 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
+import fs from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 import { createExtraProviders } from "./launchpad-extra.mjs";
 
 const digest = (algorithm, bytes) =>
@@ -9,6 +12,16 @@ const jar = Buffer.concat([
   Buffer.from("504b0304", "hex"),
   Buffer.from("isolated test package"),
 ]);
+async function reviewStage(t) {
+  const temp = await fs.realpath(os.tmpdir());
+  const stage = await fs.mkdtemp(path.join(temp, "mc-extra-pin-test-"));
+  t.after(async () => {
+    assert.equal(path.dirname(stage), temp);
+    assert.equal(await fs.realpath(stage), stage);
+    await fs.rm(stage, { recursive: true, force: true });
+  });
+  return stage;
+}
 function fixture(data, handler = () => null) {
   const requests = [];
   const providers = createExtraProviders({
@@ -87,7 +100,9 @@ test("extra source capabilities expose only supported content types", () => {
   );
 });
 
-test("FTB sorts every matching pack before paging and preserves the default cached order", async () => {
+test("FTB sorts every matching pack before paging and preserves the default cached order", async (t) => {
+  let now = Date.now();
+  t.mock.method(Date, "now", () => now);
   const names = [
     "Golf",
     "Alpha",
@@ -149,6 +164,23 @@ test("FTB sorts every matching pack before paging and preserves the default cach
     requests.length,
     11,
     "catalog and pack metadata remain cached across sorts",
+  );
+  now += 6 * 60 * 1000;
+  assert.equal(
+    (await provider("ftb").search({ ...input, sort: "name", offset: 3 })).total,
+    8,
+  );
+  assert.equal(
+    requests.length,
+    11,
+    "Hydrated catalogs outlive leaf metadata caches across sort/page changes.",
+  );
+  now += 15 * 60 * 1000;
+  await provider("ftb").search(input);
+  assert.equal(
+    requests.length,
+    22,
+    "Hydrated catalogs must eventually refresh.",
   );
 });
 
@@ -284,6 +316,7 @@ test("FTB search applies compatibility and resolves required server files with p
     0,
   );
   const result = await ftb.resolve(ftbSelection);
+  assert.equal(result.url, "https://www.feed-the-beast.com/modpacks/1");
   assert.deepEqual(result.loaderInstall, {
     loader: "neoforge",
     gameVersion: "1.21.1",
@@ -358,9 +391,10 @@ function atFixture(modPatch = {}) {
   };
   return { pack, manifest };
 }
-test("ATLauncher resolves required mods and config archive together and pins legacy checksums", async () => {
+test("ATLauncher resolves required mods and config archive together and pins legacy checksums", async (t) => {
+  const stage = await reviewStage(t);
   const { pack, manifest } = atFixture();
-  const { provider } = fixture(
+  const { provider, requests } = fixture(
     { [`${ATL}/packs/full/public`]: { data: [pack] } },
     (url) => {
       if (url.endsWith("/Configs.json"))
@@ -371,7 +405,8 @@ test("ATLauncher resolves required mods and config archive together and pins leg
   const at = provider("atlauncher");
   const input = { ...ftbSelection, projectId: "FixturePack", versionId: "1.0" };
   assert.equal((await at.versions(input))[0].downloadable, true);
-  const resolved = await at.resolve(input);
+  const resolved = await at.resolve({ ...input, stage });
+  assert.equal(resolved.url, "https://atlauncher.com/pack/FixturePack");
   assert.deepEqual(resolved.loaderInstall, {
     loader: "neoforge",
     gameVersion: "1.21.1",
@@ -383,7 +418,18 @@ test("ATLauncher resolves required mods and config archive together and pins leg
     url: `${CDN}packs/FixturePack/files/fixture.jar`,
     size: jar.length,
     hashes: { sha512: digest("sha512", jar) },
+    stagedPath: resolved.files[0].stagedPath,
   });
+  assert.equal(path.dirname(resolved.files[0].stagedPath), stage);
+  assert.match(
+    path.basename(resolved.files[0].stagedPath),
+    /^pinned-[a-f0-9-]+$/,
+  );
+  assert.deepEqual(await fs.readFile(resolved.files[0].stagedPath), jar);
+  assert.equal(
+    requests.filter((url) => url.endsWith("/fixture.jar")).length,
+    1,
+  );
   assert.deepEqual(resolved.archive, {
     format: "server-zip",
     url: `${CDN}packs/FixturePack/versions/1.0/Configs.zip`,
@@ -394,7 +440,8 @@ test("ATLauncher resolves required mods and config archive together and pins leg
   assert.match(resolved.warnings.join(" "), /Skipped 2/);
 });
 
-test("ATLauncher refuses required extraction steps and MD5 mismatches without silently skipping content", async () => {
+test("ATLauncher refuses required extraction steps and MD5 mismatches without silently skipping content", async (t) => {
+  const stage = await reviewStage(t);
   for (const patch of [{ type: "extract" }, { md5: "0".repeat(32) }]) {
     const { pack, manifest } = atFixture(patch);
     const { provider } = fixture(
@@ -406,12 +453,14 @@ test("ATLauncher refuses required extraction steps and MD5 mismatches without si
     );
     await assert.rejects(
       provider("atlauncher").resolve({
+        stage,
         ...ftbSelection,
         projectId: "FixturePack",
         versionId: "1.0",
       }),
       /manual installation step|does not match/,
     );
+    assert.deepEqual(await fs.readdir(stage), []);
   }
 });
 
@@ -451,7 +500,8 @@ const spigotSelection = {
   gameVersion: "1.21.1",
   loader: "paper",
 };
-test("Spigot includes separately published latest versions and pins only official directly hosted JARs", async () => {
+test("Spigot includes separately published latest versions and pins only official directly hosted JARs", async (t) => {
+  const stage = await reviewStage(t);
   const { provider } = fixture(spigotData(), (url) =>
     url === `${SPIGOT}/resources/1/download`
       ? new Response(null, {
@@ -469,13 +519,16 @@ test("Spigot includes separately published latest versions and pins only officia
       { id: "9", downloadable: false },
     ],
   );
-  const resolved = await spigot.resolve(spigotSelection);
+  const resolved = await spigot.resolve({ ...spigotSelection, stage });
+  assert.equal(resolved.url, "https://www.spigotmc.org/resources/1/");
   assert.equal(resolved.files[0].path, "plugins/spigot-1-10.jar");
   assert.equal(resolved.files[0].hashes.sha512, digest("sha512", jar));
   assert.match(resolved.warnings[0], /does not publish a strong checksum/);
+  assert.deepEqual(await fs.readFile(resolved.files[0].stagedPath), jar);
 });
 
-test("Spigot blocks premium/external files, unsafe redirects, and updates racing preview", async () => {
+test("Spigot blocks premium/external files, unsafe redirects, and updates racing preview", async (t) => {
+  const stage = await reviewStage(t);
   for (const patch of [{ premium: true }, { external: true }]) {
     const { provider } = fixture(spigotData(patch));
     await assert.rejects(
@@ -492,7 +545,7 @@ test("Spigot blocks premium/external files, unsafe redirects, and updates racing
       }),
   );
   await assert.rejects(
-    foreign.provider("spigot").resolve(spigotSelection),
+    foreign.provider("spigot").resolve({ ...spigotSelection, stage }),
     /outside the provider/,
   );
   assert.equal(
@@ -503,7 +556,7 @@ test("Spigot blocks premium/external files, unsafe redirects, and updates racing
   changed[`${SPIGOT}/resources/1/versions/latest`].id = 11;
   const raced = fixture(changed, () => new Response(jar));
   await assert.rejects(
-    raced.provider("spigot").resolve(spigotSelection),
+    raced.provider("spigot").resolve({ ...spigotSelection, stage }),
     /updated during review/,
   );
 });
@@ -657,7 +710,8 @@ test("Voids Wrath sorts all matching names before pagination without inventing c
   assert.equal(requests.length, 1);
 });
 
-test("Voids Wrath discovers current official packs and verifies direct server archives", async () => {
+test("Voids Wrath discovers current official packs and verifies direct server archives", async (t) => {
+  const stage = await reviewStage(t);
   const { provider } = fixture({}, (url, options) => {
     if (url.endsWith("/mod-packs/")) return new Response(voidCatalog);
     if (url.includes("/modpacks/"))
@@ -686,9 +740,218 @@ test("Voids Wrath discovers current official packs and verifies direct server ar
   assert.equal(results.projects[0].title, "Fixture & Pack");
   assert.equal(results.projects[0].downloads, undefined);
   assert.equal((await voids.versions(input))[0].downloadable, true);
-  const resolved = await voids.resolve(input);
+  const resolved = await voids.resolve({ ...input, stage });
+  assert.match(resolved.url, /^https:\/\/voidswrath\.com\/modpacks\//);
   assert.equal(resolved.archive.format, "server-zip");
   assert.equal(resolved.archive.hashes.sha512, digest("sha512", jar));
+  assert.deepEqual(await fs.readFile(resolved.archive.stagedPath), jar);
+});
+
+test("ATLauncher reuses hydrated versions after leaf metadata expires", async (t) => {
+  let now = Date.now();
+  t.mock.method(Date, "now", () => now);
+  const { pack, manifest } = atFixture();
+  const { provider, requests } = fixture(
+    { [`${ATL}/packs/full/public`]: { data: [pack] } },
+    () => new Response(JSON.stringify(manifest)),
+  );
+  const input = { ...ftbSelection, projectId: "FixturePack" };
+  const first = await provider("atlauncher").versions(input);
+  assert.equal(first.length, 1);
+  assert.equal(requests.length, 2);
+  now += 6 * 60 * 1000;
+  assert.deepEqual(
+    await provider("atlauncher").versions({
+      ...input,
+      offset: 10,
+      sort: "name",
+    }),
+    first,
+  );
+  assert.equal(requests.length, 2);
+  now += 15 * 60 * 1000;
+  await provider("atlauncher").versions(input);
+  assert.equal(requests.length, 4);
+});
+
+test("Spigot installed-version metadata verifies identity and caches safe dates", async () => {
+  const data = spigotData();
+  const { provider, requests } = fixture(data);
+  const spigot = provider("spigot");
+  const selection = { projectId: "1", versionId: "10" };
+  const version = await spigot.installedVersion(selection);
+  assert.equal(version.id, "10");
+  assert.equal(version.publishedAt, new Date(1700000000 * 1000).toISOString());
+  assert.deepEqual(await spigot.installedVersion(selection), version);
+  assert.equal(requests.length, 1);
+  const invalid = fixture({
+    ...data,
+    [`${SPIGOT}/resources/1/versions/10`]: {
+      id: 10,
+      resource: 2,
+      releaseDate: 1700000000,
+    },
+  });
+  await assert.rejects(
+    invalid.provider("spigot").installedVersion(selection),
+    /different plugin/,
+  );
+});
+
+test("metadata cache evicts least-recently-used entries at its hard bound", async () => {
+  const data = Object.fromEntries(
+    Array.from({ length: 1001 }, (_, index) => {
+      const id = index + 1;
+      return [
+        `${SPIGOT}/resources/1/versions/${id}`,
+        { id, resource: 1, name: String(id), releaseDate: 1700000000 },
+      ];
+    }),
+  );
+  const { provider, requests } = fixture(data);
+  const lookup = (id) =>
+    provider("spigot").installedVersion({
+      projectId: "1",
+      versionId: String(id),
+    });
+  for (let id = 1; id <= 1000; id++) await lookup(id);
+  await lookup(1);
+  await lookup(1001);
+  await lookup(1);
+  assert.equal(
+    requests.length,
+    1001,
+    "A recently used entry must survive eviction.",
+  );
+  await lookup(2);
+  assert.equal(
+    requests.length,
+    1002,
+    "The oldest untouched entry must be evicted.",
+  );
+});
+
+for (const phase of ["headers", "body"]) {
+  test(`pinning reports a ${phase} stall and removes any partial staged file`, async (t) => {
+    const stage = await reviewStage(t);
+    t.mock.timers.enable({ apis: ["setTimeout"] });
+    let began;
+    const started = new Promise((resolve) => {
+      began = resolve;
+    });
+    const { provider } = fixture(spigotData(), (_url, { signal }) => {
+      if (phase === "headers") {
+        began();
+        return new Promise((_resolve, reject) =>
+          signal.addEventListener("abort", () => reject(signal.reason), {
+            once: true,
+          }),
+        );
+      }
+      return new Response(
+        new ReadableStream({
+          start(controller) {
+            controller.enqueue(jar.subarray(0, 4));
+            signal.addEventListener(
+              "abort",
+              () => controller.error(signal.reason),
+              { once: true },
+            );
+            began();
+          },
+        }),
+      );
+    });
+    const failed = assert.rejects(
+      provider("spigot").resolve({ ...spigotSelection, stage }),
+      (cause) => cause.status === 504 && /stalled/.test(cause.message),
+    );
+    await started;
+    t.mock.timers.tick(60000);
+    await failed;
+    assert.deepEqual(await fs.readdir(stage), []);
+  });
+}
+
+test("pinning preserves caller cancellation and rejects non-ZIP bytes without leftovers", async (t) => {
+  const stage = await reviewStage(t);
+  const bad = fixture(spigotData(), () => new Response("not a jar"));
+  await assert.rejects(
+    bad.provider("spigot").resolve({ ...spigotSelection, stage }),
+    /JAR or ZIP/,
+  );
+  assert.deepEqual(await fs.readdir(stage), []);
+  const caller = new AbortController();
+  const reason = new Error("review closed");
+  caller.abort(reason);
+  const canceled = fixture(spigotData(), () => {
+    assert.fail("Cancelled review must not download");
+  });
+  await assert.rejects(
+    canceled
+      .provider("spigot")
+      .resolve({ ...spigotSelection, stage, signal: caller.signal }),
+    (cause) => cause === reason,
+  );
+  assert.deepEqual(await fs.readdir(stage), []);
+});
+
+test("a failed multi-file review waits for its other pin writers before releasing the stage", async (t) => {
+  const stage = await reviewStage(t);
+  const { pack, manifest } = atFixture();
+  manifest.mods = [
+    { ...manifest.mods[0], type: "extract" },
+    {
+      ...manifest.mods[0],
+      file: "slow.jar",
+      url: "packs/FixturePack/files/slow.jar",
+    },
+  ];
+  let body, began;
+  const started = new Promise((resolve) => {
+    began = resolve;
+  });
+  const { provider } = fixture(
+    { [`${ATL}/packs/full/public`]: { data: [pack] } },
+    (url) =>
+      url.endsWith("/Configs.json")
+        ? new Response(JSON.stringify(manifest))
+        : new Response(
+            new ReadableStream({
+              start(controller) {
+                body = controller;
+                controller.enqueue(jar);
+                began();
+              },
+            }),
+          ),
+  );
+  let settled = false;
+  const pending = provider("atlauncher").resolve({
+    ...ftbSelection,
+    projectId: "FixturePack",
+    versionId: "1.0",
+    stage,
+  });
+  pending.then(
+    () => {
+      settled = true;
+    },
+    () => {
+      settled = true;
+    },
+  );
+  await started;
+  assert.equal(
+    settled,
+    false,
+    "The plan owner must not remove a stage while another worker still writes to it.",
+  );
+  body.close();
+  await assert.rejects(pending, /manual installation step/);
+  const pinned = await fs.readdir(stage);
+  assert.equal(pinned.length, 1);
+  assert.deepEqual(await fs.readFile(path.join(stage, pinned[0])), jar);
 });
 
 test("Voids Wrath exposes oversized archives as manual downloads and never fetches their contents", async () => {

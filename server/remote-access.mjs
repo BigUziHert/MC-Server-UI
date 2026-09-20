@@ -77,6 +77,7 @@ export function requiredPermissions(req) {
       [
         "/api/versions/install",
         "/api/launchpad/preview",
+        "/api/launchpad/updates/preview",
         "/api/launchpad/removal-preview",
         "/api/launchpad/remove",
         "/api/launchpad/install",

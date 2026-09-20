@@ -232,6 +232,116 @@ test("installs a verified official ZIP into private storage and reuses it withou
   assert.equal(f.service.support().installJob.id, retry.id);
 });
 
+for (const damage of [
+  "missing marker",
+  "malformed marker",
+  "mismatched marker",
+  "unsafe executable marker",
+  "missing executable",
+]) {
+  test(`repairs a managed runtime with a ${damage} without manual folder removal`, async (t) => {
+    const f = await fixture(t);
+    const initial = await settled(f.service, f.service.install(choice).id);
+    assert.equal(initial.status, "completed", initial.error);
+    const [name] = await runtimeEntries(f.dataDir);
+    const destination = path.join(f.dataDir, "java-runtimes", name);
+    const marker = path.join(destination, "mc-panel-runtime.json");
+    if (damage === "missing marker") await fs.unlink(marker);
+    if (damage === "malformed marker") await fs.writeFile(marker, "{broken");
+    if (damage === "mismatched marker")
+      await fs.writeFile(
+        marker,
+        JSON.stringify({
+          sha256: "0".repeat(64),
+          executable: "jdk-21/bin/java.exe",
+          majorVersion: 21,
+        }),
+      );
+    if (damage === "unsafe executable marker")
+      await fs.writeFile(
+        marker,
+        JSON.stringify({
+          sha256: sha256(f.bytes),
+          executable: "../bin/java.exe",
+          majorVersion: 21,
+        }),
+      );
+    if (damage === "missing executable") await fs.unlink(initial.java.path);
+    const repaired = await settled(f.service, f.service.install(choice).id);
+    assert.equal(repaired.status, "completed", repaired.error);
+    assert.equal(repaired.java.path, initial.java.path);
+    assert.match(
+      await fs.readFile(repaired.java.path, "utf8"),
+      /synthetic Java/,
+    );
+    assert.equal(
+      JSON.parse(await fs.readFile(marker, "utf8")).sha256,
+      sha256(f.bytes),
+    );
+    assert.deepEqual(
+      await runtimeEntries(f.dataDir),
+      [name],
+      "Successful repair must remove staging and quarantine.",
+    );
+    assert.equal(f.requests.filter((value) => value === packageUrl).length, 2);
+  });
+}
+
+test("a failed repair download retains the original runtime files and can be retried", async (t) => {
+  let failDownload = false;
+  const f = await fixture(t, {
+    request: (address, _init, normal) =>
+      address === packageUrl && failDownload
+        ? new Response("bad archive")
+        : normal(address),
+  });
+  const initial = await settled(f.service, f.service.install(choice).id);
+  const [name] = await runtimeEntries(f.dataDir);
+  const marker = path.join(
+    f.dataDir,
+    "java-runtimes",
+    name,
+    "mc-panel-runtime.json",
+  );
+  await fs.writeFile(marker, "{broken");
+  failDownload = true;
+  const failed = await settled(f.service, f.service.install(choice).id);
+  assert.equal(failed.status, "failed");
+  assert.match(failed.error, /checksum/);
+  assert.equal(await fs.readFile(marker, "utf8"), "{broken");
+  assert.match(await fs.readFile(initial.java.path, "utf8"), /synthetic Java/);
+  assert.deepEqual(await runtimeEntries(f.dataDir), [name]);
+  failDownload = false;
+  assert.equal(
+    (await settled(f.service, f.service.install(choice).id)).status,
+    "completed",
+  );
+});
+
+test("a failed replacement promotion restores the quarantined managed runtime", async (t) => {
+  const f = await fixture(t);
+  const initial = await settled(f.service, f.service.install(choice).id);
+  const [name] = await runtimeEntries(f.dataDir);
+  const destination = path.join(f.dataDir, "java-runtimes", name);
+  const marker = path.join(destination, "mc-panel-runtime.json");
+  await fs.writeFile(marker, "{damaged marker retained on rollback");
+  const rename = fs.rename;
+  t.mock.method(fs, "rename", async (from, to) => {
+    if (to === destination && /[\\/]\.install-[^\\/]+[\\/]runtime$/.test(from))
+      throw Object.assign(new Error("promotion interrupted"), { code: "EIO" });
+    return rename(from, to);
+  });
+  const failed = await settled(f.service, f.service.install(choice).id);
+  assert.equal(failed.status, "failed");
+  assert.match(failed.error, /promotion interrupted/);
+  assert.equal(
+    await fs.readFile(marker, "utf8"),
+    "{damaged marker retained on rollback",
+  );
+  assert.match(await fs.readFile(initial.java.path, "utf8"), /synthetic Java/);
+  assert.deepEqual(await runtimeEntries(f.dataDir), [name]);
+});
+
 const failures = [
   {
     name: "checksum mismatch",

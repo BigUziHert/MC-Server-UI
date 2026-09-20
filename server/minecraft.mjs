@@ -752,6 +752,12 @@ export async function createMinecraft(ctx) {
       endpoint(async (req, res) => res.json(await launchpad.preview(req.body))),
     );
     app.post(
+      "/api/launchpad/updates/preview",
+      endpoint(async (req, res) =>
+        res.json(await launchpad.previewUpdates(req.body)),
+      ),
+    );
+    app.post(
       "/api/launchpad/preview/:id/cancel",
       endpoint(async (req, res) =>
         res.json(await launchpad.cancelPreview(req.params.id)),

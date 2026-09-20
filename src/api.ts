@@ -3,6 +3,13 @@ import { createContext, useContext, useMemo } from "react";
 export const ServerScope = createContext<string | null>(null);
 export const SessionExpiredContext = createContext<(() => void) | null>(null);
 
+export function messageOf(
+  cause: unknown,
+  fallback = "Something went wrong. Please try again.",
+) {
+  return cause instanceof Error ? cause.message : fallback;
+}
+
 export async function api<T = any>(
   path: string,
   options: RequestInit = {},

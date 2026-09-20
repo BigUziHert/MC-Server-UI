@@ -607,6 +607,7 @@ export function createCoreProviders({
     (project) => ({
       id: String(project.id),
       title: project.title,
+      url: `https://modrinth.com/project/${enc(project.slug ?? project.id)}`,
       iconUrl: iconUrl(project.icon_url),
       teamId: project.team,
     }),
@@ -688,6 +689,7 @@ export function createCoreProviders({
         ? {
             id: String(project.id),
             title: project.name,
+            url: iconUrl(project.links?.websiteUrl),
             iconUrl: iconUrl(project.logo?.thumbnailUrl ?? project.logo?.url),
             author: projectAuthors(project),
           }
@@ -990,7 +992,6 @@ export function createCoreProviders({
           fits(mrVersion(value), input) && serverEnvironment(value.environment)
         );
       },
-      project: mrProject,
       async version(versionId) {
         return json(`${mr}/version/${enc(id(versionId))}`);
       },
@@ -1057,7 +1058,7 @@ export function createCoreProviders({
             iconUrl: value.logo?.thumbnailUrl,
             downloads: value.downloadCount,
             author: value.authors?.map((author) => author.name).join(", "),
-            url: value.links?.websiteUrl,
+            url: iconUrl(value.links?.websiteUrl),
           })),
           total: result.pagination?.totalCount ?? result.data.length,
           offset: input.offset,
@@ -1068,6 +1069,23 @@ export function createCoreProviders({
         return (await cfFiles(input))
           .map((file) => cfVersion(file, input.type))
           .filter((version) => fits(version, input));
+      },
+      async installedVersion(input) {
+        const file = (
+          await curseJson(
+            `/mods/${enc(id(input.projectId))}/files/${enc(id(input.versionId))}`,
+            { signal: input.signal },
+          )
+        ).data;
+        if (
+          String(file?.modId) !== input.projectId ||
+          String(file?.id) !== input.versionId
+        )
+          throw launchpadError(
+            502,
+            "The provider returned a different installed release.",
+          );
+        return cfVersion(file, input.type);
       },
       async identifyFingerprints(fingerprints, { signal } = {}) {
         return (

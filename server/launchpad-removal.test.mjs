@@ -8,6 +8,7 @@ import { crc32 } from "node:zlib";
 import { createLaunchpad } from "./launchpad.mjs";
 import { createRecycleBin } from "./recycle-bin.mjs";
 import { containedSourcePath } from "./import.mjs";
+import yauzl from "yauzl";
 
 const safePath = (root, relative = "") =>
   relative ? containedSourcePath(root, relative) : fs.realpath(root);
@@ -543,7 +544,7 @@ test("removal requires a stopped supported server, an exact confirmation and a c
   assert.deepEqual(await f.bin.list(), []);
 });
 
-test("removal paths stay in root-level mod JARs and unreadable declarations block a review", async (t) => {
+test("removal paths stay in root-level mod JARs and unreadable declarations require acknowledgement", async (t) => {
   const selected = mod("neoforge", "selected");
   const f = await fixture(t, { files: { "selected.jar": selected } });
   for (const value of [
@@ -564,10 +565,34 @@ test("removal paths stay in root-level mod JARs and unreadable declarations bloc
   });
   await f.write("mods/unreadable.jar", "not a ZIP");
   const result = await f.service.removalPreview({ path: "mods/selected.jar" });
-  assert.equal(result.blocked, true);
-  assert.equal(result.planId, undefined);
+  assert.equal(result.blocked, false);
+  assert.equal(result.requiresAcknowledgement, true);
+  assert.ok(result.planId);
   assert.match(result.warnings.join("\n"), /unreadable.jar/);
   assert.deepEqual(await f.read("mods/selected.jar"), selected);
+  await assert.rejects(
+    f.service.remove({ planId: result.planId, confirmed: true }),
+    { status: 400 },
+  );
+  await f.service.remove({
+    planId: result.planId,
+    confirmed: true,
+    acknowledgedUnreadableDependencies: true,
+  });
+  await assert.rejects(f.read("mods/selected.jar"), { code: "ENOENT" });
+  const unreadable = await f.service.removalPreview({
+    path: "mods/unreadable.jar",
+  });
+  assert.equal(unreadable.requiresAcknowledgement, true);
+  await assert.rejects(
+    f.service.remove({ planId: unreadable.planId, confirmed: true }),
+    { status: 400 },
+  );
+  await f.service.remove({
+    planId: unreadable.planId,
+    confirmed: true,
+    acknowledgedUnreadableDependencies: true,
+  });
 });
 
 test("removal drops the install receipt and restoration recovers cached identity by content hash offline", async (t) => {
@@ -728,6 +753,37 @@ test("plugins and datapacks can be reviewed and removed without scanning mod dep
     });
   }
   assert.equal((await f.read("mods/unreadable.jar")).toString(), "not a jar");
+});
+
+test("removal reuses metadata while fresh selected hashes and other file stamps guard confirmation", async (t) => {
+  const f = await fixture(t, {
+    files: {
+      "selected.jar": mod("neoforge", "selected"),
+      "other.jar": mod("neoforge", "other"),
+    },
+  });
+  const open = yauzl.open;
+  let parses = 0;
+  t.mock.method(yauzl, "open", (...args) => {
+    parses++;
+    return open(...args);
+  });
+  await f.service.removalPreview({ path: "mods/selected.jar" });
+  assert.equal(parses, 2);
+  const next = await f.service.removalPreview({ path: "mods/selected.jar" });
+  assert.equal(
+    parses,
+    2,
+    "unchanged archives do not need another metadata parse",
+  );
+  const future = new Date(Date.now() + 2000);
+  await fs.utimes(path.join(f.serverDir, "mods", "other.jar"), future, future);
+  await assert.rejects(
+    f.service.remove({ planId: next.planId, confirmed: true }),
+    /changed after this review/,
+  );
+  await f.service.removalPreview({ path: "mods/selected.jar" });
+  assert.equal(parses, 3, "only changed metadata is parsed again");
 });
 
 test("cancelled removal plans cannot mutate files", async (t) => {

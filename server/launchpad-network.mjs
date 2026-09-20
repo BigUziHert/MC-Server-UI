@@ -123,6 +123,52 @@ export function strongestHash(hashes = {}) {
     "The provider does not supply a supported file checksum. Install this file manually.",
   );
 }
+// Progress extends the inactivity deadline, never the absolute transfer ceiling.
+// Every owner closes both timers even when headers, opening the target, or a
+// checksum check fails. Keep catalog request deadlines independent of this.
+export function createDownloadDeadline(callerSignal) {
+  const controller = new AbortController();
+  let stall;
+  const timeout = (message) => controller.abort(launchpadError(504, message));
+  const progress = () => {
+    clearTimeout(stall);
+    if (controller.signal.aborted) return;
+    stall = setTimeout(
+      () =>
+        timeout(
+          "The download stalled and was cancelled. No server files were changed.",
+        ),
+      60000,
+    );
+    stall.unref?.();
+  };
+  const ceiling = setTimeout(
+    () =>
+      timeout(
+        "The download exceeded the 30-minute limit and was cancelled. No server files were changed.",
+      ),
+    30 * 60 * 1000,
+  );
+  ceiling.unref?.();
+  progress();
+  return {
+    signal: callerSignal
+      ? AbortSignal.any([callerSignal, controller.signal])
+      : controller.signal,
+    progress,
+    reason(cause) {
+      return callerSignal?.aborted
+        ? callerSignal.reason
+        : controller.signal.aborted
+          ? controller.signal.reason
+          : cause;
+    },
+    close() {
+      clearTimeout(stall);
+      clearTimeout(ceiling);
+    },
+  };
+}
 export async function downloadVerified(
   file,
   target,
@@ -142,24 +188,30 @@ export async function downloadVerified(
       400,
       `This download exceeds the ${limitDescription} limit.`,
     );
-  const timeout = AbortSignal.timeout(file.archive === true ? 300000 : 60000);
-  const downloadSignal = signal ? AbortSignal.any([signal, timeout]) : timeout;
-  downloadSignal.throwIfAborted();
-  const response = await responseFor(
-    file.url,
-    {
-      fetch: request,
-      signal: downloadSignal,
-      deadlineMs: file.archive === true ? 300000 : 60000,
-    },
-    hosts,
-  );
-  const handle = await fs.open(target, "wx");
-  const hash = createHash(algorithm);
+  const deadline = createDownloadDeadline(signal);
+  let handle;
   let size = 0;
   try {
+    deadline.signal.throwIfAborted();
+    const response = await responseFor(
+      file.url,
+      {
+        fetch: request,
+        signal: deadline.signal,
+        deadlineMs: 30 * 60 * 1000,
+      },
+      hosts,
+    );
+    try {
+      handle = await fs.open(target, "wx");
+    } catch (cause) {
+      await response.body?.cancel().catch(() => {});
+      throw cause;
+    }
+    const hash = createHash(algorithm);
     for await (const chunk of response.body) {
-      downloadSignal.throwIfAborted();
+      deadline.signal.throwIfAborted();
+      deadline.progress();
       size += chunk.length;
       if (size > limit)
         throw launchpadError(
@@ -169,6 +221,7 @@ export async function downloadVerified(
       hash.update(chunk);
       await handle.writeFile(chunk);
     }
+    deadline.signal.throwIfAborted();
     if (
       (file.size != null && size !== file.size) ||
       hash.digest("hex") !== expected
@@ -178,8 +231,11 @@ export async function downloadVerified(
         "Downloaded file failed its size or checksum check. No server files were changed.",
       );
     await handle.sync();
+  } catch (cause) {
+    throw deadline.reason(cause);
   } finally {
-    await handle.close();
+    deadline.close();
+    await handle?.close();
   }
   return size;
 }

@@ -50,7 +50,9 @@ export async function prepareCleanSettings(result, ctx) {
   }
   const values = parseProperties(properties);
   const maxPlayers = Number(values.get("max-players") ?? 20);
-  const motd = values.get("motd") ?? "A Minecraft Server";
+  const motd = (values.get("motd") ?? "A Minecraft Server")
+    .replace(/[\x00-\x1f\x7f]/g, " ")
+    .slice(0, 256);
   if (!Number.isInteger(maxPlayers) || maxPlayers < 1 || maxPlayers > 100000)
     throw fail(400, "The pack has an invalid max-players setting.");
   result.configuration = { ...result.configuration, motd, maxPlayers };

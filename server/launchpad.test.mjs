@@ -15,6 +15,7 @@ import { containedSourcePath } from "./import.mjs";
 import { unpackProviderZip, safeInstallPath } from "./launchpad-archives.mjs";
 import { downloadVerified } from "./launchpad-network.mjs";
 import { createCoreProviders } from "./launchpad-providers.mjs";
+import { createExtraProviders } from "./launchpad-extra.mjs";
 import { inferPackRuntime } from "./launchpad-pack-runtime.mjs";
 
 const bytes = (value) => Buffer.from(value);
@@ -338,6 +339,472 @@ async function waitForJob(service, id) {
   }
   assert.fail("Fixture install did not complete");
 }
+
+for (const tamper of [false, true])
+  test(`Spigot pinned downloads are reused and verified at install (tamper=${tamper})`, async (t) => {
+    const f = await fixture(t);
+    f.setServer({ loader: "paper" });
+    const payload = zip([
+      ["plugin.yml", "name: Fixture\nversion: 1.0\nmain: Fixture\n"],
+    ]);
+    let downloads = 0;
+    const request = async (value) => {
+      const pathname = new URL(value).pathname;
+      if (pathname === "/v2/resources/1")
+        return Response.json({
+          id: 1,
+          name: "Fixture",
+          file: { type: ".jar" },
+          version: { id: 10 },
+          testedVersions: ["1.21"],
+        });
+      if (/\/versions\/(10|latest)$/.test(pathname))
+        return Response.json({
+          id: 10,
+          resource: 1,
+          name: "1.0",
+          releaseDate: 1700000000,
+        });
+      if (pathname === "/v2/resources/1/download") {
+        downloads++;
+        return new Response(payload);
+      }
+      throw new Error(`Unexpected request: ${value}`);
+    };
+    const service = await f.boot({
+      extraProviders: createExtraProviders({ fetch: request }),
+    });
+    const plan = await service.preview({
+      ...selection,
+      platform: "spigot",
+      type: "plugin",
+      loader: "paper",
+      projectId: "1",
+      versionId: "10",
+    });
+    assert.equal(downloads, 1);
+    if (tamper) {
+      const stage = path.join(f.dataDir, "launchpad", plan.planId);
+      const pinned = (await fs.readdir(stage)).find((name) =>
+        name.startsWith("pinned-"),
+      );
+      assert.ok(pinned);
+      await fs.writeFile(path.join(stage, pinned), "tampered");
+    }
+    const job = await finish(service, { planId: plan.planId, confirmed: true });
+    assert.equal(job.status, tamper ? "failed" : "completed", job.error);
+    assert.equal(downloads, 1);
+    if (tamper) {
+      assert.match(job.error, /size or checksum/);
+      assert.equal(job.retryable, false);
+    } else
+      assert.deepEqual(
+        await fs.readFile(path.join(f.serverDir, "plugins", "spigot-1-10.jar")),
+        payload,
+      );
+  });
+
+for (const tamper of [false, true])
+  test(`Voids Wrath pinned archives are reused before extraction (tamper=${tamper})`, async (t) => {
+    const f = await fixture(t);
+    const archive = zip([
+      [
+        "manifest.json",
+        JSON.stringify({
+          minecraft: {
+            version: "1.21.1",
+            modLoaders: [{ id: "forge-21.1.200", primary: true }],
+          },
+        }),
+      ],
+      ["config/pack.cfg", "verified settings"],
+    ]);
+    let downloads = 0;
+    const request = async (value, options = {}) => {
+      const url = String(value);
+      if (url.endsWith("/mod-packs/"))
+        return new Response(
+          '<a href="https://voidswrath.com/modpacks/fixture-pack/"><div class="mod-pack-thumb"><div class="mod-pack-title-list">Fixture Pack</div><ul><li>Version: 1.0</li><li>Minecraft: 1.21.1</li></ul></div></a>',
+        );
+      if (url.includes("/modpacks/"))
+        return new Response(
+          '<a href="https://vl4.voidswrath.com/releases/fixture.zip">Download the Server Pack</a>',
+        );
+      if (options.method === "HEAD")
+        return new Response(null, {
+          headers: { "content-length": String(archive.length) },
+        });
+      if (url === "https://vl4.voidswrath.com/releases/fixture.zip") {
+        downloads++;
+        return new Response(archive);
+      }
+      throw new Error(`Unexpected request: ${url}`);
+    };
+    const extras = createExtraProviders({ fetch: request });
+    const provider = extras.find((value) => value.id === "voidswrath"),
+      resolve = provider.resolve;
+    provider.resolve = async (input) => {
+      const result = await resolve(input);
+      if (tamper) await fs.writeFile(result.archive.stagedPath, "tampered");
+      return result;
+    };
+    const service = await f.boot({ extraProviders: extras });
+    const input = {
+      ...selection,
+      platform: "voidswrath",
+      type: "modpack",
+      loader: "forge",
+      projectId: "fixture-pack",
+      versionId: "1.0",
+    };
+    if (tamper) {
+      await assert.rejects(service.preview(input), /size or checksum/);
+      assert.deepEqual(
+        await fs.readFile(path.join(f.serverDir, "mods", "old.jar")),
+        f.old,
+      );
+    } else {
+      const plan = await service.preview(input);
+      assert.equal(plan.hasExistingContent, true);
+      const job = await finish(service, {
+        planId: plan.planId,
+        confirmed: true,
+        cleanInstall: true,
+      });
+      assert.equal(job.status, "completed", job.error);
+      assert.ok(job.recoveryEntries.length);
+      assert.equal(
+        (
+          await fs.readFile(path.join(f.serverDir, "config", "pack.cfg"))
+        ).toString(),
+        "verified settings",
+      );
+    }
+    assert.equal(downloads, 1);
+  });
+
+test("bulk update review shares dependencies and a failed download preserves every installed root", async (t) => {
+  const f = await fixture(t);
+  const another = bytes("another installed mod"),
+    anotherNew = bytes("another verified update");
+  await fs.writeFile(path.join(f.serverDir, "mods", "another.jar"), another);
+  const second = {
+    ...f.versions.new,
+    id: "second",
+    project_id: "another",
+    name: "Another update",
+    files: [
+      {
+        ...f.versions.new.files[0],
+        filename: "another-new.jar",
+        url: "https://cdn.modrinth.com/another-new.jar",
+        size: anotherNew.length,
+        hashes: hashes(anotherNew),
+      },
+    ],
+  };
+  f.versions.second = second;
+  f.versions.new.dependencies = second.dependencies = [
+    {
+      project_id: "dependency",
+      version_id: "dep",
+      dependency_type: "required",
+    },
+  ];
+  await fs.writeFile(
+    path.join(f.dataDir, "launchpad", "installed.json"),
+    JSON.stringify([
+      {
+        path: "mods/old.jar",
+        sha512: hashes(f.old).sha512,
+        platform: "modrinth",
+        projectId: "project",
+        versionId: "old",
+        type: "mod",
+      },
+      {
+        path: "mods/another.jar",
+        sha512: hashes(another).sha512,
+        platform: "modrinth",
+        projectId: "another",
+        versionId: "another-old",
+        type: "mod",
+      },
+    ]),
+  );
+  const service = await f.boot();
+  const input = {
+    type: "mod",
+    gameVersion: "1.21.1",
+    loader: "neoforge",
+    updates: [
+      {
+        platform: "modrinth",
+        projectId: "project",
+        versionId: "new",
+        replacePath: "mods/old.jar",
+      },
+      {
+        platform: "modrinth",
+        projectId: "another",
+        versionId: "second",
+        replacePath: "mods/another.jar",
+      },
+    ],
+  };
+  f.versions.dep2 = { ...f.versions.dep, id: "dep2" };
+  second.dependencies = [
+    {
+      project_id: "dependency",
+      version_id: "dep2",
+      dependency_type: "required",
+    },
+  ];
+  await assert.rejects(service.previewUpdates(input), /conflicting versions/);
+  second.dependencies = f.versions.new.dependencies;
+  f.versions.new.files[0].filename = "another.jar";
+  await assert.rejects(
+    service.previewUpdates(input),
+    /overlapping installation and replacement paths/,
+  );
+  assert.deepEqual(
+    await fs.readFile(path.join(f.serverDir, "mods/another.jar")),
+    another,
+    "one update must not install into another update's replacement source",
+  );
+  f.versions.new.files[0].filename = "new.jar";
+  const plan = await service.previewUpdates(input);
+  assert.equal(plan.files.length, 3, "the shared dependency appears once");
+  const failed = await finish(service, {
+    planId: plan.planId,
+    confirmed: true,
+  });
+  assert.equal(failed.status, "failed");
+  assert.equal(failed.retryable, true);
+  assert.deepEqual(
+    await fs.readFile(path.join(f.serverDir, "mods/old.jar")),
+    f.old,
+  );
+  assert.deepEqual(
+    await fs.readFile(path.join(f.serverDir, "mods/another.jar")),
+    another,
+  );
+  f.downloads.set("https://cdn.modrinth.com/another-new.jar", anotherNew);
+  const done = await finish(service, { planId: plan.planId, confirmed: true });
+  assert.equal(done.status, "completed", done.error);
+  assert.deepEqual(
+    await fs.readFile(path.join(f.serverDir, "mods/another-new.jar")),
+    anotherNew,
+  );
+  assert.equal(
+    f.requests.filter(({ url }) => url === "https://cdn.modrinth.com/dep.jar")
+      .length,
+    1,
+  );
+});
+
+test("installed project URLs survive receipts and never replace download URLs", async (t) => {
+  const f = await fixture(t);
+  const plan = await f.service.preview(selection);
+  const done = await finish(f.service, {
+    planId: plan.planId,
+    confirmed: true,
+  });
+  assert.equal(done.status, "completed", done.error);
+  const receipts = f.service.snapshotInstalled();
+  assert.equal(receipts[0].url, "https://modrinth.com/project/project");
+  assert.ok(
+    f.requests.some(({ url }) => url === "https://cdn.modrinth.com/new.jar"),
+  );
+  const restarted = await f.boot({
+    fetch: async () => {
+      throw new Error("Offline");
+    },
+  });
+  const local = await restarted.installed({ ...selection, local: true });
+  assert.equal(local.items[0].url, receipts[0].url);
+});
+
+test("missing installed releases use verified provider dates and cache the lookup", async (t) => {
+  const f = await fixture(t);
+  let lookup = 0,
+    installedDate = "2026-03-01",
+    latestDate = "2026-02-01";
+  await fs.writeFile(
+    path.join(f.dataDir, "launchpad", "installed.json"),
+    JSON.stringify([
+      {
+        path: "mods/old.jar",
+        sha512: hashes(f.old).sha512,
+        platform: "fixture",
+        projectId: "project",
+        versionId: "old",
+        type: "mod",
+      },
+    ]),
+  );
+  const service = await f.boot({
+    extraProviders: [
+      {
+        id: "fixture",
+        name: "Fixture",
+        types: ["mod"],
+        versions: async () => [
+          { id: "new", publishedAt: latestDate, gameVersions: [], loaders: [] },
+        ],
+        installedVersion: async () => {
+          lookup++;
+          return { id: "old", publishedAt: installedDate };
+        },
+      },
+    ],
+  });
+  const first = await service.installed(selection);
+  assert.equal(first.items[0].update, undefined);
+  assert.equal(first.items[0].updateCheck, "checked");
+  latestDate = "2026-04-01";
+  const second = await service.installed({ ...selection, refresh: true });
+  assert.equal(second.items[0].update.id, "new");
+  assert.equal(lookup, 1);
+  const unknown = await f.boot({
+    extraProviders: [
+      {
+        id: "fixture",
+        name: "Fixture",
+        types: ["mod"],
+        versions: async () => [{ id: "new", publishedAt: "invalid" }],
+        installedVersion: async () => ({
+          id: "old",
+          publishedAt: installedDate,
+        }),
+      },
+    ],
+  });
+  const unverified = await unknown.installed(selection);
+  assert.equal(unverified.items[0].update, undefined);
+  assert.match(unverified.items[0].updateIssue, /dates could not be verified/);
+});
+
+test("modpack receipts check all releases independently of the installed runtime filters", async (t) => {
+  const f = await fixture(t);
+  await fs.writeFile(
+    path.join(f.dataDir, "launchpad", "installed.json"),
+    JSON.stringify([
+      {
+        pack: true,
+        path: "",
+        platform: "fixture",
+        projectId: "pack",
+        versionId: "old",
+        title: "Pack",
+        type: "modpack",
+      },
+    ]),
+  );
+  const calls = [];
+  const service = await f.boot({
+    extraProviders: [
+      {
+        id: "fixture",
+        name: "Fixture",
+        types: ["modpack"],
+        updates: () => assert.fail("Pack updates must not use hash lookup"),
+        versions: async (input) => {
+          calls.push(input);
+          return [
+            { id: "new", publishedAt: "2026-02-01" },
+            { id: "old", publishedAt: "2026-01-01" },
+          ];
+        },
+      },
+    ],
+  });
+  const input = { ...selection, type: "modpack" };
+  const result = await service.installed(input);
+  assert.equal(result.items[0].update.id, "new");
+  assert.equal(result.items[0].updateCheck, "checked");
+  assert.equal(calls[0].gameVersion, "");
+  assert.equal(calls[0].loader, "");
+  await service.installed(input);
+  assert.equal(calls.length, 1);
+});
+
+test("failed download retries reuse verified files, report busy transitions and preserve original bytes", async (t) => {
+  let fail = true;
+  const f = await fixture(t, {
+    request: async (url) => {
+      if (String(url) === "https://cdn.modrinth.com/dep.jar" && fail)
+        return new Response("Temporarily unavailable", { status: 503 });
+    },
+  });
+  f.versions.new.dependencies = [
+    {
+      project_id: "dependency",
+      version_id: "dep",
+      dependency_type: "required",
+    },
+  ];
+  f.downloads.delete("https://cdn.modrinth.com/dep.jar");
+  const changes = [];
+  const service = await f.boot({ onBusyChange: (busy) => changes.push(busy) });
+  const plan = await service.preview(selection);
+  const first = await finish(service, { planId: plan.planId, confirmed: true });
+  assert.equal(first.status, "failed");
+  assert.equal(first.retryable, true, first.error);
+  assert.equal(first.planId, plan.planId);
+  assert.deepEqual(changes, [true, false]);
+  assert.equal(service.isBusy(), false);
+  assert.deepEqual(
+    await fs.readFile(path.join(f.serverDir, "mods/old.jar")),
+    f.old,
+  );
+  assert.equal(
+    f.requests.filter(({ url }) => url === "https://cdn.modrinth.com/new.jar")
+      .length,
+    1,
+  );
+  fail = false;
+  f.downloads.set("https://cdn.modrinth.com/dep.jar", f.dependency);
+  const done = await finish(service, { planId: first.planId, confirmed: true });
+  assert.equal(done.status, "completed", done.error);
+  assert.equal(
+    f.requests.filter(({ url }) => url === "https://cdn.modrinth.com/new.jar")
+      .length,
+    1,
+  );
+  assert.deepEqual(changes, [true, false, true, false]);
+});
+
+test("unknown unchanged JAR fingerprints survive negative identification cache expiry", async (t) => {
+  let now = Date.now();
+  t.mock.method(Date, "now", () => now);
+  const f = await fixture(t, {
+    request: async (url) => {
+      const pathname = new URL(url).pathname;
+      if (pathname === "/v2/version_files") return Response.json({});
+      if (pathname === "/v1/fingerprints/432")
+        return Response.json({ data: { exactMatches: [] } });
+    },
+  });
+  await f.service.settings({ curseforgeApiKey: "fixture" });
+  const readFile = fs.readFile;
+  let reads = 0;
+  t.mock.method(fs, "readFile", (...args) => {
+    if (String(args[0]) === path.join(f.serverDir, "mods", "old.jar")) reads++;
+    return readFile(...args);
+  });
+  await f.service.installed(selection);
+  assert.equal(reads, 1);
+  now += 60_001;
+  await f.service.installed(selection);
+  assert.equal(reads, 1);
+  assert.equal(
+    f.requests.filter(
+      ({ url }) => new URL(url).pathname === "/v1/fingerprints/432",
+    ).length,
+    2,
+  );
+});
 
 test("local inventory needs no provider, reuses unchanged hashes and notices same-size edits with restored mtime", async (t) => {
   const f = await fixture(t);
@@ -875,6 +1342,7 @@ test("Launchpad hash-identifies installed mods, filters compatibility, confirms 
   assert.equal(installed.items[0].update.id, "new");
   assert.equal(installed.items[0].author, "FixtureAuthor");
   assert.equal(installed.items[0].title, "Fixture Project");
+  assert.equal(installed.items[0].url, "https://modrinth.com/project/project");
   assert.equal(
     installed.items[0].iconUrl,
     "https://cdn.modrinth.com/data/project/icon.png",
@@ -1717,6 +2185,7 @@ test("metadata timeout cools down queued batches without hiding cached icons or 
     {
       id: "cached",
       title: "Project cached",
+      url: "https://modrinth.com/project/cached",
       iconUrl: "https://cdn.modrinth.com/cached.png",
     },
   ]);

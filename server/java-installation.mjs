@@ -42,7 +42,7 @@ async function responseFor(address, { request, signal, hosts }) {
   throw fail(502, "The Java download service redirected too many times.");
 }
 
-export async function temurinPackage(
+async function temurinPackage(
   major,
   { architecture, request = fetch, signal },
 ) {
@@ -180,6 +180,7 @@ export function createJavaInstallation({
     let stage;
     let installed = false;
     let destination;
+    let damaged, quarantine;
     const stagePath = async (relative) =>
       safePath(await root(), `${stage}/${relative}`);
     try {
@@ -206,34 +207,49 @@ export function createJavaInstallation({
       const directory = await root();
       const finalName = `temurin-${major}-windows-${architecture}-${pkg.sha256.slice(0, 16)}`;
       destination = await safePath(directory, finalName);
-      try {
-        const saved = JSON.parse(
-          await fs.readFile(
-            await safePath(destination, "mc-panel-runtime.json"),
-            "utf8",
-          ),
-        );
+      const existing = await fs.lstat(destination).catch((cause) => {
+        if (cause.code === "ENOENT") return null;
+        throw cause;
+      });
+      if (existing && (!existing.isDirectory() || existing.isSymbolicLink()))
+        throw fail(409, "Managed Java storage changed. Restart MC Panel.");
+      if (existing) {
+        let saved;
+        try {
+          saved = JSON.parse(
+            await fs.readFile(
+              await safePath(destination, "mc-panel-runtime.json"),
+              "utf8",
+            ),
+          );
+        } catch (cause) {
+          if (cause.code !== "ENOENT" && !(cause instanceof SyntaxError))
+            throw cause;
+        }
         if (
-          saved.sha256 === pkg.sha256 &&
-          typeof saved.executable === "string"
+          saved?.sha256 === pkg.sha256 &&
+          saved.majorVersion === major &&
+          typeof saved.executable === "string" &&
+          /^(?!\.{1,2}\/)[^/\\]+\/bin\/java\.exe$/i.test(saved.executable)
         ) {
-          const executable = await safePath(destination, saved.executable);
-          const java = await probe(executable);
-          if (compatibleJava(java, major)) {
-            job.java = { ...java, path: executable };
-            job.message = `Java ${major} is ready.`;
-            job.phase = "completed";
-            job.status = "completed";
-            await onInstalled();
-            return;
+          try {
+            const executable = await safePath(destination, saved.executable);
+            const java = await probe(executable);
+            if (compatibleJava(java, major)) {
+              job.java = { ...java, path: executable };
+              job.message = `Java ${major} is ready.`;
+              job.phase = "completed";
+              job.status = "completed";
+              await onInstalled();
+              return;
+            }
+          } catch (cause) {
+            if (cause.code !== "ENOENT") throw cause;
           }
         }
-        throw fail(
-          409,
-          "The managed Java installation is incomplete. Remove its folder manually before trying again.",
-        );
-      } catch (cause) {
-        if (cause.code !== "ENOENT") throw cause;
+        // Download and verify the replacement before moving the damaged runtime.
+        // A network/checksum failure leaves its original files untouched.
+        damaged = existing;
       }
       stage = `.install-${job.id}`;
       const stageDir = await safePath(directory, stage);
@@ -325,6 +341,35 @@ export function createJavaInstallation({
       timeout.throwIfAborted();
       // Re-resolve containment immediately before the one atomic promotion.
       await root();
+      if (damaged) {
+        const current = await fs.lstat(await safePath(directory, finalName));
+        if (
+          !current.isDirectory() ||
+          current.isSymbolicLink() ||
+          current.ino !== damaged.ino ||
+          current.dev !== damaged.dev ||
+          current.birthtimeMs !== damaged.birthtimeMs
+        )
+          throw fail(
+            409,
+            "Managed Java storage changed during repair. Try again.",
+          );
+        const staleName = `.stale-${job.id}`;
+        try {
+          await fs.rename(
+            await safePath(directory, finalName),
+            await safePath(directory, staleName),
+          );
+          quarantine = staleName;
+        } catch (cause) {
+          if (["EPERM", "EACCES", "EBUSY"].includes(cause.code))
+            throw fail(
+              409,
+              "Close any servers using this Java runtime, then retry its repair.",
+            );
+          throw cause;
+        }
+      }
       await fs.rename(
         await stagePath("runtime"),
         await safePath(directory, finalName),
@@ -337,6 +382,22 @@ export function createJavaInstallation({
       job.phase = "completed";
       job.message = `Java ${major} installed and ready.`;
     } catch (cause) {
+      if (quarantine && !installed) {
+        try {
+          const directory = await root();
+          const target = await safePath(directory, path.basename(destination));
+          const exists = await fs.lstat(target).catch((failure) => {
+            if (failure.code === "ENOENT") return null;
+            throw failure;
+          });
+          if (!exists) {
+            await fs.rename(await safePath(directory, quarantine), target);
+            quarantine = undefined;
+          }
+        } catch {
+          // Retain the quarantined files if their original path changed.
+        }
+      }
       job.status = "failed";
       job.message = "Java installation could not be completed.";
       job.error = signal.aborted
@@ -347,6 +408,16 @@ export function createJavaInstallation({
         job.error +=
           " The verified Java files were retained; refresh Java to use them.";
     } finally {
+      if (quarantine && installed) {
+        try {
+          await fs.rm(await safePath(await root(), quarantine), {
+            recursive: true,
+            force: true,
+          });
+        } catch {
+          // A verified replacement remains usable even if old files are locked.
+        }
+      }
       if (stage) {
         try {
           await fs.rm(await safePath(await root(), stage), {

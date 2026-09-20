@@ -6,7 +6,7 @@ import os from "node:os";
 import path from "node:path";
 import { cleanInstall, prepareCleanSettings } from "./clean-install.mjs";
 import { createRecycleBin } from "./recycle-bin.mjs";
-import { safePath } from "./index.mjs";
+import { safePath, validateServerConfiguration } from "./index.mjs";
 
 async function fixture(t, recycleOptions = {}) {
   const temporary = await fs.realpath(os.tmpdir());
@@ -344,6 +344,38 @@ test("fresh settings use pack defaults with the explicit EULA decision and selec
   );
   assert.equal(f.result.files.length, 3);
 });
+
+for (const [name, raw, display] of [
+  ["escaped newline", "Line one\\nLine two", "Line one Line two"],
+  ["long MOTD", "x".repeat(400), "x".repeat(256)],
+]) {
+  test(`clean installation normalizes ${name} for the registry and preserves pack file bytes`, async (t) => {
+    const f = await fixture(t);
+    await f.stage("server.properties", `motd=${raw}\n`);
+    await prepareCleanSettings(f.result, f.ctx);
+    assert.equal(f.result.configuration.motd, display);
+    assert.doesNotMatch(f.result.configuration.motd, /[\x00-\x1f\x7f]/);
+    let committed;
+    await cleanInstall(f.result, {
+      ...f.ctx,
+      commit: async () => {
+        committed = validateServerConfiguration(
+          {
+            motd: f.result.configuration.motd,
+          },
+          f.ctx.getConfiguration(),
+        );
+      },
+    });
+    assert.equal(committed.motd, display);
+    for (const directory of [f.stageDir, f.serverDir])
+      assert.ok(
+        (await fs.readFile(path.join(directory, "server.properties"), "utf8"))
+          .split("\n")
+          .includes(`motd=${raw}`),
+      );
+  });
+}
 
 test("without pack properties fresh defaults replace the old server settings and world name", async (t) => {
   const f = await fixture(t);
