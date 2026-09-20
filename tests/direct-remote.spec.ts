@@ -131,6 +131,10 @@ test("a copied invitation works over direct HTTPS through password setup, sign-i
       phone.getByRole("button", { name: "Start", exact: true }),
     ).toBeEnabled();
     await expect(phone.getByRole("log")).toBeVisible();
+    await expect(
+      phone.getByRole("heading", { name: "Console", exact: true }),
+    ).toBeVisible();
+    await expect(phone.locator(".metric-card")).toHaveCount(4);
     const cookie = (await context.cookies(publicUrl)).find(
       (entry) => entry.name === "__Host-mc-subuser",
     );
@@ -151,6 +155,7 @@ test("a copied invitation works over direct HTTPS through password setup, sign-i
     await expect(
       phone.getByRole("heading", { name: serverName, exact: true }),
     ).toBeVisible();
+    await phone.getByRole("button", { name: "Open navigation" }).click();
     await phone
       .getByRole("button", { name: "Account menu for sister@example.test" })
       .click();

@@ -87,16 +87,31 @@ function EntryIcon({ entry }: { entry: Entry }) {
 
 export default function FileManager({
   notify,
+  permissions,
   path,
   onPathChange: setPath,
   showingBin,
   onBinChange: setShowingBin,
 }: PageProps & {
+  permissions?: string[];
   path: string;
   onPathChange: (path: string) => void;
   showingBin: boolean;
   onBinChange: (showing: boolean) => void;
 }) {
+  const canRead =
+    permissions === undefined || permissions.includes("file.read");
+  const canContent =
+    permissions === undefined || permissions.includes("file.read-content");
+  const canCreate =
+    permissions === undefined || permissions.includes("file.create");
+  const canUpdate =
+    permissions === undefined || permissions.includes("file.update");
+  const canDelete =
+    permissions === undefined || permissions.includes("file.delete");
+  const canBin =
+    canRead &&
+    (permissions === undefined || permissions.includes("backup.read"));
   const { api, post, downloadUrl } = useServerApi();
   const [entries, setEntries] = useState<Entry[]>([]);
   const [query, setQuery] = useState("");
@@ -110,6 +125,12 @@ export default function FileManager({
   const [uploading, setUploading] = useState(false);
   const [dragging, setDragging] = useState(false);
   const [dialog, setDialog] = useState<FileDialog | null>(null);
+  const canSubmitDialog =
+    dialog?.type === "create"
+      ? canCreate
+      : dialog?.type === "edit"
+        ? canContent && canUpdate
+        : canDelete;
   const [name, setName] = useState("");
   const [content, setContent] = useState("");
   const [saving, setSaving] = useState(false);
@@ -130,6 +151,10 @@ export default function FileManager({
   pathRef.current = path;
 
   const load = useCallback(async () => {
+    if (!canRead) {
+      setLoading(false);
+      return false;
+    }
     const id = ++requestId.current;
     setLoading(true);
     setError("");
@@ -154,7 +179,7 @@ export default function FileManager({
     } finally {
       if (id === requestId.current) setLoading(false);
     }
-  }, [path, api]);
+  }, [path, api, canRead]);
 
   useEffect(() => {
     loaded.current = false;
@@ -163,11 +188,11 @@ export default function FileManager({
     setPage(1);
   }, [api, path]);
   useEffect(() => {
-    if (!showingBin) void load();
+    if (!showingBin || !canBin) void load();
     return () => {
       requestId.current++;
     };
-  }, [load, showingBin]);
+  }, [load, showingBin, canBin]);
   useEffect(() => {
     setSelected(new Set());
   }, [path, api, showingBin]);
@@ -233,12 +258,14 @@ export default function FileManager({
     setDialog(null);
   }
   function openDelete(entry: Entry) {
+    if (!canDelete) return;
     editRequestId.current++;
     setReading(false);
     setDialogError("");
     setDialog({ type: "delete", entry });
   }
   function openDeleteSelected() {
+    if (!canDelete) return;
     const targets = entries.filter((entry) => selected.has(entry.path));
     if (!targets.length || savingRef.current) return;
     editRequestId.current++;
@@ -255,6 +282,7 @@ export default function FileManager({
     });
   }
   function openCreate(kind: "file" | "directory") {
+    if (!canCreate) return;
     editRequestId.current++;
     setReading(false);
     setReadFailed(false);
@@ -269,6 +297,7 @@ export default function FileManager({
       navigate(entry.path);
       return;
     }
+    if (!canContent) return;
     if (!editable(entry.name)) {
       notify("Use the download button to open this file on your computer.");
       return;
@@ -295,7 +324,7 @@ export default function FileManager({
   }
 
   async function uploadFiles(files: FileList | File[]) {
-    if (!files.length || uploading) return;
+    if (!canCreate || !files.length || uploading) return;
     const uploadPath = path;
     setUploading(true);
     const form = new FormData();
@@ -320,7 +349,7 @@ export default function FileManager({
 
   async function submitDialog(event: FormEvent) {
     event.preventDefault();
-    if (!dialog || savingRef.current) return;
+    if (!dialog || !canSubmitDialog || savingRef.current) return;
     savingRef.current = true;
     setSaving(true);
     setDialogError("");
@@ -435,10 +464,19 @@ export default function FileManager({
     (sum, entry) => sum + (entry.type === "file" ? entry.size : 0),
     0,
   );
-  if (showingBin)
+  if (!canRead)
+    return (
+      <StatePanel
+        variant="empty"
+        title="Files unavailable"
+        message="You do not have permission to browse server files."
+      />
+    );
+  if (showingBin && canBin)
     return (
       <RecycleBin
         notify={notify}
+        permissions={permissions}
         onBack={() => {
           setQuery("");
           setShowingBin(false);
@@ -454,7 +492,7 @@ export default function FileManager({
         <button
           className="btn primary"
           onClick={() => uploadInput.current?.click()}
-          disabled={uploading || loading}
+          disabled={!canCreate || uploading || loading}
         >
           {uploading ? (
             <LoaderCircle size={16} className="spin" />
@@ -471,6 +509,7 @@ export default function FileManager({
           onChange={(event) => {
             if (event.target.files) void uploadFiles(event.target.files);
           }}
+          disabled={!canCreate}
           aria-label="Upload server files"
         />
       </div>
@@ -479,7 +518,7 @@ export default function FileManager({
         className={`panel files-panel ${dragging ? "files-dragging" : ""}`}
         aria-label="Server files"
         onDragEnter={(event) => {
-          if (event.dataTransfer.types.includes("Files")) {
+          if (canCreate && event.dataTransfer.types.includes("Files")) {
             event.preventDefault();
             dragDepth.current++;
             setDragging(true);
@@ -537,11 +576,16 @@ export default function FileManager({
             <button
               className="btn small"
               onClick={() => openCreate("directory")}
+              disabled={!canCreate}
             >
               <FolderPlus size={15} />
               New folder
             </button>
-            <button className="btn small" onClick={() => openCreate("file")}>
+            <button
+              className="btn small"
+              disabled={!canCreate}
+              onClick={() => openCreate("file")}
+            >
               <FilePlus2 size={15} />
               New file
             </button>
@@ -594,7 +638,7 @@ export default function FileManager({
                 <button
                   className="btn danger small"
                   onClick={openDeleteSelected}
-                  disabled={saving || loading || !!error}
+                  disabled={!canDelete || saving || loading || !!error}
                 >
                   <Trash2 size={15} /> Delete selected
                 </button>
@@ -635,7 +679,7 @@ export default function FileManager({
                               input.indeterminate =
                                 visibleSelectedCount > 0 && !allVisibleSelected;
                           }}
-                          disabled={!visible.length || saving}
+                          disabled={!canDelete || !visible.length || saving}
                           onChange={toggleVisibleSelection}
                         />
                         <span>Name</span>
@@ -650,7 +694,7 @@ export default function FileManager({
                 </thead>
               )}
               <tbody>
-                {!path && (
+                {!path && canBin && (
                   <tr
                     className="recycle-bin-entry"
                     aria-label="Protected Recycle Bin"
@@ -707,12 +751,13 @@ export default function FileManager({
                           type="checkbox"
                           aria-label={`Select ${entry.name}`}
                           checked={selected.has(entry.path)}
-                          disabled={saving}
+                          disabled={!canDelete || saving}
                           onChange={() => toggleSelection(entry.path)}
                         />
                         <button
                           className={`file-name ${entry.type === "directory" ? "directory" : ""}`}
                           onClick={() => void openEntry(entry)}
+                          disabled={entry.type === "file" && !canContent}
                           title={entry.name}
                         >
                           <EntryIcon entry={entry} />
@@ -739,13 +784,13 @@ export default function FileManager({
                     </td>
                     <td>
                       <div className="file-row-actions">
-                        {entry.type === "file" && (
+                        {entry.type === "file" && canContent && (
                           <>
                             {editable(entry.name) && (
                               <button
                                 className="btn icon"
-                                aria-label={`Edit ${entry.name}`}
-                                title="Edit file"
+                                aria-label={`${canUpdate ? "Edit" : "View"} ${entry.name}`}
+                                title={canUpdate ? "Edit file" : "View file"}
                                 onClick={() => void openEntry(entry)}
                               >
                                 <Pencil size={14} />
@@ -768,6 +813,7 @@ export default function FileManager({
                           className="btn icon delete-action"
                           aria-label={`Delete ${entry.name}`}
                           title="Move to Recycle Bin"
+                          disabled={!canDelete}
                           onClick={() => openDelete(entry)}
                         >
                           <Trash2 size={14} />
@@ -786,10 +832,13 @@ export default function FileManager({
                 message={
                   query
                     ? "Try a different file or folder name."
-                    : "Upload your server files or create a new folder."
+                    : canCreate
+                      ? "Upload your server files or create a new folder."
+                      : "There are no files in this folder."
                 }
                 action={
-                  !query && (
+                  !query &&
+                  canCreate && (
                     <button
                       className="btn"
                       onClick={() => uploadInput.current?.click()}
@@ -820,7 +869,7 @@ export default function FileManager({
             <span className="storage-status-dot" />
             {formatBytes(totalSize)} in this directory
           </span>
-          <span>Drag and drop files here to upload</span>
+          {canCreate && <span>Drag and drop files here to upload</span>}
         </div>
       </section>
       <div className="storage-hint">
@@ -908,6 +957,7 @@ export default function FileManager({
                   ) : (
                     <textarea
                       className="file-editor"
+                      readOnly={dialog.type === "edit" && !canUpdate}
                       value={content}
                       onChange={(event) => setContent(event.target.value)}
                       spellCheck={false}
@@ -987,6 +1037,7 @@ export default function FileManager({
                 <button
                   className={`btn ${dialog.type === "delete" || dialog.type === "delete-many" ? "danger" : "primary"}`}
                   disabled={
+                    !canSubmitDialog ||
                     saving ||
                     (dialog.type === "edit" && (reading || readFailed)) ||
                     (dialog.type === "create" && !name.trim())
@@ -1014,7 +1065,19 @@ export default function FileManager({
   );
 }
 
-function RecycleBin({ notify, onBack }: PageProps & { onBack: () => void }) {
+function RecycleBin({
+  notify,
+  onBack,
+  permissions,
+}: PageProps & { onBack: () => void; permissions?: string[] }) {
+  const canRestore =
+    permissions === undefined ||
+    (permissions.includes("file.create") &&
+      permissions.includes("backup.create"));
+  const canDelete =
+    permissions === undefined ||
+    (permissions.includes("file.delete") &&
+      permissions.includes("backup.delete"));
   const { api, post } = useServerApi();
   const [items, setItems] = useState<RecycledItem[]>([]);
   const [query, setQuery] = useState("");
@@ -1113,7 +1176,8 @@ function RecycleBin({ notify, onBack }: PageProps & { onBack: () => void }) {
     return [...new Set(warnings)];
   }
   async function restore(item: RecycledItem) {
-    if (restorePending.current || item.status !== "ready") return;
+    if (!canRestore || restorePending.current || item.status !== "ready")
+      return;
     restorePending.current = true;
     setRestoring(item.id);
     setRestoreErrors((previous) => ({ ...previous, [item.id]: "" }));
@@ -1154,7 +1218,12 @@ function RecycleBin({ notify, onBack }: PageProps & { onBack: () => void }) {
     type: "restore" | "delete",
     targets: RecycledItem[],
   ) {
-    if (!targets.length || restorePending.current) return;
+    if (
+      (type === "restore" ? !canRestore : !canDelete) ||
+      !targets.length ||
+      restorePending.current
+    )
+      return;
     setActionError("");
     setCompleted(0);
     setRestoreWarnings([]);
@@ -1180,7 +1249,13 @@ function RecycleBin({ notify, onBack }: PageProps & { onBack: () => void }) {
   }
   async function submitAction(event: FormEvent) {
     event.preventDefault();
-    if (!action || restorePending.current || checkingRestore) return;
+    if (
+      !action ||
+      (action.type === "restore" ? !canRestore : !canDelete) ||
+      restorePending.current ||
+      checkingRestore
+    )
+      return;
     restorePending.current = true;
     const successes = new Set<string>();
     const failures: { item: RecycledItem; message: string }[] = [];
@@ -1362,6 +1437,7 @@ function RecycleBin({ notify, onBack }: PageProps & { onBack: () => void }) {
             <button
               className="btn small"
               disabled={
+                !canRestore ||
                 !selectedItems.length ||
                 !!restoring ||
                 loading ||
@@ -1380,7 +1456,11 @@ function RecycleBin({ notify, onBack }: PageProps & { onBack: () => void }) {
             <button
               className="btn danger small"
               disabled={
-                !selectedItems.length || !!restoring || loading || !!error
+                !canDelete ||
+                !selectedItems.length ||
+                !!restoring ||
+                loading ||
+                !!error
               }
               onClick={() => openAction("delete", selectedItems)}
             >
@@ -1491,7 +1571,9 @@ function RecycleBin({ notify, onBack }: PageProps & { onBack: () => void }) {
                   <button
                     className="btn small"
                     aria-label={`Restore ${item.name}`}
-                    disabled={!!restoring || item.status !== "ready"}
+                    disabled={
+                      !canRestore || !!restoring || item.status !== "ready"
+                    }
                     onClick={() => void restore(item)}
                   >
                     {restoring === item.id ? (
@@ -1504,7 +1586,7 @@ function RecycleBin({ notify, onBack }: PageProps & { onBack: () => void }) {
                   <button
                     className="btn danger small"
                     aria-label={`Permanently delete ${item.name}`}
-                    disabled={!!restoring}
+                    disabled={!canDelete || !!restoring}
                     onClick={() => openAction("delete", [item])}
                   >
                     <Trash2 size={15} /> Delete permanently
@@ -1640,7 +1722,11 @@ function RecycleBin({ notify, onBack }: PageProps & { onBack: () => void }) {
               <button
                 type="submit"
                 className={`btn ${action.type === "delete" ? "danger" : "primary"}`}
-                disabled={!!restoring || checkingRestore}
+                disabled={
+                  !!restoring ||
+                  checkingRestore ||
+                  (action.type === "restore" ? !canRestore : !canDelete)
+                }
               >
                 {restoring
                   ? `${action.type === "delete" ? "Deleting" : "Restoring"} ${completed} of ${action.targets.length}…`

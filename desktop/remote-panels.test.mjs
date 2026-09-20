@@ -7,6 +7,10 @@ import path from "node:path";
 import selfsigned from "selfsigned";
 import { normalizePanelConnectionUrl } from "../shared/panel-connection.mjs";
 import { createRemotePanelController } from "./remote-panels.mjs";
+import {
+  installConnectionIpc,
+  CONNECTION_CHANNELS,
+} from "./connections-ipc.mjs";
 import { DESKTOP_COOKIE_NAME, startDesktopRuntime } from "./runtime.mjs";
 import { requiredPermissions } from "../server/remote-access.mjs";
 
@@ -14,36 +18,73 @@ const invite = "a".repeat(43);
 const origin = "https://panel.example:3002";
 
 function harness({ responses = [], load } = {}) {
-  const windows = [];
+  const views = [];
   const partitions = [];
   const prompts = [];
-  class FakeWindow extends EventEmitter {
+  const openedWebsites = [];
+  const contents = () => {
+    const value = new EventEmitter();
+    value.url = "";
+    value.mainFrame = { url: "", origin: "null" };
+    value.getURL = () => value.url;
+    value.isDestroyed = () => Boolean(value.destroyed);
+    value.focus = () => {
+      value.focused = true;
+    };
+    value.send = () => {};
+    value.close = () => {
+      value.destroyed = true;
+      value.emit("destroyed");
+    };
+    return value;
+  };
+  const owner = new EventEmitter();
+  owner.webContents = contents();
+  owner.webContents.url = "http://127.0.0.1:3001/";
+  owner.webContents.mainFrame = {
+    url: owner.webContents.url,
+    origin: "http://127.0.0.1:3001",
+  };
+  owner.isDestroyed = () => false;
+  owner.getContentSize = () => [1200, 800];
+  owner.setTitle = (value) => {
+    owner.title = value;
+  };
+  owner.contentView = {
+    children: [],
+    addChildView(view) {
+      this.children.push(view);
+    },
+    removeChildView(view) {
+      this.children = this.children.filter((item) => item !== view);
+    },
+  };
+  class FakeView {
     constructor(options) {
-      super();
       this.options = options;
-      this.webContents = new EventEmitter();
+      this.webContents = contents();
       this.webContents.setWindowOpenHandler = (handler) => {
         this.popup = handler;
       };
-      windows.push(this);
+      this.webContents.loadURL = async (url) => {
+        this.webContents.url = url;
+        this.webContents.mainFrame = { url, origin: new URL(url).origin };
+        this.loads = [...(this.loads || []), url];
+        await load?.(this);
+      };
+      views.push(this);
     }
-    setMenu(value) {
-      this.menu = value;
-    }
-    isDestroyed() {
-      return Boolean(this.destroyed);
-    }
-    destroy() {
-      this.destroyed = true;
-      this.emit("closed");
-    }
-    async loadURL(url) {
-      this.url = url;
-      await load?.(this);
+    setBackgroundColor() {}
+    setBounds(bounds) {
+      this.bounds = bounds;
     }
   }
   const controller = createRemotePanelController({
-    BrowserWindow: FakeWindow,
+    window: owner,
+    localOrigin: "http://127.0.0.1:3001",
+    WebContentsView: FakeView,
+    preload: "/desktop/connections-preload.cjs",
+    openWebsite: (url) => openedWebsites.push(url),
     session: {
       fromPartition(name) {
         const value = new EventEmitter();
@@ -62,6 +103,9 @@ function harness({ responses = [], load } = {}) {
         value.clearStorageData = async () => {
           value.cleared = true;
         };
+        value.clearCache = async () => {
+          value.cacheCleared = true;
+        };
         value.closeAllConnections = async () => {
           value.disconnected = true;
         };
@@ -77,7 +121,7 @@ function harness({ responses = [], load } = {}) {
     },
     downloadsDirectory: path.join(os.tmpdir(), "remote-downloads"),
   });
-  return { controller, windows, partitions, prompts };
+  return { controller, views, owner, partitions, prompts, openedWebsites };
 }
 
 function event() {
@@ -171,19 +215,28 @@ test("panel addresses accept only HTTPS roots and complete invitations", () => {
     );
 });
 
-test("remote windows isolate sessions, reject external navigation, and scope downloads", async () => {
+test("remote views share one window, isolate sessions, reject external navigation, and scope downloads", async () => {
   const h = harness();
-  assert.deepEqual(await h.controller.open(`${origin}/#invite=${invite}`), {
-    opened: true,
-    url: `${origin}/#invite=${invite}`,
-  });
-  await h.controller.open(origin);
-  const [first, second] = h.windows;
+  const connected = await h.controller.open(`${origin}/#invite=${invite}`);
+  const firstId = connected.activeId;
+  assert.deepEqual(connected.panels, [
+    {
+      id: "local",
+      label: "This computer",
+      origin: "http://127.0.0.1:3001",
+      local: true,
+    },
+    { id: firstId, label: "panel.example:3002", origin, local: false },
+  ]);
+  const secondContext = await h.controller.open("https://other.example:3002/");
+  const secondId = secondContext.activeId;
+  const [first, second] = h.views;
   const [firstSession, secondSession] = h.partitions;
   assert.notEqual(firstSession.name, secondSession.name);
   assert.ok(h.partitions.every((value) => !value.name.startsWith("persist:")));
   assert.deepEqual(first.options.webPreferences, {
     session: firstSession,
+    preload: "/desktop/connections-preload.cjs",
     nodeIntegration: false,
     contextIsolation: true,
     sandbox: true,
@@ -191,9 +244,28 @@ test("remote windows isolate sessions, reject external navigation, and scope dow
     webviewTag: false,
     spellcheck: false,
   });
-  assert.equal(first.menu, null);
+  assert.deepEqual(h.owner.contentView.children, [second]);
+  assert.equal(h.owner.webContents.isDestroyed(), false);
+  assert.deepEqual(second.bounds, { x: 0, y: 0, width: 1200, height: 800 });
+  h.controller.activate("local");
+  assert.deepEqual(h.owner.contentView.children, []);
+  h.controller.activate(firstId);
+  assert.deepEqual(h.owner.contentView.children, [first]);
+  await h.controller.open(origin);
+  assert.equal(
+    h.views.length,
+    2,
+    "reopening an origin reuses its existing view and session",
+  );
+  assert.equal(first.loads.length, 1, "switching does not reload or sign out");
+  await h.controller.open(`${origin}/#invite=${"b".repeat(43)}`);
+  assert.equal(
+    first.loads.length,
+    2,
+    "new invitation navigates the existing connection",
+  );
   const titleChange = event();
-  first.emit("page-title-updated", titleChange, "Untrusted title");
+  first.webContents.emit("page-title-updated", titleChange, "Untrusted title");
   assert.equal(titleChange.prevented, true);
   assert.equal(
     firstSession.check(null, "openExternal", "https://evil.example"),
@@ -258,16 +330,66 @@ test("remote windows isolate sessions, reject external navigation, and scope dow
         path.join(os.tmpdir(), "remote-downloads", "world.zip"),
       );
   }
-  first.destroy();
-  assert.equal(second.isDestroyed(), false);
+  await h.controller.disconnect(firstId);
+  assert.equal(h.controller.list().activeId, "local");
+  assert.equal(first.webContents.isDestroyed(), true);
+  assert.equal(second.webContents.isDestroyed(), false);
   assert.equal(firstSession.cleared, true);
+  assert.equal(firstSession.cacheCleared, true);
   assert.equal(firstSession.disconnected, true);
-  h.controller.close();
-  assert.equal(second.isDestroyed(), true);
+  assert.equal(h.owner.webContents.isDestroyed(), false);
+  h.controller.activate(secondId);
+  await h.controller.close();
+  assert.equal(second.webContents.isDestroyed(), true);
+  assert.equal(h.owner.webContents.isDestroyed(), false);
   await assert.rejects(h.controller.open(origin), { status: 503 });
 });
 
-test("certificate trust is explicit, per-window, and tied to the valid leaf and host", async () => {
+test("remote official links open only allowlisted sites externally without replacing the panel", async () => {
+  const h = harness();
+  const context = await h.controller.open(origin);
+  const view = h.views[0];
+  const allowed = "https://modrinth.com/mod/sodium";
+  assert.deepEqual(view.popup({ url: allowed }), { action: "deny" });
+  const navigation = event();
+  view.webContents.emit(
+    "will-navigate",
+    navigation,
+    "https://papermc.io/downloads",
+  );
+  assert.equal(navigation.prevented, true);
+  assert.deepEqual(h.openedWebsites, [allowed, "https://papermc.io/downloads"]);
+  for (const url of [
+    "https://evil.example/",
+    "http://modrinth.com/",
+    "https://modrinth.com:8443/",
+    "https://user:password@modrinth.com/",
+    "file:///C:/Windows/system32/calc.exe",
+    "javascript:alert(1)",
+  ]) {
+    assert.deepEqual(view.popup({ url }), { action: "deny" });
+    const blocked = event();
+    view.webContents.emit("will-navigate", blocked, url);
+    assert.equal(blocked.prevented, true);
+  }
+  for (const name of ["will-frame-navigate", "will-redirect"]) {
+    const blocked = Object.assign(event(), { url: allowed });
+    view.webContents.emit(name, blocked, allowed);
+    assert.equal(
+      blocked.prevented,
+      true,
+      "subframe and redirect cannot escape the panel",
+    );
+  }
+  assert.equal(h.openedWebsites.length, 2);
+  assert.equal(h.controller.list().activeId, context.activeId);
+  assert.equal(view.webContents.getURL(), `${origin}/`);
+  assert.equal(view.loads.length, 1);
+  assert.deepEqual(h.owner.contentView.children, [view]);
+  await h.controller.close();
+});
+
+test("certificate trust is explicit, per-connection, and tied to the valid leaf and host", async () => {
   const [cert, changed, wrongHost] = await Promise.all([
     certificate(),
     certificate(),
@@ -275,9 +397,10 @@ test("certificate trust is explicit, per-window, and tied to the valid leaf and 
   ]);
   const h = harness({ responses: [1, 0, 0] });
   await h.controller.open(origin);
-  const first = h.windows[0];
+  const first = h.views[0];
   assert.equal(await verify(first, cert), true);
   assert.equal(h.prompts.length, 1);
+  assert.equal(h.prompts[0].window, h.owner);
   assert.equal(h.prompts[0].options.defaultId, 0);
   assert.equal(h.prompts[0].options.cancelId, 0);
   assert.match(h.prompts[0].options.detail, /(?:[0-9A-F]{2}:){31}[0-9A-F]{2}/);
@@ -293,13 +416,22 @@ test("certificate trust is explicit, per-window, and tied to the valid leaf and 
   assert.equal(h.prompts.length, 1);
   assert.equal(await verify(first, changed), false);
   assert.match(h.prompts[1].options.detail, /certificate has changed/);
+  const id = h.controller.list().activeId;
+  h.controller.activate("local");
   await h.controller.open(origin);
-  assert.equal(await verify(h.windows[1], cert), false);
+  assert.equal(
+    await verify(first, cert),
+    true,
+    "switching preserves certificate decision",
+  );
+  await h.controller.disconnect(id);
+  await h.controller.open(origin);
+  assert.equal(await verify(h.views[1], cert), false);
   assert.equal(h.prompts.length, 3);
-  h.controller.close();
+  await h.controller.close();
 });
 
-test("canceled trust fails opening and destroys the isolated window", async () => {
+test("canceled trust fails opening and destroys only the isolated view", async () => {
   const cert = await certificate();
   const h = harness({
     load: async (window) => {
@@ -308,8 +440,65 @@ test("canceled trust fails opening and destroys the isolated window", async () =
     },
   });
   await assert.rejects(h.controller.open(origin), { status: 409 });
-  assert.equal(h.windows[0].isDestroyed(), true);
+  assert.equal(h.views[0].webContents.isDestroyed(), true);
   assert.equal(h.partitions[0].cleared, true);
+  assert.equal(h.owner.webContents.isDestroyed(), false);
+  assert.equal(h.controller.list().activeId, "local");
+  assert.equal(h.controller.list().panels.length, 1);
+});
+
+test("connection IPC validates managed sender, main frame, origin and bounded arguments", async () => {
+  const h = harness();
+  const handlers = new Map();
+  const remove = installConnectionIpc(
+    {
+      handle: (channel, callback) => handlers.set(channel, callback),
+      removeHandler: (channel) => handlers.delete(channel),
+    },
+    h.controller,
+  );
+  const invoke = (action, sender, value, senderFrame = sender.mainFrame) =>
+    handlers.get(CONNECTION_CHANNELS[action])({ sender, senderFrame }, value);
+  const local = h.owner.webContents;
+  assert.equal(invoke("list", local).activeId, "local");
+  await invoke("open", local, origin);
+  const remote = h.views[0].webContents;
+  const remoteId = invoke("list", remote).activeId;
+  assert.equal(invoke("activate", remote, "local").activeId, "local");
+  assert.equal(invoke("activate", local, remoteId).activeId, remoteId);
+  for (const senderFrame of [
+    null,
+    { ...remote.mainFrame },
+    { url: "about:blank", origin },
+  ])
+    assert.throws(
+      () => invoke("list", remote, undefined, senderFrame),
+      /cannot manage/,
+    );
+  for (const bad of [
+    "https://evil.example",
+    "null",
+    "http://panel.example:3002",
+  ]) {
+    const before = remote.mainFrame;
+    remote.mainFrame = { ...before, origin: bad };
+    assert.throws(() => invoke("list", remote), /cannot manage/);
+    remote.mainFrame = before;
+  }
+  remote.url = "https://evil.example/";
+  assert.throws(() => invoke("list", remote), /cannot manage/);
+  remote.url = origin;
+  const impostor = { ...remote, mainFrame: remote.mainFrame };
+  assert.throws(() => invoke("list", impostor), /cannot manage/);
+  for (const value of [null, {}, 12, "a".repeat(4097)])
+    assert.throws(() => invoke("open", local, value), /valid panel address/);
+  await assert.rejects(invoke("disconnect", local, "local"), { status: 400 });
+  await invoke("disconnect", local, remoteId);
+  assert.throws(() => invoke("list", remote), /cannot manage/);
+  await h.controller.close();
+  assert.throws(() => invoke("list", local), /cannot manage/);
+  remove();
+  assert.equal(handlers.size, 0);
 });
 
 test("desktop connection endpoint requires owner session, valid origin, method, and address", async (t) => {

@@ -1,6 +1,7 @@
 import { createContext, useContext, useMemo } from "react";
 
 export const ServerScope = createContext<string | null>(null);
+export const SessionExpiredContext = createContext<(() => void) | null>(null);
 
 export async function api<T = any>(
   path: string,
@@ -70,11 +71,15 @@ window.__mcPanelFlushSelection = flushDesktopSelection;
 // that finishes after the user switches servers. No mutable global selector.
 export function useServerApi() {
   const serverId = useContext(ServerScope);
+  const onSessionExpired = useContext(SessionExpiredContext);
   return useMemo(() => {
     const scopedApi = <T = any>(path: string, options: RequestInit = {}) => {
       const headers = new Headers(options.headers);
       if (serverId) headers.set("X-Server-Id", serverId);
-      return api<T>(path, { ...options, headers });
+      return api<T>(path, { ...options, headers }).catch((cause) => {
+        if (cause?.status === 401) onSessionExpired?.();
+        throw cause;
+      });
     };
     return {
       api: scopedApi,
@@ -83,7 +88,7 @@ export function useServerApi() {
       downloadUrl: (path: string) =>
         `/api${path}${serverId ? `${path.includes("?") ? "&" : "?"}serverId=${encodeURIComponent(serverId)}` : ""}`,
     };
-  }, [serverId]);
+  }, [serverId, onSessionExpired]);
 }
 export function formatBytes(bytes: number) {
   if (!bytes) return "0 B";

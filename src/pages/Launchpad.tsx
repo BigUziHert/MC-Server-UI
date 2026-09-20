@@ -25,6 +25,7 @@ import {
   X,
 } from "lucide-react";
 import { formatBytes, ServerScope, useServerApi, type PageProps } from "../api";
+import { canChangeContent } from "../page-permissions";
 import SearchField, { useDebouncedValue } from "../SearchField";
 import RefreshButton from "../RefreshButton";
 import StatePanel from "../StatePanel";
@@ -358,7 +359,11 @@ export function ProjectIcon({ url }: { url?: string | null }) {
   );
 }
 
-export default function Launchpad({ notify }: PageProps) {
+export default function Launchpad({
+  notify,
+  permissions,
+}: PageProps & { permissions?: string[] }) {
+  const allowChanges = canChangeContent(permissions);
   const { api, post } = useServerApi();
   const serverId = useContext(ServerScope);
   const viewKey = `mc-panel.launchpad.view.${serverId ?? "default"}`;
@@ -475,7 +480,7 @@ export default function Launchpad({ notify }: PageProps) {
     : (sortOptions[0]?.id ?? "");
   const supported = Boolean(source?.types.includes(type));
   const working = Boolean(job && ["queued", "running"].includes(job.status));
-  const canInstall = status === "offline" && !working;
+  const canInstall = allowChanges && status === "offline" && !working;
   const contentName =
     type === "plugin" ? "plugin" : type === "datapack" ? "datapack" : "mod";
   const minecraftVersions = [
@@ -1057,6 +1062,7 @@ export default function Launchpad({ notify }: PageProps) {
   }, [api, job?.id, job?.status, jobReload, notify, reconcileJob]);
 
   function chooseProject(project: Project, entry?: InstalledItem) {
+    if (!allowChanges) return;
     operation.current++;
     setDialogError("");
     setPlan(null);
@@ -1323,7 +1329,7 @@ export default function Launchpad({ notify }: PageProps) {
     }
   }
   async function saveKey(value: string) {
-    if (pending.current) return;
+    if (permissions !== undefined || pending.current) return;
     const currentSession = session.current;
     pending.current = true;
     setBusy("settings");
@@ -1462,16 +1468,18 @@ export default function Launchpad({ notify }: PageProps) {
         <div>
           <h1>Launchpad</h1>
         </div>
-        <button
-          className="btn"
-          onClick={() => {
-            setApiKey("");
-            setSettingsError("");
-            setSettingsOpen(true);
-          }}
-        >
-          <KeyRound size={15} /> Platform settings
-        </button>
+        {permissions === undefined && (
+          <button
+            className="btn"
+            onClick={() => {
+              setApiKey("");
+              setSettingsError("");
+              setSettingsOpen(true);
+            }}
+          >
+            <KeyRound size={15} /> Platform settings
+          </button>
+        )}
       </div>
       <div className="panel launchpad-filters">
         <label>
@@ -1759,27 +1767,29 @@ export default function Launchpad({ notify }: PageProps) {
               </strong>
               <p>{job.error || job.message}</p>
             </div>
-            {!working && (
-              <button
-                className="btn icon"
-                aria-label="Dismiss installation status"
-                onClick={() => {
-                  const currentSession = session.current;
-                  void post(
-                    `/launchpad/jobs/${encodeURIComponent(job.id)}/dismiss`,
-                  )
-                    .then(() => {
-                      if (currentSession === session.current)
-                        setJob((current) =>
-                          current?.id === job.id ? null : current,
-                        );
-                    })
-                    .catch((cause) => notify(messageOf(cause), true));
-                }}
-              >
-                <X size={16} />
-              </button>
-            )}
+            {!working &&
+              (permissions === undefined ||
+                permissions.includes("file.update")) && (
+                <button
+                  className="btn icon"
+                  aria-label="Dismiss installation status"
+                  onClick={() => {
+                    const currentSession = session.current;
+                    void post(
+                      `/launchpad/jobs/${encodeURIComponent(job.id)}/dismiss`,
+                    )
+                      .then(() => {
+                        if (currentSession === session.current)
+                          setJob((current) =>
+                            current?.id === job.id ? null : current,
+                          );
+                      })
+                      .catch((cause) => notify(messageOf(cause), true));
+                  }}
+                >
+                  <X size={16} />
+                </button>
+              )}
           </div>
           {working && (
             <progress
@@ -1908,6 +1918,7 @@ export default function Launchpad({ notify }: PageProps) {
               source?.reason || "Choose another platform or content type."
             }
             action={
+              permissions === undefined &&
               source?.requiresKey && (
                 <button
                   className="btn primary"
@@ -2083,6 +2094,7 @@ export default function Launchpad({ notify }: PageProps) {
                       className={`btn ${entry && !entry.update ? "" : "primary"}`}
                       aria-label={`${entry?.update ? "Update" : entry ? "Choose version for" : "Install"} ${project.title}`}
                       disabled={
+                        !allowChanges ||
                         working ||
                         Boolean(busy) ||
                         Boolean(entry && pendingPaths.has(entry.path)) ||
@@ -2503,9 +2515,11 @@ export default function Launchpad({ notify }: PageProps) {
           )}
           {!canInstall && (
             <p className="management-form-error" role="alert">
-              {working
-                ? "Another installation is still running."
-                : "Stop the server in Console before installing or updating content."}
+              {!allowChanges
+                ? "Your account does not have permission to change server content."
+                : working
+                  ? "Another installation is still running."
+                  : "Stop the server in Console before installing or updating content."}
             </p>
           )}
           {dialogError && (
@@ -2689,9 +2703,11 @@ export default function Launchpad({ notify }: PageProps) {
         )}
         {!canInstall && (
           <p className="management-form-error" role="alert">
-            {working
-              ? `Wait for the installation to finish before removing ${contentName}s.`
-              : `Stop the server in Console before removing ${contentName}s.`}
+            {!allowChanges
+              ? "Your account does not have permission to change server content."
+              : working
+                ? `Wait for the installation to finish before removing ${contentName}s.`
+                : `Stop the server in Console before removing ${contentName}s.`}
           </p>
         )}
         {removalError && (

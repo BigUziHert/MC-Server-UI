@@ -530,120 +530,6 @@
   color: #969bb3;
   margin-top: 8px;
 }
-.management-database-summary {
-  display: flex;
-  padding: 25px;
-  gap: 36px;
-  align-items: center;
-}
-.management-summary-item {
-  display: flex;
-  align-items: center;
-  gap: 13px;
-  padding-right: 36px;
-  border-right: 1px solid #303140;
-}
-.management-summary-item > div {
-  display: flex;
-  flex-direction: column;
-  gap: 7px;
-}
-.management-summary-item > div > span {
-  font-size: 11px;
-  color: #969bb3;
-}
-.management-summary-item strong {
-  font-size: 21px;
-  font-weight: 600;
-  letter-spacing: -0.5px;
-}
-.management-engine {
-  display: flex;
-  gap: 13px;
-  align-items: center;
-  flex: 1;
-}
-.management-sqlite-mark {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  font-size: 22px;
-  font-weight: 700;
-  font-style: italic;
-  width: 35px;
-  height: 39px;
-  border: 1px solid #404356;
-  background: #272833;
-  color: #b1b6ce;
-  border-radius: 8px;
-}
-.management-engine > div {
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-}
-.management-engine > div > strong {
-  font-size: 12px;
-  font-weight: 550;
-}
-.management-engine > div > span {
-  font-size: 10px;
-  color: #969bb3;
-}
-.management-engine > .badge {
-  margin-left: auto;
-  font-size: 9px;
-  white-space: nowrap;
-}
-.management-file-icon {
-  height: 37px;
-  width: 37px;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  flex-shrink: 0;
-  border-radius: 9px;
-  background: #272833;
-  border: 1px solid #303140;
-  color: #969bb3;
-}
-.management-mono {
-  font-family: "JetBrains Mono", "SFMono-Regular", Consolas, monospace;
-  font-size: 11px !important;
-  white-space: nowrap;
-}
-.management-create-engine {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  padding: 17px;
-  border: 1px solid #303140;
-  border-radius: 8px;
-  background: #20212b;
-  color: #b1b6ce;
-}
-.management-create-engine > div {
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-}
-.management-create-engine strong {
-  font-size: 12px;
-  font-weight: 550;
-  color: #d4d8e9;
-}
-.management-create-engine > div > span {
-  font-size: 10px;
-  color: #969bb3;
-  line-height: 1.5;
-}
-.management-create-engine > .badge {
-  margin-left: auto;
-  font-size: 9px;
-}
-.management-download-before-delete {
-  display: inline-flex !important;
-}
 .management-audit-overview {
   display: flex;
   align-items: center;
@@ -877,15 +763,6 @@
 }
 
 @media (max-width: 1100px) {
-  .management-database-summary {
-    gap: 22px;
-  }
-  .management-summary-item {
-    padding-right: 22px;
-  }
-  .management-engine > .badge {
-    display: none;
-  }
   .management-table td,
   .management-table th {
     padding-left: 18px;
@@ -932,25 +809,6 @@
   }
   .role-overview-item {
     padding: 15px 18px;
-  }
-  .management-database-summary {
-    flex-wrap: wrap;
-    padding: 20px;
-  }
-  .management-summary-item {
-    flex: 1;
-    padding-right: 15px;
-  }
-  .management-summary-item:nth-child(2) {
-    border: 0;
-  }
-  .management-engine {
-    flex-basis: 100%;
-    padding-top: 20px;
-    border-top: 1px solid #303140;
-  }
-  .management-engine > .badge {
-    display: inline-flex;
   }
   .management-audit-overview {
     flex-wrap: wrap;
@@ -1006,26 +864,6 @@
   }
   .management-notice {
     padding: 15px;
-  }
-  .management-database-summary {
-    gap: 16px;
-  }
-  .management-summary-item {
-    gap: 10px;
-  }
-  .management-summary-item .management-icon {
-    width: 34px;
-    height: 34px;
-  }
-  .management-summary-item strong {
-    font-size: 18px;
-  }
-  .management-create-engine {
-    padding: 13px;
-    gap: 10px;
-  }
-  .management-create-engine > .badge {
-    display: none;
   }
   .management-dialog-actions .btn {
     font-size: 11px;

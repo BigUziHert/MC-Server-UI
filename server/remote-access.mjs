@@ -21,9 +21,35 @@ const read = (req) => ["GET", "HEAD"].includes(req.method);
 
 export function requiredPermissions(req) {
   const route = req.path;
+  const contentChanges = [
+    "file.create",
+    "file.update",
+    "file.delete",
+    "control.start",
+    "control.stop",
+  ];
   if (read(req)) {
     if (["/api/server", "/api/server/icon"].includes(route)) return [];
     if (route === "/api/console") return ["control.console"];
+    if (route === "/api/players") return [];
+    if (
+      route === "/api/versions" ||
+      /^\/api\/versions\/[^/]+(?:\/[^/]+)?$/.test(route) ||
+      [
+        "/api/launchpad",
+        "/api/launchpad/search",
+        "/api/launchpad/versions",
+        "/api/launchpad/installed",
+      ].includes(route) ||
+      /^\/api\/launchpad\/jobs\/[^/]+$/.test(route)
+    )
+      return ["file.read"];
+    if (
+      ["/api/minecraft/properties", "/api/minecraft/properties/file"].includes(
+        route,
+      )
+    )
+      return ["file.read-content"];
     if (route === "/api/files") return ["file.read"];
     if (["/api/files/content", "/api/files/download"].includes(route))
       return ["file.read-content"];
@@ -36,14 +62,32 @@ export function requiredPermissions(req) {
     if (route === "/api/backups") return ["backup.read"];
     if (/^\/api\/backups\/[^/]+\/download$/.test(route))
       return ["backup.download"];
-    if (route === "/api/databases") return ["database.read"];
-    if (/^\/api\/databases\/[^/]+\/download$/.test(route))
-      return ["database.download"];
     if (route === "/api/subusers") return ["user.read"];
     if (route === "/api/audit" && req.query.scope !== "panel")
       return ["audit.read"];
   }
   if (req.method === "POST") {
+    if (
+      /^\/api\/players\/(?:op|deop|kick|ban|unban)$/.test(route) ||
+      /^\/api\/players\/whitelist\/(?:add|remove|state)$/.test(route)
+    )
+      return ["control.console"];
+    if (route === "/api/minecraft/properties/save") return ["file.update"];
+    if (
+      [
+        "/api/versions/install",
+        "/api/launchpad/preview",
+        "/api/launchpad/removal-preview",
+        "/api/launchpad/remove",
+        "/api/launchpad/install",
+      ].includes(route) ||
+      /^\/api\/launchpad\/(?:preview|removal-preview)\/[^/]+\/cancel$/.test(
+        route,
+      )
+    )
+      return contentChanges;
+    if (/^\/api\/(?:versions|launchpad)\/jobs\/[^/]+\/dismiss$/.test(route))
+      return ["file.update"];
     if (route === "/api/server/power") {
       const action = req.body?.action;
       if (!["start", "stop", "restart", "force-stop"].includes(action))
@@ -64,7 +108,6 @@ export function requiredPermissions(req) {
     if (/^\/api\/files\/recycle-bin\/[^/]+\/restore$/.test(route))
       return ["file.create", "backup.create"];
     if (route === "/api/backups") return ["backup.create"];
-    if (route === "/api/databases") return ["database.create"];
     if (
       route === "/api/subusers" ||
       /^\/api\/subusers\/[^/]+\/invite$/.test(route)
@@ -82,7 +125,6 @@ export function requiredPermissions(req) {
     if (/^\/api\/files\/recycle-bin\/[^/]+$/.test(route))
       return ["file.delete", "backup.delete"];
     if (/^\/api\/backups\/[^/]+$/.test(route)) return ["backup.delete"];
-    if (/^\/api\/databases\/[^/]+$/.test(route)) return ["database.delete"];
     if (/^\/api\/subusers\/[^/]+$/.test(route)) return ["user.delete"];
   }
   // New routes are owner-only until deliberately assigned a permission here.

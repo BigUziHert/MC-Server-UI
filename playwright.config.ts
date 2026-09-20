@@ -3,7 +3,7 @@ import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
-// Every run gets its own server files, database files, schedules, and archives.
+// Every run gets its own server files, schedules, and archives.
 // Keeping this in the environment also shares the path with worker processes.
 const dataDir = (process.env.PANEL_E2E_DATA_DIR ||= mkdtempSync(
   path.join(tmpdir(), "mc-panel-e2e-"),
@@ -27,6 +27,7 @@ export default defineConfig({
     "file-selection.spec.ts",
     "subusers.spec.ts",
     "remote-access.spec.ts",
+    "remote-permissions.spec.ts",
     "panel-connections.spec.ts",
     "direct-remote.spec.ts",
     "server-customization.spec.ts",

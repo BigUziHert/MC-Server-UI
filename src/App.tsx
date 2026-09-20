@@ -18,8 +18,6 @@ import {
   FolderOpen,
   HardDrive,
   Layers3,
-  KeyRound,
-  LogIn,
   ListFilter,
   Menu,
   MessageSquare,
@@ -44,6 +42,7 @@ import {
   formatBytes,
   saveDesktopSelection,
   ServerScope,
+  SessionExpiredContext,
   useServerApi,
 } from "./api";
 import FileManager from "./pages/FileManager";
@@ -58,9 +57,9 @@ import PlayerHead from "./PlayerHead";
 import SearchField, { useDebouncedValue } from "./SearchField";
 import Switch from "./Switch";
 import DesktopUpdates from "./DesktopUpdates";
-import ServerIcon from "./ServerIcon";
+import ServerIcon, { ServerIconImage } from "./ServerIcon";
 import { copyText } from "./clipboard";
-import AccountMenu from "./AccountMenu";
+import PanelAccount, { type PanelSession } from "./PanelAccount";
 import ConnectPanel, { type ConnectionMode } from "./ConnectPanel";
 import { version as appVersion } from "../package.json";
 import ServerManager, {
@@ -162,6 +161,15 @@ function getPage(): Page {
   const hash = window.location.hash.slice(1);
   return navigation.some((n) => n.id === hash) ? (hash as Page) : "console";
 }
+const pagePermissions: Partial<Record<Page, string>> = {
+  files: "file.read",
+  versions: "file.read",
+  launchpad: "file.read",
+  properties: "file.read-content",
+  subusers: "user.read",
+  backups: "backup.read",
+  audit: "audit.read",
+};
 function uptime(seconds: number) {
   return seconds < 60
     ? `${Math.floor(seconds)}s`
@@ -253,12 +261,32 @@ function Sparkline({
   );
 }
 
-export default function App() {
+export default function App({
+  session,
+  onSignedOut,
+}: {
+  session?: PanelSession;
+  onSignedOut?: () => void;
+}) {
+  const remote = Boolean(session);
+  const sessionMounted = useRef(true);
+  useEffect(() => {
+    sessionMounted.current = true;
+    return () => {
+      sessionMounted.current = false;
+    };
+  }, []);
+  const expireSession = useCallback(() => {
+    if (sessionMounted.current) onSignedOut?.();
+  }, [onSignedOut]);
+  const selectionKey = session
+    ? `mc-panel.active-server.${session.email}`
+    : "mc-panel.active-server";
   const [connection, setConnection] = useState<ConnectionMode | null>(null);
   const [servers, setServers] = useState<ServerRecord[]>([]);
   const [activeId, setActiveId] = useState(() => {
     try {
-      return localStorage.getItem("mc-panel.active-server") || "";
+      return localStorage.getItem(selectionKey) || session?.serverId || "";
     } catch {
       return "";
     }
@@ -276,78 +304,90 @@ export default function App() {
   const desktopSelection = useRef<boolean | null>(null);
   const persistedSelection = useRef("");
   const [selectionReady, setSelectionReady] = useState(false);
-  const loadServers = useCallback(async (showLoading = false) => {
-    if (fleetInFlight.current) return;
-    fleetInFlight.current = true;
-    const request = ++fleetRequest.current;
-    if (showLoading) {
-      setLoading(true);
-      setError("");
-    }
-    try {
-      const [result, selection] = await Promise.all([
-        fleetApi<{
-          servers: ServerRecord[];
-          defaultServerId: string | null;
-        }>("/servers", { signal: AbortSignal.timeout(10_000) }),
-        desktopSelection.current === null
-          ? fleetApi<{ desktop: boolean; activeServerId: string | null }>(
-              "/desktop/selection",
-              { signal: AbortSignal.timeout(10_000) },
-            ).catch((cause) => {
-              // Browser runtimes do not provide desktop preferences. A failed
-              // desktop read must be retried before mounting any server workspace.
-              if (cause instanceof SyntaxError || cause?.status === 404)
-                return null;
-              throw cause;
-            })
-          : Promise.resolve(null),
-      ]);
-      if (request !== fleetRequest.current) return;
-      if (desktopSelection.current === null) {
-        desktopSelection.current = selection?.desktop === true;
-        persistedSelection.current = selection?.activeServerId ?? "";
+  const loadServers = useCallback(
+    async (showLoading = false) => {
+      if (fleetInFlight.current) return;
+      fleetInFlight.current = true;
+      const request = ++fleetRequest.current;
+      if (showLoading) {
+        setLoading(true);
+        setError("");
       }
-      setServers(result.servers);
-      setActiveId((current) => {
-        const preferred = selection?.activeServerId || current;
-        return result.servers.some((server) => server.id === preferred)
-          ? preferred
-          : (result.servers.find(
-              (server) => server.id === result.defaultServerId,
-            )?.id ??
-              result.servers[0]?.id ??
-              "");
-      });
-      setSelectionReady(true);
-      setError("");
-    } catch (cause) {
-      if (request === fleetRequest.current)
-        setError(
-          cause instanceof Error && cause.name === "TimeoutError"
-            ? "The local panel took too long to respond. Try connecting again."
-            : cause instanceof Error
-              ? cause.message
-              : "The local panel could not be reached.",
-        );
-    } finally {
-      fleetInFlight.current = false;
-      if (request === fleetRequest.current) setLoading(false);
-    }
-  }, []);
+      try {
+        const [result, selection] = await Promise.all([
+          fleetApi<{
+            servers: ServerRecord[];
+            defaultServerId: string | null;
+          }>("/servers", { signal: AbortSignal.timeout(10_000) }),
+          !remote && desktopSelection.current === null
+            ? fleetApi<{ desktop: boolean; activeServerId: string | null }>(
+                "/desktop/selection",
+                { signal: AbortSignal.timeout(10_000) },
+              ).catch((cause) => {
+                // Browser runtimes do not provide desktop preferences. A failed
+                // desktop read must be retried before mounting any server workspace.
+                if (cause instanceof SyntaxError || cause?.status === 404)
+                  return null;
+                throw cause;
+              })
+            : Promise.resolve(null),
+        ]);
+        if (request !== fleetRequest.current) return;
+        if (desktopSelection.current === null) {
+          desktopSelection.current = selection?.desktop === true;
+          persistedSelection.current = selection?.activeServerId ?? "";
+        }
+        setServers(result.servers);
+        setActiveId((current) => {
+          const preferred = selection?.activeServerId || current;
+          return result.servers.some((server) => server.id === preferred)
+            ? preferred
+            : (result.servers.find(
+                (server) => server.id === result.defaultServerId,
+              )?.id ??
+                result.servers[0]?.id ??
+                "");
+        });
+        setSelectionReady(true);
+        setError("");
+      } catch (cause) {
+        if (request !== fleetRequest.current || !sessionMounted.current) return;
+        if (remote && (cause as { status?: number })?.status === 401) {
+          expireSession();
+          return;
+        }
+        if (request === fleetRequest.current)
+          setError(
+            cause instanceof Error && cause.name === "TimeoutError"
+              ? "The panel took too long to respond. Try connecting again."
+              : cause instanceof Error
+                ? cause.message
+                : "The panel could not be reached.",
+          );
+      } finally {
+        fleetInFlight.current = false;
+        if (request === fleetRequest.current) setLoading(false);
+      }
+    },
+    [remote, expireSession],
+  );
   useEffect(() => {
     void loadServers(true);
     const timer = setInterval(() => void loadServers(), 5000);
-    return () => clearInterval(timer);
+    return () => {
+      clearInterval(timer);
+      fleetRequest.current++;
+      fleetInFlight.current = false;
+    };
   }, [loadServers]);
   useEffect(() => {
     try {
-      if (activeId) localStorage.setItem("mc-panel.active-server", activeId);
-      else localStorage.removeItem("mc-panel.active-server");
+      if (activeId) localStorage.setItem(selectionKey, activeId);
+      else localStorage.removeItem(selectionKey);
     } catch {
       /* Selection still works without browser storage. */
     }
-  }, [activeId]);
+  }, [activeId, selectionKey]);
   useEffect(() => {
     if (
       !selectionReady ||
@@ -414,20 +454,38 @@ export default function App() {
     void loadServers();
   };
   return (
-    <>
+    <SessionExpiredContext.Provider value={session ? expireSession : null}>
       {active && !firstServerSetup ? (
         <ServerScope.Provider value={active.id}>
           <ServerWorkspace
-            key={active.id}
+            key={`${active.id}:${remote ? (active.accessPermissions?.join(",") ?? session?.permissions.join(",")) : "owner"}`}
+            session={session}
+            onSignedOut={expireSession}
+            permissions={
+              session
+                ? (active.accessPermissions ??
+                  (active.id === session.serverId ? session.permissions : []))
+                : undefined
+            }
             servers={servers}
             selected={active}
-            onSelect={setActiveId}
+            onSelect={(id) => {
+              if (remote && id !== active.id) window.location.hash = "console";
+              setActiveId(id);
+            }}
             onConnect={setConnection}
-            onAdd={() => setManager({ editing: null, initialStep: "choice" })}
-            onSettings={(status) =>
-              setManager({
-                editing: { ...active, status: status ?? active.status },
-              })
+            onAdd={
+              remote
+                ? undefined
+                : () => setManager({ editing: null, initialStep: "choice" })
+            }
+            onSettings={
+              remote
+                ? undefined
+                : (status) =>
+                    setManager({
+                      editing: { ...active, status: status ?? active.status },
+                    })
             }
           />
         </ServerScope.Provider>
@@ -440,7 +498,7 @@ export default function App() {
             <Box size={33} />
           </span>
           <h1>{error ? "Unable to load your servers" : "Opening MC Panel…"}</h1>
-          <p>{error || "Connecting to your local server panel."}</p>
+          <p>{error || "Connecting to your server panel."}</p>
           {error && (
             <button
               className="btn primary"
@@ -449,9 +507,20 @@ export default function App() {
               Retry connection
             </button>
           )}
+          {session && (
+            <div className="workspace-account-state">
+              <PanelAccount
+                session={session}
+                onSignedOut={expireSession}
+                onConnect={setConnection}
+              />
+            </div>
+          )}
         </div>
       ) : (
         <EmptyFleet
+          session={session}
+          onSignedOut={expireSession}
           onConnect={setConnection}
           onAdd={(initialStep) =>
             setManager({ editing: null, initialStep, firstServer: true })
@@ -465,11 +534,11 @@ export default function App() {
           onClose={() => setConnection(null)}
           onOpened={() => {
             setConnection(null);
-            setNotice("The remote panel opened in its own window.");
+            setNotice("Connected panel opened.");
           }}
         />
       )}
-      {manager && (
+      {!remote && manager && (
         <ServerManager
           editing={manager.editing}
           initialStep={manager.initialStep}
@@ -494,47 +563,20 @@ export default function App() {
           </button>
         </div>
       )}
-    </>
-  );
-}
-
-function LocalAccount({
-  onConnect,
-}: {
-  onConnect: (mode: ConnectionMode) => void;
-}) {
-  return (
-    <AccountMenu
-      identity={{
-        name: "Local administrator",
-        detail: "This computer",
-        initial: "L",
-      }}
-      status={{ label: "Local access", tone: "neutral" }}
-      actions={[
-        {
-          id: "signin",
-          label: "Sign in to another panel",
-          icon: <LogIn size={16} />,
-          onSelect: () => onConnect("signin"),
-        },
-        {
-          id: "invitation",
-          label: "Accept an invitation",
-          icon: <KeyRound size={16} />,
-          onSelect: () => onConnect("invitation"),
-        },
-      ]}
-    />
+    </SessionExpiredContext.Provider>
   );
 }
 
 function EmptyFleet({
   onAdd,
   onConnect,
+  session,
+  onSignedOut,
 }: {
   onAdd: (step: "create" | "import") => void;
   onConnect: (mode: ConnectionMode) => void;
+  session?: PanelSession;
+  onSignedOut?: () => void;
 }) {
   return (
     <div className="fleet-welcome-shell fleet-welcome-simple">
@@ -548,7 +590,7 @@ function EmptyFleet({
           </span>
         </div>
         <div className="welcome-header-actions">
-          <DesktopUpdates />
+          {!session && <DesktopUpdates />}
           <a
             className="help-button"
             href="https://github.com/BigUziHert/MC-Server-UI/tree/dev#readme"
@@ -566,46 +608,58 @@ function EmptyFleet({
           aria-labelledby="fleet-welcome-title"
         >
           <div className="fleet-welcome-copy">
-            <h1 id="fleet-welcome-title">Welcome to MC Panel</h1>
-            <p>Start a new Minecraft server, or bring one you already have.</p>
-            <div className="fleet-welcome-choices">
-              <button
-                className="fleet-welcome-choice"
-                aria-label="Create a new server"
-                aria-describedby="welcome-create-description"
-                onClick={() => onAdd("create")}
-              >
-                <span className="fleet-welcome-choice-icon">
-                  <Plus size={23} />
-                </span>
-                <span>
-                  <strong>Create a new server</strong>
-                  <span id="welcome-create-description">
-                    Choose your software. We’ll guide the setup.
+            <h1 id="fleet-welcome-title">
+              {session ? "No shared servers" : "Welcome to MC Panel"}
+            </h1>
+            <p>
+              {session
+                ? "Your access may have been removed. Ask the server owner for a new invitation."
+                : "Start a new Minecraft server, or bring one you already have."}
+            </p>
+            {!session && (
+              <div className="fleet-welcome-choices">
+                <button
+                  className="fleet-welcome-choice"
+                  aria-label="Create a new server"
+                  aria-describedby="welcome-create-description"
+                  onClick={() => onAdd("create")}
+                >
+                  <span className="fleet-welcome-choice-icon">
+                    <Plus size={23} />
                   </span>
-                </span>
-                <ArrowRight size={19} />
-              </button>
-              <button
-                className="fleet-welcome-choice"
-                aria-label="Import an existing server"
-                aria-describedby="welcome-import-description"
-                onClick={() => onAdd("import")}
-              >
-                <span className="fleet-welcome-choice-icon">
-                  <FolderOpen size={23} />
-                </span>
-                <span>
-                  <strong>Import an existing server</strong>
-                  <span id="welcome-import-description">
-                    Connect a server folder on your computer.
+                  <span>
+                    <strong>Create a new server</strong>
+                    <span id="welcome-create-description">
+                      Choose your software. We’ll guide the setup.
+                    </span>
                   </span>
-                </span>
-                <ArrowRight size={19} />
-              </button>
-            </div>
+                  <ArrowRight size={19} />
+                </button>
+                <button
+                  className="fleet-welcome-choice"
+                  aria-label="Import an existing server"
+                  aria-describedby="welcome-import-description"
+                  onClick={() => onAdd("import")}
+                >
+                  <span className="fleet-welcome-choice-icon">
+                    <FolderOpen size={23} />
+                  </span>
+                  <span>
+                    <strong>Import an existing server</strong>
+                    <span id="welcome-import-description">
+                      Connect a server folder on your computer.
+                    </span>
+                  </span>
+                  <ArrowRight size={19} />
+                </button>
+              </div>
+            )}
             <div className="welcome-remote-account">
-              <LocalAccount onConnect={onConnect} />
+              <PanelAccount
+                session={session}
+                onSignedOut={onSignedOut}
+                onConnect={onConnect}
+              />
             </div>
           </div>
         </section>
@@ -626,16 +680,30 @@ function ServerWorkspace({
   onAdd,
   onSettings,
   onConnect,
+  session,
+  onSignedOut,
+  permissions,
 }: {
   servers: ServerRecord[];
   selected: ServerRecord;
   onSelect: (id: string) => void;
-  onAdd: () => void;
-  onSettings: (status?: ServerRecord["status"]) => void;
+  onAdd?: () => void;
+  onSettings?: (status?: ServerRecord["status"]) => void;
   onConnect: (mode: ConnectionMode) => void;
+  session?: PanelSession;
+  onSignedOut?: () => void;
+  permissions?: string[];
 }) {
   const { api } = useServerApi();
-  const [page, setPage] = useState<Page>(getPage);
+  const can = (permission: string) =>
+    !permissions || permissions.includes(permission);
+  const allowedNavigation = navigation.filter(
+    (item) => !pagePermissions[item.id] || can(pagePermissions[item.id]!),
+  );
+  const [requestedPage, setPage] = useState<Page>(getPage);
+  const page = allowedNavigation.some((item) => item.id === requestedPage)
+    ? requestedPage
+    : "console";
   const [filePath, setFilePath] = useState("");
   const [showingFileBin, setShowingFileBin] = useState(false);
   const [server, setServer] = useState<Server | null>(null);
@@ -645,6 +713,60 @@ function ServerWorkspace({
     error?: boolean;
   } | null>(null);
   const [sidebar, setSidebar] = useState(false);
+  const sidebarElement = useRef<HTMLElement>(null);
+  const sidebarToggle = useRef<HTMLButtonElement>(null);
+  useEffect(() => {
+    if (!sidebar) return;
+    const mobile = window.matchMedia("(max-width: 760px)");
+    if (!mobile.matches) return;
+    const focusable = () =>
+      Array.from(
+        sidebarElement.current?.querySelectorAll<HTMLElement>(
+          'a[href], button:not(:disabled), input:not(:disabled), select:not(:disabled), [tabindex="0"]',
+        ) ?? [],
+      ).filter(
+        (element) =>
+          element.getClientRects().length > 0 &&
+          getComputedStyle(element).visibility !== "hidden",
+      );
+    (
+      sidebarElement.current?.querySelector<HTMLElement>(
+        '[aria-current="page"]',
+      ) ?? focusable()[0]
+    )?.focus();
+    const keydown = (event: KeyboardEvent) => {
+      if (
+        !mobile.matches ||
+        event.defaultPrevented ||
+        document.querySelector("dialog[open], .modal-backdrop .modal")
+      )
+        return;
+      if (event.key === "Escape") {
+        event.preventDefault();
+        setSidebar(false);
+      } else if (event.key === "Tab") {
+        const elements = focusable();
+        const first = elements[0],
+          last = elements.at(-1);
+        if (!sidebarElement.current?.contains(document.activeElement)) {
+          event.preventDefault();
+          (event.shiftKey ? last : first)?.focus();
+        } else if (event.shiftKey && document.activeElement === first) {
+          event.preventDefault();
+          last?.focus();
+        } else if (!event.shiftKey && document.activeElement === last) {
+          event.preventDefault();
+          first?.focus();
+        }
+      }
+    };
+    document.addEventListener("keydown", keydown);
+    return () => {
+      document.removeEventListener("keydown", keydown);
+      if (sidebarToggle.current?.getClientRects().length)
+        sidebarToggle.current.focus();
+    };
+  }, [sidebar]);
   const [collapsedNavigation, setCollapsedNavigation] = useState(
     readCollapsedNavigation,
   );
@@ -673,7 +795,7 @@ function ServerWorkspace({
       setConnectionError((error as Error).message);
     }
   }, [api]);
-  const controls = useServerPower(server, refresh, notify);
+  const controls = useServerPower(server, refresh, notify, permissions);
   useEffect(() => {
     void refresh();
     const timer = window.setInterval(refresh, 3000);
@@ -733,7 +855,11 @@ function ServerWorkspace({
           onClick={() => setSidebar(false)}
         />
       )}
-      <aside className={`sidebar ${sidebar ? "is-open" : ""}`}>
+      <aside
+        ref={sidebarElement}
+        id="app-navigation"
+        className={`sidebar ${sidebar ? "is-open" : ""}`}
+      >
         <a className="brand" href="#console" aria-label="MC Panel home">
           <span className="brand-icon">
             <Box size={24} />
@@ -755,7 +881,10 @@ function ServerWorkspace({
         </div>
         <nav aria-label="Main navigation">
           {navigationGroups.map((group) => {
-            const items = navigation.filter((item) => item.group === group.id);
+            const items = allowedNavigation.filter(
+              (item) => item.group === group.id,
+            );
+            if (group.id !== "servers" && !items.length) return null;
             const collapsed = collapsedNavigation[group.id];
             const active = items.find((item) => item.id === page);
             return (
@@ -803,9 +932,16 @@ function ServerWorkspace({
                           ? server.minecraftVersion
                           : selected.minecraftVersion,
                       }}
-                      onSelect={onSelect}
+                      onSelect={(id) => {
+                        setSidebar(false);
+                        onSelect(id);
+                      }}
                       onAdd={onAdd}
-                      onSettings={() => onSettings(server?.status)}
+                      onSettings={
+                        onSettings
+                          ? () => onSettings(server?.status)
+                          : undefined
+                      }
                     />
                   )}
                   {items.map((item) => (
@@ -827,15 +963,22 @@ function ServerWorkspace({
           })}
         </nav>
         <div className="sidebar-bottom">
-          <LocalAccount onConnect={onConnect} />
+          <PanelAccount
+            session={session}
+            onSignedOut={onSignedOut}
+            onConnect={onConnect}
+          />
         </div>
       </aside>
       <div className="main-shell">
         <header className="topbar">
           <nav className="breadcrumbs" aria-label="Breadcrumb">
             <button
+              ref={sidebarToggle}
               className="btn icon mobile-menu"
               aria-label="Open navigation"
+              aria-expanded={sidebar}
+              aria-controls="app-navigation"
               onClick={() => setSidebar(true)}
             >
               <Menu size={20} />
@@ -899,7 +1042,7 @@ function ServerWorkspace({
             )}
           </nav>
           <div className="topbar-right">
-            <DesktopUpdates />
+            {!session && <DesktopUpdates />}
             <button
               className="help-button"
               aria-label="Help and documentation"
@@ -915,7 +1058,7 @@ function ServerWorkspace({
             <div className="connection-error" role="alert">
               {selected.sourceError
                 ? "Server folder unavailable."
-                : "Unable to reach the local backend."}{" "}
+                : "Unable to reach the panel."}{" "}
               {selected.sourceError || connectionError}
               <button className="btn" onClick={refresh}>
                 Retry
@@ -929,8 +1072,12 @@ function ServerWorkspace({
               notify={notify}
               refresh={refresh}
               navigate={navigate}
-              onSettings={() => onSettings(server?.status)}
+              onSettings={
+                onSettings ? () => onSettings(server?.status) : undefined
+              }
               controls={controls}
+              permissions={permissions}
+              remote={Boolean(session)}
             />
           )}
           {page === "files" && (
@@ -940,14 +1087,27 @@ function ServerWorkspace({
               onPathChange={setFilePath}
               showingBin={showingFileBin}
               onBinChange={setShowingFileBin}
+              permissions={permissions}
             />
           )}
-          {page === "players" && <Players notify={notify} />}
-          {page === "versions" && <Versions notify={notify} />}
-          {page === "launchpad" && <Launchpad notify={notify} />}
-          {page === "properties" && <Properties notify={notify} />}
-          {page === "backups" && <Backups notify={notify} />}
-          {page === "subusers" && <Subusers notify={notify} />}
+          {page === "players" && (
+            <Players notify={notify} permissions={permissions} />
+          )}
+          {page === "versions" && (
+            <Versions notify={notify} permissions={permissions} />
+          )}
+          {page === "launchpad" && (
+            <Launchpad notify={notify} permissions={permissions} />
+          )}
+          {page === "properties" && (
+            <Properties notify={notify} permissions={permissions} />
+          )}
+          {page === "backups" && (
+            <Backups notify={notify} permissions={permissions} />
+          )}
+          {page === "subusers" && (
+            <Subusers notify={notify} permissions={permissions} />
+          )}
           {page === "audit" && <AuditLogs notify={notify} />}
           <footer className="footer">
             <span>
@@ -1000,8 +1160,9 @@ function ServerWorkspace({
             </div>
             <h2 id="help-title">Your server starts here.</h2>
             <p>
-              MC Panel runs on your computer. Server files, backup archives,
-              schedules, and activity are stored locally.
+              {session
+                ? "You are connected to a remote MC Panel. Server files, backups, and running Minecraft servers stay on that computer."
+                : "MC Panel runs on your computer. Server files, backup archives, schedules, and activity are stored locally."}
             </p>
             <div className="help-step">
               <span>01</span>
@@ -1054,6 +1215,7 @@ function useServerPower(
   server: Server | null,
   refresh: () => Promise<void>,
   notify: (message: string, error?: boolean) => void,
+  permissions?: string[],
 ) {
   const { post } = useServerApi();
   const [commandBusy, setCommandBusy] = useState(false);
@@ -1063,6 +1225,11 @@ function useServerPower(
   >(null);
   const powerRequest = useRef(0);
   const busy = commandBusy || powerAction !== null;
+  const canPower = (action: "start" | "stop" | "restart" | "force-stop") =>
+    !permissions ||
+    permissions.includes(
+      `control.${action === "force-stop" ? "stop" : action}`,
+    );
   const [confirmPower, setConfirmPower] = useState<
     "stop" | "restart" | "force-stop" | null
   >(null);
@@ -1072,6 +1239,7 @@ function useServerPower(
       setConfirmPower(null);
   }, [confirmPower, server?.status]);
   async function power(action: "start" | "stop" | "restart" | "force-stop") {
+    if (!canPower(action)) return;
     const token = ++powerRequest.current;
     if (action === "force-stop") {
       ++commandRequest.current;
@@ -1098,6 +1266,7 @@ function useServerPower(
     }
   }
   return {
+    canPower,
     busy,
     commandRequest,
     setCommandBusy,
@@ -1115,40 +1284,48 @@ function PowerButtons({
   server: Server | null;
   controls: ReturnType<typeof useServerPower>;
 }) {
-  const { busy, powerAction, setConfirmPower, power } = controls;
+  const { busy, powerAction, setConfirmPower, power, canPower } = controls;
   const isRunning = server?.status === "running";
   return (
     <div className="power-buttons">
-      <button
-        className="btn start-button"
-        disabled={!server || isRunning || busy || server.status !== "offline"}
-        onClick={() => power("start")}
-      >
-        <Play size={14} fill="currentColor" />
-        Start
-      </button>
-      <button
-        className="btn restart-button"
-        disabled={!isRunning || busy}
-        onClick={() => setConfirmPower("restart")}
-      >
-        <RotateCw size={14} />
-        Restart
-      </button>
-      <button
-        className="btn stop-button"
-        disabled={
-          server?.status === "stopping"
-            ? powerAction === "force-stop"
-            : (!isRunning && server?.status !== "starting") || busy
-        }
-        onClick={() =>
-          setConfirmPower(server?.status === "stopping" ? "force-stop" : "stop")
-        }
-      >
-        <Square size={12} fill="currentColor" />
-        {server?.status === "stopping" ? "Force Stop" : "Stop"}
-      </button>
+      {canPower("start") && (
+        <button
+          className="btn start-button"
+          disabled={!server || isRunning || busy || server.status !== "offline"}
+          onClick={() => power("start")}
+        >
+          <Play size={14} fill="currentColor" />
+          Start
+        </button>
+      )}
+      {canPower("restart") && (
+        <button
+          className="btn restart-button"
+          disabled={!isRunning || busy}
+          onClick={() => setConfirmPower("restart")}
+        >
+          <RotateCw size={14} />
+          Restart
+        </button>
+      )}
+      {canPower("stop") && (
+        <button
+          className="btn stop-button"
+          disabled={
+            server?.status === "stopping"
+              ? powerAction === "force-stop"
+              : (!isRunning && server?.status !== "starting") || busy
+          }
+          onClick={() =>
+            setConfirmPower(
+              server?.status === "stopping" ? "force-stop" : "stop",
+            )
+          }
+        >
+          <Square size={12} fill="currentColor" />
+          {server?.status === "stopping" ? "Force Stop" : "Stop"}
+        </button>
+      )}
     </div>
   );
 }
@@ -1216,6 +1393,8 @@ function ConsolePage({
   refresh,
   navigate,
   onSettings,
+  permissions,
+  remote,
 }: {
   server: Server | null;
   history: { cpu: number[]; memory: number[] };
@@ -1223,9 +1402,13 @@ function ConsolePage({
   notify: (message: string, error?: boolean) => void;
   refresh: () => Promise<void>;
   navigate: (page: Page) => void;
-  onSettings: () => void;
+  onSettings?: () => void;
+  permissions?: string[];
+  remote: boolean;
 }) {
   const { api, post } = useServerApi();
+  const canConsole = !permissions || permissions.includes("control.console");
+  const canFiles = !permissions || permissions.includes("file.read");
   const [lines, setLines] = useState<LogLine[]>([]);
   const [inputMode, setInputMode] = useState<"command" | "message">("command");
   const [drafts, setDrafts] = useState({ command: "", message: "" });
@@ -1247,6 +1430,7 @@ function ConsolePage({
   });
   const historyIndex = useRef(-1);
   const loadLogs = useCallback(async () => {
+    if (!canConsole) return;
     try {
       const result = await api<{ lines: LogLine[] }>("/console");
       setLines(result.lines);
@@ -1254,12 +1438,13 @@ function ConsolePage({
     } catch {
       setLogError(true);
     }
-  }, [api]);
+  }, [api, canConsole]);
   useEffect(() => {
+    if (!canConsole) return;
     void loadLogs();
     const timer = setInterval(loadLogs, 1500);
     return () => clearInterval(timer);
-  }, [loadLogs]);
+  }, [loadLogs, canConsole]);
   useEffect(() => {
     if (autoScroll && logContainer.current)
       logContainer.current.scrollTop = logContainer.current.scrollHeight;
@@ -1276,7 +1461,7 @@ function ConsolePage({
   }, []);
   async function sendCommand(e: React.FormEvent) {
     e.preventDefault();
-    if (!command.trim() || busy) return;
+    if (!canConsole || !command.trim() || busy) return;
     const token = ++commandRequest.current;
     setCommandBusy(true);
     try {
@@ -1354,23 +1539,34 @@ function ConsolePage({
       </div>
       <section className="server-banner">
         <div className="server-identity">
-          <ServerIcon
-            version={server?.iconVersion}
-            serverVersion={server?.serverIconVersion}
-            name={server?.name || "Minecraft server"}
-            onSaved={refresh}
-          />
+          {onSettings ? (
+            <ServerIcon
+              version={server?.iconVersion}
+              serverVersion={server?.serverIconVersion}
+              name={server?.name || "Minecraft server"}
+              onSaved={refresh}
+            />
+          ) : (
+            <span className="world-icon">
+              <ServerIconImage
+                version={server?.iconVersion}
+                name={server?.name || "Minecraft server"}
+              />
+            </span>
+          )}
           <div>
             <div className="server-title">
               <h2>{server?.name || "Minecraft Server"}</h2>
-              <button
-                className="rename-server-button"
-                aria-label="Rename server"
-                title="Rename server"
-                onClick={onSettings}
-              >
-                <Pencil size={14} />
-              </button>
+              {onSettings && (
+                <button
+                  className="rename-server-button"
+                  aria-label="Rename server"
+                  title="Rename server"
+                  onClick={onSettings}
+                >
+                  <Pencil size={14} />
+                </button>
+              )}
               <span
                 className={`status-badge ${isRunning ? "running" : "offline"}`}
               >
@@ -1509,196 +1705,205 @@ function ConsolePage({
           </div>
         </div>
       </section>
-      <div className="console-layout">
-        <section className="panel console-panel">
-          <div className="panel-heading">
-            <div className="panel-title">
-              <Terminal size={17} />
-              <h2>Server console</h2>
-              <span className="live-label">
-                <i />
-                LIVE
-              </span>
-            </div>
-            <div className="console-tools">
-              <button
-                className={`tool-button ${showSearch ? "selected" : ""}`}
-                aria-label="Search console logs"
-                title="Search logs"
-                onClick={() => {
-                  if (showSearch) setSearch("");
-                  setShowSearch((v) => !v);
-                }}
-              >
-                <Search size={16} />
-              </button>
-              <button
-                className="tool-button"
-                aria-label="Clear console view"
-                title="Clear view"
-                onClick={() => setHiddenUntil(lines.at(-1)?.id ?? null)}
-              >
-                <ListFilter size={16} />
-              </button>
-              <button
-                className="tool-button"
-                aria-label="Download console logs"
-                title="Download logs"
-                onClick={downloadLogs}
-              >
-                <ArrowDownToLine size={16} />
-              </button>
-            </div>
-          </div>
-          {showSearch && (
-            <div className="log-search">
-              <SearchField
-                className="console-log-search-field"
-                iconSize={15}
-                aria-label="Filter console logs"
-                placeholder="Search logs…"
-                value={search}
-                onValueChange={setSearch}
-                autoFocus
-              />
-              <button
-                className="tool-button"
-                aria-label="Close log search"
-                onClick={() => {
-                  setShowSearch(false);
-                  setSearch("");
-                }}
-              >
-                <X size={15} />
-              </button>
-            </div>
-          )}
-          <div
-            className="console-output"
-            ref={logContainer}
-            role="log"
-            aria-label="Server console output"
-            aria-live="off"
-          >
-            {logError ? (
-              <div className="console-empty">
-                Console connection unavailable. Retrying…
+      <div
+        className={`console-layout ${canConsole ? "" : "console-layout-summary"}`}
+      >
+        {canConsole && (
+          <section className="panel console-panel">
+            <div className="panel-heading">
+              <div className="panel-title">
+                <Terminal size={17} />
+                <h2>Server console</h2>
+                <span className="live-label">
+                  <i />
+                  LIVE
+                </span>
               </div>
-            ) : visibleLines.length ? (
-              visibleLines.map((line, index) => (
-                <div
-                  className={`log-line log-${line.level}`}
-                  key={`${line.id}-${index}`}
+              <div className="console-tools">
+                <button
+                  className={`tool-button ${showSearch ? "selected" : ""}`}
+                  aria-label="Search console logs"
+                  title="Search logs"
+                  onClick={() => {
+                    if (showSearch) setSearch("");
+                    setShowSearch((v) => !v);
+                  }}
                 >
-                  <time>
-                    {/^\d{2}:\d{2}/.test(line.time)
-                      ? line.time
-                      : new Date(line.time).toLocaleTimeString("en-GB")}
-                  </time>
-                  <span className="log-level">{line.level.toUpperCase()}</span>
-                  <span className="log-message">{line.message}</span>
-                </div>
-              ))
-            ) : (
-              <div className="console-empty">
-                <Terminal size={24} />
-                <p>
-                  {search
-                    ? "No logs match your search."
-                    : "Console is ready. Server output will appear here."}
-                </p>
+                  <Search size={16} />
+                </button>
+                <button
+                  className="tool-button"
+                  aria-label="Clear console view"
+                  title="Clear view"
+                  onClick={() => setHiddenUntil(lines.at(-1)?.id ?? null)}
+                >
+                  <ListFilter size={16} />
+                </button>
+                <button
+                  className="tool-button"
+                  aria-label="Download console logs"
+                  title="Download logs"
+                  onClick={downloadLogs}
+                >
+                  <ArrowDownToLine size={16} />
+                </button>
+              </div>
+            </div>
+            {showSearch && (
+              <div className="log-search">
+                <SearchField
+                  className="console-log-search-field"
+                  iconSize={15}
+                  aria-label="Filter console logs"
+                  placeholder="Search logs…"
+                  value={search}
+                  onValueChange={setSearch}
+                  autoFocus
+                />
+                <button
+                  className="tool-button"
+                  aria-label="Close log search"
+                  onClick={() => {
+                    setShowSearch(false);
+                    setSearch("");
+                  }}
+                >
+                  <X size={15} />
+                </button>
               </div>
             )}
-          </div>
-          <div className="console-status">
-            <span>
-              <span className={`status-dot ${logError ? "offline" : ""}`} />
-              {logError ? "Reconnecting" : "Console connected"}
-              <span className="console-status-separator">•</span>UTF-8
-            </span>
-            <div className="console-options">
-              <Switch
-                aria-label="Server messaging"
-                title="Send messages to every player without typing say"
-                label={
-                  <>
-                    <MessageSquare size={12} aria-hidden="true" /> Server
-                    messaging
-                  </>
+            <div
+              className="console-output"
+              ref={logContainer}
+              role="log"
+              aria-label="Server console output"
+              aria-live="off"
+            >
+              {logError ? (
+                <div className="console-empty">
+                  Console connection unavailable. Retrying…
+                </div>
+              ) : visibleLines.length ? (
+                visibleLines.map((line, index) => (
+                  <div
+                    className={`log-line log-${line.level}`}
+                    key={`${line.id}-${index}`}
+                  >
+                    <time>
+                      {/^\d{2}:\d{2}/.test(line.time)
+                        ? line.time
+                        : new Date(line.time).toLocaleTimeString("en-GB")}
+                    </time>
+                    <span className="log-level">
+                      {line.level.toUpperCase()}
+                    </span>
+                    <span className="log-message">{line.message}</span>
+                  </div>
+                ))
+              ) : (
+                <div className="console-empty">
+                  <Terminal size={24} />
+                  <p>
+                    {search
+                      ? "No logs match your search."
+                      : "Console is ready. Server output will appear here."}
+                  </p>
+                </div>
+              )}
+            </div>
+            <div className="console-status">
+              <span>
+                <span className={`status-dot ${logError ? "offline" : ""}`} />
+                {logError ? "Reconnecting" : "Console connected"}
+                <span className="console-status-separator">•</span>UTF-8
+              </span>
+              <div className="console-options">
+                <Switch
+                  aria-label="Server messaging"
+                  title="Send messages to every player without typing say"
+                  label={
+                    <>
+                      <MessageSquare size={12} aria-hidden="true" /> Server
+                      messaging
+                    </>
+                  }
+                  checked={inputMode === "message"}
+                  disabled={busy}
+                  onCheckedChange={(enabled) => {
+                    setInputMode(enabled ? "message" : "command");
+                    historyIndex.current = -1;
+                    commandInput.current?.focus();
+                  }}
+                />
+                <button
+                  onClick={() => setAutoScroll((v) => !v)}
+                  className={autoScroll ? "autoscroll active" : "autoscroll"}
+                >
+                  {autoScroll ? <Check size={12} /> : <ArrowDown size={12} />}
+                  Autoscroll
+                </button>
+              </div>
+            </div>
+            <form className="command-form" onSubmit={sendCommand}>
+              {inputMode === "message" ? (
+                <MessageSquare size={18} />
+              ) : (
+                <ChevronRight size={18} />
+              )}
+              <input
+                ref={commandInput}
+                aria-label={
+                  inputMode === "message" ? "Server message" : "Server command"
                 }
-                checked={inputMode === "message"}
-                disabled={busy}
-                onCheckedChange={(enabled) => {
-                  setInputMode(enabled ? "message" : "command");
-                  historyIndex.current = -1;
-                  commandInput.current?.focus();
+                placeholder={
+                  isRunning
+                    ? inputMode === "message"
+                      ? "Message all players…"
+                      : "Type a command…"
+                    : `Start your server to send a ${inputMode}…`
+                }
+                maxLength={inputMode === "message" ? 2044 : 2048}
+                value={command}
+                disabled={!isRunning}
+                onChange={(e) => setCommand(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "ArrowUp") {
+                    e.preventDefault();
+                    historyIndex.current = Math.min(
+                      historyIndex.current + 1,
+                      commandHistory.current[inputMode].length - 1,
+                    );
+                    setCommand(
+                      commandHistory.current[inputMode][historyIndex.current] ||
+                        "",
+                    );
+                  }
+                  if (e.key === "ArrowDown") {
+                    e.preventDefault();
+                    historyIndex.current = Math.max(
+                      -1,
+                      historyIndex.current - 1,
+                    );
+                    setCommand(
+                      commandHistory.current[inputMode][historyIndex.current] ||
+                        "",
+                    );
+                  }
                 }}
               />
+              <kbd>Ctrl K</kbd>
               <button
-                onClick={() => setAutoScroll((v) => !v)}
-                className={autoScroll ? "autoscroll active" : "autoscroll"}
+                type="submit"
+                aria-label={
+                  inputMode === "message" ? "Send message" : "Send command"
+                }
+                disabled={!isRunning || !command.trim() || busy}
               >
-                {autoScroll ? <Check size={12} /> : <ArrowDown size={12} />}
-                Autoscroll
+                <Send size={16} />
               </button>
-            </div>
-          </div>
-          <form className="command-form" onSubmit={sendCommand}>
-            {inputMode === "message" ? (
-              <MessageSquare size={18} />
-            ) : (
-              <ChevronRight size={18} />
-            )}
-            <input
-              ref={commandInput}
-              aria-label={
-                inputMode === "message" ? "Server message" : "Server command"
-              }
-              placeholder={
-                isRunning
-                  ? inputMode === "message"
-                    ? "Message all players…"
-                    : "Type a command…"
-                  : `Start your server to send a ${inputMode}…`
-              }
-              maxLength={inputMode === "message" ? 2044 : 2048}
-              value={command}
-              disabled={!isRunning}
-              onChange={(e) => setCommand(e.target.value)}
-              onKeyDown={(e) => {
-                if (e.key === "ArrowUp") {
-                  e.preventDefault();
-                  historyIndex.current = Math.min(
-                    historyIndex.current + 1,
-                    commandHistory.current[inputMode].length - 1,
-                  );
-                  setCommand(
-                    commandHistory.current[inputMode][historyIndex.current] ||
-                      "",
-                  );
-                }
-                if (e.key === "ArrowDown") {
-                  e.preventDefault();
-                  historyIndex.current = Math.max(-1, historyIndex.current - 1);
-                  setCommand(
-                    commandHistory.current[inputMode][historyIndex.current] ||
-                      "",
-                  );
-                }
-              }}
-            />
-            <kbd>Ctrl K</kbd>
-            <button
-              type="submit"
-              aria-label={
-                inputMode === "message" ? "Send message" : "Send command"
-              }
-              disabled={!isRunning || !command.trim() || busy}
-            >
-              <Send size={16} />
-            </button>
-          </form>
-        </section>
+            </form>
+          </section>
+        )}
         <aside className="console-side">
           <section className="panel server-details">
             <div className="panel-heading">
@@ -1725,7 +1930,7 @@ function ConsolePage({
               </div>
               <div>
                 <dt>Environment</dt>
-                <dd>Local server</dd>
+                <dd>{remote ? "Remote server" : "Local server"}</dd>
               </div>
               <div>
                 <dt>Connection</dt>
@@ -1738,9 +1943,11 @@ function ConsolePage({
                 </dd>
               </div>
             </dl>
-            <button className="card-link" onClick={() => navigate("files")}>
-              Manage server files <ArrowRight size={14} />
-            </button>
+            {canFiles && (
+              <button className="card-link" onClick={() => navigate("files")}>
+                Manage server files <ArrowRight size={14} />
+              </button>
+            )}
           </section>
           <section className="panel online-players">
             <div className="panel-heading">
@@ -1798,8 +2005,9 @@ function ConsolePage({
       <div className="console-bottom-note">
         <ShieldCheck size={14} />
         <span>
-          Your panel is running locally. Server commands are sent directly to
-          the server process.
+          {remote
+            ? "Connected to a remote panel. Your permissions apply to this server."
+            : "Your panel is running locally. Server commands are sent directly to the server process."}
         </span>
       </div>
     </>

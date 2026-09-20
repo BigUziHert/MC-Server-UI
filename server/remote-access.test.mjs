@@ -388,9 +388,31 @@ test("remote route permissions fail closed for unassigned routes and distinguish
     ["PUT", "/api/backups/schedule", ["backup.update"]],
     ["GET", "/api/backups/id/download", ["backup.download"]],
     ["DELETE", "/api/backups/id", ["backup.delete"]],
-    ["POST", "/api/databases", ["database.create"]],
-    ["GET", "/api/databases/id/download", ["database.download"]],
-    ["DELETE", "/api/databases/id", ["database.delete"]],
+    ["GET", "/api/players", []],
+    ["POST", "/api/players/ban", ["control.console"]],
+    ["POST", "/api/players/whitelist/state", ["control.console"]],
+    ["GET", "/api/versions", ["file.read"]],
+    ["GET", "/api/versions/jobs/job-id", ["file.read"]],
+    ["GET", "/api/launchpad/installed", ["file.read"]],
+    ["GET", "/api/launchpad/jobs/job-id", ["file.read"]],
+    ["GET", "/api/minecraft/properties/file", ["file.read-content"]],
+    ["POST", "/api/minecraft/properties/save", ["file.update"]],
+    ...[
+      "/api/versions/install",
+      "/api/launchpad/install",
+      "/api/launchpad/preview",
+      "/api/launchpad/remove",
+    ].map((path) => [
+      "POST",
+      path,
+      [
+        "file.create",
+        "file.update",
+        "file.delete",
+        "control.start",
+        "control.stop",
+      ],
+    ]),
     [
       "POST",
       "/api/files/recycle-bin/id/restore",
@@ -406,8 +428,7 @@ test("remote route permissions fail closed for unassigned routes and distinguish
   for (const path of [
     "/api/servers",
     "/api/server-import",
-    "/api/launchpad/install",
-    "/api/minecraft/properties/save",
+    "/api/launchpad/settings",
     "/api/server/icon",
     "/api/future-feature",
   ])
@@ -415,6 +436,61 @@ test("remote route permissions fail closed for unassigned routes and distinguish
       () => requiredPermissions({ method: "POST", path, query: {} }),
       { status: 403 },
     );
+});
+
+test("the shared panel exposes standard pages within the user's file and console grants", async (t) => {
+  const { invite, local } = await fixture(t);
+  assert.equal(
+    (
+      await local(
+        "/api/files",
+        json("POST", {
+          name: "server.properties",
+          type: "file",
+          content: "motd=Shared test server\n",
+        }),
+      )
+    ).status,
+    201,
+  );
+  const { asUser } = await invite(["file.read", "file.read-content"]);
+  assert.equal((await asUser("/api/players")).status, 200);
+  assert.equal((await asUser("/api/versions")).status, 200);
+  const properties = await asUser("/api/minecraft/properties");
+  assert.equal(properties.status, 200);
+  assert.ok(
+    properties.body.files.some((file) => file.path === "server.properties"),
+  );
+  assert.equal(
+    (await asUser("/api/minecraft/properties/file?path=server.properties"))
+      .status,
+    200,
+  );
+  for (const route of [
+    "/api/players/op",
+    "/api/minecraft/properties/save",
+    "/api/versions/install",
+    "/api/launchpad/preview",
+    "/api/launchpad/remove",
+  ])
+    assert.equal((await asUser(route, json("POST", {}))).status, 403, route);
+  assert.equal(
+    (
+      await asUser(
+        "/api/launchpad/settings",
+        json("PUT", { curseforgeApiKey: "not-saved" }),
+      )
+    ).status,
+    403,
+  );
+  const { asUser: restricted } = await invite([], "restricted@example.test");
+  for (const route of [
+    "/api/versions",
+    "/api/launchpad",
+    "/api/minecraft/properties",
+    "/api/minecraft/properties/file?path=server.properties",
+  ])
+    assert.equal((await restricted(route)).status, 403, route);
 });
 
 test("network discovery is owner-only and does not claim the forwarded port is reachable", async (t) => {

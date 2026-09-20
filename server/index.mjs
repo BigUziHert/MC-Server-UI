@@ -1,7 +1,6 @@
 import express from "express";
 import multer from "multer";
 import * as tar from "tar";
-import { DatabaseSync } from "node:sqlite";
 import { spawn } from "node:child_process";
 import { EventEmitter } from "node:events";
 import { createHash, randomUUID } from "node:crypto";
@@ -65,8 +64,9 @@ const permissionIds = new Set(
 );
 const userWithPermissions = (user) => ({
   ...user,
-  permissions:
-    user.permissions ?? permissionsCatalog.roleDefaults[user.role] ?? [],
+  permissions: (
+    user.permissions ?? permissionsCatalog.roleDefaults[user.role] ?? []
+  ).filter((permission) => permissionIds.has(permission)),
 });
 function validatePermissions(value) {
   if (
@@ -509,7 +509,6 @@ export async function createPanel(options = {}) {
     throw new Error("MC_MEMORY_MB must be an integer between 256 and 262144.");
   await fs.mkdir(dataDir, { recursive: true });
   const backupDir = await safePath(dataDir, "backups");
-  const databaseDir = await safePath(dataDir, "databases");
   const uploadDir = await safePath(dataDir, "uploads");
   const statePath = await safePath(dataDir, "panel.json");
   if (options.existingServerDir)
@@ -518,7 +517,6 @@ export async function createPanel(options = {}) {
     dataDir,
     ...(options.existingServerDir ? [] : [serverDir]),
     backupDir,
-    databaseDir,
     uploadDir,
   ])
     await fs.mkdir(dir, { recursive: true });
@@ -542,7 +540,6 @@ export async function createPanel(options = {}) {
   });
   let state = {
     users: [],
-    databases: [],
     backups: [],
     audit: [],
     playerHistory: [],
@@ -2614,73 +2611,6 @@ export async function createPanel(options = {}) {
       state.users = state.users.filter((entry) => entry.id !== item.id);
       await audit("user", "Subuser access revoked", item.email);
       await options.revokeUser?.(item.id);
-      res.json({ ok: true });
-    }),
-  );
-  app.get("/api/databases", async (_req, res) => {
-    const databases = await Promise.all(
-      state.databases.map(async (item) => ({
-        ...item,
-        size: (await fs.stat(path.join(databaseDir, `${item.id}.sqlite`))).size,
-      })),
-    );
-    res.json({ databases });
-  });
-  app.post(
-    "/api/databases",
-    trackOperation(async (req, res) => {
-      const name = validateName(req.body?.name);
-      if (!/^[a-zA-Z][a-zA-Z0-9_-]{0,47}$/.test(name))
-        throw error(
-          400,
-          "Database names must start with a letter and use up to 48 letters, numbers, underscores, or dashes.",
-        );
-      if (
-        state.databases.some(
-          (item) => item.name.toLowerCase() === name.toLowerCase(),
-        )
-      )
-        throw error(409, "A database with this name already exists.");
-      const item = {
-        id: randomUUID(),
-        name,
-        type: "SQLite",
-        size: 0,
-        createdAt: new Date().toISOString(),
-      };
-      const target = path.join(databaseDir, `${item.id}.sqlite`);
-      const db = new DatabaseSync(target);
-      try {
-        db.exec(
-          "CREATE TABLE panel_metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
-        );
-        db.prepare("INSERT INTO panel_metadata (key, value) VALUES (?, ?)").run(
-          "createdAt",
-          item.createdAt,
-        );
-      } finally {
-        db.close();
-      }
-      item.size = (await fs.stat(target)).size;
-      state.databases.push(item);
-      await audit("database", "SQLite database created", name);
-      res.status(201).json(item);
-    }),
-  );
-  app.get("/api/databases/:id/download", (req, res) => {
-    const item = getItem(state.databases, req.params.id);
-    res.download(
-      path.join(databaseDir, `${item.id}.sqlite`),
-      `${item.name}.sqlite`,
-    );
-  });
-  app.delete(
-    "/api/databases/:id",
-    trackOperation(async (req, res) => {
-      const item = getItem(state.databases, req.params.id);
-      await fs.rm(path.join(databaseDir, `${item.id}.sqlite`), { force: true });
-      state.databases = state.databases.filter((entry) => entry.id !== item.id);
-      await audit("database", "SQLite database deleted", item.name);
       res.json({ ok: true });
     }),
   );

@@ -165,7 +165,7 @@ test("server registration accepts only live runtimes and leaves new servers stop
   );
 });
 
-test("fleet scopes files, console, backups, schedules, users, databases and player permissions", async (t) => {
+test("fleet scopes files, console, backups, schedules, users and player permissions", async (t) => {
   const { boot } = await fixture(t);
   const panel = await boot();
   const { request, base, tick } = panel;
@@ -286,19 +286,6 @@ test("fleet scopes files, console, backups, schedules, users, databases and play
     404,
   );
   assert.deepEqual((await request("/api/subusers", {}, second)).body.users, []);
-  const db = await request(
-    "/api/databases",
-    json("POST", { name: "first_world" }),
-    first,
-  );
-  assert.equal(
-    (await request(`/api/databases/${db.body.id}/download`, {}, second)).status,
-    404,
-  );
-  assert.deepEqual(
-    (await request("/api/databases", {}, second)).body.databases,
-    [],
-  );
   const operated = await request(
     "/api/players/op",
     json("POST", { name: "BuilderOne" }),

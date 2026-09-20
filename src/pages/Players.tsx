@@ -206,7 +206,10 @@ function Roster({
   );
 }
 
-export default function Players({ notify }: PageProps) {
+export default function Players({
+  notify,
+  permissions,
+}: PageProps & { permissions?: string[] }) {
   const { api, post } = useServerApi();
   const [data, setData] = useState<PlayersResponse | null>(null);
   const [loading, setLoading] = useState(true);
@@ -292,7 +295,12 @@ export default function Players({ notify }: PageProps) {
     else whitelistDialog.current?.close();
   }, [whitelistAction]);
 
-  const canManage = Boolean(data && !error && data.status === "running");
+  const canManage = Boolean(
+    data &&
+    !error &&
+    data.status === "running" &&
+    (permissions === undefined || permissions.includes("control.console")),
+  );
   const operators = data?.operators ?? [];
   const filtered = operators.filter((player) =>
     player.name.toLowerCase().includes(query.trim().toLowerCase()),
@@ -341,6 +349,7 @@ export default function Players({ notify }: PageProps) {
         : "Unban player";
 
   function openModeration(action: Moderation["action"], player: KnownPlayer) {
+    if (!canManage) return;
     setReason("");
     setFormError("");
     setModerating({ action, player });
@@ -395,16 +404,19 @@ export default function Players({ notify }: PageProps) {
   }
 
   function openGrant(player: KnownPlayer) {
+    if (!canManage) return;
     setName(player.name);
     setGrantUuid(player.uuid);
     setFormError("");
     setGranting(true);
   }
   function openRemove(player: Operator) {
+    if (!canManage) return;
     setFormError("");
     setRemoving(player);
   }
   function openWhitelist(action: WhitelistAction) {
+    if (!canManage) return;
     setFormError("");
     setWhitelistName(
       action.kind === "state" ? "" : (action.player?.name ?? ""),

@@ -14,6 +14,7 @@ import {
   X,
 } from "lucide-react";
 import { ServerScope, useServerApi, type PageProps } from "../api";
+import { canChangeContent } from "../page-permissions";
 import SearchField, { useDebouncedValue } from "../SearchField";
 import RefreshButton from "../RefreshButton";
 import StatePanel from "../StatePanel";
@@ -113,7 +114,11 @@ export function SoftwareIcon({ software }: { software: string }) {
   );
 }
 
-export default function Versions({ notify }: PageProps) {
+export default function Versions({
+  notify,
+  permissions,
+}: PageProps & { permissions?: string[] }) {
+  const allowChanges = canChangeContent(permissions);
   const { api, post } = useServerApi();
   const scope = useContext(ServerScope);
   const [providers, setProviders] = useState<Provider[]>([]);
@@ -349,6 +354,7 @@ export default function Versions({ notify }: PageProps) {
   }
   async function install() {
     if (
+      !allowChanges ||
       !selected ||
       !confirming ||
       (updating ? !canUpdate : !accepted) ||
@@ -461,33 +467,35 @@ export default function Versions({ notify }: PageProps) {
                 "Preparing the official download…"}
             </p>
           </div>
-          {!jobBusy && (
-            <button
-              className="btn icon"
-              aria-label="Dismiss installation status"
-              onClick={async () => {
-                const dismissedId = job.id;
-                try {
-                  await post(
-                    `/versions/jobs/${encodeURIComponent(dismissedId)}/dismiss`,
-                    {},
-                  );
-                  setJob((currentJob) =>
-                    currentJob?.id === dismissedId ? null : currentJob,
-                  );
-                } catch (cause) {
-                  notify(
-                    cause instanceof Error
-                      ? cause.message
-                      : "Unable to dismiss installation status.",
-                    true,
-                  );
-                }
-              }}
-            >
-              <X size={16} />
-            </button>
-          )}
+          {!jobBusy &&
+            (permissions === undefined ||
+              permissions.includes("file.update")) && (
+              <button
+                className="btn icon"
+                aria-label="Dismiss installation status"
+                onClick={async () => {
+                  const dismissedId = job.id;
+                  try {
+                    await post(
+                      `/versions/jobs/${encodeURIComponent(dismissedId)}/dismiss`,
+                      {},
+                    );
+                    setJob((currentJob) =>
+                      currentJob?.id === dismissedId ? null : currentJob,
+                    );
+                  } catch (cause) {
+                    notify(
+                      cause instanceof Error
+                        ? cause.message
+                        : "Unable to dismiss installation status.",
+                      true,
+                    );
+                  }
+                }}
+              >
+                <X size={16} />
+              </button>
+            )}
         </section>
       )}
       {(selected?.kind === "proxy" || current?.software === "Velocity") && (
@@ -742,7 +750,11 @@ export default function Versions({ notify }: PageProps) {
                       </div>
                       <button
                         className="btn primary"
-                        disabled={jobBusy || current?.status !== "offline"}
+                        disabled={
+                          !allowChanges ||
+                          jobBusy ||
+                          current?.status !== "offline"
+                        }
                         onClick={() => {
                           setConfirming(build);
                           setInstallMode(canUpdate ? "update" : "clean");
@@ -923,6 +935,7 @@ export default function Versions({ notify }: PageProps) {
           <button
             className="btn primary"
             disabled={
+              !allowChanges ||
               (updating ? !canUpdate : !accepted) ||
               submitting ||
               jobBusy ||

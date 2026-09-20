@@ -1,4 +1,5 @@
 import { expect, test, type Page } from "@playwright/test";
+import permissionCatalog from "../shared/subuser-permissions.json" with { type: "json" };
 
 const sister = {
   role: "subuser",
@@ -22,6 +23,12 @@ const server = {
   players: [],
   maxPlayers: 20,
   memory: 0,
+  cpu: 0,
+  cpuCapacity: 800,
+  memoryLimit: 4 * 1024 ** 3,
+  disk: 128 * 1024 ** 2,
+  diskLimit: 1024 ** 4,
+  uptime: 0,
   address: "play.example.com",
 };
 async function sharedEndpoints(page: Page, permissions = sister.permissions) {
@@ -109,6 +116,13 @@ test("an invitation opens controls only after a password is chosen and explicitl
     page.getByRole("button", { name: "Start", exact: true }),
   ).toBeEnabled();
   await expect(page.getByRole("log")).toContainText("Family server is ready.");
+  await expect(
+    page.getByRole("heading", { name: "Console", exact: true }),
+  ).toBeVisible();
+  await expect(
+    page.getByRole("region", { name: "Server resources" }),
+  ).toBeVisible();
+  await expect(page.locator(".metric-card")).toHaveCount(4);
   const overflow = await page.evaluate(
     () => document.documentElement.scrollWidth > window.innerWidth,
   );
@@ -128,8 +142,12 @@ test("a phone only offers granted controls and scopes every action to the shared
     route.fulfill({ json: { ...sister, permissions: ["control.start"] } }),
   );
   let consoleRequests = 0;
+  const forbiddenRequests: string[] = [];
   page.on("request", (request) => {
-    if (new URL(request.url()).pathname === "/api/console") consoleRequests++;
+    const pathname = new URL(request.url()).pathname;
+    if (pathname === "/api/console") consoleRequests++;
+    if (/^\/api\/(desktop|files|backups|subusers|audit)(\/|$)/.test(pathname))
+      forbiddenRequests.push(pathname);
   });
   const actions: unknown[] = [];
   await page.route("**/api/server/power", async (route) => {
@@ -153,8 +171,22 @@ test("a phone only offers granted controls and scopes every action to the shared
   ).toHaveCount(0);
   await expect(page.getByRole("log")).toHaveCount(0);
   await expect(
-    page.getByRole("textbox", { name: "Console command" }),
+    page.getByRole("textbox", { name: "Server command" }),
   ).toHaveCount(0);
+  await page.getByRole("button", { name: "Open navigation" }).click();
+  await expect(
+    page.getByRole("link", { name: "File Manager", exact: true }),
+  ).toHaveCount(0);
+  await expect(
+    page.getByRole("link", { name: "Players", exact: true }),
+  ).toBeVisible();
+  await page.evaluate(() => {
+    window.location.hash = "files";
+  });
+  await expect(
+    page.getByRole("heading", { name: "Console", exact: true }),
+  ).toBeVisible();
+  expect(forbiddenRequests).toEqual([]);
   expect(consoleRequests).toBe(0);
   await expect(
     page.getByRole("button", { name: "Add server", exact: true }),
@@ -194,8 +226,8 @@ test("switching shared servers drops the previous console and uses the next memb
   await page.goto("/");
   await expect(page.getByRole("log")).toContainText("Family server is ready.");
   await page
-    .getByRole("combobox", { name: "Select shared server" })
-    .selectOption("creative");
+    .getByRole("button", { name: "Select server Creative world" })
+    .click();
   await expect(
     page.getByRole("heading", { name: "Creative world", exact: true }),
   ).toBeVisible();
@@ -204,8 +236,179 @@ test("switching shared servers drops the previous console and uses the next memb
     page.getByRole("button", { name: "Stop", exact: true }),
   ).toHaveCount(0);
   await expect(
-    page.getByRole("button", { name: "Start", exact: true }),
+    page.getByRole("main").getByRole("button", { name: "Start", exact: true }),
   ).toBeEnabled();
+});
+
+test("a fully shared account uses the complete desktop workspace and mobile navigation", async ({
+  page,
+}, testInfo) => {
+  const permissions = permissionCatalog.groups.flatMap((group) =>
+    group.permissions.map((permission) => permission.id),
+  );
+  await sharedEndpoints(page, permissions);
+  await page.route("**/api/access/session", (route) =>
+    route.fulfill({ json: { ...sister, permissions } }),
+  );
+  const ownerRequests: string[] = [];
+  page.on("request", (request) => {
+    const pathname = new URL(request.url()).pathname;
+    if (pathname.startsWith("/api/desktop/")) ownerRequests.push(pathname);
+  });
+  await page.setViewportSize({ width: 1280, height: 900 });
+  await page.goto("/");
+  const navigation = page.getByRole("navigation", { name: "Main navigation" });
+  const pages = [
+    "Console",
+    "File Manager",
+    "Players",
+    "Versions",
+    "Launchpad",
+    "Properties",
+    "Subusers",
+    "Backups",
+    "Audit Logs",
+  ];
+  for (const name of pages) {
+    await expect(
+      navigation.getByRole("link", { name, exact: true }),
+    ).toBeVisible();
+  }
+  await expect(page.locator(".metric-card")).toHaveCount(4);
+  await expect(page.getByRole("log")).toContainText("Family server is ready.");
+  await expect(
+    page.getByRole("button", { name: "Add server", exact: true }),
+  ).toHaveCount(0);
+  await expect(
+    page.getByRole("button", { name: "Server settings", exact: true }),
+  ).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "Rename server" })).toHaveCount(
+    0,
+  );
+  await page.screenshot({
+    path: testInfo.outputPath("shared-desktop-workspace.png"),
+    fullPage: true,
+  });
+  await page.setViewportSize({ width: 320, height: 720 });
+  await expect(navigation).toBeHidden();
+  await page.getByRole("button", { name: "Open navigation" }).click();
+  for (const name of pages) {
+    await expect(
+      navigation.getByRole("link", { name, exact: true }),
+    ).toBeVisible();
+  }
+  await expect(
+    page.getByRole("button", { name: `Account menu for ${sister.email}` }),
+  ).toBeVisible();
+  expect(
+    await page.evaluate(
+      () => document.documentElement.scrollWidth > window.innerWidth,
+    ),
+  ).toBe(false);
+  expect(ownerRequests).toEqual([]);
+  await expect
+    .poll(async () =>
+      Math.round((await page.locator(".sidebar").boundingBox())!.x),
+    )
+    .toBe(0);
+  await page.screenshot({
+    path: testInfo.outputPath("shared-mobile-navigation.png"),
+    animations: "disabled",
+  });
+  await page
+    .getByRole("button", { name: `Account menu for ${sister.email}` })
+    .focus();
+  await page.keyboard.press("Tab");
+  await expect(page.getByRole("link", { name: "MC Panel home" })).toBeFocused();
+  await page.keyboard.press("Escape");
+  await expect(navigation).toBeHidden();
+  await expect(
+    page.getByRole("button", { name: "Open navigation" }),
+  ).toBeFocused();
+});
+
+test("an expired shared session leaves the workspace when an action returns 401", async ({
+  page,
+}) => {
+  await sharedEndpoints(page, ["control.start"]);
+  await page.route("**/api/access/session", (route) =>
+    route.fulfill({ json: sister }),
+  );
+  await page.route("**/api/server/power", (route) =>
+    route.fulfill({ status: 401, json: { error: "Sign in again." } }),
+  );
+  await page.goto("/");
+  await page
+    .getByRole("main")
+    .getByRole("button", { name: "Start", exact: true })
+    .click();
+  await expect(
+    page.getByRole("heading", { name: "Welcome to your server" }),
+  ).toBeVisible();
+  await expect(page.locator(".app-shell")).toHaveCount(0);
+});
+
+test("a late response from a signed-out workspace cannot end the next session", async ({
+  page,
+}) => {
+  await sharedEndpoints(page, ["control.start"]);
+  await page.route("**/api/access/session", (route) =>
+    route.fulfill({ json: sister }),
+  );
+  await page.route("**/api/access/logout", (route) =>
+    route.fulfill({ json: { ok: true } }),
+  );
+  await page.route("**/api/access/login", (route) =>
+    route.fulfill({ json: sister }),
+  );
+  let releaseResponse!: () => void;
+  const pendingResponse = new Promise<void>((resolve) => {
+    releaseResponse = resolve;
+  });
+  let finishRoute!: () => void;
+  const routeDone = new Promise<void>((resolve) => {
+    finishRoute = resolve;
+  });
+  await page.route("**/api/server/power", async (route) => {
+    await pendingResponse;
+    await route.fulfill({
+      status: 401,
+      json: { error: "Old session expired." },
+    });
+    finishRoute();
+  });
+  await page.goto("/");
+  const requestReceived = page.waitForRequest("**/api/server/power");
+  await page
+    .getByRole("main")
+    .getByRole("button", { name: "Start", exact: true })
+    .click();
+  await requestReceived;
+  await page
+    .getByRole("button", { name: `Account menu for ${sister.email}` })
+    .click();
+  await page.getByRole("menuitem", { name: "Sign out" }).click();
+  await page.getByLabel("Email address").fill(sister.email);
+  await page.getByLabel("Password", { exact: true }).fill(password);
+  await page.getByRole("button", { name: "Sign in", exact: true }).click();
+  await expect(page.getByRole("heading", { name: server.name })).toBeVisible();
+  const responseFinished = page.waitForEvent("requestfinished", {
+    predicate: (request) =>
+      new URL(request.url()).pathname === "/api/server/power",
+  });
+  releaseResponse();
+  await routeDone;
+  await responseFinished;
+  await page.evaluate(
+    () =>
+      new Promise<void>((resolve) => requestAnimationFrame(() => resolve())),
+  );
+  await expect(
+    page.getByRole("main").getByRole("button", { name: "Start", exact: true }),
+  ).toBeEnabled();
+  await expect(
+    page.getByRole("heading", { name: "Welcome to your server" }),
+  ).toHaveCount(0);
 });
 
 test("email and password sign-in opens the shared panel and logout returns to sign-in", async ({
@@ -264,6 +467,7 @@ test("email and password sign-in opens the shared panel and logout returns to si
   await page.route("**/api/access/logout", (route) =>
     route.fulfill({ json: { ok: true } }),
   );
+  await page.getByRole("button", { name: "Open navigation" }).click();
   await page
     .getByRole("button", { name: "Account menu for sister@example.com" })
     .click();
@@ -489,6 +693,7 @@ test("the mobile account menu stays onscreen and a failed sign-out can be retrie
       : route.fulfill({ json: { ok: true } });
   });
   await page.goto("/");
+  await page.getByRole("button", { name: "Open navigation" }).click();
   const account = page.getByRole("button", {
     name: `Account menu for ${sister.email}`,
   });
@@ -498,7 +703,7 @@ test("the mobile account menu stays onscreen and a failed sign-out can be retrie
   const anchor = await account.boundingBox();
   const bounds = await menu.boundingBox();
   expect(bounds).not.toBeNull();
-  expect(bounds!.y).toBeGreaterThanOrEqual(anchor!.y + anchor!.height);
+  expect(bounds!.y + bounds!.height).toBeLessThanOrEqual(anchor!.y);
   expect(bounds!.x).toBeGreaterThanOrEqual(0);
   expect(bounds!.x + bounds!.width).toBeLessThanOrEqual(320);
   expect(bounds!.y + bounds!.height).toBeLessThanOrEqual(720);

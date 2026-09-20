@@ -391,27 +391,6 @@ for (const width of [1348, 390]) {
   });
 }
 
-test("Databases is absent and old bookmarks fall back to Console without database requests", async ({
-  page,
-}) => {
-  const databaseRequests: string[] = [];
-  page.on("request", (request) => {
-    if (/\/api\/(?:servers\/[^/]+\/)?databases(?:\?|$|\/)/.test(request.url()))
-      databaseRequests.push(request.url());
-  });
-  await page.goto("/#databases");
-  await expect(
-    page.getByRole("heading", { name: "Console", exact: true }),
-  ).toBeVisible();
-  await expect(
-    page
-      .getByRole("navigation", { name: "Main navigation" })
-      .getByRole("link", { name: "Databases", exact: true }),
-  ).toHaveCount(0);
-  await expect(page).toHaveTitle("Console · MC Panel");
-  expect(databaseRequests).toEqual([]);
-});
-
 test("mobile group controls support keyboard reopening and keep navigation within the viewport", async ({
   page,
 }) => {

@@ -28,11 +28,13 @@ export function auditHistory(entries) {
     "Mod removed": "Mod deleted",
   };
   return entries
-    .filter((entry) => entry.category !== "database")
     .map((entry) =>
       Object.hasOwn(legacy, entry.action)
         ? { ...entry, category: "file", action: legacy[entry.action] }
         : entry,
+    )
+    .filter((entry) =>
+      ["server", "file", "backup", "user", "player"].includes(entry.category),
     )
     .sort((a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt));
 }

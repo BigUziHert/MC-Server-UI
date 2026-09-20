@@ -74,7 +74,9 @@ for (const width of [1348, 390]) {
     const consolePower = page.locator(".server-power");
     const sidebarPower = page.locator(".sidebar-power");
     await expect(consolePower.getByRole("button")).toHaveCount(3);
-    await expect(sidebarPower.getByRole("button")).toHaveCount(3);
+    await expect(
+      sidebarPower.getByRole("button", { includeHidden: true }),
+    ).toHaveCount(3);
     for (const name of ["Start", "Restart", "Stop"])
       await expect(
         consolePower.getByRole("button", { name, exact: true }),
@@ -93,6 +95,7 @@ for (const width of [1348, 390]) {
     const sidebarForce = sidebarPower.getByRole("button", {
       name: "Force Stop",
       exact: true,
+      includeHidden: true,
     });
     await expect(force).toBeEnabled();
     await expect(sidebarForce).toBeEnabled();
@@ -107,10 +110,18 @@ for (const width of [1348, 390]) {
         .getByRole("button", { name: "Restart", exact: true }),
     ).toBeDisabled();
     await expect(
-      sidebarPower.getByRole("button", { name: "Start", exact: true }),
+      sidebarPower.getByRole("button", {
+        name: "Start",
+        exact: true,
+        includeHidden: true,
+      }),
     ).toBeDisabled();
     await expect(
-      sidebarPower.getByRole("button", { name: "Restart", exact: true }),
+      sidebarPower.getByRole("button", {
+        name: "Restart",
+        exact: true,
+        includeHidden: true,
+      }),
     ).toBeDisabled();
     expect(actions).toEqual([{ action: "stop" }]);
     await force.click();
@@ -147,10 +158,18 @@ for (const width of [1348, 390]) {
         .getByRole("button", { name: "Stop", exact: true }),
     ).toBeDisabled();
     await expect(
-      sidebarPower.getByRole("button", { name: "Start", exact: true }),
+      sidebarPower.getByRole("button", {
+        name: "Start",
+        exact: true,
+        includeHidden: true,
+      }),
     ).toBeEnabled();
     await expect(
-      sidebarPower.getByRole("button", { name: "Stop", exact: true }),
+      sidebarPower.getByRole("button", {
+        name: "Stop",
+        exact: true,
+        includeHidden: true,
+      }),
     ).toBeDisabled();
     if (width < 768)
       await page.getByRole("link", { name: "Console", exact: true }).click();
@@ -214,12 +233,21 @@ for (const width of [1348, 390]) {
             .click();
       };
       await openSidebar();
-      const start = sidebar.getByRole("button", { name: "Start", exact: true });
+      const start = sidebar.getByRole("button", {
+        name: "Start",
+        exact: true,
+        includeHidden: true,
+      });
       const restart = sidebar.getByRole("button", {
         name: "Restart",
         exact: true,
+        includeHidden: true,
       });
-      const stop = sidebar.getByRole("button", { name: "Stop", exact: true });
+      const stop = sidebar.getByRole("button", {
+        name: "Stop",
+        exact: true,
+        includeHidden: true,
+      });
       await expect(start).toBeDisabled();
       await expect(stop).toBeEnabled();
       await selectServer(page, target.id);
@@ -258,9 +286,9 @@ for (const width of [1348, 390]) {
       await restartDialog
         .getByRole("button", { name: "Restart server", exact: true })
         .click();
-      await expect(stop).toBeEnabled();
       await expect(consoleStop).toBeEnabled();
       await openSidebar();
+      await expect(stop).toBeEnabled();
       await stop.click();
       await page
         .getByRole("dialog", { name: "Stop your server?", exact: true })

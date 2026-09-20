@@ -514,46 +514,7 @@ test("subusers can be prepared before remote setup, searched, and revoked", asyn
   ).toBe(false);
 });
 
-test("removing the Databases page preserves existing SQLite files", async ({
-  page,
-  request,
-}) => {
-  // Seed an existing record through the compatibility API, never user data.
-  expect(
-    (
-      await request.post("/api/databases", {
-        data: { name: "e2e_player_stats" },
-      })
-    ).status(),
-  ).toBe(201);
-  const before = (await (await request.get("/api/databases")).json()).databases;
-  const record = before.find(
-    (item: { name: string }) => item.name === "e2e_player_stats",
-  );
-  const download = await request.get(`/api/databases/${record.id}/download`);
-  const original = await download.body();
-  expect(original.subarray(0, 16).toString()).toBe("SQLite format 3\0");
-  await page.goto("/#databases");
-  await expect(
-    page.getByRole("heading", { name: "Console", exact: true }),
-  ).toBeVisible();
-  await expect(
-    page
-      .getByRole("navigation", { name: "Main navigation" })
-      .getByRole("link", { name: "Databases", exact: true }),
-  ).toHaveCount(0);
-  await expect(
-    page.getByRole("heading", { name: "Databases", exact: true }),
-  ).toHaveCount(0);
-  expect(
-    (await (await request.get("/api/databases")).json()).databases,
-  ).toEqual(before);
-  expect(
-    await (await request.get(`/api/databases/${record.id}/download`)).body(),
-  ).toEqual(original);
-});
-
-test("audit filters show file, server and player actions without databases", async ({
+test("audit filters show file, server and player actions", async ({
   page,
   request,
 }) => {
@@ -573,13 +534,6 @@ test("audit filters show file, server and player actions without databases", asy
     (
       await request.put("/api/files/content", {
         data: { path: "e2e-audit-probe.txt", content: "edited audit probe" },
-      })
-    ).ok(),
-  ).toBe(true);
-  expect(
-    (
-      await request.post("/api/databases", {
-        data: { name: "e2e_audit_database" },
       })
     ).ok(),
   ).toBe(true);
@@ -605,22 +559,12 @@ test("audit filters show file, server and player actions without databases", asy
     });
     expect(response.ok(), await response.text()).toBe(true);
   }
-  const audit = await (await request.get("/api/audit")).json();
-  expect(
-    audit.entries.some(
-      (entry: { category: string }) => entry.category === "database",
-    ),
-  ).toBe(false);
   await openPage(page, "audit", "Audit logs");
   const filters = page.getByRole("group", {
     name: "Filter by activity category",
   });
   const rows = page.getByRole("table").getByRole("row");
-  await expect(
-    filters.getByRole("button", { name: "Databases", exact: true }),
-  ).toHaveCount(0);
   await expect(rows.filter({ hasText: "e2e-audit-probe.txt" })).toHaveCount(2);
-  await expect(rows.filter({ hasText: "e2e_audit_database" })).toHaveCount(0);
   await filters.getByRole("button", { name: "Files", exact: true }).click();
   await expect(
     filters.getByRole("button", { name: "Files", exact: true }),
@@ -631,7 +575,6 @@ test("audit filters show file, server and player actions without databases", asy
       .filter({ hasText: "File edited" }),
   ).toBeVisible();
   await expect(rows.filter({ hasText: "Audit_Player" })).toHaveCount(0);
-  await expect(rows.filter({ hasText: "e2e_audit_database" })).toHaveCount(0);
   await page
     .getByRole("textbox", { name: "Search audit logs" })
     .fill("e2e-audit-probe.txt");
@@ -1698,7 +1641,7 @@ test("an empty fleet shows only guided creation and refreshes after a server is 
     const pathname = new URL(request.url()).pathname;
     if (
       !firstServer &&
-      /^\/api\/(?:server|console|files|backups|players|subusers|databases|audit)(?:\/|$)/.test(
+      /^\/api\/(?:server|console|files|backups|players|subusers|audit)(?:\/|$)/.test(
         pathname,
       )
     ) {

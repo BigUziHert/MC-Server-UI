@@ -23,6 +23,7 @@ import "./servers.css";
 
 export type ServerRecord = {
   id: string;
+  accessPermissions?: string[];
   name: string;
   status: "running" | "offline" | "starting" | "stopping";
   mode: "live";
@@ -57,8 +58,8 @@ export function ServerSwitcher({
   servers: ServerRecord[];
   selected: ServerRecord;
   onSelect: (id: string) => void;
-  onAdd: () => void;
-  onSettings: () => void;
+  onAdd?: () => void;
+  onSettings?: () => void;
 }) {
   return (
     <div className="fleet-switcher">
@@ -103,21 +104,27 @@ export function ServerSwitcher({
           );
         })}
       </ul>
-      <div className="fleet-actions">
-        <button className="nav-item" onClick={onAdd}>
-          <Plus size={19} />
-          Add server
-        </button>
-        <button
-          className="nav-item"
-          aria-label="Server settings"
-          title="Server settings"
-          onClick={onSettings}
-        >
-          <Settings2 size={19} />
-          <span>Settings</span>
-        </button>
-      </div>
+      {(onAdd || onSettings) && (
+        <div className="fleet-actions">
+          {onAdd && (
+            <button className="nav-item" onClick={onAdd}>
+              <Plus size={19} />
+              Add server
+            </button>
+          )}
+          {onSettings && (
+            <button
+              className="nav-item"
+              aria-label="Server settings"
+              title="Server settings"
+              onClick={onSettings}
+            >
+              <Settings2 size={19} />
+              <span>Settings</span>
+            </button>
+          )}
+        </div>
+      )}
     </div>
   );
 }

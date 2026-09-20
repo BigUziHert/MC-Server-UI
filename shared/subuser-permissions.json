@@ -120,33 +120,6 @@
       ]
     },
     {
-      "id": "database",
-      "label": "Databases",
-      "description": "Manage the server's local database files.",
-      "permissions": [
-        {
-          "id": "database.read",
-          "label": "View databases",
-          "description": "View database records and file information."
-        },
-        {
-          "id": "database.create",
-          "label": "Create databases",
-          "description": "Create a new database."
-        },
-        {
-          "id": "database.download",
-          "label": "Download databases",
-          "description": "Download database files."
-        },
-        {
-          "id": "database.delete",
-          "label": "Delete databases",
-          "description": "Permanently delete databases."
-        }
-      ]
-    },
-    {
       "id": "audit",
       "label": "Audit",
       "description": "Review server management activity.",
@@ -179,10 +152,6 @@
       "backup.download",
       "backup.delete",
       "backup.update",
-      "database.read",
-      "database.create",
-      "database.download",
-      "database.delete",
       "audit.read"
     ],
     "operator": [
@@ -200,8 +169,6 @@
       "backup.download",
       "backup.delete",
       "backup.update",
-      "database.read",
-      "database.download",
       "audit.read"
     ],
     "viewer": [
@@ -209,7 +176,6 @@
       "file.read-content",
       "backup.read",
       "backup.download",
-      "database.read",
       "audit.read"
     ]
   }

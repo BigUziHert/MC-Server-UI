@@ -48,6 +48,8 @@ files:
   - desktop/external-links.mjs
   - desktop/remote-panels.mjs
   - desktop/permissions.mjs
+  - desktop/connections-ipc.mjs
+  - desktop/connections-preload.cjs
   - desktop/assets/**/*
   - package.json
 asar: true

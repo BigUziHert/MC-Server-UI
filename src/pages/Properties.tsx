@@ -23,7 +23,14 @@ type Config = {
   fields: Field[];
   status: string;
 };
-export default function Properties({ notify }: PageProps) {
+export default function Properties({
+  notify,
+  permissions,
+}: PageProps & { permissions?: string[] }) {
+  const canRead =
+    permissions === undefined || permissions.includes("file.read-content");
+  const canWrite =
+    permissions === undefined || permissions.includes("file.update");
   const { api, post } = useServerApi();
   const [files, setFiles] = useState<{ path: string; name: string }[]>([]),
     [selected, setSelected] = useState("");
@@ -48,6 +55,7 @@ export default function Properties({ notify }: PageProps) {
   const dirty = changes.length > 0;
   const load = useCallback(
     async (file: string, preserve = false) => {
+      if (!canRead) return false;
       const id = ++request.current;
       setLoading(true);
       setError("");
@@ -74,7 +82,7 @@ export default function Properties({ notify }: PageProps) {
         if (id === request.current) setLoading(false);
       }
     },
-    [api],
+    [api, canRead],
   );
   useEffect(() => {
     const id = ++session.current;
@@ -88,6 +96,10 @@ export default function Properties({ notify }: PageProps) {
     setLoading(true);
     setSaving(false);
     setError("");
+    if (!canRead) {
+      setLoading(false);
+      return;
+    }
     void api<{ files: { path: string; name: string }[] }>(
       "/minecraft/properties",
     )
@@ -109,7 +121,7 @@ export default function Properties({ notify }: PageProps) {
       session.current++;
       request.current++;
     };
-  }, [api, load, catalogReload]);
+  }, [api, load, catalogReload, canRead]);
   useEffect(() => {
     if (pending) dialog.current?.showModal();
     else dialog.current?.close();
@@ -143,7 +155,7 @@ export default function Properties({ notify }: PageProps) {
     return load(selected, true);
   };
   async function save() {
-    if (!config || !dirty || saving) return;
+    if (!canWrite || !config || !dirty || saving) return;
     const id = session.current;
     setSaving(true);
     setError("");
@@ -171,6 +183,14 @@ export default function Properties({ notify }: PageProps) {
       .toLowerCase()
       .includes(debouncedSearch.toLowerCase()),
   );
+  if (!canRead)
+    return (
+      <StatePanel
+        variant="empty"
+        title="Properties unavailable"
+        message="You do not have permission to read configuration files."
+      />
+    );
   return (
     <div className="properties-page">
       <div className="page-heading">
@@ -180,7 +200,7 @@ export default function Properties({ notify }: PageProps) {
         <button
           className="btn primary"
           onClick={() => void save()}
-          disabled={!dirty || saving || loading}
+          disabled={!canWrite || !dirty || saving || loading}
         >
           <Save size={15} />
           {saving ? "Saving…" : "Save changes"}
@@ -259,7 +279,7 @@ export default function Properties({ notify }: PageProps) {
                       aria-label={field.label}
                       label={values[field.key] === true ? "On" : "Off"}
                       checked={values[field.key] === true}
-                      disabled={saving || loading}
+                      disabled={!canWrite || saving || loading}
                       onCheckedChange={(checked) =>
                         setValues((current) => ({
                           ...current,
@@ -271,7 +291,7 @@ export default function Properties({ notify }: PageProps) {
                     <select
                       aria-label={field.label}
                       value={String(values[field.key])}
-                      disabled={saving || loading}
+                      disabled={!canWrite || saving || loading}
                       onChange={(event) =>
                         setValues((current) => ({
                           ...current,
@@ -297,7 +317,7 @@ export default function Properties({ notify }: PageProps) {
                       max={field.max}
                       autoComplete="off"
                       spellCheck={false}
-                      disabled={saving || loading}
+                      disabled={!canWrite || saving || loading}
                       value={String(values[field.key])}
                       onChange={(event) =>
                         setValues((current) => ({
@@ -325,8 +345,21 @@ export default function Properties({ notify }: PageProps) {
             )}
             <p className="properties-note">
               <SlidersHorizontal size={15} />
-              Changes apply after a server restart. Complex YAML lists can be
-              edited in <a href="#files">File Manager</a>.
+              {canWrite ? (
+                <span>
+                  Changes apply after a server restart.
+                  {(permissions === undefined ||
+                    permissions.includes("file.read")) && (
+                    <>
+                      {" "}
+                      Complex YAML lists can be edited in{" "}
+                      <a href="#files">File Manager</a>.
+                    </>
+                  )}
+                </span>
+              ) : (
+                "You have read-only access to these configuration files."
+              )}
             </p>
           </>
         )

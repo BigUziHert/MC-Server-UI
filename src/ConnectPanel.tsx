@@ -9,6 +9,7 @@ import {
 } from "lucide-react";
 import { normalizePanelConnectionUrl } from "../shared/panel-connection.mjs";
 import { api } from "./api";
+import "./desktop-connections";
 import "./connect-panel.css";
 
 export type ConnectionMode = "signin" | "invitation";
@@ -24,6 +25,7 @@ export default function ConnectPanel({
   onClose: () => void;
   onOpened: () => void;
 }) {
+  const inDesktop = desktop || Boolean(window.mcPanelConnections);
   const dialog = useRef<HTMLDialogElement>(null);
   const addressInput = useRef<HTMLInputElement>(null);
   const active = useRef(true);
@@ -70,7 +72,10 @@ export default function ConnectPanel({
     pending.current = true;
     setBusy(true);
     try {
-      if (desktop) {
+      if (window.mcPanelConnections) {
+        await window.mcPanelConnections.open(url);
+        if (active.current) onOpened();
+      } else if (desktop) {
         await api("/desktop/connections/open", {
           method: "POST",
           body: JSON.stringify({ url }),
@@ -78,7 +83,7 @@ export default function ConnectPanel({
         if (active.current) onOpened();
       } else {
         // Credentials are entered only on the destination panel's own origin.
-        // Native desktop connections instead use a separate isolated window.
+        // Native desktop connections keep isolated sessions in the same window.
         window.location.assign(url);
       }
     } catch (cause) {
@@ -224,8 +229,8 @@ export default function ConnectPanel({
         </div>
       </form>
       <p className="connect-panel-note">
-        {desktop
-          ? "The panel opens in its own window."
+        {inDesktop
+          ? "Switch between this computer and connected panels in the account menu."
           : "The panel opens in this tab."}{" "}
         Your local servers keep running.
       </p>

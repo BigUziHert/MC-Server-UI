@@ -1,7 +1,9 @@
 import {
   app,
   BrowserWindow,
+  WebContentsView,
   dialog,
+  ipcMain,
   Menu,
   nativeImage,
   session,
@@ -17,6 +19,7 @@ import { startDesktopRuntime } from "./runtime.mjs";
 import { flushRendererSelection } from "./selection.mjs";
 import { createRemotePanelController } from "./remote-panels.mjs";
 import { installPanelPermissionHandlers } from "./permissions.mjs";
+import { installConnectionIpc } from "./connections-ipc.mjs";
 import {
   installExternalLinkHandlers,
   openExternalWebsite,
@@ -52,6 +55,7 @@ let updates;
 let updateTimer;
 let initialUpdateTimer;
 let remotePanels;
+let removeConnectionIpc;
 
 async function logError(cause) {
   const message =
@@ -140,7 +144,8 @@ async function requestQuit(installUpdate = false) {
     }
     tray?.setToolTip("MC Panel — shutting down servers");
     await runtime?.close({ gracefulOnly: installUpdate });
-    remotePanels?.close();
+    removeConnectionIpc?.();
+    await remotePanels?.close();
     clearTimeout(initialUpdateTimer);
     clearInterval(updateTimer);
     tray?.destroy();
@@ -199,6 +204,7 @@ function endWindowsSession() {
 }
 
 function createMenus() {
+  const connections = remotePanels?.list();
   const dataFolder = path.join(userData, "data");
   const actions = [
     { label: "Open MC Panel", click: showWindow },
@@ -215,6 +221,7 @@ function createMenus() {
     {
       label: "Check for updates",
       click: () => {
+        remotePanels?.activate("local");
         showWindow();
         updates?.check();
       },
@@ -225,6 +232,30 @@ function createMenus() {
   Menu.setApplicationMenu(
     Menu.buildFromTemplate([
       { label: "Panel", submenu: actions },
+      {
+        label: "Connections",
+        submenu: [
+          ...(connections?.panels || []).map((panel) => ({
+            label: panel.label,
+            type: "radio",
+            checked: panel.id === connections.activeId,
+            ...(panel.local ? { accelerator: "CmdOrCtrl+Shift+L" } : {}),
+            click: () => {
+              remotePanels.activate(panel.id);
+              showWindow();
+            },
+          })),
+          { type: "separator" },
+          {
+            label: "Disconnect current panel",
+            enabled: Boolean(connections && connections.activeId !== "local"),
+            click: () =>
+              void remotePanels
+                .disconnect(remotePanels.list().activeId)
+                .catch(logError),
+          },
+        ],
+      },
       {
         label: "Edit",
         submenu: [
@@ -249,6 +280,10 @@ function createMenus() {
       },
     ]),
   );
+  if (tray) {
+    tray.setContextMenu(Menu.buildFromTemplate(actions));
+    return;
+  }
   try {
     tray = new Tray(
       nativeImage.createFromPath(path.join(desktopDir, "assets", "icon.ico")),
@@ -296,13 +331,6 @@ async function launch() {
       return remotePanels.open(url);
     },
   });
-  remotePanels = createRemotePanelController({
-    BrowserWindow,
-    session,
-    dialog,
-    downloadsDirectory: app.getPath("downloads"),
-    icon: path.join(desktopDir, "assets", "icon.ico"),
-  });
   const panelSession = session.fromPartition(`mc-panel-${randomUUID()}`);
   await panelSession.cookies.set({
     url: runtime.url,
@@ -349,6 +377,7 @@ async function launch() {
     autoHideMenuBar: true,
     webPreferences: {
       session: panelSession,
+      preload: path.join(desktopDir, "connections-preload.cjs"),
       nodeIntegration: false,
       contextIsolation: true,
       sandbox: true,
@@ -356,6 +385,25 @@ async function launch() {
       webviewTag: false,
       spellcheck: false,
     },
+  });
+  remotePanels = createRemotePanelController({
+    window,
+    localOrigin: runtime.url,
+    WebContentsView,
+    session,
+    dialog,
+    downloadsDirectory: app.getPath("downloads"),
+    preload: path.join(desktopDir, "connections-preload.cjs"),
+    openWebsite,
+    onChange: (context) => {
+      if (quitting) return;
+      window.setMenuBarVisibility(context.activeId !== "local");
+      createMenus();
+    },
+  });
+  removeConnectionIpc = installConnectionIpc(ipcMain, remotePanels);
+  window.on("page-title-updated", (event) => {
+    if (remotePanels.list().activeId !== "local") event.preventDefault();
   });
   installPanelPermissionHandlers(
     panelSession,

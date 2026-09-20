@@ -87,7 +87,7 @@ export async function startDesktopRuntime({
         const target = await readPanelConnectionBody(req);
         if (!openRemotePanel)
           throw Object.assign(
-            new Error("Remote panel windows require the desktop app."),
+            new Error("Remote panel connections require the desktop app."),
             { status: 409 },
           );
         if (closing)

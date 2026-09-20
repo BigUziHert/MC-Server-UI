@@ -84,7 +84,7 @@ export default function AccountMenu({
       window.removeEventListener("resize", placeMenu);
       window.removeEventListener("scroll", placeMenu, true);
     };
-  }, [open]);
+  }, [open, actions.length]);
 
   useEffect(() => {
     if (!open) return;

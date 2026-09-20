@@ -23,6 +23,53 @@ const localServer = {
   diskLimit: 1024,
 };
 
+async function desktopBridge(page: Page) {
+  await page.addInitScript(() => {
+    const state = {
+      activeId: "local",
+      panels: [
+        {
+          id: "local",
+          label: "This computer",
+          origin: location.origin,
+          local: true,
+        },
+        {
+          id: "pc-one",
+          label: "pc-one.example:3002",
+          origin: "https://pc-one.example:3002",
+          local: false,
+        },
+        {
+          id: "pc-two",
+          label: "pc-two.example:3002",
+          origin: "https://pc-two.example:3002",
+          local: false,
+        },
+      ],
+    };
+    const calls: { action: string; value: string }[] = [];
+    Object.assign(window, { connectionCalls: calls });
+    window.mcPanelConnections = {
+      list: async () => state,
+      open: async (url) => {
+        calls.push({ action: "open", value: url });
+        return state;
+      },
+      activate: async (id) => {
+        calls.push({ action: "activate", value: id });
+        state.activeId = id;
+        window.dispatchEvent(new Event("mc-panel-connections-changed"));
+        return state;
+      },
+      disconnect: async (id) => {
+        calls.push({ action: "disconnect", value: id });
+        return state;
+      },
+    };
+  });
+}
+
 async function localPanel(page: Page, desktop = false) {
   const localCredentials: string[] = [];
   page.on("request", (request) => {
@@ -273,6 +320,88 @@ test("a failed desktop connection preserves the address and allows an explicit r
     { url: `${panelOrigin}/` },
   ]);
   await expect(page).toHaveURL(/\/#console$/);
+});
+
+test("desktop account switches between this computer and multiple connected panels in one window", async ({
+  page,
+  context,
+}) => {
+  await desktopBridge(page);
+  await localPanel(page, true);
+  await page.goto("/#console");
+  const account = page.getByRole("button", {
+    name: "Account menu for Local administrator",
+  });
+  await account.click();
+  await page
+    .getByRole("menuitem", {
+      name: "Switch to pc-two.example:3002",
+      exact: true,
+    })
+    .click();
+  await account.click();
+  await page
+    .getByRole("menuitem", { name: "Switch to this computer", exact: true })
+    .click();
+  expect(
+    await page.evaluate(
+      () => (window as unknown as { connectionCalls: unknown }).connectionCalls,
+    ),
+  ).toEqual([
+    { action: "activate", value: "pc-two" },
+    { action: "activate", value: "local" },
+  ]);
+  expect(context.pages()).toHaveLength(1);
+});
+
+test("desktop invitations use the scoped connection bridge and keep credentials on the destination", async ({
+  page,
+  context,
+}) => {
+  await desktopBridge(page);
+  const { localCredentials } = await localPanel(page, true);
+  const apiOpens: string[] = [];
+  page.on("request", (request) => {
+    if (request.url().includes("/desktop/connections/open"))
+      apiOpens.push(request.url());
+  });
+  await page.goto("/#console");
+  const dialog = await openConnection(page, true);
+  await expect(dialog).toContainText(
+    "Switch between this computer and connected panels",
+  );
+  await dialog
+    .getByLabel("Panel address or invitation link")
+    .fill(invitationUrl);
+  await dialog
+    .getByRole("button", { name: "Continue with invitation" })
+    .click();
+  await expect(dialog).toHaveCount(0);
+  expect(
+    await page.evaluate(
+      () => (window as unknown as { connectionCalls: unknown }).connectionCalls,
+    ),
+  ).toEqual([{ action: "open", value: invitationUrl }]);
+  expect(localCredentials).toEqual([]);
+  expect(apiOpens).toEqual([]);
+  expect(context.pages()).toHaveLength(1);
+});
+
+test("a remote desktop sign-in screen can return to this computer before authentication", async ({
+  page,
+}) => {
+  await desktopBridge(page);
+  await page.route("**/api/access/session", (route) =>
+    route.fulfill({ json: { role: "guest" } }),
+  );
+  await page.goto("/");
+  await expect(page.getByLabel("Password", { exact: true })).toBeVisible();
+  await page.getByRole("button", { name: "Back to this computer" }).click();
+  expect(
+    await page.evaluate(
+      () => (window as unknown as { connectionCalls: unknown }).connectionCalls,
+    ),
+  ).toEqual([{ action: "activate", value: "local" }]);
 });
 
 for (const invitation of [false, true]) {

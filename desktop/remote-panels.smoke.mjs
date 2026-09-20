@@ -13,10 +13,12 @@ const scriptPath = fileURLToPath(import.meta.url);
 const projectDirectory = path.dirname(path.dirname(scriptPath));
 
 async function fixture() {
-  const { app, BrowserWindow, session } = await import("electron");
+  const { app, BrowserWindow, WebContentsView, ipcMain, session } =
+    await import("electron");
   const { default: selfsigned } = await import("selfsigned");
   const { createRemotePanelController } = await import("./remote-panels.mjs");
   const { installPanelPermissionHandlers } = await import("./permissions.mjs");
+  const { installConnectionIpc } = await import("./connections-ipc.mjs");
   const { startDesktopRuntime, DESKTOP_COOKIE_NAME } =
     await import("./runtime.mjs");
   const root = app.commandLine.getSwitchValue("remote-smoke-root");
@@ -40,59 +42,50 @@ async function fixture() {
   const expectedFingerprint = new X509Certificate(certificate.cert)
     .fingerprint256;
   const requests = [];
-  const secureServer = https.createServer(
-    { key: certificate.private, cert: certificate.cert },
-    (req, res) => {
-      requests.push({
-        path: req.url,
-        cookie: req.headers.cookie || "",
-        origin: req.headers.origin,
-      });
-      res.setHeader(
-        "Set-Cookie",
-        "remote-fixture=fixture-session; Secure; HttpOnly; SameSite=Strict; Path=/",
-      );
-      res.setHeader("Content-Type", "text/html; charset=utf-8");
-      res.end(
-        "<!doctype html><title>Fixture cannot replace native host title</title><h1>Remote fixture panel</h1><p>This page is served by the loopback HTTPS test fixture.</p>" +
-          (req.url === "/" ? '<iframe src="/embedded"></iframe>' : ""),
-      );
-    },
+  const secureServers = [0, 1].map((number) =>
+    https.createServer(
+      { key: certificate.private, cert: certificate.cert },
+      (req, res) => {
+        requests.push({
+          path: req.url,
+          cookie: req.headers.cookie || "",
+          origin: req.headers.origin,
+          server: number,
+        });
+        res.setHeader(
+          "Set-Cookie",
+          `remote-fixture=fixture-session-${number}; Secure; HttpOnly; SameSite=Strict; Path=/`,
+        );
+        res.setHeader("Content-Type", "text/html; charset=utf-8");
+        res.end(
+          "<!doctype html><title>Fixture cannot replace native host title</title><h1>Remote fixture panel</h1><p>This page is served by the loopback HTTPS test fixture.</p>" +
+            (req.url === "/" ? '<iframe src="/embedded"></iframe>' : ""),
+        );
+      },
+    ),
   );
-  await new Promise((resolve, reject) => {
-    secureServer.once("error", reject);
-    secureServer.listen(0, "127.0.0.1", resolve);
-  });
-  const remoteUrl = `https://127.0.0.1:${secureServer.address().port}/`;
-  const remoteWindows = [];
+  for (const secureServer of secureServers)
+    await new Promise((resolve, reject) => {
+      secureServer.once("error", reject);
+      secureServer.listen(0, "127.0.0.1", resolve);
+    });
+  const remoteUrls = secureServers.map(
+    (server) => `https://127.0.0.1:${server.address().port}/`,
+  );
+  const remoteUrl = remoteUrls[0];
+  const remoteViews = [];
+  const remoteContents = [];
   const prompts = [];
-  const answers = [0, 1, 1];
-  class HiddenRemoteWindow extends BrowserWindow {
+  const answers = [0, 1, 1, 1];
+  class TrackedView {
     constructor(options) {
-      super({ ...options, show: false });
-      remoteWindows.push(this);
+      const view = new WebContentsView(options);
+      remoteViews.push(view);
+      remoteContents.push(view.webContents);
+      return view;
     }
   }
-  const controller = createRemotePanelController({
-    BrowserWindow: HiddenRemoteWindow,
-    session,
-    downloadsDirectory: path.join(root, "downloads"),
-    dialog: {
-      async showMessageBox(window, options) {
-        assert.ok(remoteWindows.includes(window));
-        assert.ok(
-          options.detail.includes(expectedFingerprint),
-          "Only the known fixture certificate may receive a test answer.",
-        );
-        assert.equal(options.defaultId, 0);
-        assert.equal(options.cancelId, 0);
-        assert.ok(answers.length, "Unexpected certificate prompt");
-        const response = answers.shift();
-        prompts.push(response);
-        return { response };
-      },
-    },
-  });
+  let controller;
   const runtime = await startDesktopRuntime({
     dataDir: path.join(root, "data"),
     scheduler: false,
@@ -114,8 +107,37 @@ async function fixture() {
       sandbox: true,
       contextIsolation: true,
       nodeIntegration: false,
+      preload: path.join(
+        projectDirectory,
+        "desktop",
+        "connections-preload.cjs",
+      ),
     },
   });
+  controller = createRemotePanelController({
+    window: ownerWindow,
+    localOrigin: runtime.url,
+    WebContentsView: TrackedView,
+    session,
+    preload: path.join(projectDirectory, "desktop", "connections-preload.cjs"),
+    downloadsDirectory: path.join(root, "downloads"),
+    dialog: {
+      async showMessageBox(window, options) {
+        assert.equal(window, ownerWindow);
+        assert.ok(
+          options.detail.includes(expectedFingerprint),
+          "Only the known fixture certificate may receive a test answer.",
+        );
+        assert.equal(options.defaultId, 0);
+        assert.equal(options.cancelId, 0);
+        assert.ok(answers.length, "Unexpected certificate prompt");
+        const response = answers.shift();
+        prompts.push(response);
+        return { response };
+      },
+    },
+  });
+  const removeIpc = installConnectionIpc(ipcMain, controller);
   installPanelPermissionHandlers(
     ownerSession,
     runtime.url,
@@ -144,6 +166,7 @@ async function fixture() {
   globalThis.__remotePanelSmoke = {
     ready: true,
     remoteUrl,
+    remoteUrls,
     async open() {
       const response = await privateRequest("/api/desktop/connections/open", {
         method: "POST",
@@ -151,16 +174,25 @@ async function fixture() {
       });
       return { status: response.status, body: await response.json() };
     },
+    invoke(action, value, fromRemote = false) {
+      const contents = fromRemote
+        ? remoteContents.at(-1)
+        : ownerWindow.webContents;
+      assert.ok(["list", "open", "activate", "disconnect"].includes(action));
+      return contents.executeJavaScript(
+        `window.mcPanelConnections[${JSON.stringify(action)}](${JSON.stringify(value)})`,
+      );
+    },
     async inspect() {
-      const window = remoteWindows.at(-1);
-      const active = window && !window.isDestroyed();
-      const preferences = active
-        ? window.webContents.getLastWebPreferences()
-        : null;
+      const contents = remoteContents.at(-1);
+      const active = contents && !contents.isDestroyed();
+      const preferences = active ? contents.getLastWebPreferences() : null;
       return {
         prompts,
         requests,
-        windows: remoteWindows.map((item) => ({
+        nativeWindows: BrowserWindow.getAllWindows().length,
+        context: controller.list(),
+        views: remoteContents.map((item) => ({
           destroyed: item.isDestroyed(),
         })),
         ownerOpen: !ownerWindow.isDestroyed(),
@@ -168,41 +200,37 @@ async function fixture() {
         ownerCookie: (
           await ownerSession.cookies.get({ url: runtime.url })
         ).some((item) => item.name === DESKTOP_COOKIE_NAME),
-        cookies: active ? await window.webContents.session.cookies.get({}) : [],
-        separateSession: active
-          ? window.webContents.session !== ownerSession
-          : true,
-        title: active ? window.getTitle() : null,
+        cookies: active ? await contents.session.cookies.get({}) : [],
+        remoteCookies: await Promise.all(
+          remoteContents.map(async (item) =>
+            item.isDestroyed() ? [] : item.session.cookies.get({}),
+          ),
+        ),
+        separateSession: active ? contents.session !== ownerSession : true,
+        title: ownerWindow.getTitle(),
         preferences: preferences && {
           nodeIntegration: preferences.nodeIntegration,
           contextIsolation: preferences.contextIsolation,
           sandbox: preferences.sandbox,
           webSecurity: preferences.webSecurity,
-          preload: preferences.preload || "",
         },
         ownerClipboard: await clipboardPermissions(ownerWindow.webContents),
-        remoteClipboard: active
-          ? await clipboardPermissions(window.webContents)
-          : null,
+        remoteClipboard: active ? await clipboardPermissions(contents) : null,
         document: active
-          ? await window.webContents.executeJavaScript(
-              "({heading:document.querySelector('h1')?.textContent,require:typeof require,process:typeof process})",
+          ? await contents.executeJavaScript(
+              "({heading:document.querySelector('h1')?.textContent,require:typeof require,process:typeof process,bridge:Object.keys(window.mcPanelConnections),frameBridge:typeof document.querySelector('iframe')?.contentWindow.mcPanelConnections})",
             )
           : null,
       };
     },
-    closeRemote() {
-      const window = remoteWindows.at(-1);
-      return new Promise((resolve) => {
-        window.once("closed", resolve);
-        window.close();
-      });
-    },
     async stop() {
-      controller.close();
+      removeIpc();
+      await controller.close();
       await runtime.close();
-      secureServer.closeAllConnections();
-      await new Promise((resolve) => secureServer.close(resolve));
+      for (const secureServer of secureServers) {
+        secureServer.closeAllConnections();
+        await new Promise((resolve) => secureServer.close(resolve));
+      }
       ownerWindow.destroy();
     },
   };
@@ -258,7 +286,8 @@ async function smoke() {
       globalThis.__remotePanelSmoke.inspect(),
     );
     assert.deepEqual(state.prompts, [0]);
-    assert.deepEqual(state.windows, [{ destroyed: true }]);
+    assert.deepEqual(state.views, [{ destroyed: true }]);
+    assert.equal(state.nativeWindows, 1);
     assert.equal(
       state.requests.length,
       0,
@@ -278,13 +307,14 @@ async function smoke() {
       heading: "Remote fixture panel",
       require: "undefined",
       process: "undefined",
+      bridge: ["list", "open", "activate", "disconnect"],
+      frameBridge: "undefined",
     });
     assert.deepEqual(state.preferences, {
       nodeIntegration: false,
       contextIsolation: true,
       sandbox: true,
       webSecurity: true,
-      preload: "",
     });
     assert.equal(state.ownerCookie, true);
     assert.equal(state.separateSession, true);
@@ -303,16 +333,83 @@ async function smoke() {
     assert.ok(
       state.requests.every((item) => !item.cookie.includes("mc-panel-desktop")),
     );
-    assert.match(state.title, /^127\.0\.0\.1:\d+ · MC Panel remote$/);
+    assert.match(state.title, /^127\.0\.0\.1:\d+ · MC Panel$/);
+    const firstId = state.context.activeId;
+    const firstCookie = state.cookies.find(
+      (item) => item.name === "remote-fixture",
+    ).value;
+    assert.equal(firstCookie, "fixture-session-0");
+    const second = await application.evaluate(() =>
+      globalThis.__remotePanelSmoke.invoke(
+        "open",
+        globalThis.__remotePanelSmoke.remoteUrls[1],
+        true,
+      ),
+    );
+    const secondId = second.activeId;
+    assert.notEqual(firstId, secondId);
+    state = await application.evaluate(() =>
+      globalThis.__remotePanelSmoke.inspect(),
+    );
+    assert.equal(
+      state.nativeWindows,
+      1,
+      "remote connections must stay in the original native window",
+    );
+    assert.equal(state.context.panels.length, 3);
+    assert.equal(
+      state.remoteCookies[1].find((item) => item.name === "remote-fixture")
+        .value,
+      firstCookie,
+    );
+    assert.equal(
+      state.remoteCookies[2].find((item) => item.name === "remote-fixture")
+        .value,
+      "fixture-session-1",
+    );
     await application.evaluate(() =>
-      globalThis.__remotePanelSmoke.closeRemote(),
+      globalThis.__remotePanelSmoke.invoke("activate", "local", true),
+    );
+    const resumed = await application.evaluate(() =>
+      globalThis.__remotePanelSmoke.invoke(
+        "open",
+        globalThis.__remotePanelSmoke.remoteUrl,
+      ),
+    );
+    assert.equal(resumed.activeId, firstId);
+    state = await application.evaluate(() =>
+      globalThis.__remotePanelSmoke.inspect(),
+    );
+    assert.equal(
+      state.views.length,
+      3,
+      "switching and reopening an origin reuse its view",
+    );
+    assert.equal(
+      state.remoteCookies[1].find((item) => item.name === "remote-fixture")
+        .value,
+      firstCookie,
+    );
+    assert.deepEqual(
+      state.prompts,
+      [0, 1, 1],
+      "switching must preserve the certificate decision",
+    );
+    await application.evaluate(
+      (_electron, id) => globalThis.__remotePanelSmoke.invoke("disconnect", id),
+      firstId,
+    );
+    await application.evaluate(
+      (_electron, id) => globalThis.__remotePanelSmoke.invoke("disconnect", id),
+      secondId,
     );
     state = await application.evaluate(() =>
       globalThis.__remotePanelSmoke.inspect(),
     );
     assert.equal(state.ownerOpen, true);
     assert.equal(state.localStatus, 200);
-    assert.ok(state.windows.every((item) => item.destroyed));
+    assert.ok(state.views.every((item) => item.destroyed));
+    assert.equal(state.context.activeId, "local");
     const reopened = await application.evaluate(() =>
       globalThis.__remotePanelSmoke.open(),
     );
@@ -322,17 +419,19 @@ async function smoke() {
     );
     assert.deepEqual(
       state.prompts,
-      [0, 1, 1],
-      "Each new window must require its own certificate decision.",
+      [0, 1, 1, 1],
+      "Reconnecting after disconnect must require its own certificate decision.",
     );
-    const documents = state.requests.filter((item) => item.path === "/");
+    const documents = state.requests.filter(
+      (item) => item.path === "/" && item.server === 0,
+    );
     assert.equal(documents.length, 2);
     assert.ok(
       documents.every((item) => item.cookie === ""),
-      "A new window must not inherit the previous remote session.",
+      "A reconnected view must not inherit the disconnected session.",
     );
     console.log(
-      "Passed real Electron remote smoke: certificate cancel/accept, HTTPS rendering, sandbox/no Node bridge, isolated cookies, new-window trust, clipboard writes granted only to main documents with reads denied (OS clipboard untouched), and local runtime survives remote close.",
+      "Passed real Electron remote smoke: one native window, two isolated remote views, scoped four-method preload, live switching with cookies/trust preserved, disconnect/reconnect cleanup, local runtime survival, certificate validation, and clipboard permission checks (OS clipboard untouched).",
     );
   } catch (cause) {
     if (stderr) console.error(stderr);

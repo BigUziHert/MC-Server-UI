@@ -575,7 +575,25 @@ function InvitationDialog({
   );
 }
 
-export default function Subusers({ notify }: PageProps) {
+export default function Subusers({
+  notify,
+  permissions,
+}: PageProps & { permissions?: string[] }) {
+  const remote = permissions !== undefined;
+  const can = (permission: string) =>
+    permissions === undefined || permissions.includes(permission);
+  const canRead = can("user.read");
+  const canCreate = can("user.create");
+  const canUpdate = can("user.update");
+  const canDelete = can("user.delete");
+  const manageable = (user: Subuser) => permissionsFor(user).every(can);
+  const grantablePermissions = permissionIds.filter(can);
+  const groups = catalog.groups
+    .map((group) => ({
+      ...group,
+      permissions: group.permissions.filter((permission) => can(permission.id)),
+    }))
+    .filter((group) => group.permissions.length);
   const { api, post } = useServerApi();
   const [users, setUsers] = useState<Subuser[]>([]);
   const [loading, setLoading] = useState(true);
@@ -606,9 +624,21 @@ export default function Subusers({ notify }: PageProps) {
   const request = useRef<AbortController | null>(null);
   const errorMessage = useRef<HTMLParagraphElement>(null);
   const editing = editor && editor !== "create" ? editor : null;
+  const invitationReady = canCreate && (remote || accessReady(accessSettings));
+  const canSubmitRecord = resetting
+    ? canCreate && manageable(resetting)
+    : deleting
+      ? canDelete && manageable(deleting)
+      : editing
+        ? canUpdate && manageable(editing)
+        : canCreate;
 
   const refresh = useCallback(async () => {
     request.current?.abort();
+    if (!canRead) {
+      setLoading(false);
+      return false;
+    }
     const controller = new AbortController();
     request.current = controller;
     if (!loaded.current) setLoading(true);
@@ -630,7 +660,7 @@ export default function Subusers({ notify }: PageProps) {
     } finally {
       if (!controller.signal.aborted) setLoading(false);
     }
-  }, [api]);
+  }, [api, canRead]);
   useEffect(() => {
     loaded.current = false;
     setUsers([]);
@@ -665,13 +695,15 @@ export default function Subusers({ notify }: PageProps) {
     setFormError("");
   }
   function openEditor(user?: Subuser) {
+    if (user ? !canUpdate || !manageable(user) : !canCreate) return;
     setEmail(user?.email ?? "");
     setSelected(user ? permissionsFor(user) : []);
     setFormError("");
-    setInviteOnCreate(accessReady(accessSettings));
+    setInviteOnCreate(invitationReady);
     setEditor(user ?? "create");
   }
   async function createInvitation(user: Subuser) {
+    if (!canCreate || !manageable(user)) return;
     setInviting(user.id);
     setInvitationError("");
     try {
@@ -699,6 +731,7 @@ export default function Subusers({ notify }: PageProps) {
     }
   }
   function togglePermissions(ids: string[]) {
+    ids = ids.filter(can);
     setSelected((previous) => {
       const next = new Set(previous);
       const allSelected = ids.every((id) => next.has(id));
@@ -706,12 +739,12 @@ export default function Subusers({ notify }: PageProps) {
         if (allSelected) next.delete(id);
         else next.add(id);
       }
-      return permissionIds.filter((id) => next.has(id));
+      return grantablePermissions.filter((id) => next.has(id));
     });
   }
   async function submit(event: FormEvent) {
     event.preventDefault();
-    if (busy) return;
+    if (busy || !canSubmitRecord || !selected.every(can)) return;
     setBusy(true);
     setFormError("");
     try {
@@ -771,6 +804,14 @@ export default function Subusers({ notify }: PageProps) {
     (currentPage - 1) * pageSize,
     currentPage * pageSize,
   );
+  if (!canRead)
+    return (
+      <StatePanel
+        variant="empty"
+        title="Subusers unavailable"
+        message="You do not have permission to view subusers."
+      />
+    );
   return (
     <div className="subusers-page">
       <header className="page-heading">
@@ -782,14 +823,16 @@ export default function Subusers({ notify }: PageProps) {
         </div>
         <button
           className="btn primary"
-          disabled={busy || !!inviting}
+          disabled={!canCreate || busy || !!inviting}
           onClick={() => openEditor()}
         >
           <Plus size={16} />
           New user
         </button>
       </header>
-      <RemoteAccessSetup onSettings={setAccessSettings} notify={notify} />
+      {!remote && (
+        <RemoteAccessSetup onSettings={setAccessSettings} notify={notify} />
+      )}
       {invitationError && (
         <p className="subusers-form-error" role="alert">
           <AlertCircle size={16} />
@@ -904,12 +947,16 @@ export default function Subusers({ notify }: PageProps) {
                           className="btn subuser-invite"
                           aria-label={`${user.inviteStatus === "accepted" ? "Reset access for" : "Create invite link for"} ${user.email}`}
                           title={
-                            accessReady(accessSettings)
+                            invitationReady
                               ? "Create a one-time link. Any previous unused link will stop working."
                               : "Complete remote access setup to create invitation links"
                           }
                           disabled={
-                            busy || !!inviting || !accessReady(accessSettings)
+                            !canCreate ||
+                            !manageable(user) ||
+                            busy ||
+                            !!inviting ||
+                            !invitationReady
                           }
                           onClick={() =>
                             user.inviteStatus === "accepted"
@@ -928,7 +975,12 @@ export default function Subusers({ notify }: PageProps) {
                           className="btn icon"
                           aria-label={`Edit permissions for ${user.email}`}
                           title="Edit permissions"
-                          disabled={busy || !!inviting}
+                          disabled={
+                            !canUpdate ||
+                            !manageable(user) ||
+                            busy ||
+                            !!inviting
+                          }
                           onClick={() => openEditor(user)}
                         >
                           <Pencil size={15} />
@@ -937,7 +989,12 @@ export default function Subusers({ notify }: PageProps) {
                           className="btn icon subuser-delete"
                           aria-label={`Remove access record for ${user.email}`}
                           title="Revoke access"
-                          disabled={busy || !!inviting}
+                          disabled={
+                            !canDelete ||
+                            !manageable(user) ||
+                            busy ||
+                            !!inviting
+                          }
                           onClick={() => {
                             setFormError("");
                             setDeleting(user);
@@ -1041,16 +1098,16 @@ export default function Subusers({ notify }: PageProps) {
                   <div className="subusers-invitation-choice">
                     <PermissionCheckbox
                       label="Create invitation link"
-                      disabled={busy || !accessReady(accessSettings)}
+                      disabled={busy || !invitationReady}
                       description={
-                        accessReady(accessSettings)
+                        invitationReady
                           ? "Show a one-time link to copy after this subuser is created."
                           : "Complete remote access setup before creating links. You can save the subuser now and invite them later."
                       }
                       checked={inviteOnCreate}
                       onChange={() => setInviteOnCreate(!inviteOnCreate)}
                     />
-                    {!accessReady(accessSettings) && (
+                    {!invitationReady && (
                       <small>
                         No invitation link can be created until remote access is
                         configured.
@@ -1058,7 +1115,10 @@ export default function Subusers({ notify }: PageProps) {
                     )}
                   </div>
                 )}
-                <fieldset className="subusers-permissions" disabled={busy}>
+                <fieldset
+                  className="subusers-permissions"
+                  disabled={busy || !canSubmitRecord}
+                >
                   <legend className="subusers-sr-only">
                     Server permissions
                   </legend>
@@ -1070,9 +1130,14 @@ export default function Subusers({ notify }: PageProps) {
                     <button
                       type="button"
                       className="btn"
+                      disabled={
+                        !grantablePermissions.some((id) =>
+                          id.startsWith("control."),
+                        )
+                      }
                       onClick={() =>
                         setSelected(
-                          permissionIds.filter((id) =>
+                          grantablePermissions.filter((id) =>
                             id.startsWith("control."),
                           ),
                         )
@@ -1085,18 +1150,22 @@ export default function Subusers({ notify }: PageProps) {
                     <PermissionCheckbox
                       label="All permissions"
                       description="Grant every listed permission for this server."
-                      checked={selected.length === permissionIds.length}
+                      checked={
+                        grantablePermissions.length > 0 &&
+                        selected.length === grantablePermissions.length
+                      }
+                      disabled={!grantablePermissions.length}
                       mixed={
                         selected.length > 0 &&
-                        selected.length < permissionIds.length
+                        selected.length < grantablePermissions.length
                       }
-                      onChange={() => togglePermissions(permissionIds)}
+                      onChange={() => togglePermissions(grantablePermissions)}
                     />
                     <span>
-                      {selected.length} / {permissionIds.length}
+                      {selected.length} / {grantablePermissions.length}
                     </span>
                   </div>
-                  {catalog.groups.map((group) => {
+                  {groups.map((group) => {
                     const ids = group.permissions.map(
                       (permission) => permission.id,
                     );
@@ -1174,7 +1243,7 @@ export default function Subusers({ notify }: PageProps) {
               <button
                 type="submit"
                 className={`btn ${deleting || resetting ? "danger" : "primary"}`}
-                disabled={busy}
+                disabled={busy || !canSubmitRecord}
               >
                 {busy
                   ? "Saving…"

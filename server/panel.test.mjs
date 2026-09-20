@@ -7,7 +7,6 @@ import http from "node:http";
 import { EventEmitter } from "node:events";
 import { PassThrough, Writable } from "node:stream";
 import * as tar from "tar";
-import { DatabaseSync } from "node:sqlite";
 import {
   createPanel,
   nextRunFor,
@@ -121,11 +120,13 @@ test("file operations upload and download original bytes, edit text, and reject 
   );
 });
 
-test("audit describes added and deleted mods and hides legacy database records without erasing history", async (t) => {
-  const { request, base, serverDir, dataDir, audit, assertRemovable } =
-    await fixture(t, {
+test("audit describes added and deleted mods and normalizes legacy content activity", async (t) => {
+  const { request, base, serverDir, audit, assertRemovable } = await fixture(
+    t,
+    {
       mode: "live",
-    });
+    },
+  );
   await fs.mkdir(path.join(serverDir, "mods"));
   const form = new FormData();
   form.append("files", new Blob(["mod bytes"]), "new-mod.jar");
@@ -154,13 +155,14 @@ test("audit describes added and deleted mods and hides legacy database records w
     method: "DELETE",
   });
   assert.equal(removed.status, 200, JSON.stringify(removed.body));
-  await audit("database", "SQLite database created", "legacy database");
   await audit(
     "server",
     "Launchpad installation completed",
     "old mod installation",
   );
+  await audit("retired-feature", "Historical event", "Unsupported activity");
   const entries = (await request("/api/audit")).body.entries;
+  assert.ok(entries.every((entry) => entry.category !== "retired-feature"));
   assert.ok(
     entries.some(
       (entry) =>
@@ -193,11 +195,6 @@ test("audit describes added and deleted mods and hides legacy database records w
         entry.detail === "old mod installation",
     ),
   );
-  assert.ok(entries.every((entry) => entry.category !== "database"));
-  const saved = JSON.parse(
-    await fs.readFile(path.join(dataDir, "panel.json"), "utf8"),
-  );
-  assert.ok(saved.audit.some((entry) => entry.category === "database"));
 });
 
 test("live lifecycle audits confirmed starts, restarts and exits, never chat or failed startup as success", async (t) => {
@@ -511,37 +508,8 @@ test("schedules validate values and compute interval, daily, and weekly future r
     assert.throws(() => validateSchedule({ ...interval, ...change }));
 });
 
-test("databases are actual SQLite files and access records do not imply authentication", async (t) => {
-  const { request, base, dataDir } = await fixture(t);
-  const created = await request(
-    "/api/databases",
-    json("POST", { name: "survival" }),
-  );
-  assert.equal(created.status, 201);
-  const db = new DatabaseSync(
-    path.join(dataDir, "databases", `${created.body.id}.sqlite`),
-    { readOnly: true },
-  );
-  try {
-    assert.ok(
-      db
-        .prepare("SELECT value FROM panel_metadata WHERE key = ?")
-        .get("createdAt").value,
-    );
-  } finally {
-    db.close();
-  }
-  const downloaded = Buffer.from(
-    await (
-      await fetch(`${base}/api/databases/${created.body.id}/download`)
-    ).arrayBuffer(),
-  );
-  assert.equal(downloaded.subarray(0, 15).toString(), "SQLite format 3");
-  assert.equal(
-    (await request("/api/databases", json("POST", { name: "survival" })))
-      .status,
-    409,
-  );
+test("access records do not imply authentication", async (t) => {
+  const { request } = await fixture(t);
   const user = await request(
     "/api/subusers",
     json("POST", { email: "builder@example.com", role: "operator" }),
@@ -555,11 +523,6 @@ test("databases are actual SQLite files and access records do not imply authenti
   );
   assert.equal(
     (await request(`/api/subusers/${user.body.id}`, { method: "DELETE" }))
-      .status,
-    200,
-  );
-  assert.equal(
-    (await request(`/api/databases/${created.body.id}`, { method: "DELETE" }))
       .status,
     200,
   );

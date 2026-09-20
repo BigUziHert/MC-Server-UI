@@ -74,7 +74,20 @@ const fullDate = (date: string) =>
     minute: "2-digit",
   });
 
-export default function Backups({ notify }: PageProps) {
+export default function Backups({
+  notify,
+  permissions,
+}: PageProps & { permissions?: string[] }) {
+  const canRead =
+    permissions === undefined || permissions.includes("backup.read");
+  const canCreate =
+    permissions === undefined || permissions.includes("backup.create");
+  const canDelete =
+    permissions === undefined || permissions.includes("backup.delete");
+  const canSchedule =
+    permissions === undefined || permissions.includes("backup.update");
+  const canDownload =
+    permissions === undefined || permissions.includes("backup.download");
   const { api, post, downloadUrl } = useServerApi();
   const [backups, setBackups] = useState<Backup[]>([]);
   const [schedule, setSchedule] = useState<Schedule>(defaults);
@@ -97,6 +110,10 @@ export default function Backups({ notify }: PageProps) {
 
   const load = useCallback(
     async (initial = false) => {
+      if (!canRead) {
+        setLoading(false);
+        return false;
+      }
       const token = generation.current;
       if (initial) setLoading(true);
       setError("");
@@ -119,7 +136,7 @@ export default function Backups({ notify }: PageProps) {
         if (token === generation.current) setLoading(false);
       }
     },
-    [api],
+    [api, canRead],
   );
   useEffect(() => {
     generation.current++;
@@ -179,11 +196,13 @@ export default function Backups({ notify }: PageProps) {
   }, [dialog]);
 
   function updateSchedule(patch: Partial<Schedule>) {
+    if (!canSchedule) return;
     setSaved(false);
     setSchedule((current) => ({ ...current, ...patch }));
   }
   async function saveSchedule(event: FormEvent) {
     event.preventDefault();
+    if (!canSchedule) return;
     setSaving(true);
     setSaved(false);
     try {
@@ -204,7 +223,12 @@ export default function Backups({ notify }: PageProps) {
   }
   async function submitDialog(event: FormEvent) {
     event.preventDefault();
-    if (!dialog || busyRef.current) return;
+    if (
+      !dialog ||
+      busyRef.current ||
+      (dialog === "create" ? !canCreate : !canDelete)
+    )
+      return;
     const token = generation.current;
     busyRef.current = true;
     setBusy(true);
@@ -270,6 +294,7 @@ export default function Backups({ notify }: PageProps) {
   }
 
   function confirmDelete(targets: Backup[], bulk = false) {
+    if (!canDelete) return;
     setDialogError("");
     setDeleteErrors([]);
     setDialog({ backups: targets, bulk });
@@ -284,6 +309,14 @@ export default function Backups({ notify }: PageProps) {
   const latest = [...backups].sort(
     (a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime(),
   )[0];
+  if (!canRead)
+    return (
+      <StatePanel
+        variant="empty"
+        title="Backups unavailable"
+        message="You do not have permission to view backups."
+      />
+    );
   return (
     <div className="storage-page">
       <div className="page-heading">
@@ -292,7 +325,7 @@ export default function Backups({ notify }: PageProps) {
         </div>
         <button
           className="btn primary"
-          disabled={loading || !!error || busy}
+          disabled={!canCreate || loading || !!error || busy}
           onClick={() => {
             setName("");
             setDialogError("");
@@ -397,7 +430,7 @@ export default function Backups({ notify }: PageProps) {
                       ref={(element) => {
                         if (element) element.indeterminate = someSelected;
                       }}
-                      disabled={busy}
+                      disabled={!canDelete || busy}
                       onChange={(event) =>
                         setSelected(
                           event.target.checked
@@ -413,7 +446,9 @@ export default function Backups({ notify }: PageProps) {
                   </span>
                   <button
                     className="btn small danger"
-                    disabled={busy || selectedBackups.length === 0}
+                    disabled={
+                      !canDelete || busy || selectedBackups.length === 0
+                    }
                     onClick={() => confirmDelete(selectedBackups, true)}
                   >
                     <Trash2 size={14} />
@@ -430,6 +465,7 @@ export default function Backups({ notify }: PageProps) {
                   action={
                     <button
                       className="btn"
+                      disabled={!canCreate}
                       onClick={() => {
                         setName("");
                         setDialogError("");
@@ -459,7 +495,7 @@ export default function Backups({ notify }: PageProps) {
                           className="backup-checkbox"
                           aria-label={`Select backup ${backup.name}`}
                           checked={selected.has(backup.id)}
-                          disabled={busy}
+                          disabled={!canDelete || busy}
                           onChange={(event) => {
                             const checked = event.target.checked;
                             setSelected((current) => {
@@ -498,22 +534,24 @@ export default function Backups({ notify }: PageProps) {
                           </div>
                         </div>
                         <div className="backup-item-actions">
-                          <a
-                            className="btn icon"
-                            href={downloadUrl(
-                              `/backups/${encodeURIComponent(backup.id)}/download`,
-                            )}
-                            download
-                            aria-label={`Download backup ${backup.name}`}
-                            title="Download backup"
-                          >
-                            <Download size={16} />
-                          </a>
+                          {canDownload && (
+                            <a
+                              className="btn icon"
+                              href={downloadUrl(
+                                `/backups/${encodeURIComponent(backup.id)}/download`,
+                              )}
+                              download
+                              aria-label={`Download backup ${backup.name}`}
+                              title="Download backup"
+                            >
+                              <Download size={16} />
+                            </a>
+                          )}
                           <button
                             className="btn icon delete-action"
                             aria-label={`Delete backup ${backup.name}`}
                             title="Move backup to Recycle Bin"
-                            disabled={busy}
+                            disabled={!canDelete || busy}
                             onClick={() => confirmDelete([backup])}
                           >
                             <Trash2 size={15} />
@@ -553,7 +591,7 @@ export default function Backups({ notify }: PageProps) {
                       label=""
                       checked={schedule.enabled}
                       onCheckedChange={(enabled) => updateSchedule({ enabled })}
-                      disabled={saving}
+                      disabled={!canSchedule || saving}
                     />
                   </div>
                   <div className="schedule-fields">
@@ -566,7 +604,7 @@ export default function Backups({ notify }: PageProps) {
                             type: event.target.value as Schedule["type"],
                           })
                         }
-                        disabled={saving}
+                        disabled={!canSchedule || saving}
                       >
                         <option value="interval">At an interval</option>
                         <option value="daily">Every day</option>
@@ -588,7 +626,7 @@ export default function Backups({ notify }: PageProps) {
                                 intervalHours: Number(event.target.value),
                               })
                             }
-                            disabled={saving}
+                            disabled={!canSchedule || saving}
                           />
                           <span>hours</span>
                         </div>
@@ -608,7 +646,7 @@ export default function Backups({ notify }: PageProps) {
                                     dayOfWeek: Number(event.target.value),
                                   })
                                 }
-                                disabled={saving}
+                                disabled={!canSchedule || saving}
                               >
                                 {[
                                   "Sunday",
@@ -635,7 +673,7 @@ export default function Backups({ notify }: PageProps) {
                               onChange={(event) =>
                                 updateSchedule({ time: event.target.value })
                               }
-                              disabled={saving}
+                              disabled={!canSchedule || saving}
                             />
                           </label>
                         </div>
@@ -658,7 +696,7 @@ export default function Backups({ notify }: PageProps) {
                               retention: Number(event.target.value),
                             })
                           }
-                          disabled={saving}
+                          disabled={!canSchedule || saving}
                         />
                         <span>backups</span>
                       </div>
@@ -671,7 +709,7 @@ export default function Backups({ notify }: PageProps) {
                     <button
                       className="btn primary schedule-save"
                       type="submit"
-                      disabled={saving}
+                      disabled={!canSchedule || saving}
                     >
                       {saving ? (
                         <LoaderCircle size={15} className="spin" />
@@ -851,7 +889,9 @@ export default function Backups({ notify }: PageProps) {
                 </button>
                 <button
                   className={`btn ${dialog === "create" ? "primary" : "danger"}`}
-                  disabled={busy}
+                  disabled={
+                    busy || (dialog === "create" ? !canCreate : !canDelete)
+                  }
                 >
                   {busy && <LoaderCircle size={15} className="spin" />}
                   {dialog === "create"

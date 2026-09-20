@@ -1250,29 +1250,6 @@ ${processFixture}`,
   await capturePackaged("packaged-file-manager.png");
   const backup = await assertSmokeBackup(page, serverId);
 
-  step(
-    "Checking the removed Databases route and preserving legacy SQLite storage.",
-  );
-  const legacyDatabase = await browserApi(page, "/databases", {
-    method: "POST",
-    body: { name: "desktop_smoke" },
-    serverId,
-  });
-  assert.equal(legacyDatabase.status, 201);
-  await page.goto(`${currentOrigin}/#databases`);
-  await ui(
-    page.getByRole("heading", { name: "Console", exact: true }),
-  ).toBeVisible();
-  await ui(
-    page.getByRole("link", { name: "Databases", exact: true }),
-  ).toHaveCount(0);
-  const databases = await browserApi(page, "/databases", { serverId });
-  assert.equal(databases.status, 200);
-  assert.ok(
-    databases.data.databases.some(
-      (item) => item.name === "desktop_smoke" && item.size > 1024,
-    ),
-  );
   assert.ok(
     (
       await fs.stat(path.join(profileDirectory, "data", "servers.json"))
@@ -1332,7 +1309,7 @@ ${processFixture}`,
   step("Quitting the app and confirming that its private API shuts down.");
   await quitPackaged("quit", ["Desktop smoke world"]);
   step(
-    "Relaunching the same profile to verify saved worlds, files, and databases.",
+    "Relaunching the same profile to verify saved worlds and files.",
   );
   ({ page } = await launchPackaged());
   await ui(serverButton(page, neoForge.id)).toHaveAttribute(
@@ -1369,13 +1346,6 @@ ${processFixture}`,
   }, serverId);
   assert.equal(retainedBytes.status, 200);
   assert.deepEqual(Buffer.from(retainedBytes.bytes), uploadBytes);
-  const retainedDatabases = await browserApi(page, "/databases", { serverId });
-  assert.equal(retainedDatabases.status, 200);
-  assert.ok(
-    retainedDatabases.data.databases.some(
-      (item) => item.name === "desktop_smoke",
-    ),
-  );
   await capturePackaged("packaged-relaunch.png");
   const retainedFleet = await browserApi(page, "/servers");
   const retainedImport = retainedFleet.data.servers.find(
@@ -1429,7 +1399,7 @@ ${processFixture}`,
   );
   await quitPackaged("query-session-end");
   step(
-    `Passed: clean startup, real process start/restart/commands, read-only update status, catalog browser links and blocked external navigation, explicit creation, native folder picker cancellation/import, JAR and NeoForge imports, source/JVM/EULA preservation, isolation, authenticated API, sandboxing, uploads/downloads, backup recovery, SQLite, persistence, tray close, normal quit, and Windows-session shutdown with owned-process exit. Artifacts: ${outputDirectory}`,
+    `Passed: clean startup, real process start/restart/commands, read-only update status, catalog browser links and blocked external navigation, explicit creation, native folder picker cancellation/import, JAR and NeoForge imports, source/JVM/EULA preservation, isolation, authenticated API, sandboxing, uploads/downloads, backup recovery, persistence, tray close, normal quit, and Windows-session shutdown with owned-process exit. Artifacts: ${outputDirectory}`,
   );
 } catch (error) {
   failed = true;

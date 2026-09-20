@@ -3,6 +3,10 @@ import { isIP } from "node:net";
 import path from "node:path";
 import { normalizePanelConnectionUrl } from "../shared/panel-connection.mjs";
 import { installPanelPermissionHandlers } from "./permissions.mjs";
+import {
+  externalWebsite,
+  installExternalLinkHandlers,
+} from "./external-links.mjs";
 
 const failure = (status, message) =>
   Object.assign(new Error(message), { status });
@@ -30,7 +34,7 @@ function sameOrigin(value, origin) {
   try {
     const url = new URL(value);
     return (
-      url.protocol === "https:" &&
+      ["http:", "https:"].includes(url.protocol) &&
       url.origin === origin &&
       !url.username &&
       !url.password
@@ -61,32 +65,135 @@ function selfSignedFingerprint(certificate, hostname) {
 }
 
 export function createRemotePanelController({
-  BrowserWindow,
+  window,
+  localOrigin,
+  WebContentsView,
   session,
   dialog,
   downloadsDirectory,
-  icon,
+  preload,
+  openWebsite = () => {},
+  onChange = () => {},
 }) {
-  const windows = new Set();
+  const panels = new Map();
+  const local = {
+    id: "local",
+    label: "This computer",
+    origin: localOrigin,
+    local: true,
+    contents: window.webContents,
+  };
+  panels.set(local.id, local);
+  let activeId = local.id;
+  let attached;
   let closed = false;
-  return {
+  const cleanups = new Set();
+  const list = () => ({
+    activeId,
+    panels: [...panels.values()].map(({ id, label, origin, local }) => ({
+      id,
+      label,
+      origin,
+      local,
+    })),
+  });
+  const changed = () => {
+    const context = list();
+    for (const panel of panels.values()) {
+      if (!panel.contents.isDestroyed())
+        panel.contents.send("mc-panel-connections:changed");
+    }
+    onChange(context);
+    return context;
+  };
+  const resize = () => {
+    if (!attached || window.isDestroyed()) return;
+    const [width, height] = window.getContentSize();
+    attached.setBounds({ x: 0, y: 0, width, height });
+  };
+  window.on("resize", resize);
+  const ensureOpen = () => {
+    if (closed || window.isDestroyed())
+      throw failure(503, "MC Panel is shutting down.");
+  };
+  const activate = (id) => {
+    ensureOpen();
+    const panel = panels.get(id);
+    if (!panel || panel.contents.isDestroyed())
+      throw failure(404, "This panel connection is no longer available.");
+    if (attached) window.contentView.removeChildView(attached);
+    attached = panel.view;
+    if (attached) {
+      window.contentView.addChildView(attached);
+      resize();
+    }
+    activeId = id;
+    window.setTitle(panel.local ? "MC Panel" : `${panel.label} · MC Panel`);
+    panel.contents.focus();
+    return changed();
+  };
+  const dispose = (panel) => {
+    if (panel.disposing) return panel.disposing;
+    if (activeId === panel.id) {
+      if (!closed && !window.isDestroyed()) activate(local.id);
+      else activeId = local.id;
+    }
+    panels.delete(panel.id);
+    panel.trustedFingerprint = undefined;
+    if (attached === panel.view) {
+      if (!window.isDestroyed()) window.contentView.removeChildView(attached);
+      attached = undefined;
+    }
+    // Destroy the renderer before clearing storage so it cannot recreate a
+    // session cookie while the connection is being removed.
+    if (!panel.contents.isDestroyed()) panel.contents.close();
+    const cleanup = Promise.all([
+      panel.session.clearStorageData(),
+      panel.session.clearCache(),
+      panel.session.closeAllConnections(),
+    ]).then(() => undefined);
+    panel.disposing = cleanup;
+    cleanups.add(cleanup);
+    void cleanup.finally(() => cleanups.delete(cleanup)).catch(() => {});
+    return cleanup;
+  };
+  const controller = {
+    list,
+    activate,
+    isManagedSender(event) {
+      if (closed || !event?.sender || event.sender.isDestroyed()) return false;
+      const panel = [...panels.values()].find(
+        (item) => item.contents === event.sender,
+      );
+      const frame = event.senderFrame;
+      return Boolean(
+        panel &&
+        frame &&
+        frame === event.sender.mainFrame &&
+        frame.origin === panel.origin &&
+        sameOrigin(frame.url, panel.origin) &&
+        sameOrigin(event.sender.getURL(), panel.origin),
+      );
+    },
     async open(input) {
-      if (closed) throw failure(503, "MC Panel is shutting down.");
+      ensureOpen();
       const url = normalizePanelConnectionUrl(input);
-      const { origin, host, hostname } = new URL(url);
+      const { origin, host, hostname, hash } = new URL(url);
+      let existing = [...panels.values()].find(
+        (panel) => !panel.local && panel.origin === origin,
+      );
+      if (existing) {
+        if (existing.loading) await existing.loading;
+        ensureOpen();
+        if (hash && existing.contents.getURL() !== url)
+          await existing.contents.loadURL(url);
+        return activate(existing.id);
+      }
       const remoteSession = session.fromPartition(`mc-remote-${randomUUID()}`);
-      const remoteWindow = new BrowserWindow({
-        title: `${host} · MC Panel remote`,
-        width: 1200,
-        height: 900,
-        minWidth: 760,
-        minHeight: 600,
-        backgroundColor: "#101211",
-        icon,
-        show: true,
-        autoHideMenuBar: true,
+      const view = new WebContentsView({
         webPreferences: {
           session: remoteSession,
+          preload,
           nodeIntegration: false,
           contextIsolation: true,
           sandbox: true,
@@ -95,24 +202,34 @@ export function createRemotePanelController({
           spellcheck: false,
         },
       });
-      // Remote content has no native menus or bridge to the local owner window.
-      remoteWindow.setMenu(null);
-      windows.add(remoteWindow);
-      const contents = remoteWindow.webContents;
+      view.setBackgroundColor("#101211");
+      const contents = view.webContents;
+      const panel = {
+        id: randomUUID(),
+        label: host,
+        origin,
+        local: false,
+        view,
+        contents,
+        session: remoteSession,
+      };
+      panels.set(panel.id, panel);
       installPanelPermissionHandlers(remoteSession, origin, () => contents);
-      let trustedFingerprint;
       let pendingTrust;
       let canceled = false;
       const navigation = (event, destination) => {
         if (!sameOrigin(event.url ?? destination, origin))
           event.preventDefault();
       };
-      contents.setWindowOpenHandler(() => ({ action: "deny" }));
+      installExternalLinkHandlers(contents, origin, (target) => {
+        const approved = externalWebsite(target);
+        if (approved) return openWebsite(approved);
+      });
       contents.on("will-navigate", navigation);
       contents.on("will-frame-navigate", navigation);
       contents.on("will-redirect", navigation);
       contents.on("will-attach-webview", (event) => event.preventDefault());
-      remoteWindow.on("page-title-updated", (event) => event.preventDefault());
+      contents.on("page-title-updated", (event) => event.preventDefault());
       // A response redirect cannot escape the selected host, including requests
       // started from the main process (which skip will-navigate).
       remoteSession.webRequest.onBeforeRequest((details, done) => {
@@ -146,25 +263,29 @@ export function createRemotePanelController({
             error === "net::ERR_CERT_AUTHORITY_INVALID"
               ? selfSignedFingerprint(cert, hostname)
               : null;
-          if (!fingerprint || remoteWindow.isDestroyed()) return done(false);
-          if (fingerprint === trustedFingerprint) return done(true);
+          if (!fingerprint || contents.isDestroyed() || !panels.has(panel.id))
+            return done(false);
+          if (fingerprint === panel.trustedFingerprint) return done(true);
           if (pendingTrust && pendingTrust.fingerprint !== fingerprint)
             return done(false);
           if (!pendingTrust) {
             const verification = dialog
-              .showMessageBox(remoteWindow, {
+              .showMessageBox(window, {
                 type: "warning",
                 title: "Verify remote panel certificate",
                 message: `Verify the certificate for ${host}`,
-                detail: `${trustedFingerprint ? "This panel's certificate has changed.\n\n" : ""}Compare this SHA-256 fingerprint with the fingerprint the server owner shares through a trusted channel:\n\n${fingerprint}\n\nContinue only if every character matches. Trust applies only to this panel window and this exact certificate.`,
+                detail: `${panel.trustedFingerprint ? "This panel's certificate has changed.\n\n" : ""}Compare this SHA-256 fingerprint with the fingerprint the server owner shares through a trusted channel:\n\n${fingerprint}\n\nContinue only if every character matches. Trust applies only to this connection and this exact certificate.`,
                 buttons: ["Cancel connection", "Fingerprint matches — connect"],
                 defaultId: 0,
                 cancelId: 0,
                 noLink: true,
               })
               .then(({ response }) => {
-                const accepted = response === 1 && !remoteWindow.isDestroyed();
-                if (accepted) trustedFingerprint = fingerprint;
+                const accepted =
+                  response === 1 &&
+                  !contents.isDestroyed() &&
+                  panels.has(panel.id);
+                if (accepted) panel.trustedFingerprint = fingerprint;
                 else canceled = true;
                 return accepted;
               })
@@ -180,19 +301,15 @@ export function createRemotePanelController({
           void pendingTrust.verification.then((accepted) => done(accepted));
         },
       );
-      remoteWindow.once("closed", () => {
-        windows.delete(remoteWindow);
-        trustedFingerprint = undefined;
-        // The partition is memory-only; also discard cookies/storage promptly.
-        void remoteSession.clearStorageData().catch(() => {});
-        void remoteSession.closeAllConnections().catch(() => {});
-      });
       try {
-        await remoteWindow.loadURL(url);
-        if (remoteWindow.isDestroyed())
-          throw failure(409, "The remote panel window was closed.");
+        panel.loading = contents.loadURL(url);
+        await panel.loading;
+        panel.loading = undefined;
+        ensureOpen();
+        return activate(panel.id);
       } catch {
-        if (!remoteWindow.isDestroyed()) remoteWindow.destroy();
+        await dispose(panel);
+        changed();
         throw failure(
           canceled ? 409 : 502,
           canceled
@@ -200,11 +317,26 @@ export function createRemotePanelController({
             : "Could not open the remote panel. Check its HTTPS address, certificate, and whether the host is online.",
         );
       }
-      return { opened: true, url };
     },
-    close() {
+    async disconnect(id) {
+      ensureOpen();
+      const panel = panels.get(id);
+      if (!panel)
+        throw failure(404, "This panel connection is no longer available.");
+      if (panel.local)
+        throw failure(400, "The local panel cannot be disconnected.");
+      if (activeId === id) activate(local.id);
+      await dispose(panel);
+      return changed();
+    },
+    async close() {
       closed = true;
-      for (const remoteWindow of windows) remoteWindow.destroy();
+      window.off("resize", resize);
+      await Promise.all(
+        [...panels.values()].filter((panel) => !panel.local).map(dispose),
+      );
+      await Promise.all([...cleanups]);
     },
   };
+  return controller;
 }
