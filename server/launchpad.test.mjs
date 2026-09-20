@@ -332,12 +332,18 @@ async function finish(service, input) {
   return waitForJob(service, result.job.id);
 }
 async function waitForJob(service, id) {
-  for (let at = 0; at < 200; at++) {
-    const job = service.job(id).job;
+  // Real filesystem promotion can take longer on a busy Windows CI runner.
+  // Keep a wall-clock bound below the test deadline instead of counting polls.
+  const deadline = performance.now() + 15_000;
+  let job;
+  do {
+    job = service.job(id).job;
     if (["completed", "failed"].includes(job.status)) return job;
-    await new Promise((resolve) => setTimeout(resolve, 5));
-  }
-  assert.fail("Fixture install did not complete");
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  } while (performance.now() < deadline);
+  assert.fail(
+    `Fixture install did not complete: ${JSON.stringify({ status: job.status, phase: job.phase, message: job.message, error: job.error })}`,
+  );
 }
 
 for (const tamper of [false, true])
