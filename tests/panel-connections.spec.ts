@@ -7,7 +7,7 @@ const localServer = {
   id: "local-connection-fixture",
   name: "Local connection fixture",
   mode: "live",
-  status: "offline",
+  status: "offline" as const,
   software: "Paper",
   version: "1.21.1",
   minecraftVersion: "1.21.1",
@@ -23,51 +23,75 @@ const localServer = {
   diskLimit: 1024,
 };
 
-async function desktopBridge(page: Page) {
-  await page.addInitScript(() => {
-    const state = {
-      activeId: "local",
-      panels: [
-        {
-          id: "local",
-          label: "This computer",
-          origin: location.origin,
-          local: true,
+type LocalServerDescriptor = {
+  id: string;
+  name: string;
+  status: "running" | "offline" | "starting" | "stopping";
+  software?: string;
+  minecraftVersion?: string | null;
+};
+
+async function desktopBridge(
+  page: Page,
+  options: { activeId?: string; localServers?: LocalServerDescriptor[] } = {},
+) {
+  await page.addInitScript(
+    ({ activeId, localServers }) => {
+      const state = {
+        activeId,
+        localServers,
+        panels: [
+          {
+            id: "local",
+            label: "This computer",
+            origin: location.origin,
+            local: true,
+          },
+          {
+            id: "pc-one",
+            label: "pc-one.example:3002",
+            origin: "https://pc-one.example:3002",
+            local: false,
+          },
+          {
+            id: "pc-two",
+            label: "pc-two.example:3002",
+            origin: "https://pc-two.example:3002",
+            local: false,
+          },
+        ],
+      };
+      const calls: { action: string; value: string }[] = [];
+      Object.assign(window, { connectionCalls: calls });
+      window.mcPanelConnections = {
+        list: async () => state,
+        open: async (url) => {
+          calls.push({ action: "open", value: url });
+          return state;
         },
-        {
-          id: "pc-one",
-          label: "pc-one.example:3002",
-          origin: "https://pc-one.example:3002",
-          local: false,
+        activate: async (id) => {
+          calls.push({ action: "activate", value: id });
+          state.activeId = id;
+          window.dispatchEvent(new Event("mc-panel-connections-changed"));
+          return state;
         },
-        {
-          id: "pc-two",
-          label: "pc-two.example:3002",
-          origin: "https://pc-two.example:3002",
-          local: false,
+        disconnect: async (id) => {
+          calls.push({ action: "disconnect", value: id });
+          return state;
         },
-      ],
-    };
-    const calls: { action: string; value: string }[] = [];
-    Object.assign(window, { connectionCalls: calls });
-    window.mcPanelConnections = {
-      list: async () => state,
-      open: async (url) => {
-        calls.push({ action: "open", value: url });
-        return state;
-      },
-      activate: async (id) => {
-        calls.push({ action: "activate", value: id });
-        state.activeId = id;
-        window.dispatchEvent(new Event("mc-panel-connections-changed"));
-        return state;
-      },
-      disconnect: async (id) => {
-        calls.push({ action: "disconnect", value: id });
-        return state;
-      },
-    };
-  });
+        selectLocalServer: async (id) => {
+          calls.push({ action: "selectLocalServer", value: id });
+          state.activeId = "local";
+          window.dispatchEvent(new Event("mc-panel-connections-changed"));
+          return state;
+        },
+      };
+    },
+    {
+      activeId: options.activeId ?? "local",
+      localServers: options.localServers ?? [localServer],
+    },
+  );
 }
 
 async function localPanel(page: Page, desktop = false) {
@@ -352,6 +376,253 @@ test("desktop account switches between this computer and multiple connected pane
     { action: "activate", value: "local" },
   ]);
   expect(context.pages()).toHaveLength(1);
+});
+
+for (const { width, localId, label } of [
+  { width: 1434, localId: localServer.id, label: "matching server IDs" },
+  { width: 390, localId: "local-only-fixture", label: "mobile navigation" },
+]) {
+  test(`the remote desktop selector opens local servers through the bridge with ${label}`, async ({
+    page,
+    context,
+  }, testInfo) => {
+    const localServers = [
+      localServer,
+      {
+        ...localServer,
+        id: "local-only-fixture",
+        name: "Local survival world",
+      },
+    ];
+    const remoteServers = [
+      {
+        ...localServer,
+        name: "Shared family world",
+        iconVersion: "remote-family-icon",
+        accessPermissions: ["control.console"],
+      },
+      {
+        ...localServer,
+        id: "remote-second-fixture",
+        name: "Shared creative world",
+        iconVersion: "remote-creative-icon",
+        accessPermissions: ["control.console"],
+      },
+    ];
+    const requests: {
+      path: string;
+      method: string;
+      serverId: string | null;
+    }[] = [];
+    await desktopBridge(page, { activeId: "pc-one", localServers });
+    await page.route("**/api/**", (route) => {
+      const request = route.request();
+      const url = new URL(request.url());
+      const serverId =
+        request.headers()["x-server-id"] ?? url.searchParams.get("serverId");
+      requests.push({ path: url.pathname, method: request.method(), serverId });
+      if (url.pathname === "/api/access/session")
+        return route.fulfill({
+          json: {
+            role: "subuser",
+            email: "sister@example.test",
+            userId: "sister",
+            serverId: remoteServers[0].id,
+            permissions: ["control.console"],
+          },
+        });
+      if (url.pathname === "/api/servers")
+        return route.fulfill({
+          json: {
+            servers: remoteServers,
+            defaultServerId: remoteServers[0].id,
+          },
+        });
+      if (url.pathname === "/api/server") {
+        const server = remoteServers.find((item) => item.id === serverId);
+        if (server) return route.fulfill({ json: server });
+      }
+      if (url.pathname === "/api/console")
+        return route.fulfill({ json: { lines: [] } });
+      if (
+        url.pathname === "/api/server/icon" &&
+        remoteServers.some((item) => item.id === serverId)
+      )
+        return route.fulfill({
+          contentType: "image/svg+xml",
+          body: '<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64"><path fill="#82b362" d="M0 0h64v64H0z"/></svg>',
+        });
+      return route.fulfill({
+        status: 404,
+        json: { error: "Not available on this remote panel." },
+      });
+    });
+    await page.setViewportSize({ width, height: 900 });
+    await page.goto("/#console");
+    await expect(
+      page.getByRole("heading", { name: remoteServers[0].name, exact: true }),
+    ).toBeVisible();
+    if (width < 761) {
+      await page.screenshot({
+        path: testInfo.outputPath("mobile-local-remote-sidebar-closed.png"),
+        animations: "disabled",
+        fullPage: true,
+      });
+      await page
+        .getByRole("button", { name: "Open navigation", exact: true })
+        .click();
+    }
+    const nav = page.getByRole("navigation", { name: "Main navigation" });
+    const localList = nav.getByRole("list", {
+      name: "Servers on this computer",
+      exact: true,
+    });
+    const remoteList = nav.getByRole("list", {
+      name: `Servers on ${new URL(page.url()).host}`,
+      exact: true,
+    });
+    await expect(localList.getByRole("button")).toHaveCount(2);
+    await expect(remoteList.getByRole("button")).toHaveCount(2);
+    const local = localList.getByRole("button", {
+      name: `Open local server ${localServers.find((item) => item.id === localId)!.name}`,
+      exact: true,
+    });
+    await expect(local).toHaveAttribute("data-local-server-id", localId);
+    await expect(localList.locator("[data-server-id]")).toHaveCount(0);
+    await expect(localList.locator("img")).toHaveCount(0);
+    await expect(
+      remoteList.getByRole("button", {
+        name: `Select server ${remoteServers[0].name}`,
+        exact: true,
+      }),
+    ).toHaveAttribute("aria-pressed", "true");
+    await remoteList
+      .getByRole("button", {
+        name: `Select server ${remoteServers[1].name}`,
+        exact: true,
+      })
+      .click();
+    await expect(
+      page.getByRole("heading", { name: remoteServers[1].name, exact: true }),
+    ).toBeVisible();
+    await expect
+      .poll(() =>
+        requests.some(
+          (request) =>
+            request.path === "/api/server" &&
+            request.serverId === remoteServers[1].id,
+        ),
+      )
+      .toBe(true);
+    if (width < 761)
+      await page
+        .getByRole("button", { name: "Open navigation", exact: true })
+        .click();
+    await expect(local).toBeVisible();
+    if (width < 761)
+      await expect
+        .poll(() =>
+          page
+            .locator(".sidebar")
+            .evaluate((element) => element.getBoundingClientRect().left),
+        )
+        .toBe(0);
+    await page.screenshot({
+      path: testInfo.outputPath(
+        `${width < 761 ? "mobile" : "desktop"}-local-remote-selector.png`,
+      ),
+      animations: "disabled",
+      fullPage: width >= 761,
+    });
+    await local.click();
+    await expect
+      .poll(() =>
+        page.evaluate(
+          () =>
+            (window as unknown as { connectionCalls: unknown }).connectionCalls,
+        ),
+      )
+      .toEqual([{ action: "selectLocalServer", value: localId }]);
+    expect(requests.filter((request) => request.method !== "GET")).toEqual([]);
+    expect(
+      requests.filter((request) => request.path.startsWith("/api/desktop/")),
+    ).toEqual([]);
+    expect(
+      requests.filter((request) => request.serverId === "local-only-fixture"),
+    ).toEqual([]);
+    expect(
+      await page.evaluate(() =>
+        localStorage.getItem("mc-panel.active-server.sister@example.test"),
+      ),
+    ).toBe(remoteServers[1].id);
+    expect(context.pages()).toHaveLength(1);
+  });
+}
+
+test("a local server selection event switches the owner workspace and scopes subsequent requests", async ({
+  page,
+}) => {
+  const second = {
+    ...localServer,
+    id: "owner-second-fixture",
+    name: "Local selected world",
+  };
+  const servers = [localServer, second];
+  const scopes: (string | undefined)[] = [];
+  await desktopBridge(page, { localServers: servers });
+  await localPanel(page, true);
+  await page.route("**/api/servers", (route) =>
+    route.fulfill({ json: { servers, defaultServerId: localServer.id } }),
+  );
+  await page.route("**/api/desktop/selection", (route) =>
+    route.fulfill({ json: { desktop: true, activeServerId: localServer.id } }),
+  );
+  await page.route("**/api/server", (route) => {
+    const id = route.request().headers()["x-server-id"];
+    scopes.push(id);
+    const server = servers.find((item) => item.id === id);
+    return route.fulfill(
+      server
+        ? { json: server }
+        : { status: 404, json: { error: "Unknown local server." } },
+    );
+  });
+  await page.goto("/#console");
+  await expect(
+    page.getByRole("heading", { name: localServer.name, exact: true }),
+  ).toBeVisible();
+  await page.evaluate((serverId) => {
+    for (const detail of [null, {}, { serverId: 42 }, { serverId: "" }])
+      window.dispatchEvent(
+        new CustomEvent("mc-panel-local-server-selected", { detail }),
+      );
+    window.dispatchEvent(
+      new CustomEvent("mc-panel-local-server-selected", {
+        detail: { serverId },
+      }),
+    );
+  }, second.id);
+  await expect(
+    page.getByRole("heading", { name: second.name, exact: true }),
+  ).toBeVisible();
+  await expect(
+    page.getByRole("button", {
+      name: `Select server ${second.name}`,
+      exact: true,
+    }),
+  ).toHaveAttribute("aria-pressed", "true");
+  await expect.poll(() => scopes.at(-1)).toBe(second.id);
+  expect(scopes.every((id) => servers.some((server) => server.id === id))).toBe(
+    true,
+  );
+  expect(
+    await page.evaluate(() => localStorage.getItem("mc-panel.active-server")),
+  ).toBe(second.id);
+  expect(
+    await page.evaluate(
+      () => (window as unknown as { connectionCalls: unknown }).connectionCalls,
+    ),
+  ).toEqual([]);
 });
 
 test("desktop invitations use the scoped connection bridge and keep credentials on the destination", async ({

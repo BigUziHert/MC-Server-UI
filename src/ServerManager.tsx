@@ -2,6 +2,7 @@ import { useEffect, useRef, useState, type FormEvent } from "react";
 import {
   AlertCircle,
   Box,
+  LoaderCircle,
   Plus,
   Save,
   Settings2,
@@ -11,6 +12,7 @@ import {
 import { api, post, ServerScope } from "./api";
 import AddServer from "./AddServer";
 import { ServerIconImage } from "./ServerIcon";
+import { useDesktopConnections } from "./desktop-connections";
 import {
   LaunchAdvancedFields,
   LaunchMemoryNote,
@@ -54,19 +56,131 @@ export function ServerSwitcher({
   onSelect,
   onAdd,
   onSettings,
+  remoteHost,
 }: {
   servers: ServerRecord[];
-  selected: ServerRecord;
+  selected?: ServerRecord;
   onSelect: (id: string) => void;
   onAdd?: () => void;
   onSettings?: () => void;
+  remoteHost?: string;
 }) {
+  const connections = useDesktopConnections(Boolean(remoteHost));
+  const grouped = Boolean(remoteHost && window.mcPanelConnections);
+  const [openingLocal, setOpeningLocal] = useState<string | null>(null);
+  const [localError, setLocalError] = useState("");
+  const localRequest = useRef(false);
+  const mounted = useRef(true);
+  useEffect(() => {
+    mounted.current = true;
+    return () => {
+      mounted.current = false;
+    };
+  }, []);
+  async function openLocal(serverId: string) {
+    if (localRequest.current) return;
+    localRequest.current = true;
+    setOpeningLocal(serverId);
+    setLocalError("");
+    try {
+      const bridge = window.mcPanelConnections;
+      if (!bridge?.selectLocalServer)
+        throw new Error(
+          "Update the desktop app to open a local server from this panel.",
+        );
+      await bridge.selectLocalServer(serverId);
+    } catch (cause) {
+      if (mounted.current)
+        setLocalError(
+          cause instanceof Error
+            ? cause.message
+            : "Could not open the local server. Try again.",
+        );
+    } finally {
+      localRequest.current = false;
+      if (mounted.current) setOpeningLocal(null);
+    }
+  }
   return (
     <div className="fleet-switcher">
-      <ul className="fleet-server-list" aria-label="Your servers">
+      {grouped && (
+        <div className="fleet-server-group">
+          <h3 className="fleet-server-group-heading">This computer</h3>
+          <ul
+            className="fleet-server-list"
+            aria-label="Servers on this computer"
+          >
+            {(connections?.localServers ?? []).map((server) => {
+              const software = [
+                server.software || "Java",
+                server.minecraftVersion,
+              ]
+                .filter(Boolean)
+                .join(" ");
+              return (
+                <li key={`local:${server.id}`}>
+                  <button
+                    type="button"
+                    className="fleet-server-button"
+                    aria-label={`Open local server ${server.name}`}
+                    data-local-server-id={server.id}
+                    data-server-scope="local"
+                    disabled={openingLocal !== null}
+                    aria-busy={openingLocal === server.id || undefined}
+                    onClick={() => void openLocal(server.id)}
+                  >
+                    <span className="server-mini" aria-hidden="true">
+                      {openingLocal === server.id ? (
+                        <LoaderCircle size={18} className="spin" />
+                      ) : (
+                        <Box size={18} />
+                      )}
+                    </span>
+                    <span className="fleet-selection">
+                      <strong title={server.name}>{server.name}</strong>
+                      <span>
+                        <i
+                          className={`status-dot ${server.status === "running" ? "" : "offline"}`}
+                        />
+                        {server.status}
+                        <span className="fleet-mode" title={software}>
+                          · {software}
+                        </span>
+                      </span>
+                    </span>
+                  </button>
+                </li>
+              );
+            })}
+          </ul>
+          {!connections ? (
+            <p className="fleet-server-group-note">Loading local servers…</p>
+          ) : (
+            !connections.localServers?.length && (
+              <p className="fleet-server-group-note">
+                No servers on this computer.
+              </p>
+            )
+          )}
+          {localError && (
+            <p className="fleet-server-group-error" role="alert">
+              {localError}
+            </p>
+          )}
+        </div>
+      )}
+      {grouped && (
+        <h3 className="fleet-server-group-heading" title={remoteHost}>
+          {remoteHost}
+        </h3>
+      )}
+      <ul
+        className="fleet-server-list"
+        aria-label={grouped ? `Servers on ${remoteHost}` : "Your servers"}
+      >
         {servers.map((record) => {
-          const active = record.id === selected.id;
-          const server = active ? selected : record;
+          const active = record.id === selected?.id;
+          const server = active && selected ? selected : record;
           const software = [server.software || "Java", server.minecraftVersion]
             .filter(Boolean)
             .join(" ");
@@ -76,6 +190,7 @@ export function ServerSwitcher({
                 className="fleet-server-button"
                 aria-label={`Select server ${server.name}`}
                 data-server-id={server.id}
+                data-server-scope="panel"
                 aria-pressed={active}
                 onClick={() => onSelect(server.id)}
               >
@@ -104,6 +219,11 @@ export function ServerSwitcher({
           );
         })}
       </ul>
+      {grouped && !servers.length && (
+        <p className="fleet-server-group-note">
+          No shared servers on this panel.
+        </p>
+      )}
       {(onAdd || onSettings) && (
         <div className="fleet-actions">
           {onAdd && (

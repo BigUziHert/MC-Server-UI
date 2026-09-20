@@ -55,6 +55,51 @@ async function fixture(t) {
   return { rootDir, dataDir, launch };
 }
 
+test("native local server entries omit private configuration and selecting one persists only known IDs", async (t) => {
+  const { launch } = await fixture(t);
+  const runtime = await launch();
+  const server = await addServer(runtime, { name: "Local selector world" });
+  const entries = runtime.listLocalServers();
+  assert.equal(entries.length, 1);
+  assert.equal(entries[0].id, server.id);
+  assert.equal(entries[0].name, "Local selector world");
+  assert.equal(entries[0].status, "offline");
+  assert.ok(
+    Object.keys(entries[0]).every((key) =>
+      ["id", "name", "status", "software", "minecraftVersion"].includes(key),
+    ),
+  );
+  await assert.rejects(runtime.selectLocalServer("missing"), { status: 400 });
+  await assert.rejects(runtime.selectLocalServer(null), { status: 400 });
+  await runtime.selectLocalServer(server.id);
+  assert.equal(
+    (await (await runtime.request("/api/desktop/selection")).json())
+      .activeServerId,
+    server.id,
+  );
+  await runtime.close();
+  await assert.rejects(runtime.selectLocalServer(server.id), { status: 503 });
+});
+
+test("native selection persistence failures do not expose local filesystem paths", async (t) => {
+  const { launch, dataDir } = await fixture(t);
+  const runtime = await launch();
+  const server = await addServer(runtime);
+  await fs.mkdir(path.join(dataDir, "desktop-selection.json"));
+  await assert.rejects(runtime.selectLocalServer(server.id), (cause) => {
+    assert.equal(cause.status, 500);
+    assert.equal(
+      cause.message,
+      "The local server selection could not be saved.",
+    );
+    assert.ok(
+      cause.cause instanceof Error,
+      "Keep the filesystem failure available only in the main process.",
+    );
+    return true;
+  });
+});
+
 test("native quit waits for pending renderer selection writes and reports a bounded failure", async () => {
   let finish;
   let flushed = false;

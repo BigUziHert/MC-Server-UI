@@ -17,7 +17,12 @@ import { requiredPermissions } from "../server/remote-access.mjs";
 const invite = "a".repeat(43);
 const origin = "https://panel.example:3002";
 
-function harness({ responses = [], load } = {}) {
+function harness({
+  responses = [],
+  load,
+  localServers = [],
+  selectLocalServer,
+} = {}) {
   const views = [];
   const partitions = [];
   const prompts = [];
@@ -31,7 +36,8 @@ function harness({ responses = [], load } = {}) {
     value.focus = () => {
       value.focused = true;
     };
-    value.send = () => {};
+    value.sent = [];
+    value.send = (...args) => value.sent.push(args);
     value.close = () => {
       value.destroyed = true;
       value.emit("destroyed");
@@ -85,6 +91,8 @@ function harness({ responses = [], load } = {}) {
     WebContentsView: FakeView,
     preload: "/desktop/connections-preload.cjs",
     openWebsite: (url) => openedWebsites.push(url),
+    listLocalServers: () => localServers,
+    selectLocalServer,
     session: {
       fromPartition(name) {
         const value = new EventEmitter();
@@ -445,6 +453,93 @@ test("canceled trust fails opening and destroys only the isolated view", async (
   assert.equal(h.owner.webContents.isDestroyed(), false);
   assert.equal(h.controller.list().activeId, "local");
   assert.equal(h.controller.list().panels.length, 1);
+});
+
+test("local server selection exposes only display fields and notifies only the owner after saving", async () => {
+  let finishSave;
+  const saved = [];
+  const localServers = [
+    {
+      id: "local-a",
+      name: "Survival",
+      status: "running",
+      software: "Paper",
+      minecraftVersion: "1.21.8",
+      serverDir: "C:/private/world",
+      address: "192.0.2.1",
+      password: "private",
+    },
+    {
+      id: "local-b",
+      name: "Creative",
+      status: "offline",
+      software: null,
+      minecraftVersion: null,
+    },
+    { id: "invalid", name: { private: "data" }, status: "offline" },
+  ];
+  const h = harness({
+    localServers,
+    selectLocalServer: (id) =>
+      new Promise((resolve) => {
+        saved.push(id);
+        finishSave = resolve;
+      }),
+  });
+  const handlers = new Map();
+  installConnectionIpc(
+    { handle: (channel, callback) => handlers.set(channel, callback) },
+    h.controller,
+  );
+  await h.controller.open(origin);
+  const remote = h.views[0].webContents;
+  const sender = { sender: remote, senderFrame: remote.mainFrame };
+  const snapshot = handlers.get(CONNECTION_CHANNELS.list)(sender);
+  assert.deepEqual(snapshot.localServers, [
+    {
+      id: "local-a",
+      name: "Survival",
+      status: "running",
+      software: "Paper",
+      minecraftVersion: "1.21.8",
+    },
+    { id: "local-b", name: "Creative", status: "offline" },
+  ]);
+  const select = handlers.get(CONNECTION_CHANNELS.selectLocalServer);
+  await assert.rejects(select(sender, "missing"), { status: 400 });
+  assert.deepEqual(saved, []);
+  assert.throws(
+    () =>
+      select({ ...sender, senderFrame: { ...remote.mainFrame } }, "local-a"),
+    /cannot manage/,
+  );
+  const pending = select(sender, "local-a");
+  assert.equal(
+    h.controller.list().activeId,
+    snapshot.activeId,
+    "keep current panel visible until persistence succeeds",
+  );
+  assert.ok(
+    h.owner.webContents.sent.every(
+      ([channel]) => channel !== "mc-panel-local-server-selected",
+    ),
+  );
+  finishSave();
+  assert.equal((await pending).activeId, "local");
+  assert.deepEqual(saved, ["local-a"]);
+  assert.deepEqual(
+    h.owner.webContents.sent.filter(
+      ([channel]) => channel === "mc-panel-local-server-selected",
+    ),
+    [["mc-panel-local-server-selected", "local-a"]],
+  );
+  assert.ok(
+    remote.sent.every(
+      ([channel]) => channel !== "mc-panel-local-server-selected",
+    ),
+  );
+  assert.equal(remote.isDestroyed(), false);
+  await h.controller.close();
 });
 
 test("connection IPC validates managed sender, main frame, origin and bounded arguments", async () => {

@@ -203,8 +203,7 @@ function endWindowsSession() {
     .finally(() => app.quit());
 }
 
-function createMenus() {
-  const connections = remotePanels?.list();
+function createTray() {
   const dataFolder = path.join(userData, "data");
   const actions = [
     { label: "Open MC Panel", click: showWindow },
@@ -229,68 +228,21 @@ function createMenus() {
     { label: "Help and documentation", click: () => void openWebsite() },
     { label: "Quit MC Panel", click: () => void requestQuit() },
   ];
-  Menu.setApplicationMenu(
-    Menu.buildFromTemplate([
-      { label: "Panel", submenu: actions },
-      {
-        label: "Connections",
-        submenu: [
-          ...(connections?.panels || []).map((panel) => ({
-            label: panel.label,
-            type: "radio",
-            checked: panel.id === connections.activeId,
-            ...(panel.local ? { accelerator: "CmdOrCtrl+Shift+L" } : {}),
-            click: () => {
-              remotePanels.activate(panel.id);
-              showWindow();
-            },
-          })),
-          { type: "separator" },
-          {
-            label: "Disconnect current panel",
-            enabled: Boolean(connections && connections.activeId !== "local"),
-            click: () =>
-              void remotePanels
-                .disconnect(remotePanels.list().activeId)
-                .catch(logError),
-          },
-        ],
-      },
-      {
-        label: "Edit",
-        submenu: [
-          { role: "undo" },
-          { role: "redo" },
-          { type: "separator" },
-          { role: "cut" },
-          { role: "copy" },
-          { role: "paste" },
-          { role: "selectAll" },
-        ],
-      },
-      {
-        label: "View",
-        submenu: [
-          { role: "reload" },
-          { role: "resetZoom" },
-          { role: "zoomIn" },
-          { role: "zoomOut" },
-          { role: "togglefullscreen" },
-        ],
-      },
-    ]),
-  );
-  if (tray) {
-    tray.setContextMenu(Menu.buildFromTemplate(actions));
-    return;
-  }
   try {
     tray = new Tray(
       nativeImage.createFromPath(path.join(desktopDir, "assets", "icon.ico")),
     );
     tray.setToolTip("MC Panel — servers and backups keep running");
-    tray.setContextMenu(Menu.buildFromTemplate(actions));
+    const trayMenu = Menu.buildFromTemplate(actions);
+    tray.setContextMenu(trayMenu);
     tray.on("double-click", showWindow);
+    // Main-process-only smoke inspection of the actual tray, never exposed to
+    // the renderer or included in the connection bridge.
+    if (smokeTest)
+      globalThis.__mcPanelTraySmoke = () => ({
+        alive: !tray.isDestroyed(),
+        actions: trayMenu.items.map((item) => item.label),
+      });
   } catch (cause) {
     void logError(cause);
     // If the tray cannot be created, the window's close button quits normally.
@@ -298,6 +250,8 @@ function createMenus() {
 }
 
 async function launch() {
+  // Remove the native menu itself so Alt cannot reveal it.
+  Menu.setApplicationMenu(null);
   const installed =
     app.isPackaged &&
     !process.env.PORTABLE_EXECUTABLE_FILE &&
@@ -374,7 +328,6 @@ async function launch() {
     backgroundColor: "#101211",
     icon: path.join(desktopDir, "assets", "icon.ico"),
     show: false,
-    autoHideMenuBar: true,
     webPreferences: {
       session: panelSession,
       preload: path.join(desktopDir, "connections-preload.cjs"),
@@ -386,6 +339,7 @@ async function launch() {
       spellcheck: false,
     },
   });
+  window.setMenu(null);
   remotePanels = createRemotePanelController({
     window,
     localOrigin: runtime.url,
@@ -395,10 +349,10 @@ async function launch() {
     downloadsDirectory: app.getPath("downloads"),
     preload: path.join(desktopDir, "connections-preload.cjs"),
     openWebsite,
-    onChange: (context) => {
-      if (quitting) return;
-      window.setMenuBarVisibility(context.activeId !== "local");
-      createMenus();
+    listLocalServers: () => runtime.listLocalServers(),
+    selectLocalServer: async (id) => {
+      await flushRendererSelection(window.webContents);
+      return runtime.selectLocalServer(id);
     },
   });
   removeConnectionIpc = installConnectionIpc(ipcMain, remotePanels);
@@ -422,7 +376,7 @@ async function launch() {
   });
   window.on("query-session-end", endWindowsSession);
   window.on("session-end", endWindowsSession);
-  createMenus();
+  createTray();
   await window.loadURL(runtime.url);
   if (supported) {
     initialUpdateTimer = setTimeout(() => updates.check(), 30000);

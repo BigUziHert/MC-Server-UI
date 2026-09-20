@@ -189,6 +189,41 @@ export async function startDesktopRuntime({
     url,
     token,
     fleet,
+    listLocalServers() {
+      return [...fleet.runtimes.values()].map((server) => {
+        const { id, name, status, software, minecraftVersion } =
+          server.descriptor();
+        return {
+          id,
+          name,
+          status,
+          ...(typeof software === "string" ? { software } : {}),
+          ...(typeof minecraftVersion === "string" ? { minecraftVersion } : {}),
+        };
+      });
+    },
+    async selectLocalServer(id) {
+      if (closing)
+        throw Object.assign(new Error("The desktop panel is closing."), {
+          status: 503,
+        });
+      if (typeof id !== "string" || !fleet.runtimes.has(id))
+        throw Object.assign(
+          new Error("Select a server that is still in the panel."),
+          { status: 400 },
+        );
+      try {
+        return await selection.save(id);
+      } catch (cause) {
+        if ([400, 503].includes(cause?.status)) throw cause;
+        throw Object.assign(
+          new Error("The local server selection could not be saved.", {
+            cause,
+          }),
+          { status: 500 },
+        );
+      }
+    },
     close({ gracefulOnly = false } = {}) {
       if (!closing) {
         closing = (async () => {

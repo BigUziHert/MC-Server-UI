@@ -69,6 +69,9 @@ jobs:
       - name: Smoke-test remote panel connections
         run: node desktop/remote-panels.smoke.mjs
 
+      - name: Smoke-test desktop navigation
+        run: node desktop/menu.smoke.mjs
+
       - name: Smoke-test the packaged desktop app
         run: pnpm test:desktop
 

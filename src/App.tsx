@@ -303,6 +303,7 @@ export default function App({
   const fleetInFlight = useRef(false);
   const desktopSelection = useRef<boolean | null>(null);
   const persistedSelection = useRef("");
+  const nativeSelection = useRef<string | null>(null);
   const [selectionReady, setSelectionReady] = useState(false);
   const loadServers = useCallback(
     async (showLoading = false) => {
@@ -338,8 +339,11 @@ export default function App({
           persistedSelection.current = selection?.activeServerId ?? "";
         }
         setServers(result.servers);
+        const nativePreferred = nativeSelection.current;
+        nativeSelection.current = null;
         setActiveId((current) => {
-          const preferred = selection?.activeServerId || current;
+          const preferred =
+            nativePreferred || selection?.activeServerId || current;
           return result.servers.some((server) => server.id === preferred)
             ? preferred
             : (result.servers.find(
@@ -348,6 +352,11 @@ export default function App({
                 result.servers[0]?.id ??
                 "");
         });
+        if (
+          nativePreferred &&
+          !result.servers.some((server) => server.id === nativePreferred)
+        )
+          setNotice("The selected local server is no longer available.");
         setSelectionReady(true);
         setError("");
       } catch (cause) {
@@ -365,12 +374,41 @@ export default function App({
                 : "The panel could not be reached.",
           );
       } finally {
-        fleetInFlight.current = false;
-        if (request === fleetRequest.current) setLoading(false);
+        if (request === fleetRequest.current) {
+          fleetInFlight.current = false;
+          setLoading(false);
+        }
       }
     },
     [remote, expireSession],
   );
+  useEffect(() => {
+    if (remote || !window.mcPanelConnections) return;
+    const selectedLocally = (event: Event) => {
+      const serverId = (event as CustomEvent<{ serverId?: unknown }>).detail
+        ?.serverId;
+      if (typeof serverId !== "string" || !serverId.trim()) return;
+      // Native code validated and persisted this selection after flushing older
+      // renderer writes. Ignore any earlier fleet/desktop-selection response.
+      nativeSelection.current = serverId;
+      persistedSelection.current = serverId;
+      desktopSelection.current = true;
+      fleetRequest.current++;
+      fleetInFlight.current = false;
+      setSelectionReady(false);
+      setActiveId(serverId);
+      setManager(null);
+      setConnection(null);
+      window.location.hash = "console";
+      void loadServers(true);
+    };
+    window.addEventListener("mc-panel-local-server-selected", selectedLocally);
+    return () =>
+      window.removeEventListener(
+        "mc-panel-local-server-selected",
+        selectedLocally,
+      );
+  }, [remote, loadServers]);
   useEffect(() => {
     void loadServers(true);
     const timer = setInterval(() => void loadServers(), 5000);
@@ -418,6 +456,7 @@ export default function App({
   }, [active, error, firstServerSetup, loading]);
   const saved = (server: ServerRecord) => {
     fleetRequest.current++;
+    fleetInFlight.current = false;
     setLoading(false);
     setError("");
     setServers((current) =>
@@ -439,6 +478,7 @@ export default function App({
   };
   const removed = (serverId: string) => {
     fleetRequest.current++;
+    fleetInFlight.current = false;
     setServers((current) => current.filter((server) => server.id !== serverId));
     setActiveId((current) =>
       current === serverId
@@ -470,6 +510,7 @@ export default function App({
             servers={servers}
             selected={active}
             onSelect={(id) => {
+              nativeSelection.current = null;
               if (remote && id !== active.id) window.location.hash = "console";
               setActiveId(id);
             }}
@@ -509,6 +550,13 @@ export default function App({
           )}
           {session && (
             <div className="workspace-account-state">
+              {error && window.mcPanelConnections && (
+                <ServerSwitcher
+                  servers={[]}
+                  remoteHost={window.location.host}
+                  onSelect={() => {}}
+                />
+              )}
               <PanelAccount
                 session={session}
                 onSignedOut={expireSession}
@@ -655,6 +703,15 @@ function EmptyFleet({
               </div>
             )}
             <div className="welcome-remote-account">
+              {session && window.mcPanelConnections && (
+                <div className="fleet-available-servers">
+                  <ServerSwitcher
+                    servers={[]}
+                    remoteHost={window.location.host}
+                    onSelect={() => {}}
+                  />
+                </div>
+              )}
               <PanelAccount
                 session={session}
                 onSignedOut={onSignedOut}
@@ -922,6 +979,7 @@ function ServerWorkspace({
                 <div id={`nav-links-${group.id}`} hidden={collapsed}>
                   {group.id === "servers" && (
                     <ServerSwitcher
+                      remoteHost={session ? window.location.host : undefined}
                       servers={servers}
                       selected={{
                         ...selected,

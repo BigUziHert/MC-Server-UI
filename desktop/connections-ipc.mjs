@@ -3,6 +3,7 @@ export const CONNECTION_CHANNELS = {
   open: "mc-panel-connections:open",
   activate: "mc-panel-connections:activate",
   disconnect: "mc-panel-connections:disconnect",
+  selectLocalServer: "mc-panel-connections:select-local-server",
 };
 
 export function installConnectionIpc(ipcMain, controller) {

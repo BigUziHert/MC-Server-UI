@@ -73,6 +73,8 @@ export function createRemotePanelController({
   downloadsDirectory,
   preload,
   openWebsite = () => {},
+  listLocalServers = () => [],
+  selectLocalServer,
   onChange = () => {},
 }) {
   const panels = new Map();
@@ -88,8 +90,30 @@ export function createRemotePanelController({
   let attached;
   let closed = false;
   const cleanups = new Set();
+  const localServerEntries = () =>
+    listLocalServers().flatMap((server) => {
+      if (
+        !server ||
+        typeof server.id !== "string" ||
+        typeof server.name !== "string" ||
+        typeof server.status !== "string"
+      )
+        return [];
+      const { id, name, status, software, minecraftVersion } = server;
+      return [
+        {
+          id,
+          name,
+          status,
+          ...(typeof software === "string" ? { software } : {}),
+          ...(typeof minecraftVersion === "string" ? { minecraftVersion } : {}),
+        },
+      ];
+    });
   const list = () => ({
     activeId,
+    // Only the selector's display fields may cross into remote renderers.
+    localServers: localServerEntries(),
     panels: [...panels.values()].map(({ id, label, origin, local }) => ({
       id,
       label,
@@ -160,6 +184,20 @@ export function createRemotePanelController({
   const controller = {
     list,
     activate,
+    async selectLocalServer(id) {
+      ensureOpen();
+      if (
+        typeof id !== "string" ||
+        !localServerEntries().some((server) => server.id === id)
+      )
+        throw failure(400, "Select a server that is still in the panel.");
+      if (!selectLocalServer)
+        throw failure(409, "Local server selection is unavailable.");
+      await selectLocalServer(id);
+      ensureOpen();
+      local.contents.send("mc-panel-local-server-selected", id);
+      return activate(local.id);
+    },
     isManagedSender(event) {
       if (closed || !event?.sender || event.sender.isDestroyed()) return false;
       const panel = [...panels.values()].find(

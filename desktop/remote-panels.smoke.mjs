@@ -59,6 +59,7 @@ async function fixture() {
         res.setHeader("Content-Type", "text/html; charset=utf-8");
         res.end(
           "<!doctype html><title>Fixture cannot replace native host title</title><h1>Remote fixture panel</h1><p>This page is served by the loopback HTTPS test fixture.</p>" +
+            '<script>window.__localServerSelections=[];addEventListener("mc-panel-local-server-selected",event=>window.__localServerSelections.push(event.detail))</script>' +
             (req.url === "/" ? '<iframe src="/embedded"></iframe>' : ""),
         );
       },
@@ -121,6 +122,8 @@ async function fixture() {
     session,
     preload: path.join(projectDirectory, "desktop", "connections-preload.cjs"),
     downloadsDirectory: path.join(root, "downloads"),
+    listLocalServers: () => runtime.listLocalServers(),
+    selectLocalServer: (id) => runtime.selectLocalServer(id),
     dialog: {
       async showMessageBox(window, options) {
         assert.equal(window, ownerWindow);
@@ -144,6 +147,9 @@ async function fixture() {
     () => ownerWindow.webContents,
   );
   await ownerWindow.loadURL(`${runtime.url}/api/access/session`);
+  await ownerWindow.webContents.executeJavaScript(
+    'window.__localServerSelections=[];addEventListener("mc-panel-local-server-selected",event=>window.__localServerSelections.push(event.detail))',
+  );
   // Query Chromium's real permission path without reading or overwriting the
   // user's OS clipboard. The renderer copy/fallback flow is covered in e2e.
   const clipboardPermissions = (contents) =>
@@ -163,10 +169,17 @@ async function fixture() {
         "Content-Type": "application/json",
       },
     });
+  const localResponse = await privateRequest("/api/servers", {
+    method: "POST",
+    body: JSON.stringify({ name: "Local smoke world", port: 25565 }),
+  });
+  assert.equal(localResponse.status, 201);
+  const localServerId = (await localResponse.json()).server.id;
   globalThis.__remotePanelSmoke = {
     ready: true,
     remoteUrl,
     remoteUrls,
+    localServerId,
     async open() {
       const response = await privateRequest("/api/desktop/connections/open", {
         method: "POST",
@@ -178,7 +191,15 @@ async function fixture() {
       const contents = fromRemote
         ? remoteContents.at(-1)
         : ownerWindow.webContents;
-      assert.ok(["list", "open", "activate", "disconnect"].includes(action));
+      assert.ok(
+        [
+          "list",
+          "open",
+          "activate",
+          "disconnect",
+          "selectLocalServer",
+        ].includes(action),
+      );
       return contents.executeJavaScript(
         `window.mcPanelConnections[${JSON.stringify(action)}](${JSON.stringify(value)})`,
       );
@@ -192,6 +213,15 @@ async function fixture() {
         requests,
         nativeWindows: BrowserWindow.getAllWindows().length,
         context: controller.list(),
+        localSelection: (
+          await (await privateRequest("/api/desktop/selection")).json()
+        ).activeServerId,
+        ownerSelectionEvents: await ownerWindow.webContents.executeJavaScript(
+          "window.__localServerSelections",
+        ),
+        remoteSelectionEvents: active
+          ? await contents.executeJavaScript("window.__localServerSelections")
+          : [],
         views: remoteContents.map((item) => ({
           destroyed: item.isDestroyed(),
         })),
@@ -307,7 +337,7 @@ async function smoke() {
       heading: "Remote fixture panel",
       require: "undefined",
       process: "undefined",
-      bridge: ["list", "open", "activate", "disconnect"],
+      bridge: ["list", "open", "activate", "disconnect", "selectLocalServer"],
       frameBridge: "undefined",
     });
     assert.deepEqual(state.preferences, {
@@ -357,6 +387,13 @@ async function smoke() {
       "remote connections must stay in the original native window",
     );
     assert.equal(state.context.panels.length, 3);
+    assert.equal(state.context.localServers.length, 1);
+    assert.equal(state.context.localServers[0].name, "Local smoke world");
+    assert.ok(
+      Object.keys(state.context.localServers[0]).every((key) =>
+        ["id", "name", "status", "software", "minecraftVersion"].includes(key),
+      ),
+    );
     assert.equal(
       state.remoteCookies[1].find((item) => item.name === "remote-fixture")
         .value,
@@ -367,8 +404,25 @@ async function smoke() {
         .value,
       "fixture-session-1",
     );
-    await application.evaluate(() =>
-      globalThis.__remotePanelSmoke.invoke("activate", "local", true),
+    const localSelected = await application.evaluate(() =>
+      globalThis.__remotePanelSmoke.invoke(
+        "selectLocalServer",
+        globalThis.__remotePanelSmoke.localServerId,
+        true,
+      ),
+    );
+    assert.equal(localSelected.activeId, "local");
+    state = await application.evaluate(() =>
+      globalThis.__remotePanelSmoke.inspect(),
+    );
+    assert.equal(state.localSelection, state.context.localServers[0].id);
+    assert.deepEqual(state.ownerSelectionEvents, [
+      { serverId: state.localSelection },
+    ]);
+    assert.deepEqual(
+      state.remoteSelectionEvents,
+      [],
+      "local selection notifications must only reach the owner renderer",
     );
     const resumed = await application.evaluate(() =>
       globalThis.__remotePanelSmoke.invoke(
@@ -431,7 +485,7 @@ async function smoke() {
       "A reconnected view must not inherit the disconnected session.",
     );
     console.log(
-      "Passed real Electron remote smoke: one native window, two isolated remote views, scoped four-method preload, live switching with cookies/trust preserved, disconnect/reconnect cleanup, local runtime survival, certificate validation, and clipboard permission checks (OS clipboard untouched).",
+      "Passed real Electron remote smoke: one native window, two isolated remote views, scoped preload, minimal local server entries, owner-only persisted selection, switching with cookies/trust preserved, disconnect/reconnect cleanup, local runtime survival, certificate validation, and clipboard permission checks (OS clipboard untouched).",
     );
   } catch (cause) {
     if (stderr) console.error(stderr);

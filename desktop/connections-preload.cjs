@@ -7,8 +7,18 @@ if (process.isMainFrame) {
     activate: (id) => ipcRenderer.invoke("mc-panel-connections:activate", id),
     disconnect: (id) =>
       ipcRenderer.invoke("mc-panel-connections:disconnect", id),
+    selectLocalServer: (id) =>
+      ipcRenderer.invoke("mc-panel-connections:select-local-server", id),
   });
   ipcRenderer.on("mc-panel-connections:changed", () => {
     window.dispatchEvent(new Event("mc-panel-connections-changed"));
+  });
+  ipcRenderer.on("mc-panel-local-server-selected", (_event, serverId) => {
+    if (typeof serverId === "string")
+      window.dispatchEvent(
+        new CustomEvent("mc-panel-local-server-selected", {
+          detail: { serverId },
+        }),
+      );
   });
 }

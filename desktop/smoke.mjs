@@ -267,7 +267,7 @@ async function launchPackaged({ expectEmpty = false } = {}) {
   currentOrigin = url.origin;
 
   const mainState = await application.evaluate(
-    async ({ app, BrowserWindow }, origin) => {
+    async ({ app, BrowserWindow, Menu }, origin) => {
       const window = BrowserWindow.getAllWindows().find((item) =>
         item.webContents.getURL().startsWith(origin),
       );
@@ -279,6 +279,8 @@ async function launchPackaged({ expectEmpty = false } = {}) {
         packaged: app.isPackaged,
         userData: app.getPath("userData"),
         visible: window.isVisible(),
+        nativeMenu: Menu.getApplicationMenu() !== null,
+        menuVisible: window.isMenuBarVisible(),
         preferences: {
           sandbox: preferences.sandbox,
           contextIsolation: preferences.contextIsolation,
@@ -300,6 +302,20 @@ async function launchPackaged({ expectEmpty = false } = {}) {
     mainState.packaged,
     true,
     "This script must test the packaged executable, not Electron development mode.",
+  );
+  assert.equal(
+    mainState.nativeMenu,
+    false,
+    "The app must not install a native menu bar.",
+  );
+  assert.equal(mainState.menuVisible, false);
+  await page.keyboard.press("Alt");
+  assert.equal(
+    await application.evaluate(({ BrowserWindow }) =>
+      BrowserWindow.getAllWindows()[0].isMenuBarVisible(),
+    ),
+    false,
+    "Alt must not reveal a removed menu.",
   );
   assert.equal(
     await fs.realpath(mainState.userData),
@@ -1280,14 +1296,13 @@ ${processFixture}`,
   const trayState = await application.evaluate(({ BrowserWindow, Menu }) => {
     const window = BrowserWindow.getAllWindows()[0];
     window.close();
-    // The Panel menu shares its open/quit actions with the tray's context menu.
-    const panelMenu = Menu.getApplicationMenu()?.items.find(
-      (item) => item.label === "Panel",
-    );
+    const tray = globalThis.__mcPanelTraySmoke?.();
     return {
       destroyed: window.isDestroyed(),
       visible: window.isDestroyed() ? null : window.isVisible(),
-      actions: panelMenu?.submenu?.items.map((item) => item.label) ?? [],
+      nativeMenu: Menu.getApplicationMenu() !== null,
+      trayAlive: tray?.alive,
+      actions: tray?.actions ?? [],
     };
   });
   assert.equal(
@@ -1296,6 +1311,8 @@ ${processFixture}`,
     "Closing the window must keep the desktop process available in the tray.",
   );
   assert.equal(trayState.visible, false);
+  assert.equal(trayState.nativeMenu, false);
+  assert.equal(trayState.trayAlive, true);
   assert.ok(trayState.actions.includes("Open MC Panel"));
   assert.ok(trayState.actions.includes("Quit MC Panel"));
   const trayRuntime = await browserApi(page, "/servers");
@@ -1308,9 +1325,7 @@ ${processFixture}`,
 
   step("Quitting the app and confirming that its private API shuts down.");
   await quitPackaged("quit", ["Desktop smoke world"]);
-  step(
-    "Relaunching the same profile to verify saved worlds and files.",
-  );
+  step("Relaunching the same profile to verify saved worlds and files.");
   ({ page } = await launchPackaged());
   await ui(serverButton(page, neoForge.id)).toHaveAttribute(
     "aria-pressed",
