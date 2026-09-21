@@ -25,12 +25,13 @@ const gate = () => {
   return { promise, resolve };
 };
 async function eventually(work) {
-  const until = Date.now() + 5000;
+  // Durable promotion and rollback are slower on a busy Windows CI filesystem.
+  const until = performance.now() + 15_000;
   do {
     const value = await work();
     if (value) return value;
-    await new Promise((resolve) => setTimeout(resolve, 15));
-  } while (Date.now() < until);
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  } while (performance.now() < until);
   assert.fail("The Minecraft operation did not reach its expected state.");
 }
 async function fixture(

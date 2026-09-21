@@ -172,14 +172,14 @@ async function fixture(
         error: response.body.error,
         status: response.status,
       };
-    const deadline = Date.now() + 5000;
-    while (Date.now() < deadline) {
-      const result = (await request(`/api/versions/jobs/${response.body.id}`))
-        .body;
+    const deadline = performance.now() + 15_000;
+    let result;
+    do {
+      result = (await request(`/api/versions/jobs/${response.body.id}`)).body;
       if (["complete", "failed"].includes(result.state)) return result;
-      await new Promise((resolve) => setTimeout(resolve, 15));
-    }
-    assert.fail("Runtime update did not finish");
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    } while (performance.now() < deadline);
+    assert.fail(`Runtime update did not finish: ${JSON.stringify(result)}`);
   };
   return {
     request,

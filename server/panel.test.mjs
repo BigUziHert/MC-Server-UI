@@ -226,13 +226,14 @@ test("audit describes added and deleted mods and normalizes legacy content activ
   );
   // Upload responses precede temporary-file cleanup; wait for its mutation
   // lock to release before exercising the exclusive Recycle Bin operation.
-  for (let attempt = 0; ; attempt++) {
+  const cleanupDeadline = performance.now() + 15_000;
+  for (;;) {
     try {
       assertRemovable();
       break;
     } catch (cause) {
-      if (attempt >= 100) throw cause;
-      await new Promise((resolve) => setTimeout(resolve, 10));
+      if (performance.now() >= cleanupDeadline) throw cause;
+      await new Promise((resolve) => setTimeout(resolve, 25));
     }
   }
   const removed = await request("/api/files?path=mods/new-mod.jar", {

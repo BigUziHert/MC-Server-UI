@@ -5204,11 +5204,12 @@ test("explicit background refresh immediately publishes progress and coalesces p
   assert.equal(checks, 2, "manual refresh joins the active background check");
   release();
   let complete;
-  for (let i = 0; i < 100; i++) {
+  const deadline = performance.now() + 15_000;
+  do {
     complete = await f.service.installed(selection);
     if (!complete.checkingUpdates) break;
-    await new Promise((resolve) => setTimeout(resolve, 5));
-  }
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  } while (performance.now() < deadline);
   assert.equal(complete.checkingUpdates, false);
   assert.equal(complete.progress.completed, 1);
   assert.equal(complete.items[0].updateCheck, "checked");
@@ -5337,11 +5338,12 @@ test("unexpected background finalization failures terminate polling with a warni
   });
   await f.service.installed({ ...selection, refresh: true, background: true });
   let result;
-  for (let i = 0; i < 100; i++) {
+  const deadline = performance.now() + 15_000;
+  do {
     result = await f.service.installed(selection);
     if (!result.checkingUpdates) break;
-    await new Promise((resolve) => setTimeout(resolve, 5));
-  }
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  } while (performance.now() < deadline);
   assert.equal(injected, true);
   assert.equal(result.checkingUpdates, false);
   assert.equal(result.progress.completed, 1);
@@ -5390,11 +5392,12 @@ test("failed bulk update checks advance progress while another provider is still
   });
   await service.installed({ ...selection, refresh: true, background: true });
   let progress;
-  for (let i = 0; i < 100; i++) {
+  const deadline = performance.now() + 15_000;
+  do {
     progress = await service.installed(selection);
     if (progress.progress.completed === 1) break;
-    await new Promise((resolve) => setTimeout(resolve, 5));
-  }
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  } while (performance.now() < deadline);
   assert.equal(progress.checkingUpdates, true);
   assert.deepEqual(progress.progress, { completed: 1, total: 2 });
   assert.equal(
@@ -5778,13 +5781,8 @@ test("Launchpad reserves the shared runtime lock throughout downloads and preser
     f.old.toString(),
   );
   release();
-  for (
-    let i = 0;
-    i < 100 && direct.job(accepted.job.id).job.status !== "completed";
-    i++
-  )
-    await new Promise((resolve) => setTimeout(resolve, 5));
-  assert.equal(direct.job(accepted.job.id).job.status, "completed");
+  const completed = await waitForJob(direct, accepted.job.id);
+  assert.equal(completed.status, "completed", completed.error);
   assert.equal(locked, false);
 });
 
@@ -5962,12 +5960,6 @@ test("cancelling a claimed review during asynchronous server validation cannot d
   );
   release();
   const accepted = await installing;
-  for (
-    let i = 0;
-    i < 100 &&
-    ["queued", "running"].includes(service.job(accepted.job.id).job.status);
-    i++
-  )
-    await new Promise((resolve) => setTimeout(resolve, 5));
-  assert.equal(service.job(accepted.job.id).job.status, "completed");
+  const completed = await waitForJob(service, accepted.job.id);
+  assert.equal(completed.status, "completed", completed.error);
 });

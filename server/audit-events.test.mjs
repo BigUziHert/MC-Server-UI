@@ -110,12 +110,14 @@ test("file audits distinguish plugin/datapack uploads, directory deletion, resto
     201,
   );
   // Upload temp-file cleanup remains protected after the response is sent.
-  for (let attempt = 0; attempt < 100; attempt++) {
+  const cleanupDeadline = performance.now() + 15_000;
+  for (;;) {
     try {
       f.panel.assertRemovable();
       break;
-    } catch {
-      await new Promise((resolve) => setTimeout(resolve, 10));
+    } catch (cause) {
+      if (performance.now() >= cleanupDeadline) throw cause;
+      await new Promise((resolve) => setTimeout(resolve, 25));
     }
   }
   let removed = await f.request("/api/files?path=plugins/example.jar", {

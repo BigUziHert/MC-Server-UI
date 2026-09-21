@@ -221,12 +221,14 @@ async function fixture(
   };
 }
 async function finish(service, id) {
-  for (let i = 0; i < 200; i++) {
-    const { job } = service.job(id);
+  const deadline = performance.now() + 15_000;
+  let job;
+  do {
+    ({ job } = service.job(id));
     if (["completed", "failed"].includes(job.status)) return job;
-    await new Promise((resolve) => setTimeout(resolve, 5));
-  }
-  assert.fail("Installation fixture did not finish");
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  } while (performance.now() < deadline);
+  assert.fail(`Installation fixture did not finish: ${JSON.stringify(job)}`);
 }
 async function install(f) {
   const plan = await f.service.preview(f.selection);

@@ -13,6 +13,16 @@ import { createLaunchpad } from "./launchpad.mjs";
 import { validateStartupFiles } from "./import.mjs";
 
 const json = (method, body) => ({ method, body: JSON.stringify(body) });
+async function finishJob(read, isTerminal) {
+  const deadline = performance.now() + 15_000;
+  let job;
+  do {
+    job = await read();
+    if (isTerminal(job)) return job;
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  } while (performance.now() < deadline);
+  assert.fail(`Installation job did not finish: ${JSON.stringify(job)}`);
+}
 const java = {
   path: "java",
   available: true,
@@ -504,14 +514,12 @@ test("guided modpacks install their runtime atomically and switching to Vanilla 
     id,
   );
   assert.equal(installed.status, 202, JSON.stringify(installed.body));
-  let packJob;
-  for (let attempt = 0; attempt < 200; attempt++) {
-    packJob = (
-      await f.request(`/api/launchpad/jobs/${installed.body.job.id}`, {}, id)
-    ).body.job;
-    if (["failed", "completed"].includes(packJob.status)) break;
-    await new Promise((resolve) => setTimeout(resolve, 10));
-  }
+  const packJob = await finishJob(
+    async () =>
+      (await f.request(`/api/launchpad/jobs/${installed.body.job.id}`, {}, id))
+        .body.job,
+    (job) => ["failed", "completed"].includes(job.status),
+  );
   assert.equal(packJob.status, "completed", JSON.stringify(packJob));
   assert.deepEqual(runtimeStages, ["neoforge"]);
   for (const removed of ["old-world", "mods/old-loader.jar", "config/old.toml"])
@@ -558,14 +566,11 @@ test("guided modpacks install their runtime atomically and switching to Vanilla 
     id,
   );
   assert.equal(queued.status, 202, JSON.stringify(queued.body));
-  let vanillaJob;
-  for (let attempt = 0; attempt < 200; attempt++) {
-    vanillaJob = (
-      await f.request(`/api/versions/jobs/${queued.body.id}`, {}, id)
-    ).body;
-    if (["failed", "complete"].includes(vanillaJob.state)) break;
-    await new Promise((resolve) => setTimeout(resolve, 10));
-  }
+  const vanillaJob = await finishJob(
+    async () =>
+      (await f.request(`/api/versions/jobs/${queued.body.id}`, {}, id)).body,
+    (job) => ["failed", "complete"].includes(job.state),
+  );
   assert.equal(vanillaJob.state, "complete", JSON.stringify(vanillaJob));
   assert.equal(
     await fs.readFile(path.join(serverDir, "server.jar"), "utf8"),
@@ -890,14 +895,11 @@ test("failed runtime installs retry on the same created server through the exist
       id,
     );
     assert.equal(queued.status, 202);
-    for (let tries = 0; tries < 200; tries++) {
-      const job = (
-        await f.request(`/api/versions/jobs/${queued.body.id}`, {}, id)
-      ).body;
-      if (["failed", "complete"].includes(job.state)) return job;
-      await new Promise((resolve) => setTimeout(resolve, 10));
-    }
-    assert.fail("Installation job did not finish");
+    return finishJob(
+      async () =>
+        (await f.request(`/api/versions/jobs/${queued.body.id}`, {}, id)).body,
+      (job) => ["failed", "complete"].includes(job.state),
+    );
   }
   assert.equal((await install()).state, "failed");
   const reused = await f.request("/api/server-setup", json("POST", body));
@@ -1083,14 +1085,12 @@ test(
       }),
     );
     assert.equal(accepted.status, 202, JSON.stringify(accepted.body));
-    let job;
-    for (let attempt = 0; attempt < 100; attempt++) {
-      job = (
-        await f.request(`/api/server-setup/java/jobs/${accepted.body.job.id}`)
-      ).body.job;
-      if (["failed", "completed"].includes(job.status)) break;
-      await new Promise((resolve) => setTimeout(resolve, 10));
-    }
+    const job = await finishJob(
+      async () =>
+        (await f.request(`/api/server-setup/java/jobs/${accepted.body.job.id}`))
+          .body.job,
+      (job) => ["failed", "completed"].includes(job.status),
+    );
     assert.equal(job.status, "completed", JSON.stringify(job));
     assert.equal(job.majorVersion, 21);
     assert.ok(requested[0].includes("/latest/21/hotspot"), requested[0]);

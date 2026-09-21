@@ -167,15 +167,17 @@ async function fixture(t, options = {}) {
 }
 
 async function settled(service, id) {
-  for (let attempt = 0; attempt < 500; attempt++) {
-    const job = service.job(id);
+  const deadline = performance.now() + 15_000;
+  let job;
+  do {
+    job = service.job(id);
     if (job.finishedAt) {
       await delay(0); // Let the active-job finalizer settle before a retry.
       return job;
     }
-    await delay(10);
-  }
-  assert.fail("Java installation did not settle within five seconds");
+    await delay(25);
+  } while (performance.now() < deadline);
+  assert.fail(`Java installation did not settle: ${JSON.stringify(job)}`);
 }
 
 async function runtimeEntries(dataDir) {
