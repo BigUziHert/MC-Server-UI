@@ -9,7 +9,7 @@ import {
   type APIRequestContext,
   type Page,
 } from "@playwright/test";
-import { readFile } from "node:fs/promises";
+import { readFile, realpath } from "node:fs/promises";
 import path from "node:path";
 import { processStartup } from "./fixtures/process-options.mjs";
 
@@ -296,7 +296,11 @@ test("the last removed managed server can be recovered from the welcome screen w
   const dataDir = process.env.PANEL_E2E_DATA_DIR!;
   expect(path.basename(dataDir)).toMatch(/^mc-panel-e2e-/);
   expect(server.id).toMatch(/^[a-f0-9-]{36}$/);
-  const savedDirectory = path.join(dataDir, "instances", server.id, "server");
+  // Recovery displays the canonical folder, including on Windows runners
+  // whose temporary-directory environment variable uses a short path alias.
+  const savedDirectory = await realpath(
+    path.join(dataDir, "instances", server.id, "server"),
+  );
   const savedProof = path.join(savedDirectory, "recovery-proof.txt");
   expect(await readFile(savedProof, "utf8")).toBe(original);
 
