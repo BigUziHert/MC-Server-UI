@@ -2715,6 +2715,10 @@ export async function createPanel(options = {}) {
     serverDir,
     tick,
     descriptor,
+    iconDataUrl: () =>
+      state.iconPreference !== "default" && cachedIcon
+        ? (cachedIcon.dataUrl ??= `data:image/png;base64,${cachedIcon.bytes.toString("base64")}`)
+        : null,
     subusers: () => state.users.map(userWithPermissions),
     refreshStartupMetadata,
     assertRemovable: () => {

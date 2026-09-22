@@ -43,6 +43,7 @@ files:
   - server/launchpad-extra.mjs
   - shared/subuser-permissions.json
   - shared/panel-connection.mjs
+  - shared/launchpad-project.mjs
   - desktop/main.mjs
   - desktop/runtime.mjs
   - desktop/updates.mjs

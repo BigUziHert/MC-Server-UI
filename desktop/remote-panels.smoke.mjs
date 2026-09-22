@@ -8,9 +8,17 @@ import https from "node:https";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { Resvg } from "@resvg/resvg-js";
 
 const scriptPath = fileURLToPath(import.meta.url);
 const projectDirectory = path.dirname(path.dirname(scriptPath));
+const icon = (fill) =>
+  `data:image/png;base64,${new Resvg(
+    `<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64"><rect width="64" height="64" fill="${fill}"/></svg>`,
+  )
+    .render()
+    .asPng()
+    .toString("base64")}`;
 
 async function fixture() {
   const { app, BrowserWindow, WebContentsView, ipcMain, session } =
@@ -179,6 +187,11 @@ async function fixture() {
   });
   assert.equal(localResponse.status, 201);
   const localServerId = (await localResponse.json()).server.id;
+  const iconResponse = await privateRequest(
+    `/api/server/icon?serverId=${encodeURIComponent(localServerId)}`,
+    { method: "POST", body: JSON.stringify({ image: icon("#008800") }) },
+  );
+  assert.equal(iconResponse.status, 200);
   globalThis.__remotePanelSmoke = {
     ready: true,
     remoteUrl,
@@ -403,6 +416,7 @@ async function smoke() {
         status: "running",
         software: "Paper",
         minecraftVersion: "1.21.8",
+        iconDataUrl: icon("#0044cc"),
       },
     ];
     await application.evaluate(
@@ -423,7 +437,12 @@ async function smoke() {
     );
     const secondId = second.activeId;
     const secondRoster = [
-      { id: "remote-world", name: "Remote creative", status: "offline" },
+      {
+        id: "remote-world",
+        name: "Remote creative",
+        status: "offline",
+        iconDataUrl: icon("#cc4400"),
+      },
     ];
     await application.evaluate(
       (_electron, roster) =>
@@ -444,8 +463,28 @@ async function smoke() {
     assert.equal(state.context.localServers[0].name, "Local smoke world");
     assert.ok(
       Object.keys(state.context.localServers[0]).every((key) =>
-        ["id", "name", "status", "software", "minecraftVersion"].includes(key),
+        [
+          "id",
+          "name",
+          "status",
+          "software",
+          "minecraftVersion",
+          "iconDataUrl",
+        ].includes(key),
       ),
+    );
+    assert.equal(state.context.localServers[0].iconDataUrl, icon("#008800"));
+    const remoteSnapshot = await application.evaluate(() =>
+      globalThis.__remotePanelSmoke.invoke("list", undefined, true),
+    );
+    assert.equal(remoteSnapshot.localServers[0].iconDataUrl, icon("#008800"));
+    assert.deepEqual(
+      remoteSnapshot.panels.find((panel) => panel.id === firstId).servers,
+      firstRoster,
+    );
+    assert.deepEqual(
+      remoteSnapshot.panels.find((panel) => panel.id === secondId).servers,
+      secondRoster,
     );
     assert.equal(
       state.remoteCookies[1].find((item) => item.name === "remote-fixture")
@@ -599,7 +638,7 @@ async function smoke() {
       "A reconnected view must not inherit the disconnected session.",
     );
     console.log(
-      "Passed real Electron remote smoke: one native window, two isolated remote views, retained remote rosters across local switches, scoped signout clearing/selection events, minimal local entries, owner-only persisted selection, cookies/trust preserved, disconnect cleanup, local runtime survival, and clipboard permission checks (OS clipboard untouched).",
+      "Passed real Electron remote smoke: one native window, two isolated remote views, distinct local/remote icons and rosters across switches, scoped signout clearing/selection events, minimal local entries, owner-only persisted selection, cookies/trust preserved, disconnect cleanup, local runtime survival, and clipboard permission checks (OS clipboard untouched).",
     );
   } catch (cause) {
     if (stderr) console.error(stderr);

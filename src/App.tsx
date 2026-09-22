@@ -372,6 +372,9 @@ export default function App({
               ...(optionalText(server.minecraftVersion)
                 ? { minecraftVersion: optionalText(server.minecraftVersion) }
                 : {}),
+              ...(optionalText(server.iconVersion)
+                ? { iconVersion: optionalText(server.iconVersion) }
+                : {}),
             }));
           void reportDesktopServers(roster).catch(() => {});
         }

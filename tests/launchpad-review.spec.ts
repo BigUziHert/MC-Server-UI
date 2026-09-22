@@ -98,6 +98,44 @@ const plan = {
   warnings: [],
 };
 
+test("installed project buttons resolve older panel responses without metadata URLs", async ({
+  page,
+}) => {
+  await catalog(page);
+  const items = [
+    { ...installed("Alpha"), url: undefined },
+    { ...installed("238222", "curseforge"), title: "JEI", url: undefined },
+    {
+      ...installed("Unknown"),
+      platform: null,
+      projectId: undefined,
+      update: undefined,
+      url: undefined,
+    },
+  ];
+  await page.route("**/api/launchpad/installed?**", (route) =>
+    route.fulfill({ json: { items, warnings: [] } }),
+  );
+  await page.goto("/#launchpad");
+  await page.getByRole("switch", { name: "Show installed content" }).check();
+  await expect(
+    page.getByRole("link", { name: "Open Alpha project page" }),
+  ).toHaveAttribute("href", "https://modrinth.com/project/Alpha");
+  await expect(
+    page.getByRole("link", { name: "Open JEI project page" }),
+  ).toHaveAttribute("href", "https://www.curseforge.com/projects/238222");
+  await expect(
+    page.getByRole("link", { name: "Open Unknown project page" }),
+  ).toHaveCount(0);
+  await page
+    .getByRole("article", { name: "Alpha", exact: true })
+    .getByRole("button", { name: "Update Alpha", exact: true })
+    .click();
+  await expect(
+    page.getByRole("dialog").getByRole("link", { name: "Open project page" }),
+  ).toHaveAttribute("href", "https://modrinth.com/project/Alpha");
+});
+
 test("installed project links and update-all review span platforms and retry the accepted download", async ({
   page,
 }) => {

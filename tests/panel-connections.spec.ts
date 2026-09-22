@@ -1,4 +1,14 @@
 import { expect, test, type Page } from "@playwright/test";
+import { Resvg } from "@resvg/resvg-js";
+
+const iconBytes = (fill: string) =>
+  new Resvg(
+    `<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64"><rect width="64" height="64" fill="${fill}"/></svg>`,
+  )
+    .render()
+    .asPng();
+const iconData = (fill: string) =>
+  `data:image/png;base64,${iconBytes(fill).toString("base64")}`;
 
 const invitationToken = "A".repeat(43);
 const panelOrigin = "https://panel.example.test";
@@ -29,6 +39,7 @@ type LocalServerDescriptor = {
   status: "running" | "offline" | "starting" | "stopping";
   software?: string;
   minecraftVersion?: string | null;
+  iconDataUrl?: string;
 };
 
 async function desktopBridge(
@@ -205,6 +216,7 @@ const cachedRemoteServers = {
     {
       id: localServer.id,
       name: "Family survival world",
+      iconDataUrl: iconData("blue"),
       status: "offline" as const,
       software: "Paper",
       minecraftVersion: "1.21.1",
@@ -214,6 +226,7 @@ const cachedRemoteServers = {
     {
       id: localServer.id,
       name: "Friends creative world",
+      iconDataUrl: iconData("green"),
       status: "offline" as const,
       software: "Paper",
       minecraftVersion: "1.21.1",
@@ -502,11 +515,12 @@ for (const { width, localId, label } of [
     context,
   }, testInfo) => {
     const localServers = [
-      localServer,
+      { ...localServer, iconDataUrl: iconData("red") },
       {
         ...localServer,
         id: "local-only-fixture",
         name: "Local survival world",
+        iconDataUrl: iconData("orange"),
       },
     ];
     const remoteServers = [
@@ -564,8 +578,8 @@ for (const { width, localId, label } of [
         remoteServers.some((item) => item.id === serverId)
       )
         return route.fulfill({
-          contentType: "image/svg+xml",
-          body: '<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64"><path fill="#82b362" d="M0 0h64v64H0z"/></svg>',
+          contentType: "image/png",
+          body: iconBytes(serverId === remoteServers[0].id ? "blue" : "green"),
         });
       return route.fulfill({
         status: 404,
@@ -604,7 +618,23 @@ for (const { width, localId, label } of [
     });
     await expect(local).toHaveAttribute("data-local-server-id", localId);
     await expect(localList.locator("[data-server-id]")).toHaveCount(0);
-    await expect(localList.locator("img")).toHaveCount(0);
+    await expect(localList.locator("img")).toHaveCount(2);
+    for (const server of localServers)
+      await expect(
+        localList.getByRole("img", {
+          name: `${server.name} server icon`,
+          exact: true,
+        }),
+      ).toHaveAttribute("src", server.iconDataUrl);
+    await expect
+      .poll(async () =>
+        page.evaluate(async () =>
+          (await window.mcPanelConnections!.list()).panels
+            .find((panel) => panel.id === "pc-one")
+            ?.servers?.map((server) => server.iconDataUrl),
+        ),
+      )
+      .toEqual([iconData("blue"), iconData("green")]);
     await expect(
       remoteList.getByRole("button", {
         name: `Select server ${remoteServers[0].name}`,
@@ -799,7 +829,10 @@ test("returning to this computer keeps each remote roster and selects colliding 
     await expect(row).toHaveAttribute("data-remote-panel-id", panelId);
     await expect(row).toHaveAttribute("data-remote-server-id", server.id);
     await expect(row).toContainText(server.name);
-    await expect(list.locator("img, [data-server-id]")).toHaveCount(0);
+    await expect(list.locator("[data-server-id]")).toHaveCount(0);
+    await expect(
+      row.getByRole("img", { name: `${server.name} server icon`, exact: true }),
+    ).toHaveAttribute("src", server.iconDataUrl);
   }
   await page.screenshot({
     path: testInfo.outputPath("local-with-connected-remote-servers.png"),
@@ -1074,6 +1107,141 @@ for (const reason of ["sign-out", "expired session"] as const) {
     } finally {
       release();
       releaseStatus();
+    }
+  });
+}
+
+for (const reason of ["default icon", "sign-out"] as const) {
+  test(`a late remote icon response cannot restore a cleared image after ${reason}`, async ({
+    page,
+  }) => {
+    let iconVersion: string | null = "initial-icon";
+    const server = {
+      ...localServer,
+      name: "Delayed icon world",
+      accessPermissions: ["control.console"],
+    };
+    await desktopBridge(page, { activeId: "pc-one" });
+    let release!: () => void;
+    const pending = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let fetching = false;
+    let finished!: () => void;
+    const completed = new Promise<void>((resolve) => {
+      finished = resolve;
+    });
+    await page.route("**/api/**", async (route) => {
+      const path = new URL(route.request().url()).pathname;
+      if (path === "/api/access/session")
+        return route.fulfill({
+          json: {
+            role: "subuser",
+            email: "sister@example.test",
+            userId: "sister",
+            serverId: server.id,
+            permissions: ["control.console"],
+          },
+        });
+      if (path === "/api/servers")
+        return route.fulfill({
+          json: {
+            servers: [{ ...server, iconVersion }],
+            defaultServerId: server.id,
+          },
+        });
+      if (path === "/api/server")
+        return route.fulfill({ json: { ...server, iconVersion } });
+      if (path === "/api/console")
+        return route.fulfill({ json: { lines: [] } });
+      if (path === "/api/access/logout")
+        return route.fulfill({ json: { ok: true } });
+      if (path === "/api/server/icon") {
+        if (route.request().resourceType() === "fetch") {
+          fetching = true;
+          await pending;
+          try {
+            await route.fulfill({
+              contentType: "image/png",
+              body: iconBytes("red"),
+            });
+          } catch {
+            /* The cleared icon request is expected to be aborted. */
+          } finally {
+            finished();
+          }
+          return;
+        }
+        return route.fulfill({
+          contentType: "image/png",
+          body: iconBytes("red"),
+        });
+      }
+      return route.fulfill({
+        status: 404,
+        json: { error: "Unavailable in icon fixture." },
+      });
+    });
+    const roster = () =>
+      page.evaluate(
+        async () =>
+          (await window.mcPanelConnections!.list()).panels.find(
+            (panel) => panel.id === "pc-one",
+          )?.servers ?? [],
+      );
+    await page.goto("/#console");
+    try {
+      await expect.poll(() => fetching).toBe(true);
+      if (reason === "sign-out") {
+        await page
+          .getByRole("button", {
+            name: "Account menu for sister@example.test",
+            exact: true,
+          })
+          .click();
+        await page
+          .getByRole("menuitem", { name: "Sign out", exact: true })
+          .click();
+        await expect(
+          page.getByLabel("Password", { exact: true }),
+        ).toBeVisible();
+        await expect.poll(roster).toEqual([]);
+      } else {
+        iconVersion = null;
+        await page.evaluate(
+          (serverId) =>
+            window.dispatchEvent(
+              new CustomEvent("mc-panel-remote-server-selected", {
+                detail: { serverId },
+              }),
+            ),
+          server.id,
+        );
+        await expect(
+          page.getByRole("img", {
+            name: `${server.name} server icon`,
+            exact: true,
+          }),
+        ).toHaveCount(0);
+        await expect
+          .poll(async () => (await roster()).map((entry) => entry.id))
+          .toEqual([server.id]);
+      }
+      release();
+      await completed;
+      await page.evaluate(
+        () =>
+          new Promise<void>((resolve) =>
+            requestAnimationFrame(() => requestAnimationFrame(() => resolve())),
+          ),
+      );
+      const remaining = await roster();
+      expect(remaining.map((entry) => entry.id)).toEqual(
+        reason === "sign-out" ? [] : [server.id],
+      );
+      expect(remaining.some((entry) => entry.iconDataUrl)).toBe(false);
+    } finally {
+      release();
     }
   });
 }

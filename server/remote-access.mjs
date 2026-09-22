@@ -272,6 +272,7 @@ export function createRemoteGateway({
           address: d.address,
           software: d.software,
           version: d.version,
+          minecraftVersion: d.minecraftVersion,
           iconVersion: d.iconVersion,
           accessPermissions: user.permissions,
         };

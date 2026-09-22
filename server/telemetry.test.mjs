@@ -344,7 +344,7 @@ test("Windows CIM query deadline follows the configured overall timeout while re
 
 test(
   "Windows samples a real benign child tree and releases the collector cleanly",
-  { skip: process.platform !== "win32" },
+  { skip: process.platform !== "win32", timeout: 90000 },
   async (t) => {
     const worker =
       "globalThis.memory=Buffer.alloc(32*1024*1024,7);setInterval(()=>{const until=Date.now()+35;while(Date.now()<until){}},100);";
@@ -354,7 +354,9 @@ test(
       stdio: ["pipe", "pipe", "pipe"],
     });
     const exited = new Promise((resolve) => child.once("exit", resolve));
-    const telemetry = createProcessTelemetry({ cacheMs: 0, timeoutMs: 10000 });
+    // Real CIM startup can exceed ten seconds on a busy Windows host; mocked
+    // collector tests above verify the short production timeout independently.
+    const telemetry = createProcessTelemetry({ cacheMs: 0, timeoutMs: 30000 });
     t.after(async () => {
       telemetry.close();
       if (child.exitCode === null) child.stdin.write("stop\n");

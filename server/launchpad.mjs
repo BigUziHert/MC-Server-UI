@@ -11,6 +11,10 @@ import { createVersionsService } from "./versions.mjs";
 import { cleanInstall, prepareCleanSettings } from "./clean-install.mjs";
 import { inferPackRuntime } from "./launchpad-pack-runtime.mjs";
 import {
+  projectPageUrl,
+  safeProjectUrl as projectUrl,
+} from "../shared/launchpad-project.mjs";
+import {
   checkedProviderUrl,
   downloadVerified,
   strongestHash,
@@ -171,17 +175,6 @@ const publicVersion = (value) => ({
   publishedAt: value.publishedAt,
   downloadable: value.downloadable !== false,
 });
-const projectUrl = (value) => {
-  try {
-    const url = new URL(value);
-    return url.protocol === "https:" && !url.username && !url.password
-      ? url.href
-      : undefined;
-  } catch {
-    return undefined;
-  }
-};
-
 // CurseForge's fingerprint is only a lookup hint. Matches below are additionally
 // verified against the API's SHA-1 file hash before an update can be offered.
 export function curseFingerprint(bytes) {
@@ -744,6 +737,10 @@ export async function createLaunchpad(ctx) {
     signal = lifetime.signal,
     urlField = "url",
   ) {
+    for (const item of items) {
+      const url = projectPageUrl({ ...item, url: item[urlField] });
+      if (url) item[urlField] = url;
+    }
     await Promise.all(
       providers.map(async (found) => {
         if (!found.projectMetadata) return;
@@ -1131,6 +1128,8 @@ export async function createLaunchpad(ctx) {
             .map((item) => ({ ...item, name: item.title }))
         : await scan(input.type, input.signal, scanWarnings);
     for (const item of items) {
+      const url = projectPageUrl(item);
+      if (url) item.url = url;
       const cached = updateCache.get(updateKey(input, item));
       // Keep the last verified update visible if the provider is temporarily
       // unavailable. Its expiry controls rechecking, not erasing known updates.

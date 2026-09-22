@@ -254,6 +254,37 @@ test("invited phone sessions are server-scoped, honor changed permissions, and r
   assert.equal((await asUser("/api/server")).status, 401);
 });
 
+test("remote server rosters retain the Minecraft release separately from the loader build", async (t) => {
+  const { fleet, local, invite, id } = await fixture(t);
+  const { asUser } = await invite([]);
+  const initial = (await asUser("/api/servers")).body.servers[0];
+  assert.equal(initial.minecraftVersion, null);
+
+  const argumentFile = "libraries/net/neoforged/neoforge/21.1.251/win_args.txt";
+  const target = path.join(fleet.runtimes.get(id).serverDir, argumentFile);
+  await fs.mkdir(path.dirname(target), { recursive: true });
+  await fs.writeFile(target, "net.fixture.Main\n");
+  const configured = await local(
+    `/api/servers/${id}`,
+    json("PATCH", {
+      launchType: "java-args",
+      launchArgs: [`@${argumentFile}`, "nogui"],
+    }),
+  );
+  assert.equal(configured.status, 200, JSON.stringify(configured.body));
+
+  const roster = await asUser("/api/servers");
+  const selected = await asUser("/api/server");
+  assert.equal(roster.status, 200);
+  assert.equal(selected.status, 200);
+  for (const server of [roster.body.servers[0], selected.body]) {
+    assert.equal(server.id, id);
+    assert.equal(server.software, "NeoForge");
+    assert.equal(server.version, "21.1.251");
+    assert.equal(server.minecraftVersion, "1.21.1");
+  }
+});
+
 test("remote subuser managers cannot escalate through roles, explicit permissions, or encoded target identifiers", async (t) => {
   const { local, invite } = await fixture(t);
   const { asUser, user } = await invite([

@@ -13,7 +13,7 @@ import {
 } from "lucide-react";
 import { api, post, ServerScope } from "./api";
 import AddServer from "./AddServer";
-import { ServerIconImage } from "./ServerIcon";
+import { CachedServerIconImage, ServerIconImage } from "./ServerIcon";
 import { useDesktopConnections } from "./desktop-connections";
 import {
   LaunchAdvancedFields,
@@ -186,11 +186,14 @@ export function ServerSwitcher({
                     aria-busy={openingLocal === server.id || undefined}
                     onClick={() => void openLocal(server.id)}
                   >
-                    <span className="server-mini" aria-hidden="true">
+                    <span className="server-mini">
                       {openingLocal === server.id ? (
                         <LoaderCircle size={18} className="spin" />
                       ) : (
-                        <Box size={18} />
+                        <CachedServerIconImage
+                          name={server.name}
+                          dataUrl={server.iconDataUrl}
+                        />
                       )}
                     </span>
                     <span className="fleet-selection">
@@ -331,11 +334,14 @@ export function ServerSwitcher({
                     aria-busy={opening || undefined}
                     onClick={() => void openRemote(panel.id, server.id)}
                   >
-                    <span className="server-mini" aria-hidden="true">
+                    <span className="server-mini">
                       {opening ? (
                         <LoaderCircle size={18} className="spin" />
                       ) : (
-                        <Box size={18} />
+                        <CachedServerIconImage
+                          name={server.name}
+                          dataUrl={server.iconDataUrl}
+                        />
                       )}
                     </span>
                     <span className="fleet-selection">

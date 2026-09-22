@@ -227,12 +227,14 @@ export async function startDesktopRuntime({
       return [...fleet.runtimes.values()].map((server) => {
         const { id, name, status, software, minecraftVersion } =
           server.descriptor();
+        const iconDataUrl = server.iconDataUrl?.();
         return {
           id,
           name,
           status,
           ...(typeof software === "string" ? { software } : {}),
           ...(typeof minecraftVersion === "string" ? { minecraftVersion } : {}),
+          ...(iconDataUrl ? { iconDataUrl } : {}),
         };
       });
     },

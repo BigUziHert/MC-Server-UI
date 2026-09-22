@@ -3,6 +3,7 @@ import { isIP } from "node:net";
 import path from "node:path";
 import { normalizePanelConnectionUrl } from "../shared/panel-connection.mjs";
 import { installPanelPermissionHandlers } from "./permissions.mjs";
+import { decodeIcon } from "../server/server-icon.mjs";
 import {
   externalWebsite,
   installExternalLinkHandlers,
@@ -11,6 +12,20 @@ import {
 const failure = (status, message) =>
   Object.assign(new Error(message), { status });
 
+const maxRosterIconCharacters = 4 * 1024 * 1024;
+function displayIcon(value, budget) {
+  if (typeof value !== "string" || value.length > budget.remaining) return {};
+  try {
+    // Only bounded, validated 64-pixel PNG bytes may cross session boundaries.
+    // Never forward URLs, filesystem paths, or an SVG supplied by a renderer.
+    decodeIcon(value);
+    budget.remaining -= value.length;
+    return { iconDataUrl: value };
+  } catch {
+    return {};
+  }
+}
+
 function serverRoster(value) {
   if (value === null) return [];
   if (!Array.isArray(value) || value.length > 500)
@@ -18,6 +33,7 @@ function serverRoster(value) {
   const text = (value, maximum) =>
     typeof value === "string" && value.length > 0 && value.length <= maximum;
   const result = [];
+  const iconBudget = { remaining: maxRosterIconCharacters };
   const ids = new Set();
   for (const server of value) {
     if (
@@ -40,6 +56,7 @@ function serverRoster(value) {
       status,
       ...(typeof software === "string" ? { software } : {}),
       ...(typeof minecraftVersion === "string" ? { minecraftVersion } : {}),
+      ...displayIcon(server.iconDataUrl, iconBudget),
     });
   }
   return result;
@@ -178,8 +195,9 @@ export function createRemotePanelController({
     savedWrites = write;
     return write;
   };
-  const localServerEntries = () =>
-    listLocalServers().flatMap((server) => {
+  const localServerEntries = () => {
+    const iconBudget = { remaining: maxRosterIconCharacters };
+    return listLocalServers().flatMap((server) => {
       if (
         !server ||
         typeof server.id !== "string" ||
@@ -195,9 +213,11 @@ export function createRemotePanelController({
           status,
           ...(typeof software === "string" ? { software } : {}),
           ...(typeof minecraftVersion === "string" ? { minecraftVersion } : {}),
+          ...displayIcon(server.iconDataUrl, iconBudget),
         },
       ];
     });
+  };
   const list = () => ({
     activeId,
     // Only the selector's display fields may cross into remote renderers.
@@ -368,10 +388,13 @@ export function createRemotePanelController({
         throw failure(400, "Select a server that is still in the panel.");
       if (!selectLocalServer)
         throw failure(409, "Local server selection is unavailable.");
+      const requestedAt = ++activationVersion;
       await selectLocalServer(id);
       ensureOpen();
       local.contents.send("mc-panel-local-server-selected", id);
-      return activate(local.id);
+      // Saving may wait for older renderer writes. Keep any panel the user
+      // chose during that wait visible while updating the local selection.
+      return requestedAt === activationVersion ? activate(local.id) : list();
     },
     isManagedSender(event) {
       if (closed || !event?.sender || event.sender.isDestroyed()) return false;

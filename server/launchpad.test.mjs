@@ -1997,7 +1997,7 @@ test("old mod and modpack receipts are enriched without compatibility filters or
   assert.deepEqual(JSON.parse(await fs.readFile(receiptPath, "utf8")), legacy);
 });
 
-test("metadata failures preserve installed files, receipt icons, and compatible update checks with a short retry cache", async (t) => {
+test("metadata failures preserve installed files, receipt icons, project links, and compatible update checks with a short retry cache", async (t) => {
   let now = Date.now();
   t.mock.method(Date, "now", () => now);
   const f = await fixture(t, {
@@ -2023,10 +2023,13 @@ test("metadata failures preserve installed files, receipt icons, and compatible 
     ]),
   );
   const restarted = await f.boot();
+  const local = await restarted.installed({ ...selection, local: true });
+  assert.equal(local.items[0].url, "https://modrinth.com/project/project");
   for (let count = 0; count < 2; count++) {
     const result = await restarted.installed(selection);
     assert.equal(result.items.length, 1);
     assert.equal(result.items[0].title, "Saved project title");
+    assert.equal(result.items[0].url, "https://modrinth.com/project/project");
     assert.equal(
       result.items[0].iconUrl,
       "https://cdn.modrinth.com/saved-icon.png",

@@ -6,6 +6,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import selfsigned from "selfsigned";
+import { Resvg } from "@resvg/resvg-js";
 import { normalizePanelConnectionUrl } from "../shared/panel-connection.mjs";
 import { createRemotePanelController } from "./remote-panels.mjs";
 import {
@@ -580,6 +581,36 @@ test("local server selection exposes only display fields and notifies only the o
   await h.controller.close();
 });
 
+test("pending local server selection preserves a newer panel activation", async () => {
+  let finishSave;
+  const h = harness({
+    localServers: [{ id: "local-a", name: "Local world", status: "offline" }],
+    selectLocalServer: () =>
+      new Promise((resolve) => {
+        finishSave = resolve;
+      }),
+  });
+  const first = await h.controller.open(origin);
+  const second = await h.controller.open("https://second.example:3002");
+  h.controller.activate(first.activeId);
+
+  const pending = h.controller.selectLocalServer("local-a");
+  h.controller.activate(second.activeId);
+  finishSave();
+
+  assert.equal((await pending).activeId, second.activeId);
+  assert.equal(h.controller.list().activeId, second.activeId);
+  assert.deepEqual(h.owner.contentView.children, [h.views[1]]);
+  assert.deepEqual(
+    h.owner.webContents.sent.filter(
+      ([channel]) => channel === "mc-panel-local-server-selected",
+    ),
+    [["mc-panel-local-server-selected", "local-a"]],
+    "the saved local selection still reaches its own background renderer",
+  );
+  await h.controller.close();
+});
+
 test("remote rosters stay with their sending sessions across local switches and clear only on that session's signout", async () => {
   const h = harness();
   const handlers = new Map();
@@ -719,6 +750,55 @@ test("remote rosters stay with their sending sessions across local switches and 
   );
   const reconnected = await h.controller.open("https://other.example:3002");
   assert.deepEqual(roster(reconnected.activeId), []);
+  await h.controller.close();
+});
+
+test("selector icons stay with their host for colliding IDs and reject unsafe image sources", async () => {
+  const icon = (fill) =>
+    `data:image/png;base64,${new Resvg(`<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64"><rect width="64" height="64" fill="${fill}"/></svg>`).render().asPng().toString("base64")}`;
+  const record = { id: "same-id", name: "World", status: "offline" };
+  const localIcon = icon("red"),
+    firstIcon = icon("blue"),
+    secondIcon = icon("green");
+  const h = harness({ localServers: [{ ...record, iconDataUrl: localIcon }] });
+  const first = await h.controller.open(origin);
+  const second = await h.controller.open("https://other.example:3002");
+  const report = (index, iconDataUrl) => {
+    const contents = h.views[index].webContents;
+    h.controller.reportServers(
+      { sender: contents, senderFrame: contents.mainFrame },
+      [{ ...record, iconDataUrl }],
+    );
+  };
+  const roster = (id) =>
+    h.controller.list().panels.find((panel) => panel.id === id).servers;
+  report(0, firstIcon);
+  report(1, secondIcon);
+  for (const id of ["local", first.activeId, second.activeId, "local"]) {
+    h.controller.activate(id);
+    assert.equal(h.controller.list().localServers[0].iconDataUrl, localIcon);
+    assert.equal(roster(first.activeId)[0].iconDataUrl, firstIcon);
+    assert.equal(roster(second.activeId)[0].iconDataUrl, secondIcon);
+  }
+  for (const unsafe of [
+    "https://private.example/icon?token=secret",
+    "file:///private/icon.png",
+    "data:image/svg+xml,<svg/>",
+    "data:image/png;base64,AAAA",
+    `data:image/png;base64,${"A".repeat(350000)}`,
+  ]) {
+    report(0, unsafe);
+    assert.deepEqual(roster(first.activeId), [record]);
+    assert.equal(roster(second.activeId)[0].iconDataUrl, secondIcon);
+  }
+  report(0, firstIcon);
+  const contents = h.views[0].webContents;
+  h.controller.reportServers(
+    { sender: contents, senderFrame: contents.mainFrame },
+    null,
+  );
+  assert.deepEqual(roster(first.activeId), []);
+  assert.equal(roster(second.activeId)[0].iconDataUrl, secondIcon);
   await h.controller.close();
 });
 

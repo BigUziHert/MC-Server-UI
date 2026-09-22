@@ -59,6 +59,22 @@ export function ServerIconImage({
   );
 }
 
+// Cross-host selectors receive image bytes through the desktop bridge. Their
+// image URLs must never depend on the currently visible panel's API or cookies.
+export function CachedServerIconImage({
+  dataUrl,
+  name,
+}: {
+  dataUrl?: string;
+  name: string;
+}) {
+  return dataUrl ? (
+    <IconImage key={dataUrl} src={dataUrl} alt={`${name} server icon`} />
+  ) : (
+    <DefaultIcon />
+  );
+}
+
 export default function ServerIcon({
   version,
   serverVersion,

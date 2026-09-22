@@ -38,6 +38,7 @@ import StatePanel from "../StatePanel";
 import Pagination from "../Pagination";
 import Switch from "../Switch";
 import { readPreference, writePreference } from "../preferences";
+import { projectPageUrl } from "../../shared/launchpad-project.mjs";
 import "./management.css";
 import "./launchpad.css";
 
@@ -1547,12 +1548,15 @@ export default function Launchpad({
             description: entry.path,
             iconUrl: entry.iconUrl,
             author: entry.author,
-            url: entry.url,
+            url: projectPageUrl(entry),
           },
           entry,
         }))
       : (results?.projects ?? []).map((project) => ({
-          project,
+          project: {
+            ...project,
+            url: projectPageUrl({ ...project, projectId: project.id }),
+          },
           entry: installed?.items.find(
             (entry) =>
               entry.platform === project.platform &&

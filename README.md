@@ -98,7 +98,7 @@ pnpm desktop:dist
 
 After `desktop:pack` or `desktop:dist`, run `pnpm test:desktop` to smoke-test the packaged app. It uses an isolated temporary workspace so it does not change your normal desktop server data.
 
-Run `node desktop/remote-panels.smoke.mjs` to check remote connections with the installed Electron runtime. This uses a hidden test window, a temporary profile, and loopback HTTPS fixtures to verify certificate confirmation, session isolation, same-window switching, and that disconnecting preserves the local panel.
+Run `node desktop/remote-panels.smoke.mjs` to check remote connections with the installed Electron runtime. This uses a hidden test window, a temporary profile, and loopback HTTPS fixtures to verify certificate confirmation, session isolation, same-window switching, distinct local and remote server icons, and that disconnecting preserves the local panel.
 
 Run `node desktop/remote-persistence.smoke.mjs` to verify saved connections and sign-ins across actual Electron process restarts. It uses a temporary profile and loopback HTTPS fixtures to check restoration, certificate trust, session isolation, sign-out, and disconnect behavior.
 
@@ -211,7 +211,7 @@ During a Launchpad installation, the server stays stopped and the panel reserves
 
 **Versions refresh** reloads the selected provider's releases and builds from the source while keeping the current selection and search. If a runtime update cannot be verified, the review explains why only clean installation is available.
 
-In the desktop app, Launchpad project links and Versions' official software links open in your default web browser.
+In the desktop app, Launchpad project links and Versions' official software links open in your default web browser, including while connected to another computer. Identified installed content keeps its project link when older saved metadata lacks a website URL or a catalog refresh fails; unidentified files need a successful identification first.
 
 Individual content installation reviews list only files that need changing. Files that already match the required download's checksum are omitted from the review and left in place without downloading or replacing them, including required dependencies. The installer rechecks those files before applying the reviewed changes. If a required Modrinth mod dependency points to the wrong loader, Launchpad can use a uniquely verified release of the same project with the exact same version number for the selected Minecraft version and loader. When a different dependency version is already installed on Forge or NeoForge, Launchpad keeps it if its verified JAR satisfies the requesting mod's declared dependency range. Its existing path and bytes stay unchanged; only actual changes appear in the review. Recovery remains blocked when the installed dependency's compatibility or a matching release cannot be verified. Missing catalog entries are shown as requirements needing review; **Install anyway** explicitly confirms installing only the listed compatible files. If every file already matches, no installation is needed.
 

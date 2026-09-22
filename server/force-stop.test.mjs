@@ -244,7 +244,7 @@ test("a hung taskkill helper times out without targeting unrelated processes", a
 
 test(
   "real Windows Force Stop ends a hung saving batch tree and leaves unrelated processes running",
-  { skip: process.platform !== "win32" },
+  { skip: process.platform !== "win32", timeout: 90000 },
   async (t) => {
     const root = await fs.mkdtemp(
       path.join(await fs.realpath(os.tmpdir()), "mc-force-stop-real-"),
@@ -285,6 +285,9 @@ createInterface({ input: process.stdin }).on('line', (line) => {
       useEnvironment: false,
       scheduler: false,
       stopTimeoutMs: 20,
+      // Process-tree enumeration is slower on a busy Windows desktop than the
+      // mocked timeout checks above. Keep this integration deadline bounded.
+      forceStopTimeoutMs: 20000,
       telemetry: { reset() {}, sample: async () => ({ available: false }) },
       publicAddress: { resolve: async () => null },
       spawnServer: (...args) => {
@@ -303,15 +306,39 @@ createInterface({ input: process.stdin }).on('line', (line) => {
       return { status: response.status, body: await response.json() };
     };
     t.after(async () => {
-      if (child && child.exitCode === null && child.signalCode === null)
-        await terminateProcessTree(child, { tree: true });
-      unrelated.kill();
-      await panel.close();
-      listener.closeAllConnections();
-      await new Promise((resolve) => listener.close(resolve));
+      let terminationError;
+      try {
+        if (child && child.exitCode === null && child.signalCode === null)
+          await terminateProcessTree(child, { tree: true, timeoutMs: 20000 });
+      } catch (cause) {
+        terminationError = cause;
+        // A failed taskkill must not leak the deliberately hung test process or
+        // prevent the listener and unrelated-process fixture from being closed.
+        const ownedPid = Number(
+          await fs
+            .readFile(path.join(serverDir, "server.pid"), "utf8")
+            .catch(() => ""),
+        );
+        if (Number.isSafeInteger(ownedPid) && ownedPid > 0) {
+          try {
+            process.kill(ownedPid);
+          } catch (error) {
+            if (error.code !== "ESRCH") throw error;
+          }
+        }
+        child.kill();
+      } finally {
+        unrelated.kill();
+        listener.closeAllConnections();
+        await Promise.all([
+          panel.close(),
+          new Promise((resolve) => listener.close(resolve)),
+        ]);
+      }
       assert.equal(path.dirname(root), await fs.realpath(os.tmpdir()));
       assert.ok(path.basename(root).startsWith("mc-force-stop-real-"));
       await fs.rm(root, { recursive: true, force: true });
+      if (terminationError) throw terminationError;
     });
     assert.equal(
       (await request("/api/server/power", json({ action: "start" }))).status,

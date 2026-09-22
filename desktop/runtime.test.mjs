@@ -7,6 +7,7 @@ import http from "node:http";
 import { fileURLToPath } from "node:url";
 import { EventEmitter } from "node:events";
 import { PassThrough, Writable } from "node:stream";
+import { Resvg } from "@resvg/resvg-js";
 import { DESKTOP_COOKIE_NAME, startDesktopRuntime } from "./runtime.mjs";
 import { createFleet } from "../server/index.mjs";
 import { flushRendererSelection } from "./selection.mjs";
@@ -79,6 +80,32 @@ test("native local server entries omit private configuration and selecting one p
   );
   await runtime.close();
   await assert.rejects(runtime.selectLocalServer(server.id), { status: 503 });
+});
+
+test("native local server icons follow uploads and panel preferences without exposing their file paths", async (t) => {
+  const { launch } = await fixture(t);
+  const runtime = await launch();
+  const server = await addServer(runtime);
+  const bytes = new Resvg(
+    '<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64"><rect width="64" height="64" fill="red"/></svg>',
+  )
+    .render()
+    .asPng();
+  const iconDataUrl = `data:image/png;base64,${bytes.toString("base64")}`;
+  const icon = `/api/server/icon?serverId=${server.id}`;
+  assert.equal(
+    (await runtime.request(icon, json("POST", { image: iconDataUrl }))).status,
+    200,
+  );
+  assert.equal(runtime.listLocalServers()[0].iconDataUrl, iconDataUrl);
+  assert.equal(runtime.listLocalServers()[0].serverDir, undefined);
+  assert.equal((await runtime.request(icon, { method: "DELETE" })).status, 200);
+  assert.equal(runtime.listLocalServers()[0].iconDataUrl, undefined);
+  assert.equal(
+    (await runtime.request(icon, json("PUT", { preference: "server" }))).status,
+    200,
+  );
+  assert.equal(runtime.listLocalServers()[0].iconDataUrl, iconDataUrl);
 });
 
 test("native selection persistence failures do not expose local filesystem paths", async (t) => {
