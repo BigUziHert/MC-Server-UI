@@ -658,6 +658,305 @@ test("Properties validates empty, fractional, and out-of-range numbers before sa
     ]),
   );
 });
+async function mockQuickUpdate(page: Page, serverId: string) {
+  const state = {
+    status: "offline",
+    available: true,
+    provider: "neoforge",
+    installedBuild: "21.1.250" as string | null,
+    failBuilds: false,
+    holdBuilds: false,
+    heldBuilds: undefined as Route | undefined,
+    builds: [
+      { id: "21.1.260-beta", label: "21.1.260-beta", stable: false },
+      { id: "21.1.250", label: "21.1.250", stable: true },
+      { id: "21.1.251", label: "21.1.251", stable: true },
+    ],
+    installations: [] as unknown[],
+    refreshed: [] as string[],
+  };
+  await page.route("**/api/server", async (route) => {
+    const response = await route.fetch();
+    await route.fulfill({
+      json: { ...(await response.json()), status: state.status },
+    });
+  });
+  await page.route(/\/api\/versions(?:\/.*)?(?:\?.*)?$/, (route) => {
+    expect(route.request().headers()["x-server-id"]).toBe(serverId);
+    const url = new URL(route.request().url());
+    if (url.searchParams.get("refresh") === "1")
+      state.refreshed.push(url.pathname);
+    if (url.pathname === "/api/versions/install") {
+      state.installations.push(route.request().postDataJSON());
+      return route.fulfill({
+        status: 202,
+        json: { id: "quick-runtime-update", state: "complete" },
+      });
+    }
+    if (url.pathname === "/api/versions")
+      return route.fulfill({
+        json: {
+          providers: ["neoforge", "vanilla", "paper"].map((id) => ({
+            id,
+            name:
+              id === "neoforge"
+                ? "NeoForge"
+                : id === "vanilla"
+                  ? "Vanilla"
+                  : "Paper",
+            description: "Fixture server software",
+            kind: "server",
+            installable: true,
+            website: "https://example.com",
+          })),
+          current: {
+            software: state.provider === "neoforge" ? "NeoForge" : "Vanilla",
+            version: state.installedBuild ?? "1.21.1",
+            status: state.status,
+            mode: "live",
+          },
+          runtimeUpdate: {
+            available: state.available,
+            reason: state.available
+              ? undefined
+              : "The installed runtime could not be identified.",
+            provider: state.provider,
+            gameVersion: "1.21.1",
+            build: state.installedBuild,
+          },
+          job: null,
+        },
+      });
+    if (url.pathname === `/api/versions/${state.provider}/1.21.1`) {
+      if (state.holdBuilds) {
+        state.heldBuilds = route;
+        return;
+      }
+      return state.failBuilds
+        ? route.fulfill({
+            status: 502,
+            json: { error: "The official build catalog is unavailable." },
+          })
+        : route.fulfill({ json: { builds: state.builds } });
+    }
+    return route.fulfill({
+      json: { versions: [{ id: "1.21.1", label: "1.21.1", stable: true }] },
+    });
+  });
+  return state;
+}
+
+test("Versions quick update reviews the latest stable build for the current server even while browsing another software", async ({
+  page,
+  serverId,
+}, testInfo) => {
+  const state = await mockQuickUpdate(page, serverId);
+  await page.goto("/#versions");
+  const quick = page.getByRole("button", { name: "Quick update", exact: true });
+  await expect(quick).toBeEnabled();
+  await expect(quick).toHaveAccessibleDescription(
+    "Latest stable build · Keeps files · Minecraft 1.21.1",
+  );
+  await page.screenshot({
+    path: testInfo.outputPath("versions-quick-update-desktop.png"),
+    fullPage: true,
+  });
+  await page
+    .locator(".version-provider-paper")
+    .getByRole("button", { name: "Choose version" })
+    .click();
+  await expect(page.locator(".versions-toolbar h2")).toHaveText("Paper");
+  state.holdBuilds = true;
+  await quick.click();
+  await expect(
+    page.getByRole("button", { name: "Checking…", exact: true }),
+  ).toBeDisabled();
+  await expect.poll(() => Boolean(state.heldBuilds)).toBe(true);
+  await state.heldBuilds!.fulfill({ json: { builds: state.builds } });
+  const dialog = page.getByRole("dialog", {
+    name: "Update NeoForge",
+    exact: true,
+  });
+  await expect(dialog).toBeVisible();
+  await expect(dialog).toContainText("21.1.251 for Minecraft 1.21.1");
+  await expect(dialog).not.toContainText("21.1.260-beta");
+  await expect(
+    dialog.getByRole("radio", { name: /Update runtime/ }),
+  ).toBeChecked();
+  await expect(dialog).toContainText("Your server files stay in place");
+  expect(state.installations).toEqual([]);
+  expect(state.refreshed.sort()).toEqual([
+    "/api/versions",
+    "/api/versions/neoforge/1.21.1",
+  ]);
+  await dialog
+    .getByRole("button", { name: "Update runtime", exact: true })
+    .click();
+  expect(state.installations).toEqual([
+    {
+      provider: "neoforge",
+      version: "1.21.1",
+      build: "21.1.251",
+      confirmed: true,
+      updateRuntime: true,
+    },
+  ]);
+  await expect(dialog).not.toBeVisible();
+  await page.setViewportSize({ width: 390, height: 844 });
+  await expect(quick).toBeVisible();
+  expect(
+    await page.evaluate(
+      () => document.documentElement.scrollWidth <= window.innerWidth,
+    ),
+  ).toBe(true);
+  await page.screenshot({
+    path: testInfo.outputPath("versions-quick-update-mobile.png"),
+    fullPage: true,
+  });
+  await page.unrouteAll({ behavior: "wait" });
+});
+
+test("Versions quick update handles current builds, experimental-only catalogs, and retryable failures without installing", async ({
+  page,
+  serverId,
+}) => {
+  const state = await mockQuickUpdate(page, serverId);
+  state.installedBuild = "21.1.251";
+  await page.goto("/#versions");
+  const quick = page.getByRole("button", { name: "Quick update", exact: true });
+  await quick.click();
+  await expect(
+    page.getByText(
+      "No newer stable NeoForge build is available for Minecraft 1.21.1.",
+      { exact: true },
+    ),
+  ).toBeVisible();
+  await expect(page.getByRole("dialog")).not.toBeVisible();
+  state.installedBuild = "21.1.260-beta";
+  await quick.click();
+  await expect(quick).toBeEnabled();
+  await expect(page.getByRole("dialog")).not.toBeVisible();
+  state.builds = state.builds.filter((build) => !build.stable);
+  await quick.click();
+  await expect(
+    page.getByText(/No stable NeoForge builds are available/),
+  ).toBeVisible();
+  state.failBuilds = true;
+  await quick.click();
+  await expect(
+    page.getByText("The official build catalog is unavailable.", {
+      exact: true,
+    }),
+  ).toBeVisible();
+  await expect(quick).toBeEnabled();
+  state.failBuilds = false;
+  state.installedBuild = "21.1.250";
+  state.builds = [{ id: "21.1.251", label: "21.1.251", stable: true }];
+  await quick.click();
+  await expect(
+    page.getByRole("dialog", { name: "Update NeoForge", exact: true }),
+  ).toBeVisible();
+  expect(state.installations).toEqual([]);
+  await page.unrouteAll({ behavior: "wait" });
+});
+
+test("Versions quick update rechecks the stopped server and disables unverified runtimes", async ({
+  page,
+  serverId,
+}) => {
+  const state = await mockQuickUpdate(page, serverId);
+  await page.goto("/#versions");
+  const quick = page.getByRole("button", { name: "Quick update", exact: true });
+  await expect(quick).toBeEnabled();
+  state.status = "running";
+  await quick.click();
+  await expect(quick).toBeDisabled();
+  await expect(quick).toHaveAccessibleDescription(
+    "Stop this server before updating.",
+  );
+  expect(state.refreshed).toEqual(["/api/versions"]);
+  await expect(page.getByRole("dialog")).not.toBeVisible();
+  state.status = "offline";
+  state.available = false;
+  await expect(quick).toHaveAccessibleDescription(
+    "The installed runtime could not be identified.",
+  );
+  await expect(quick).toBeDisabled();
+  expect(state.installations).toEqual([]);
+  await page.unrouteAll({ behavior: "wait" });
+});
+
+test("Versions quick update skips an installed Vanilla release, requires an identified loader build, and accepts a stable successor to its prerelease", async ({
+  page,
+  serverId,
+}) => {
+  const state = await mockQuickUpdate(page, serverId);
+  state.provider = "vanilla";
+  state.installedBuild = null;
+  state.builds = [{ id: "1.21.1", label: "Official server", stable: true }];
+  await page.goto("/#versions");
+  const quick = page.getByRole("button", { name: "Quick update", exact: true });
+  await quick.click();
+  await expect(
+    page.getByText(
+      "No newer stable Vanilla build is available for Minecraft 1.21.1.",
+      { exact: true },
+    ),
+  ).toBeVisible();
+  await expect(page.getByRole("dialog")).not.toBeVisible();
+  state.provider = "neoforge";
+  await expect(quick).toHaveAccessibleDescription(
+    "Installed build could not be identified. Choose a version to review an update.",
+  );
+  await expect(quick).toBeDisabled();
+  state.installedBuild = "Unknown";
+  await page
+    .getByRole("button", { name: "Refresh versions", exact: true })
+    .click();
+  await expect(quick).toBeDisabled();
+  state.installedBuild = "21.1.251-beta";
+  state.builds = [{ id: "21.1.251", label: "21.1.251", stable: true }];
+  await page
+    .getByRole("button", { name: "Refresh versions", exact: true })
+    .click();
+  await expect(quick).toBeEnabled();
+  await quick.click();
+  await expect(
+    page.getByRole("dialog", { name: "Update NeoForge", exact: true }),
+  ).toContainText("21.1.251 for Minecraft 1.21.1");
+  expect(state.installations).toEqual([]);
+  await page.unrouteAll({ behavior: "wait" });
+});
+
+test("Versions discards a quick update response after leaving the page", async ({
+  page,
+  serverId,
+}) => {
+  const state = await mockQuickUpdate(page, serverId);
+  state.holdBuilds = true;
+  await page.goto("/#versions");
+  await page.getByRole("button", { name: "Quick update", exact: true }).click();
+  await expect.poll(() => Boolean(state.heldBuilds)).toBe(true);
+  await page
+    .locator(".sidebar")
+    .getByRole("link", { name: "Console", exact: true })
+    .click();
+  await expect(
+    page.getByRole("heading", { name: "Console", exact: true }),
+  ).toBeVisible();
+  await state.heldBuilds!.fulfill({ json: { builds: state.builds } });
+  await page
+    .locator(".sidebar")
+    .getByRole("link", { name: "Versions", exact: true })
+    .click();
+  await expect(
+    page.getByRole("button", { name: "Quick update", exact: true }),
+  ).toBeEnabled();
+  await expect(page.getByRole("dialog")).not.toBeVisible();
+  expect(state.installations).toEqual([]);
+  await page.unrouteAll({ behavior: "wait" });
+});
+
 test("Versions updates an imported NeoForge runtime without a clean install and keeps clean install explicit", async ({
   page,
   serverId,

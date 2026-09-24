@@ -56,6 +56,25 @@ type Catalog = {
   runtimeUpdate?: RuntimeUpdate;
   job?: Job | null;
 };
+
+function installedRuntimeBuild(runtime?: RuntimeUpdate | null) {
+  const build =
+    runtime?.build ??
+    (runtime?.provider === "vanilla" ? runtime.gameVersion : null);
+  return build && /^\d[\w.+-]*$/.test(build) ? build : null;
+}
+
+function newerStableBuild(candidate: Build, installed: string) {
+  const installedCore = installed.replace(
+    /[-.]?(?:alpha|beta|snapshot|pre|rc).*$/i,
+    "",
+  );
+  const comparison = candidate.id.localeCompare(installedCore, "en", {
+    numeric: true,
+  });
+  return comparison > 0 || (comparison === 0 && installedCore !== installed);
+}
+
 type Job = {
   id: string;
   status: "queued" | "running" | "completed" | "failed";
@@ -145,11 +164,29 @@ export default function Versions({
   const [accepted, setAccepted] = useState(false);
   const [installMode, setInstallMode] = useState<"update" | "clean">("clean");
   const [submitting, setSubmitting] = useState(false);
+  const [checkingUpdate, setCheckingUpdate] = useState(false);
   const [job, setJob] = useState<Job | null>(null);
   const [dialogError, setDialogError] = useState("");
   const generation = useRef(0);
   const dialog = useRef<HTMLDialogElement>(null);
   const jobBusy = job?.status === "queued" || job?.status === "running";
+  const currentProvider = providers.find(
+    (provider) => provider.id === runtimeUpdate?.provider,
+  );
+  const quickUpdateReason = !allowChanges
+    ? "You do not have permission to update server software."
+    : jobBusy || submitting
+      ? "Wait for the current installation to finish."
+      : current?.status !== "offline"
+        ? "Stop this server before updating."
+        : !runtimeUpdate?.available ||
+            !runtimeUpdate.gameVersion ||
+            !currentProvider?.installable
+          ? runtimeUpdate?.reason ||
+            "Quick updates are unavailable for this runtime."
+          : !installedRuntimeBuild(runtimeUpdate)
+            ? "Installed build could not be identified. Choose a version to review an update."
+            : "";
   const canUpdate = Boolean(
     runtimeUpdate?.available &&
     runtimeUpdate.provider === selected?.id &&
@@ -225,6 +262,7 @@ export default function Versions({
     setVersion("");
     setJob(null);
     setConfirming(null);
+    setCheckingUpdate(false);
     setSearch("");
     void refresh();
     return () => {
@@ -360,6 +398,83 @@ export default function Versions({
       if (token === generation.current) setLoadingBuilds(false);
     }
   }
+  async function quickUpdate() {
+    if (quickUpdateReason || checkingUpdate || loading || loadingBuilds) return;
+    const token = ++generation.current;
+    setCheckingUpdate(true);
+    setError("");
+    try {
+      const [catalog, server] = await Promise.all([
+        api<Catalog>("/versions?refresh=1"),
+        api<Current>("/server"),
+      ]);
+      if (token !== generation.current) return;
+      const runtime = catalog.runtimeUpdate;
+      const provider = catalog.providers.find(
+        (entry) => entry.id === runtime?.provider,
+      );
+      const latestJob = catalog.job ? normalizeJob(catalog.job) : null;
+      setCurrent({ ...server, ...catalog.current, status: server.status });
+      setRuntimeUpdate(runtime ?? null);
+      setProviders(catalog.providers);
+      setJob(latestJob);
+      if (server.status !== "offline")
+        throw new Error("Stop this server before updating.");
+      if (latestJob?.status === "queued" || latestJob?.status === "running")
+        throw new Error("Wait for the current installation to finish.");
+      if (!runtime?.available || !runtime.gameVersion || !provider?.installable)
+        throw new Error(
+          runtime?.reason || "Quick updates are unavailable for this runtime.",
+        );
+      const installedBuild = installedRuntimeBuild(runtime);
+      if (!installedBuild)
+        throw new Error(
+          "Installed build could not be identified. Choose a version to review an update.",
+        );
+      const base = `/versions/${encodeURIComponent(provider.id)}`;
+      // Refreshing builds also refreshes its provider's release catalog.
+      const buildResult = await api<{ builds: Build[] }>(
+        `${base}/${encodeURIComponent(runtime.gameVersion)}?refresh=1`,
+      );
+      if (token !== generation.current) return;
+      const latest = buildResult.builds
+        .filter((build) => build.stable)
+        .sort((a, b) => b.id.localeCompare(a.id, "en", { numeric: true }))[0];
+      if (!latest)
+        throw new Error(
+          `No stable ${provider.name} builds are available for Minecraft ${runtime.gameVersion}. Choose a version to review experimental builds.`,
+        );
+      if (!newerStableBuild(latest, installedBuild)) {
+        notify(
+          `No newer stable ${provider.name} build is available for Minecraft ${runtime.gameVersion}.`,
+        );
+        return;
+      }
+      const releaseResult = await api<{ versions: Release[] }>(base);
+      if (token !== generation.current) return;
+      setSelected(provider);
+      setVersion(runtime.gameVersion);
+      setReleases(releaseResult.versions);
+      setBuilds(buildResult.builds);
+      setReleaseSearch("");
+      setLoading(false);
+      setLoadingBuilds(false);
+      setConfirming(latest);
+      setInstallMode("update");
+      setAccepted(false);
+      setDialogError("");
+    } catch (cause) {
+      if (token === generation.current)
+        notify(
+          cause instanceof Error
+            ? cause.message
+            : "Unable to check for updates.",
+          true,
+        );
+    } finally {
+      if (token === generation.current) setCheckingUpdate(false);
+    }
+  }
   async function install() {
     if (
       !allowChanges ||
@@ -443,9 +558,30 @@ export default function Versions({
           <span className={`status-badge ${current.status}`}>
             {current.status}
           </span>
-          <span className="versions-current-hint">
-            Runtime updates keep your files. Clean installs replace them.
-          </span>
+          <div className="versions-current-update">
+            <button
+              className="btn primary"
+              disabled={
+                Boolean(quickUpdateReason) ||
+                checkingUpdate ||
+                loading ||
+                loadingBuilds
+              }
+              aria-describedby="versions-quick-update-hint"
+              onClick={() => void quickUpdate()}
+            >
+              {checkingUpdate ? (
+                <LoaderCircle size={15} className="spin" />
+              ) : (
+                <RefreshCw size={15} />
+              )}
+              {checkingUpdate ? "Checking…" : "Quick update"}
+            </button>
+            <span id="versions-quick-update-hint">
+              {quickUpdateReason ||
+                `Latest stable build · Keeps files${runtimeUpdate?.gameVersion ? ` · Minecraft ${runtimeUpdate.gameVersion}` : ""}`}
+            </span>
+          </div>
         </section>
       )}
       {job && (
@@ -533,7 +669,7 @@ export default function Versions({
           <div className="versions-toolbar">
             <RefreshButton
               label="Refresh versions"
-              disabled={jobBusy || submitting}
+              disabled={jobBusy || submitting || checkingUpdate}
               onRefresh={() => refresh(true)}
               notify={notify}
               successMessage="Versions refreshed."
@@ -586,7 +722,7 @@ export default function Versions({
                       <button
                         className="btn"
                         onClick={() => void chooseProvider(provider)}
-                        disabled={jobBusy}
+                        disabled={jobBusy || checkingUpdate}
                       >
                         Choose version <ChevronRight size={15} />
                       </button>
@@ -609,13 +745,13 @@ export default function Versions({
       ) : (
         <>
           <div className="versions-toolbar">
-            <button className="btn" onClick={back}>
+            <button className="btn" onClick={back} disabled={checkingUpdate}>
               <ArrowLeft size={15} /> All software
             </button>
             <h2>{selected.name}</h2>
             <RefreshButton
               label="Refresh versions"
-              disabled={jobBusy || submitting}
+              disabled={jobBusy || submitting || checkingUpdate}
               onRefresh={() => refresh(true)}
               notify={notify}
               successMessage="Versions refreshed."
@@ -662,6 +798,7 @@ export default function Versions({
                       key={release.id}
                       className={version === release.id ? "active" : ""}
                       onClick={() => void chooseVersion(release.id)}
+                      disabled={checkingUpdate}
                     >
                       <span>{release.label}</span>
                       {!release.stable && <small>Experimental</small>}
@@ -772,6 +909,7 @@ export default function Versions({
                         }
                         disabled={
                           !allowChanges ||
+                          checkingUpdate ||
                           jobBusy ||
                           current?.status !== "offline"
                         }

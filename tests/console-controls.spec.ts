@@ -76,6 +76,104 @@ test("cleared console lines stay hidden when the marker is absent and recover af
 });
 
 for (const width of [1348, 390]) {
+  test(`console level filters combine with search, live output, and clearing at ${width}px`, async ({
+    page,
+    serverId,
+  }, testInfo) => {
+    await page.setViewportSize({ width, height: 1000 });
+    const line = (id: number, level: string, message: string) => ({
+      id,
+      level,
+      message,
+      time: "12:00:00",
+    });
+    let lines = [
+      line(1, "info", "Server ready"),
+      line(2, "success", "World saved"),
+      line(3, "debug", "Tick completed"),
+      line(4, "warn", "World save delayed"),
+      line(5, "WARNING", "Plugin response delayed"),
+      line(6, "ERROR", "World save failed"),
+      line(7, "fatal", "Plugin failed to load"),
+    ];
+    await page.route("**/api/console", (route) =>
+      route.fulfill({ json: { lines } }),
+    );
+    await page.addInitScript(
+      (id) => localStorage.setItem("mc-panel.active-server", id),
+      serverId,
+    );
+    await page.goto("/#console");
+    const output = page.getByRole("log");
+    const messages = output.locator(".log-message");
+    await expect(messages).toHaveCount(7);
+    const filterToggle = page.getByRole("button", {
+      name: "Filter console levels",
+      exact: true,
+    });
+    await filterToggle.click();
+    await expect(filterToggle).toHaveAttribute("aria-expanded", "true");
+    const filters = page.getByRole("group", { name: "Console log level" });
+    const chooseLevel = (name: string) =>
+      filters.getByRole("button", { name, exact: true }).click();
+    await chooseLevel("ERROR");
+    await expect(messages).toHaveText([
+      "World save failed",
+      "Plugin failed to load",
+    ]);
+    await chooseLevel("INFO");
+    await expect(messages).toHaveText([
+      "Server ready",
+      "World saved",
+      "Tick completed",
+    ]);
+    await chooseLevel("WARNING");
+    await expect(messages).toHaveText([
+      "World save delayed",
+      "Plugin response delayed",
+    ]);
+    await filterToggle.click();
+    await expect(filters).toHaveCount(0);
+    await expect(filterToggle).toHaveClass(/selected/);
+    lines = [...lines, line(8, "warn", "World overload warning")];
+    await expect(messages).toHaveCount(3);
+    await page.getByRole("button", { name: "Search console logs" }).click();
+    await page
+      .getByRole("textbox", { name: "Filter console logs" })
+      .fill("World");
+    await expect(messages).toHaveText([
+      "World save delayed",
+      "World overload warning",
+    ]);
+    await page
+      .getByRole("textbox", { name: "Filter console logs" })
+      .fill("missing");
+    await expect(output).toContainText("No logs match your filters.");
+    await page.getByRole("button", { name: "Close log search" }).click();
+    await expect(messages).toHaveCount(3);
+    await filterToggle.click();
+    await expect(
+      filters.getByRole("button", { name: "WARNING", exact: true }),
+    ).toHaveAttribute("aria-pressed", "true");
+    expect(
+      await page.evaluate(() => document.documentElement.scrollWidth),
+    ).toBeLessThanOrEqual(width);
+    await page.screenshot({
+      path: testInfo.outputPath(`console-filters-${width}.png`),
+      fullPage: true,
+    });
+    await page
+      .getByRole("button", { name: "Clear console view", exact: true })
+      .click();
+    await expect(messages).toHaveCount(0);
+    await chooseLevel("All logs");
+    await expect(messages).toHaveCount(0);
+    lines = [...lines, line(9, "info", "New console output")];
+    await expect(messages).toHaveText(["New console output"]);
+  });
+}
+
+for (const width of [1348, 390]) {
   test(`a stopping server offers a confirmed Force Stop and recovers at ${width}px`, async ({
     page,
     request,

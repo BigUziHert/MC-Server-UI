@@ -13,6 +13,7 @@ import {
   Cloud,
   Copy,
   Cpu,
+  Eraser,
   ExternalLink,
   FileText,
   FolderOpen,
@@ -117,6 +118,25 @@ type LogLine = {
   level: string;
   message: string;
 };
+const consoleLevelFilters = [
+  { value: "all", label: "All logs" },
+  { value: "error", label: "ERROR" },
+  { value: "warn", label: "WARNING" },
+  { value: "regular", label: "INFO" },
+] as const;
+type ConsoleLevelFilter = (typeof consoleLevelFilters)[number]["value"];
+function consoleLevelGroup(level: string): ConsoleLevelFilter {
+  switch (level.trim().toLowerCase()) {
+    case "error":
+    case "fatal":
+      return "error";
+    case "warn":
+    case "warning":
+      return "warn";
+    default:
+      return "regular";
+  }
+}
 const navigationGroups = [
   { id: "servers", label: "SERVER SELECTOR" },
   { id: "server", label: "SERVER" },
@@ -1562,6 +1582,9 @@ function ConsolePage({
   const [search, setSearch] = useState("");
   const query = useDebouncedValue(search);
   const [showSearch, setShowSearch] = useState(false);
+  const [showFilters, setShowFilters] = useState(false);
+  const [levelFilter, setLevelFilter] = useState<ConsoleLevelFilter>("all");
+  const filtersId = useId();
   const [autoScroll, setAutoScroll] = useState(true);
   const { busy, commandRequest, setCommandBusy } = controls;
   const [hiddenUntil, setHiddenUntil] = useState<string | number | null>(null);
@@ -1596,7 +1619,7 @@ function ConsolePage({
   useEffect(() => {
     if (autoScroll && logContainer.current)
       logContainer.current.scrollTop = logContainer.current.scrollHeight;
-  }, [lines, autoScroll]);
+  }, [lines, autoScroll, levelFilter, query, showSearch]);
   useEffect(() => {
     const listener = (e: KeyboardEvent) => {
       if ((e.ctrlKey || e.metaKey) && e.key === "k") {
@@ -1672,6 +1695,10 @@ function ConsolePage({
   const visibleLines = lines
     .filter(
       (line) => hiddenUntil === null || Number(line.id) > Number(hiddenUntil),
+    )
+    .filter(
+      (line) =>
+        levelFilter === "all" || consoleLevelGroup(line.level) === levelFilter,
     )
     .filter((line) =>
       `${line.message} ${line.level}`
@@ -1891,12 +1918,22 @@ function ConsolePage({
                   <Search size={16} />
                 </button>
                 <button
+                  className={`tool-button ${showFilters || levelFilter !== "all" ? "selected" : ""}`}
+                  aria-label="Filter console levels"
+                  title={`Filter logs: ${consoleLevelFilters.find((filter) => filter.value === levelFilter)?.label}`}
+                  aria-expanded={showFilters}
+                  aria-controls={filtersId}
+                  onClick={() => setShowFilters((value) => !value)}
+                >
+                  <ListFilter size={16} />
+                </button>
+                <button
                   className="tool-button"
                   aria-label="Clear console view"
                   title="Clear view"
                   onClick={() => setHiddenUntil(lines.at(-1)?.id ?? null)}
                 >
-                  <ListFilter size={16} />
+                  <Eraser size={16} />
                 </button>
                 <button
                   className="tool-button"
@@ -1908,6 +1945,26 @@ function ConsolePage({
                 </button>
               </div>
             </div>
+            {showFilters && (
+              <div
+                className="console-level-filters"
+                id={filtersId}
+                role="group"
+                aria-label="Console log level"
+              >
+                {consoleLevelFilters.map((filter) => (
+                  <button
+                    key={filter.value}
+                    type="button"
+                    className={`console-level-filter console-level-${filter.value}`}
+                    aria-pressed={levelFilter === filter.value}
+                    onClick={() => setLevelFilter(filter.value)}
+                  >
+                    {filter.label}
+                  </button>
+                ))}
+              </div>
+            )}
             {showSearch && (
               <div className="log-search">
                 <SearchField
@@ -1963,9 +2020,11 @@ function ConsolePage({
                 <div className="console-empty">
                   <Terminal size={24} />
                   <p>
-                    {search
-                      ? "No logs match your search."
-                      : "Console is ready. Server output will appear here."}
+                    {levelFilter !== "all"
+                      ? "No logs match your filters."
+                      : search
+                        ? "No logs match your search."
+                        : "Console is ready. Server output will appear here."}
                   </p>
                 </div>
               )}

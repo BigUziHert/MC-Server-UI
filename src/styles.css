@@ -827,6 +827,48 @@ input:disabled {
   display: flex;
   gap: 6px;
 }
+.console-panel > .panel-heading {
+  flex-wrap: wrap;
+  gap: 10px;
+}
+.console-panel .console-tools {
+  margin-left: auto;
+}
+.console-level-filters {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 10px 17px;
+  border-bottom: 1px solid #303140;
+  background: #1c1d27;
+}
+.console-level-filter {
+  padding: 6px 9px;
+  border: 1px solid transparent;
+  border-radius: 5px;
+  background: none;
+  color: var(--muted);
+  font-size: 10px;
+}
+.console-level-filter:hover {
+  background: #272833;
+  color: #d4d8e9;
+}
+.console-level-filter[aria-pressed="true"] {
+  border-color: #4b5267;
+  background: #303140;
+  color: #d4d8e9;
+}
+.console-level-error[aria-pressed="true"] {
+  border-color: #795052;
+  background: #4a2727;
+  color: var(--danger);
+}
+.console-level-warn[aria-pressed="true"] {
+  border-color: #776229;
+  background: #3b3218;
+  color: #ffd000;
+}
 .tool-button {
   background: none;
   color: #969bb3;

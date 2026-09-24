@@ -44,10 +44,22 @@
   color: var(--muted);
   margin-left: 8px;
 }
-.versions-current-hint {
+.versions-current-update {
   margin-left: auto;
-  font-size: 12px;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 7px;
+  max-width: 380px;
+  text-align: right;
+}
+.versions-current-update > span {
+  font-size: 11px;
+  line-height: 1.5;
   color: var(--muted);
+}
+.versions-current-update .btn {
+  white-space: nowrap;
 }
 .versions-install-mode {
   border: 1px solid var(--border);
@@ -363,9 +375,6 @@
     flex-direction: column;
     gap: 5px;
   }
-  .versions-current-hint {
-    display: none;
-  }
   .versions-browser {
     grid-template-columns: 230px minmax(0, 1fr);
   }
@@ -378,6 +387,14 @@
   .versions-current {
     padding: 16px;
     gap: 10px;
+    flex-wrap: wrap;
+  }
+  .versions-current-update {
+    align-items: flex-start;
+    margin-left: 0;
+    flex-basis: 100%;
+    max-width: none;
+    text-align: left;
   }
   .versions-toolbar {
     flex-wrap: wrap;
