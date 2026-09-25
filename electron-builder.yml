@@ -24,6 +24,7 @@ files:
   - server/server-icon.mjs
   - server/telemetry.mjs
   - server/recycle-bin.mjs
+  - server/backup-archive.mjs
   - server/player-history.mjs
   - server/minecraft.mjs
   - server/clean-install.mjs

@@ -76,6 +76,42 @@ async function backupNames(request: APIRequestContext, fixture: BackupFixture) {
     .sort();
 }
 
+test("backup history shows compressed sizes and savings without requiring legacy metadata", async ({
+  page,
+  backups,
+}) => {
+  await page.route("**/api/backups", async (route) => {
+    if (route.request().method() !== "GET") return route.continue();
+    const response = await route.fetch();
+    const result = await response.json();
+    result.backups = result.backups.map((backup: Record<string, unknown>) => {
+      const { compression, compressionLevel, originalSize, ...legacy } = backup;
+      if (backup.name === "Beta backup") return { ...legacy, size: 1024 };
+      return {
+        ...legacy,
+        size: 1024,
+        compression: "gzip",
+        compressionLevel: 9,
+        originalSize: backup.name === "Alpha backup" ? 4096 : 512,
+      };
+    });
+    await route.fulfill({ response, json: result });
+  });
+  await openBackups(page, backups);
+  const alpha = page.getByRole("article").filter({ hasText: "Alpha backup" });
+  await expect(alpha).toContainText("1.0 KB compressed");
+  await expect(alpha).toContainText(".tar.gz");
+  await expect(alpha).toContainText("3.0 KB saved");
+  for (const name of ["Beta backup", "Gamma backup"]) {
+    const row = page.getByRole("article").filter({ hasText: name });
+    await expect(row).toContainText("1.0 KB compressed");
+    await expect(row).not.toContainText("saved");
+    await expect(
+      row.getByRole("link", { name: `Download backup ${name}`, exact: true }),
+    ).toBeVisible();
+  }
+});
+
 test("backup dialogs use native modal focus, restore the trigger, and stay open while saving", async ({
   page,
   backups,

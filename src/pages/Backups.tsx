@@ -39,6 +39,9 @@ type Backup = {
   createdAt: string;
   status: "completed";
   trigger: "manual" | "scheduled";
+  compression?: "gzip";
+  compressionLevel?: number;
+  originalSize?: number;
 };
 type Schedule = {
   enabled: boolean;
@@ -346,7 +349,7 @@ export default function Backups({
                 <span className="backup-stat-label">Storage used</span>
                 <strong>
                   {formatBytes(totalSize)}
-                  <small>across all backups</small>
+                  <small>in backup history</small>
                 </strong>
               </div>
             </div>
@@ -375,7 +378,10 @@ export default function Backups({
                     <History size={17} />
                     Backup history
                   </h2>
-                  <p>Download an archive whenever you need it.</p>
+                  <p>
+                    New backups are automatically compressed as .tar.gz
+                    archives.
+                  </p>
                 </div>
                 <span className="badge">{backups.length} total</span>
                 <RefreshButton
@@ -486,7 +492,33 @@ export default function Backups({
                           <p>
                             <span>{fullDate(backup.createdAt)}</span>
                             <span className="backup-meta-separator">·</span>
-                            <span>{formatBytes(backup.size)}</span>
+                            <span>{formatBytes(backup.size)} compressed</span>
+                            <span className="backup-meta-separator">·</span>
+                            <span
+                              title={
+                                backup.compression === "gzip" &&
+                                backup.compressionLevel === 9
+                                  ? "Maximum gzip compression (level 9)"
+                                  : "Gzip compressed archive"
+                              }
+                            >
+                              .tar.gz
+                            </span>
+                            {typeof backup.originalSize === "number" &&
+                              Number.isFinite(backup.originalSize) &&
+                              backup.originalSize > backup.size && (
+                                <>
+                                  <span className="backup-meta-separator">
+                                    ·
+                                  </span>
+                                  <span>
+                                    {formatBytes(
+                                      backup.originalSize - backup.size,
+                                    )}{" "}
+                                    saved
+                                  </span>
+                                </>
+                              )}
                           </p>
                           <div className="backup-tags">
                             <span className="backup-complete">
@@ -536,7 +568,8 @@ export default function Backups({
               <div className="backup-history-footer">
                 <ShieldCheck size={14} />
                 <span>
-                  Archives contain the files in your server directory.
+                  Archives contain your server files, excluding symbolic links
+                  and temporary Minecraft session.lock files.
                 </span>
               </div>
             </section>
@@ -766,8 +799,8 @@ export default function Backups({
                 </h2>
                 <p id="backup-dialog-description">
                   {dialog === "create"
-                    ? "Save an archive of your current server files."
-                    : "You can restore these archives from File Manager → Recycle Bin."}
+                    ? "Save a compressed .tar.gz archive of your current server files."
+                    : "You can restore these archives from File Manager → Recycle Bin. They use disk space until permanently deleted."}
                 </p>
               </div>
               <button

@@ -1,6 +1,5 @@
 import express from "express";
 import multer from "multer";
-import * as tar from "tar";
 import { spawn } from "node:child_process";
 import { EventEmitter } from "node:events";
 import { createHash, randomUUID } from "node:crypto";
@@ -18,6 +17,7 @@ import {
 } from "./connection.mjs";
 import { decodeIcon, readServerIcon, writeServerIcon } from "./server-icon.mjs";
 import { createRecycleBin } from "./recycle-bin.mjs";
+import { createBackupArchive } from "./backup-archive.mjs";
 import { createMinecraft } from "./minecraft.mjs";
 import { createServerSetup } from "./server-setup.mjs";
 import { auditEntry, auditHistory, contentKind } from "./audit.mjs";
@@ -1572,17 +1572,7 @@ export async function createPanel(options = {}) {
         );
         await flushWorld(liveChild);
       }
-      await tar.c(
-        {
-          gzip: true,
-          file: `${target}.tmp`,
-          cwd: serverDir,
-          portable: true,
-          follow: false,
-          filter: (_name, stat) => !stat.isSymbolicLink(),
-        },
-        ["."],
-      );
+      const compression = await createBackupArchive(serverDir, `${target}.tmp`);
       if (liveChild && processHandle !== liveChild)
         throw error(
           409,
@@ -1593,6 +1583,7 @@ export async function createPanel(options = {}) {
         id,
         name: backupName,
         size: (await fs.stat(target)).size,
+        ...compression,
         createdAt: new Date().toISOString(),
         status: "completed",
         trigger,

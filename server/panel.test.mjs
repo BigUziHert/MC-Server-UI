@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs/promises";
+import nativeFs from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import http from "node:http";
@@ -584,12 +585,13 @@ test("local security rejects foreign hosts and cross-site mutations", async (t) 
 
 test("backup is a readable gzip tar containing uploaded files, and survives a restart", async (t) => {
   const { request, base, dataDir, close } = await fixture(t);
+  const content = "this content must be in the archive\n".repeat(16_384);
   await request(
     "/api/files",
     json("POST", {
       name: "proof.txt",
       type: "file",
-      content: "this content must be in the archive",
+      content,
     }),
   );
   const created = await request(
@@ -598,12 +600,18 @@ test("backup is a readable gzip tar containing uploaded files, and survives a re
   );
   assert.equal(created.status, 201);
   assert.ok(created.body.size > 0);
+  assert.equal(created.body.compression, "gzip");
+  assert.equal(created.body.compressionLevel, 9);
+  assert.equal(created.body.originalSize, Buffer.byteLength(content));
+  assert.ok(created.body.size < created.body.originalSize / 20);
   const response = await fetch(
     `${base}/api/backups/${created.body.id}/download`,
   );
   assert.equal(response.status, 200);
   const bytes = Buffer.from(await response.arrayBuffer());
   assert.deepEqual([...bytes.subarray(0, 2)], [0x1f, 0x8b]);
+  assert.equal(bytes[8], 2, "Gzip XFL must indicate maximum compression.");
+  assert.equal(bytes.length, created.body.size);
   const unpackDir = path.join(dataDir, "verify");
   await fs.mkdir(unpackDir);
   await tar.x({
@@ -612,7 +620,7 @@ test("backup is a readable gzip tar containing uploaded files, and survives a re
   });
   assert.equal(
     await fs.readFile(path.join(unpackDir, "proof.txt"), "utf8"),
-    "this content must be in the archive",
+    content,
   );
   await close();
   const restarted = await createPanel({ dataDir, scheduler: false });
@@ -621,6 +629,9 @@ test("backup is a readable gzip tar containing uploaded files, and survives a re
     await fs.readFile(path.join(dataDir, "panel.json"), "utf8"),
   );
   assert.equal(state.backups[0].id, created.body.id);
+  assert.equal(state.backups[0].compression, "gzip");
+  assert.equal(state.backups[0].compressionLevel, 9);
+  assert.equal(state.backups[0].originalSize, Buffer.byteLength(content));
   assert.equal(
     (await request(`/api/backups/${created.body.id}`, { method: "DELETE" }))
       .status,
@@ -823,6 +834,212 @@ function fakeJava({
     },
   };
 }
+
+async function busyFileReads(t, files) {
+  const key = (file) => path.resolve(String(file)).toLowerCase();
+  const locked = new Set(
+    await Promise.all(files.map(async (file) => key(await fs.realpath(file)))),
+  );
+  const opened = new Map();
+  const attempts = [];
+  const open = nativeFs.open.bind(nativeFs);
+  const read = nativeFs.read.bind(nativeFs);
+  const close = nativeFs.close.bind(nativeFs);
+  t.mock.method(nativeFs, "open", (file, ...args) => {
+    const callback = args.pop();
+    return open(file, ...args, (cause, fd) => {
+      if (!cause) opened.set(fd, key(file));
+      callback(cause, fd);
+    });
+  });
+  t.mock.method(nativeFs, "read", (fd, ...args) => {
+    const file = opened.get(fd);
+    if (!locked.has(file)) return read(fd, ...args);
+    attempts.push(file);
+    const callback = args.at(-1);
+    // Windows read errors contain only a descriptor, so there is no error.path.
+    setImmediate(() =>
+      callback(
+        Object.assign(new Error("EBUSY: resource busy or locked, read"), {
+          code: "EBUSY",
+          syscall: "read",
+        }),
+      ),
+    );
+  });
+  t.mock.method(nativeFs, "close", (fd, ...args) => {
+    opened.delete(fd);
+    return close(fd, ...args);
+  });
+  return { locked, attempts };
+}
+
+test("scheduled live backups omit locked session files and preserve complete world data", async (t) => {
+  const java = fakeJava();
+  const { request, serverDir, dataDir, tick } = await fixture(t, {
+    jar: "server.jar",
+    spawnServer: java.spawnServer,
+    backupFlushTimeoutMs: 1000,
+  });
+  const files = new Map([
+    ["server.jar", Buffer.from("test fixture, never executed")],
+    ["eula.txt", Buffer.from("eula=true\n")],
+    ["server.properties", Buffer.from("server-port=25565\n")],
+    ["world/level.dat", Buffer.from([0, 255, 0, 42, 1, 17])],
+    ["world/region/r.0.0.mca", Buffer.alloc(128 * 1024, 37)],
+    ["world_nether/DIM-1/data/maps.dat", Buffer.from("nether data")],
+    ["custom/world/session.lock/keep.txt", Buffer.from("directory content")],
+  ]);
+  const sessionLocks = [
+    "session.lock",
+    "world/session.lock",
+    "world_nether/SESSION.LOCK",
+    "custom/world/dimensions/custom/planet/Session.Lock",
+  ];
+  for (const [name, content] of files) {
+    await fs.mkdir(path.dirname(path.join(serverDir, name)), {
+      recursive: true,
+    });
+    await fs.writeFile(path.join(serverDir, name), content);
+  }
+  for (const name of sessionLocks) {
+    await fs.mkdir(path.dirname(path.join(serverDir, name)), {
+      recursive: true,
+    });
+    await fs.writeFile(path.join(serverDir, name), Buffer.from([0, 0, 1, 2]));
+  }
+  const reads = await busyFileReads(
+    t,
+    sessionLocks.map((name) => path.join(serverDir, name)),
+  );
+  assert.equal(
+    (await request("/api/server/power", json("POST", { action: "start" })))
+      .status,
+    200,
+  );
+  const saved = await request(
+    "/api/backups/schedule",
+    json("PUT", {
+      enabled: true,
+      type: "interval",
+      intervalHours: 1,
+      time: "03:00",
+      dayOfWeek: 0,
+      retention: 3,
+    }),
+  );
+  assert.equal(saved.status, 200);
+  await tick(new Date(new Date(saved.body.schedule.nextRun).getTime() + 1));
+  const backups = (await request("/api/backups")).body.backups;
+  assert.equal(backups.length, 1);
+  assert.equal(backups[0].trigger, "scheduled");
+  assert.equal(backups[0].compression, "gzip");
+  assert.equal(backups[0].compressionLevel, 9);
+  assert.equal(
+    backups[0].originalSize,
+    [...files.values()].reduce((total, content) => total + content.length, 0),
+  );
+  assert.deepEqual(reads.attempts, [], "Session locks must never be read.");
+  assert.deepEqual(java.commands, ["save-off", "save-all flush", "save-on"]);
+  assert.equal((await request("/api/server")).body.status, "running");
+  const unpackDir = path.join(dataDir, "verify");
+  await fs.mkdir(unpackDir);
+  await tar.x({
+    file: path.join(dataDir, "backups", `${backups[0].id}.tar.gz`),
+    cwd: unpackDir,
+  });
+  for (const [name, content] of files)
+    assert.deepEqual(await fs.readFile(path.join(unpackDir, name)), content);
+  for (const name of sessionLocks)
+    await assert.rejects(fs.stat(path.join(unpackDir, name)), {
+      code: "ENOENT",
+    });
+  assert.equal(
+    (await request("/api/audit")).body.entries.some(
+      (entry) => entry.action === "Scheduled backup failed",
+    ),
+    false,
+  );
+});
+
+test("a busy world data file fails a scheduled backup safely and permits a complete retry", async (t) => {
+  const java = fakeJava();
+  const { request, serverDir, dataDir, tick } = await fixture(t, {
+    jar: "server.jar",
+    spawnServer: java.spawnServer,
+    backupFlushTimeoutMs: 1000,
+  });
+  await fs.writeFile(path.join(serverDir, "server.jar"), "never executed");
+  await fs.writeFile(path.join(serverDir, "eula.txt"), "eula=true\n");
+  const relative = "world/region/r.0.0.mca";
+  const content = Buffer.alloc(128 * 1024, 51);
+  const target = path.join(serverDir, relative);
+  await fs.mkdir(path.dirname(target), { recursive: true });
+  await fs.writeFile(target, content);
+  const reads = await busyFileReads(t, [target]);
+  await request("/api/server/power", json("POST", { action: "start" }));
+  const saved = await request(
+    "/api/backups/schedule",
+    json("PUT", {
+      enabled: true,
+      type: "interval",
+      intervalHours: 1,
+      time: "03:00",
+      dayOfWeek: 0,
+      retention: 3,
+    }),
+  );
+  assert.equal(saved.status, 200);
+  await tick(new Date(new Date(saved.body.schedule.nextRun).getTime() + 1));
+  assert.equal(reads.attempts.length, 1, "The EBUSY read must be exercised.");
+  assert.deepEqual(java.commands, ["save-off", "save-all flush", "save-on"]);
+  assert.deepEqual((await request("/api/backups")).body.backups, []);
+  assert.deepEqual(await fs.readdir(path.join(dataDir, "backups")), []);
+  const entries = (await request("/api/audit")).body.entries;
+  const failure = entries.find(
+    (entry) => entry.action === "Scheduled backup failed",
+  );
+  assert.ok(failure);
+  assert.match(
+    failure.detail.replaceAll("\\", "/"),
+    /world\/region\/r\.0\.0\.mca/,
+  );
+  assert.match(failure.detail, /locked|busy/i);
+  assert.match(failure.detail, /retry|try again|close|stop/i);
+  assert.equal(
+    entries.some((entry) => entry.action === "Backup created"),
+    false,
+  );
+  const stored = JSON.parse(
+    await fs.readFile(path.join(dataDir, "panel.json"), "utf8"),
+  );
+  assert.deepEqual(stored.backups, []);
+
+  reads.locked.clear();
+  const retry = await request(
+    "/api/backups",
+    json("POST", { name: "Unlocked retry" }),
+  );
+  assert.equal(retry.status, 201, JSON.stringify(retry.body));
+  assert.deepEqual(java.commands, [
+    "save-off",
+    "save-all flush",
+    "save-on",
+    "save-off",
+    "save-all flush",
+    "save-on",
+  ]);
+  assert.deepEqual(await fs.readdir(path.join(dataDir, "backups")), [
+    `${retry.body.id}.tar.gz`,
+  ]);
+  const unpackDir = path.join(dataDir, "verify");
+  await fs.mkdir(unpackDir);
+  await tar.x({
+    file: path.join(dataDir, "backups", `${retry.body.id}.tar.gz`),
+    cwd: unpackDir,
+  });
+  assert.deepEqual(await fs.readFile(path.join(unpackDir, relative)), content);
+});
 
 test("live console waits for command delivery and rejects a failed or disconnected input", async (t) => {
   const java = fakeJava();
