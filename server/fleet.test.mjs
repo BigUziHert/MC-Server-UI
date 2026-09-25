@@ -293,11 +293,20 @@ test("fleet scopes files, console, backups, schedules, users and player permissi
   );
   assert.equal(operated.status, 200);
   assert.match(operated.body.message, /Requested op BuilderOne/);
-  await waitFor(async () =>
-    (await request("/api/players", {}, first)).body.operators.some(
-      (entry) => entry.name === "BuilderOne",
-    ),
-  );
+  await waitFor(async () => {
+    const result = await request("/api/players", {}, first);
+    // The subprocess can briefly leave ops.json empty while rewriting it.
+    if (result.status === 409) {
+      assert.match(result.body.error, /ops\.json contains invalid JSON/);
+      return false;
+    }
+    assert.equal(result.status, 200, JSON.stringify(result.body));
+    assert.ok(
+      Array.isArray(result.body.operators),
+      JSON.stringify(result.body),
+    );
+    return result.body.operators.some((entry) => entry.name === "BuilderOne");
+  });
   assert.equal(
     (await request("/api/players", {}, first)).body.operators[0].name,
     "BuilderOne",

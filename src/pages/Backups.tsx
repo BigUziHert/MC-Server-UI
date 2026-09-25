@@ -56,7 +56,141 @@ type BackupResult = {
   backups: Backup[];
   schedule: Schedule;
   timezone?: string;
+  job?: BackupJob | null;
 };
+type BackupJob = {
+  id: string;
+  name: string;
+  trigger: "manual" | "scheduled";
+  status: "running" | "cancelling" | "completed" | "cancelled" | "failed";
+  phase: "scanning" | "saving" | "archiving" | "finalizing" | "resuming";
+  totalBytes: number;
+  processedBytes: number;
+  totalFiles: number;
+  processedFiles: number;
+  currentFile: string | null;
+  compressedBytes: number;
+  startedAt: string;
+  updatedAt: string;
+  error?: string;
+  cancellable: boolean;
+};
+const isActiveJob = (job: BackupJob | null) =>
+  job?.status === "running" || job?.status === "cancelling";
+
+function BackupProgress({
+  job,
+  starting,
+  error,
+  cancelling,
+  canCancel,
+  onCancel,
+  onRetry,
+}: {
+  job: BackupJob | null;
+  starting: boolean;
+  error: string;
+  cancelling: boolean;
+  canCancel: boolean;
+  onCancel: () => void;
+  onRetry: () => void;
+}) {
+  const active = isActiveJob(job);
+  const measured =
+    job && ["archiving", "finalizing", "resuming"].includes(job.phase);
+  const percent =
+    job?.status === "completed"
+      ? 100
+      : measured && job.totalBytes > 0
+        ? Math.min(
+            99,
+            Math.max(
+              0,
+              Math.floor((job.processedBytes / job.totalBytes) * 100),
+            ),
+          )
+        : undefined;
+  const title = !job
+    ? starting
+      ? "Starting backup…"
+      : "Backup status unavailable"
+    : job.status === "cancelling"
+      ? "Cancelling backup…"
+      : job.status === "completed"
+        ? "Backup completed"
+        : job.status === "cancelled"
+          ? "Backup cancelled"
+          : job.status === "failed"
+            ? "Backup failed"
+            : {
+                scanning: "Scanning server files…",
+                saving: "Saving the world…",
+                archiving: "Compressing server files…",
+                finalizing: "Finishing the archive…",
+                resuming: "Resuming world saves…",
+              }[job.phase];
+  return (
+    <section className="backup-job" aria-label="Backup progress">
+      <div className="backup-job-heading">
+        <strong role="status">{title}</strong>
+        {active && !error && percent !== undefined && <span>{percent}%</span>}
+      </div>
+      {job && <p>{job.name}</p>}
+      {(active || starting) && (
+        <progress
+          aria-label="Backup progress"
+          max={100}
+          value={error ? undefined : percent}
+        />
+      )}
+      {job && measured && (
+        <p>
+          {formatBytes(job.processedBytes)} of {formatBytes(job.totalBytes)} ·{" "}
+          {job.processedFiles} of {job.totalFiles} files ·{" "}
+          {formatBytes(job.compressedBytes)} compressed
+        </p>
+      )}
+      {job?.currentFile && active && (
+        <p className="backup-job-file" title={job.currentFile}>
+          {job.currentFile}
+        </p>
+      )}
+      {active && (
+        <p>
+          {job?.status === "cancelling"
+            ? "Waiting for the server to stop the backup and resume world saves."
+            : "The backup keeps running when you close its dialog or leave this page."}
+        </p>
+      )}
+      {(error || (job?.status === "failed" && job.error)) && (
+        <p className="storage-form-error" role="alert">
+          {error || job?.error}
+        </p>
+      )}
+      <div className="backup-job-actions">
+        {error && (
+          <button type="button" className="btn small" onClick={onRetry}>
+            Retry status
+          </button>
+        )}
+        {active && canCancel && (
+          <button
+            type="button"
+            className="btn small danger"
+            disabled={
+              cancelling || job?.status === "cancelling" || !job?.cancellable
+            }
+            onClick={onCancel}
+          >
+            {cancelling || job?.status === "cancelling"
+              ? "Cancelling…"
+              : "Cancel backup"}
+          </button>
+        )}
+      </div>
+    </section>
+  );
+}
 type DeleteDialog = { backups: Backup[]; bulk: boolean };
 const defaults: Schedule = {
   enabled: false,
@@ -89,7 +223,7 @@ export default function Backups({
     permissions === undefined || permissions.includes("backup.update");
   const canDownload =
     permissions === undefined || permissions.includes("backup.download");
-  const { api, post, downloadUrl } = useServerApi();
+  const { api, downloadUrl } = useServerApi();
   const [backups, setBackups] = useState<Backup[]>([]);
   const [schedule, setSchedule] = useState<Schedule>(defaults);
   const [savedSchedule, setSavedSchedule] = useState<Schedule>(defaults);
@@ -99,6 +233,10 @@ export default function Backups({
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
   const [busy, setBusy] = useState(false);
+  const [job, setJob] = useState<BackupJob | null>(null);
+  const [starting, setStarting] = useState(false);
+  const [cancelling, setCancelling] = useState(false);
+  const [jobError, setJobError] = useState("");
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [dialog, setDialog] = useState<"create" | DeleteDialog | null>(null);
   const [name, setName] = useState("");
@@ -108,7 +246,51 @@ export default function Backups({
   const headingRef = useRef<HTMLHeadingElement>(null);
   const busyRef = useRef(false);
   const generation = useRef(0);
+  const jobRef = useRef<BackupJob | null>(null);
+  const startingRef = useRef(false);
+  const jobRevision = useRef(0);
+  const dialogVersion = useRef(0);
+  const createDialogVersion = useRef<number | null>(null);
+  const currentDialog = useRef(dialog);
+  currentDialog.current = dialog;
+  const reloadRef = useRef<() => Promise<boolean>>(async () => false);
   busyRef.current = busy;
+
+  const acceptJob = useCallback(
+    (updated: BackupJob | null, startedHere = false) => {
+      const previous = jobRef.current;
+      if (
+        updated &&
+        previous?.id === updated.id &&
+        (updated.updatedAt < previous.updatedAt ||
+          (previous.status === "cancelling" && updated.status === "running") ||
+          (!isActiveJob(previous) && isActiveJob(updated)))
+      )
+        return;
+      jobRef.current = updated;
+      setJob(updated);
+      setJobError("");
+      if (
+        updated &&
+        (startedHere ||
+          (previous?.id === updated.id && isActiveJob(previous))) &&
+        !isActiveJob(updated)
+      ) {
+        if (updated.status === "completed") {
+          notify("Backup created. Your server files are safely archived.");
+          if (
+            currentDialog.current === "create" &&
+            createDialogVersion.current === dialogVersion.current
+          ) {
+            dialogVersion.current++;
+            setDialog(null);
+          }
+        }
+        void reloadRef.current();
+      }
+    },
+    [notify],
+  );
 
   const load = useCallback(
     async (initial = false) => {
@@ -117,12 +299,17 @@ export default function Backups({
         return false;
       }
       const token = generation.current;
+      const revision = jobRevision.current;
       if (initial) setLoading(true);
       setError("");
       try {
-        const result = await api<BackupResult>("/backups");
+        const result = await api<BackupResult>("/backups", {
+          signal: AbortSignal.timeout(10_000),
+        });
         if (token !== generation.current) return false;
         setBackups(result.backups);
+        if (revision === jobRevision.current && !startingRef.current)
+          acceptJob(result.job || null);
         const available = new Set(result.backups.map((backup) => backup.id));
         setSelected(
           (current) => new Set([...current].filter((id) => available.has(id))),
@@ -138,8 +325,9 @@ export default function Backups({
         if (token === generation.current) setLoading(false);
       }
     },
-    [api, canRead],
+    [api, canRead, acceptJob],
   );
+  reloadRef.current = () => load();
   useEffect(() => {
     generation.current++;
     setBackups([]);
@@ -148,6 +336,16 @@ export default function Backups({
     setDialogError("");
     setDeleteErrors([]);
     setBusy(false);
+    setSaving(false);
+    setSaved(false);
+    setJob(null);
+    jobRef.current = null;
+    jobRevision.current++;
+    setStarting(false);
+    startingRef.current = false;
+    setCancelling(false);
+    setJobError("");
+    dialogVersion.current++;
     setSchedule(defaults);
     setSavedSchedule(defaults);
     void load(true);
@@ -155,6 +353,86 @@ export default function Backups({
       generation.current++;
     };
   }, [load]);
+  const refreshJob = useCallback(async () => {
+    const pending = jobRef.current;
+    if (!pending) return load();
+    const token = generation.current;
+    const revision = jobRevision.current;
+    try {
+      const result = await api<{ job: BackupJob }>(
+        `/backups/jobs/${encodeURIComponent(pending.id)}`,
+        { signal: AbortSignal.timeout(10_000) },
+      );
+      if (token !== generation.current || revision !== jobRevision.current)
+        return false;
+      acceptJob(result.job);
+      return true;
+    } catch (failure) {
+      if (token === generation.current && revision === jobRevision.current) {
+        setJobError(`Progress unavailable. ${messageOf(failure)}`);
+        if ((failure as { status?: number }).status === 404) return load();
+      }
+      return false;
+    }
+  }, [api, acceptJob, load]);
+  useEffect(() => {
+    if (!isActiveJob(job)) return;
+    let stopped = false;
+    let timer: ReturnType<typeof setTimeout>;
+    async function poll() {
+      await refreshJob();
+      if (!stopped) timer = setTimeout(poll, 1000);
+    }
+    timer = setTimeout(poll, 1000);
+    return () => {
+      stopped = true;
+      clearTimeout(timer);
+    };
+  }, [job?.id, job?.status, refreshJob]);
+
+  function closeDialog() {
+    dialogVersion.current++;
+    setDialog(null);
+  }
+  function openCreate() {
+    dialogVersion.current++;
+    createDialogVersion.current =
+      isActiveJob(jobRef.current) || startingRef.current
+        ? dialogVersion.current
+        : null;
+    setName("");
+    setDialogError("");
+    setDialog("create");
+  }
+  async function cancelBackup() {
+    const pending = jobRef.current;
+    if (
+      !canCreate ||
+      !pending?.cancellable ||
+      cancelling ||
+      !isActiveJob(pending)
+    )
+      return;
+    const token = generation.current;
+    jobRevision.current++;
+    setCancelling(true);
+    setJobError("");
+    try {
+      const result = await api<{ job: BackupJob }>(
+        `/backups/jobs/${encodeURIComponent(pending.id)}/cancel`,
+        { method: "POST", body: "{}", signal: AbortSignal.timeout(10_000) },
+      );
+      if (token === generation.current) {
+        jobRevision.current++;
+        acceptJob(result.job);
+      }
+    } catch (failure) {
+      if (token === generation.current)
+        setJobError(`Could not confirm cancellation. ${messageOf(failure)}`);
+    } finally {
+      if (token === generation.current) setCancelling(false);
+    }
+  }
   useEffect(() => {
     if (!dialog) return;
     const previous = document.activeElement as HTMLElement | null;
@@ -176,6 +454,7 @@ export default function Backups({
   async function saveSchedule(event: FormEvent) {
     event.preventDefault();
     if (!canSchedule) return;
+    const token = generation.current;
     setSaving(true);
     setSaved(false);
     try {
@@ -183,15 +462,16 @@ export default function Backups({
         "/backups/schedule",
         { method: "PUT", body: JSON.stringify(schedule) },
       );
+      if (token !== generation.current) return;
       const updated = "schedule" in result ? result.schedule : result;
       setSchedule(updated);
       setSavedSchedule(updated);
       setSaved(true);
       notify("Backup schedule saved.");
     } catch (failure) {
-      notify(messageOf(failure), true);
+      if (token === generation.current) notify(messageOf(failure), true);
     } finally {
-      setSaving(false);
+      if (token === generation.current) setSaving(false);
     }
   }
   async function submitDialog(event: FormEvent) {
@@ -203,16 +483,53 @@ export default function Backups({
     )
       return;
     const token = generation.current;
+    if (dialog === "create") {
+      if (
+        startingRef.current ||
+        isActiveJob(jobRef.current) ||
+        (jobError && !jobRef.current)
+      )
+        return;
+      startingRef.current = true;
+      setStarting(true);
+      jobRef.current = null;
+      setJob(null);
+      setJobError("");
+      setDialogError("");
+      jobRevision.current++;
+      createDialogVersion.current = dialogVersion.current;
+      let reconcile = false;
+      try {
+        const result = await api<{ job: BackupJob }>("/backups/jobs", {
+          method: "POST",
+          body: JSON.stringify({ name: name.trim() || undefined }),
+          signal: AbortSignal.timeout(10_000),
+        });
+        if (token !== generation.current) return;
+        jobRevision.current++;
+        acceptJob(result.job, true);
+      } catch (failure) {
+        if (token === generation.current) {
+          setJobError(
+            `Backup start could not be confirmed. ${messageOf(failure)}`,
+          );
+          reconcile = true;
+        }
+      } finally {
+        if (token === generation.current) {
+          startingRef.current = false;
+          setStarting(false);
+          if (reconcile) void load();
+        }
+      }
+      return;
+    }
     busyRef.current = true;
     setBusy(true);
     setDialogError("");
     setDeleteErrors([]);
     try {
-      if (dialog === "create") {
-        await post("/backups", { name: name.trim() || undefined });
-        if (token !== generation.current) return;
-        notify("Backup created. Your server files are safely archived.");
-      } else {
+      {
         const deleted = new Set<string>();
         const failed: Backup[] = [];
         const failures: string[] = [];
@@ -268,6 +585,7 @@ export default function Backups({
 
   function confirmDelete(targets: Backup[], bulk = false) {
     if (!canDelete) return;
+    dialogVersion.current++;
     setDialogError("");
     setDeleteErrors([]);
     setDialog({ backups: targets, bulk });
@@ -282,6 +600,19 @@ export default function Backups({
   const latest = [...backups].sort(
     (a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime(),
   )[0];
+  const activeJob = isActiveJob(job);
+  const showProgress = !!job || starting || !!jobError;
+  const progressPanel = (
+    <BackupProgress
+      job={job}
+      starting={starting}
+      error={jobError}
+      cancelling={cancelling}
+      canCancel={canCreate}
+      onCancel={() => void cancelBackup()}
+      onRetry={() => void refreshJob()}
+    />
+  );
   if (!canRead)
     return (
       <StatePanel
@@ -301,16 +632,13 @@ export default function Backups({
         <button
           className="btn primary"
           disabled={!canCreate || loading || !!error || busy}
-          onClick={() => {
-            setName("");
-            setDialogError("");
-            setDialog("create");
-          }}
+          onClick={openCreate}
         >
           <Plus size={17} />
-          Create backup
+          {activeJob || starting ? "View backup progress" : "Create backup"}
         </button>
       </div>
+      {showProgress && dialog !== "create" && progressPanel}
       {error && (
         <StatePanel
           className="panel"
@@ -444,11 +772,7 @@ export default function Backups({
                     <button
                       className="btn"
                       disabled={!canCreate}
-                      onClick={() => {
-                        setName("");
-                        setDialogError("");
-                        setDialog("create");
-                      }}
+                      onClick={openCreate}
                     >
                       <Plus size={15} />
                       Create your first backup
@@ -773,7 +1097,7 @@ export default function Backups({
           aria-describedby="backup-dialog-description"
           onCancel={(event) => {
             event.preventDefault();
-            if (!busyRef.current) setDialog(null);
+            if (!busyRef.current) closeDialog();
           }}
           onMouseDown={(event) => {
             if (event.target !== event.currentTarget || busyRef.current) return;
@@ -784,7 +1108,7 @@ export default function Backups({
               event.clientY < bounds.top ||
               event.clientY > bounds.bottom
             )
-              setDialog(null);
+              closeDialog();
           }}
         >
           <form onSubmit={submitDialog}>
@@ -807,7 +1131,7 @@ export default function Backups({
                 type="button"
                 className="btn icon"
                 aria-label="Close dialog"
-                onClick={() => setDialog(null)}
+                onClick={closeDialog}
                 disabled={busy}
               >
                 <X size={18} />
@@ -822,7 +1146,7 @@ export default function Backups({
                     onChange={(event) => setName(event.target.value)}
                     placeholder="Before the next big adventure"
                     maxLength={100}
-                    disabled={busy}
+                    disabled={starting || activeJob}
                   />
                 </label>
                 <div className="backup-create-note">
@@ -832,13 +1156,7 @@ export default function Backups({
                     pause automatic saves while archiving, then resume saving.
                   </p>
                 </div>
-                {busy && (
-                  <p className="backup-create-progress" role="status">
-                    <LoaderCircle size={15} className="spin" />
-                    Preparing and archiving your files. Large worlds can take a
-                    little longer.
-                  </p>
-                )}
+                {showProgress && progressPanel}
               </>
             ) : (
               <>
@@ -894,22 +1212,30 @@ export default function Backups({
               <button
                 type="button"
                 className="btn"
-                onClick={() => setDialog(null)}
+                onClick={closeDialog}
                 disabled={busy}
               >
-                Cancel
+                {dialog === "create" ? "Close" : "Cancel"}
               </button>
               <button
                 className={`btn ${dialog === "create" ? "primary" : "danger"}`}
                 disabled={
-                  busy || (dialog === "create" ? !canCreate : !canDelete)
+                  busy ||
+                  (dialog === "create"
+                    ? !canCreate ||
+                      starting ||
+                      activeJob ||
+                      (!!jobError && !job)
+                    : !canDelete)
                 }
               >
                 {busy && <LoaderCircle size={15} className="spin" />}
                 {dialog === "create"
-                  ? busy
-                    ? "Creating backup…"
-                    : "Create backup"
+                  ? starting
+                    ? "Starting backup…"
+                    : activeJob
+                      ? "Backup running…"
+                      : "Create backup"
                   : busy
                     ? "Moving backups…"
                     : deleteErrors.length > 0

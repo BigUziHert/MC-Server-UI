@@ -239,6 +239,10 @@ Online backups send `save-off` followed by `save-all flush`, then wait up to 15 
 
 A scheduled failure is recorded in Audit Logs and the job tries again at its next deadline. Backup restore is not implemented; downloaded archives can be restored manually while the server is stopped.
 
+Backup creation runs in the background and shows its current stage, files processed, bytes processed, and compressed size. Scanning and world saving have an indeterminate progress bar; compression progress uses the measured source bytes and reaches completion only after the archive is saved and automatic world saves resume. **Close**, the **X**, and Escape dismiss the creation dialog while the backup continues in the page's progress panel. **Cancel backup** requests cancellation, closes the active files, removes the incomplete archive, and resumes world saves before releasing that server's operation lock. Cancellation is no longer available once the completed archive starts its final commit. Refreshing the page reconnects to the operation while the panel process remains running.
+
+API clients can start an asynchronous backup with `POST /api/backups/jobs`, poll `GET /api/backups/jobs/:id`, and cancel it with `POST /api/backups/jobs/:id/cancel`. `GET /api/backups` includes the latest job. These endpoints use the same server selector as other APIs; reading progress requires `backup.read`, while starting and cancelling require `backup.create`. The original `POST /api/backups` endpoint still waits for completion and returns the completed archive for existing clients.
+
 Storage layout (all ignored by Git):
 
 ```text

@@ -1474,9 +1474,14 @@ export async function createPanel(options = {}) {
         cause ? reject(cause) : resolve(),
       );
     });
-  async function flushWorld(child) {
+  async function flushWorld(child, signal) {
+    signal?.throwIfAborted();
     let cleanup;
     const confirmation = new Promise((resolve, reject) => {
+      const onAbort = () => {
+        cleanup();
+        reject(signal.reason);
+      };
       const onLine = (line) => {
         // Only accept the exact server logger response, never chat or a command echo.
         if (
@@ -1513,14 +1518,17 @@ export async function createPanel(options = {}) {
         clearTimeout(timer);
         events.off("line", onLine);
         events.off("server-exit", onExit);
+        signal?.removeEventListener("abort", onAbort);
       };
       events.on("line", onLine);
       events.on("server-exit", onExit);
+      signal?.addEventListener("abort", onAbort, { once: true });
     });
     // Attach a rejection handler immediately, including while command writes are pending.
     confirmation.catch(() => {});
     try {
       await writeServer(child, "save-off");
+      signal?.throwIfAborted();
       await writeServer(child, "save-all flush");
       await confirmation;
     } finally {
@@ -1544,7 +1552,20 @@ export async function createPanel(options = {}) {
     );
     return recycled;
   }
-  async function createBackup(name, trigger = "manual") {
+  const backupJobs = new Map();
+  let latestBackupJob = null;
+  const backupControllers = new Map();
+  const cancelledBackup = () =>
+    Object.assign(new Error("Backup cancelled. No archive was retained."), {
+      name: "AbortError",
+      code: "BACKUP_CANCELLED",
+      status: 409,
+    });
+  const updateBackupJob = (job, values) => {
+    Object.assign(job, values, { updatedAt: new Date().toISOString() });
+  };
+  function beginBackup(name, trigger = "manual") {
+    if (closed) throw error(503, "The panel is shutting down.");
     if (configBusy)
       throw error(409, "Wait for the server settings to finish saving.");
     if (backupBusy) throw error(409, "A backup is already in progress.");
@@ -1563,21 +1584,67 @@ export async function createPanel(options = {}) {
       : `${trigger === "scheduled" ? "Scheduled" : "Manual"} backup`;
     backupBusy = true;
     const id = randomUUID();
+    const controller = new AbortController();
+    const { signal } = controller;
+    const job = {
+      id,
+      name: backupName,
+      trigger,
+      status: "running",
+      phase: "saving",
+      totalBytes: 0,
+      processedBytes: 0,
+      totalFiles: 0,
+      processedFiles: 0,
+      currentFile: null,
+      compressedBytes: 0,
+      startedAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+      cancellable: true,
+    };
+    backupJobs.set(id, job);
+    latestBackupJob = job;
+    backupControllers.set(id, controller);
+    // Retain recent terminal jobs so a slow poll cannot confuse two backups.
+    while (backupJobs.size > 20)
+      backupJobs.delete(backupJobs.keys().next().value);
+    const promise = trackTask(() => runBackup(job, signal));
+    promise.catch(() => {});
+    return { job, promise };
+  }
+  const createBackup = (name, trigger = "manual") =>
+    beginBackup(name, trigger).promise;
+  async function runBackup(job, signal) {
+    const { id, name: backupName, trigger } = job;
     const target = path.join(backupDir, `${id}.tar.gz`);
     const liveChild = status === "running" ? processHandle : null;
+    let failed;
+    let committed = false;
     try {
+      signal.throwIfAborted();
       if (liveChild) {
         append(
           "[Panel] Flushing the world and pausing automatic saves for backup…",
         );
-        await flushWorld(liveChild);
+        await flushWorld(liveChild, signal);
       }
-      const compression = await createBackupArchive(serverDir, `${target}.tmp`);
+      const compression = await createBackupArchive(
+        serverDir,
+        `${target}.tmp`,
+        {
+          signal,
+          onProgress: (progress) => updateBackupJob(job, progress),
+        },
+      );
+      signal.throwIfAborted();
       if (liveChild && processHandle !== liveChild)
         throw error(
           409,
           "The server disconnected during backup. No archive was retained.",
         );
+      // Cancellation ends at the atomic publish boundary. Once published, the
+      // archive must finish its history commit and restore automatic saves.
+      updateBackupJob(job, { phase: "finalizing", cancellable: false });
       await fs.rename(`${target}.tmp`, target);
       const item = {
         id,
@@ -1589,6 +1656,7 @@ export async function createPanel(options = {}) {
         trigger,
       };
       state.backups.unshift(item);
+      committed = true;
       if (trigger === "scheduled") {
         const obsolete = state.backups
           .filter((item) => item.trigger === "scheduled")
@@ -1605,17 +1673,31 @@ export async function createPanel(options = {}) {
           ? "Scheduler"
           : (requestActor.getStore() ?? "Local administrator"),
       );
+      job.backupId = id;
       return item;
     } catch (cause) {
-      await fs.rm(`${target}.tmp`, { force: true });
-      throw cause;
+      failed = signal.aborted && !committed ? signal.reason : cause;
+      try {
+        await fs.rm(`${target}.tmp`, { force: true });
+      } catch (cleanupError) {
+        failed = new Error(
+          `${failed.message} The incomplete archive could not be removed: ${cleanupError.message}`,
+          { cause: failed },
+        );
+      }
+      throw failed;
     } finally {
+      updateBackupJob(job, { phase: "resuming", cancellable: false });
       try {
         if (liveChild && processHandle === liveChild) {
           try {
             await writeServer(liveChild, "save-on");
             append("[Panel] Requested automatic world saves to resume.");
           } catch (cause) {
+            failed = new Error(
+              `${committed ? "The backup archive was saved, but automatic world saves could not be resumed." : "Automatic world saves could not be resumed after the backup stopped."} Run save-on on the server: ${cause.message}`,
+              { cause },
+            );
             append(
               `[Panel] Could not re-enable world saves: ${cause.message}. Run save-on on the server.`,
               "error",
@@ -1628,10 +1710,22 @@ export async function createPanel(options = {}) {
                 ? "Scheduler"
                 : (requestActor.getStore() ?? "Local administrator"),
             );
+            throw failed;
           }
         }
       } finally {
         backupBusy = false;
+        backupControllers.delete(id);
+        updateBackupJob(job, {
+          status: failed
+            ? failed.code === "BACKUP_CANCELLED"
+              ? "cancelled"
+              : "failed"
+            : "completed",
+          finishedAt: new Date().toISOString(),
+          ...(failed ? { error: failed.message } : {}),
+          currentFile: null,
+        });
       }
     }
   }
@@ -1656,11 +1750,16 @@ export async function createPanel(options = {}) {
       } catch (cause) {
         await audit(
           "backup",
-          "Scheduled backup failed",
+          cause.code === "BACKUP_CANCELLED"
+            ? "Backup cancelled"
+            : "Scheduled backup failed",
           cause.message,
           "Scheduler",
         );
-        append(`[Panel] Scheduled backup failed: ${cause.message}`, "error");
+        append(
+          `[Panel] ${cause.code === "BACKUP_CANCELLED" ? "Scheduled backup cancelled" : "Scheduled backup failed"}: ${cause.message}`,
+          cause.code === "BACKUP_CANCELLED" ? "info" : "error",
+        );
       }
     } finally {
       schedulerBusy = false;
@@ -2616,6 +2715,51 @@ export async function createPanel(options = {}) {
       backups: state.backups,
       schedule: state.schedule,
       timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+      job: latestBackupJob,
+    }),
+  );
+  const backupFailureAudit = (cause) =>
+    audit(
+      "backup",
+      cause.code === "BACKUP_CANCELLED" ? "Backup cancelled" : "Backup failed",
+      cause.message,
+    );
+  app.post(
+    "/api/backups/jobs",
+    trackOperation(async (req, res) => {
+      const { job, promise } = beginBackup(req.body?.name);
+      // A disconnected browser must not detach the actual disk work from the
+      // shutdown barrier. The result remains available through the job API.
+      trackTask(async () => {
+        try {
+          await promise;
+        } catch (cause) {
+          await backupFailureAudit(cause);
+        }
+      }).catch((cause) =>
+        append(`[Panel] Backup history: ${cause.message}`, "error"),
+      );
+      res.status(202).json({ job });
+    }),
+  );
+  app.get("/api/backups/jobs/:id", (req, res) => {
+    const job = backupJobs.get(req.params.id);
+    if (!job) throw error(404, "Backup operation not found.");
+    res.json({ job });
+  });
+  app.post(
+    "/api/backups/jobs/:id/cancel",
+    trackOperation(async (req, res) => {
+      const job = backupJobs.get(req.params.id);
+      if (!job) throw error(404, "Backup operation not found.");
+      if (["completed", "cancelled", "failed"].includes(job.status))
+        return res.json({ job });
+      if (job.status === "cancelling") return res.status(202).json({ job });
+      if (!job.cancellable)
+        throw error(409, "This backup is finishing. Wait for it to complete.");
+      updateBackupJob(job, { status: "cancelling", cancellable: false });
+      backupControllers.get(job.id)?.abort(cancelledBackup());
+      res.status(202).json({ job });
     }),
   );
   app.post(
@@ -2624,7 +2768,7 @@ export async function createPanel(options = {}) {
       try {
         res.status(201).json(await createBackup(req.body?.name));
       } catch (cause) {
-        await audit("backup", "Backup failed", cause.message);
+        await backupFailureAudit(cause);
         throw cause;
       }
     }),
