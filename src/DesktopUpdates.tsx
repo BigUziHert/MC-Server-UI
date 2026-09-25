@@ -14,7 +14,64 @@ type UpdateState = {
   message: string;
 };
 
-export default function DesktopUpdates() {
+export default function DesktopUpdates({
+  remote = false,
+}: {
+  remote?: boolean;
+}) {
+  return remote ? <RemoteUpdates /> : <LocalUpdates />;
+}
+
+function RemoteUpdates() {
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const openUpdates = window.mcPanelConnections?.openUpdates;
+  if (!openUpdates) return null;
+
+  async function open() {
+    setBusy(true);
+    setError("");
+    try {
+      // App updates belong to this desktop, even while viewing another host.
+      // Only open the trusted local dialog; never call the remote update API.
+      await openUpdates!();
+    } catch (cause) {
+      setError(
+        cause instanceof Error ? cause.message : "Unable to open app updates.",
+      );
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <>
+      <button
+        className="help-button update-button"
+        aria-label="App updates"
+        title="Open app updates on this computer"
+        disabled={busy}
+        onClick={() => void open()}
+      >
+        <ArrowDownToLine size={16} />
+        <span>Updates</span>
+      </button>
+      {error && (
+        <div className="toast" role="alert">
+          <span>{error}</span>
+          <button
+            aria-label="Dismiss update error"
+            onClick={() => setError("")}
+          >
+            <X size={16} />
+          </button>
+        </div>
+      )}
+    </>
+  );
+}
+
+function LocalUpdates() {
   const [state, setState] = useState<UpdateState | null>(null);
   const [open, setOpen] = useState(false);
   const [busy, setBusy] = useState(false);

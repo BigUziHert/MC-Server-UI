@@ -50,10 +50,18 @@ async function desktopBridge(
     localServers?: LocalServerDescriptor[];
     remoteServers?: Record<string, LocalServerDescriptor[]>;
     listFailure?: "reject" | "hang";
+    updatesFailure?: boolean;
   } = {},
 ) {
   await page.addInitScript(
-    ({ activeId, senderId, localServers, remoteServers, listFailure }) => {
+    ({
+      activeId,
+      senderId,
+      localServers,
+      remoteServers,
+      listFailure,
+      updatesFailure,
+    }) => {
       // The sending renderer stays fixed when native activation hides its view.
       const state = {
         activeId,
@@ -130,6 +138,17 @@ async function desktopBridge(
           changed();
           return snapshot();
         },
+        openUpdates: async () => {
+          if (updatesFailure) {
+            updatesFailure = false;
+            throw new Error(
+              "The local panel is still loading. Try again in a moment.",
+            );
+          }
+          calls.push({ action: "openUpdates", value: "local" });
+          state.activeId = "local";
+          changed();
+        },
         disconnect: async (id) => {
           calls.push({ action: "disconnect", value: id });
           return snapshot();
@@ -166,6 +185,7 @@ async function desktopBridge(
       localServers: options.localServers ?? [localServer],
       remoteServers: options.remoteServers ?? {},
       listFailure: options.listFailure,
+      updatesFailure: options.updatesFailure,
     },
   );
 }
@@ -200,6 +220,112 @@ async function localPanel(page: Page, desktop = false) {
   });
   return { localCredentials };
 }
+
+for (const empty of [false, true]) {
+  for (const desktop of [false, true]) {
+    test(`remote app updates ${desktop ? "open the local desktop updater" : "stay unavailable in a browser"} ${empty ? "without shared servers" : "with a selected server"}`, async ({
+      page,
+    }) => {
+      if (desktop) await desktopBridge(page, { activeId: "pc-one" });
+      await localPanel(page);
+      await page.route("**/api/access/session", (route) =>
+        route.fulfill({
+          json: {
+            role: "subuser",
+            email: "friend@example.test",
+            userId: "friend",
+            serverId: localServer.id,
+            permissions: ["control.console"],
+          },
+        }),
+      );
+      await page.route("**/api/servers", (route) =>
+        route.fulfill({
+          json: {
+            servers: empty
+              ? []
+              : [{ ...localServer, accessPermissions: ["control.console"] }],
+            defaultServerId: empty ? null : localServer.id,
+          },
+        }),
+      );
+      const updateRequests: string[] = [];
+      page.on("request", (request) => {
+        if (new URL(request.url()).pathname.startsWith("/api/desktop/updates"))
+          updateRequests.push(request.url());
+      });
+      await page.goto("/#console");
+      await expect(
+        page.getByRole("heading", {
+          name: empty ? "No shared servers" : localServer.name,
+          exact: true,
+        }),
+      ).toBeVisible();
+      const updates = page.getByRole("button", {
+        name: "App updates",
+        exact: true,
+      });
+      if (desktop) {
+        await expect(updates).toBeVisible();
+        await expect(updates).toHaveAttribute(
+          "title",
+          "Open app updates on this computer",
+        );
+        await updates.click();
+        await expect
+          .poll(() =>
+            page.evaluate(
+              () =>
+                (window as unknown as { connectionCalls: unknown })
+                  .connectionCalls,
+            ),
+          )
+          .toEqual([{ action: "openUpdates", value: "local" }]);
+      } else {
+        await expect(updates).toHaveCount(0);
+      }
+      expect(updateRequests).toEqual([]);
+    });
+  }
+}
+
+test("remote update shortcut reports a bridge failure and can be retried", async ({
+  page,
+}) => {
+  await desktopBridge(page, { activeId: "pc-one", updatesFailure: true });
+  await localPanel(page);
+  await page.route("**/api/access/session", (route) =>
+    route.fulfill({
+      json: {
+        role: "subuser",
+        email: "friend@example.test",
+        userId: "friend",
+        serverId: localServer.id,
+        permissions: ["control.console"],
+      },
+    }),
+  );
+  await page.goto("/#console");
+  const updates = page.getByRole("button", {
+    name: "App updates",
+    exact: true,
+  });
+  await updates.click();
+  await expect(page.getByRole("alert")).toContainText(
+    "The local panel is still loading",
+  );
+  await expect(updates).toBeEnabled();
+  await updates.click();
+  await expect(page.getByRole("alert")).toHaveCount(0);
+  await expect
+    .poll(() =>
+      page.evaluate(
+        () =>
+          (window as unknown as { connectionCalls: unknown }).connectionCalls,
+      ),
+    )
+    .toEqual([{ action: "openUpdates", value: "local" }]);
+});
 
 type ConnectionMock = Window & {
   connectionReports: {

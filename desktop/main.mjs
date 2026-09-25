@@ -18,6 +18,11 @@ import { fileURLToPath } from "node:url";
 import { startDesktopRuntime } from "./runtime.mjs";
 import { flushRendererSelection } from "./selection.mjs";
 import { createRemotePanelController } from "./remote-panels.mjs";
+import {
+  createRemoteFrontend,
+  configureRemoteCertificateVerification,
+  PANEL_CONTENT_SECURITY_POLICY,
+} from "./remote-frontend.mjs";
 import { installPanelPermissionHandlers } from "./permissions.mjs";
 import { installConnectionIpc } from "./connections-ipc.mjs";
 import { createConnectionStore } from "./connection-store.mjs";
@@ -35,6 +40,7 @@ const desktopDir = path.dirname(fileURLToPath(import.meta.url));
 const documentation =
   "https://github.com/BigUziHert/MC-Server-UI/tree/dev#readme";
 const smokeTest = process.argv.includes("--smoke-test");
+configureRemoteCertificateVerification(app.commandLine);
 app.setName("MC Panel");
 app.setAppUserModelId("com.biguzihert.mcpanel");
 
@@ -380,9 +386,7 @@ async function launch() {
     callback({
       responseHeaders: {
         ...details.responseHeaders,
-        "Content-Security-Policy": [
-          "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; img-src 'self' data: blob: https://mc-heads.net https://cdn.modrinth.com https://media.forgecdn.net https://mediafilez.forgecdn.net https://www.spigotmc.org https://cdn.spiget.org https://cdn.feed-the-beast.com https://download.nodecdn.net https://apps.modpacks.ch https://cdn.atlauncher.com https://voidswrath.com https://www.voidswrath.com; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-src 'none'; frame-ancestors 'none'; form-action 'self'",
-        ],
+        "Content-Security-Policy": [PANEL_CONTENT_SECURITY_POLICY],
       },
     });
   });
@@ -429,6 +433,9 @@ async function launch() {
     downloadsDirectory: app.getPath("downloads"),
     preload: path.join(desktopDir, "connections-preload.cjs"),
     openWebsite,
+    remoteFrontend: await createRemoteFrontend({
+      directory: path.join(desktopDir, "../dist"),
+    }),
     store: createConnectionStore({ dataDir: path.join(userData, "data") }),
     onError: (cause) => void logError(cause),
     listLocalServers: () => runtime.listLocalServers(),

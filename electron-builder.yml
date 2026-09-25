@@ -52,6 +52,7 @@ files:
   - desktop/shutdown.mjs
   - desktop/external-links.mjs
   - desktop/remote-panels.mjs
+  - desktop/remote-frontend.mjs
   - desktop/permissions.mjs
   - desktop/connections-ipc.mjs
   - desktop/connection-store.mjs

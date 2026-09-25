@@ -719,7 +719,7 @@ function EmptyFleet({
           </span>
         </div>
         <div className="welcome-header-actions">
-          {!session && <DesktopUpdates />}
+          <DesktopUpdates remote={Boolean(session)} />
           <a
             className="help-button"
             href="https://github.com/BigUziHert/MC-Server-UI/tree/dev#readme"
@@ -1203,7 +1203,7 @@ function ServerWorkspace({
             )}
           </nav>
           <div className="topbar-right">
-            {!session && <DesktopUpdates />}
+            <DesktopUpdates remote={Boolean(session)} />
             <button
               className="help-button"
               aria-label="Help and documentation"
@@ -1270,7 +1270,9 @@ function ServerWorkspace({
           {page === "subusers" && (
             <Subusers notify={notify} permissions={permissions} />
           )}
-          {page === "audit" && <AuditLogs notify={notify} />}
+          {page === "audit" && (
+            <AuditLogs notify={notify} serverOnly={Boolean(session)} />
+          )}
           <footer className="footer">
             <span>
               <Box size={13} /> MC Panel

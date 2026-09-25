@@ -3,6 +3,7 @@ export const CONNECTION_CHANNELS = {
   open: "mc-panel-connections:open",
   activate: "mc-panel-connections:activate",
   disconnect: "mc-panel-connections:disconnect",
+  openUpdates: "mc-panel-connections:open-updates",
   selectLocalServer: "mc-panel-connections:select-local-server",
   reportServers: "mc-panel-connections:report-servers",
   selectRemoteServer: "mc-panel-connections:select-remote-server",
@@ -13,6 +14,7 @@ export function installConnectionIpc(ipcMain, controller) {
     ipcMain.handle(channel, (event, value, serverId) => {
       if (!controller.isManagedSender(event))
         throw new Error("This page cannot manage desktop connections.");
+      if (action === "openUpdates") return controller.openUpdates();
       if (action === "reportServers")
         return controller.reportServers(event, value);
       if (action === "selectRemoteServer") {

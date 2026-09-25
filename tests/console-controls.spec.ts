@@ -75,8 +75,13 @@ test("cleared console lines stay hidden when the marker is absent and recover af
   );
 });
 
-for (const width of [1348, 390]) {
-  test(`console level filters combine with search, live output, and clearing at ${width}px`, async ({
+for (const { width, remote } of [
+  { width: 1348, remote: false },
+  { width: 390, remote: false },
+  { width: 1348, remote: true },
+  { width: 390, remote: true },
+]) {
+  test(`${remote ? "remote" : "local"} console level filters combine with search, live output, and clearing at ${width}px`, async ({
     page,
     serverId,
   }, testInfo) => {
@@ -103,6 +108,39 @@ for (const width of [1348, 390]) {
       (id) => localStorage.setItem("mc-panel.active-server", id),
       serverId,
     );
+    if (remote) {
+      await page.route("**/api/access/session", (route) =>
+        route.fulfill({
+          json: {
+            role: "subuser",
+            email: "console@example.test",
+            userId: "console-reader",
+            serverId,
+            permissions: ["control.console"],
+          },
+        }),
+      );
+      await page.route("**/api/servers", async (route) => {
+        const response = await route.fetch();
+        const fleet = await response.json();
+        await route.fulfill({
+          json: {
+            servers: fleet.servers.filter(
+              (server: { id: string }) => server.id === serverId,
+            ),
+            defaultServerId: serverId,
+          },
+        });
+      });
+    }
+    const consoleWrites: string[] = [];
+    page.on("request", (request) => {
+      if (
+        new URL(request.url()).pathname.startsWith("/api/console") &&
+        request.method() !== "GET"
+      )
+        consoleWrites.push(request.url());
+    });
     await page.goto("/#console");
     const output = page.getByRole("log");
     const messages = output.locator(".log-message");
@@ -170,6 +208,7 @@ for (const width of [1348, 390]) {
     await expect(messages).toHaveCount(0);
     lines = [...lines, line(9, "info", "New console output")];
     await expect(messages).toHaveText(["New console output"]);
+    expect(consoleWrites).toEqual([]);
   });
 }
 

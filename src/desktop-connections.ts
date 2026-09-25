@@ -34,6 +34,7 @@ declare global {
       list: () => Promise<PanelConnections>;
       open: (url: string) => Promise<PanelConnections>;
       activate: (id: string) => Promise<PanelConnections>;
+      openUpdates?: () => Promise<void>;
       disconnect: (id: string) => Promise<PanelConnections>;
       selectLocalServer: (id: string) => Promise<PanelConnections>;
       selectRemoteServer: (

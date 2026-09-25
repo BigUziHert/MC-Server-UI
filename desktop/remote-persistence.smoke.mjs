@@ -19,6 +19,8 @@ async function electronFixture() {
   const { app, BrowserWindow, WebContentsView, ipcMain, session } =
     await import("electron");
   const { createRemotePanelController } = await import("./remote-panels.mjs");
+  const { createRemoteFrontend, configureRemoteCertificateVerification } =
+    await import("./remote-frontend.mjs");
   const { createConnectionStore } = await import("./connection-store.mjs");
   const { installConnectionIpc } = await import("./connections-ipc.mjs");
   const root = app.commandLine.getSwitchValue("persistence-smoke-root");
@@ -27,6 +29,7 @@ async function electronFixture() {
   assert.ok(path.basename(root).startsWith("mc-remote-persistence-smoke-"));
   app.setPath("userData", path.join(root, "profile"));
   app.setPath("sessionData", path.join(root, "profile"));
+  configureRemoteCertificateVerification(app.commandLine);
   const config = JSON.parse(
     await fs.readFile(path.join(root, "fixture.json"), "utf8"),
   );
@@ -78,6 +81,9 @@ async function electronFixture() {
     session,
     store,
     preload,
+    remoteFrontend: await createRemoteFrontend({
+      directory: path.join(root, "frontend"),
+    }),
     downloadsDirectory: path.join(root, "downloads"),
     dialog: {
       async showMessageBox(parent, options) {
@@ -151,6 +157,11 @@ async function electronFixture() {
     },
     async remoteState(origin, marker) {
       const contents = remoteContents(origin);
+      assert.equal(
+        await contents.executeJavaScript("document.title"),
+        "Bundled persistence fixture",
+        "Restored sessions must render the bundled frontend.",
+      );
       if (marker !== undefined)
         await contents.executeJavaScript(
           `localStorage.setItem("fixture-marker",${JSON.stringify(marker)})`,
@@ -223,6 +234,12 @@ async function smoke() {
   const loginCounts = [0, 0];
   const page =
     "<!doctype html><title>Persistence fixture</title><h1>Remote persistence fixture</h1>";
+  const frontendDirectory = path.join(root, "frontend");
+  await fs.mkdir(frontendDirectory);
+  await fs.writeFile(
+    path.join(frontendDirectory, "index.html"),
+    "<!doctype html><title>Bundled persistence fixture</title><h1>Bundled remote persistence fixture</h1>",
+  );
   const remoteServers = [0, 1].map((index) =>
     https.createServer(
       { key: certificates[0].private, cert: certificates[0].cert },
@@ -561,7 +578,7 @@ async function smoke() {
     assertIsolated(state);
     await close();
     console.log(
-      "Passed real Electron persistence smoke: five distinct processes, saved hosts and certificate trust restored, HttpOnly sessions survive normal quit, local/remote storage stays isolated, signout survives restart, changed certificates block credentials, and disconnect forgets and clears the old session.",
+      "Passed real Electron persistence smoke: five distinct processes with the bundled frontend, saved hosts and certificate trust restored, HttpOnly sessions survive normal quit, local/remote storage stays isolated, signout survives restart, changed certificates block credentials, and disconnect forgets and clears the old session.",
     );
   } catch (cause) {
     if (stderr) console.error(stderr);

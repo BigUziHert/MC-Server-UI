@@ -10,6 +10,7 @@ if (process.isMainFrame) {
     activate: (id) => ipcRenderer.invoke("mc-panel-connections:activate", id),
     disconnect: (id) =>
       ipcRenderer.invoke("mc-panel-connections:disconnect", id),
+    openUpdates: () => ipcRenderer.invoke("mc-panel-connections:open-updates"),
     selectLocalServer: (id) =>
       ipcRenderer.invoke("mc-panel-connections:select-local-server", id),
     reportServers: (servers) =>

@@ -27,6 +27,7 @@ function harness({
   store,
   restoreTimeoutMs,
   onError,
+  remoteFrontend,
 } = {}) {
   const views = [];
   const partitions = [];
@@ -105,6 +106,7 @@ function harness({
     store,
     restoreTimeoutMs,
     onError,
+    remoteFrontend,
     session: {
       fromPartition(name) {
         const value = new EventEmitter();
@@ -119,6 +121,9 @@ function harness({
         };
         value.setPermissionCheckHandler = (handler) => {
           value.check = handler;
+        };
+        value.setCertificateVerifyProc = (handler) => {
+          value.verifyCertificate = handler;
         };
         value.clearStorageData = async () => {
           value.cleared = true;
@@ -193,6 +198,20 @@ function verify(
   });
   assert.equal(attempt.prevented, true);
   return result;
+}
+
+function verifyNetwork(
+  session,
+  cert,
+  hostname = "panel.example",
+  verificationResult = "net::ERR_CERT_AUTHORITY_INVALID",
+) {
+  return new Promise((resolve) => {
+    session.verifyCertificate(
+      { hostname, verificationResult, certificate: { data: cert } },
+      resolve,
+    );
+  });
 }
 
 async function certificate(hostname = "panel.example") {
@@ -392,6 +411,52 @@ test("remote views share one window, isolate sessions, reject external navigatio
   await assert.rejects(h.controller.open(origin), { status: 503 });
 });
 
+test("remote console downloads accept panel-owned blobs without weakening navigation or redirect checks", async () => {
+  const h = harness();
+  await h.controller.open(origin);
+  const remoteSession = h.partitions[0];
+  const blob = `blob:${origin}/console-export`;
+  for (const { url, chain = [url], allowed = false } of [
+    { url: blob, allowed: true },
+    { url: blob, chain: [], allowed: true },
+    { url: blob, chain: [`${origin}/api/console`, blob], allowed: true },
+    { url: `${origin}/api/files/download`, allowed: true },
+    { url: `${origin}/api/backups/archive/download`, allowed: true },
+    { url: blob, chain: ["https://evil.example/redirect", blob] },
+    { url: blob, chain: [`blob:https://evil.example/export`, blob] },
+    { url: `${origin}/file`, chain: [blob, `${origin}/file`] },
+    { url: "blob:https://evil.example/export" },
+    { url: "blob:null/export" },
+    { url: "blob:file:///export" },
+    { url: "blob:https://name:password@panel.example:3002/export" },
+    { url: "data:text/plain,console" },
+    { url: "file:///console.log" },
+    { url: "invalid" },
+  ]) {
+    const download = event();
+    let options;
+    remoteSession.emit("will-download", download, {
+      getURL: () => url,
+      getURLChain: () => chain,
+      getFilename: () => "../../server-console.log",
+      setSaveDialogOptions: (value) => {
+        options = value;
+      },
+    });
+    assert.equal(download.prevented, !allowed, `${url}: ${chain.join(", ")}`);
+    assert.equal(Boolean(options), allowed);
+    if (allowed)
+      assert.equal(
+        options.defaultPath,
+        path.join(os.tmpdir(), "remote-downloads", "server-console.log"),
+      );
+  }
+  const navigation = Object.assign(event(), { url: blob });
+  h.views[0].webContents.emit("will-navigate", navigation, blob);
+  assert.equal(navigation.prevented, true);
+  await h.controller.close();
+});
+
 test("remote official links open only allowlisted sites externally without replacing the panel", async () => {
   const h = harness();
   const context = await h.controller.open(origin);
@@ -475,6 +540,163 @@ test("certificate trust is explicit, per-connection, and tied to the valid leaf 
   await h.controller.open(origin);
   assert.equal(await verify(h.views[1], cert), false);
   assert.equal(h.prompts.length, 3);
+  await h.controller.close();
+});
+
+test("bundled remote frontend network verification keeps certificate consent and isolates its cleanup", async () => {
+  const [cert, changed, wrongHost] = await Promise.all([
+    certificate(),
+    certificate(),
+    certificate("other.example"),
+  ]);
+  const installations = [];
+  const h = harness({
+    responses: [1, 0],
+    remoteFrontend: {
+      install(session, target) {
+        const installed = { session, target, removed: 0 };
+        installations.push(installed);
+        return () => installed.removed++;
+      },
+    },
+    load: async (view) => {
+      const session = view.options.webPreferences.session;
+      assert.equal(installations.at(-1).session, session);
+      assert.equal(installations.at(-1).target, origin);
+      assert.equal(await verifyNetwork(session, cert), 0);
+    },
+  });
+  const opened = await h.controller.open(origin);
+  const session = h.partitions[0];
+  assert.equal(h.prompts.length, 1);
+  assert.equal(await verifyNetwork(session, cert), 0);
+  assert.equal(await verify(h.views[0], cert), true);
+  assert.equal(h.prompts.length, 1, "both network paths share the same trust");
+  assert.equal(
+    await verifyNetwork(session, "", "images.example", "net::OK"),
+    -3,
+    "publicly valid certificates use normal Chromium verification",
+  );
+  assert.equal(await verifyNetwork(session, cert, "other.example"), -2);
+  assert.equal(await verifyNetwork(session, wrongHost), -2);
+  assert.equal(await verifyNetwork(session, "malformed"), -2);
+  assert.equal(
+    await verifyNetwork(
+      session,
+      cert,
+      "panel.example",
+      "net::ERR_CERT_DATE_INVALID",
+    ),
+    -2,
+  );
+  assert.equal(h.prompts.length, 1);
+  assert.equal(await verifyNetwork(session, changed), -2);
+  assert.match(h.prompts[1].options.detail, /certificate has changed/);
+  h.controller.activate("local");
+  await h.controller.open(origin);
+  assert.equal(
+    installations.length,
+    1,
+    "switching reuses the installed frontend",
+  );
+  await h.controller.disconnect(opened.activeId);
+  assert.equal(installations[0].removed, 1);
+  assert.equal(session.verifyCertificate, null);
+  assert.equal(session.cleared, true);
+  assert.equal(h.owner.webContents.isDestroyed(), false);
+  await h.controller.close();
+  assert.equal(installations[0].removed, 1);
+});
+
+test("bundled remote frontend cleanup preserves saved sessions on close", async () => {
+  let removed = 0;
+  const store = memoryStore();
+  const h = harness({
+    store,
+    remoteFrontend: {
+      install() {
+        return () => removed++;
+      },
+    },
+  });
+  await h.controller.open(origin);
+  await h.controller.close();
+  assert.equal(removed, 1);
+  assert.equal(h.partitions[0].verifyCertificate, null);
+  assert.equal(h.partitions[0].storageFlushed, true);
+  assert.equal(h.partitions[0].cookiesFlushed, true);
+  assert.equal(h.partitions[0].cleared, undefined);
+  assert.equal(store.snapshot.panels.length, 1);
+  assert.equal(h.owner.webContents.isDestroyed(), false);
+});
+
+test("restored frontend network requests reject changed certificates quietly until an explicit retry", async () => {
+  const [trusted, changed] = await Promise.all([certificate(), certificate()]);
+  const id = randomUUID();
+  const store = memoryStore({
+    activeId: id,
+    panels: [
+      {
+        id,
+        origin,
+        trustedFingerprint: new X509Certificate(trusted).fingerprint256,
+      },
+    ],
+  });
+  let installations = 0;
+  const h = harness({
+    store,
+    responses: [1],
+    remoteFrontend: {
+      install() {
+        installations++;
+        return () => {};
+      },
+    },
+    load: async (view) => {
+      if (
+        (await verifyNetwork(view.options.webPreferences.session, changed)) !==
+        0
+      )
+        throw new Error("Certificate rejected");
+    },
+  });
+  await h.controller.restore();
+  assert.equal(h.prompts.length, 0);
+  assert.equal(h.views[0].webContents.isDestroyed(), false);
+  assert.equal(h.controller.list().panels.length, 2);
+  await h.controller.open(origin);
+  assert.equal(h.prompts.length, 1);
+  assert.match(h.prompts[0].options.detail, /certificate has changed/);
+  assert.equal(installations, 1);
+  assert.equal(h.controller.list().activeId, id);
+  await h.controller.close();
+  assert.equal(
+    store.snapshot.panels[0].trustedFingerprint,
+    new X509Certificate(changed).fingerprint256,
+  );
+});
+
+test("a failed remote frontend install removes its verifier and isolated view", async () => {
+  const h = harness({
+    remoteFrontend: {
+      install() {
+        throw new Error("Could not install the frontend protocol");
+      },
+    },
+  });
+  await assert.rejects(h.controller.open(origin), /frontend protocol/);
+  assert.equal(
+    h.views[0].loads,
+    undefined,
+    "failed setup never loads remote code",
+  );
+  assert.equal(h.views[0].webContents.isDestroyed(), true);
+  assert.equal(h.partitions[0].verifyCertificate, null);
+  assert.equal(h.partitions[0].cleared, true);
+  assert.equal(h.partitions[0].disconnected, true);
+  assert.equal(h.controller.list().panels.length, 1);
+  assert.equal(h.owner.webContents.isDestroyed(), false);
   await h.controller.close();
 });
 
@@ -954,6 +1176,72 @@ test("remote roster reports and selection reject untrusted scopes and invalid bo
   await h.controller.close();
 });
 
+test("opening app updates from a remote panel activates only the trusted local UI", async () => {
+  const h = harness();
+  const handlers = new Map();
+  const remove = installConnectionIpc(
+    {
+      handle: (channel, callback) => handlers.set(channel, callback),
+      removeHandler: (channel) => handlers.delete(channel),
+    },
+    h.controller,
+  );
+  const connection = await h.controller.open(origin);
+  const remote = h.views[0].webContents;
+  const local = h.owner.webContents;
+  const openUpdates = () =>
+    handlers.get(CONNECTION_CHANNELS.openUpdates)({
+      sender: remote,
+      senderFrame: remote.mainFrame,
+    });
+  const updateEvents = (contents) =>
+    contents.sent.filter(([channel]) => channel === "mc-panel-updates-open");
+
+  assert.equal(openUpdates(), undefined);
+  assert.equal(h.controller.list().activeId, "local");
+  assert.deepEqual(updateEvents(local), [["mc-panel-updates-open"]]);
+  assert.deepEqual(updateEvents(remote), []);
+  assert.equal(h.owner.contentView.children.length, 0);
+  assert.equal(remote.isDestroyed(), false);
+  assert.equal(local.focused, true);
+
+  h.controller.activate(connection.activeId);
+  const originalFrame = local.mainFrame;
+  const originalUrl = local.url;
+  for (const change of [
+    () => {
+      local.loading = true;
+    },
+    () => {
+      local.mainFrame = { ...originalFrame, origin: "https://evil.example" };
+    },
+    () => {
+      local.mainFrame = { ...originalFrame, url: "https://evil.example/" };
+    },
+    () => {
+      local.url = "https://evil.example/";
+    },
+    () => {
+      local.destroyed = true;
+    },
+  ]) {
+    change();
+    assert.throws(openUpdates, /local panel is not ready/);
+    assert.equal(h.controller.list().activeId, connection.activeId);
+    assert.deepEqual(updateEvents(local), [["mc-panel-updates-open"]]);
+    local.mainFrame = originalFrame;
+    local.url = originalUrl;
+    local.loading = false;
+    local.destroyed = false;
+  }
+  assert.equal(openUpdates(), undefined);
+  assert.equal(updateEvents(local).length, 2);
+  assert.deepEqual(updateEvents(remote), []);
+  await h.controller.close();
+  assert.throws(() => h.controller.openUpdates(), /shutting down/);
+  remove();
+});
+
 test("connection IPC validates managed sender, main frame, origin and bounded arguments", async () => {
   const h = harness();
   const handlers = new Map();
@@ -973,15 +1261,19 @@ test("connection IPC validates managed sender, main frame, origin and bounded ar
   const remoteId = invoke("list", remote).activeId;
   assert.equal(invoke("activate", remote, "local").activeId, "local");
   assert.equal(invoke("activate", local, remoteId).activeId, remoteId);
+  const rejectsSender = (sender, senderFrame = sender.mainFrame) => {
+    for (const action of ["list", "openUpdates"])
+      assert.throws(
+        () => invoke(action, sender, undefined, senderFrame),
+        /cannot manage/,
+      );
+  };
   for (const senderFrame of [
     null,
     { ...remote.mainFrame },
     { url: "about:blank", origin },
   ])
-    assert.throws(
-      () => invoke("list", remote, undefined, senderFrame),
-      /cannot manage/,
-    );
+    rejectsSender(remote, senderFrame);
   for (const bad of [
     "https://evil.example",
     "null",
@@ -989,21 +1281,21 @@ test("connection IPC validates managed sender, main frame, origin and bounded ar
   ]) {
     const before = remote.mainFrame;
     remote.mainFrame = { ...before, origin: bad };
-    assert.throws(() => invoke("list", remote), /cannot manage/);
+    rejectsSender(remote);
     remote.mainFrame = before;
   }
   remote.url = "https://evil.example/";
-  assert.throws(() => invoke("list", remote), /cannot manage/);
+  rejectsSender(remote);
   remote.url = origin;
   const impostor = { ...remote, mainFrame: remote.mainFrame };
-  assert.throws(() => invoke("list", impostor), /cannot manage/);
+  rejectsSender(impostor);
   for (const value of [null, {}, 12, "a".repeat(4097)])
     assert.throws(() => invoke("open", local, value), /valid panel address/);
   await assert.rejects(invoke("disconnect", local, "local"), { status: 400 });
   await invoke("disconnect", local, remoteId);
-  assert.throws(() => invoke("list", remote), /cannot manage/);
+  rejectsSender(remote);
   await h.controller.close();
-  assert.throws(() => invoke("list", local), /cannot manage/);
+  rejectsSender(local);
   remove();
   assert.equal(handlers.size, 0);
 });

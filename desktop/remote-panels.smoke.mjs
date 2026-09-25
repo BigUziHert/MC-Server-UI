@@ -69,6 +69,7 @@ async function fixture() {
           "<!doctype html><title>Fixture cannot replace native host title</title><h1>Remote fixture panel</h1><p>This page is served by the loopback HTTPS test fixture.</p>" +
             '<script>window.__localServerSelections=[];addEventListener("mc-panel-local-server-selected",event=>window.__localServerSelections.push(event.detail))</script>' +
             '<script>window.__remoteServerSelections=[];addEventListener("mc-panel-remote-server-selected",event=>window.__remoteServerSelections.push(event.detail))</script>' +
+            '<script>window.__updatesOpened=0;addEventListener("mc-panel-updates-open",()=>window.__updatesOpened++)</script>' +
             (req.url === "/" ? '<iframe src="/embedded"></iframe>' : ""),
         );
       },
@@ -96,10 +97,20 @@ async function fixture() {
     }
   }
   let controller;
+  const updaterCalls = [];
   const runtime = await startDesktopRuntime({
     dataDir: path.join(root, "data"),
     scheduler: false,
     openRemotePanel: (url) => controller.open(url),
+    updates: Object.fromEntries(
+      ["snapshot", "check", "download", "install"].map((action) => [
+        action,
+        () => {
+          updaterCalls.push(action);
+          return { desktop: true, supported: false };
+        },
+      ]),
+    ),
   });
   const ownerSession = session.fromPartition("remote-smoke-owner");
   await ownerSession.cookies.set({
@@ -162,6 +173,9 @@ async function fixture() {
   await ownerWindow.webContents.executeJavaScript(
     'window.__remoteServerSelections=[];addEventListener("mc-panel-remote-server-selected",event=>window.__remoteServerSelections.push(event.detail));window.__connectionChanges=0;addEventListener("mc-panel-connections-changed",()=>window.__connectionChanges++)',
   );
+  await ownerWindow.webContents.executeJavaScript(
+    'window.__updatesOpened=0;addEventListener("mc-panel-updates-open",()=>window.__updatesOpened++)',
+  );
   // Query Chromium's real permission path without reading or overwriting the
   // user's OS clipboard. The renderer copy/fallback flow is covered in e2e.
   const clipboardPermissions = (contents) =>
@@ -217,13 +231,16 @@ async function fixture() {
           "open",
           "activate",
           "disconnect",
+          "openUpdates",
           "selectLocalServer",
           "reportServers",
           "selectRemoteServer",
         ].includes(action),
       );
       return contents.executeJavaScript(
-        `window.mcPanelConnections[${JSON.stringify(action)}](${JSON.stringify(value)},${JSON.stringify(other)})`,
+        action === "openUpdates"
+          ? "window.mcPanelConnections.openUpdates()"
+          : `window.mcPanelConnections[${JSON.stringify(action)}](${JSON.stringify(value)},${JSON.stringify(other)})`,
       );
     },
     async inspect() {
@@ -233,8 +250,19 @@ async function fixture() {
       return {
         prompts,
         requests,
+        updaterCalls,
         nativeWindows: BrowserWindow.getAllWindows().length,
         context: controller.list(),
+        ownerUpdatesOpened: await ownerWindow.webContents.executeJavaScript(
+          "window.__updatesOpened",
+        ),
+        remoteUpdatesOpened: await Promise.all(
+          remoteContents.map(async (item) =>
+            item.isDestroyed()
+              ? 0
+              : item.executeJavaScript("window.__updatesOpened"),
+          ),
+        ),
         connectionChanges: await ownerWindow.webContents.executeJavaScript(
           "window.__connectionChanges",
         ),
@@ -378,6 +406,7 @@ async function smoke() {
         "open",
         "activate",
         "disconnect",
+        "openUpdates",
         "selectLocalServer",
         "reportServers",
         "selectRemoteServer",
@@ -409,6 +438,64 @@ async function smoke() {
     );
     assert.match(state.title, /^127\.0\.0\.1:\d+ · MC Panel$/);
     const firstId = state.context.activeId;
+    const connectedPanels = state.context.panels;
+    const connectedCookies = state.cookies;
+    assert.equal(state.ownerUpdatesOpened, 0);
+    assert.deepEqual(state.remoteUpdatesOpened, [0, 0]);
+    const updatesResult = await application.evaluate(() =>
+      globalThis.__remotePanelSmoke.invoke("openUpdates", undefined, true),
+    );
+    assert.equal(
+      updatesResult,
+      undefined,
+      "opening updates must return no local data",
+    );
+    await expect
+      .poll(async () => {
+        const current = await application.evaluate(() =>
+          globalThis.__remotePanelSmoke.inspect(),
+        );
+        return current.ownerUpdatesOpened;
+      })
+      .toBe(1);
+    state = await application.evaluate(() =>
+      globalThis.__remotePanelSmoke.inspect(),
+    );
+    assert.equal(state.context.activeId, "local");
+    assert.equal(state.title, "MC Panel");
+    assert.deepEqual(state.context.panels, connectedPanels);
+    assert.deepEqual(state.views, [{ destroyed: true }, { destroyed: false }]);
+    assert.deepEqual(state.cookies, connectedCookies);
+    assert.deepEqual(
+      state.remoteUpdatesOpened,
+      [0, 0],
+      "update notifications must only reach the local owner renderer",
+    );
+    assert.deepEqual(
+      state.updaterCalls,
+      [],
+      "the connection bridge must not read updater state or initiate update actions",
+    );
+    assert.ok(
+      state.requests.every(
+        (request) => !request.path.startsWith("/api/desktop/updates"),
+      ),
+      "opening local updates must not call the remote updater",
+    );
+    const returnedToRemote = await application.evaluate(
+      (_electron, id) => globalThis.__remotePanelSmoke.invoke("activate", id),
+      firstId,
+    );
+    assert.equal(returnedToRemote.activeId, firstId);
+    state = await application.evaluate(() =>
+      globalThis.__remotePanelSmoke.inspect(),
+    );
+    assert.equal(
+      state.views.length,
+      2,
+      "opening updates must retain the remote view",
+    );
+    assert.deepEqual(state.cookies, connectedCookies);
     const firstRoster = [
       {
         id: "remote-world",
@@ -638,7 +725,7 @@ async function smoke() {
       "A reconnected view must not inherit the disconnected session.",
     );
     console.log(
-      "Passed real Electron remote smoke: one native window, two isolated remote views, distinct local/remote icons and rosters across switches, scoped signout clearing/selection events, minimal local entries, owner-only persisted selection, cookies/trust preserved, disconnect cleanup, local runtime survival, and clipboard permission checks (OS clipboard untouched).",
+      "Passed real Electron remote smoke: one native window, two isolated remote views, distinct local/remote icons and rosters across switches, scoped signout clearing/selection events, minimal local entries, owner-only persisted selection and update navigation, cookies/trust preserved, disconnect cleanup, local runtime survival, and clipboard permission checks (OS clipboard untouched).",
     );
   } catch (cause) {
     if (stderr) console.error(stderr);

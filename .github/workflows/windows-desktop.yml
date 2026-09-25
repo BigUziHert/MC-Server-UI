@@ -75,6 +75,9 @@ jobs:
       - name: Smoke-test saved remote sign-ins across restarts
         run: node desktop/remote-persistence.smoke.mjs
 
+      - name: Smoke-test consistent desktop and remote interfaces
+        run: node desktop/remote-frontend.smoke.mjs
+
       - name: Smoke-test desktop navigation
         run: node desktop/menu.smoke.mjs
 

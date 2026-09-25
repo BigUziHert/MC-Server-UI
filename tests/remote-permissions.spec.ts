@@ -59,6 +59,19 @@ async function sharedPanel(page: Page, permissions: string[]) {
       });
     if (path === "/api/server") return reply(server);
     if (path === "/api/console") return reply({ lines: [] });
+    if (path === "/api/audit")
+      return reply({
+        entries: [
+          {
+            id: "shared-audit-event",
+            action: "file.edited",
+            detail: "Updated shared server settings",
+            actor: "manager@example.test",
+            category: "file",
+            createdAt: stamp,
+          },
+        ],
+      });
     if (path === "/api/versions")
       return reply({
         providers: [
@@ -395,6 +408,41 @@ test("properties and player controls stay disabled for read-only access", async 
   await expect(
     page.getByRole("switch", { name: "Enable whitelist", exact: true }),
   ).toBeDisabled();
+  expect(calls.filter((call) => call.method !== "GET")).toEqual([]);
+});
+
+test("remote audit readers keep server filters without offering owner-only panel activity", async ({
+  page,
+}) => {
+  const calls = await sharedPanel(page, ["audit.read"]);
+  await page.goto("/#audit");
+  await expect(
+    page.getByRole("heading", { name: "Audit logs", exact: true }),
+  ).toBeVisible();
+  const row = page.getByRole("row").filter({
+    hasText: "Updated shared server settings",
+  });
+  await expect(row).toBeVisible();
+  await expect(page.getByRole("combobox", { name: "Audit scope" })).toHaveCount(
+    0,
+  );
+  await page.getByRole("button", { name: "Files", exact: true }).click();
+  await expect(row).toBeVisible();
+  const search = page.getByRole("textbox", {
+    name: "Search audit logs",
+    exact: true,
+  });
+  await search.fill("no matching event");
+  await expect(
+    page.getByRole("heading", { name: "No activity matches your filters" }),
+  ).toBeVisible();
+  await page.getByRole("button", { name: "Clear search", exact: true }).click();
+  await expect(row).toBeVisible();
+  await page.getByRole("button", { name: "Refresh audit logs" }).click();
+  await expect(
+    page.getByText("Audit logs refreshed.", { exact: true }),
+  ).toBeVisible();
+  expect(calls.some((call) => call.path === "/api/panel/audit")).toBe(false);
   expect(calls.filter((call) => call.method !== "GET")).toEqual([]);
 });
 

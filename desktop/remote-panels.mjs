@@ -95,6 +95,18 @@ function sameOrigin(value, origin) {
   }
 }
 
+function sameOriginDownload(value, origin) {
+  if (sameOrigin(value, origin)) return true;
+  try {
+    const url = new URL(value);
+    // Console exports are generated in the renderer. Permit only blobs owned
+    // by this panel; document navigation still requires an HTTP(S) URL.
+    return url.protocol === "blob:" && sameOrigin(url.pathname, origin);
+  } catch {
+    return false;
+  }
+}
+
 // Only MC Panel's direct-access case is eligible for a trust exception. A
 // fingerprint confirmation must not bypass expiry, name, or signature checks.
 function selfSignedFingerprint(certificate, hostname) {
@@ -123,6 +135,7 @@ export function createRemotePanelController({
   dialog,
   downloadsDirectory,
   preload,
+  remoteFrontend,
   openWebsite = () => {},
   listLocalServers = () => [],
   selectLocalServer,
@@ -325,6 +338,7 @@ export function createRemotePanelController({
     // Destroy the renderer before clearing storage so it cannot recreate a
     // session cookie while the connection is being removed.
     if (!panel.contents.isDestroyed()) panel.contents.close();
+    panel.removeFrontend?.();
     const cleanup = Promise.all([
       panel.session.clearStorageData(),
       panel.session.clearCache(),
@@ -338,6 +352,25 @@ export function createRemotePanelController({
   const controller = {
     list,
     activate,
+    openUpdates() {
+      ensureOpen();
+      const contents = local.contents;
+      if (
+        !controller.isManagedSender({
+          sender: contents,
+          senderFrame: contents.mainFrame,
+        }) ||
+        contents.isLoadingMainFrame()
+      )
+        throw failure(
+          409,
+          "The local panel is not ready to show app updates. Try again shortly.",
+        );
+      // Remote pages can open the trusted local UI, but cannot read updater
+      // state or start a check, download, or install through this bridge.
+      activate(local.id);
+      contents.send("mc-panel-updates-open");
+    },
     reportServers(event, value) {
       if (!controller.isManagedSender(event))
         throw failure(403, "This page cannot report remote servers.");
@@ -539,9 +572,14 @@ export function createRemotePanelController({
         done({ cancel: document && !sameOrigin(details.url, origin) });
       });
       remoteSession.on("will-download", (event, item) => {
+        const downloadUrl = item.getURL();
         if (
-          !sameOrigin(item.getURL(), origin) ||
-          item.getURLChain().some((entry) => !sameOrigin(entry, origin))
+          !sameOriginDownload(downloadUrl, origin) ||
+          item
+            .getURLChain()
+            .some(
+              (entry) => entry !== downloadUrl && !sameOrigin(entry, origin),
+            )
         ) {
           event.preventDefault();
           return;
@@ -554,65 +592,105 @@ export function createRemotePanelController({
           title: "Save remote server file",
         });
       });
+      const verifyCertificate = (destination, error, cert, done) => {
+        const fingerprint =
+          sameOrigin(destination, origin) &&
+          error === "net::ERR_CERT_AUTHORITY_INVALID"
+            ? selfSignedFingerprint(cert, hostname)
+            : null;
+        if (
+          !fingerprint ||
+          panel.removed ||
+          contents.isDestroyed() ||
+          !panels.has(panel.id)
+        )
+          return done(false);
+        if (fingerprint === panel.trustedFingerprint) return done(true);
+        if (!panel.allowCertificatePrompt) return done(false);
+        if (pendingTrust && pendingTrust.fingerprint !== fingerprint)
+          return done(false);
+        if (!pendingTrust) {
+          const verification = dialog
+            .showMessageBox(window, {
+              type: "warning",
+              title: "Verify remote panel certificate",
+              message: `Verify the certificate for ${host}`,
+              detail: `${panel.trustedFingerprint ? "This panel's certificate has changed.\n\n" : ""}Compare this SHA-256 fingerprint with the fingerprint the server owner shares through a trusted channel:\n\n${fingerprint}\n\nContinue only if every character matches. Trust applies only to this connection and this exact certificate.`,
+              buttons: ["Cancel connection", "Fingerprint matches — connect"],
+              defaultId: 0,
+              cancelId: 0,
+              noLink: true,
+            })
+            .then(({ response }) => {
+              const accepted =
+                response === 1 &&
+                !panel.removed &&
+                !contents.isDestroyed() &&
+                panels.has(panel.id);
+              if (accepted) {
+                panel.trustedFingerprint = fingerprint;
+                if (panel.saved) {
+                  remember(panel);
+                  void persist().catch(onError);
+                }
+              } else canceled = true;
+              return accepted;
+            })
+            .catch(() => {
+              canceled = true;
+              return false;
+            });
+          pendingTrust = { fingerprint, verification };
+          void verification.finally(() => {
+            pendingTrust = undefined;
+          });
+        }
+        void pendingTrust.verification.then((accepted) => done(accepted));
+      };
       contents.on(
         "certificate-error",
         (event, destination, error, cert, done) => {
           event.preventDefault();
-          const fingerprint =
-            sameOrigin(destination, origin) &&
-            error === "net::ERR_CERT_AUTHORITY_INVALID"
-              ? selfSignedFingerprint(cert, hostname)
-              : null;
-          if (
-            !fingerprint ||
-            panel.removed ||
-            contents.isDestroyed() ||
-            !panels.has(panel.id)
-          )
-            return done(false);
-          if (fingerprint === panel.trustedFingerprint) return done(true);
-          if (!panel.allowCertificatePrompt) return done(false);
-          if (pendingTrust && pendingTrust.fingerprint !== fingerprint)
-            return done(false);
-          if (!pendingTrust) {
-            const verification = dialog
-              .showMessageBox(window, {
-                type: "warning",
-                title: "Verify remote panel certificate",
-                message: `Verify the certificate for ${host}`,
-                detail: `${panel.trustedFingerprint ? "This panel's certificate has changed.\n\n" : ""}Compare this SHA-256 fingerprint with the fingerprint the server owner shares through a trusted channel:\n\n${fingerprint}\n\nContinue only if every character matches. Trust applies only to this connection and this exact certificate.`,
-                buttons: ["Cancel connection", "Fingerprint matches — connect"],
-                defaultId: 0,
-                cancelId: 0,
-                noLink: true,
-              })
-              .then(({ response }) => {
-                const accepted =
-                  response === 1 &&
-                  !panel.removed &&
-                  !contents.isDestroyed() &&
-                  panels.has(panel.id);
-                if (accepted) {
-                  panel.trustedFingerprint = fingerprint;
-                  if (panel.saved) {
-                    remember(panel);
-                    void persist().catch(onError);
-                  }
-                } else canceled = true;
-                return accepted;
-              })
-              .catch(() => {
-                canceled = true;
-                return false;
-              });
-            pendingTrust = { fingerprint, verification };
-            void verification.finally(() => {
-              pendingTrust = undefined;
-            });
-          }
-          void pendingTrust.verification.then((accepted) => done(accepted));
+          verifyCertificate(destination, error, cert, done);
         },
       );
+      if (remoteFrontend) {
+        // Protocol forwarding uses this isolated session's network stack and
+        // does not have a WebContents certificate-error event. Apply the same
+        // fingerprint consent and hostname/expiry checks to that path.
+        const verifySessionCertificate = (request, done) => {
+          if (request.verificationResult === "net::OK") return done(-3);
+          if (
+            request.hostname.replace(/^\[|\]$/g, "") !==
+            hostname.replace(/^\[|\]$/g, "")
+          )
+            return done(-2);
+          verifyCertificate(
+            origin,
+            request.verificationResult,
+            request.certificate,
+            (accepted) => done(accepted ? 0 : -2),
+          );
+        };
+        remoteSession.setCertificateVerifyProc(verifySessionCertificate);
+        let remove = () => {};
+        let frontendRemoved = false;
+        panel.removeFrontend = () => {
+          if (frontendRemoved) return;
+          frontendRemoved = true;
+          try {
+            remove();
+          } finally {
+            remoteSession.setCertificateVerifyProc(null);
+          }
+        };
+        try {
+          remove = remoteFrontend.install(remoteSession, origin);
+        } catch (cause) {
+          await dispose(panel);
+          throw cause;
+        }
+      }
       panel.load = async (target, { quiet = false } = {}) => {
         ensureOpen();
         if (panel.removed || contents.isDestroyed() || panels.get(id) !== panel)
@@ -707,6 +785,7 @@ export function createRemotePanelController({
                 panel.contents.stop();
                 panel.contents.close();
               }
+              panel.removeFrontend?.();
               const flushed = await Promise.allSettled([
                 Promise.resolve().then(() => panel.session.flushStorageData()),
                 Promise.resolve().then(() =>

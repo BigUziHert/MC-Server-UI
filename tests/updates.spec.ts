@@ -131,4 +131,10 @@ test("portable builds explain the one-time Setup requirement and never offer an 
   ).toHaveCount(0);
   await page.keyboard.press("Escape");
   await expect(dialog).not.toBeVisible();
+  // Both the tray and remote-panel shortcut open this trusted local dialog.
+  await page.evaluate(() =>
+    window.dispatchEvent(new Event("mc-panel-updates-open")),
+  );
+  await expect(dialog).toBeVisible();
+  await expect(dialog).toContainText("Setup edition once");
 });
