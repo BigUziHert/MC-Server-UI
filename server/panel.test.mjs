@@ -842,20 +842,31 @@ async function busyFileReads(t, files) {
   );
   const opened = new Map();
   const attempts = [];
+  const io = [];
   const open = nativeFs.open.bind(nativeFs);
   const read = nativeFs.read.bind(nativeFs);
   const close = nativeFs.close.bind(nativeFs);
   t.mock.method(nativeFs, "open", (file, ...args) => {
     const callback = args.pop();
     return open(file, ...args, (cause, fd) => {
-      // Windows temp paths can use short names or junctions. Match the same
-      // canonical path used by locked, even when tar opens through an alias.
-      if (!cause) opened.set(fd, key(nativeFs.realpathSync(file)));
+      // Match fs.promises.realpath's native behavior: the default synchronous
+      // implementation resolves junctions but preserves Windows 8.3 names.
+      const resolved = cause
+        ? undefined
+        : key(nativeFs.realpathSync.native(file));
+      io.push({
+        operation: "open",
+        file: key(file),
+        resolved,
+        error: cause?.code,
+      });
+      if (!cause) opened.set(fd, resolved);
       callback(cause, fd);
     });
   });
   t.mock.method(nativeFs, "read", (fd, ...args) => {
     const file = opened.get(fd);
+    io.push({ operation: "read", file, locked: locked.has(file) });
     if (!locked.has(file)) return read(fd, ...args);
     attempts.push(file);
     const callback = args.at(-1);
@@ -873,7 +884,7 @@ async function busyFileReads(t, files) {
     opened.delete(fd);
     return close(fd, ...args);
   });
-  return { locked, attempts };
+  return { locked, attempts, io };
 }
 
 test("scheduled live backups omit locked session files and preserve complete world data", async (t) => {
@@ -998,11 +1009,15 @@ test("a busy world data file fails a scheduled backup safely and permits a compl
   );
   assert.equal(saved.status, 200);
   await tick(new Date(new Date(saved.body.schedule.nextRun).getTime() + 1));
-  assert.equal(reads.attempts.length, 1, "The EBUSY read must be exercised.");
+  const entries = (await request("/api/audit")).body.entries;
+  assert.equal(
+    reads.attempts.length,
+    1,
+    `The EBUSY read must be exercised. ${JSON.stringify({ locked: [...reads.locked], io: reads.io, commands: java.commands, audit: entries.slice(0, 5) })}`,
+  );
   assert.deepEqual(java.commands, ["save-off", "save-all flush", "save-on"]);
   assert.deepEqual((await request("/api/backups")).body.backups, []);
   assert.deepEqual(await fs.readdir(path.join(dataDir, "backups")), []);
-  const entries = (await request("/api/audit")).body.entries;
   const failure = entries.find(
     (entry) => entry.action === "Scheduled backup failed",
   );
