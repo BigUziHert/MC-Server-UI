@@ -713,10 +713,10 @@ test("subuser creation and permission changes publish only after persistence suc
 });
 
 test("failed subuser revocation stays retryable and never restores revoked credentials", async (t) => {
-  const { fleet, root, id, local, invite } = await fixture(t);
+  const { fleet, id, local, invite } = await fixture(t);
   const { user, cookie, asUser } = await invite([]);
   const statePath = path.join(fleet.runtimes.get(id).dataDir, "panel.json");
-  const accessPath = path.join(root, "remote-access.json");
+  const accessPath = path.join(fleet.dataDir, "remote-access.json");
   const rename = fs.rename;
   let failingPath = accessPath;
   t.mock.method(console, "error", () => {});
@@ -740,7 +740,7 @@ test("failed subuser revocation stays retryable and never restores revoked crede
   const persisted = JSON.parse(await fs.readFile(statePath, "utf8"));
   assert.equal(persisted.users[0].id, user.id);
   const reloaded = await createAccessService({
-    dataDir: root,
+    dataDir: fleet.dataDir,
     getUser: (serverId, userId) =>
       serverId === id
         ? persisted.users.find((entry) => entry.id === userId)
