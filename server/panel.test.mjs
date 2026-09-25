@@ -848,7 +848,9 @@ async function busyFileReads(t, files) {
   t.mock.method(nativeFs, "open", (file, ...args) => {
     const callback = args.pop();
     return open(file, ...args, (cause, fd) => {
-      if (!cause) opened.set(fd, key(file));
+      // Windows temp paths can use short names or junctions. Match the same
+      // canonical path used by locked, even when tar opens through an alias.
+      if (!cause) opened.set(fd, key(nativeFs.realpathSync(file)));
       callback(cause, fd);
     });
   });
@@ -977,7 +979,12 @@ test("a busy world data file fails a scheduled backup safely and permits a compl
   await fs.mkdir(path.dirname(target), { recursive: true });
   await fs.writeFile(target, content);
   const reads = await busyFileReads(t, [target]);
-  await request("/api/server/power", json("POST", { action: "start" }));
+  assert.equal(
+    (await request("/api/server/power", json("POST", { action: "start" })))
+      .status,
+    200,
+  );
+  assert.equal((await request("/api/server")).body.status, "running");
   const saved = await request(
     "/api/backups/schedule",
     json("PUT", {
