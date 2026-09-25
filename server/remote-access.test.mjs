@@ -6,6 +6,7 @@ import path from "node:path";
 import http from "node:http";
 import { createFleet } from "./index.mjs";
 import { requiredPermissions } from "./remote-access.mjs";
+import { createAccessService } from "./access.mjs";
 import { processStartup } from "../tests/fixtures/process-options.mjs";
 
 const origin = "https://panel.example.test";
@@ -591,4 +592,299 @@ test("manual invitations never grant other servers merely because their email ma
   assert.deepEqual(login.body.memberships, [
     { serverId: id, userId: first.user.id },
   ]);
+});
+
+test("proxy sign-in isolates account limits without trusting forwarded addresses", async (t) => {
+  const { guest, invite } = await fixture(t);
+  await invite([]);
+  for (let index = 0; index < 9; index++) {
+    const result = await guest(
+      "/api/access/login",
+      json("POST", {
+        email: `unknown-${index}@example.test`,
+        password: "Wrong-test-password!",
+      }),
+    );
+    assert.equal(result.status, 401);
+  }
+  assert.equal(
+    (
+      await guest(
+        "/api/access/login",
+        json("POST", {
+          email: "sister@example.test",
+          password: "Correct-test-password!",
+        }),
+      )
+    ).status,
+    200,
+  );
+  for (let index = 0; index < 8; index++) {
+    assert.equal(
+      (
+        await guest("/api/access/login", {
+          ...json("POST", {
+            email:
+              index % 2 ? " LIMITED@example.test " : "limited@example.test",
+            password: "Wrong-test-password!",
+          }),
+          headers: { "X-Forwarded-For": `192.0.2.${index}` },
+        })
+      ).status,
+      401,
+    );
+  }
+  assert.equal(
+    (
+      await guest(
+        "/api/access/login",
+        json("POST", {
+          email: "limited@example.test",
+          password: "Wrong-test-password!",
+        }),
+      )
+    ).status,
+    429,
+  );
+});
+
+test("remote users cannot reset their own access and retain their session", async (t) => {
+  const { invite, local } = await fixture(t);
+  const { user, asUser } = await invite(["user.create"]);
+  const result = await asUser(`/api/subusers/${user.id}/invite`, {
+    method: "POST",
+  });
+  assert.equal(result.status, 403);
+  assert.match(result.body.error, /owner.*own access/);
+  assert.equal((await asUser("/api/server")).status, 200);
+  assert.equal(
+    (await local("/api/subusers")).body.users[0].inviteStatus,
+    "accepted",
+  );
+});
+
+test("subuser creation and permission changes publish only after persistence succeeds", async (t) => {
+  const { fleet, id, local } = await fixture(t);
+  const statePath = path.join(fleet.runtimes.get(id).dataDir, "panel.json");
+  const rename = fs.rename;
+  let fail = true;
+  t.mock.method(console, "error", () => {});
+  t.mock.method(fs, "rename", async (from, to) => {
+    if (fail && to === statePath) {
+      fail = false;
+      throw Object.assign(new Error("Fixture disk unavailable"), {
+        code: "EACCES",
+      });
+    }
+    return rename(from, to);
+  });
+  const input = json("POST", { email: "helper@example.test", permissions: [] });
+  assert.equal((await local("/api/subusers", input)).status, 500);
+  assert.deepEqual((await local("/api/subusers")).body.users, []);
+  const created = await local("/api/subusers", input);
+  assert.equal(created.status, 201);
+  fail = true;
+  assert.equal(
+    (
+      await local(
+        `/api/subusers/${created.body.id}`,
+        json("PATCH", {
+          permissions: ["control.start"],
+        }),
+      )
+    ).status,
+    500,
+  );
+  assert.deepEqual(
+    (await local("/api/subusers")).body.users[0].permissions,
+    [],
+  );
+  assert.equal(
+    (
+      await local(
+        `/api/subusers/${created.body.id}`,
+        json("PATCH", {
+          permissions: ["control.start"],
+        }),
+      )
+    ).status,
+    200,
+  );
+});
+
+test("failed subuser revocation stays retryable and never restores revoked credentials", async (t) => {
+  const { fleet, root, id, local, invite } = await fixture(t);
+  const { user, cookie, asUser } = await invite([]);
+  const statePath = path.join(fleet.runtimes.get(id).dataDir, "panel.json");
+  const accessPath = path.join(root, "remote-access.json");
+  const rename = fs.rename;
+  let failingPath = accessPath;
+  t.mock.method(console, "error", () => {});
+  t.mock.method(fs, "rename", async (from, to) => {
+    if (to === failingPath) {
+      failingPath = null;
+      throw Object.assign(new Error("Fixture disk unavailable"), {
+        code: "EACCES",
+      });
+    }
+    return rename(from, to);
+  });
+  const remove = () => local(`/api/subusers/${user.id}`, { method: "DELETE" });
+  assert.equal((await remove()).status, 500);
+  assert.equal((await local("/api/subusers")).body.users[0].id, user.id);
+  assert.equal((await asUser("/api/server")).status, 200);
+  failingPath = statePath;
+  assert.equal((await remove()).status, 500);
+  assert.equal((await local("/api/subusers")).body.users[0].id, user.id);
+  assert.equal((await asUser("/api/server")).status, 401);
+  const persisted = JSON.parse(await fs.readFile(statePath, "utf8"));
+  assert.equal(persisted.users[0].id, user.id);
+  const reloaded = await createAccessService({
+    dataDir: root,
+    getUser: (serverId, userId) =>
+      serverId === id
+        ? persisted.users.find((entry) => entry.id === userId)
+        : null,
+  });
+  assert.equal(await reloaded.authenticate({ headers: { cookie } }), null);
+  await assert.rejects(
+    reloaded.login({ email: user.email, password: "Correct-test-password!" }),
+    { status: 401 },
+  );
+  await reloaded.close();
+  assert.equal((await remove()).status, 200);
+  assert.deepEqual((await local("/api/subusers")).body.users, []);
+});
+
+test("an overlapping audit save preserves a committed subuser transaction", async (t) => {
+  const { fleet, id, local } = await fixture(t);
+  const runtime = fleet.runtimes.get(id);
+  const statePath = path.join(runtime.dataDir, "panel.json");
+  const rename = fs.rename;
+  let entered,
+    release,
+    paused = false;
+  const writing = new Promise((resolve) => {
+    entered = resolve;
+  });
+  const resume = new Promise((resolve) => {
+    release = resolve;
+  });
+  t.mock.method(fs, "rename", async (from, to) => {
+    if (!paused && to === statePath) {
+      paused = true;
+      entered();
+      await resume;
+    }
+    return rename(from, to);
+  });
+  const creating = local(
+    "/api/subusers",
+    json("POST", {
+      email: "helper@example.test",
+      permissions: [],
+    }),
+  );
+  await writing;
+  const auditing = runtime.audit(
+    "file",
+    "Overlapping file event",
+    "A concurrent operation finished.",
+  );
+  release();
+  assert.equal((await creating).status, 201);
+  await auditing;
+  const persisted = JSON.parse(await fs.readFile(statePath, "utf8"));
+  assert.equal(persisted.users[0].email, "helper@example.test");
+  assert.ok(persisted.audit.some((entry) => entry.action === "Subuser added"));
+  assert.ok(
+    persisted.audit.some((entry) => entry.action === "Overlapping file event"),
+  );
+});
+
+test("committed invitations return their link even when the audit save fails", async (t) => {
+  const { fleet, id, local, guest } = await fixture(t);
+  const created = await local(
+    "/api/subusers",
+    json("POST", {
+      email: "helper@example.test",
+      permissions: [],
+    }),
+  );
+  const runtime = fleet.runtimes.get(id);
+  const statePath = path.join(runtime.dataDir, "panel.json");
+  const rename = fs.rename;
+  let fail = true;
+  t.mock.method(console, "error", () => {});
+  t.mock.method(fs, "rename", async (from, to) => {
+    if (fail && to === statePath) {
+      fail = false;
+      throw Object.assign(new Error("Fixture disk unavailable"), {
+        code: "EACCES",
+      });
+    }
+    return rename(from, to);
+  });
+  const invitation = await local(`/api/subusers/${created.body.id}/invite`, {
+    method: "POST",
+  });
+  assert.equal(invitation.status, 200);
+  assert.match(invitation.body.warning, /audit history could not be saved/);
+  const token = new URL(invitation.body.invitationUrl).hash.slice(
+    "#invite=".length,
+  );
+  assert.equal(
+    (
+      await guest(
+        "/api/access/accept",
+        json("POST", {
+          token,
+          password: "Correct-test-password!",
+        }),
+      )
+    ).status,
+    200,
+  );
+  await runtime.audit("user", "Audit recovered", "Fixture disk is available.");
+});
+
+test("remote Launchpad removals persist the subuser actor", async (t) => {
+  const { fleet, id, invite } = await fixture(t);
+  const runtime = fleet.runtimes.get(id);
+  await fs.mkdir(path.join(runtime.serverDir, "plugins"));
+  await fs.writeFile(
+    path.join(runtime.serverDir, "plugins", "unmanaged.jar"),
+    "fixture plugin",
+  );
+  const { user, asUser } = await invite([
+    "file.create",
+    "file.update",
+    "file.delete",
+    "control.start",
+    "control.stop",
+    "audit.read",
+  ]);
+  const preview = await asUser(
+    "/api/launchpad/removal-preview",
+    json("POST", {
+      type: "plugin",
+      path: "plugins/unmanaged.jar",
+    }),
+  );
+  assert.equal(preview.status, 200, JSON.stringify(preview.body));
+  const removed = await asUser(
+    "/api/launchpad/remove",
+    json("POST", {
+      planId: preview.body.planId,
+      confirmed: true,
+    }),
+  );
+  assert.equal(removed.status, 200, JSON.stringify(removed.body));
+  const saved = JSON.parse(
+    await fs.readFile(path.join(runtime.dataDir, "panel.json"), "utf8"),
+  );
+  assert.equal(
+    saved.audit.find((entry) => entry.action === "Plugin deleted").actor,
+    user.email,
+  );
 });

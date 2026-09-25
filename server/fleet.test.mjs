@@ -564,7 +564,11 @@ test("live player actions send validated single commands; ops.json remains autho
   );
   await request(
     "/api/files/content",
-    json("PUT", { path: "eula.txt", content: "eula=true\n" }),
+    json("PUT", {
+      path: "eula.txt",
+      ...(await request("/api/files/content?path=eula.txt", {}, live.id)).body,
+      content: "eula=true\n",
+    }),
     live.id,
   );
   const starts = await Promise.all(
@@ -646,7 +650,11 @@ test("live player actions send validated single commands; ops.json remains autho
   );
   await request(
     "/api/files/content",
-    json("PUT", { path: "ops.json", content: "[broken" }),
+    json("PUT", {
+      path: "ops.json",
+      ...(await request("/api/files/content?path=ops.json", {}, live.id)).body,
+      content: "[broken",
+    }),
     live.id,
   );
   assert.equal((await request("/api/players", {}, live.id)).status, 409);

@@ -60,6 +60,7 @@ type Invitation = {
   user: Subuser;
   invitationUrl: string;
   inviteExpiresAt: string;
+  warning?: string;
 };
 function accessReady(settings: AccessSettings | null) {
   return !!settings?.ready && !settings.error && settings.listening !== false;
@@ -553,6 +554,11 @@ function InvitationDialog({
             their previous password and signs them out of this server
             immediately. They regain access after accepting the new link.
           </p>
+          {invitation.warning && (
+            <p className="subusers-form-error" role="alert">
+              <AlertCircle size={16} /> {invitation.warning}
+            </p>
+          )}
           {copyStatus && (
             <p role="status" className="subusers-copy-status">
               {copyStatus}
@@ -578,7 +584,8 @@ function InvitationDialog({
 export default function Subusers({
   notify,
   permissions,
-}: PageProps & { permissions?: string[] }) {
+  signedInEmail,
+}: PageProps & { permissions?: string[]; signedInEmail?: string }) {
   const remote = permissions !== undefined;
   const can = (permission: string) =>
     permissions === undefined || permissions.includes(permission);
@@ -587,6 +594,9 @@ export default function Subusers({
   const canUpdate = can("user.update");
   const canDelete = can("user.delete");
   const manageable = (user: Subuser) => permissionsFor(user).every(can);
+  const ownAccess = (user: Subuser) =>
+    signedInEmail !== undefined &&
+    user.email.toLowerCase() === signedInEmail.toLowerCase();
   const grantablePermissions = permissionIds.filter(can);
   const groups = catalog.groups
     .map((group) => ({
@@ -626,7 +636,7 @@ export default function Subusers({
   const editing = editor && editor !== "create" ? editor : null;
   const invitationReady = canCreate && (remote || accessReady(accessSettings));
   const canSubmitRecord = resetting
-    ? canCreate && manageable(resetting)
+    ? canCreate && manageable(resetting) && !ownAccess(resetting)
     : deleting
       ? canDelete && manageable(deleting)
       : editing
@@ -703,7 +713,7 @@ export default function Subusers({
     setEditor(user ?? "create");
   }
   async function createInvitation(user: Subuser) {
-    if (!canCreate || !manageable(user)) return;
+    if (!canCreate || !manageable(user) || ownAccess(user)) return;
     setInviting(user.id);
     setInvitationError("");
     try {
@@ -923,6 +933,11 @@ export default function Subusers({
                                   ? "Invitation expired · create a new link"
                                   : "Not invited"}
                           </span>
+                          {ownAccess(user) && canCreate && (
+                            <span>
+                              Ask the panel owner to reset your own access.
+                            </span>
+                          )}
                         </div>
                       </div>
                     </td>
@@ -947,13 +962,16 @@ export default function Subusers({
                           className="btn subuser-invite"
                           aria-label={`${user.inviteStatus === "accepted" ? "Reset access for" : "Create invite link for"} ${user.email}`}
                           title={
-                            invitationReady
-                              ? "Create a one-time link. Any previous unused link will stop working."
-                              : "Complete remote access setup to create invitation links"
+                            ownAccess(user)
+                              ? "Ask the panel owner to reset your own access."
+                              : invitationReady
+                                ? "Create a one-time link. Any previous unused link will stop working."
+                                : "Complete remote access setup to create invitation links"
                           }
                           disabled={
                             !canCreate ||
                             !manageable(user) ||
+                            ownAccess(user) ||
                             busy ||
                             !!inviting ||
                             !invitationReady

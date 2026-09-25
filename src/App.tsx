@@ -1268,7 +1268,11 @@ function ServerWorkspace({
             <Backups notify={notify} permissions={permissions} />
           )}
           {page === "subusers" && (
-            <Subusers notify={notify} permissions={permissions} />
+            <Subusers
+              notify={notify}
+              permissions={permissions}
+              signedInEmail={session?.email}
+            />
           )}
           {page === "audit" && (
             <AuditLogs notify={notify} serverOnly={Boolean(session)} />

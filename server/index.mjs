@@ -561,21 +561,45 @@ export async function createPanel(options = {}) {
   let reportPersistenceFailure = (cause) =>
     console.error("Panel state could not be saved:", cause);
   let saveChain = Promise.resolve();
-  const save = () => {
-    const serialized = JSON.stringify(state, null, 2);
+  const writeState = async (next) => {
+    const temp = `${statePath}.${randomUUID()}.tmp`;
+    try {
+      await fs.writeFile(temp, JSON.stringify(next, null, 2));
+      await fs.rename(temp, statePath);
+    } finally {
+      await fs.rm(temp, { force: true }).catch(() => {});
+    }
+  };
+  const queueSave = (operation) => {
     saveChain = saveChain
       .catch(() => {})
-      .then(async () => {
-        const temp = `${statePath}.${randomUUID()}.tmp`;
-        await fs.writeFile(temp, serialized);
-        await fs.rename(temp, statePath);
-      })
+      .then(operation)
       .catch((cause) => {
         reportPersistenceFailure(cause);
         throw cause;
       });
     return saveChain;
   };
+  // Read state only when this write begins, so a queued ordinary save cannot
+  // overwrite a user transaction with a snapshot of the previous membership.
+  const save = () => queueSave(() => writeState(state));
+  const saveSubusers = (users, action, detail) =>
+    queueSave(async () => {
+      const entry = auditEntry(
+        "user",
+        action,
+        detail,
+        requestActor.getStore() ?? "Local administrator",
+      );
+      await writeState({
+        ...state,
+        users,
+        audit: [entry, ...state.audit].slice(0, 2000),
+      });
+      state.users = users;
+      // Other operations may have appended audit entries while the write ran.
+      state.audit = [entry, ...state.audit].slice(0, 2000);
+    });
   const audit = async (
     category,
     action,
@@ -2495,12 +2519,21 @@ export async function createPanel(options = {}) {
         "This appears to be a binary file. Download it instead.",
       );
     const { text, encoding } = decodeText(buffer);
-    return { target, content: text, encoding };
+    return {
+      target,
+      content: text,
+      encoding,
+      mode: stat.mode & 0o777,
+      revision: createHash("sha256").update(buffer).digest("hex"),
+    };
   };
   app.get("/api/files/content", async (req, res) => {
-    const { content, encoding } = await editable(req.query.path);
-    res.json({ content, encoding });
+    const { content, encoding, revision } = await editable(req.query.path);
+    res.json({ content, encoding, revision });
   });
+  // Serialize text replacements, including different spellings of the same path.
+  // The surrounding mutation counter also excludes Properties and Recycle Bin.
+  let fileEditChain = Promise.resolve();
   app.put(
     "/api/files/content",
     trackOperation(async (req, res) => {
@@ -2509,13 +2542,63 @@ export async function createPanel(options = {}) {
         Buffer.byteLength(req.body.content) > 1024 * 1024
       )
         throw error(400, "The editor supports text files up to 1 MB.");
-      const { target, encoding } = await editable(req.body.path);
-      if (req.body.encoding != null && req.body.encoding !== encoding)
-        throw error(409, "The file encoding changed. Reload it before saving.");
-      await fs.writeFile(target, encodeText(req.body.content, encoding));
-      await audit("file", "File edited", req.body.path);
-      diskCache.at = 0;
-      res.json({ ok: true });
+      if (
+        typeof req.body.revision !== "string" ||
+        !/^[a-f0-9]{64}$/.test(req.body.revision)
+      )
+        throw error(
+          400,
+          "Reload the file before saving to obtain its current revision.",
+        );
+      const edit = fileEditChain
+        .catch(() => {})
+        .then(async () => {
+          const {
+            target,
+            encoding,
+            revision,
+            mode: fileMode,
+          } = await editable(req.body.path);
+          if (req.body.encoding != null && req.body.encoding !== encoding)
+            throw error(
+              409,
+              "The file encoding changed. Reload it before saving.",
+            );
+          if (req.body.revision !== revision)
+            throw error(
+              409,
+              "This file changed after you opened it. Reopen it before saving to keep those changes.",
+            );
+          const content = encodeText(req.body.content, encoding);
+          const temporary = await safePath(
+            serverDir,
+            [
+              ...req.body.path.split("/").filter(Boolean).slice(0, -1),
+              `.mc-edit-${randomUUID()}.tmp`,
+            ].join("/"),
+          );
+          try {
+            await fs.writeFile(temporary, content, {
+              flag: "wx",
+              mode: fileMode,
+            });
+            await fs.chmod(temporary, fileMode);
+            const current = await editable(req.body.path);
+            if (current.target !== target || current.revision !== revision)
+              throw error(
+                409,
+                "This file changed while saving. Reopen it before saving to keep those changes.",
+              );
+            await fs.rename(temporary, target);
+          } finally {
+            await fs.rm(temporary, { force: true });
+          }
+          await audit("file", "File edited", req.body.path);
+          diskCache.at = 0;
+          res.json({ ok: true });
+        });
+      fileEditChain = edit.catch(() => {});
+      await edit;
     }),
   );
   app.delete(
@@ -2597,32 +2680,67 @@ export async function createPanel(options = {}) {
     inviteStatus: "not-invited",
     ...options.invitationState?.(user.id),
   });
+  let subuserChain = Promise.resolve();
+  const subuserOperation = (handler) =>
+    trackOperation((req, res) => {
+      const pending = subuserChain.then(() => handler(req, res));
+      subuserChain = pending.catch(() => {});
+      return pending;
+    });
+  const checkSubuserAccess = (req, permission, target, requested = []) => {
+    const principal = req[remotePrincipal];
+    if (!principal) return;
+    const actor = state.users.find((user) => user.email === principal.email);
+    const allowed = actor ? userWithPermissions(actor).permissions : [];
+    if (
+      !allowed.includes(permission) ||
+      (target &&
+        userWithPermissions(target).permissions.some(
+          (id) => !allowed.includes(id),
+        )) ||
+      requested.some((id) => !allowed.includes(id))
+    )
+      throw error(
+        403,
+        "You can only manage users and grant permissions within your own access.",
+      );
+  };
   app.get("/api/subusers", (_req, res) =>
     res.json({ users: state.users.map(presentedUser) }),
   );
   app.post(
     "/api/subusers/:id/invite",
-    trackOperation(async (req, res) => {
+    subuserOperation(async (req, res) => {
       const user = getItem(state.users, req.params.id);
+      checkSubuserAccess(req, "user.create", user);
+      if (req[remotePrincipal]?.email === user.email)
+        throw error(403, "Ask the panel owner to reset your own access.");
       if (!options.inviteUser)
         throw error(
           503,
           "Set up remote access in the panel before creating invitations.",
         );
       const invitation = await options.inviteUser(userWithPermissions(user));
-      await audit("user", "Subuser invitation link created", user.email);
+      let warning;
+      try {
+        await audit("user", "Subuser invitation link created", user.email);
+      } catch {
+        warning =
+          "The invitation is ready, but its audit history could not be saved. Copy the link before closing this window.";
+      }
       res.json({
         message:
           "Invitation link created. Copy it and send it to the recipient.",
         user: presentedUser(user),
         invitationUrl: invitation.invitationUrl,
         inviteExpiresAt: invitation.inviteExpiresAt,
+        ...(warning ? { warning } : {}),
       });
     }),
   );
   app.post(
     "/api/subusers",
-    trackOperation(async (req, res) => {
+    subuserOperation(async (req, res) => {
       const { email, role = "custom", permissions } = req.body ?? {};
       if (
         typeof email !== "string" ||
@@ -2643,9 +2761,9 @@ export async function createPanel(options = {}) {
             : validatePermissions(permissions),
         createdAt: new Date().toISOString(),
       };
-      state.users.push(item);
-      await audit(
-        "user",
+      checkSubuserAccess(req, "user.create", null, item.permissions);
+      await saveSubusers(
+        [...state.users, item],
         "Subuser added",
         `${item.email} · ${item.permissions.length} permissions. Invitation not yet sent.`,
       );
@@ -2654,26 +2772,32 @@ export async function createPanel(options = {}) {
   );
   app.patch(
     "/api/subusers/:id",
-    trackOperation(async (req, res) => {
+    subuserOperation(async (req, res) => {
       const item = getItem(state.users, req.params.id);
       const permissions = validatePermissions(req.body?.permissions);
-      item.permissions = permissions;
-      item.role = "custom";
-      await audit(
-        "user",
+      checkSubuserAccess(req, "user.update", item, permissions);
+      const updated = { ...item, permissions, role: "custom" };
+      await saveSubusers(
+        state.users.map((user) => (user.id === item.id ? updated : user)),
         "Subuser permissions updated",
         `${item.email} · ${permissions.length} permissions. Changes apply to subsequent requests.`,
       );
-      res.json(userWithPermissions(item));
+      res.json(userWithPermissions(updated));
     }),
   );
   app.delete(
     "/api/subusers/:id",
-    trackOperation(async (req, res) => {
+    subuserOperation(async (req, res) => {
       const item = getItem(state.users, req.params.id);
-      state.users = state.users.filter((entry) => entry.id !== item.id);
-      await audit("user", "Subuser access revoked", item.email);
+      checkSubuserAccess(req, "user.delete", item);
+      // Revoke credentials first. A later panel-state failure leaves a visible,
+      // retryable row with no remote access, including after a restart.
       await options.revokeUser?.(item.id);
+      await saveSubusers(
+        state.users.filter((entry) => entry.id !== item.id),
+        "Subuser access revoked",
+        item.email,
+      );
       res.json({ ok: true });
     }),
   );
@@ -2983,16 +3107,29 @@ export async function createFleet(options = {}) {
       close: async () => {},
     };
   };
-  const makeAvailableRuntime = async (entry, preserveFiles = false) => {
+  const makeAvailableRuntime = async (
+    entry,
+    preserveFiles = false,
+    publish = true,
+  ) => {
     if (entry.storage === "external") {
-      const inspected = await inspectImport(entry.serverDir, entry.id, true);
+      await inspectImport(entry.serverDir, entry.id, true);
       if (entry.launchType !== "jar")
         await validateStartupFiles(entry.serverDir, entry);
-      else if (!inspected.jars.includes(entry.jar))
-        throw error(
-          409,
-          "The selected server JAR is missing or is no longer a regular file in the source folder.",
-        );
+      else {
+        // Import's picker lists root JARs, but saved startup settings also
+        // support contained nested paths. Reconstruct the same launch contract.
+        const jar = await containedSourcePath(entry.serverDir, entry.jar);
+        const stat = await fs.stat(jar).catch((cause) => {
+          if (["ENOENT", "ENOTDIR"].includes(cause.code)) return null;
+          throw cause;
+        });
+        if (!stat?.isFile())
+          throw error(
+            409,
+            "The selected server JAR is missing or is no longer a regular file in the source folder.",
+          );
+      }
     } else if (preserveFiles)
       await canonicalExternalDirectory(entry.serverDir, {
         requireCanonical: true,
@@ -3074,7 +3211,7 @@ export async function createFleet(options = {}) {
           });
         }),
     });
-    runtimes.set(entry.id, runtime);
+    if (publish) runtimes.set(entry.id, runtime);
     return runtime;
   };
   const makeRuntime = async (
@@ -3094,6 +3231,16 @@ export async function createFleet(options = {}) {
       runtimes.set(entry.id, runtime);
       return runtime;
     }
+  };
+  const resolveRuntime = async (id) => {
+    const runtime = runtimes.get(id);
+    if (!runtime?.unavailable) return runtime;
+    return serialize(async () => {
+      const current = runtimes.get(id);
+      if (!current?.unavailable) return current;
+      const entry = registry.servers.find((item) => item.id === id);
+      return entry ? makeRuntime(entry, true, true) : undefined;
+    });
   };
   if (await exists(registryPath)) {
     registry = JSON.parse(await fs.readFile(registryPath, "utf8"));
@@ -3257,9 +3404,8 @@ export async function createFleet(options = {}) {
   try {
     access = await createAccessService({
       dataDir,
-      getUser: (serverId, userId) =>
-        runtimes
-          .get(serverId)
+      getUser: async (serverId, userId) =>
+        (await resolveRuntime(serverId))
           ?.subusers?.()
           .find((user) => user.id === userId) ?? null,
     });
@@ -3771,14 +3917,54 @@ export async function createFleet(options = {}) {
         next.version = "Configured JAR";
         next.software = "Java";
       }
-      return runtimes.get(entry.id).updateConfiguration(next, () =>
-        persist({
+      let configurationSaved = false;
+      const persistConfiguration = async () => {
+        await persist({
           ...registry,
           servers: registry.servers.map((item) =>
             item.id === entry.id ? next : item,
           ),
-        }),
+        });
+        configurationSaved = true;
+      };
+      const previous = runtimes.get(entry.id);
+      if (!previous.unavailable)
+        return previous.updateConfiguration(next, persistConfiguration);
+      // Let Settings repair a renamed/missing launcher without replacing the
+      // server identity. Keep prior property values until the normal update
+      // transaction writes and persists changes to the port or MOTD.
+      const repaired = await makeAvailableRuntime(
+        {
+          ...entry,
+          ...Object.fromEntries(
+            [
+              "jar",
+              "launchType",
+              "launchScript",
+              "launchArgs",
+              "launchExecutable",
+              "javaPath",
+              "minecraftVersion",
+              "version",
+              "software",
+            ].map((key) => [key, next[key]]),
+          ),
+        },
+        true,
+        false,
       );
+      try {
+        const server = await repaired.updateConfiguration(
+          next,
+          persistConfiguration,
+        );
+        runtimes.set(entry.id, repaired);
+        return server;
+      } catch (cause) {
+        if (configurationSaved) runtimes.set(entry.id, repaired);
+        else await repaired.close();
+        throw cause;
+      }
     });
     res.json({ server });
   });
@@ -3845,18 +4031,8 @@ export async function createFleet(options = {}) {
       );
     if (typeof id !== "string" || !runtimes.has(id))
       return next(error(404, "Server not found."));
-    let runtime = runtimes.get(id);
-    if (runtime.unavailable)
-      runtime = await serialize(() => {
-        const current = runtimes.get(id);
-        if (!current) throw error(404, "Server not found.");
-        return current.unavailable
-          ? makeRuntime(
-              registry.servers.find((entry) => entry.id === id),
-              true,
-            )
-          : current;
-      });
+    const runtime = await resolveRuntime(id);
+    if (!runtime) throw error(404, "Server not found.");
     runtime.app(req, res, next);
   });
   const distDir = path.join(projectDir, "dist");

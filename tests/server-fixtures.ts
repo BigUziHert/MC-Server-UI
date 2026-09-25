@@ -12,9 +12,16 @@ export async function createProcessServer(
   expect(response.status(), await response.text()).toBe(201);
   const { server } = await response.json();
   const headers = { "X-Server-Id": server.id };
+  const loadedEula = await (
+    await request.get("/api/files/content?path=eula.txt", { headers })
+  ).json();
   const eula = await request.put("/api/files/content", {
     headers,
-    data: { path: "eula.txt", content: "eula=true\n" },
+    data: {
+      path: "eula.txt",
+      content: "eula=true\n",
+      revision: loadedEula.revision,
+    },
   });
   expect(eula.status(), await eula.text()).toBe(200);
   const started = await request.post("/api/server/power", {

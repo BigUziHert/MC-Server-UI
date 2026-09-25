@@ -460,6 +460,9 @@ async function createSmokeServer(page) {
     method: "PUT",
     body: {
       path: "eula.txt",
+      revision: (
+        await browserApi(page, "/files/content?path=eula.txt", { serverId: id })
+      ).data.revision,
       content: "# Accepted only for the isolated smoke fixture.\neula=true\n",
     },
     serverId: id,

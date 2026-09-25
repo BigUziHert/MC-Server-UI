@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import http from "node:http";
 import { EventEmitter } from "node:events";
 import { PassThrough, Writable } from "node:stream";
 import { spawn } from "node:child_process";
@@ -556,6 +557,218 @@ test("unavailable imported folders are not recreated and recover without blockin
     ).unavailable,
     undefined,
   );
+});
+
+test("imported nested JAR settings survive panel restart and remain launchable", async (t) => {
+  const launches = [];
+  const { directory, prepare, boot } = await fixture(t, {
+    spawnServer(executable, args) {
+      launches.push({ executable, args });
+      return mockServer();
+    },
+  });
+  await prepare();
+  const first = await boot();
+  const imported = await first.request(
+    "/api/server-import",
+    json("POST", { directory, jar: "server.jar" }),
+  );
+  const id = imported.body.server.id;
+  await fs.mkdir(path.join(directory, "runtime"));
+  await fs.rename(
+    path.join(directory, "server.jar"),
+    path.join(directory, "runtime", "server.jar"),
+  );
+  const updated = await first.request(
+    `/api/servers/${id}`,
+    json("PATCH", { jar: "runtime/server.jar" }),
+  );
+  assert.equal(updated.status, 200, JSON.stringify(updated.body));
+  await first.close();
+  const restarted = await boot();
+  const record = (await restarted.request("/api/servers")).body.servers[0];
+  assert.equal(record.id, id);
+  assert.equal(record.jar, "runtime/server.jar");
+  assert.equal(record.unavailable, undefined);
+  await fs.writeFile(path.join(directory, "eula.txt"), "eula=true\n");
+  const started = await restarted.request(
+    "/api/server/power",
+    json("POST", { action: "start" }),
+  );
+  assert.equal(started.status, 200, JSON.stringify(started.body));
+  assert.ok(
+    launches[0].args.includes(path.join(directory, "runtime", "server.jar")),
+  );
+});
+
+test("Settings repairs an unavailable imported launcher while preserving identity and properties", async (t) => {
+  const { dataDir, directory, prepare, boot } = await fixture(t);
+  await prepare();
+  const first = await boot();
+  const imported = await first.request(
+    "/api/server-import",
+    json("POST", { directory, jar: "server.jar" }),
+  );
+  const id = imported.body.server.id;
+  await first.close();
+  await fs.rename(
+    path.join(directory, "server.jar"),
+    path.join(directory, "updated.jar"),
+  );
+  const restarted = await boot();
+  assert.equal(
+    (await restarted.request("/api/servers")).body.servers[0].unavailable,
+    true,
+  );
+  const invalid = await restarted.request(
+    `/api/servers/${id}`,
+    json("PATCH", { jar: "missing.jar", port: 25572 }),
+  );
+  assert.equal(invalid.status, 409);
+  assert.equal(restarted.runtimes.get(id).unavailable, true);
+  const placeholder = restarted.runtimes.get(id);
+  let entered, release;
+  const persistenceEntered = new Promise((resolve) => {
+    entered = resolve;
+  });
+  const releasePersistence = new Promise((resolve) => {
+    release = resolve;
+  });
+  const rename = fs.rename.bind(fs);
+  const mocked = t.mock.method(fs, "rename", async (source, destination) => {
+    if (destination === path.join(dataDir, "servers.json")) {
+      entered();
+      await releasePersistence;
+      throw Object.assign(new Error("Registry persistence fixture failure"), {
+        code: "EIO",
+      });
+    }
+    return rename(source, destination);
+  });
+  const logged = t.mock.method(console, "error", () => {});
+  const pending = restarted.request(
+    `/api/servers/${id}`,
+    json("PATCH", { jar: "updated.jar", port: 25572 }),
+  );
+  await persistenceEntered;
+  // A repair must not expose new handlers to remote requests until committed.
+  assert.equal(restarted.runtimes.get(id), placeholder);
+  release();
+  const failed = await pending;
+  assert.equal(failed.status, 500);
+  assert.equal(restarted.runtimes.get(id), placeholder);
+  assert.equal(
+    parseProperties(
+      await fs.readFile(path.join(directory, "server.properties"), "utf8"),
+    ).get("server-port"),
+    "25571",
+  );
+  mocked.mock.restore();
+  logged.mock.restore();
+  const repaired = await restarted.request(
+    `/api/servers/${id}`,
+    json("PATCH", { jar: "updated.jar", port: 25572, motd: "Repaired world" }),
+  );
+  assert.equal(repaired.status, 200, JSON.stringify(repaired.body));
+  assert.equal(repaired.body.server.id, id);
+  assert.equal(repaired.body.server.unavailable, undefined);
+  const properties = parseProperties(
+    await fs.readFile(path.join(directory, "server.properties"), "utf8"),
+  );
+  assert.equal(properties.get("server-port"), "25572");
+  assert.equal(properties.get("motd"), "Repaired world");
+  const registry = JSON.parse(
+    await fs.readFile(path.join(dataDir, "servers.json"), "utf8"),
+  );
+  assert.equal(registry.servers[0].id, id);
+  assert.equal(registry.servers[0].jar, "updated.jar");
+  await restarted.close();
+  const restored = await boot();
+  assert.equal((await restored.request("/api/server")).status, 200);
+});
+
+test("remote authentication restores an imported runtime after its folder returns", async (t) => {
+  const { root, directory, prepare, boot } = await fixture(t, {
+    remoteListen: false,
+  });
+  await prepare();
+  const first = await boot();
+  const imported = await first.request(
+    "/api/server-import",
+    json("POST", { directory, jar: "server.jar" }),
+  );
+  const id = imported.body.server.id;
+  await first.access.configure({
+    enabled: true,
+    publicUrl: "https://panel.example.test",
+    transport: "proxy",
+  });
+  const user = (
+    await first.request(
+      "/api/subusers",
+      json("POST", {
+        email: "returning@example.test",
+        permissions: ["control.console"],
+      }),
+    )
+  ).body;
+  const invitation = await first.access.invite({ serverId: id, user });
+  const token = new URL(invitation.invitationUrl).hash.slice("#invite=".length);
+  const signed = await first.access.accept(token, "Correct-test-password!");
+  await first.close();
+  const parked = path.join(root, "parked-server");
+  await fs.rename(directory, parked);
+  const restarted = await boot();
+  assert.equal(restarted.runtimes.get(id).unavailable, true);
+  const listener = await new Promise((resolve) => {
+    const server = restarted.remoteApp.listen(0, "127.0.0.1", () =>
+      resolve(server),
+    );
+  });
+  t.after(async () => {
+    listener.closeAllConnections();
+    await new Promise((resolve) => listener.close(resolve));
+  });
+  const remote = (route, cookie) =>
+    new Promise((resolve, reject) => {
+      const req = http.request(
+        `http://127.0.0.1:${listener.address().port}${route}`,
+        {
+          headers: { Host: "panel.example.test", Cookie: cookie.split(";")[0] },
+        },
+        (response) => {
+          let body = "";
+          response.setEncoding("utf8");
+          response.on("data", (chunk) => {
+            body += chunk;
+          });
+          response.on("end", () =>
+            resolve({ status: response.statusCode, body: JSON.parse(body) }),
+          );
+        },
+      );
+      req.on("error", reject);
+      req.end();
+    });
+  assert.equal(
+    (await remote("/api/access/session", signed.cookie)).body.role,
+    "guest",
+  );
+  await fs.rename(parked, directory);
+  // No owner request may be needed to wake the restored runtime.
+  const requests = await Promise.all([
+    remote("/api/access/session", signed.cookie),
+    remote("/api/servers", signed.cookie),
+  ]);
+  assert.equal(requests[0].body.role, "subuser");
+  assert.equal(requests[1].status, 200);
+  assert.equal(requests[1].body.servers[0].id, id);
+  assert.equal(restarted.runtimes.get(id).unavailable, undefined);
+  const login = await restarted.access.login({
+    email: user.email,
+    password: "Correct-test-password!",
+  });
+  assert.equal(login.session.serverId, id);
 });
 
 test("folder browsing capability is explicit and cancellation performs no import", async (t) => {

@@ -584,6 +584,7 @@ test("Properties reports external file changes without overwriting them", async 
     data: {
       path: "server.properties",
       content: original.content + "\n# changed elsewhere\n",
+      revision: original.revision,
     },
   });
   await page

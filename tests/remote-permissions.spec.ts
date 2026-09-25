@@ -519,3 +519,74 @@ test("remote subuser managers grant only their own permissions and invite withou
   ).toEqual([]);
   expect(calls.filter((call) => call.path.endsWith("/invite"))).toHaveLength(1);
 });
+
+test("remote managers cannot reset their own access but can reset another user's access", async ({
+  page,
+}) => {
+  const permissions = ["user.read", "user.create"];
+  const calls = await sharedPanel(page, permissions);
+  const ownUser = {
+    id: "manager",
+    email: "manager@example.test",
+    permissions,
+    createdAt: stamp,
+    inviteStatus: "accepted",
+  };
+  const otherUser = {
+    ...ownUser,
+    id: "helper",
+    email: "helper@example.test",
+  };
+  await page.route("**/api/subusers", (route) =>
+    route.fulfill({ json: { users: [ownUser, otherUser] } }),
+  );
+  const invitations: string[] = [];
+  const warning = "Invitation created, but its audit entry could not be saved.";
+  await page.route("**/api/subusers/*/invite", (route) => {
+    invitations.push(new URL(route.request().url()).pathname);
+    return route.fulfill({
+      json: {
+        user: { ...otherUser, inviteStatus: "pending" },
+        invitationUrl: `https://panel.example.test/#invite=${"B".repeat(43)}`,
+        inviteExpiresAt: "2099-01-01T00:00:00.000Z",
+        warning,
+      },
+    });
+  });
+  await page.goto("/#subusers");
+  const ownReset = page.getByRole("button", {
+    name: "Reset access for manager@example.test",
+    exact: true,
+  });
+  await expect(ownReset).toBeDisabled();
+  await expect(ownReset).toHaveAttribute(
+    "title",
+    "Ask the panel owner to reset your own access.",
+  );
+  await expect(
+    page.getByText("Ask the panel owner to reset your own access.", {
+      exact: true,
+    }),
+  ).toBeVisible();
+  await page
+    .getByRole("button", {
+      name: "Reset access for helper@example.test",
+      exact: true,
+    })
+    .click();
+  await page
+    .getByRole("dialog", { name: "Reset subuser access?", exact: true })
+    .getByRole("button", { name: "Reset and create link", exact: true })
+    .click();
+  const invitation = page.getByRole("dialog", {
+    name: "Share invitation link",
+    exact: true,
+  });
+  await expect(invitation.getByLabel("Invitation link")).toHaveValue(
+    `https://panel.example.test/#invite=${"B".repeat(43)}`,
+  );
+  await expect(invitation.getByRole("alert")).toHaveText(warning);
+  await expect(ownReset).toBeDisabled();
+  expect(invitations).toEqual(["/api/subusers/helper/invite"]);
+  expect(calls.filter((call) => call.method !== "GET")).toEqual([]);
+});

@@ -114,17 +114,20 @@ export default function PanelAccount({
           if (mounted.current) onSignedOut?.();
         }),
     });
-  if (connections && connections.activeId !== "local")
+  for (const panel of connections?.panels ?? []) {
+    if (panel.local) continue;
     actions.push({
-      id: "disconnect",
-      label: "Disconnect from this panel",
+      id: `disconnect:${panel.id}`,
+      label:
+        panel.id === connections?.activeId
+          ? "Disconnect from this panel"
+          : `Disconnect from ${panel.label}`,
       icon: <Unplug size={16} />,
       disabled: busy,
       onSelect: () =>
-        void perform(() =>
-          window.mcPanelConnections!.disconnect(connections.activeId),
-        ),
+        void perform(() => window.mcPanelConnections!.disconnect(panel.id)),
     });
+  }
   return (
     <>
       {error && (

@@ -3,6 +3,7 @@ import path from "node:path";
 import { AsyncLocalStorage } from "node:async_hooks";
 import http from "node:http";
 import https from "node:https";
+import { createHash } from "node:crypto";
 import { createAccessRateLimiter } from "./access.mjs";
 import {
   createRemoteTls,
@@ -132,7 +133,7 @@ export function requiredPermissions(req) {
   throw failure(403, "This action is available only to the panel owner.");
 }
 
-function preventEscalation(req, runtime, permissions) {
+function preventEscalation(req, runtime, permissions, email) {
   if (!req.path.startsWith("/api/subusers") || read(req)) return;
   let targetId;
   try {
@@ -143,6 +144,12 @@ function preventEscalation(req, runtime, permissions) {
   const target = targetId
     ? runtime.subusers().find((user) => user.id === targetId)
     : null;
+  if (
+    req.method === "POST" &&
+    req.path.endsWith("/invite") &&
+    target?.email === email
+  )
+    throw failure(403, "Ask the panel owner to reset your own access.");
   const requested =
     req.body?.permissions ??
     (req.method === "POST" && !targetId
@@ -221,16 +228,39 @@ export function createRemoteGateway({
     next();
   });
   app.use(express.json({ limit: "2mb" }));
-  const loginLimit = createAccessRateLimiter({ limit: 8 });
-  const acceptLimit = createAccessRateLimiter({ limit: 30 });
+  // A proxy puts every visitor behind one socket peer. Keep the strict direct
+  // peer limit, and combine a generous proxy budget with a per-account limit.
+  // Forwarding headers remain untrusted in both modes.
+  const loginLimit = createAccessRateLimiter({
+    limit: () => (access.status().transport === "proxy" ? 240 : 8),
+  });
+  const accountLoginLimit = createAccessRateLimiter({
+    limit: 8,
+    keyForRequest: (req) =>
+      createHash("sha256")
+        .update(
+          typeof req.body?.email === "string"
+            ? req.body.email.trim().toLowerCase()
+            : "",
+        )
+        .digest("hex"),
+  });
+  const acceptLimit = createAccessRateLimiter({
+    limit: () => (access.status().transport === "proxy" ? 240 : 30),
+  });
   app.get("/api/access/session", async (req, res) => {
     res.json((await access.authenticate(req)) ?? { role: "guest" });
   });
-  app.post("/api/access/login", loginLimit, async (req, res) => {
-    const result = await access.login(req.body ?? {});
-    res.setHeader("Set-Cookie", result.cookie);
-    res.json(result.session);
-  });
+  app.post(
+    "/api/access/login",
+    loginLimit,
+    accountLoginLimit,
+    async (req, res) => {
+      const result = await access.login(req.body ?? {});
+      res.setHeader("Set-Cookie", result.cookie);
+      res.json(result.session);
+    },
+  );
   app.post("/api/access/accept", acceptLimit, async (req, res) => {
     const result = await access.accept(req.body?.token, req.body?.password);
     await accepted?.(result.session);
@@ -299,7 +329,12 @@ export function createRemoteGateway({
       )
     )
       throw failure(403, "You do not have permission to perform this action.");
-    preventEscalation(req, membership.runtime, membership.user.permissions);
+    preventEscalation(
+      req,
+      membership.runtime,
+      membership.user.permissions,
+      session.email,
+    );
     req[remotePrincipal] = {
       ...session,
       serverId: id,

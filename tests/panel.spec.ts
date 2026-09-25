@@ -65,8 +65,11 @@ async function seedServerProperties(request: APIRequestContext) {
     data: { name: "server.properties", type: "file", content },
   });
   if (created.status() === 409) {
+    const loaded = await (
+      await request.get("/api/files/content?path=server.properties")
+    ).json();
     const updated = await request.put("/api/files/content", {
-      data: { path: "server.properties", content },
+      data: { path: "server.properties", content, revision: loaded.revision },
     });
     expect(updated.status(), await updated.text()).toBe(200);
   } else expect(created.status(), await created.text()).toBe(201);
@@ -238,6 +241,61 @@ for (const viewport of [
     });
   });
 }
+
+test("file manager retains the draft and reports a conflict when another editor saves", async ({
+  page,
+  request,
+}) => {
+  const name = "e2e-concurrent-edit.txt";
+  expect(
+    (
+      await request.post("/api/files", {
+        data: { name, type: "file", content: "original configuration" },
+      })
+    ).status(),
+  ).toBe(201);
+  try {
+    await openPage(page, "files", "File Manager");
+    await page
+      .getByRole("button", { name: `Edit ${name}`, exact: true })
+      .click();
+    const dialog = page.getByRole("dialog");
+    await expect(dialog.getByLabel("File contents")).toHaveValue(
+      "original configuration",
+    );
+    await dialog.getByLabel("File contents").fill("my unsaved draft");
+    const loaded = await (
+      await request.get(`/api/files/content?path=${name}`)
+    ).json();
+    expect(
+      (
+        await request.put("/api/files/content", {
+          data: {
+            ...loaded,
+            path: name,
+            content: "other editor's saved changes",
+          },
+        })
+      ).status(),
+    ).toBe(200);
+    await dialog
+      .getByRole("button", { name: "Save changes", exact: true })
+      .click();
+    await expect(dialog.getByRole("alert")).toContainText(
+      "changed after you opened",
+    );
+    await expect(dialog.getByLabel("File contents")).toHaveValue(
+      "my unsaved draft",
+    );
+    const current = await (
+      await request.get(`/api/files/content?path=${name}`)
+    ).json();
+    expect(current.content).toBe("other editor's saved changes");
+    await dialog.getByRole("button", { name: "Cancel", exact: true }).click();
+  } finally {
+    await request.delete(`/api/files?path=${name}`);
+  }
+});
 
 test("file manager creates and edits nested files and preserves upload/download bytes", async ({
   page,
@@ -533,7 +591,13 @@ test("audit filters show file, server and player actions", async ({
   expect(
     (
       await request.put("/api/files/content", {
-        data: { path: "e2e-audit-probe.txt", content: "edited audit probe" },
+        data: {
+          path: "e2e-audit-probe.txt",
+          ...(await (
+            await request.get("/api/files/content?path=e2e-audit-probe.txt")
+          ).json()),
+          content: "edited audit probe",
+        },
       })
     ).ok(),
   ).toBe(true);

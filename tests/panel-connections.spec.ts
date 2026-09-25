@@ -51,6 +51,7 @@ async function desktopBridge(
     remoteServers?: Record<string, LocalServerDescriptor[]>;
     listFailure?: "reject" | "hang";
     updatesFailure?: boolean;
+    unavailablePanels?: string[];
   } = {},
 ) {
   await page.addInitScript(
@@ -61,6 +62,7 @@ async function desktopBridge(
       remoteServers,
       listFailure,
       updatesFailure,
+      unavailablePanels,
     }) => {
       // The sending renderer stays fixed when native activation hides its view.
       const state = {
@@ -134,6 +136,8 @@ async function desktopBridge(
         },
         activate: async (id) => {
           calls.push({ action: "activate", value: id });
+          if (unavailablePanels.includes(id))
+            throw new Error("This saved panel is offline.");
           state.activeId = id;
           changed();
           return snapshot();
@@ -151,6 +155,9 @@ async function desktopBridge(
         },
         disconnect: async (id) => {
           calls.push({ action: "disconnect", value: id });
+          state.panels = state.panels.filter((panel) => panel.id !== id);
+          if (state.activeId === id) state.activeId = "local";
+          changed();
           return snapshot();
         },
         selectLocalServer: async (id) => {
@@ -186,6 +193,7 @@ async function desktopBridge(
       remoteServers: options.remoteServers ?? {},
       listFailure: options.listFailure,
       updatesFailure: options.updatesFailure,
+      unavailablePanels: options.unavailablePanels ?? [],
     },
   );
 }
@@ -631,6 +639,67 @@ test("desktop account switches between this computer and multiple connected pane
   ]);
   expect(context.pages()).toHaveLength(1);
 });
+
+for (const empty of [false, true]) {
+  test(`the local account can disconnect an offline saved panel ${empty ? "without local servers" : "with a local workspace"}`, async ({
+    page,
+  }) => {
+    await desktopBridge(page, { unavailablePanels: ["pc-one"] });
+    const { localCredentials } = await localPanel(page, true);
+    if (empty)
+      await page.route("**/api/servers", (route) =>
+        route.fulfill({ json: { servers: [], defaultServerId: null } }),
+      );
+    await page.goto("/#console");
+    const account = page.getByRole("button", {
+      name: "Account menu for Local administrator",
+      exact: true,
+    });
+    await account.click();
+    await page
+      .getByRole("menuitem", {
+        name: "Switch to pc-one.example:3002",
+        exact: true,
+      })
+      .click();
+    await expect(page.getByRole("alert")).toContainText(
+      "This saved panel is offline.",
+    );
+    await account.click();
+    await page
+      .getByRole("menuitem", {
+        name: "Disconnect from pc-one.example:3002",
+        exact: true,
+      })
+      .click();
+    await expect
+      .poll(() => page.evaluate(async () => window.mcPanelConnections!.list()))
+      .toMatchObject({
+        activeId: "local",
+        panels: [{ id: "local" }, { id: "pc-two" }],
+      });
+    await account.click();
+    await expect(
+      page.getByRole("menuitem", { name: /pc-one\.example/ }),
+    ).toHaveCount(0);
+    await expect(
+      page.getByRole("menuitem", {
+        name: "Disconnect from pc-two.example:3002",
+        exact: true,
+      }),
+    ).toBeEnabled();
+    expect(
+      await page.evaluate(
+        () =>
+          (window as unknown as { connectionCalls: unknown }).connectionCalls,
+      ),
+    ).toEqual([
+      { action: "activate", value: "pc-one" },
+      { action: "disconnect", value: "pc-one" },
+    ]);
+    expect(localCredentials).toEqual([]);
+  });
+}
 
 for (const { width, localId, label } of [
   { width: 1434, localId: localServer.id, label: "matching server IDs" },

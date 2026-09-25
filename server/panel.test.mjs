@@ -56,7 +56,9 @@ test("File Manager preserves Latin-1 bytes and rejects unrepresentable edits or 
   assert.deepEqual(loaded.body, {
     content: "caf\u00e9\r\n",
     encoding: "latin1",
+    revision: loaded.body.revision,
   });
+  assert.match(loaded.body.revision, /^[a-f0-9]{64}$/);
   assert.equal(
     (
       await request(
@@ -73,6 +75,7 @@ test("File Manager preserves Latin-1 bytes and rejects unrepresentable edits or 
       path: "legacy.txt",
       content: "caf\u00e9 \u2603",
       encoding: "latin1",
+      revision: loaded.body.revision,
     }),
   );
   assert.equal(rejected.status, 400);
@@ -102,6 +105,115 @@ test("File Manager preserves Latin-1 bytes and rejects unrepresentable edits or 
     200,
   );
   assert.deepEqual(await fs.readFile(target), bom);
+});
+
+test("file edits reject missing or stale revisions and concurrent editors cannot overwrite each other", async (t) => {
+  const { request, serverDir } = await fixture(t);
+  const target = path.join(serverDir, "shared.txt");
+  await fs.writeFile(target, "original");
+  const loaded = (await request("/api/files/content?path=shared.txt")).body;
+  const missing = await request(
+    "/api/files/content",
+    json("PUT", {
+      path: "shared.txt",
+      content: "unversioned edit",
+    }),
+  );
+  assert.equal(missing.status, 400);
+  assert.equal(await fs.readFile(target, "utf8"), "original");
+  const edits = ["first edit", "second edit"];
+  const results = await Promise.all(
+    edits.map((content) =>
+      request(
+        "/api/files/content",
+        json("PUT", {
+          path: "shared.txt",
+          ...loaded,
+          content,
+        }),
+      ),
+    ),
+  );
+  assert.deepEqual(results.map((result) => result.status).sort(), [200, 409]);
+  const winner = edits[results.findIndex((result) => result.status === 200)];
+  assert.equal(await fs.readFile(target, "utf8"), winner);
+  const stale = await request(
+    "/api/files/content",
+    json("PUT", {
+      path: "shared.txt",
+      ...loaded,
+      content: "stale retry",
+    }),
+  );
+  assert.equal(stale.status, 409);
+  assert.equal(await fs.readFile(target, "utf8"), winner);
+  const refreshed = (await request("/api/files/content?path=shared.txt")).body;
+  assert.notEqual(refreshed.revision, loaded.revision);
+  assert.equal(
+    (
+      await request(
+        "/api/files/content",
+        json("PUT", {
+          path: "shared.txt",
+          ...refreshed,
+          content: "reviewed edit",
+        }),
+      )
+    ).status,
+    200,
+  );
+});
+
+test("file edits preserve permissions and support the maximum filename length", async (t) => {
+  const { request, serverDir } = await fixture(t);
+  const name = `${"a".repeat(177)}.sh`;
+  const target = path.join(serverDir, name);
+  await fs.writeFile(target, "#!/bin/sh\necho original\n", { mode: 0o700 });
+  const mode = (await fs.stat(target)).mode & 0o777;
+  const loaded = (await request(`/api/files/content?path=${name}`)).body;
+  const result = await request(
+    "/api/files/content",
+    json("PUT", {
+      path: name,
+      ...loaded,
+      content: "#!/bin/sh\necho edited\n",
+    }),
+  );
+  assert.equal(result.status, 200, JSON.stringify(result.body));
+  assert.equal((await fs.stat(target)).mode & 0o777, mode);
+  assert.equal(await fs.readFile(target, "utf8"), "#!/bin/sh\necho edited\n");
+});
+
+test("file edits preserve the original file when writing the replacement fails", async (t) => {
+  const { request, serverDir } = await fixture(t);
+  const target = path.join(serverDir, "protected.txt");
+  await fs.writeFile(target, "keep this configuration");
+  const loaded = (await request("/api/files/content?path=protected.txt")).body;
+  const write = fs.writeFile.bind(fs);
+  t.mock.method(fs, "writeFile", async (file, content, options) => {
+    if (
+      path.basename(String(file)).startsWith(".mc-edit-") &&
+      String(file).endsWith(".tmp")
+    ) {
+      await write(file, "partial replacement", options);
+      throw Object.assign(new Error("Fixture disk full"), { code: "ENOSPC" });
+    }
+    return write(file, content, options);
+  });
+  const result = await request(
+    "/api/files/content",
+    json("PUT", {
+      path: "protected.txt",
+      ...loaded,
+      content: "new configuration",
+    }),
+  );
+  assert.equal(result.status, 500);
+  assert.equal(await fs.readFile(target, "utf8"), loaded.content);
+  assert.equal(
+    (await fs.readdir(serverDir)).some((name) => name.startsWith(".mc-edit-")),
+    false,
+  );
 });
 
 test("file listing skips an entry removed after readdir without hiding remaining files", async (t) => {
@@ -170,7 +282,11 @@ test("file operations upload and download original bytes, edit text, and reject 
     (
       await request(
         "/api/files/content",
-        json("PUT", { path: "custom/hello.txt", content: "edited" }),
+        json("PUT", {
+          path: "custom/hello.txt",
+          ...(await request("/api/files/content?path=custom/hello.txt")).body,
+          content: "edited",
+        }),
       )
     ).status,
     200,

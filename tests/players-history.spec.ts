@@ -52,7 +52,16 @@ const test = base.extend<{ server: { id: string; other: string } }>({
           (
             await request.put("/api/files/content", {
               headers,
-              data: { path: name, content },
+              data: {
+                path: name,
+                ...(await (
+                  await request.get(
+                    `/api/files/content?path=${encodeURIComponent(name)}`,
+                    { headers },
+                  )
+                ).json()),
+                content,
+              },
             })
           ).status(),
         ).toBe(200);

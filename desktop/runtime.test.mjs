@@ -595,7 +595,13 @@ test("desktop close awaits graceful shutdown of managed Java and releases its li
     headers,
   });
   await runtime.request("/api/files/content", {
-    ...json("PUT", { path: "eula.txt", content: "eula=true\n" }),
+    ...json("PUT", {
+      path: "eula.txt",
+      ...(await (
+        await runtime.request("/api/files/content?path=eula.txt", { headers })
+      ).json()),
+      content: "eula=true\n",
+    }),
     headers,
   });
   assert.equal(

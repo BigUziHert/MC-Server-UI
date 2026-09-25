@@ -132,6 +132,7 @@ export default function FileManager({
   const [name, setName] = useState("");
   const [content, setContent] = useState("");
   const [encoding, setEncoding] = useState<"utf8" | "latin1">("utf8");
+  const [revision, setRevision] = useState<string>();
   const [saving, setSaving] = useState(false);
   const [reading, setReading] = useState(false);
   const [readFailed, setReadFailed] = useState(false);
@@ -263,6 +264,7 @@ export default function FileManager({
     setReadFailed(false);
     setName("");
     setContent("");
+    setRevision(undefined);
     setDialogError("");
     setDialog({ type: "create", kind });
   }
@@ -279,6 +281,7 @@ export default function FileManager({
     }
     const id = ++editRequestId.current;
     setContent("");
+    setRevision(undefined);
     setDialogError("");
     setReadFailed(false);
     setReading(true);
@@ -287,10 +290,12 @@ export default function FileManager({
       const result = await api<{
         content: string;
         encoding?: "utf8" | "latin1";
+        revision?: string;
       }>(`/files/content?path=${encodeURIComponent(entry.path)}`);
       if (id === editRequestId.current) {
         setContent(result.content);
         setEncoding(result.encoding ?? "utf8");
+        setRevision(result.revision);
       }
     } catch (failure) {
       if (id === editRequestId.current) {
@@ -386,7 +391,12 @@ export default function FileManager({
       } else if (dialog.type === "edit") {
         await api("/files/content", {
           method: "PUT",
-          body: JSON.stringify({ path: dialog.entry.path, content, encoding }),
+          body: JSON.stringify({
+            path: dialog.entry.path,
+            content,
+            encoding,
+            revision,
+          }),
         });
         notify(`${dialog.entry.name} saved.`);
       } else {

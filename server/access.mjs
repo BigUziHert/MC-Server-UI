@@ -536,6 +536,7 @@ export async function createAccessService({
 // Ignore spoofed forwarding headers: only the gateway's actual peer is trusted.
 export function createAccessRateLimiter({
   limit = 10,
+  keyForRequest = (req) => req.socket?.remoteAddress || "unknown",
   windowMs = 15 * 60 * 1000,
   maxEntries = 10_000,
   now = Date.now,
@@ -545,7 +546,7 @@ export function createAccessRateLimiter({
     const time = now();
     for (const [key, entry] of entries)
       if (entry.expiresAt <= time) entries.delete(key);
-    const key = req.socket?.remoteAddress || "unknown";
+    const key = keyForRequest(req);
     let entry = entries.get(key);
     if (!entry) {
       if (entries.size >= maxEntries) {
@@ -558,7 +559,7 @@ export function createAccessRateLimiter({
       entries.set(key, entry);
     }
     entry.count += 1;
-    if (entry.count > limit) {
+    if (entry.count > (typeof limit === "function" ? limit(req) : limit)) {
       res.setHeader(
         "Retry-After",
         String(Math.max(1, Math.ceil((entry.expiresAt - time) / 1000))),
