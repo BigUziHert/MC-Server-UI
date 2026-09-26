@@ -174,8 +174,10 @@ test("remote gateway never grants owner access, even with forged headers or a lo
 
 test("host folder browsing is local-only even for an authenticated user with file access", async (t) => {
   const { local, guest, invite, root } = await fixture(t);
-  const route = `/api/server-setup/directories?${new URLSearchParams({ directory: root })}`;
-  assert.equal((await local(route)).status, 200);
+  const directory = await fs.realpath(root);
+  const route = `/api/server-setup/directories?${new URLSearchParams({ directory })}`;
+  const localResponse = await local(route);
+  assert.equal(localResponse.status, 200, JSON.stringify(localResponse.body));
   assert.equal((await guest(route)).status, 401);
   const { asUser } = await invite(["file.read", "file.read-content"]);
   const response = await asUser(route);
