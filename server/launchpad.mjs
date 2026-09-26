@@ -215,6 +215,7 @@ export async function createLaunchpad(ctx) {
     restore,
     getServer,
     fetch: rawRequest = fetch,
+    recoveryFetch = rawRequest,
   } = ctx;
   const lifetime = new AbortController();
   const request = (url, init = {}) => {
@@ -231,7 +232,7 @@ export async function createLaunchpad(ctx) {
   const providers = [
     ...createCoreProviders({
       fetch: request,
-      recoveryFetch: rawRequest,
+      recoveryFetch,
       lifetimeSignal: lifetime.signal,
       key,
     }),
@@ -921,24 +922,42 @@ export async function createLaunchpad(ctx) {
           input.type !== "modpack"
         ) {
           const work = (async () => {
-            try {
-              const result = await abortable(
-                found.updates(input, missing),
-                input.signal,
-              );
-              warnings.push(...(result.warnings ?? []));
-              const checked = new Map();
+            const checked = new Map();
+            const cacheGeneration = metadataCache?.generation;
+            let accepting = true;
+            const accept = (result) => {
+              if (
+                !accepting ||
+                input.signal?.aborted ||
+                cacheGeneration !== metadataCache?.generation ||
+                !result?.updates ||
+                typeof result.updates !== "object"
+              )
+                return;
               for (const item of missing) {
-                if (!Object.hasOwn(result.updates, item.sha512)) continue;
-                const value = result.updates[item.sha512];
                 const key = updateKey(input, item);
+                if (
+                  checked.has(key) ||
+                  !Object.hasOwn(result.updates, item.sha512)
+                )
+                  continue;
+                const value = result.updates[item.sha512];
                 const normalized = value ? publicVersion(value) : null;
                 remember(updateCache, key, {
                   value: normalized,
                   expiresAt: Date.now() + 5 * 60_000,
                 });
                 checked.set(key, normalized);
+                apply(item, normalized);
               }
+            };
+            try {
+              const result = await abortable(
+                found.updates({ ...input, onProgress: accept }, missing),
+                input.signal,
+              );
+              warnings.push(...(result.warnings ?? []));
+              accept(result);
               return {
                 checked,
                 issues: result.issues,
@@ -946,7 +965,9 @@ export async function createLaunchpad(ctx) {
               };
             } catch (cause) {
               fail(found, cause);
-              return { issue: cause.message };
+              return { checked, issue: cause.message };
+            } finally {
+              accepting = false;
             }
           })();
           for (const item of missing) {
@@ -1217,13 +1238,20 @@ export async function createLaunchpad(ctx) {
       );
       // The provider result only describes the files that existed when it began.
       // Reuse it only after a fresh scan verifies the same paths and checksums.
+      // Unreadable files stay unverified placeholders; they cannot benefit from
+      // another provider check and must not restart a completed background job.
       if (
         items.every(
           (item) =>
-            item.sha512 && previous.get(item.path)?.sha512 === item.sha512,
+            (input.type !== "modpack" && !item.sha512) ||
+            (item.sha512 && previous.get(item.path)?.sha512 === item.sha512),
         )
       ) {
         for (const item of items) {
+          if (!item.sha512) {
+            item.updateCheck = "unavailable";
+            continue;
+          }
           const checked = previous.get(item.path);
           Object.assign(item, identityFields(checked), {
             updateCheck: checked.updateCheck,

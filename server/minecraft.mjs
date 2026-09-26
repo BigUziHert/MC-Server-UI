@@ -476,6 +476,9 @@ export async function createMinecraft(ctx) {
     isContentMutationActive: () =>
       operations.size > 0 || ctx.isContentMutationActive?.(),
     fetch: catalogFetch,
+    // Public recovery transport is shared across servers. Its subscribers carry
+    // their own lifetime, so closing this runtime cannot abort another server.
+    recoveryFetch: request,
     platformConfig,
     extraProviders: extras,
     audit: (action, detail, category = "file", actor) =>

@@ -372,12 +372,12 @@ test("missing or invalid later responses cannot overwrite a previously discovere
 test("bulk update and current-version verification have independent request deadlines", async (t) => {
   const timeout = AbortSignal.timeout.bind(AbortSignal);
   const budgets = [];
-  const deadlines = new Map();
+  const deadlines = [];
   t.mock.method(AbortSignal, "timeout", (milliseconds) => {
     budgets.push(milliseconds);
     if (![4000, 8000].includes(milliseconds)) return timeout(milliseconds);
     const controller = new AbortController();
-    deadlines.set(milliseconds, controller);
+    deadlines.push(controller);
     return controller.signal;
   });
   let calls = 0;
@@ -387,19 +387,268 @@ test("bulk update and current-version verification have independent request dead
     calls++;
     signals.push(options.signal);
     if (url.endsWith("/update")) return json({ [row.sha512]: raw(row) });
-    deadlines
-      .get(4000)
-      .abort(new DOMException("Earlier bulk deadline", "TimeoutError"));
+    deadlines[0].abort(
+      new DOMException("Earlier bulk deadline", "TimeoutError"),
+    );
     options.signal.throwIfAborted();
     return json([current(row)]);
   });
   const result = await p.updates(input, [row]);
-  assert.ok(budgets.includes(4000));
-  assert.ok(budgets.includes(8000));
+  assert.ok(budgets.filter((budget) => budget === 8000).length >= 2);
   assert.notEqual(signals[0], signals[1]);
   assert.equal(result.updates[row.sha512].id, raw(row).id);
   assert.deepEqual(result.warnings, []);
   assert.equal(calls, 2);
+});
+
+test("a six-second primary update request succeeds within the restored eight-second budget", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  t.mock.method(AbortSignal, "timeout", (duration) => {
+    const controller = new AbortController();
+    setTimeout(
+      () =>
+        controller.abort(new DOMException("Fixture deadline", "TimeoutError")),
+      duration,
+    );
+    return controller.signal;
+  });
+  let entered;
+  const ready = new Promise((resolve) => {
+    entered = resolve;
+  });
+  const row = item(0),
+    requests = [];
+  const p = provider(async (url) => {
+    requests.push(url);
+    const waiting = new Promise((resolve) => setTimeout(resolve, 6000));
+    entered();
+    await waiting;
+    return json({ [row.sha512]: current(row) });
+  });
+  const work = p.updates(input, [row]);
+  await ready;
+  t.mock.timers.tick(6000);
+  const result = await work;
+  assert.deepEqual(result.updates, { [row.sha512]: null });
+  assert.equal(
+    requests.length,
+    1,
+    "successful primary POST never enters GET recovery",
+  );
+});
+
+test("172 update checks publish verified batches before a later batch deadline and never publish after cancellation", async () => {
+  const rows = Array.from({ length: 172 }, (_, index) => item(index));
+  const byHash = new Map(rows.map((row) => [row.sha512, row]));
+  const controller = new AbortController(),
+    completed = {};
+  let entered, reached, release;
+  const ready = new Promise((resolve) => {
+    entered = resolve;
+  });
+  const progress = new Promise((resolve) => {
+    reached = resolve;
+  });
+  const held = new Promise((resolve) => {
+    release = resolve;
+  });
+  let slow = true;
+  const p = provider(async (url, options) => {
+    const hashes = JSON.parse(options.body).hashes;
+    if (slow && hashes.includes(rows[100].sha512)) {
+      entered();
+      await held;
+    }
+    return json(
+      Object.fromEntries(
+        hashes.map((sha512) => [sha512, current(byHash.get(sha512))]),
+      ),
+    );
+  });
+  const work = p.updates(
+    {
+      ...input,
+      signal: controller.signal,
+      onProgress: (partial) => {
+        Object.assign(completed, partial.updates);
+        if (Object.keys(completed).length === 100) reached();
+      },
+    },
+    rows,
+  );
+  await Promise.all([ready, progress]);
+  controller.abort(
+    new DOMException("Overall inventory deadline", "TimeoutError"),
+  );
+  await assert.rejects(work, /Overall inventory deadline/);
+  assert.equal(Object.keys(completed).length, 100);
+  slow = false;
+  release();
+  await delay(0);
+  assert.equal(
+    Object.keys(completed).length,
+    100,
+    "late fetches cannot republish cancelled work",
+  );
+  const retried = await p.updates(input, rows.slice(100));
+  assert.equal(
+    Object.keys(retried.updates).length,
+    72,
+    "both queue lanes are released after cancellation",
+  );
+});
+
+test("verified current hashes publish before slow current-version verification in the same batch", async () => {
+  const rows = [item(0), item(1), item(2)],
+    controller = new AbortController(),
+    completed = {};
+  let entered, reached;
+  const ready = new Promise((resolve) => {
+    entered = resolve;
+  });
+  const progress = new Promise((resolve) => {
+    reached = resolve;
+  });
+  const p = provider(async (url) => {
+    if (url.endsWith("/update"))
+      return json({
+        [rows[0].sha512]: current(rows[0]),
+        [rows[1].sha512]: raw(rows[1]),
+        [rows[2].sha512]: raw(rows[2], { loaders: ["fabric"] }),
+      });
+    entered();
+    return new Promise(() => {});
+  });
+  const work = p.updates(
+    {
+      ...input,
+      signal: controller.signal,
+      onProgress: ({ updates }) => {
+        Object.assign(completed, updates);
+        reached();
+      },
+    },
+    rows,
+  );
+  await Promise.all([ready, progress]);
+  assert.deepEqual(completed, { [rows[0].sha512]: null });
+  controller.abort(new Error("left server"));
+  await assert.rejects(work, /left server/);
+  assert.deepEqual(completed, { [rows[0].sha512]: null });
+});
+
+test("one verified recovered update publishes while another installed-version lookup is still pending", async () => {
+  const rows = [item(0), item(1)],
+    controller = new AbortController(),
+    completed = {};
+  let entered, reached;
+  const ready = new Promise((resolve) => {
+    entered = resolve;
+  });
+  const progress = new Promise((resolve) => {
+    reached = resolve;
+  });
+  const p = historyProvider(async (url, options) => {
+    if (options.method === "POST")
+      return new Response("gateway", { status: 503 });
+    const parsed = new URL(url);
+    if (parsed.pathname === "/v2/project/project0/version")
+      return json([raw(rows[0])]);
+    if (parsed.pathname === "/v2/project/project1/version")
+      return json([raw(rows[1])]);
+    if (parsed.pathname === "/v2/version/old0") return json(current(rows[0]));
+    assert.equal(parsed.pathname, "/v2/version/old1");
+    entered();
+    return new Promise(() => {});
+  });
+  const work = p.updates(
+    {
+      ...input,
+      signal: controller.signal,
+      onProgress: ({ updates }) => {
+        Object.assign(completed, updates);
+        reached();
+      },
+    },
+    rows,
+  );
+  await Promise.all([ready, progress]);
+  assert.equal(completed[rows[0].sha512].id, raw(rows[0]).id);
+  controller.abort(new Error("left server"));
+  await assert.rejects(work, /left server/);
+  assert.equal(Object.keys(completed).length, 1);
+});
+
+test("indexed and completed history results publish before a neighboring history reaches the inventory deadline", async () => {
+  const rows = [item(0), item(1), item(2), item(3)],
+    controller = new AbortController(),
+    completed = {};
+  let entered, reached, release;
+  const ready = new Promise((resolve) => {
+    entered = resolve;
+  });
+  const progress = new Promise((resolve) => {
+    reached = resolve;
+  });
+  const held = new Promise((resolve) => {
+    release = resolve;
+  });
+  const p = provider(async (url, options) => {
+    if (options.method === "POST")
+      return new Response("gateway", { status: 503 });
+    const parsed = new URL(url);
+    if (parsed.pathname === "/v2/search")
+      return json({
+        hits: [
+          { project_id: rows[0].projectId, latest_version: rows[0].versionId },
+        ],
+      });
+    if (parsed.pathname === "/v2/projects")
+      return json([
+        {
+          id: rows[0].projectId,
+          versions: [rows[0].versionId, raw(rows[0]).id],
+        },
+      ]);
+    if (parsed.pathname === "/v2/versions")
+      return json([current(rows[0]), raw(rows[0])]);
+    if (parsed.pathname === "/v2/project/project1/version")
+      return json([current(rows[1]), raw(rows[1])]);
+    if (parsed.pathname === "/v2/project/project3/version")
+      return json([
+        current(rows[3], { files: current(rows[0]).files }),
+        raw(rows[3]),
+      ]);
+    assert.equal(parsed.pathname, "/v2/project/project2/version");
+    entered();
+    await held;
+    return json([current(rows[2]), raw(rows[2])]);
+  });
+  const work = p.updates(
+    {
+      ...input,
+      signal: controller.signal,
+      onProgress: ({ updates }) => {
+        Object.assign(completed, updates);
+        if (Object.keys(completed).length === 2) reached();
+      },
+    },
+    rows,
+  );
+  await Promise.all([ready, progress]);
+  assert.equal(completed[rows[0].sha512].id, raw(rows[0]).id);
+  assert.equal(completed[rows[1].sha512].id, raw(rows[1]).id);
+  controller.abort(
+    new DOMException("Overall inventory deadline", "TimeoutError"),
+  );
+  await assert.rejects(work, /Overall inventory deadline/);
+  release();
+  await delay(0);
+  assert.equal(
+    Object.keys(completed).length,
+    2,
+    "unverified and late results cannot overwrite verified progress",
+  );
 });
 
 test("220 installed mods recover from failed hash POSTs using bounded cached GET project histories", async (t) => {
@@ -692,6 +941,159 @@ test("indexed recovery splits long version IDs into bounded GET URLs", async () 
   assert.deepEqual(result.updates, { [row.sha512]: null });
   assert.deepEqual(result.issues, {});
   assert.ok(reads >= 4);
+});
+
+test("a bulk metadata timeout stops further chunks and immediately recovers unresolved project histories", async () => {
+  for (const successfulChunks of [0, 1]) {
+    const rows = [item(0), item(1), item(2)],
+      versions = new Map(),
+      projects = new Map();
+    for (const [index, row] of rows.entries()) {
+      const history = [
+        current(row),
+        ...Array.from({ length: 200 }, (_, offset) =>
+          raw(row, {
+            id: `v${index}_${offset}`,
+            date_published: new Date(
+              Date.UTC(2026, 7, 1, 0, offset),
+            ).toISOString(),
+            loaders: ["fabric"],
+          }),
+        ),
+      ];
+      history.forEach((version) => versions.set(version.id, version));
+      projects.set(row.projectId, {
+        id: row.projectId,
+        versions: history.map((version) => version.id),
+      });
+    }
+    let bulkReads = 0,
+      historyReads = 0;
+    const p = provider(async (url, options) => {
+      if (options.method === "POST")
+        return new Response("gateway", { status: 503 });
+      const parsed = new URL(url);
+      if (parsed.pathname === "/v2/search")
+        return json({
+          hits: rows.map((row) => ({
+            project_id: row.projectId,
+            latest_version: row.versionId,
+          })),
+        });
+      if (parsed.pathname === "/v2/projects")
+        return json([...projects.values()]);
+      if (parsed.pathname === "/v2/versions") {
+        if (bulkReads++ === successfulChunks)
+          throw new DOMException("bulk metadata timed out", "TimeoutError");
+        return json(
+          JSON.parse(parsed.searchParams.get("ids")).map((id) =>
+            versions.get(id),
+          ),
+        );
+      }
+      const row = rows.find(
+        (row) => parsed.pathname === `/v2/project/${row.projectId}/version`,
+      );
+      assert.ok(row);
+      historyReads++;
+      return json([current(row)]);
+    });
+    const result = await p.updates(input, rows);
+    assert.deepEqual(
+      result.updates,
+      Object.fromEntries(rows.map((row) => [row.sha512, null])),
+    );
+    assert.deepEqual(result.issues, {});
+    assert.equal(
+      bulkReads,
+      successfulChunks + 1,
+      "later chunks are skipped after the first timeout",
+    );
+    assert.equal(
+      historyReads,
+      successfulChunks ? 2 : 3,
+      "complete earlier project metadata is retained",
+    );
+  }
+});
+
+test("fully covered indexed projects publish before a later metadata chunk hits the inventory deadline", async () => {
+  const rows = [item(0), item(1), item(2)],
+    versions = new Map(),
+    projects = new Map(),
+    controller = new AbortController(),
+    completed = {};
+  for (const [index, row] of rows.entries()) {
+    const history = [
+      current(row),
+      ...Array.from({ length: 200 }, (_, offset) =>
+        raw(row, {
+          id: `v${index}_${offset}`,
+          date_published: new Date(
+            Date.UTC(2026, 7, 1, 0, offset),
+          ).toISOString(),
+          loaders: ["fabric"],
+        }),
+      ),
+    ];
+    history.forEach((version) => versions.set(version.id, version));
+    projects.set(row.projectId, {
+      id: row.projectId,
+      versions: history.map((version) => version.id),
+    });
+  }
+  let entered,
+    release,
+    reads = 0;
+  const ready = new Promise((resolve) => {
+    entered = resolve;
+  });
+  const held = new Promise((resolve) => {
+    release = resolve;
+  });
+  const p = provider(async (url, options) => {
+    if (options.method === "POST")
+      return new Response("gateway", { status: 503 });
+    const parsed = new URL(url);
+    if (parsed.pathname === "/v2/search")
+      return json({
+        hits: rows.map((row) => ({
+          project_id: row.projectId,
+          latest_version: row.versionId,
+        })),
+      });
+    if (parsed.pathname === "/v2/projects") return json([...projects.values()]);
+    assert.equal(
+      parsed.pathname,
+      "/v2/versions",
+      "cancellation never starts extra histories",
+    );
+    if (++reads === 2) {
+      entered();
+      await held;
+    }
+    return json(
+      JSON.parse(parsed.searchParams.get("ids")).map((id) => versions.get(id)),
+    );
+  });
+  const work = p.updates(
+    {
+      ...input,
+      signal: controller.signal,
+      onProgress: ({ updates }) => Object.assign(completed, updates),
+    },
+    rows,
+  );
+  const rejected = assert.rejects(work, /Overall inventory deadline/);
+  await ready;
+  controller.abort(
+    new DOMException("Overall inventory deadline", "TimeoutError"),
+  );
+  await rejected;
+  release();
+  await delay(0);
+  assert.deepEqual(completed, { [rows[0].sha512]: null });
+  assert.equal(reads, 2, "later metadata chunks stop after cancellation");
 });
 
 test("indexed recovery obeys cancellation and rate limits without launching individual histories", async () => {

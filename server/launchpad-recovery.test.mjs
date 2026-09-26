@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { setTimeout as delay } from "node:timers/promises";
 import { createModrinthRecovery } from "./launchpad-recovery.mjs";
 
-test("failing POST routes share a circuit while GET metadata stays available", async () => {
+test("a failing identification POST does not suppress the independent update route", async () => {
   const calls = [];
   const recovery = createModrinthRecovery(async (url, options) => {
     calls.push(url);
@@ -21,7 +21,7 @@ test("failing POST routes share a circuit while GET metadata stays available", a
     useFallback: true,
   });
   assert.deepEqual(await recovery.read("one"), { id: "known" });
-  assert.deepEqual(calls, ["identify", "one"]);
+  assert.deepEqual(calls, ["identify", "updates", "one"]);
 });
 
 test("authentication errors and rate limits do not fan out into fallback requests", async () => {
@@ -177,11 +177,88 @@ test("servers using the same public transport share the recovery budget and circ
   await assert.rejects(first.bulk("identify", { method: "POST" }), {
     useFallback: true,
   });
-  await assert.rejects(second.bulk("updates", { method: "POST" }), {
+  await assert.rejects(second.bulk("identify", { method: "POST" }), {
     useFallback: true,
   });
   assert.equal(await second.read("metadata"), "metadata");
   assert.deepEqual(calls, ["identify", "metadata"]);
+});
+
+test("three slow files cannot give their timeout to the remaining 221-file refresh", async () => {
+  const calls = [];
+  const recovery = createModrinthRecovery(
+    async (url) => {
+      const index = Number(new URL(url).searchParams.get("index"));
+      calls.push(index);
+      if (index >= 49 && index < 52) return new Promise(() => {});
+      return index;
+    },
+    { requestTimeoutMs: 15 },
+  );
+  const work = Promise.allSettled(
+    Array.from({ length: 221 }, (_, index) =>
+      recovery.read(
+        `https://api.modrinth.com/v2/project/p${index}/version?index=${index}`,
+      ),
+    ),
+  );
+  const [results] = await Promise.all([work, delay(40)]);
+  assert.equal(calls.length, 221);
+  assert.equal(
+    results.filter((value) => value.status === "fulfilled").length,
+    218,
+  );
+  assert.deepEqual(
+    results.flatMap((value, index) =>
+      value.status === "rejected" ? [index] : [],
+    ),
+    [49, 50, 51],
+  );
+});
+
+test("a bulk metadata outage leaves project-history recovery available", async () => {
+  const calls = [];
+  const recovery = createModrinthRecovery(async (url) => {
+    calls.push(url);
+    if (new URL(url).pathname === "/v2/versions")
+      throw Object.assign(new Error("Bulk unavailable"), {
+        status: 502,
+        upstreamStatus: 503,
+      });
+    return [{ id: "verified" }];
+  });
+  for (let index = 0; index < 3; index++)
+    await assert.rejects(
+      recovery.read(`https://api.modrinth.com/v2/versions?ids=${index}`),
+    );
+  await assert.rejects(
+    recovery.read("https://api.modrinth.com/v2/versions?ids=4"),
+  );
+  assert.deepEqual(
+    await recovery.read("https://api.modrinth.com/v2/project/healthy/version"),
+    [{ id: "verified" }],
+  );
+  assert.equal(calls.length, 4, "only the failing bulk route is paused");
+});
+
+test("update POST can retain its earlier request budget without extending identity probes", async () => {
+  const optionsSeen = [];
+  const recovery = createModrinthRecovery(
+    async (_url, options) => {
+      optionsSeen.push(options);
+      await delay(25);
+      return { verified: true };
+    },
+    { bulkTimeoutMs: 10 },
+  );
+  await assert.rejects(recovery.bulk("identify", { method: "POST" }), {
+    useFallback: true,
+  });
+  assert.deepEqual(
+    await recovery.bulk("updates", { method: "POST", timeoutMs: 60 }),
+    { verified: true },
+  );
+  assert.ok(optionsSeen.every((options) => !("timeoutMs" in options)));
 });
 
 test("a complete GET outage stops queued recovery without a request per file", async () => {

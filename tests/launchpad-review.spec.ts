@@ -273,6 +273,150 @@ test("220 installed files stay usable while provider checks run without rescanni
   expect(requests.at(-1)!.searchParams.get("refresh")).toBe("true");
 });
 
+test("a 120-second background check deadline preserves completed rows and fails only unfinished checks", async ({
+  page,
+}) => {
+  await catalog(page);
+  await page.clock.install();
+  const items = [
+    { ...installed("Current Mod"), update: null },
+    installed("Verified Update"),
+    { ...installed("Pending Mod"), update: null, updateCheck: "pending" },
+    {
+      ...installed("Provider Failure"),
+      update: null,
+      updateCheck: "unavailable",
+      updateIssue: "Provider is temporarily unavailable (503).",
+    },
+    ...Array.from({ length: 170 }, (_, index) => ({
+      ...installed(`Z verified ${index}`),
+      update: null,
+    })),
+    ...Array.from({ length: 47 }, (_, index) => ({
+      path: `mods/z-unreadable-${index}.jar`,
+      name: `z-unreadable-${index}.jar`,
+      size: 100,
+      platform: null,
+      updateCheck: "unavailable",
+    })),
+  ];
+  let onlineReads = 0;
+  await page.route("**/api/launchpad/installed?**", (route) => {
+    const local = new URL(route.request().url()).searchParams.has("local");
+    if (!local) onlineReads++;
+    return route.fulfill({
+      json: {
+        items,
+        warnings: [],
+        ...(!local && {
+          checkingUpdates: true,
+          progress: { completed: 220, total: 221 },
+        }),
+      },
+    });
+  });
+  await page.goto("/#launchpad");
+  await page.getByRole("switch", { name: "Show installed content" }).check();
+  const progress = page.getByRole("status", {
+    name: "Installed content refresh",
+    exact: true,
+  });
+  await expect(progress).toHaveText("Checking updates for 1 of 221…");
+  await page.clock.fastForward(120_001);
+  await expect(progress).toHaveCount(0);
+  await expect(
+    page.getByText(/The update check is taking longer than expected/).first(),
+  ).toBeVisible();
+  const current = page.getByRole("article", {
+    name: "Current Mod",
+    exact: true,
+  });
+  await expect(current.getByText("Up to date", { exact: true })).toBeVisible();
+  await expect(current.getByText("Update check unavailable")).toHaveCount(0);
+  const verified = page.getByRole("article", {
+    name: "Verified Update",
+    exact: true,
+  });
+  await expect(
+    verified.getByRole("button", {
+      name: "Update Verified Update",
+      exact: true,
+    }),
+  ).toBeEnabled();
+  await expect(verified.getByText("Update check unavailable")).toHaveCount(0);
+  await expect(
+    page
+      .getByRole("article", { name: "Pending Mod", exact: true })
+      .getByText("Update check unavailable"),
+  ).toBeVisible();
+  await expect(
+    page
+      .getByRole("article", { name: "Provider Failure", exact: true })
+      .getByText("Provider is temporarily unavailable (503).", { exact: true }),
+  ).toBeVisible();
+  expect(onlineReads).toBe(1);
+});
+
+test("a failed initial online refresh does not reuse an old checked status but keeps known updates", async ({
+  page,
+}) => {
+  await catalog(page);
+  const items = [
+    { ...installed("Current Mod"), update: null },
+    installed("Verified Update"),
+  ];
+  let onlineReads = 0;
+  await page.route("**/api/launchpad/installed?**", (route) => {
+    const local = new URL(route.request().url()).searchParams.has("local");
+    if (!local && ++onlineReads === 2)
+      return route.fulfill({
+        status: 503,
+        json: { error: "Fixture provider gateway offline." },
+      });
+    return route.fulfill({
+      json: {
+        items:
+          local && onlineReads > 0
+            ? items.map((item) => ({ ...item, updateCheck: "pending" }))
+            : items,
+        warnings: [],
+      },
+    });
+  });
+  await page.goto("/#launchpad");
+  await page.getByRole("switch", { name: "Show installed content" }).check();
+  const current = page.getByRole("article", {
+    name: "Current Mod",
+    exact: true,
+  });
+  await expect(current.getByText("Up to date", { exact: true })).toBeVisible();
+  await expect.poll(() => onlineReads).toBe(1);
+  const refresh = page.getByRole("button", {
+    name: "Refresh Launchpad and check updates",
+    exact: true,
+  });
+  await expect(refresh).toBeEnabled();
+  await refresh.click();
+  await expect(current.getByText("Update check unavailable")).toBeVisible();
+  await expect(current.getByText("Up to date", { exact: true })).toHaveCount(0);
+  await expect(
+    current.getByText("Fixture provider gateway offline.", { exact: true }),
+  ).toBeVisible();
+  const verified = page.getByRole("article", {
+    name: "Verified Update",
+    exact: true,
+  });
+  await expect(
+    verified.getByRole("button", {
+      name: "Update Verified Update",
+      exact: true,
+    }),
+  ).toBeEnabled();
+  await expect(verified.getByText("Update check unavailable")).toBeVisible();
+  await expect(refresh).toBeEnabled();
+  expect(onlineReads).toBe(2);
+});
+
 test("installed content tabs retain their own snapshots and ignore late responses for another type", async ({
   page,
 }) => {

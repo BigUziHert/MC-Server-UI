@@ -39,6 +39,18 @@ function transient(cause) {
   );
 }
 
+function operation(url) {
+  try {
+    const path = new URL(url).pathname;
+    if (/\/version_file\//.test(path)) return "file-identity";
+    if (/\/project\/[^/]+\/version$/.test(path)) return "project-history";
+    if (/\/version\/[^/]+$/.test(path)) return "version";
+    return path;
+  } catch {
+    return "metadata";
+  }
+}
+
 // Modrinth's batch POST routes can fail while equivalent GET routes work.
 // Share their circuit breaker, GET concurrency and request budget across file
 // identification and update checks. No file downloads use this transport.
@@ -58,16 +70,13 @@ export function createModrinthRecovery(
     return sharedRecovery.get(sharingKey);
   const cache = new Map(),
     pending = new Map(),
+    bulkFailures = new Map(),
+    readFailures = new Map(),
     queue = [],
     started = [];
   let active = 0,
     timer,
-    bulkUnavailableUntil = 0,
-    rateLimitedUntil = 0,
-    readUnavailableUntil = 0,
-    readFailures = 0,
-    lastReadFailure,
-    lastBulkFailure;
+    rateLimitedUntil = 0;
 
   const rememberRateLimit = (cause) => {
     if (cause?.status === 429 || cause?.upstreamStatus === 429)
@@ -84,13 +93,13 @@ export function createModrinthRecovery(
       ),
       { retryAfterMs: Math.max(1000, rateLimitedUntil - now()) },
     );
-  const readBlock = () => {
+  const readBlock = (key) => {
     if (rateLimitedUntil > now()) return rateLimitError();
-    if (readUnavailableUntil > now())
-      return Object.assign(new Error(lastReadFailure.message), {
-        name: lastReadFailure.name,
-        status: lastReadFailure.status,
-        upstreamStatus: lastReadFailure.upstreamStatus,
+    const failure = readFailures.get(key);
+    if (failure?.until > now())
+      return Object.assign(new Error(failure.cause.message), {
+        status: failure.cause.status,
+        upstreamStatus: failure.cause.upstreamStatus,
       });
     return null;
   };
@@ -98,16 +107,15 @@ export function createModrinthRecovery(
   function pump() {
     clearTimeout(timer);
     timer = undefined;
-    const blocked = readBlock();
-    if (blocked) {
-      for (const job of queue.splice(0)) {
-        job.signal.removeEventListener("abort", job.cancel);
-        job.reject(blocked);
-      }
-      return;
-    }
     while (started.length && started[0] <= now() - windowMs) started.shift();
     while (active < concurrency && queue.length) {
+      const blocked = readBlock(queue[0].key);
+      if (blocked) {
+        const job = queue.shift();
+        job.signal.removeEventListener("abort", job.cancel);
+        job.reject(blocked);
+        continue;
+      }
       const waitUntil = started.length >= maxReads ? started[0] + windowMs : 0;
       if (waitUntil > now()) {
         timer = setTimeout(pump, Math.max(1, waitUntil - now()));
@@ -131,9 +139,9 @@ export function createModrinthRecovery(
     }
   }
 
-  function enqueue(run, signal) {
+  function enqueue(run, signal, key) {
     return new Promise((resolve, reject) => {
-      const job = { run, signal, resolve, reject };
+      const job = { run, signal, key, resolve, reject };
       job.cancel = () => {
         const index = queue.indexOf(job);
         if (index >= 0) queue.splice(index, 1);
@@ -170,14 +178,15 @@ export function createModrinthRecovery(
   }
 
   const recovery = {
-    async bulk(url, options = {}) {
+    async bulk(url, { timeoutMs = bulkTimeoutMs, ...options } = {}) {
       options.signal?.throwIfAborted();
       if (rateLimitedUntil > now()) throw rateLimitError();
-      if (bulkUnavailableUntil > now())
-        throw Object.assign(new Error(lastBulkFailure.message), {
+      const failure = bulkFailures.get(url);
+      if (failure?.until > now())
+        throw Object.assign(new Error(failure.cause.message), {
           useFallback: true,
         });
-      const deadline = AbortSignal.timeout(bulkTimeoutMs);
+      const deadline = AbortSignal.timeout(timeoutMs);
       const signal = options.signal
         ? AbortSignal.any([options.signal, deadline])
         : deadline;
@@ -187,8 +196,7 @@ export function createModrinthRecovery(
         if (options.signal?.aborted) throw aborted(options.signal);
         rememberRateLimit(cause);
         if (!transient(cause)) throw cause;
-        lastBulkFailure = cause;
-        bulkUnavailableUntil = now() + 60000;
+        bulkFailures.set(url, { cause, until: now() + 60000 });
         throw Object.assign(new Error(cause.message), {
           useFallback: true,
           cause,
@@ -205,36 +213,54 @@ export function createModrinthRecovery(
       let entry = pending.get(url);
       if (entry?.controller.signal.aborted) entry = undefined;
       if (!entry) {
-        const blocked = readBlock();
+        const key = operation(url);
+        const blocked = readBlock(key);
         if (blocked) return Promise.reject(blocked);
         const controller = new AbortController();
         entry = { controller, waiters: 0, done: false };
         const owned = entry;
-        entry.work = enqueue(async () => {
-          const deadline = AbortSignal.timeout(requestTimeoutMs);
-          const requestSignal = AbortSignal.any([controller.signal, deadline]);
-          try {
-            const value = await bounded(
-              () => json(url, { signal: requestSignal }),
-              requestSignal,
-            );
-            readFailures = 0;
-            if (ttlMs > 0) {
-              cache.set(url, { value, until: now() + ttlMs });
-              while (cache.size > 1000) cache.delete(cache.keys().next().value);
-            }
-            return value;
-          } catch (cause) {
-            rememberRateLimit(cause);
-            if (!controller.signal.aborted && transient(cause)) {
-              if (++readFailures >= 3) {
-                lastReadFailure = cause;
-                readUnavailableUntil = now() + 30000;
+        entry.work = enqueue(
+          async () => {
+            const deadline = AbortSignal.timeout(requestTimeoutMs);
+            const requestSignal = AbortSignal.any([
+              controller.signal,
+              deadline,
+            ]);
+            try {
+              const value = await bounded(
+                () => json(url, { signal: requestSignal }),
+                requestSignal,
+              );
+              readFailures.delete(key);
+              if (ttlMs > 0) {
+                cache.set(url, { value, until: now() + ttlMs });
+                while (cache.size > 1000)
+                  cache.delete(cache.keys().next().value);
               }
-            } else if (cause?.status === 404) readFailures = 0;
-            throw cause;
-          }
-        }, controller.signal).finally(() => {
+              return value;
+            } catch (cause) {
+              rememberRateLimit(cause);
+              // A slow query is not evidence that every other metadata route is
+              // down. In particular, a bulk-version timeout must not prevent the
+              // independent project-history fallback from being attempted.
+              if (
+                !controller.signal.aborted &&
+                !["TimeoutError", "AbortError"].includes(cause?.name) &&
+                transient(cause)
+              ) {
+                const count = (readFailures.get(key)?.count ?? 0) + 1;
+                readFailures.set(key, {
+                  count,
+                  cause,
+                  until: count >= 3 ? now() + 30000 : 0,
+                });
+              } else if (cause?.status === 404) readFailures.delete(key);
+              throw cause;
+            }
+          },
+          controller.signal,
+          key,
+        ).finally(() => {
           owned.done = true;
           if (pending.get(url) === owned) pending.delete(url);
         });

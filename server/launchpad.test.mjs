@@ -5612,8 +5612,59 @@ test("explicit background refresh immediately publishes progress and coalesces p
   assert.equal(complete.items[0].updateCheck, "checked");
 });
 
-test("completed background inventories reconcile deleted and replaced files before publishing", async (t) => {
-  for (const change of ["deleted", "replaced"]) {
+test("completed background inventories settle with one unreadable file among 221 rows", async (t) => {
+  const f = await fixture(t);
+  await Promise.all(
+    Array.from({ length: 219 }, (_, index) =>
+      fs.writeFile(path.join(f.serverDir, "mods", `copy-${index}.jar`), f.old),
+    ),
+  );
+  const blocked = path.join(f.serverDir, "mods", "locked.jar");
+  await fs.writeFile(blocked, "unreadable fixture");
+  const open = fs.open.bind(fs);
+  t.mock.method(fs, "open", async (target, ...args) => {
+    if (target === blocked)
+      throw Object.assign(new Error("File is locked"), { code: "EACCES" });
+    return open(target, ...args);
+  });
+
+  let result = await f.service.installed({ ...selection, background: true });
+  assert.equal(result.items.length, 221);
+  assert.equal(result.checkingUpdates, true);
+  const deadline = performance.now() + 5000;
+  while (result.checkingUpdates && performance.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    result = await f.service.installed({ ...selection, background: true });
+  }
+  assert.equal(
+    result.checkingUpdates,
+    false,
+    "the completed job must end polling",
+  );
+  assert.deepEqual(result.progress, { completed: 221, total: 221 });
+  assert.equal(
+    result.items.filter((item) => item.updateCheck === "checked").length,
+    220,
+  );
+  const unreadable = result.items.find((item) => item.name === "locked.jar");
+  assert.equal(unreadable.updateCheck, "unavailable");
+  assert.equal(unreadable.sha512, undefined);
+  assert.equal(unreadable.platform, null);
+  assert.equal(unreadable.update, undefined);
+  assert.deepEqual(result.warnings, [
+    "locked.jar could not be read: File is locked",
+  ]);
+  assert.equal(
+    f.requests.filter(
+      ({ url }) => new URL(url).pathname === "/v2/version_files/update",
+    ).length,
+    1,
+    "a read failure must not repeat the successful provider update check",
+  );
+});
+
+test("completed background inventories reconcile deleted, replaced, and unreadable files before publishing", async (t) => {
+  for (const change of ["deleted", "replaced", "unreadable"]) {
     const f = await fixture(t);
     await f.service.installed(selection);
     await f.service.installed({
@@ -5630,6 +5681,14 @@ test("completed background inventories reconcile deleted and replaced files befo
         target,
         "unidentified replacement with different bytes",
       );
+    if (change === "unreadable") {
+      const open = fs.open.bind(fs);
+      t.mock.method(fs, "open", async (filename, ...args) => {
+        if (filename === target)
+          throw Object.assign(new Error("File is locked"), { code: "EACCES" });
+        return open(filename, ...args);
+      });
+    }
     const next = await f.service.installed(selection);
     if (change === "deleted") assert.deepEqual(next.items, []);
     else {
@@ -5637,6 +5696,13 @@ test("completed background inventories reconcile deleted and replaced files befo
       assert.notEqual(next.items[0].sha512, hashes(f.old).sha512);
       assert.equal(next.items[0].update, undefined);
       assert.equal(next.items[0].platform, null);
+      if (change === "unreadable") {
+        assert.equal(next.checkingUpdates, false);
+        assert.equal(next.items[0].sha512, undefined);
+        assert.equal(next.items[0].projectId, undefined);
+        assert.equal(next.items[0].updateCheck, "unavailable");
+        assert.match(next.warnings.join(" "), /old.jar could not be read/);
+      }
     }
   }
 });
@@ -5802,6 +5868,150 @@ test("failed bulk update checks advance progress while another provider is still
     "unavailable",
   );
   release();
+});
+
+test("221 installed files retain 100 verified checks when the remaining 72 known checks hit the inventory deadline", async (t) => {
+  const timeout = AbortSignal.timeout.bind(AbortSignal),
+    deadline = new AbortController();
+  t.mock.method(AbortSignal, "timeout", (duration) =>
+    duration === 90000 ? deadline.signal : timeout(duration),
+  );
+  const rows = Array.from({ length: 221 }, (_, index) => {
+    const contents = bytes(`installed fixture ${index}`),
+      sha512 = hashes(contents).sha512;
+    const name = `${index < 172 ? "known" : "unknown"}${String(index).padStart(3, "0")}.jar`;
+    return {
+      contents,
+      path: `mods/${name}`,
+      sha512,
+      platform: index < 172 ? "modrinth" : null,
+      projectId: `project${index}`,
+      versionId: `version${index}`,
+    };
+  });
+  const byHash = new Map(rows.map((row) => [row.sha512, row]));
+  let reached, release;
+  const heldStarted = new Promise((resolve) => {
+    reached = resolve;
+  });
+  const held = new Promise((resolve) => {
+    release = resolve;
+  });
+  t.after(() => release());
+  const f = await fixture(t, {
+    request: async (url, options) => {
+      const parsed = new URL(url);
+      if (parsed.pathname === "/v2/version_files") return Response.json({});
+      if (parsed.pathname !== "/v2/version_files/update") return;
+      const requested = JSON.parse(options.body).hashes;
+      if (requested.includes(rows[100].sha512)) {
+        reached();
+        await held;
+      }
+      return Response.json(
+        Object.fromEntries(
+          requested.map((sha512) => {
+            const row = byHash.get(sha512);
+            return [
+              sha512,
+              {
+                id: row.versionId,
+                project_id: row.projectId,
+                name: "Current",
+                version_number: "1",
+                game_versions: ["1.21.1"],
+                loaders: ["neoforge"],
+                environment: "server_only",
+                date_published: "2026-01-01",
+                files: [
+                  {
+                    filename: path.basename(row.path),
+                    url: "https://cdn.modrinth.com/current.jar",
+                    hashes: { sha512 },
+                    size: row.contents.length,
+                  },
+                ],
+              },
+            ];
+          }),
+        ),
+      );
+    },
+  });
+  await f.service.close();
+  await fs.rm(path.join(f.serverDir, "mods", "old.jar"));
+  await Promise.all(
+    rows.map((row) =>
+      fs.writeFile(path.join(f.serverDir, row.path), row.contents),
+    ),
+  );
+  await fs.writeFile(
+    path.join(f.dataDir, "launchpad", "installed.json"),
+    JSON.stringify(rows.slice(0, 172).map(({ contents, ...row }) => row)),
+  );
+  const service = await f.boot();
+  await service.installed({ ...selection, refresh: true, background: true });
+  await heldStarted;
+  let progress;
+  const progressDeadline = performance.now() + 5000;
+  do {
+    progress = await service.installed(selection);
+    if (
+      progress.items.filter((row) => row.updateCheck === "checked").length ===
+      100
+    )
+      break;
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  } while (performance.now() < progressDeadline);
+  assert.equal(progress.items.length, 221);
+  assert.equal(
+    progress.items.filter((row) => row.updateCheck === "checked").length,
+    100,
+  );
+  assert.equal(
+    progress.checkingUpdates,
+    true,
+    "completed results appear before the slow batch settles",
+  );
+  deadline.abort(
+    new DOMException("Fixture overall inventory deadline", "TimeoutError"),
+  );
+  const finishDeadline = performance.now() + 5000;
+  do {
+    progress = await service.installed(selection);
+    if (!progress.checkingUpdates) break;
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  } while (performance.now() < finishDeadline);
+  const known = progress.items.filter((row) => row.platform === "modrinth");
+  assert.equal(known.length, 172);
+  assert.equal(
+    known.filter((row) => row.updateCheck === "checked").length,
+    100,
+  );
+  assert.equal(
+    known.filter((row) => row.updateCheck === "unavailable").length,
+    72,
+  );
+  assert.ok(
+    known
+      .filter((row) => row.updateCheck === "checked")
+      .every((row) => !row.updateIssue),
+  );
+  assert.equal(progress.items.filter((row) => !row.platform).length, 49);
+  const cached = await service.installed({ ...selection, local: true });
+  assert.equal(
+    cached.items.filter((row) => row.updateCheck === "checked").length,
+    100,
+    "verified decisions survive in the update cache",
+  );
+  release();
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  const afterLateReply = await service.installed({ ...selection, local: true });
+  assert.equal(
+    afterLateReply.items.filter((row) => row.updateCheck === "checked").length,
+    100,
+    "late aborted replies cannot publish the unfinished 72 checks",
+  );
 });
 
 test("manual refresh respects Modrinth rate limits and retries after their cooldown", async (t) => {

@@ -921,10 +921,12 @@ export default function Launchpad({
           if (current()) setScanLoading(false);
         }
         if (!current()) return;
+        let receivedOnline = false;
         try {
           const deadline = Date.now() + 120_000;
           let result = await readStage(false, force);
           publish(result);
+          receivedOnline = true;
           while (current() && result.checkingUpdates) {
             await new Promise<void>((resolve) => {
               const done = () => {
@@ -960,7 +962,11 @@ export default function Launchpad({
               publish({
                 ...snapshot.result,
                 items: snapshot.result.items.map((item) =>
-                  item.platform && item.projectId
+                  item.platform &&
+                  item.projectId &&
+                  (!receivedOnline ||
+                    !item.updateCheck ||
+                    item.updateCheck === "pending")
                     ? {
                         ...item,
                         updateCheck: "unavailable",

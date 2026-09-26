@@ -239,7 +239,13 @@ const mrInstalledHash = (value, sha512) =>
 // https://github.com/modrinth/code/blob/main/apps/labrinth/src/database/models/project_item.rs
 // Verify every release from that starting point onward through bulk GET /versions.
 // Missing/unlisted identities and large suffixes use the filtered-history fallback.
-async function mrIndexedUpdates(input, batch, recovery, versionCache) {
+async function mrIndexedUpdates(
+  input,
+  batch,
+  recovery,
+  versionCache,
+  onResult,
+) {
   const signal = input.signal;
   const projects = [...new Set(batch.map((item) => item.projectId))].sort();
   const facets = [
@@ -303,6 +309,60 @@ async function mrIndexedUpdates(input, batch, recovery, versionCache) {
     if (saved.until <= Date.now()) versionCache.delete(key);
     else if (needed.includes(key)) metadata.set(key, saved.value);
   }
+  const results = {},
+    current = new Map();
+  const pending = new Set(plans);
+  // Evaluate each project only once its entire authoritative suffix is present.
+  // A later chunk may fail or be cancelled after this project's proof is ready.
+  function publishCompletePlans() {
+    signal?.throwIfAborted();
+    for (const plan of pending) {
+      const { item, ids } = plan;
+      if (
+        !metadata.has(item.versionId) ||
+        ids.some((key) => !metadata.has(key))
+      )
+        continue;
+      pending.delete(plan);
+      const installed = metadata.get(item.versionId);
+      const suffix = ids.map((key) => metadata.get(key));
+      if (
+        !mrVersionMetadata(installed, item.projectId) ||
+        !mrInstalledHash(installed, item.sha512) ||
+        suffix.some((value) => !mrVersionMetadata(value, item.projectId)) ||
+        Date.parse(suffix[0].date_published) <
+          Date.parse(installed.date_published) ||
+        suffix.some(
+          (value, index) =>
+            index > 0 &&
+            Date.parse(value.date_published) <
+              Date.parse(suffix[index - 1].date_published),
+        )
+      )
+        continue;
+      const compatible = suffix.filter(
+        (value) =>
+          fits(mrVersion(value), input) && mrVersion(value).downloadable,
+      );
+      const latest = compatible.at(-1);
+      if (!latest) continue;
+      try {
+        if (latest.id !== item.versionId && !mrUpdateFile(latest, input))
+          continue;
+      } catch {
+        continue;
+      }
+      results[item.sha512] = latest;
+      current.set(item.versionId, installed);
+      onResult?.(item, latest, installed);
+      for (const value of [installed, ...suffix])
+        if (!versionCache.has(value.id))
+          versionCache.set(value.id, { value, until: Date.now() + 30000 });
+    }
+    while (versionCache.size > 5000)
+      versionCache.delete(versionCache.keys().next().value);
+  }
+  publishCompletePlans();
   const missing = needed.filter((key) => !metadata.has(key));
   for (let offset = 0; offset < missing.length;) {
     let count = Math.min(300, missing.length - offset);
@@ -321,52 +381,19 @@ async function mrIndexedUpdates(input, batch, recovery, versionCache) {
     } catch (cause) {
       signal?.throwIfAborted();
       if (cause.status === 429) throw cause;
-      continue;
+      // A failing bulk metadata route should not consume the whole inventory
+      // deadline one chunk at a time. Keep the completed chunks, then try the
+      // independent project-history route for only unresolved files.
+      break;
     }
     if (!Array.isArray(values)) continue;
     for (const value of values) {
       if (!ids.includes(value?.id)) continue;
       metadata.set(value.id, metadata.has(value.id) ? null : value);
     }
+    // Read the whole chunk first so duplicate IDs cannot publish an early value.
+    publishCompletePlans();
   }
-  const results = {},
-    current = new Map();
-  for (const { item, ids } of plans) {
-    const installed = metadata.get(item.versionId);
-    const suffix = ids.map((key) => metadata.get(key));
-    if (
-      !mrVersionMetadata(installed, item.projectId) ||
-      !mrInstalledHash(installed, item.sha512) ||
-      suffix.some((value) => !mrVersionMetadata(value, item.projectId)) ||
-      Date.parse(suffix[0].date_published) <
-        Date.parse(installed.date_published) ||
-      suffix.some(
-        (value, index) =>
-          index > 0 &&
-          Date.parse(value.date_published) <
-            Date.parse(suffix[index - 1].date_published),
-      )
-    )
-      continue;
-    const compatible = suffix.filter(
-      (value) => fits(mrVersion(value), input) && mrVersion(value).downloadable,
-    );
-    const latest = compatible.at(-1);
-    if (!latest) continue;
-    try {
-      if (latest.id !== item.versionId && !mrUpdateFile(latest, input))
-        continue;
-    } catch {
-      continue;
-    }
-    results[item.sha512] = latest;
-    current.set(item.versionId, installed);
-    for (const value of [installed, ...suffix])
-      if (!versionCache.has(value.id))
-        versionCache.set(value.id, { value, until: Date.now() + 30000 });
-  }
-  while (versionCache.size > 5000)
-    versionCache.delete(versionCache.keys().next().value);
   return { results, current };
 }
 // Batch updates avoid a full release-history request per installed file. Current
@@ -455,6 +482,15 @@ function modrinthUpdates(json, recovery) {
         const updates = {},
           issues = {},
           warnings = new Set();
+        const publish = (sha512, value) => {
+          input.signal?.throwIfAborted();
+          updates[sha512] = value;
+          // Only fully verified decisions leave this provider. A later request
+          // or batch deadline must not erase already completed file checks.
+          try {
+            input.onProgress?.({ updates: { [sha512]: value } });
+          } catch {}
+        };
         if (failureUntil > Date.now()) {
           const message = `${failureWarning} Retry in ${Math.ceil((failureUntil - Date.now()) / 1000)} seconds.`;
           return {
@@ -466,12 +502,150 @@ function modrinthUpdates(json, recovery) {
           };
         }
         const signal = input.signal;
+        function verifyCandidate(item, value) {
+          if (!value) {
+            issues[item.sha512] ??=
+              "Modrinth did not return an update result for this file checksum.";
+            return;
+          }
+          try {
+            if (
+              !Array.isArray(value.game_versions) ||
+              !Array.isArray(value.loaders) ||
+              !value.game_versions.every(
+                (entry) => typeof entry === "string",
+              ) ||
+              !value.loaders.every((entry) => typeof entry === "string")
+            )
+              throw launchpadError(
+                502,
+                "Modrinth returned invalid update compatibility data.",
+              );
+            if (
+              !Array.isArray(value.files) ||
+              value.files.some((file) => !file || typeof file !== "object")
+            )
+              throw launchpadError(
+                502,
+                "Modrinth returned invalid update download metadata.",
+              );
+            if (
+              typeof value.id !== "string" ||
+              !/^[A-Za-z0-9_-]{1,100}$/.test(value.id)
+            )
+              throw launchpadError(
+                502,
+                "Modrinth returned an invalid update version ID.",
+              );
+            const version = mrVersion(value);
+            if (value.project_id !== item.projectId)
+              throw new Error(
+                "Modrinth returned an update for a different project.",
+              );
+            if (!serverEnvironment(value.environment))
+              throw new Error(
+                value.environment === "singleplayer_only"
+                  ? "The returned version is marked singleplayer-only and does not support a dedicated server."
+                  : "The returned version is marked client-only and does not support server installation.",
+              );
+            if (
+              input.gameVersion &&
+              !version.gameVersions.includes(input.gameVersion)
+            )
+              throw new Error(
+                `The returned version does not support Minecraft ${input.gameVersion}.`,
+              );
+            if (
+              input.loader &&
+              !compatibleLoaders(input).some((loader) =>
+                version.loaders.includes(loader),
+              )
+            )
+              throw new Error(
+                `The returned version does not support the selected ${input.loader} loader.`,
+              );
+            if (!version.downloadable)
+              throw new Error(
+                "The returned version has no downloadable file with a verification checksum.",
+              );
+            if (version.id === item.versionId) {
+              if (
+                !value.files.some(
+                  (file) =>
+                    typeof file.hashes?.sha512 === "string" &&
+                    file.hashes.sha512.toLowerCase() === item.sha512,
+                )
+              )
+                throw new Error(
+                  "Modrinth returned an installed version with a different file checksum.",
+                );
+              publish(item.sha512, null);
+              return;
+            }
+            const file = mrUpdateFile(value, input);
+            if (!file)
+              throw new Error(
+                "The returned version does not contain a single supported server download.",
+              );
+            if (file.hashes?.sha512?.toLowerCase() === item.sha512) {
+              publish(item.sha512, null);
+              return;
+            }
+            return { item, version };
+          } catch (cause) {
+            issues[item.sha512] = cause.message;
+          }
+        }
+        function verifyCurrent({ item, version }, installed) {
+          const before = Date.parse(installed?.date_published);
+          const after = Date.parse(version.publishedAt);
+          if (!installed) {
+            issues[item.sha512] ??=
+              "Modrinth did not return metadata for the installed version, so this update could not be verified.";
+            return;
+          }
+          if (installed.project_id !== item.projectId) {
+            issues[item.sha512] =
+              "The installed-version metadata belongs to a different project, so this update could not be verified.";
+            return;
+          }
+          if (
+            !Array.isArray(installed.files) ||
+            !installed.files.some(
+              (file) =>
+                typeof file?.hashes?.sha512 === "string" &&
+                file.hashes.sha512.toLowerCase() === item.sha512,
+            )
+          ) {
+            issues[item.sha512] =
+              "The installed file checksum does not match Modrinth's version metadata, so this update could not be verified.";
+            return;
+          }
+          if (!Number.isFinite(before) || !Number.isFinite(after)) {
+            issues[item.sha512] =
+              "Modrinth returned an invalid publication date, so a newer version could not be verified.";
+            return;
+          }
+          publish(item.sha512, after > before ? version : null);
+        }
+        async function verifyRecovered(item, value, installed) {
+          const candidate = verifyCandidate(item, value);
+          if (!candidate) return;
+          if (!installed)
+            installed = await recovery.read(
+              `${mr}/version/${enc(item.versionId)}`,
+              { signal, ttlMs: 0 },
+            );
+          signal?.throwIfAborted();
+          verifyCurrent(candidate, installed);
+        }
         try {
           let result;
           let recoveredCurrent;
           try {
             result = await recovery.bulk(`${mr}/version_files/update`, {
               method: "POST",
+              timeoutMs: 8000,
               signal,
               headers: { "Content-Type": "application/json" },
               body: JSON.stringify({
@@ -494,6 +668,10 @@ function modrinthUpdates(json, recovery) {
                 batch,
                 recovery,
                 recoveredVersions,
+                (item, value, installed) => {
+                  const candidate = verifyCandidate(item, value);
+                  if (candidate) verifyCurrent(candidate, installed);
+                },
               );
               result = indexed.results;
               recoveredCurrent = indexed.current;
@@ -596,6 +774,7 @@ function modrinthUpdates(json, recovery) {
                           Date.parse(a.date_published),
                       );
                       result[item.sha512] = compatible[0];
+                      await verifyRecovered(item, compatible[0], installed);
                     } catch (failure) {
                       signal?.throwIfAborted();
                       rememberReadFailure(input, item, failure);
@@ -613,171 +792,27 @@ function modrinthUpdates(json, recovery) {
               502,
               "Modrinth returned invalid update metadata.",
             );
-          const candidates = [];
-          for (const item of batch) {
-            const value = result[item.sha512];
-            if (!value) {
-              issues[item.sha512] ??=
-                "Modrinth did not return an update result for this file checksum.";
-              continue;
-            }
-            try {
-              if (
-                !Array.isArray(value.game_versions) ||
-                !Array.isArray(value.loaders) ||
-                !value.game_versions.every(
-                  (entry) => typeof entry === "string",
-                ) ||
-                !value.loaders.every((entry) => typeof entry === "string")
-              )
-                throw launchpadError(
-                  502,
-                  "Modrinth returned invalid update compatibility data.",
-                );
-              if (
-                !Array.isArray(value.files) ||
-                value.files.some((file) => !file || typeof file !== "object")
-              )
-                throw launchpadError(
-                  502,
-                  "Modrinth returned invalid update download metadata.",
-                );
-              if (
-                typeof value.id !== "string" ||
-                !/^[A-Za-z0-9_-]{1,100}$/.test(value.id)
-              )
-                throw launchpadError(
-                  502,
-                  "Modrinth returned an invalid update version ID.",
-                );
-              const version = mrVersion(value);
-              if (value.project_id !== item.projectId)
-                throw new Error(
-                  "Modrinth returned an update for a different project.",
-                );
-              if (!serverEnvironment(value.environment))
-                throw new Error(
-                  value.environment === "singleplayer_only"
-                    ? "The returned version is marked singleplayer-only and does not support a dedicated server."
-                    : "The returned version is marked client-only and does not support server installation.",
-                );
-              if (
-                input.gameVersion &&
-                !version.gameVersions.includes(input.gameVersion)
-              )
-                throw new Error(
-                  `The returned version does not support Minecraft ${input.gameVersion}.`,
-                );
-              if (
-                input.loader &&
-                !compatibleLoaders(input).some((loader) =>
-                  version.loaders.includes(loader),
-                )
-              )
-                throw new Error(
-                  `The returned version does not support the selected ${input.loader} loader.`,
-                );
-              if (!version.downloadable)
-                throw new Error(
-                  "The returned version has no downloadable file with a verification checksum.",
-                );
-              if (version.id === item.versionId) {
-                if (
-                  !value.files.some(
-                    (file) =>
-                      typeof file.hashes?.sha512 === "string" &&
-                      file.hashes.sha512.toLowerCase() === item.sha512,
-                  )
-                )
-                  throw new Error(
-                    "Modrinth returned an installed version with a different file checksum.",
-                  );
-                updates[item.sha512] = null;
-                continue;
-              }
-              const file = mrUpdateFile(value, input);
-              if (!file)
-                throw new Error(
-                  "The returned version does not contain a single supported server download.",
-                );
-              if (file.hashes?.sha512?.toLowerCase() === item.sha512) {
-                updates[item.sha512] = null;
-                continue;
-              }
-              candidates.push({ item, version });
-            } catch (cause) {
-              issues[item.sha512] = cause.message;
-            }
-          }
-          if (candidates.length) {
-            const ids = [
-              ...new Set(candidates.map(({ item }) => item.versionId)),
-            ];
-            const current = recoveredCurrent
-              ? await Promise.all(
-                  ids.map(async (versionId) => {
-                    if (recoveredCurrent.has(versionId))
-                      return recoveredCurrent.get(versionId);
-                    try {
-                      return await recovery.read(
-                        `${mr}/version/${enc(versionId)}`,
-                        { signal, ttlMs: 0 },
-                      );
-                    } catch (cause) {
-                      signal?.throwIfAborted();
-                      warnings.add(cause.message);
-                      for (const { item } of candidates)
-                        if (item.versionId === versionId) {
-                          rememberReadFailure(input, item, cause);
-                          issues[item.sha512] = cause.message;
-                        }
-                      return null;
-                    }
-                  }),
-                )
-              : await recovery.read(
-                  `${mr}/versions?${new URLSearchParams({ ids: JSON.stringify(ids) })}`,
-                  { signal, ttlMs: 0 },
-                );
-            signal?.throwIfAborted();
-            if (!Array.isArray(current))
-              throw launchpadError(
-                502,
-                "Modrinth returned invalid installed-version metadata.",
+          if (!recoveredCurrent) {
+            const candidates = batch
+              .map((item) => verifyCandidate(item, result[item.sha512]))
+              .filter(Boolean);
+            if (candidates.length) {
+              const ids = [
+                ...new Set(candidates.map(({ item }) => item.versionId)),
+              ];
+              const current = await recovery.read(
+                `${mr}/versions?${new URLSearchParams({ ids: JSON.stringify(ids) })}`,
+                { signal, ttlMs: 0 },
               );
-            const byId = new Map(current.map((value) => [value?.id, value]));
-            for (const { item, version } of candidates) {
-              const installed = byId.get(item.versionId);
-              const before = Date.parse(installed?.date_published);
-              const after = Date.parse(version.publishedAt);
-              if (!installed) {
-                issues[item.sha512] ??=
-                  "Modrinth did not return metadata for the installed version, so this update could not be verified.";
-                continue;
-              }
-              if (installed.project_id !== item.projectId) {
-                issues[item.sha512] =
-                  "The installed-version metadata belongs to a different project, so this update could not be verified.";
-                continue;
-              }
-              if (
-                !Array.isArray(installed.files) ||
-                !installed.files.some(
-                  (file) =>
-                    typeof file?.hashes?.sha512 === "string" &&
-                    file.hashes.sha512.toLowerCase() === item.sha512,
-                )
-              ) {
-                issues[item.sha512] =
-                  "The installed file checksum does not match Modrinth's version metadata, so this update could not be verified.";
-                continue;
-              }
-              if (!Number.isFinite(before) || !Number.isFinite(after)) {
-                issues[item.sha512] =
-                  "Modrinth returned an invalid publication date, so a newer version could not be verified.";
-                continue;
-              }
-              updates[item.sha512] = after > before ? version : null;
+              signal?.throwIfAborted();
+              if (!Array.isArray(current))
+                throw launchpadError(
+                  502,
+                  "Modrinth returned invalid installed-version metadata.",
+                );
+              const byId = new Map(current.map((value) => [value?.id, value]));
+              for (const candidate of candidates)
+                verifyCurrent(candidate, byId.get(candidate.item.versionId));
             }
           }
         } catch (cause) {
@@ -804,6 +839,7 @@ function modrinthUpdates(json, recovery) {
       tasks.push(task);
     }
     const results = await Promise.all(tasks);
+    input.signal?.throwIfAborted();
     return {
       updates: Object.assign({}, ...results.map((result) => result.updates)),
       issues: Object.assign(
