@@ -1169,7 +1169,6 @@ test("server workspaces isolate files, commands and backups while panel users re
     ]),
   );
   await switchServer(page, defaultServerId);
-  await openPage(page, "subusers", "Subusers");
   await expect(
     page.getByRole("row").filter({ hasText: "secondary-only@example.com" }),
   ).toBeVisible();
