@@ -385,8 +385,16 @@ test("custom connection hostname persists while running without rewriting bind s
 
 test("copying the server address falls back when the clipboard API is denied and restores focus", async ({
   page,
+  request,
   serverId,
 }) => {
+  const expectedAddress = (
+    await (
+      await request.get("/api/server", {
+        headers: { "X-Server-Id": serverId },
+      })
+    ).json()
+  ).address;
   await page.addInitScript((id) => {
     localStorage.setItem("mc-panel.active-server", id);
     Object.defineProperty(navigator, "clipboard", {
@@ -414,6 +422,8 @@ test("copying the server address falls back when the clipboard API is denied and
     name: "Copy server address",
     exact: true,
   });
+  // The roster heading can render before the detailed address has loaded.
+  await expect(copy).toHaveText(expectedAddress);
   const displayed = await copy.innerText();
   await copy.click();
   await expect(page.getByRole("status")).toContainText(
