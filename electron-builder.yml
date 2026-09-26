@@ -39,6 +39,7 @@ files:
   - server/versions.mjs
   - server/launchpad.mjs
   - server/launchpad-network.mjs
+  - server/launchpad-identification.mjs
   - server/launchpad-archives.mjs
   - server/launchpad-bundled.mjs
   - server/launchpad-dependency-ranges.mjs

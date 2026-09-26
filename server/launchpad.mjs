@@ -75,7 +75,7 @@ async function parallel(items, count, work, signal) {
     Array.from({ length: Math.min(count, items.length) }, async () => {
       while (next < items.length && !signal?.aborted) {
         const index = next++;
-        await work(items[index]);
+        await work(items[index], index);
       }
     }),
   );
@@ -298,6 +298,7 @@ export async function createLaunchpad(ctx) {
   const versionCache = new Map(),
     versionFlights = new Map();
   const fallbackRequest = requestLimiter(6);
+  const hashRequest = requestLimiter(4);
   const inventoryFlights = new Map();
   const remember = (cache, key, value) => {
     cache.delete(key);
@@ -593,6 +594,7 @@ export async function createLaunchpad(ctx) {
     signal = lifetime.signal,
     warnings = [],
     isolated = false,
+    quick = false,
   ) {
     signal.throwIfAborted();
     if (type === "modpack") return [];
@@ -615,85 +617,105 @@ export async function createLaunchpad(ctx) {
         400,
         "This folder has over 1,000 packages. Use File Manager to narrow the installed collection.",
       );
-    const rows = [];
-    for (const file of files) {
-      signal.throwIfAborted();
-      let relativePath = `${relative}/${file.name}`;
-      let target, stat, sha512;
-      try {
-        relativePath = `${relative}/${safeInstallPath(file.name)}`;
-        target = await safePath(serverDir, relativePath);
-        stat = await fs.lstat(target);
-        if (!stat.isFile() || stat.isSymbolicLink()) continue;
-        const stamp = fileStamp(stat);
-        const cached = fileCache.get(relativePath);
-        if (cached?.stamp === stamp) sha512 = cached.sha512;
-        else if (isolated) {
-          sha512 = await fileHash(target, "sha512", signal);
-          signal.throwIfAborted();
-          if (fileStamp(await fs.lstat(target)) !== stamp)
-            throw error(
-              409,
-              `${file.name} changed while it was being checked. Refresh and try again.`,
-            );
-          remember(fileCache, relativePath, { stamp, sha512 });
-        } else {
-          const flightKey = `${relativePath}:${stamp}`;
-          let task = hashFlights.get(flightKey);
-          if (!task) {
-            task = fileHash(target).then(async (hash) => {
-              if (fileStamp(await fs.lstat(target)) !== stamp)
-                throw error(
-                  409,
-                  `${file.name} changed while it was being checked. Refresh and try again.`,
-                );
-              remember(fileCache, relativePath, { stamp, sha512: hash });
-              return hash;
-            });
-            hashFlights.set(flightKey, task);
-            void task.then(
-              () => hashFlights.delete(flightKey),
-              () => hashFlights.delete(flightKey),
-            );
-          }
-          sha512 = await abortable(task, signal);
-        }
-      } catch (cause) {
+    const rows = new Array(files.length),
+      confirmedFiles = new Set(),
+      receiptIndex = new Map();
+    for (const receipt of receipts) {
+      const key = `${receipt.path}\0${receipt.sha512}`;
+      if (!receiptIndex.has(key)) receiptIndex.set(key, receipt);
+    }
+    await parallel(
+      files,
+      4,
+      async (file, index) => {
         signal.throwIfAborted();
-        // A just-updated/deleted JAR can disappear between readdir and stat.
-        if (missing(cause)) continue;
-        fileCache.delete(relativePath);
-        warnings.push(`${file.name} could not be read: ${cause.message}`);
-        rows.push({
+        let relativePath = `${relative}/${file.name}`;
+        let target, stat, sha512;
+        try {
+          relativePath = `${relative}/${safeInstallPath(file.name)}`;
+          target = await safePath(serverDir, relativePath);
+          stat = await fs.lstat(target);
+          if (!stat.isFile() || stat.isSymbolicLink()) return;
+          confirmedFiles.add(relativePath);
+          const stamp = fileStamp(stat);
+          const cached = fileCache.get(relativePath);
+          if (cached?.stamp === stamp) sha512 = cached.sha512;
+          else if (quick) {
+            // Filename-only display may precede verification, but never reuse a
+            // receipt or identity for bytes whose current stamp has not been hashed.
+            fileCache.delete(relativePath);
+          } else if (isolated) {
+            sha512 = await fileHash(target, "sha512", signal);
+            signal.throwIfAborted();
+            if (fileStamp(await fs.lstat(target)) !== stamp)
+              throw error(
+                409,
+                `${file.name} changed while it was being checked. Refresh and try again.`,
+              );
+            remember(fileCache, relativePath, { stamp, sha512 });
+          } else {
+            const flightKey = `${relativePath}:${stamp}`;
+            let task = hashFlights.get(flightKey);
+            if (!task) {
+              task = hashRequest(
+                () => fileHash(target, "sha512", lifetime.signal),
+                lifetime.signal,
+              ).then(async (hash) => {
+                if (fileStamp(await fs.lstat(target)) !== stamp)
+                  throw error(
+                    409,
+                    `${file.name} changed while it was being checked. Refresh and try again.`,
+                  );
+                remember(fileCache, relativePath, { stamp, sha512: hash });
+                return hash;
+              });
+              hashFlights.set(flightKey, task);
+              void task.then(
+                () => hashFlights.delete(flightKey),
+                () => hashFlights.delete(flightKey),
+              );
+            }
+            sha512 = await abortable(task, signal);
+          }
+        } catch (cause) {
+          signal.throwIfAborted();
+          // A just-updated/deleted JAR can disappear between readdir and stat.
+          if (missing(cause)) return;
+          fileCache.delete(relativePath);
+          warnings.push(`${file.name} could not be read: ${cause.message}`);
+          rows[index] = {
+            path: relativePath,
+            name: file.name,
+            size: stat?.size ?? 0,
+            platform: null,
+          };
+          return;
+        }
+        const receipt = sha512
+          ? receiptIndex.get(`${relativePath}\0${sha512}`)
+          : undefined;
+        const known = identities.get(sha512);
+        rows[index] = {
           path: relativePath,
           name: file.name,
-          size: stat?.size ?? 0,
+          size: stat.size,
+          sha512,
           platform: null,
-        });
-        continue;
-      }
-      const receipt = receipts.find(
-        (item) => item.path === relativePath && item.sha512 === sha512,
-      );
-      const known = identities.get(sha512);
-      rows.push({
-        path: relativePath,
-        name: file.name,
-        size: stat.size,
-        sha512,
-        platform: null,
-        ...Object.fromEntries(
-          Object.entries(receipt ?? {}).filter(([, value]) => value != null),
-        ),
-        ...(known?.value?.platform ? known.value : {}),
-      });
-    }
+          ...Object.fromEntries(
+            Object.entries(receipt ?? {}).filter(([, value]) => value != null),
+          ),
+          ...(known?.value?.platform ? known.value : {}),
+        };
+      },
+      signal,
+    );
+    signal.throwIfAborted();
     // Restore previews are bounded, read-only checks; leave receipt cleanup to
     // the regular inventory rather than starting a save after their deadline.
-    if (!isolated) await pruneReceipts();
-    return rows;
+    if (!isolated) await pruneReceipts(confirmedFiles);
+    return rows.filter(Boolean);
   }
-  async function pruneReceipts() {
+  async function pruneReceipts(confirmedFiles = new Set()) {
     const mutating = () =>
       closing ||
       active ||
@@ -705,7 +727,7 @@ export async function createLaunchpad(ctx) {
       generation = receiptGeneration,
       retained = [];
     for (const item of snapshot) {
-      if (item.pack) {
+      if (item.pack || confirmedFiles.has(item.path)) {
         retained.push(item);
         continue;
       }
@@ -1126,7 +1148,13 @@ export async function createLaunchpad(ctx) {
         ? receipts
             .filter((item) => item.type === "modpack" && item.pack)
             .map((item) => ({ ...item, name: item.title }))
-        : await scan(input.type, input.signal, scanWarnings);
+        : await scan(
+            input.type,
+            input.signal,
+            scanWarnings,
+            false,
+            enabled(input.local) && enabled(input.quick),
+          );
     for (const item of items) {
       const url = projectPageUrl(item);
       if (url) item.url = url;
@@ -1202,21 +1230,29 @@ export async function createLaunchpad(ctx) {
               : cause.message,
           );
         }
+        const identityWarnings = [
+          ...new Set(
+            warnings.filter((message) => /identification:/i.test(message)),
+          ),
+        ];
         for (const item of items) {
           if (item.updateCheck !== "checked") item.updateCheck = "unavailable";
           if (!item.sha512) continue;
-          if (
-            item.platform ||
-            (!identities.get(item.sha512)?.value?.platform && !signal.aborted)
-          )
+          const previous = identities.get(item.sha512);
+          // Polling an unchanged negative result must not renew its retry
+          // deadline forever while a provider recovers in the background.
+          if (!item.platform && previous?.expiresAt > Date.now()) continue;
+          if (item.platform || (!previous?.value?.platform && !signal.aborted))
             remember(identities, item.sha512, {
               value: identityFields(item),
-              expiresAt: Date.now() + (item.platform ? 10 * 60_000 : 60_000),
-              warning: !item.platform
-                ? warnings
-                    .filter((message) => /identification:/i.test(message))
-                    .join(" ")
-                : undefined,
+              expiresAt:
+                Date.now() +
+                (item.platform
+                  ? 10 * 60_000
+                  : identityWarnings.length
+                    ? 30_000
+                    : 60_000),
+              warnings: !item.platform ? identityWarnings : undefined,
             });
         }
         markDuplicates(items);
@@ -1228,7 +1264,7 @@ export async function createLaunchpad(ctx) {
         () => inventoryFlights.delete(flightKey),
       );
     }
-    if (enabled(input.background) && enabled(input.refresh)) {
+    if (enabled(input.background)) {
       const entry = { items, warnings: scanWarnings, done: false, task };
       backgroundChecks.set(scope, entry);
       void task.then(
@@ -1260,14 +1296,20 @@ export async function createLaunchpad(ctx) {
   }
   async function installedDetails(input, items, warnings) {
     if (input.type === "modpack") {
-      await enrichProjectMetadata(items, warnings, input.signal);
+      await Promise.all([
+        enrichProjectMetadata(items, warnings, input.signal),
+        ...(input.identityOnly
+          ? []
+          : [
+              checkUpdates(
+                { ...input, gameVersion: "", loader: "" },
+                items,
+                warnings,
+              ),
+            ]),
+      ]);
+      input.signal.throwIfAborted();
       for (const item of items) item.name = item.title;
-      if (!input.identityOnly)
-        await checkUpdates(
-          { ...input, gameVersion: "", loader: "" },
-          items,
-          warnings,
-        );
       return;
     }
     const unknown = items.filter(
@@ -1278,19 +1320,26 @@ export async function createLaunchpad(ctx) {
     );
     for (const item of items) {
       const cached = identities.get(item.sha512);
-      if (cached?.expiresAt > Date.now() && cached.warning)
-        warnings.push(cached.warning);
+      if (cached?.expiresAt > Date.now() && cached.warnings)
+        warnings.push(...cached.warnings);
     }
     const modrinth = providers.find((value) => value.id === "modrinth");
     if (unknown.length) {
       try {
-        const matches = await abortable(
-          modrinth.identify(
-            unknown.map((item) => item.sha512),
+        const result = await abortable(
+          (modrinth.identifyInstalled ?? modrinth.identify)(
+            [...new Set(unknown.map((item) => item.sha512))],
             { signal: input.signal },
           ),
           input.signal,
         );
+        const matches = modrinth.identifyInstalled ? result.matches : result;
+        if (modrinth.identifyInstalled)
+          warnings.push(
+            ...(result.warnings ?? []).map(
+              (warning) => `Modrinth identification: ${warning}`,
+            ),
+          );
         for (const item of unknown) {
           const version = matches[item.sha512];
           if (version)
@@ -1395,9 +1444,11 @@ export async function createLaunchpad(ctx) {
     if (input.identityOnly) return;
     // Names and icons belong to the project, even with All loaders/versions.
     // Failed metadata requests must not suppress identification or updates.
-    await enrichProjectMetadata(items, warnings, input.signal);
+    await Promise.all([
+      enrichProjectMetadata(items, warnings, input.signal),
+      checkUpdates(input, items, warnings),
+    ]);
     input.signal.throwIfAborted();
-    await checkUpdates(input, items, warnings);
   }
   async function config(input = {}) {
     const current = await getServer();

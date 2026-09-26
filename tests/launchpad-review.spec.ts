@@ -1,4 +1,4 @@
-import { test as base, expect, type Page } from "@playwright/test";
+import { test as base, expect, type Page, type Route } from "@playwright/test";
 import { createProcessServer, removeTestServer } from "./server-fixtures";
 
 const test = base.extend<{ serverId: string }>({
@@ -97,6 +97,258 @@ const plan = {
   files: [{ path: "mods/a.jar", size: 100, action: "replace" }],
   warnings: [],
 };
+
+test("220 installed files stay usable while provider checks run without rescanning on list controls", async ({
+  page,
+  serverId,
+}, testInfo) => {
+  await catalog(page);
+  const items = Array.from({ length: 220 }, (_, index) => ({
+    ...installed(`Mod ${String(index + 1).padStart(3, "0")}`),
+    size: index + 1,
+    update: null,
+    updateCheck: "pending",
+  }));
+  const requests: URL[] = [];
+  let heldOnline: Route | undefined;
+  let heldRefresh: Route | undefined;
+  let localReads = 0;
+  let onlineReads = 0;
+  const warnings = [
+    "Modrinth is temporarily unavailable (503). Update checks will be available when the provider recovers.",
+    "CurseForge is temporarily unavailable (502). Installed files are unchanged.",
+  ];
+  await page.route("**/api/launchpad/installed?**", (route) => {
+    expect(route.request().headers()["x-server-id"]).toBe(serverId);
+    const url = new URL(route.request().url());
+    requests.push(url);
+    if (url.searchParams.has("local")) {
+      expect(url.searchParams.get("quick")).toBe("true");
+      localReads++;
+      if (localReads === 2) {
+        heldRefresh = route;
+        return;
+      }
+      return route.fulfill({ json: { items, warnings: [] } });
+    }
+    expect(url.searchParams.get("background")).toBe("true");
+    onlineReads++;
+    if (onlineReads === 1) {
+      heldOnline = route;
+      return;
+    }
+    return route.fulfill({
+      json: {
+        items: items.map((item) => ({ ...item, updateCheck: "checked" })),
+        warnings: Array.from(
+          { length: 220 },
+          (_, index) => warnings[index % 2],
+        ),
+      },
+    });
+  });
+  await page.goto("/#launchpad");
+  const toggle = page.getByRole("switch", { name: "Show installed content" });
+  await toggle.check();
+  await expect.poll(() => Boolean(heldOnline)).toBe(true);
+  await expect(page.getByRole("article")).toHaveCount(10);
+  await expect(page.getByRole("tabpanel")).toHaveAttribute(
+    "aria-busy",
+    "false",
+  );
+  await page
+    .getByRole("button", { name: "Next Launchpad page", exact: true })
+    .click();
+  await expect(
+    page.getByRole("status", { name: "Launchpad page", exact: true }),
+  ).toHaveText("Page 2 of 22");
+  await page
+    .getByLabel("Launchpad rows per page", { exact: true })
+    .selectOption("25");
+  await expect(page.getByRole("article")).toHaveCount(25);
+  await page
+    .getByLabel("Sort installed content", { exact: true })
+    .selectOption("size");
+  await expect(page.getByRole("article").first()).toHaveAttribute(
+    "aria-label",
+    "Mod 220",
+  );
+  const search = page.getByLabel("Search Launchpad", { exact: true });
+  await search.fill("Mod 217");
+  await expect(page.getByRole("article")).toHaveCount(1);
+  await expect(page.getByRole("article")).toHaveAttribute(
+    "aria-label",
+    "Mod 217",
+  );
+  await search.fill("");
+  await expect(page.getByRole("article")).toHaveCount(25);
+  await toggle.uncheck();
+  await expect(
+    page.getByRole("button", { name: "Install Pack", exact: true }),
+  ).toBeVisible();
+  await toggle.check();
+  await expect(page.getByRole("article")).toHaveCount(25);
+  expect(requests).toHaveLength(2);
+  expect(localReads).toBe(1);
+  expect(onlineReads).toBe(1);
+
+  await heldOnline!.fulfill({
+    json: {
+      items,
+      warnings: [],
+      checkingUpdates: true,
+      progress: { completed: 40, total: 220 },
+    },
+  });
+  await expect(
+    page.getByRole("status", {
+      name: "Installed content refresh",
+      exact: true,
+    }),
+  ).toHaveText("Checking updates for 180 of 220…");
+  await expect.poll(() => onlineReads).toBe(2);
+  await expect(
+    page.getByRole("status", {
+      name: "Installed content refresh",
+      exact: true,
+    }),
+  ).toHaveCount(0);
+  expect(requests.at(-1)!.searchParams.has("refresh")).toBe(false);
+  const notices = page.locator(".launchpad-notices");
+  await expect(notices).toHaveCount(1);
+  await expect(
+    notices.getByText(
+      "2 provider or file notices — installed files remain available",
+      { exact: true },
+    ),
+  ).toBeVisible();
+  const details = notices.getByRole("list", {
+    name: "Provider and file notices",
+  });
+  await expect(details).toBeHidden();
+  await notices.locator("summary").click();
+  await expect(details.getByRole("listitem")).toHaveText(warnings);
+  await notices.locator("summary").click();
+  await notices.scrollIntoViewIfNeeded();
+  await page.screenshot({
+    path: testInfo.outputPath("installed-220-notices-desktop.png"),
+    animations: "disabled",
+  });
+
+  await page
+    .getByRole("button", {
+      name: "Refresh Launchpad and check updates",
+      exact: true,
+    })
+    .click();
+  await expect.poll(() => Boolean(heldRefresh)).toBe(true);
+  await expect(page.getByRole("article")).toHaveCount(25);
+  await search.fill("Mod 219");
+  await expect(page.getByRole("article")).toHaveCount(1);
+  await expect(page.getByRole("article")).toHaveAttribute(
+    "aria-label",
+    "Mod 219",
+  );
+  expect(requests).toHaveLength(4);
+  await page.setViewportSize({ width: 390, height: 844 });
+  await notices.scrollIntoViewIfNeeded();
+  await expect
+    .poll(() =>
+      page.evaluate(() => document.documentElement.scrollWidth <= innerWidth),
+    )
+    .toBe(true);
+  await page.screenshot({
+    path: testInfo.outputPath("installed-220-background-mobile.png"),
+    animations: "disabled",
+  });
+  await heldRefresh!.fulfill({ json: { items, warnings: [] } });
+  await expect(
+    page.getByRole("button", {
+      name: "Refresh Launchpad and check updates",
+      exact: true,
+    }),
+  ).toBeEnabled();
+  expect(localReads).toBe(2);
+  expect(onlineReads).toBe(3);
+  expect(requests.at(-1)!.searchParams.get("refresh")).toBe("true");
+});
+
+test("installed content tabs retain their own snapshots and ignore late responses for another type", async ({
+  page,
+}) => {
+  await catalog(page);
+  const mod = installed("Known Mod");
+  const datapack = {
+    ...installed("Datapack"),
+    path: "world/datapacks/pack.zip",
+  };
+  let staleDatapack: Route | undefined;
+  let heldMods: Route | undefined;
+  let modReads = 0;
+  await page.route("**/api/launchpad/installed?**", (route) => {
+    const url = new URL(route.request().url());
+    const local = url.searchParams.has("local");
+    if (url.searchParams.get("type") === "datapack") {
+      if (!local) {
+        staleDatapack = route;
+        return;
+      }
+      return route.fulfill({ json: { items: [datapack], warnings: [] } });
+    }
+    if (local && ++modReads === 2) {
+      heldMods = route;
+      return;
+    }
+    return route.fulfill({ json: { items: [mod], warnings: [] } });
+  });
+  await page.goto("/#launchpad");
+  await page.getByRole("switch", { name: "Show installed content" }).check();
+  await expect(
+    page.getByRole("article", { name: "Known Mod", exact: true }),
+  ).toBeVisible();
+  await expect(
+    page.getByRole("status", {
+      name: "Installed content refresh",
+      exact: true,
+    }),
+  ).toHaveCount(0);
+  await page.getByRole("tab", { name: "Datapacks", exact: true }).click();
+  await expect.poll(() => Boolean(staleDatapack)).toBe(true);
+  await expect(
+    page.getByRole("article", { name: "Datapack", exact: true }),
+  ).toBeVisible();
+  await page.getByRole("tab", { name: "Mods", exact: true }).click();
+  await expect.poll(() => Boolean(heldMods)).toBe(true);
+  await expect(
+    page.getByRole("article", { name: "Known Mod", exact: true }),
+  ).toBeVisible();
+  await expect(page.getByRole("tabpanel")).toHaveAttribute(
+    "aria-busy",
+    "false",
+  );
+  await staleDatapack!
+    .fulfill({
+      json: {
+        items: [{ ...datapack, title: "Stale datapack result" }],
+        warnings: ["Stale warning"],
+      },
+    })
+    .catch(() => {});
+  await heldMods!.fulfill({ json: { items: [mod], warnings: [] } });
+  await expect(
+    page.getByRole("status", {
+      name: "Installed content refresh",
+      exact: true,
+    }),
+  ).toHaveCount(0);
+  await expect(
+    page.getByRole("article", { name: "Known Mod", exact: true }),
+  ).toBeVisible();
+  await expect(
+    page.getByText("Stale datapack result", { exact: true }),
+  ).toHaveCount(0);
+  await expect(page.getByText("Stale warning", { exact: true })).toHaveCount(0);
+});
 
 test("installed project buttons resolve older panel responses without metadata URLs", async ({
   page,

@@ -1932,26 +1932,38 @@ export async function createPanel(options = {}) {
   let diskCache = { value: null, at: 0 };
   let diskScan;
   let diskError = false;
+  let diskGeneration = 0;
+  const invalidateDiskUsage = () => {
+    diskGeneration++;
+    diskCache.at = 0;
+  };
   app.get("/api/server", async (_req, res) => {
     await refreshStartupMetadata();
     if (
       !diskScan &&
       !recycleBusy &&
       !activeMutations &&
-      Date.now() - diskCache.at > 10000
-    )
+      Date.now() - diskCache.at > 60_000
+    ) {
+      // Routine status polls do not need to walk every world file. Known file
+      // changes still refresh promptly, even if an older scan finishes later.
+      const generation = diskGeneration;
       diskScan = directorySize(serverDir)
         .then((value) => {
-          diskCache = { value, at: Date.now() };
+          diskCache = {
+            value,
+            at: generation === diskGeneration ? Date.now() : 0,
+          };
           diskError = false;
         })
         .catch(() => {
-          diskCache.at = Date.now();
+          diskCache.at = generation === diskGeneration ? Date.now() : 0;
           diskError = true;
         })
         .finally(() => {
           diskScan = undefined;
         });
+    }
     const storage = await fs.statfs(serverDir).catch(() => null);
     const sampledChild = processHandle;
     const [sample, connection] = await Promise.all([
@@ -2541,7 +2553,7 @@ export async function createPanel(options = {}) {
         result,
         updatedAt: new Date().toISOString(),
       });
-      diskCache.at = 0;
+      invalidateDiskUsage();
       res.json(result);
     } catch (cause) {
       const message =
@@ -2558,7 +2570,7 @@ export async function createPanel(options = {}) {
         error: message,
         updatedAt: new Date().toISOString(),
       });
-      diskCache.at = 0;
+      invalidateDiskUsage();
       throw error(
         cause.status >= 400 && cause.status < 500 ? cause.status : 409,
         message,
@@ -2783,7 +2795,7 @@ export async function createPanel(options = {}) {
                     : "The upload could not finish. Completed uploads have been retained; check the destination before retrying.",
           };
         }
-        diskCache.at = 0;
+        invalidateDiskUsage();
       } finally {
         // Finish bounded temp cleanup before acknowledging a batch, allowing the
         // next sequential batch to acquire the file lock immediately.
@@ -2931,7 +2943,7 @@ export async function createPanel(options = {}) {
           result,
           updatedAt: new Date().toISOString(),
         });
-        diskCache.at = 0;
+        invalidateDiskUsage();
         void audit(
           "file",
           "Files copied",
@@ -2959,7 +2971,7 @@ export async function createPanel(options = {}) {
           result,
           updatedAt: new Date().toISOString(),
         });
-        diskCache.at = 0;
+        invalidateDiskUsage();
         if (result.copiedFiles || result.copiedDirectories)
           void audit(
             "file",
@@ -3006,7 +3018,7 @@ export async function createPanel(options = {}) {
           : `${kind} added`,
         [directory, name].filter(Boolean).join("/"),
       );
-      diskCache.at = 0;
+      invalidateDiskUsage();
       res.status(201).json({ ok: true });
     }),
   );
@@ -3100,7 +3112,7 @@ export async function createPanel(options = {}) {
             await fs.rm(temporary, { force: true });
           }
           await audit("file", "File edited", req.body.path);
-          diskCache.at = 0;
+          invalidateDiskUsage();
           res.json({ ok: true });
         });
       fileEditChain = edit.catch(() => {});
@@ -3166,7 +3178,7 @@ export async function createPanel(options = {}) {
           recycled,
           updatedAt: new Date().toISOString(),
         });
-        diskCache.at = 0;
+        invalidateDiskUsage();
         // Moving is already committed. Audit I/O cannot change its outcome or
         // hold the file lock; tracked work and saveChain still drain on shutdown.
         void trackTask(async () =>
@@ -3302,7 +3314,7 @@ export async function createPanel(options = {}) {
         if (!(await exists(archive)))
           throw error(404, "Backup archive not found.");
         const restored = await restoreBackupArchive(serverDir, archive);
-        diskCache.at = 0;
+        invalidateDiskUsage();
         startupMetadataAt = 0;
         iconReadAt = 0;
         try {

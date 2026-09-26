@@ -441,11 +441,18 @@ export default function Launchpad({
     result: InstalledResult;
   } | null>(null);
   const inventoryRef = useRef<typeof inventory>(null);
-  const installed =
+  const inventoryCache = useRef(
+    new Map<ContentType, NonNullable<typeof inventory>>(),
+  );
+  const visibleInventory =
     inventory?.api === api && inventory.type === type
-      ? inventory.scope === inventoryScope
-        ? inventory.result
-        : pendingInventory(inventory.result)
+      ? inventory
+      : inventoryCache.current.get(type);
+  const installed =
+    visibleInventory?.api === api
+      ? visibleInventory.scope === inventoryScope
+        ? visibleInventory.result
+        : pendingInventory(visibleInventory.result)
       : null;
   const [scanLoading, setScanLoading] = useState(false);
   const [scanRefreshing, setScanRefreshing] = useState(false);
@@ -656,6 +663,7 @@ export default function Launchpad({
     setResults(null);
     setInventory(null);
     inventoryRef.current = null;
+    inventoryCache.current.clear();
     forceScan.current = null;
     manualCompletion.current?.(false);
     manualCompletion.current = null;
@@ -810,6 +818,8 @@ export default function Launchpad({
       !controller.signal.aborted &&
       epoch === scanEpoch.current &&
       currentSession === session.current;
+    const cached = inventoryCache.current.get(type);
+    inventoryRef.current = cached?.api === api ? cached : null;
     let hasSnapshot =
       inventoryRef.current?.api === api && inventoryRef.current.type === type;
     setScanLoading(!hasSnapshot);
@@ -826,6 +836,7 @@ export default function Launchpad({
         result: pendingInventory(inventoryRef.current!.result),
       };
       inventoryRef.current = next;
+      inventoryCache.current.set(type, next);
       setInventory(next);
     }
     const publish = (result: InstalledResult, local = false) => {
@@ -839,6 +850,7 @@ export default function Launchpad({
           : result,
       };
       inventoryRef.current = next;
+      inventoryCache.current.set(type, next);
       setInventory(next);
       hasSnapshot = true;
       if (local) setPendingPaths(new Set());
@@ -879,8 +891,9 @@ export default function Launchpad({
               gameVersion: contentGameVersion,
               loader: contentLoader,
               local: local ? "true" : undefined,
+              quick: local ? "true" : undefined,
               refresh: !local && force ? "true" : undefined,
-              background: !local && force ? "true" : undefined,
+              background: !local ? "true" : undefined,
             })}`,
             { signal: stage.signal },
           ),
@@ -1211,6 +1224,7 @@ export default function Launchpad({
           },
         };
         inventoryRef.current = next;
+        inventoryCache.current.set(next.type, next);
         setInventory(next);
       }
       reloadContent();
@@ -1573,11 +1587,15 @@ export default function Launchpad({
     if (count > 1) duplicateProjects.add(key);
   }
   const warnings = [
-    ...new Set([
-      ...(config?.warnings ?? []),
-      ...(installedOnly ? (installed?.warnings ?? []) : []),
-      ...(!installedOnly ? (results?.warnings ?? []) : []),
-    ]),
+    ...new Set(
+      [
+        ...(config?.warnings ?? []),
+        ...(installedOnly ? (installed?.warnings ?? []) : []),
+        ...(!installedOnly ? (results?.warnings ?? []) : []),
+      ]
+        .map((warning) => warning.trim())
+        .filter(Boolean),
+    ),
   ];
 
   if (!config)
@@ -2005,12 +2023,27 @@ export default function Launchpad({
           </button>
         </div>
       )}
-      {warnings.map((warning) => (
-        <div className="launchpad-inline-notice" key={warning}>
+      {warnings.length > 0 && (
+        <div className="launchpad-inline-notice launchpad-notices">
           <Info size={16} />
-          <div>{warning}</div>
+          {warnings.length === 1 && warnings[0].length <= 240 ? (
+            <div>{warnings[0]}</div>
+          ) : (
+            <details className="launchpad-update-issues">
+              <summary>
+                {warnings.length} provider or file{" "}
+                {warnings.length === 1 ? "notice" : "notices"}
+                {installedOnly ? " — installed files remain available" : ""}
+              </summary>
+              <ul aria-label="Provider and file notices" tabIndex={0}>
+                {warnings.map((warning) => (
+                  <li key={warning}>{warning}</li>
+                ))}
+              </ul>
+            </details>
+          )}
         </div>
-      ))}
+      )}
       {scanRefreshing && (!installedOnly || installed) && (
         <div
           className="launchpad-scan-status"

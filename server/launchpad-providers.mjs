@@ -5,6 +5,7 @@ import {
   strongestHash,
 } from "./launchpad-network.mjs";
 import { safeInstallPath } from "./launchpad-archives.mjs";
+import { createInstalledIdentification } from "./launchpad-identification.mjs";
 
 const mr = "https://api.modrinth.com/v2";
 const cf = "https://api.curseforge.com/v1";
@@ -571,6 +572,14 @@ export function createCoreProviders({
 } = {}) {
   const json = (url, options) =>
     providerJson(url, { ...options, fetch: request });
+  const identifyInstalled = createInstalledIdentification((hashes, signal) =>
+    json(`${mr}/version_files`, {
+      method: "POST",
+      signal,
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ hashes, algorithm: "sha512" }),
+    }),
+  );
   const mrProject = async (projectId) =>
     json(`${mr}/project/${enc(id(projectId))}`);
   const mrVersions = async (input) => {
@@ -979,6 +988,7 @@ export function createCoreProviders({
           warnings: [],
         };
       },
+      identifyInstalled,
       async identify(hashes, { signal } = {}) {
         return json(`${mr}/version_files`, {
           method: "POST",

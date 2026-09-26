@@ -788,7 +788,7 @@ test(
       "the completed scan becomes the cached disk value",
     );
     await fs.writeFile(path.join(probe, "contents.bin"), Buffer.alloc(8192));
-    now += 10001;
+    now += 60_001;
     const refreshRequest = panel.request("/api/server", {}, id);
     await entered[1].promise;
     assert.equal((await refreshRequest).body.disk, cached);

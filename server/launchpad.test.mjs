@@ -848,6 +848,182 @@ test("local inventory needs no provider, reuses unchanged hashes and notices sam
   assert.notEqual(changed.items[0].sha512, first.items[0].sha512);
 });
 
+test("a 220-mod inventory keeps identification warnings atomic across repeated reads and retries", async (t) => {
+  let now = Date.now(),
+    unavailable = true;
+  t.mock.method(Date, "now", () => now);
+  const f = await fixture(t, {
+    request: async (url) => {
+      if (unavailable && new URL(url).pathname === "/v2/version_files")
+        return new Response(null, { status: 503 });
+    },
+  });
+  await Promise.all(
+    Array.from({ length: 219 }, (_, index) =>
+      fs.writeFile(
+        path.join(f.serverDir, "mods", `unknown-${index}.jar`),
+        `fixture ${index}`,
+      ),
+    ),
+  );
+  const first = await f.service.installed(selection);
+  assert.equal(first.items.length, 220);
+  assert.equal(first.warnings.length, 1);
+  assert.match(first.warnings[0], /Modrinth identification:/);
+  const requests = () =>
+    f.requests.filter(
+      ({ url }) => new URL(url).pathname === "/v2/version_files",
+    ).length;
+  const initialRequests = requests();
+  for (let attempt = 0; attempt < 5; attempt++) {
+    const result = await f.service.installed(selection);
+    assert.deepEqual(result.warnings, first.warnings);
+    assert.equal(result.items.length, 220);
+    assert.equal(
+      requests(),
+      initialRequests,
+      "cached failure does not repeat provider calls",
+    );
+  }
+  t.diagnostic(
+    `220 mods: warning payload stayed ${Buffer.byteLength(JSON.stringify(first.warnings))} bytes across six reads; ${initialRequests} initial provider requests and zero additional cached requests.`,
+  );
+  unavailable = false;
+  // Frequent reads must not postpone recovery indefinitely.
+  let recovered;
+  for (let attempt = 0; attempt < 7; attempt++) {
+    now += 10_000;
+    recovered = await f.service.installed(selection);
+  }
+  assert.ok(requests() > initialRequests);
+  assert.equal(
+    recovered.items.find((item) => item.name === "old.jar").projectId,
+    "project",
+  );
+  assert.deepEqual(recovered.warnings, []);
+  assert.deepEqual(
+    await fs.readFile(path.join(f.serverDir, "mods", "old.jar")),
+    f.old,
+  );
+});
+
+test("quick local inventory lists cold files without reading their bytes and never shows an unverified identity", async (t) => {
+  const f = await fixture(t);
+  await Promise.all(
+    Array.from({ length: 219 }, (_, index) =>
+      fs.writeFile(
+        path.join(f.serverDir, "mods", `unknown-${index}.jar`),
+        `fixture ${index}`,
+      ),
+    ),
+  );
+  const open = fs.open.bind(fs);
+  let reads = 0;
+  t.mock.method(fs, "open", (...args) => {
+    if (String(args[0]).includes(`${path.sep}mods${path.sep}`)) reads++;
+    return open(...args);
+  });
+  const first = await f.service.installed({
+    ...selection,
+    local: true,
+    quick: true,
+  });
+  assert.equal(first.items.length, 220);
+  assert.equal(reads, 0);
+  assert.equal(f.requests.length, 0);
+  assert.ok(
+    first.items.every((item) => !item.sha512 && !item.platform && !item.update),
+  );
+
+  await f.service.installed(selection);
+  assert.equal(reads, 220);
+  const verified = await f.service.installed({
+    ...selection,
+    local: true,
+    quick: true,
+  });
+  assert.equal(
+    verified.items.find((item) => item.name === "old.jar").update.id,
+    "new",
+  );
+  assert.equal(reads, 220);
+  const target = path.join(f.serverDir, "mods", "old.jar"),
+    stat = await fs.stat(target);
+  await fs.writeFile(target, Buffer.alloc(f.old.length, 120));
+  await fs.utimes(target, stat.atime, stat.mtime);
+  const changed = await f.service.installed({
+    ...selection,
+    local: true,
+    quick: true,
+  });
+  const item = changed.items.find((entry) => entry.name === "old.jar");
+  assert.equal(item.platform, null);
+  assert.equal(item.sha512, undefined);
+  assert.equal(item.update, undefined);
+  assert.equal(reads, 220);
+});
+
+test("overlapping inventory scans share file hashes with at most four files open while quick reads stay available", async (t) => {
+  const f = await fixture(t);
+  await Promise.all(
+    Array.from({ length: 11 }, (_, index) =>
+      fs.writeFile(
+        path.join(f.serverDir, "mods", `mod-${index}.jar`),
+        `fixture ${index}`,
+      ),
+    ),
+  );
+  const open = fs.open.bind(fs);
+  let entered,
+    release,
+    active = 0,
+    maximum = 0,
+    reads = 0;
+  const ready = new Promise((resolve) => {
+    entered = resolve;
+  });
+  const gate = new Promise((resolve) => {
+    release = resolve;
+  });
+  t.after(() => release());
+  t.mock.method(fs, "open", async (target, mode, ...rest) => {
+    const handle = await open(target, mode, ...rest);
+    if (mode !== "r" || !String(target).includes(`${path.sep}mods${path.sep}`))
+      return handle;
+    reads++;
+    maximum = Math.max(maximum, ++active);
+    if (active === 4) entered();
+    await gate;
+    return {
+      stat: (...args) => handle.stat(...args),
+      createReadStream: (...args) => handle.createReadStream(...args),
+      close: async () => {
+        try {
+          await handle.close();
+        } finally {
+          active--;
+        }
+      },
+    };
+  });
+  const first = f.service.installed({ ...selection, local: true });
+  await ready;
+  const second = f.service.installed({ ...selection, local: true });
+  const quick = await f.service.installed({
+    ...selection,
+    local: true,
+    quick: true,
+  });
+  assert.equal(quick.items.length, 12);
+  assert.equal(reads, 4);
+  release();
+  const results = await Promise.all([first, second]);
+  assert.ok(results.every((result) => result.items.length === 12));
+  assert.equal(reads, 12);
+  assert.equal(maximum, 4);
+  assert.equal(active, 0);
+});
+
 test("updating one mod keeps unrelated results cached and immediately publishes the new local filename", async (t) => {
   const f = await fixture(t);
   await fs.writeFile(path.join(f.serverDir, "mods", "dep.jar"), f.dependency);
@@ -1101,24 +1277,27 @@ test("overlapping installed scans share remote work while another local read rem
   );
 });
 
-test("an unresponsive provider cannot hold installed rows past the overall remote deadline", async (t) => {
+test("an unresponsive provider cannot hold installed rows or clear cached metadata past the overall remote deadline", async (t) => {
   const timeout = AbortSignal.timeout.bind(AbortSignal),
     deadline = new AbortController();
   t.mock.method(AbortSignal, "timeout", (duration) =>
     duration === 90000 ? deadline.signal : timeout(duration),
   );
-  let started;
+  let started,
+    stalled = false;
   const began = new Promise((resolve) => {
     started = resolve;
   });
   const f = await fixture(t, {
     request: async (url) => {
-      if (new URL(url).pathname === "/v2/version_files/update") {
+      if (stalled && new URL(url).pathname === "/v2/version_files/update") {
         started();
         return new Promise(() => {}); // Deliberately ignores AbortSignal.
       }
     },
   });
+  await f.service.installed(selection);
+  stalled = true;
   const pending = f.service.installed({ ...selection, refresh: true });
   await began;
   deadline.abort(new DOMException("Timed out", "TimeoutError"));
@@ -5162,6 +5341,116 @@ test("terminal jobs survive restart, can be dismissed, and expire after ten minu
   now = Date.parse(value.finishedAt) + 600_001;
   const expired = await f.boot();
   assert.equal((await expired.config()).job, null);
+});
+
+for (const type of ["mod", "modpack"])
+  test(`slow ${type} metadata does not delay independent compatible update checks`, async (t) => {
+    const f = await fixture(t);
+    await fs.writeFile(
+      path.join(f.dataDir, "launchpad", "installed.json"),
+      JSON.stringify([
+        {
+          path: "mods/old.jar",
+          sha512: hashes(f.old).sha512,
+          platform: "fixture",
+          projectId: "project",
+          versionId: "old",
+          type,
+          ...(type === "modpack" ? { pack: true } : {}),
+        },
+      ]),
+    );
+    let release,
+      updatesStarted,
+      metadataPending = true;
+    const gate = new Promise((resolve) => {
+      release = resolve;
+    });
+    const ready = new Promise((resolve) => {
+      updatesStarted = resolve;
+    });
+    const service = await f.boot({
+      extraProviders: [
+        {
+          id: "fixture",
+          name: "Fixture",
+          types: ["mod", "modpack"],
+          projectMetadata: async () => {
+            await gate;
+            metadataPending = false;
+            return {
+              projects: [{ id: "project", title: "Enriched project" }],
+              warnings: [],
+            };
+          },
+          versions: async () => {
+            updatesStarted();
+            return [
+              { id: "old", publishedAt: "2026-01-01" },
+              { id: "new", publishedAt: "2026-02-01" },
+            ];
+          },
+        },
+      ],
+    });
+    const pending = service.installed({ ...selection, type });
+    let timer;
+    try {
+      await Promise.race([
+        ready,
+        new Promise((_, reject) => {
+          timer = setTimeout(
+            () => reject(new Error("Update check waited for project metadata")),
+            1000,
+          );
+        }),
+      ]);
+      assert.equal(metadataPending, true);
+    } finally {
+      clearTimeout(timer);
+      release();
+    }
+    const result = await pending;
+    assert.equal(result.items[0].title, "Enriched project");
+    assert.equal(result.items[0].update.id, "new");
+    assert.equal(result.items[0].updateCheck, "checked");
+  });
+
+test("the first online inventory returns progress before provider identification finishes", async (t) => {
+  let started, release;
+  const ready = new Promise((resolve) => {
+    started = resolve;
+  });
+  const gate = new Promise((resolve) => {
+    release = resolve;
+  });
+  t.after(() => release());
+  const f = await fixture(t, {
+    request: async (url) => {
+      if (new URL(url).pathname === "/v2/version_files") {
+        started();
+        await gate;
+      }
+    },
+  });
+  const first = await f.service.installed({ ...selection, background: true });
+  assert.equal(first.items.length, 1);
+  assert.equal(first.checkingUpdates, true);
+  await ready;
+  const pending = await f.service.installed({ ...selection, background: true });
+  assert.equal(pending.checkingUpdates, true);
+  assert.equal(f.requests.length, 1);
+  release();
+  let completed;
+  const deadline = performance.now() + 5000;
+  do {
+    completed = await f.service.installed(selection);
+    if (!completed.checkingUpdates) break;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  } while (performance.now() < deadline);
+  assert.equal(completed.checkingUpdates, false);
+  assert.equal(completed.items[0].projectId, "project");
+  assert.equal(completed.items[0].update.id, "new");
 });
 
 test("explicit background refresh immediately publishes progress and coalesces polling", async (t) => {
