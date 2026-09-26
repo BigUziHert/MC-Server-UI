@@ -12,6 +12,7 @@ import { createVersionsService } from "./versions.mjs";
 import { createLaunchpad, providerJson } from "./launchpad.mjs";
 import { createExtraProviders } from "./launchpad-extra.mjs";
 import { createJavaInstallation } from "./java-installation.mjs";
+import { createHostDirectoryBrowser } from "./host-directories.mjs";
 
 const fail = (status, message) => Object.assign(new Error(message), { status });
 const emptyServer = async () => ({
@@ -23,6 +24,7 @@ const emptyServer = async () => ({
 // Catalog reads have no selected server. Pack reviews use a disposable empty
 // workspace and the same checksum/path/dependency checks as scoped installs.
 export async function createServerSetup({ dataDir, safePath, ...options }) {
+  const browseDirectories = createHostDirectoryBrowser();
   const lifetime = new AbortController();
   const request = options.catalogFetch ?? fetch;
   const catalogFetch = (url, init = {}) =>
@@ -271,6 +273,12 @@ export async function createServerSetup({ dataDir, safePath, ...options }) {
   async function preflight(input = {}) {
     if (!input || typeof input !== "object" || Array.isArray(input))
       throw fail(400, "Provide the new server's memory and Java settings.");
+    const installation =
+      input.installationDirectory === undefined
+        ? null
+        : await options.inspectInstallationDirectory(
+            input.installationDirectory,
+          );
     const memoryLimitMB = input.memoryLimitMB ?? host().suggestedMemoryMB;
     if (
       !Number.isInteger(memoryLimitMB) ||
@@ -321,6 +329,8 @@ export async function createServerSetup({ dataDir, safePath, ...options }) {
       (!input.gameVersion || !!requiredJavaVersion);
     return {
       ...memory,
+      installationDirectory: installation?.directory ?? null,
+      supportDirectory: installation?.supportRoot ?? null,
       java,
       requiredJavaVersion,
       requirement,
@@ -344,7 +354,15 @@ export async function createServerSetup({ dataDir, safePath, ...options }) {
       );
     const pending = (async () => {
       const id = randomUUID();
-      const root = await safePath(dataDir, `setup-preview-${id}`);
+      const installation =
+        input.installationDirectory === undefined
+          ? null
+          : await options.inspectInstallationDirectory(
+              input.installationDirectory,
+            );
+      const scratchBase = installation?.supportRoot ?? dataDir;
+      await fs.mkdir(scratchBase, { recursive: true });
+      const root = await safePath(scratchBase, `setup-preview-${id}`);
       let preview, closePromise;
       const stopPreview = () => {
         if (preview) closePromise ??= preview.close();
@@ -372,7 +390,7 @@ export async function createServerSetup({ dataDir, safePath, ...options }) {
         await stopPreview();
         activeReviews.delete(stopPreview);
         // Resolve containment and reject replaced symlinks immediately before removal.
-        await fs.rm(await safePath(dataDir, `setup-preview-${id}`), {
+        await fs.rm(await safePath(scratchBase, `setup-preview-${id}`), {
           recursive: true,
           force: true,
         });
@@ -416,8 +434,30 @@ export async function createServerSetup({ dataDir, safePath, ...options }) {
           warnings: [...listing.warnings, ...checks.warnings],
           providers: versions.listProviders(),
           managedServersDir: path.join(dataDir, "instances"),
+          canBrowse: typeof options.selectServerDirectory === "function",
+          managedJavaDirectory: path.join(dataDir, "java-runtimes"),
         });
       }),
+    );
+    app.post(
+      "/api/server-setup/browse",
+      endpoint(async (_req, res) => {
+        if (typeof options.selectServerDirectory !== "function")
+          throw fail(
+            400,
+            "Folder browsing is available in the desktop app. Enter an absolute installation folder path instead.",
+          );
+        const directory = await options.selectServerDirectory({
+          purpose: "installation",
+        });
+        res.json({ directory: directory ?? null });
+      }),
+    );
+    app.get(
+      "/api/server-setup/directories",
+      endpoint(async (req, res, signal) =>
+        res.json(await browseDirectories(req.query.directory, signal)),
+      ),
     );
     app.post(
       "/api/server-setup/preflight",

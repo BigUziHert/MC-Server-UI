@@ -18,8 +18,14 @@ import {
 import { decodeIcon, readServerIcon, writeServerIcon } from "./server-icon.mjs";
 import { createRecycleBin } from "./recycle-bin.mjs";
 import { createBackupArchive } from "./backup-archive.mjs";
+import { restoreBackupArchive } from "./backup-restore.mjs";
 import { createMinecraft } from "./minecraft.mjs";
 import { createServerSetup } from "./server-setup.mjs";
+import {
+  inspectInstallationDirectory,
+  prepareInstallationDirectory,
+  installationFileTransaction,
+} from "./installation-directory.mjs";
 import { auditEntry, auditHistory, contentKind } from "./audit.mjs";
 import { installedMinecraftMetadata } from "./installed-minecraft.mjs";
 import { minecraftGameVersion } from "./minecraft-version.mjs";
@@ -988,7 +994,12 @@ export async function createPanel(options = {}) {
     iconPreference: state.iconPreference,
     id: options.id,
     status,
-    ...(options.source === "imported" ? { source: "imported", serverDir } : {}),
+    ...(options.source === "imported" || options.storage === "custom"
+      ? {
+          source: options.source === "imported" ? "imported" : "managed",
+          serverDir,
+        }
+      : {}),
   });
 
   const lifecycleAudit = (
@@ -2800,6 +2811,43 @@ export async function createPanel(options = {}) {
       `${item.name}.tar.gz`,
     );
   });
+  app.post(
+    "/api/backups/:id/restore",
+    trackOperation(async (req, res) => {
+      if (req.body?.confirm !== true)
+        throw error(
+          400,
+          "Confirm that this backup will replace the current server files.",
+        );
+      if (status !== "offline")
+        throw error(409, "Stop the server before restoring a backup.");
+      const item = getItem(state.backups, req.params.id);
+      const result = await withMinecraftMutation(async () => {
+        const archive = await safePath(backupDir, `${item.id}.tar.gz`);
+        if (!(await exists(archive)))
+          throw error(404, "Backup archive not found.");
+        const restored = await restoreBackupArchive(serverDir, archive);
+        diskCache.at = 0;
+        startupMetadataAt = 0;
+        iconReadAt = 0;
+        try {
+          await audit(
+            "backup",
+            "Backup restored",
+            `${item.name} · server files replaced with the saved backup. The server remains stopped.`,
+          );
+        } catch (cause) {
+          const warning = `Your server files were restored, but the activity log could not be saved. ${cause.message}`;
+          restored.warning = [restored.warning, warning]
+            .filter(Boolean)
+            .join(" ");
+          append(`[Panel] ${warning}`, "warn");
+        }
+        return restored;
+      });
+      res.json({ ok: true, backupId: item.id, ...result });
+    }),
+  );
   app.delete(
     "/api/backups/:id",
     trackOperation(async (req, res) => {
@@ -3206,10 +3254,40 @@ export async function createFleet(options = {}) {
         dataDir,
         ...registry.servers
           .filter((entry) => entry.id !== exceptId)
-          .map((entry) => entry.serverDir),
+          .flatMap((entry) => [entry.serverDir, entry.dataDir]),
       ],
       requireCanonical,
     });
+  const installationOptions = (exceptId) => ({
+    forbiddenDirectories: [
+      dataDir,
+      ...registry.servers
+        .filter((entry) => entry.id !== exceptId)
+        .flatMap((entry) => [entry.serverDir, entry.dataDir]),
+    ],
+  });
+  const inspectInstallation = async (directory) => {
+    const target = await inspectInstallationDirectory(
+      directory,
+      installationOptions(),
+    );
+    if (
+      target.directory
+        .split(path.sep)
+        .some((part) => part.toLowerCase() === ".mc-panel")
+    )
+      throw error(
+        400,
+        "Choose a server folder outside MC Panel's .mc-panel support folders.",
+      );
+    const supportRoot = path.join(path.dirname(target.directory), ".mc-panel");
+    // Check the support location too, without reserving or writing anything.
+    await inspectInstallationDirectory(
+      path.join(supportRoot, "setup-check"),
+      installationOptions(),
+    );
+    return { ...target, supportRoot };
+  };
   const unavailableRuntime = (entry, cause) => {
     const sourceError = `${entry.storage === "external" ? "Imported server" : "Server"} unavailable: ${cause.message} Restore access to its existing folder and retry.`;
     const app = express();
@@ -3265,6 +3343,20 @@ export async function createFleet(options = {}) {
             "The selected server JAR is missing or is no longer a regular file in the source folder.",
           );
       }
+    } else if (entry.storage === "custom") {
+      await inspectInstallationDirectory(entry.serverDir, {
+        ...installationOptions(entry.id),
+        requireEmpty: false,
+        requireExisting: true,
+      });
+      await inspectInstallationDirectory(entry.dataDir, {
+        forbiddenDirectories: [
+          ...installationOptions(entry.id).forbiddenDirectories,
+          entry.serverDir,
+        ],
+        requireEmpty: false,
+        requireExisting: true,
+      });
     } else if (preserveFiles)
       await canonicalExternalDirectory(entry.serverDir, {
         requireCanonical: true,
@@ -3316,7 +3408,8 @@ export async function createFleet(options = {}) {
           user,
         }),
       revokeUser: (userId) => access.revoke(entry.id, userId),
-      existingServerDir: entry.storage === "external" || preserveFiles,
+      existingServerDir:
+        ["external", "custom"].includes(entry.storage) || preserveFiles,
       scheduler: options.scheduler,
       spawnServer: options.spawnServer,
       spawnProcess: options.spawnProcess,
@@ -3359,7 +3452,8 @@ export async function createFleet(options = {}) {
     } catch (cause) {
       if (
         !allowUnavailable ||
-        (entry.storage !== "external" && cause.status === 400)
+        (!["external", "custom"].includes(entry.storage) &&
+          cause.status === 400)
       )
         throw cause;
       const runtime = unavailableRuntime(entry, cause);
@@ -3437,7 +3531,7 @@ export async function createFleet(options = {}) {
       // keep their legacy root; explicitly created instances keep their own roots.
       entry.storage ??=
         entry.id === registry.defaultServerId ? "legacy" : "instance";
-      if (!["legacy", "instance", "external"].includes(entry.storage))
+      if (!["legacy", "instance", "external", "custom"].includes(entry.storage))
         throw new Error(
           "The server registry contains an invalid storage location.",
         );
@@ -3447,9 +3541,23 @@ export async function createFleet(options = {}) {
           entry.serverDir ?? path.join(dataDir, "server"),
         );
       } else {
-        entry.dataDir = await safePath(dataDir, `instances/${entry.id}`);
-        await fs.mkdir(entry.dataDir, { recursive: true });
-        if (entry.storage === "external") {
+        if (entry.storage === "custom") {
+          if (
+            typeof entry.serverDir !== "string" ||
+            !path.isAbsolute(entry.serverDir) ||
+            typeof entry.dataDir !== "string" ||
+            !path.isAbsolute(entry.dataDir) ||
+            path.resolve(entry.dataDir) !==
+              path.join(path.dirname(entry.serverDir), ".mc-panel", entry.id)
+          )
+            throw new Error(
+              "The custom installation registry paths are invalid.",
+            );
+        } else {
+          entry.dataDir = await safePath(dataDir, `instances/${entry.id}`);
+          await fs.mkdir(entry.dataDir, { recursive: true });
+        }
+        if (["external", "custom"].includes(entry.storage)) {
           if (
             typeof entry.serverDir !== "string" ||
             !path.isAbsolute(entry.serverDir)
@@ -3457,7 +3565,7 @@ export async function createFleet(options = {}) {
             throw new Error(
               "The imported server registry path must be absolute.",
             );
-          entry.source = "imported";
+          entry.source = entry.storage === "external" ? "imported" : "managed";
         } else entry.serverDir = await safePath(entry.dataDir, "server");
       }
     }
@@ -3862,6 +3970,7 @@ export async function createFleet(options = {}) {
     dataDir,
     safePath,
     audit: panelAudit,
+    inspectInstallationDirectory: inspectInstallation,
     javaPath:
       options.javaPath ??
       env.JAVA_PATH ??
@@ -3881,10 +3990,21 @@ export async function createFleet(options = {}) {
     { requestId, acceptedEula = false } = {},
   ) => {
     return serialize(async () => {
-      const config = validateServerConfiguration(input);
+      if (!input || typeof input !== "object" || Array.isArray(input))
+        throw error(400, "Provide server settings.");
+      const { installationDirectory, ...settings } = input ?? {};
+      const config = validateServerConfiguration(settings);
       const fingerprint = requestId
         ? createHash("sha256")
-            .update(JSON.stringify({ config, acceptedEula }))
+            .update(
+              JSON.stringify({
+                config,
+                acceptedEula,
+                ...(installationDirectory === undefined
+                  ? {}
+                  : { installationDirectory }),
+              }),
+            )
             .digest("hex")
         : null;
       if (requestId) {
@@ -3905,7 +4025,13 @@ export async function createFleet(options = {}) {
       }
       checkPort(config.port);
       const id = randomUUID();
-      const instanceDir = await safePath(dataDir, `instances/${id}`);
+      const installation =
+        installationDirectory === undefined
+          ? null
+          : await inspectInstallation(installationDirectory);
+      const instanceDir = installation
+        ? path.join(installation.supportRoot, id)
+        : await safePath(dataDir, `instances/${id}`);
       for (const runtime of runtimes.values()) {
         const relative = path.relative(
           await fs.realpath(runtime.serverDir).catch((cause) => {
@@ -3932,42 +4058,52 @@ export async function createFleet(options = {}) {
             "The instances storage directory overlaps an existing server. Choose a panel data directory outside your server files.",
           );
       }
-      await fs.mkdir(instanceDir, { recursive: true });
-      const serverDir = await safePath(instanceDir, "server");
-      await fs.mkdir(serverDir);
-      // EULA acceptance is only written after an explicit guided-review choice.
-      await fs.writeFile(
-        path.join(serverDir, "eula.txt"),
-        `# Read https://aka.ms/MinecraftEULA before accepting.\neula=${acceptedEula}\n`,
-        { flag: "wx" },
-      );
-      await fs.writeFile(
-        path.join(serverDir, "server.properties"),
-        `motd=${escapeProperty(config.motd)}\nserver-port=${config.port}\nmax-players=20\nonline-mode=true\n`,
-        { flag: "wx" },
-      );
-      if (requestId)
-        await fs.writeFile(
-          path.join(serverDir, "user_jvm_args.txt"),
-          `# Memory selected during server setup.\n-Xms${Math.min(config.memoryLimitMB, 1024)}M\n-Xmx${config.memoryLimitMB}M\n`,
-          { flag: "wx" },
-        );
-      const entry = {
-        ...config,
-        id,
-        storage: "instance",
-        dataDir: instanceDir,
-        serverDir,
-        address: `localhost:${config.port}`,
-        version: "Configured JAR",
-        software: "Java",
-        ...(requestId
-          ? { setupRequestId: requestId, setupFingerprint: fingerprint }
-          : {}),
-      };
-      if (requestId) await setup.copySettings(instanceDir);
-      const runtime = await makeRuntime(entry);
+      if (installation)
+        await prepareInstallationDirectory(instanceDir, installationOptions());
+      else await fs.mkdir(instanceDir, { recursive: true });
+      const serverDir = installation
+        ? (
+            await prepareInstallationDirectory(installation.directory, {
+              forbiddenDirectories: [
+                ...installationOptions().forbiddenDirectories,
+                instanceDir,
+              ],
+            })
+          ).directory
+        : await safePath(instanceDir, "server");
+      if (!installation) await fs.mkdir(serverDir);
+      const initialFiles = await installationFileTransaction(serverDir);
+      let runtime;
       try {
+        // EULA acceptance is only written after an explicit guided-review choice.
+        await initialFiles.write(
+          "eula.txt",
+          `# Read https://aka.ms/MinecraftEULA before accepting.\neula=${acceptedEula}\n`,
+        );
+        await initialFiles.write(
+          "server.properties",
+          `motd=${escapeProperty(config.motd)}\nserver-port=${config.port}\nmax-players=20\nonline-mode=true\n`,
+        );
+        if (requestId)
+          await initialFiles.write(
+            "user_jvm_args.txt",
+            `# Memory selected during server setup.\n-Xms${Math.min(config.memoryLimitMB, 1024)}M\n-Xmx${config.memoryLimitMB}M\n`,
+          );
+        const entry = {
+          ...config,
+          id,
+          storage: installation ? "custom" : "instance",
+          dataDir: instanceDir,
+          serverDir,
+          address: `localhost:${config.port}`,
+          version: "Configured JAR",
+          software: "Java",
+          ...(requestId
+            ? { setupRequestId: requestId, setupFingerprint: fingerprint }
+            : {}),
+        };
+        if (requestId) await setup.copySettings(instanceDir);
+        runtime = await makeRuntime(entry);
         await persist({
           ...registry,
           defaultServerId: registry.defaultServerId ?? id,
@@ -3975,7 +4111,8 @@ export async function createFleet(options = {}) {
         });
       } catch (cause) {
         runtimes.delete(id);
-        await runtime.close();
+        await runtime?.close();
+        await initialFiles.rollback().catch(() => {});
         throw cause;
       }
       await runtime.audit(

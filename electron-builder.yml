@@ -17,6 +17,8 @@ files:
   - server/terminal-jobs.mjs
   - server/import.mjs
   - server/server-setup.mjs
+  - server/installation-directory.mjs
+  - server/host-directories.mjs
   - server/java-discovery.mjs
   - server/java-installation.mjs
   - server/launcher-stop.mjs
@@ -25,6 +27,7 @@ files:
   - server/telemetry.mjs
   - server/recycle-bin.mjs
   - server/backup-archive.mjs
+  - server/backup-restore.mjs
   - server/player-history.mjs
   - server/minecraft.mjs
   - server/clean-install.mjs

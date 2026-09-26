@@ -316,7 +316,7 @@ export default function App({
   const [loading, setLoading] = useState(true);
   const [manager, setManager] = useState<{
     editing: ServerRecord | null;
-    initialStep?: "choice" | "create" | "import" | "recover";
+    initialStep?: "choice" | "create" | "import";
     firstServer?: boolean;
   } | null>(null);
   const [notice, setNotice] = useState("");
@@ -702,7 +702,7 @@ function EmptyFleet({
   session,
   onSignedOut,
 }: {
-  onAdd: (step: "create" | "import" | "recover") => void;
+  onAdd: (step: "create" | "import") => void;
   onConnect: (mode: ConnectionMode) => void;
   session?: PanelSession;
   onSignedOut?: () => void;
@@ -777,23 +777,6 @@ function EmptyFleet({
                     <strong>Import an existing server</strong>
                     <span id="welcome-import-description">
                       Connect a server folder on your computer.
-                    </span>
-                  </span>
-                  <ArrowRight size={19} />
-                </button>
-                <button
-                  className="fleet-welcome-choice"
-                  aria-label="Recover a saved server"
-                  aria-describedby="welcome-recover-description"
-                  onClick={() => onAdd("recover")}
-                >
-                  <span className="fleet-welcome-choice-icon">
-                    <RotateCw size={23} />
-                  </span>
-                  <span>
-                    <strong>Recover a saved server</strong>
-                    <span id="welcome-recover-description">
-                      Add a previously removed server back to this panel.
                     </span>
                   </span>
                   <ArrowRight size={19} />

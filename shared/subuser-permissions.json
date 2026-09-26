@@ -108,6 +108,11 @@
           "description": "Download existing backup archives."
         },
         {
+          "id": "backup.restore",
+          "label": "Restore backups",
+          "description": "Replace a stopped server's files with a saved backup."
+        },
+        {
           "id": "backup.delete",
           "label": "Delete backups",
           "description": "Permanently remove backup archives."
@@ -150,6 +155,7 @@
       "backup.read",
       "backup.create",
       "backup.download",
+      "backup.restore",
       "backup.delete",
       "backup.update",
       "audit.read"
@@ -167,6 +173,7 @@
       "backup.read",
       "backup.create",
       "backup.download",
+      "backup.restore",
       "backup.delete",
       "backup.update",
       "audit.read"

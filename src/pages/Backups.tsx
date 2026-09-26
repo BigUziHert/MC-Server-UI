@@ -15,6 +15,7 @@ import {
   History,
   LoaderCircle,
   Plus,
+  RotateCcw,
   ShieldCheck,
   Trash2,
   X,
@@ -192,6 +193,7 @@ function BackupProgress({
   );
 }
 type DeleteDialog = { backups: Backup[]; bulk: boolean };
+type RestoreDialog = { restore: Backup };
 const defaults: Schedule = {
   enabled: false,
   type: "interval",
@@ -223,6 +225,8 @@ export default function Backups({
     permissions === undefined || permissions.includes("backup.update");
   const canDownload =
     permissions === undefined || permissions.includes("backup.download");
+  const canRestore =
+    permissions === undefined || permissions.includes("backup.restore");
   const { api, downloadUrl } = useServerApi();
   const [backups, setBackups] = useState<Backup[]>([]);
   const [schedule, setSchedule] = useState<Schedule>(defaults);
@@ -238,7 +242,13 @@ export default function Backups({
   const [cancelling, setCancelling] = useState(false);
   const [jobError, setJobError] = useState("");
   const [selected, setSelected] = useState<Set<string>>(new Set());
-  const [dialog, setDialog] = useState<"create" | DeleteDialog | null>(null);
+  const [dialog, setDialog] = useState<
+    "create" | DeleteDialog | RestoreDialog | null
+  >(null);
+  const [restoreConfirmed, setRestoreConfirmed] = useState(false);
+  const [restoreServerStatus, setRestoreServerStatus] = useState<string | null>(
+    null,
+  );
   const [name, setName] = useState("");
   const [dialogError, setDialogError] = useState("");
   const [deleteErrors, setDeleteErrors] = useState<string[]>([]);
@@ -479,7 +489,11 @@ export default function Backups({
     if (
       !dialog ||
       busyRef.current ||
-      (dialog === "create" ? !canCreate : !canDelete)
+      (dialog === "create"
+        ? !canCreate
+        : "restore" in dialog
+          ? !canRestore
+          : !canDelete)
     )
       return;
     const token = generation.current;
@@ -529,6 +543,22 @@ export default function Backups({
     setDialogError("");
     setDeleteErrors([]);
     try {
+      if ("restore" in dialog) {
+        if (!restoreConfirmed || restoreServerStatus !== "offline") return;
+        const result = await api<{ warning?: string | null }>(
+          `/backups/${encodeURIComponent(dialog.restore.id)}/restore`,
+          { method: "POST", body: JSON.stringify({ confirm: true }) },
+        );
+        if (token !== generation.current) return;
+        notify(
+          result.warning ||
+            `Restored ${dialog.restore.name}. Your server remains stopped.`,
+          !!result.warning,
+        );
+        await load();
+        if (token === generation.current) setDialog(null);
+        return;
+      }
       {
         const deleted = new Set<string>();
         const failed: Backup[] = [];
@@ -589,6 +619,27 @@ export default function Backups({
     setDialogError("");
     setDeleteErrors([]);
     setDialog({ backups: targets, bulk });
+  }
+
+  async function confirmRestore(backup: Backup) {
+    if (!canRestore || busyRef.current) return;
+    const token = generation.current;
+    const version = ++dialogVersion.current;
+    setDialogError("");
+    setDeleteErrors([]);
+    setRestoreConfirmed(false);
+    setRestoreServerStatus(null);
+    setDialog({ restore: backup });
+    try {
+      const server = await api<{ status: string }>("/server", {
+        signal: AbortSignal.timeout(10_000),
+      });
+      if (token === generation.current && version === dialogVersion.current)
+        setRestoreServerStatus(server.status);
+    } catch (failure) {
+      if (token === generation.current && version === dialogVersion.current)
+        setDialogError(messageOf(failure));
+    }
   }
 
   const selectedBackups = backups.filter((backup) => selected.has(backup.id));
@@ -862,6 +913,18 @@ export default function Backups({
                           </div>
                         </div>
                         <div className="backup-item-actions">
+                          {canRestore && (
+                            <button
+                              className="btn icon"
+                              type="button"
+                              aria-label={`Restore backup ${backup.name}`}
+                              title="Restore server to this backup"
+                              disabled={busy || starting || activeJob}
+                              onClick={() => void confirmRestore(backup)}
+                            >
+                              <RotateCcw size={16} />
+                            </button>
+                          )}
                           {canDownload && (
                             <a
                               className="btn icon"
@@ -1117,14 +1180,18 @@ export default function Backups({
                 <h2 id="backup-dialog-title">
                   {dialog === "create"
                     ? "Create a backup"
-                    : dialog.bulk
-                      ? "Move selected backups to Recycle Bin?"
-                      : "Move this backup to Recycle Bin?"}
+                    : "restore" in dialog
+                      ? "Restore this backup?"
+                      : dialog.bulk
+                        ? "Move selected backups to Recycle Bin?"
+                        : "Move this backup to Recycle Bin?"}
                 </h2>
                 <p id="backup-dialog-description">
                   {dialog === "create"
                     ? "Save a compressed .tar.gz archive of your current server files."
-                    : "You can restore these archives from File Manager → Recycle Bin. They use disk space until permanently deleted."}
+                    : "restore" in dialog
+                      ? "Replace your server files with this saved backup point."
+                      : "You can restore these archives from File Manager → Recycle Bin. They use disk space until permanently deleted."}
                 </p>
               </div>
               <button
@@ -1157,6 +1224,49 @@ export default function Backups({
                   </p>
                 </div>
                 {showProgress && progressPanel}
+              </>
+            ) : "restore" in dialog ? (
+              <>
+                <p className="delete-description">
+                  Restore <strong>{dialog.restore.name}</strong> from{" "}
+                  {fullDate(dialog.restore.createdAt)}? Your current world,
+                  mods, plugins, and server files will be replaced. Files added
+                  after this backup will be removed. Create a fresh backup first
+                  if you want to keep your current progress.
+                </p>
+                <div className="backup-create-note">
+                  <ShieldCheck size={17} />
+                  <p>
+                    The saved archive stays in your backup history. The server
+                    remains stopped after restoring. Panel access and launch
+                    settings stay as they are.
+                  </p>
+                </div>
+                {restoreServerStatus !== "offline" && !dialogError && (
+                  <p className="storage-form-error" role="status">
+                    {restoreServerStatus === null
+                      ? "Checking server status…"
+                      : "Stop the server from Console, then return here to restore this backup."}
+                  </p>
+                )}
+                <label className="backup-select-all">
+                  <input
+                    type="checkbox"
+                    className="backup-checkbox"
+                    checked={restoreConfirmed}
+                    disabled={busy || restoreServerStatus !== "offline"}
+                    onChange={(event) =>
+                      setRestoreConfirmed(event.target.checked)
+                    }
+                  />
+                  I understand this will replace my current server files.
+                </label>
+                {busy && (
+                  <p role="status">
+                    Restoring server files… Large backups can take several
+                    minutes.
+                  </p>
+                )}
               </>
             ) : (
               <>
@@ -1226,7 +1336,11 @@ export default function Backups({
                       starting ||
                       activeJob ||
                       (!!jobError && !job)
-                    : !canDelete)
+                    : "restore" in dialog
+                      ? !canRestore ||
+                        !restoreConfirmed ||
+                        restoreServerStatus !== "offline"
+                      : !canDelete)
                 }
               >
                 {busy && <LoaderCircle size={15} className="spin" />}
@@ -1236,11 +1350,15 @@ export default function Backups({
                     : activeJob
                       ? "Backup running…"
                       : "Create backup"
-                  : busy
-                    ? "Moving backups…"
-                    : deleteErrors.length > 0
-                      ? "Retry failed moves"
-                      : "Move to Recycle Bin"}
+                  : "restore" in dialog
+                    ? busy
+                      ? "Restoring backup…"
+                      : "Restore backup"
+                    : busy
+                      ? "Moving backups…"
+                      : deleteErrors.length > 0
+                        ? "Retry failed moves"
+                        : "Move to Recycle Bin"}
               </button>
             </div>
           </form>

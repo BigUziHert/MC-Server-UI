@@ -111,6 +111,8 @@ export function requiredPermissions(req) {
     if (/^\/api\/files\/recycle-bin\/[^/]+\/restore$/.test(route))
       return ["file.create", "backup.create"];
     if (route === "/api/backups") return ["backup.create"];
+    if (/^\/api\/backups\/[^/]+\/restore$/.test(route))
+      return ["backup.restore"];
     if (
       route === "/api/backups/jobs" ||
       /^\/api\/backups\/jobs\/[^/]+\/cancel$/.test(route)
@@ -268,7 +270,11 @@ export function createRemoteGateway({
     },
   );
   app.post("/api/access/accept", acceptLimit, async (req, res) => {
-    const result = await access.accept(req.body?.token, req.body?.password);
+    const result = await access.accept(
+      req.body?.token,
+      req.body?.password,
+      req,
+    );
     await accepted?.(result.session);
     res.setHeader("Set-Cookie", result.cookie);
     res.json(result.session);

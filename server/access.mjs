@@ -288,6 +288,26 @@ export async function createAccessService({
       cookie: `${SUBUSER_COOKIE}=${value}; Path=/; HttpOnly; SameSite=Strict; Secure; Max-Age=${sessionLifetime / 1000}`,
     };
   };
+  const authenticatedSession = async (req) => {
+    if (!status().ready) return null;
+    const token = cookieSecret(req);
+    if (!token) return null;
+    const record = state.sessions.find(
+      (item) => item.hash === digest(token) && item.expiresAt > now(),
+    );
+    if (!record) return null;
+    const memberships = [];
+    for (const scope of sessionScopes(record).slice(0, maxEmailMemberships)) {
+      const membership = { ...scope, email: record.email };
+      if (enrolled(membership) && (await liveUser(membership)))
+        memberships.push(scope);
+    }
+    // A deleted primary invalidates the session; never expand or rehome it.
+    if (!memberships.some((scope) => scopeKey(scope) === scopeKey(record)))
+      return null;
+    const user = await liveUser(record);
+    return user ? sessionView(record, user, memberships) : null;
+  };
 
   return {
     status,
@@ -397,7 +417,7 @@ export async function createAccessService({
           inviteExpiresAt: new Date(expiresAt).toISOString(),
         };
       }),
-    accept: (token, password) =>
+    accept: (token, password, req) =>
       serializeAuthentication(async () => {
         if (!status().ready || !validSecret(token))
           throw fail(401, invalidLink);
@@ -412,9 +432,19 @@ export async function createAccessService({
         if (!validPassword(password))
           throw fail(400, "Choose a password with 12 to 128 characters.");
         const passwordHash = await hashPassword(password);
-        const issued = createSession([record]);
-        const next = cleaned();
         const key = scopeKey(record);
+        const current = await authenticatedSession(req);
+        // The invitation proves this membership; the existing cookie proves
+        // only its live scopes. Sharing an email alone never grants access.
+        const retained =
+          current?.email === record.email
+            ? current.memberships
+                .filter((scope) => scopeKey(scope) !== key)
+                .map((scope) => ({ ...scope, email: current.email }))
+            : [];
+        const issued = createSession([record, ...retained]);
+        const replacedHash = retained.length ? digest(cookieSecret(req)) : null;
+        const next = cleaned();
         await persist({
           ...next,
           memberships: next.memberships.map((item) =>
@@ -425,7 +455,8 @@ export async function createAccessService({
           tokens: next.tokens.filter((item) => scopeKey(item) !== key),
           sessions: [
             ...next.sessions.filter(
-              (session) => !sessionIncludes(session, key),
+              (session) =>
+                !sessionIncludes(session, key) && session.hash !== replacedHash,
             ),
             issued.session,
           ],
@@ -476,24 +507,7 @@ export async function createAccessService({
         };
       }),
     async authenticate(req) {
-      if (closing || !status().ready) return null;
-      const token = cookieSecret(req);
-      if (!token) return null;
-      const record = state.sessions.find(
-        (item) => item.hash === digest(token) && item.expiresAt > now(),
-      );
-      if (!record) return null;
-      const memberships = [];
-      for (const scope of sessionScopes(record).slice(0, maxEmailMemberships)) {
-        const membership = { ...scope, email: record.email };
-        if (enrolled(membership) && (await liveUser(membership)))
-          memberships.push(scope);
-      }
-      // A deleted primary invalidates the session; never expand or rehome it.
-      if (!memberships.some((scope) => scopeKey(scope) === scopeKey(record)))
-        return null;
-      const user = await liveUser(record);
-      return user ? sessionView(record, user, memberships) : null;
+      return closing ? null : authenticatedSession(req);
     },
     logout: (req) => {
       if (closing)

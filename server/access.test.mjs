@@ -323,6 +323,117 @@ test("same-email membership never expands an invitation or existing session", as
   );
 });
 
+test("accepting another invitation retains the browser's proven memberships across restart", async (t) => {
+  const f = await fixture(t);
+  const first = await f.enroll();
+  const otherDevice = await f.login();
+  const token = tokenFrom(await f.invite(f.addB()));
+  const second = await f.access.accept(
+    token,
+    otherPassword,
+    request(first.cookie),
+  );
+  assert.deepEqual(second.session.memberships, [scopeB, scopeA]);
+  assert.equal(second.session.serverId, scopeB.serverId);
+  assert.deepEqual(second.session.permissions, ["control.restart"]);
+  assert.notEqual(second.cookie, first.cookie);
+  assert.equal(await f.access.authenticate(request(first.cookie)), null);
+  assert.deepEqual(
+    (await f.access.authenticate(request(otherDevice.cookie))).memberships,
+    [scopeA],
+    "accepting a link must not expand a different device's existing session",
+  );
+  const restarted = await f.reload();
+  assert.deepEqual(
+    await restarted.authenticate(request(second.cookie)),
+    second.session,
+  );
+  assert.deepEqual(
+    (await restarted.login({ email: "sister@example.com", password })).session
+      .memberships,
+    [scopeA],
+    "a fresh login must still prove each server's password independently",
+  );
+  assert.deepEqual(
+    (
+      await restarted.login({
+        email: "sister@example.com",
+        password: otherPassword,
+      })
+    ).session.memberships,
+    [scopeB],
+  );
+  await restarted.logout(request(second.cookie));
+  assert.equal(await restarted.authenticate(request(second.cookie)), null);
+});
+
+test("additional invitations retain only the signed-in scopes, never all matching emails", async (t) => {
+  const f = await fixture(t);
+  const first = await f.enroll();
+  const token = tokenFrom(await f.invite(f.addB()));
+  const userC = { id: "user-c", email: "sister@example.com", permissions: [] };
+  f.users.set("server-c:user-c", userC);
+  const third = await f.enroll(password, { serverId: "server-c", user: userC });
+  const second = await f.access.accept(
+    token,
+    otherPassword,
+    request(first.cookie),
+  );
+  assert.deepEqual(second.session.memberships, [scopeB, scopeA]);
+  assert.deepEqual(
+    (await f.access.authenticate(request(third.cookie))).memberships,
+    [{ serverId: "server-c", userId: "user-c" }],
+  );
+});
+
+test("an invitation never retains another account's session or invalid cookie scopes", async (t) => {
+  for (const invalidation of [
+    "different-email",
+    "expired",
+    "revoked",
+    "forged",
+    "duplicate",
+    "changed-email",
+  ]) {
+    await t.test(invalidation, async (t) => {
+      const f = await fixture(t);
+      const first = await f.enroll();
+      const memberB = f.addB();
+      let cookie = first.cookie;
+      if (invalidation === "different-email")
+        memberB.user.email = "other@example.com";
+      if (invalidation === "expired") f.advance(7 * 24 * 60 * 60 * 1000);
+      if (invalidation === "revoked")
+        await f.access.revoke("server-a", "user-a");
+      if (invalidation === "forged")
+        cookie = `${SUBUSER_COOKIE}=${"f".repeat(43)}`;
+      if (invalidation === "changed-email")
+        f.getUser("server-a", "user-a").email = "changed@example.com";
+      const req = request(cookie);
+      if (invalidation === "duplicate")
+        req.headers.cookie += `; ${req.headers.cookie}`;
+      const token = tokenFrom(await f.invite(memberB));
+      const second = await f.access.accept(token, otherPassword, req);
+      assert.deepEqual(second.session.memberships, [scopeB]);
+    });
+  }
+});
+
+test("same-password invitations remain available together after signing out and signing back in", async (t) => {
+  const f = await fixture(t);
+  const first = await f.enroll();
+  const token = tokenFrom(await f.invite(f.addB()));
+  const second = await f.access.accept(token, password, request(first.cookie));
+  assert.deepEqual(second.session.memberships, [scopeB, scopeA]);
+  await f.access.logout(request(second.cookie));
+  const restarted = await f.reload();
+  assert.deepEqual(
+    (await restarted.login({ email: "sister@example.com", password })).session
+      .memberships,
+    [scopeA, scopeB],
+  );
+});
+
 test("password login grants only independently enrolled memberships sharing the supplied password", async (t) => {
   const f = await fixture(t);
   const first = await f.enroll();

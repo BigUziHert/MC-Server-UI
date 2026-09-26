@@ -2,6 +2,7 @@ import {
   createProcessServer,
   selectServer,
   removeTestServer,
+  stopTestServer,
 } from "./server-fixtures";
 import {
   test as base,
@@ -75,6 +76,74 @@ async function backupNames(request: APIRequestContext, fixture: BackupFixture) {
     .map((backup: { name: string }) => backup.name)
     .sort();
 }
+
+test("restoring a backup requires a stopped server and explicit confirmation", async ({
+  page,
+  request,
+  backups,
+}, testInfo) => {
+  const headers = { "X-Server-Id": backups.id };
+  const backup = backups.backups.find((item) => item.name === "Alpha backup")!;
+  const restoreUrl = `/api/backups/${backup.id}/restore`;
+  const running = await request.post(restoreUrl, {
+    headers,
+    data: { confirm: true },
+  });
+  expect(running.status()).toBe(409);
+  expect((await running.json()).error).toContain("Stop the server");
+  await openBackups(page, backups);
+  await page
+    .getByRole("button", { name: "Restore backup Alpha backup", exact: true })
+    .click();
+  const dialog = page.getByRole("dialog", { name: "Restore this backup?" });
+  await expect(
+    dialog.getByText(
+      "Stop the server from Console, then return here to restore this backup.",
+    ),
+  ).toBeVisible();
+  await expect(
+    dialog.getByRole("button", { name: "Restore backup", exact: true }),
+  ).toBeDisabled();
+  await dialog.getByRole("button", { name: "Cancel", exact: true }).click();
+  await stopTestServer(request, backups.id);
+  const added = await request.post("/api/files", {
+    headers,
+    data: { type: "file", name: "added-after-backup.txt" },
+  });
+  expect(added.status()).toBe(201);
+  await page
+    .getByRole("button", { name: "Restore backup Alpha backup", exact: true })
+    .click();
+  await expect(
+    dialog.getByRole("button", { name: "Restore backup", exact: true }),
+  ).toBeDisabled();
+  const confirmation = dialog.getByRole("checkbox", {
+    name: "I understand this will replace my current server files.",
+  });
+  await expect(confirmation).toBeEnabled();
+  await confirmation.check();
+  await page.screenshot({
+    path: testInfo.outputPath("restore-confirmation.png"),
+    fullPage: true,
+  });
+  await dialog
+    .getByRole("button", { name: "Restore backup", exact: true })
+    .click();
+  await expect(dialog).not.toBeVisible();
+  const removed = await request.get(
+    "/api/files/content?path=added-after-backup.txt",
+    { headers },
+  );
+  expect(removed.status()).toBe(404);
+  expect(
+    (await (await request.get("/api/server", { headers })).json()).status,
+  ).toBe("offline");
+  expect(await backupNames(request, backups)).toEqual([
+    "Alpha backup",
+    "Beta backup",
+    "Gamma backup",
+  ]);
+});
 
 test("backup history shows compressed sizes and savings without requiring legacy metadata", async ({
   page,

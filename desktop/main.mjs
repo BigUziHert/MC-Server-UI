@@ -97,14 +97,21 @@ async function openFolder(folder) {
   if (failure) dialog.showErrorBox("Could not open folder", failure);
 }
 
-async function selectServerDirectory() {
+async function selectServerDirectory({ purpose } = {}) {
   if (quitting || !window || window.isDestroyed()) return null;
   if (!directoryDialog) {
     directoryDialog = dialog
       .showOpenDialog(window, {
-        title: "Choose existing Minecraft server folder",
+        title:
+          purpose === "installation"
+            ? "Choose an empty Minecraft installation folder"
+            : "Choose existing Minecraft server folder",
         buttonLabel: "Use server folder",
-        properties: ["openDirectory", "dontAddToRecent"],
+        properties: [
+          "openDirectory",
+          "dontAddToRecent",
+          ...(purpose === "installation" ? ["createDirectory"] : []),
+        ],
       })
       .then(({ canceled, filePaths }) =>
         canceled || quitting ? null : (filePaths[0] ?? null),

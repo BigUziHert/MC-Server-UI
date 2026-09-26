@@ -8,6 +8,7 @@ import {
   ChevronRight,
   Download,
   ExternalLink,
+  FolderOpen,
   Layers3,
   LoaderCircle,
   Package,
@@ -19,6 +20,7 @@ import {
 import { api, formatBytes } from "./api";
 import type { ServerRecord } from "./ServerManager";
 import SearchField, { useDebouncedValue } from "./SearchField";
+import HostDirectoryPicker from "./HostDirectoryPicker";
 import { SoftwareIcon } from "./pages/Versions";
 import { ProjectIcon } from "./pages/Launchpad";
 import "./onboarding.css";
@@ -91,6 +93,8 @@ type Catalog = {
   java: Java;
   warnings?: string[];
   managedServersDir?: string;
+  canBrowse?: boolean;
+  managedJavaDirectory?: string;
 };
 type Project = {
   id: string;
@@ -243,6 +247,11 @@ export default function NewServerWizard({
   const [apiKey, setApiKey] = useState("");
   const [name, setName] = useState("");
   const [memory, setMemory] = useState("4");
+  const [customLocation, setCustomLocation] = useState(false);
+  const [installationDirectory, setInstallationDirectory] = useState("");
+  const [folderBrowserOpen, setFolderBrowserOpen] = useState(false);
+  const browseFolderButton = useRef<HTMLButtonElement>(null);
+  const [supportDirectory, setSupportDirectory] = useState("");
   const [javaMajor, setJavaMajor] = useState<number | null>(null);
   const [javaChoices, setJavaChoices] = useState<JavaChoices | null>(null);
   const [javaLoading, setJavaLoading] = useState(false);
@@ -556,6 +565,7 @@ export default function NewServerWizard({
   function go(next: Step) {
     if (busyRef.current || createdRef.current) return;
     setError("");
+    setFolderBrowserOpen(false);
     setStep(next);
   }
   function chooseKind(value: "software" | "modpack") {
@@ -643,6 +653,28 @@ export default function NewServerWizard({
       setBusy(false);
     }
   }
+  async function browseInstallationDirectory() {
+    if (busyRef.current) return;
+    if (!catalog?.canBrowse) {
+      setFolderBrowserOpen(true);
+      return;
+    }
+    busyRef.current = true;
+    setBusy(true);
+    setError("");
+    try {
+      const result = await request<{ directory: string | null }>(
+        "/server-setup/browse",
+        {},
+      );
+      if (result.directory) setInstallationDirectory(result.directory);
+    } catch (cause) {
+      if (!controller.current.signal.aborted) setError(message(cause));
+    } finally {
+      busyRef.current = false;
+      if (!controller.current.signal.aborted) setBusy(false);
+    }
+  }
   async function review(event: FormEvent) {
     event.preventDefault();
     if (busyRef.current || !isPrepared) return;
@@ -679,15 +711,20 @@ export default function NewServerWizard({
     setAccepted(false);
     setAcknowledged(false);
     try {
-      setProgress("Checking Java and memory…");
+      setProgress("Checking Java, memory, and installation folder…");
       const check = await request<{
         java: Java;
         compatible?: boolean;
         ready?: boolean;
         warnings?: string[];
         requiredJavaVersion?: number;
+        installationDirectory?: string;
+        supportDirectory?: string;
       }>("/server-setup/preflight", {
         memoryLimitMB: mb,
+        installationDirectory: customLocation
+          ? installationDirectory.trim()
+          : undefined,
         javaPath: selectedJava.path,
         provider: kind === "software" ? provider?.id : packLoader,
         gameVersion,
@@ -706,12 +743,17 @@ export default function NewServerWizard({
           "Choose a smaller memory allocation so this PC has RAM available for Windows and other apps.",
         );
       setWarnings(check.warnings || []);
+      if (check.installationDirectory)
+        setInstallationDirectory(check.installationDirectory);
+      setSupportDirectory(check.supportDirectory || "");
       if (kind === "modpack") {
         setProgress("Preparing the modpack installation review…");
-        const next = await request<Plan>(
-          "/server-setup/modpack-preview",
-          packSelection(),
-        );
+        const next = await request<Plan>("/server-setup/modpack-preview", {
+          ...packSelection(),
+          installationDirectory: customLocation
+            ? installationDirectory.trim()
+            : undefined,
+        });
         const required = next.loaderInstall;
         if (
           !required?.loader ||
@@ -866,6 +908,9 @@ export default function NewServerWizard({
               memoryLimitMB: Number(memory) * 1024,
               port: Number(port),
               javaPath: selectedJava?.path,
+              installationDirectory: customLocation
+                ? installationDirectory.trim()
+                : undefined,
             },
           },
         );
@@ -964,6 +1009,11 @@ export default function NewServerWizard({
     }
   }
   function close() {
+    if (folderBrowserOpen) {
+      setFolderBrowserOpen(false);
+      browseFolderButton.current?.focus();
+      return;
+    }
     if (!busyRef.current) {
       if (createdRef.current) void openConsole();
       else onClose();
@@ -1564,6 +1614,72 @@ export default function NewServerWizard({
               Leave memory available for Windows and other apps.
             </small>
           </div>
+          <div className="form-field setup-location-field">
+            <label htmlFor="setup-location">Installation location</label>
+            <select
+              id="setup-location"
+              value={customLocation ? "custom" : "default"}
+              disabled={busy}
+              onChange={(event) => {
+                setCustomLocation(event.target.value === "custom");
+                setFolderBrowserOpen(false);
+              }}
+            >
+              <option value="default">MC Panel's default server folder</option>
+              <option value="custom">Choose a folder or another drive</option>
+            </select>
+            {customLocation ? (
+              <>
+                <label htmlFor="setup-directory">Installation folder</label>
+                <div className="setup-directory-input">
+                  <input
+                    id="setup-directory"
+                    required
+                    value={installationDirectory}
+                    disabled={busy}
+                    onChange={(event) =>
+                      setInstallationDirectory(event.target.value)
+                    }
+                    placeholder="D:\Minecraft\Survival"
+                    aria-describedby="setup-directory-help"
+                  />
+                  <button
+                    ref={browseFolderButton}
+                    className="btn"
+                    type="button"
+                    disabled={busy}
+                    onClick={() => void browseInstallationDirectory()}
+                  >
+                    <FolderOpen size={15} /> Browse
+                  </button>
+                </div>
+                {folderBrowserOpen && (
+                  <HostDirectoryPicker
+                    initialDirectory={installationDirectory}
+                    onClose={() => {
+                      setFolderBrowserOpen(false);
+                      browseFolderButton.current?.focus();
+                    }}
+                    onSelect={(directory) => {
+                      setInstallationDirectory(directory);
+                      setFolderBrowserOpen(false);
+                      browseFolderButton.current?.focus();
+                    }}
+                  />
+                )}
+                <small id="setup-directory-help">
+                  Choose an empty folder or enter a new folder path on the
+                  computer running MC Panel. Server files and worlds go here.
+                  Downloads, backups, and support files use a .mc-panel folder
+                  beside it on the same drive.
+                </small>
+              </>
+            ) : (
+              <small>
+                {catalog?.managedServersDir || "MC Panel's server data folder"}
+              </small>
+            )}
+          </div>
           <div className="form-field setup-java-field">
             <div className="setup-java-header">
               <label htmlFor="setup-java">Java executable</label>
@@ -1635,7 +1751,10 @@ export default function NewServerWizard({
                 </button>
                 <small>
                   Downloads Eclipse Temurin for MC Panel. No administrator
-                  access needed.
+                  access needed. Shared Java installs use{" "}
+                  {catalog?.managedJavaDirectory ||
+                    "MC Panel's app data folder"}
+                  , even when the server is on another drive.
                 </small>
               </div>
             )}
@@ -1719,10 +1838,20 @@ export default function NewServerWizard({
             <div>
               <dt>Location</dt>
               <dd>
-                {catalog?.managedServersDir ||
+                {(customLocation
+                  ? installationDirectory
+                  : catalog?.managedServersDir) ||
                   "A new folder in MC Panel’s server data"}
               </dd>
             </div>
+            {customLocation && supportDirectory && (
+              <div>
+                <dt>Downloads, backups, and support files</dt>
+                <dd>
+                  {supportDirectory} (a separate subfolder for this server)
+                </dd>
+              </div>
+            )}
           </dl>
           {warnings.map((value) => (
             <p className="setup-warning" key={value}>
@@ -1843,7 +1972,7 @@ export default function NewServerWizard({
             className="btn primary"
             type="submit"
             form="setup-configure"
-            disabled={busy || javaLoading || !selectedJava}
+            disabled={busy || javaLoading || !selectedJava || folderBrowserOpen}
           >
             {busy ? (
               <LoaderCircle size={15} className="spin" />

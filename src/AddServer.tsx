@@ -53,13 +53,11 @@ export default function AddServer({
   initialStep = "choice",
   onClose,
   onSaved,
-  onRecover,
 }: {
   servers: ServerRecord[];
   initialStep?: "choice" | "create" | "import";
   onClose: () => void;
   onSaved: (server: ServerRecord) => void;
-  onRecover?: () => void;
 }) {
   const [step, setStep] = useState<Step>(initialStep);
   const [wizardLocked, setWizardLocked] = useState(false);
@@ -394,31 +392,7 @@ export default function AddServer({
               </span>
               <ArrowRight size={18} />
             </button>
-            {onRecover && (
-              <button
-                className="server-add-choice"
-                type="button"
-                onClick={onRecover}
-                aria-label="Recover a saved server"
-              >
-                <span className="server-choice-icon">
-                  <RefreshCw size={22} />
-                </span>
-                <span>
-                  <strong>Recover a saved server</strong>
-                  <span>
-                    Add a previously removed server back with its files and
-                    backups.
-                  </span>
-                </span>
-                <ArrowRight size={18} />
-              </button>
-            )}
           </div>
-          <p className="server-choice-hint">
-            Your servers stay on your computer. Manage them together in one
-            panel.
-          </p>
           <div className="server-dialog-actions">
             <button className="btn" type="button" onClick={close}>
               Cancel

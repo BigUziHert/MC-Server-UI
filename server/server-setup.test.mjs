@@ -243,6 +243,28 @@ test("desktop setup discovers OS JAVA_HOME without importing legacy server envir
   );
 });
 
+test("browser setup can browse host folders without native integration or filesystem writes", async (t) => {
+  const f = await fixture(t);
+  await fs.mkdir(path.join(f.root, "browse-folder"));
+  await fs.writeFile(path.join(f.root, "private-file.txt"), "not returned");
+  const before = await fs.readdir(f.root);
+  assert.equal((await f.request("/api/server-setup")).body.canBrowse, false);
+  const listed = await f.request(
+    `/api/server-setup/directories?${new URLSearchParams({ directory: f.root })}`,
+  );
+  assert.equal(listed.status, 200);
+  assert.deepEqual(listed.body.folders, [
+    { name: "browse-folder", path: path.join(f.root, "browse-folder") },
+  ]);
+  assert.equal(JSON.stringify(listed.body).includes("private-file.txt"), false);
+  assert.deepEqual(await fs.readdir(f.root), before);
+  assert.equal(
+    (await f.request("/api/server-setup/directories?directory=relative"))
+      .status,
+    400,
+  );
+});
+
 test("catalog-only Launchpad exposes no install or file-management methods and never touches storage", async () => {
   const catalog = await createLaunchpad({
     catalogOnly: true,
@@ -868,6 +890,35 @@ test("pack reviews expose verified runtime requirements, clean scratch data and 
   );
   assert.deepEqual(await fs.readdir(f.root), before);
   assert.equal((await f.request("/api/servers")).body.servers.length, 0);
+  invalid = false;
+  const installationDirectory = await externalInstallation(t);
+  const scratchParent = path.join(
+    path.dirname(installationDirectory),
+    ".mc-panel",
+  );
+  const mkdir = fs.mkdir;
+  const createdDirectories = [];
+  const tracked = t.mock.method(fs, "mkdir", async (...args) => {
+    createdDirectories.push(args[0]);
+    return mkdir(...args);
+  });
+  const externalReview = await f.request(
+    "/api/server-setup/modpack-preview",
+    json("POST", {
+      ...input,
+      installationDirectory,
+    }),
+  );
+  tracked.mock.restore();
+  assert.equal(externalReview.status, 200, JSON.stringify(externalReview.body));
+  const scratch = createdDirectories.filter((directory) =>
+    path.basename(directory).startsWith("setup-preview-"),
+  );
+  assert.equal(scratch.length, 1);
+  assert.equal(path.dirname(scratch[0]), scratchParent);
+  assert.deepEqual(await fs.readdir(scratchParent), []);
+  assert.deepEqual(await fs.readdir(f.root), before);
+  await assert.rejects(fs.stat(installationDirectory), { code: "ENOENT" });
 });
 
 test("failed runtime installs retry on the same created server through the existing scoped jobs", async (t) => {
@@ -921,6 +972,213 @@ test("failed runtime installs retry on the same created server through the exist
     ),
     /eula=false/,
   );
+});
+
+async function externalInstallation(t) {
+  const temporary = await fs.realpath(os.tmpdir());
+  const root = await fs.mkdtemp(path.join(temporary, "mc-custom-setup-test-"));
+  t.after(async () => {
+    assert.equal(path.dirname(root), temporary);
+    assert.ok(path.basename(root).startsWith("mc-custom-setup-test-"));
+    await fs.rm(root, { recursive: true, force: true });
+  });
+  return path.join(root, "Minecraft");
+}
+
+test("custom setup keeps installations and staging on the chosen drive across retries and restart", async (t) => {
+  const versionsService = versionService();
+  const stage = versionsService.stage;
+  const stages = [];
+  versionsService.stage = async (...args) => {
+    stages.push(args[1].stageDir);
+    if (stages.length === 1) throw new Error("Interrupted fixture download");
+    return stage(...args);
+  };
+  let pickerOptions;
+  const f = await fixture(t, {
+    versionsService,
+    selectServerDirectory: async (options) => {
+      pickerOptions = options;
+      return installationDirectory;
+    },
+  });
+  const installationDirectory = await externalInstallation(t);
+  assert.equal((await f.request("/api/server-setup")).body.canBrowse, true);
+  assert.equal(
+    (await f.request("/api/server-setup/browse", json("POST", {}))).body
+      .directory,
+    installationDirectory,
+  );
+  assert.deepEqual(pickerOptions, { purpose: "installation" });
+  const checked = await f.request(
+    "/api/server-setup/preflight",
+    json("POST", { installationDirectory, javaPath: "java" }),
+  );
+  assert.equal(checked.status, 200, JSON.stringify(checked.body));
+  assert.equal(checked.body.installationDirectory, installationDirectory);
+  assert.equal(
+    checked.body.supportDirectory,
+    path.join(path.dirname(installationDirectory), ".mc-panel"),
+  );
+  await assert.rejects(fs.stat(installationDirectory), { code: "ENOENT" });
+  const body = requestBody({
+    configuration: { ...configuration, installationDirectory },
+    acceptedEula: true,
+  });
+  const created = await f.request("/api/server-setup", json("POST", body));
+  assert.equal(created.status, 201, JSON.stringify(created.body));
+  const id = created.body.server.id;
+  assert.equal(created.body.server.serverDir, installationDirectory);
+  assert.equal(created.body.server.source, "managed");
+  const support = path.join(
+    path.dirname(installationDirectory),
+    ".mc-panel",
+    id,
+  );
+  assert.equal(f.runtimes.get(id).dataDir, support);
+  const install = async () => {
+    const queued = await f.request(
+      "/api/versions/install",
+      json("POST", {
+        provider: "paper",
+        version: "1.21.1",
+        build: "12",
+        confirmed: true,
+        cleanInstall: true,
+      }),
+      id,
+    );
+    assert.equal(queued.status, 202, JSON.stringify(queued.body));
+    return finishJob(
+      async () =>
+        (await f.request(`/api/versions/jobs/${queued.body.id}`, {}, id)).body,
+      (job) => ["failed", "complete"].includes(job.state),
+    );
+  };
+  assert.equal((await install()).state, "failed");
+  assert.equal(
+    (await f.request("/api/server-setup", json("POST", body))).body.server.id,
+    id,
+  );
+  assert.equal((await install()).state, "complete");
+  assert.ok(
+    stages.every((directory) => directory.startsWith(support + path.sep)),
+  );
+  assert.equal(
+    await fs.readFile(path.join(installationDirectory, "server.jar"), "utf8"),
+    "verified runtime fixture",
+  );
+  await f.restart();
+  assert.equal(f.runtimes.get(id).dataDir, support);
+  assert.equal(
+    (await f.request("/api/servers")).body.servers.find(
+      (server) => server.id === id,
+    ).serverDir,
+    installationDirectory,
+  );
+  assert.equal(
+    (await f.request("/api/server-setup", json("POST", body))).status,
+    200,
+  );
+  assert.equal(
+    (
+      await f.request(
+        "/api/server-setup",
+        json("POST", {
+          ...body,
+          configuration: {
+            ...configuration,
+            installationDirectory: installationDirectory + "-changed",
+          },
+        }),
+      )
+    ).status,
+    409,
+  );
+  assert.equal((await fs.readdir(f.root)).includes("instances"), false);
+  const moved = installationDirectory + "-disconnected";
+  await fs.rename(installationDirectory, moved);
+  await f.restart();
+  assert.equal(
+    (await f.request("/api/servers")).body.servers[0].unavailable,
+    true,
+  );
+  await assert.rejects(fs.stat(installationDirectory), { code: "ENOENT" });
+  await fs.rename(moved, installationDirectory);
+  assert.equal((await f.request("/api/server", {}, id)).status, 200);
+  const movedSupport = support + "-disconnected";
+  await fs.rename(support, movedSupport);
+  await f.restart();
+  assert.equal(
+    (await f.request("/api/servers")).body.servers[0].unavailable,
+    true,
+  );
+  await assert.rejects(fs.stat(support), { code: "ENOENT" });
+  await fs.rename(movedSupport, support);
+  assert.equal((await f.request("/api/server", {}, id)).status, 200);
+});
+
+test("failed custom registry persistence leaves an empty installation folder safe to retry", async (t) => {
+  const f = await fixture(t);
+  const installationDirectory = await externalInstallation(t);
+  const body = requestBody({
+    configuration: { ...configuration, installationDirectory },
+  });
+  const rename = fs.rename;
+  const failure = t.mock.method(fs, "rename", async (source, target) => {
+    if (target === path.join(f.root, "servers.json"))
+      throw Object.assign(new Error("Fixture disk is full"), { status: 503 });
+    return rename(source, target);
+  });
+  assert.equal(
+    (await f.request("/api/server-setup", json("POST", body))).status,
+    503,
+  );
+  assert.deepEqual(await fs.readdir(installationDirectory), []);
+  assert.equal((await f.request("/api/servers")).body.servers.length, 0);
+  failure.mock.restore();
+  assert.equal(
+    (await f.request("/api/server-setup", json("POST", body))).status,
+    201,
+  );
+});
+
+test("custom creation rechecks empty folders and overlap without changing existing files", async (t) => {
+  const f = await fixture(t);
+  const installationDirectory = await externalInstallation(t);
+  await fs.mkdir(installationDirectory);
+  const body = requestBody({
+    configuration: { ...configuration, installationDirectory },
+  });
+  assert.equal(
+    (
+      await f.request(
+        "/api/server-setup/preflight",
+        json("POST", { installationDirectory }),
+      )
+    ).status,
+    200,
+  );
+  await fs.writeFile(path.join(installationDirectory, "world.dat"), "preserve");
+  assert.equal(
+    (await f.request("/api/server-setup", json("POST", body))).status,
+    409,
+  );
+  assert.equal(
+    await fs.readFile(path.join(installationDirectory, "world.dat"), "utf8"),
+    "preserve",
+  );
+  for (const directory of [f.root, path.join(f.root, "new-server")])
+    assert.equal(
+      (
+        await f.request(
+          "/api/server-setup/preflight",
+          json("POST", { installationDirectory: directory }),
+        )
+      ).status,
+      409,
+    );
+  assert.equal((await f.request("/api/servers")).body.servers.length, 0);
 });
 
 test("Java probe uses a bounded hidden shell-free executable check and handles missing Java", async () => {

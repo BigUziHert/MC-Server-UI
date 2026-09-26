@@ -1,4 +1,7 @@
 import { serverButton, removeTestServer } from "./server-fixtures";
+import fs from "node:fs/promises";
+import path from "node:path";
+import os from "node:os";
 import {
   test as base,
   expect,
@@ -180,6 +183,10 @@ const test = base.extend<{ setup: SetupFixture }>({
           compatible: true,
           ready: true,
           java: { ...java, path: body.javaPath },
+          installationDirectory: body.installationDirectory,
+          supportDirectory: body.installationDirectory
+            ? path.join(path.dirname(body.installationDirectory), ".mc-panel")
+            : undefined,
           warnings: [],
         },
       });
@@ -823,6 +830,280 @@ test("software catalog errors retry and cancellation leaves the fleet empty", as
   expect(setup.catalogRequests).toContain(
     "/api/server-setup/versions/paper/1.21.1",
   );
+});
+
+test("a chosen installation folder is reviewed and saved through browser setup", async ({
+  page,
+  request,
+  setup,
+}, testInfo) => {
+  const temporary = await fs.realpath(os.tmpdir());
+  const root = await fs.mkdtemp(
+    path.join(temporary, "mc-onboarding-location-"),
+  );
+  const directory = path.join(root, "Survival");
+  await page.route("**/api/versions/install", (route) =>
+    route.fulfill({
+      status: 202,
+      json: { id: "custom-location-install", state: "queued" },
+    }),
+  );
+  await page.route("**/api/versions/jobs/custom-location-install", (route) =>
+    route.fulfill({
+      json: { id: "custom-location-install", state: "complete" },
+    }),
+  );
+  try {
+    await openCreate(page);
+    await choosePaper(page);
+    const dialog = page.getByRole("dialog");
+    await dialog
+      .getByLabel("Installation location", { exact: true })
+      .selectOption("custom");
+    await expect(
+      dialog.getByRole("button", { name: "Browse", exact: true }),
+    ).toBeVisible();
+    await dialog
+      .getByLabel("Installation folder", { exact: true })
+      .fill(directory);
+    await configure(page, setup, "Chosen drive world");
+    await expect(dialog).toContainText(directory);
+    await expect(dialog).toContainText(path.join(root, ".mc-panel"));
+    expect(setup.preflightRequests[0]).toMatchObject({
+      installationDirectory: directory,
+    });
+    await page.setViewportSize({ width: 390, height: 844 });
+    await expect
+      .poll(() =>
+        page.evaluate(() => document.documentElement.scrollWidth <= innerWidth),
+      )
+      .toBe(true);
+    await page.screenshot({
+      path: testInfo.outputPath("chosen-installation-folder-mobile.png"),
+      fullPage: true,
+    });
+    await dialog
+      .getByRole("button", { name: "Create and install", exact: true })
+      .click();
+    await expect(
+      dialog.getByRole("button", { name: "Open Console", exact: true }),
+    ).toBeEnabled();
+    expect(setup.creationRequests[0]).toMatchObject({
+      configuration: { installationDirectory: directory },
+    });
+    expect(
+      await fs.readFile(path.join(directory, "eula.txt"), "utf8"),
+    ).toContain("eula=true");
+    const fleet = await (await request.get("/api/servers")).json();
+    expect(
+      fleet.servers.find((server: Server) => server.id === setup.created[0].id),
+    ).toMatchObject({
+      source: "managed",
+      serverDir: directory,
+    });
+  } finally {
+    for (const server of setup.created)
+      await removeTestServer(request, server.id);
+    setup.created.splice(0);
+    expect(path.dirname(root)).toBe(temporary);
+    expect(path.basename(root)).toMatch(/^mc-onboarding-location-/);
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
+test("browser Browse navigates host folders and chooses a new folder without creating it", async ({
+  page,
+  setup,
+}, testInfo) => {
+  const temporary = await fs.realpath(os.tmpdir());
+  const root = await fs.mkdtemp(path.join(temporary, "mc-onboarding-browse-"));
+  const parent = path.join(root, "Minecraft servers");
+  await fs.mkdir(parent);
+  await fs.writeFile(path.join(root, "private.txt"), "not a folder");
+  await page.route("**/api/server-setup/directories*", (route) => {
+    if (new URL(route.request().url()).searchParams.has("directory"))
+      return route.continue();
+    return route.fulfill({
+      json: {
+        directory: null,
+        parent: null,
+        separator: path.sep,
+        folders: [{ name: "Test drive", path: root }],
+        truncated: false,
+      },
+    });
+  });
+  try {
+    await openCreate(page);
+    await choosePaper(page);
+    const dialog = page.getByRole("dialog");
+    await dialog
+      .getByLabel("Installation location", { exact: true })
+      .selectOption("custom");
+    await dialog.getByRole("button", { name: "Browse", exact: true }).click();
+    const picker = dialog.getByRole("region", {
+      name: "Choose installation folder",
+      exact: true,
+    });
+    await expect(picker).toBeVisible();
+    await picker
+      .getByRole("button", { name: "Test drive", exact: true })
+      .click();
+    await expect(picker.getByLabel("Folder path", { exact: true })).toHaveValue(
+      root,
+    );
+    await expect(picker).not.toContainText("private.txt");
+    await picker
+      .getByRole("button", { name: "Minecraft servers", exact: true })
+      .click();
+    await expect(picker.getByLabel("Folder path", { exact: true })).toHaveValue(
+      parent,
+    );
+    await picker.getByRole("button", { name: "Up", exact: true }).click();
+    await picker
+      .getByRole("button", { name: "Minecraft servers", exact: true })
+      .click();
+    await picker
+      .getByLabel("New folder name (optional)", { exact: true })
+      .fill("bad/name");
+    await expect(
+      picker.getByRole("button", { name: "Use new folder", exact: true }),
+    ).toBeDisabled();
+    await picker
+      .getByLabel("New folder name (optional)", { exact: true })
+      .fill("Survival");
+    await page.setViewportSize({ width: 390, height: 844 });
+    await expect
+      .poll(() =>
+        page.evaluate(() => document.documentElement.scrollWidth <= innerWidth),
+      )
+      .toBe(true);
+    await page.screenshot({
+      path: testInfo.outputPath("browser-host-folder-picker-mobile.png"),
+      fullPage: true,
+    });
+    await picker
+      .getByRole("button", { name: "Use new folder", exact: true })
+      .click();
+    const chosen = path.join(parent, "Survival");
+    await expect(picker).not.toBeVisible();
+    await expect(
+      dialog.getByLabel("Installation folder", { exact: true }),
+    ).toHaveValue(chosen);
+    await expect(
+      dialog.getByRole("button", { name: "Browse", exact: true }),
+    ).toBeFocused();
+    await expect
+      .poll(async () => {
+        try {
+          await fs.stat(chosen);
+          return true;
+        } catch {
+          return false;
+        }
+      })
+      .toBe(false);
+    expect(setup.creationRequests).toEqual([]);
+  } finally {
+    expect(path.dirname(root)).toBe(temporary);
+    expect(path.basename(root)).toMatch(/^mc-onboarding-browse-/);
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
+test("browser folder cancellation and switching back to default leave setup usable", async ({
+  page,
+  setup,
+}) => {
+  await page.route("**/api/server-setup/directories*", (route) =>
+    route.fulfill({
+      json: {
+        directory: null,
+        parent: null,
+        separator: path.sep,
+        folders: [],
+        truncated: false,
+      },
+    }),
+  );
+  await openCreate(page);
+  await choosePaper(page);
+  const dialog = page.getByRole("dialog");
+  const location = dialog.getByLabel("Installation location", { exact: true });
+  const review = dialog.getByRole("button", {
+    name: "Review installation",
+    exact: true,
+  });
+  await expect(review).toBeEnabled();
+  await location.selectOption("custom");
+  await dialog.getByRole("button", { name: "Browse", exact: true }).click();
+  const picker = dialog.getByRole("region", {
+    name: "Choose installation folder",
+    exact: true,
+  });
+  await expect(review).toBeDisabled();
+  await picker.getByRole("button", { name: "Cancel", exact: true }).click();
+  await expect(review).toBeEnabled();
+  await expect(
+    dialog.getByRole("button", { name: "Browse", exact: true }),
+  ).toBeFocused();
+  await dialog.getByRole("button", { name: "Browse", exact: true }).click();
+  await location.selectOption("default");
+  await expect(picker).not.toBeVisible();
+  await expect(review).toBeEnabled();
+  expect(setup.creationRequests).toEqual([]);
+});
+
+test("desktop folder browsing fills setup and folder validation errors keep the chosen path editable", async ({
+  page,
+  setup,
+}) => {
+  await page.route("**/api/server-setup", async (route) => {
+    if (route.request().method() !== "GET") return route.fallback();
+    return route.fulfill({
+      json: {
+        providers: [provider],
+        platforms,
+        gameVersions: ["1.21.1"],
+        hostMemoryMB: 16384,
+        java,
+        canBrowse: true,
+      },
+    });
+  });
+  const directory = "D:\\Minecraft\\Survival";
+  await page.route("**/api/server-setup/browse", (route) =>
+    route.fulfill({ json: { directory } }),
+  );
+  await page.route("**/api/server-setup/preflight", (route) =>
+    route.fulfill({
+      status: 409,
+      json: { error: "Choose an empty installation folder." },
+    }),
+  );
+  await openCreate(page);
+  await choosePaper(page);
+  const dialog = page.getByRole("dialog");
+  await dialog
+    .getByLabel("Installation location", { exact: true })
+    .selectOption("custom");
+  await dialog.getByRole("button", { name: "Browse", exact: true }).click();
+  await expect(
+    dialog.getByLabel("Installation folder", { exact: true }),
+  ).toHaveValue(directory);
+  await dialog
+    .getByLabel("Server name", { exact: true })
+    .fill("Chosen drive world");
+  await dialog
+    .getByRole("button", { name: "Review installation", exact: true })
+    .click();
+  await expect(dialog.getByRole("alert")).toContainText(
+    "Choose an empty installation folder",
+  );
+  await expect(
+    dialog.getByLabel("Installation folder", { exact: true }),
+  ).toBeEditable();
+  expect(setup.creationRequests).toEqual([]);
 });
 
 test("confirmed software creation retries installation on the same stopped server and opens Console", async ({

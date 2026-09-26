@@ -334,7 +334,9 @@ function SignIn({
             {token && (
               <>
                 <p id="remote-password-hint" className="remote-field-hint">
-                  Use 12–128 characters. A few memorable words work well.
+                  Use 12–128 characters. For multiple servers on this panel, use
+                  the same password for each invitation to sign in to them
+                  together.
                 </p>
                 <label htmlFor="remote-password-confirmation">
                   Confirm password

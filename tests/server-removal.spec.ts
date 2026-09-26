@@ -11,7 +11,6 @@ import {
 } from "@playwright/test";
 import { readFile, realpath } from "node:fs/promises";
 import path from "node:path";
-import { processStartup } from "./fixtures/process-options.mjs";
 
 type FixtureServer = { id: string; name: string; mode: "live" };
 type Factory = (running: boolean, name: string) => Promise<FixtureServer>;
@@ -247,7 +246,7 @@ test("running servers cannot be removed and removing the final stopped server re
   ).toBeVisible();
 });
 
-test("the last removed managed server can be recovered from the welcome screen with its original identity and files", async ({
+test("removing the last managed server preserves its files and offers only create or import", async ({
   page,
   request,
   createServer,
@@ -284,7 +283,7 @@ test("the last removed managed server can be recovered from the welcome screen w
     exact: true,
   });
   await expect(confirmation).toContainText(
-    "Use Recover a saved server to add it back later.",
+    "Keep the saved files if you want to use this world again.",
   );
   await confirmation
     .getByRole("button", { name: "Remove server", exact: true })
@@ -296,8 +295,8 @@ test("the last removed managed server can be recovered from the welcome screen w
   const dataDir = process.env.PANEL_E2E_DATA_DIR!;
   expect(path.basename(dataDir)).toMatch(/^mc-panel-e2e-/);
   expect(server.id).toMatch(/^[a-f0-9-]{36}$/);
-  // Recovery displays the canonical folder, including on Windows runners
-  // whose temporary-directory environment variable uses a short path alias.
+  // Resolve the canonical folder, including on Windows runners whose
+  // temporary-directory environment variable uses a short path alias.
   const savedDirectory = await realpath(
     path.join(dataDir, "instances", server.id, "server"),
   );
@@ -311,75 +310,17 @@ test("the last removed managed server can be recovered from the welcome screen w
   await expect(
     page.getByRole("heading", { name: "Welcome to MC Panel", exact: true }),
   ).toBeVisible();
-  await page
-    .getByRole("button", { name: "Recover a saved server", exact: true })
-    .click();
-  const recovery = page.getByRole("dialog", {
-    name: "Recover a saved server",
-    exact: true,
-  });
-  await recovery
-    .getByRole("button", {
-      name: `Review saved server Recovered server ${server.id.slice(0, 8)}`,
-      exact: true,
-    })
-    .click();
   await expect(
-    recovery.getByLabel("Saved server folder", { exact: true }),
-  ).toHaveValue(savedDirectory);
-  const recover = recovery.getByRole("button", {
-    name: "Recover server",
-    exact: true,
-  });
-  await expect(recover).toBeDisabled();
-  await recovery.getByLabel("Server name", { exact: true }).fill(server.name);
-  // This fixture uses a real child process instead of downloading Minecraft.
-  // Explicitly review the original executable and arguments just as an owner
-  // would for a saved server whose custom startup cannot be auto-detected.
-  await recovery
-    .getByLabel("Launch method", { exact: true })
-    .selectOption("executable");
-  await recovery
-    .getByLabel("Server executable", { exact: true })
-    .fill(processStartup.launchExecutable);
-  await recovery
-    .getByLabel("Startup arguments", { exact: true })
-    .fill(processStartup.launchArgs.join("\n"));
-  await expect(recover).toBeDisabled();
-  await recovery
-    .getByRole("checkbox", {
-      name: "Add this saved server back to the panel.",
+    page.getByRole("button", { name: "Recover a saved server", exact: true }),
+  ).toHaveCount(0);
+  await expect(
+    page.getByRole("button", { name: "Create a new server", exact: true }),
+  ).toBeVisible();
+  await expect(
+    page.getByRole("button", {
+      name: "Import an existing server",
       exact: true,
-    })
-    .check();
-  await expect(recover).toBeEnabled();
-  const responsePromise = page.waitForResponse(
-    (response) =>
-      response.url().endsWith(`/api/server-recovery/${server.id}`) &&
-      response.request().method() === "POST",
-  );
-  await recover.click();
-  const response = await responsePromise;
-  expect(response.status(), await response.text()).toBe(201);
-  expect((await response.json()).server.id).toBe(server.id);
-  await expect(recovery).not.toBeVisible();
-  await expect(serverButton(page, server.id)).toHaveAttribute(
-    "aria-pressed",
-    "true",
-  );
-  const restored = await (await request.get("/api/server", { headers })).json();
-  expect(restored.name).toBe(server.name);
-  expect(restored.status).toBe("offline");
+    }),
+  ).toBeVisible();
   expect(await readFile(savedProof, "utf8")).toBe(original);
-  const restoredFile = await request.get(
-    "/api/files/content?path=recovery-proof.txt",
-    { headers },
-  );
-  expect(restoredFile.ok()).toBe(true);
-  expect((await restoredFile.json()).content).toBe(original);
-  await page.reload();
-  await expect(serverButton(page, server.id)).toHaveAttribute(
-    "aria-pressed",
-    "true",
-  );
 });

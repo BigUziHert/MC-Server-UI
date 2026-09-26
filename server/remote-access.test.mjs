@@ -94,6 +94,7 @@ async function fixture(t) {
     email = "sister@example.test",
     serverId = id,
     password = "Correct-test-password!",
+    existingCookie,
   ) => {
     const response = await local("/api/subusers", {
       ...json("POST", { email, permissions }),
@@ -109,10 +110,10 @@ async function fixture(t) {
     const token = new URL(sent.body.invitationUrl).hash.slice(
       "#invite=".length,
     );
-    const signed = await guest(
-      "/api/access/accept",
-      json("POST", { token, password }),
-    );
+    const signed = await guest("/api/access/accept", {
+      ...json("POST", { token, password }),
+      ...(existingCookie ? { headers: { Cookie: existingCookie } } : {}),
+    });
     assert.equal(signed.status, 200, JSON.stringify(signed.body));
     const cookie = signed.cookie.split(";")[0];
     const asUser = request(remote, {
@@ -120,7 +121,7 @@ async function fixture(t) {
       Origin: origin,
       Cookie: cookie,
     });
-    return { user, cookie, token, asUser };
+    return { user, cookie, token, asUser, session: signed.body };
   };
   return { fleet, root, id, local, guest, invite };
 }
@@ -169,6 +170,17 @@ test("remote gateway never grants owner access, even with forged headers or a lo
     ).status,
     403,
   );
+});
+
+test("host folder browsing is local-only even for an authenticated user with file access", async (t) => {
+  const { local, guest, invite, root } = await fixture(t);
+  const route = `/api/server-setup/directories?${new URLSearchParams({ directory: root })}`;
+  assert.equal((await local(route)).status, 200);
+  assert.equal((await guest(route)).status, 401);
+  const { asUser } = await invite(["file.read", "file.read-content"]);
+  const response = await asUser(route);
+  assert.equal(response.status, 403);
+  assert.equal(Object.hasOwn(response.body, "folders"), false);
 });
 
 test("invited phone sessions are server-scoped, honor changed permissions, and revoke immediately", async (t) => {
@@ -592,6 +604,61 @@ test("manual invitations never grant other servers merely because their email ma
   assert.deepEqual(login.body.memberships, [
     { serverId: id, userId: first.user.id },
   ]);
+});
+
+test("a second invitation in the same browser keeps both servers with independent permissions", async (t) => {
+  const { local, invite, id } = await fixture(t);
+  const first = await invite(["control.console"]);
+  const created = await local(
+    "/api/servers",
+    json("POST", { name: "Modded world", port: 25566 }),
+  );
+  assert.equal(created.status, 201, JSON.stringify(created.body));
+  const secondId = created.body.server.id;
+  const second = await invite(
+    ["file.read"],
+    "sister@example.test",
+    secondId,
+    "Different-test-password!",
+    first.cookie,
+  );
+  assert.deepEqual(second.session.memberships, [
+    { serverId: secondId, userId: second.user.id },
+    { serverId: id, userId: first.user.id },
+  ]);
+  const roster = (await second.asUser("/api/servers")).body;
+  assert.deepEqual(
+    roster.servers.map((server) => server.id),
+    [id, secondId],
+  );
+  assert.deepEqual(
+    roster.servers.map((server) => server.accessPermissions),
+    [["control.console"], ["file.read"]],
+  );
+  assert.equal(roster.defaultServerId, secondId);
+  for (const [serverId, consoleStatus, filesStatus] of [
+    [id, 200, 403],
+    [secondId, 403, 200],
+  ]) {
+    assert.equal(
+      (
+        await second.asUser("/api/console", {
+          headers: { "X-Server-Id": serverId },
+        })
+      ).status,
+      consoleStatus,
+    );
+    assert.equal(
+      (
+        await second.asUser("/api/files", {
+          headers: { "X-Server-Id": serverId },
+        })
+      ).status,
+      filesStatus,
+    );
+  }
+  assert.equal((await first.asUser("/api/servers")).status, 401);
+  assert.equal((await local("/api/servers")).body.servers.length, 2);
 });
 
 test("proxy sign-in isolates account limits without trusting forwarded addresses", async (t) => {
