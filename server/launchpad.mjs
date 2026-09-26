@@ -708,7 +708,12 @@ export async function createLaunchpad(ctx) {
           : undefined;
         const known =
           identities.get(sha512)?.value ??
-          (sha512 ? metadataCache?.identity(sha512) : undefined);
+          // A later explicit installation may choose another provider for the
+          // same bytes. Persisted inferred metadata cannot replace its receipt.
+          (sha512 &&
+          !(receipt?.platform && receipt.projectId && receipt.versionId)
+            ? metadataCache?.identity(sha512)
+            : undefined);
         rows[index] = {
           path: relativePath,
           name: file.name,

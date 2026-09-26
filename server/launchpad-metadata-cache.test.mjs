@@ -349,6 +349,78 @@ test("restarting Launchpad reuses verified identities and project display withou
   assert.ok(!f.requests.includes("/v2/teams"));
 });
 
+test("an explicit same-byte installation keeps its selected provider after restart without another inventory", async (t) => {
+  const f = await inventoryFixture(t);
+  const first = await f.boot();
+  await first.installed(selection);
+  await first.close();
+  const bytes = await fs.readFile(f.original);
+  await fs.rm(f.original);
+  const chosenProvider = {
+    id: "chosen-provider",
+    name: "Explicit catalog",
+    types: ["mod"],
+    available: true,
+    downloadHosts: ["cdn.modrinth.com"],
+    resolve: async () => ({
+      title: "Explicit project",
+      versionName: "Explicit version",
+      files: [
+        {
+          path: "chosen.jar",
+          url: "https://cdn.modrinth.com/chosen.jar",
+          size: bytes.length,
+          hashes: { sha512: digest(bytes) },
+        },
+      ],
+      dependencies: [],
+    }),
+  };
+  const second = await f.boot({
+    extraProviders: [chosenProvider],
+    fetch: async (url) => {
+      assert.equal(url, "https://cdn.modrinth.com/chosen.jar");
+      return new Response(bytes);
+    },
+  });
+  const plan = await second.preview({
+    ...selection,
+    platform: chosenProvider.id,
+    projectId: "explicit-project",
+    versionId: "explicit-version",
+  });
+  const started = await second.install({
+    planId: plan.planId,
+    confirmed: true,
+  });
+  const deadline = performance.now() + 15000;
+  let job;
+  do {
+    job = second.job(started.job.id).job;
+    if (["completed", "failed"].includes(job.status)) break;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  } while (performance.now() < deadline);
+  assert.equal(job.status, "completed", job.error);
+  assert.equal(second.snapshotInstalled()[0].platform, chosenProvider.id);
+  // No inventory between install and shutdown: the inferred old identity is
+  // still on disk, while the newer explicit receipt is already committed.
+  await second.close();
+  const saved = JSON.parse(
+    await fs.readFile(path.join(f.dataDir, "launchpad", "metadata-cache.json")),
+  );
+  assert.equal(
+    saved.entries.find((row) => row.kind === "identity").value.platform,
+    "modrinth",
+  );
+  const restarted = await f.boot({ extraProviders: [chosenProvider] });
+  const result = await restarted.installed({ ...selection, local: true });
+  assert.equal(result.items[0].sha512, digest(bytes));
+  assert.equal(result.items[0].platform, chosenProvider.id);
+  assert.equal(result.items[0].projectId, "explicit-project");
+  assert.equal(result.items[0].versionId, "explicit-version");
+  assert.equal(result.items[0].title, "Explicit project");
+});
+
 test("same-path same-size changes cannot inherit a persisted identity even with the old modified time", async (t) => {
   const f = await inventoryFixture(t);
   const first = await f.boot();
