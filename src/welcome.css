@@ -120,6 +120,24 @@
   padding: 20px 24px;
 }
 
+.fleet-panel-users-main {
+  width: min(100%, 1248px);
+  margin: 0 auto;
+  padding: 24px;
+}
+
+.fleet-panel-users-navigation {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  margin-bottom: 28px;
+}
+
+.fleet-panel-users-navigation .account-menu {
+  width: min(260px, 55%);
+}
+
 @media (max-width: 600px) {
   .fleet-welcome-shell .fleet-welcome-header {
     height: 76px;

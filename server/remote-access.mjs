@@ -338,24 +338,33 @@ export function createRemoteGateway({
     const authorized = session.memberships ?? [
       { serverId: session.serverId, userId: session.userId },
     ];
-    const memberships = [...runtimes].flatMap(([serverId, runtime]) =>
-      (runtime.subusers?.() ?? [])
-        .filter(
-          (user) =>
-            user.email === session.email &&
-            authorized.some(
-              (member) =>
-                member.serverId === serverId && member.userId === user.id,
-            ) &&
-            access.membershipAllowed(serverId, user.id, user.email),
-        )
-        .map((user) => ({ serverId, user, runtime })),
-    );
-    const hostPermissions = memberships.some(({ user }) =>
-      user.hostPermissions?.includes("server.create"),
+    const memberships = [...runtimes].flatMap(([serverId, runtime]) => {
+      const member = authorized.find((scope) => scope.serverId === serverId);
+      if (!member) return [];
+      const { userId } = member;
+      const base = runtime.subusers?.().find((user) => user.id === userId);
+      const user = access.resolveUser
+        ? access.resolveUser(serverId, userId, base)
+        : base;
+      return user?.email === session.email &&
+        access.membershipAllowed(serverId, user.id, user.email)
+        ? [{ serverId, user, runtime }]
+        : [];
+    });
+    const hostPermissions = (
+      session.accountId
+        ? session.hostPermissions?.includes("server.create")
+        : memberships.some(({ user }) =>
+            user.hostPermissions?.includes("server.create"),
+          )
     )
       ? ["server.create"]
       : [];
+    if (/^\/api\/panel-users(?:\/|$)/.test(req.path))
+      throw failure(
+        403,
+        "Only the local panel owner can manage panel accounts.",
+      );
     if (req.path === "/api/servers" && read(req)) {
       const servers = memberships.map(({ serverId, user, runtime }) => {
         const d = runtime.descriptor();

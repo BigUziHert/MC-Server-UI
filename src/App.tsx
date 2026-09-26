@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useId, useRef, useState } from "react";
 import {
   Activity,
+  ArrowLeft,
   ArrowDown,
   ArrowDownToLine,
   ArrowRight,
@@ -324,6 +325,15 @@ export default function App({
     firstServer?: boolean;
   } | null>(null);
   const [notice, setNotice] = useState("");
+  const [panelUsersOpen, setPanelUsersOpen] = useState(
+    () => getPage() === "subusers",
+  );
+  const notify = useCallback((message: string) => setNotice(message), []);
+  useEffect(() => {
+    const changed = () => setPanelUsersOpen(getPage() === "subusers");
+    window.addEventListener("hashchange", changed);
+    return () => window.removeEventListener("hashchange", changed);
+  }, []);
   const fleetRequest = useRef(0);
   const fleetInFlight = useRef(false);
   const desktopSelection = useRef<boolean | null>(null);
@@ -499,8 +509,16 @@ export default function App({
   useEffect(() => {
     void loadServers(true);
     const timer = setInterval(() => void loadServers(), 5000);
+    const refresh = () => void loadServers();
+    const visible = () => {
+      if (document.visibilityState === "visible") refresh();
+    };
+    window.addEventListener("focus", refresh);
+    document.addEventListener("visibilitychange", visible);
     return () => {
       clearInterval(timer);
+      window.removeEventListener("focus", refresh);
+      document.removeEventListener("visibilitychange", visible);
       fleetRequest.current++;
       fleetInFlight.current = false;
     };
@@ -561,8 +579,8 @@ export default function App({
   useEffect(() => {
     if (firstServerSetup) document.title = "Set up your server · MC Panel";
     else if (!active)
-      document.title = `${loading ? "Opening" : error ? "Connection error" : "Welcome"} · MC Panel`;
-  }, [active, error, firstServerSetup, loading]);
+      document.title = `${loading ? "Opening" : error ? "Connection error" : !remote && panelUsersOpen ? "Panel users" : "Welcome"} · MC Panel`;
+  }, [active, error, firstServerSetup, loading, panelUsersOpen, remote]);
   const saved = (server: ServerRecord) => {
     fleetRequest.current++;
     fleetInFlight.current = false;
@@ -677,6 +695,8 @@ export default function App({
       ) : (
         <EmptyFleet
           session={session}
+          panelUsersOpen={!remote && panelUsersOpen}
+          notify={notify}
           canAddServer={canAddServer}
           onSignedOut={expireSession}
           onConnect={setConnection}
@@ -737,12 +757,16 @@ function EmptyFleet({
   onConnect,
   session,
   onSignedOut,
+  panelUsersOpen,
+  notify,
 }: {
   onAdd: (step: "create" | "import") => void;
   canAddServer: boolean;
   onConnect: (mode: ConnectionMode) => void;
   session?: PanelSession;
   onSignedOut?: () => void;
+  panelUsersOpen: boolean;
+  notify: (message: string, error?: boolean) => void;
 }) {
   return (
     <div className="fleet-welcome-shell">
@@ -768,80 +792,107 @@ function EmptyFleet({
           </a>
         </div>
       </header>
-      <main className="fleet-welcome-main">
-        <section
-          className="fleet-welcome-intro"
-          aria-labelledby="fleet-welcome-title"
-        >
-          <div className="fleet-welcome-copy">
-            <h1 id="fleet-welcome-title">
-              {session ? "No shared servers" : "Welcome to MC Panel"}
-            </h1>
-            <p>
-              {session && !canAddServer
-                ? "Your access may have been removed. Ask the server owner for a new invitation."
-                : session
-                  ? `Create or import a server on ${window.location.host}.`
-                  : "Start a new Minecraft server, or bring one you already have."}
-            </p>
-            {canAddServer && (
-              <div className="fleet-welcome-choices">
-                <button
-                  className="fleet-welcome-choice"
-                  aria-label="Create a new server"
-                  aria-describedby="welcome-create-description"
-                  onClick={() => onAdd("create")}
-                >
-                  <span className="fleet-welcome-choice-icon">
-                    <Plus size={23} />
-                  </span>
-                  <span>
-                    <strong>Create a new server</strong>
-                    <span id="welcome-create-description">
-                      Choose your software. We’ll guide the setup.
+      {panelUsersOpen ? (
+        <main className="fleet-panel-users-main">
+          <div className="fleet-panel-users-navigation">
+            <button
+              className="btn"
+              onClick={() => {
+                window.location.hash = "console";
+              }}
+            >
+              <ArrowLeft size={16} /> Back to servers
+            </button>
+            <PanelAccount onConnect={onConnect} />
+          </div>
+          <Subusers notify={notify} />
+        </main>
+      ) : (
+        <main className="fleet-welcome-main">
+          <section
+            className="fleet-welcome-intro"
+            aria-labelledby="fleet-welcome-title"
+          >
+            <div className="fleet-welcome-copy">
+              <h1 id="fleet-welcome-title">
+                {session ? "No shared servers" : "Welcome to MC Panel"}
+              </h1>
+              <p>
+                {session && !canAddServer
+                  ? "No servers are currently shared with this account. Servers you gain access to will appear here automatically."
+                  : session
+                    ? `Create or import a server on ${window.location.host}.`
+                    : "Start a new Minecraft server, or bring one you already have."}
+              </p>
+              {canAddServer && (
+                <div className="fleet-welcome-choices">
+                  <button
+                    className="fleet-welcome-choice"
+                    aria-label="Create a new server"
+                    aria-describedby="welcome-create-description"
+                    onClick={() => onAdd("create")}
+                  >
+                    <span className="fleet-welcome-choice-icon">
+                      <Plus size={23} />
                     </span>
-                  </span>
-                  <ArrowRight size={19} />
-                </button>
-                <button
-                  className="fleet-welcome-choice"
-                  aria-label="Import an existing server"
-                  aria-describedby="welcome-import-description"
-                  onClick={() => onAdd("import")}
-                >
-                  <span className="fleet-welcome-choice-icon">
-                    <FolderOpen size={23} />
-                  </span>
-                  <span>
-                    <strong>Import an existing server</strong>
-                    <span id="welcome-import-description">
-                      Connect a server folder on{" "}
-                      {session ? "the connected computer" : "your computer"}.
+                    <span>
+                      <strong>Create a new server</strong>
+                      <span id="welcome-create-description">
+                        Choose your software. We’ll guide the setup.
+                      </span>
                     </span>
-                  </span>
-                  <ArrowRight size={19} />
-                </button>
-              </div>
-            )}
-            <div className="welcome-remote-account">
-              {window.mcPanelConnections && (
-                <div className="fleet-available-servers">
-                  <ServerSwitcher
-                    servers={[]}
-                    remoteHost={session ? window.location.host : undefined}
-                    onSelect={() => {}}
-                  />
+                    <ArrowRight size={19} />
+                  </button>
+                  <button
+                    className="fleet-welcome-choice"
+                    aria-label="Import an existing server"
+                    aria-describedby="welcome-import-description"
+                    onClick={() => onAdd("import")}
+                  >
+                    <span className="fleet-welcome-choice-icon">
+                      <FolderOpen size={23} />
+                    </span>
+                    <span>
+                      <strong>Import an existing server</strong>
+                      <span id="welcome-import-description">
+                        Connect a server folder on{" "}
+                        {session ? "the connected computer" : "your computer"}.
+                      </span>
+                    </span>
+                    <ArrowRight size={19} />
+                  </button>
                 </div>
               )}
-              <PanelAccount
-                session={session}
-                onSignedOut={onSignedOut}
-                onConnect={onConnect}
-              />
+              <div className="welcome-remote-account">
+                {!session && (
+                  <button
+                    className="btn"
+                    onClick={() => {
+                      window.location.hash = "subusers";
+                    }}
+                  >
+                    <Users size={16} /> Manage panel users
+                  </button>
+                )}
+                {window.mcPanelConnections && (
+                  <div className="fleet-available-servers">
+                    <ServerSwitcher
+                      servers={[]}
+                      remoteHost={session ? window.location.host : undefined}
+                      onSelect={() => {}}
+                    />
+                  </div>
+                )}
+                <PanelAccount
+                  session={session}
+                  onSignedOut={onSignedOut}
+                  onConnect={onConnect}
+                />
+              </div>
             </div>
-          </div>
-        </section>
-      </main>
+          </section>
+        </main>
+      )}
       <footer className="fleet-welcome-footer">
         <span>
           MC Panel <span className="footer-version">v{appVersion}</span>

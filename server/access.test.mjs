@@ -454,7 +454,7 @@ test("password login grants only independently enrolled memberships sharing the 
   assert.equal(await f.access.authenticate(request(all.cookie)), null);
 });
 
-test("reset and revoke invalidate whole multi-membership sessions without affecting other passwords", async (t) => {
+test("reset invalidates affected sessions while server revocation retains other proven memberships", async (t) => {
   const f = await fixture(t);
   await f.enroll();
   const memberB = f.addB();
@@ -466,7 +466,10 @@ test("reset and revoke invalidate whole multi-membership sessions without affect
   await f.enroll(password, memberB);
   const both = await f.login();
   await f.access.revoke("server-b", "user-b");
-  assert.equal(await f.access.authenticate(request(both.cookie)), null);
+  assert.deepEqual(
+    (await f.access.authenticate(request(both.cookie))).memberships,
+    [scopeA],
+  );
   assert.deepEqual((await f.login()).session.memberships, [scopeA]);
 });
 
@@ -659,7 +662,7 @@ test("legacy settings strip email secrets on save while preserving primary-scope
   );
   await migrated.configure({ port: 3443 });
   const stored = await f.read();
-  assert.equal(stored.version, 2);
+  assert.equal(stored.version, 3);
   assert.equal(JSON.stringify(stored).includes("old-provider-secret"), false);
   assert.equal(stored.sessions.length, 1);
   assert.equal(stored.tokens.length, 1);

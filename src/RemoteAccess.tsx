@@ -17,18 +17,12 @@ import {
   ShieldCheck,
 } from "lucide-react";
 import App from "./App";
-import { DesktopPanelReturn } from "./PanelAccount";
+import { DesktopPanelReturn, type PanelSession } from "./PanelAccount";
 import { api, messageOf } from "./api";
 import { reportDesktopServers } from "./desktop-connections";
 import "./remote-access.css";
 
-type SubuserSession = {
-  role: "subuser";
-  email: string;
-  serverId: string;
-  userId: string;
-  permissions: string[];
-};
+type SubuserSession = PanelSession;
 type Session = { role: "owner" } | { role: "guest" } | SubuserSession;
 const unauthorized = (cause: unknown) =>
   (cause as { status?: number })?.status === 401;
@@ -148,7 +142,7 @@ export default function RemoteAccess() {
     );
   return (
     <App
-      key={session.userId}
+      key={session.accountId ?? session.userId}
       session={session}
       onSignedOut={signedOut}
       requestedRemoteServer={requestedRemoteServer}

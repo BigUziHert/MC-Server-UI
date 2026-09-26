@@ -7,10 +7,12 @@ import { useDesktopConnections } from "./desktop-connections";
 
 export type PanelSession = {
   role: "subuser";
+  accountId?: string;
   email: string;
-  serverId: string;
+  serverId: string | null;
   userId: string;
   permissions: string[];
+  hostPermissions?: string[];
 };
 
 export function DesktopPanelReturn() {

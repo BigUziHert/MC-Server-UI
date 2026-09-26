@@ -2030,6 +2030,14 @@ export async function createPanel(options = {}) {
       playersAvailable: true,
     });
   });
+  const currentAccessUser = (principal) => {
+    if (!principal) return null;
+    const base = state.users.find((user) => user.id === principal.userId);
+    const user = options.resolveAccessUser
+      ? options.resolveAccessUser(principal.userId, base)
+      : base;
+    return user?.email === principal.email ? user : null;
+  };
   const safeServerSettings = (req) => {
     const current = descriptor();
     const fields = [
@@ -2050,13 +2058,7 @@ export async function createPanel(options = {}) {
       "serverIconVersion",
       "iconPreference",
     ];
-    const user =
-      req[remotePrincipal] &&
-      state.users.find(
-        (item) =>
-          item.id === req[remotePrincipal].userId &&
-          item.email === req[remotePrincipal].email,
-      );
+    const user = currentAccessUser(req[remotePrincipal]);
     return {
       ...Object.fromEntries(fields.map((key) => [key, current[key]])),
       ...(user
@@ -2851,10 +2853,7 @@ export async function createPanel(options = {}) {
       const self = { serverDir, withFileSource };
       const getSource = async () => {
         if (principal) {
-          const targetUser = state.users.find(
-            (user) =>
-              user.id === principal.userId && user.email === principal.email,
-          );
+          const targetUser = currentAccessUser(principal);
           if (
             !targetUser ||
             !userWithPermissions(targetUser).permissions.includes("file.create")
@@ -3360,20 +3359,29 @@ export async function createPanel(options = {}) {
   const checkSubuserAccess = (req, permission, target, requested = []) => {
     const principal = req[remotePrincipal];
     if (!principal) return;
+    const effectiveTarget =
+      target && options.resolveAccessUser
+        ? options.resolveAccessUser(target.id, target)
+        : target;
+    if (target && (!effectiveTarget || effectiveTarget.panelAccount))
+      throw error(
+        403,
+        "The panel owner manages this account's access in Panel users.",
+      );
     if (
       Object.hasOwn(req.body ?? {}, "hostPermissions") ||
-      userWithPermissions(target ?? {}).hostPermissions.length
+      userWithPermissions(effectiveTarget ?? {}).hostPermissions.length
     )
       throw error(
         403,
         "Only the local panel owner can manage host permissions or users who have them.",
       );
-    const actor = state.users.find((user) => user.email === principal.email);
+    const actor = currentAccessUser(principal);
     const allowed = actor ? userWithPermissions(actor).permissions : [];
     if (
       !allowed.includes(permission) ||
-      (target &&
-        userWithPermissions(target).permissions.some(
+      (effectiveTarget &&
+        userWithPermissions(effectiveTarget).permissions.some(
           (id) => !allowed.includes(id),
         )) ||
       requested.some((id) => !allowed.includes(id))
@@ -3384,7 +3392,11 @@ export async function createPanel(options = {}) {
       );
   };
   app.get("/api/subusers", (_req, res) =>
-    res.json({ users: state.users.map(presentedUser) }),
+    res.json({
+      users: (options.subusersForDisplay?.(state.users) ?? state.users).map(
+        presentedUser,
+      ),
+    }),
   );
   app.post(
     "/api/subusers/:id/invite",
@@ -3982,6 +3994,17 @@ export async function createFleet(options = {}) {
       ...entry,
       memoryLimit: entry.memoryLimitMB,
       useEnvironment: false,
+      resolveAccessUser: (userId, base) =>
+        access ? access.resolveUser(entry.id, userId, base) : base,
+      subusersForDisplay: (users) =>
+        access
+          ? [
+              ...users
+                .map((user) => access.resolveUser(entry.id, user.id, user))
+                .filter((user) => user && !user.panelAccount),
+              ...access.usersForServer(entry.id),
+            ]
+          : users,
       invitationState: (userId) => access?.invitationState(entry.id, userId),
       inviteUser: (user) =>
         access.invite({
@@ -4017,15 +4040,16 @@ export async function createFleet(options = {}) {
         if (!runtime || runtime.unavailable)
           throw error(409, "The source server is unavailable.");
         if (principal) {
-          const user = runtime
-            .subusers()
-            .find(
-              (item) =>
-                item.id === principal.copySourceUserId &&
-                item.email === principal.email,
-            );
+          const user = access.resolveUser(
+            id,
+            principal.copySourceUserId,
+            runtime
+              .subusers()
+              .find((item) => item.id === principal.copySourceUserId),
+          );
           if (
             principal.copySourceServerId !== id ||
+            user?.email !== principal.email ||
             !user?.permissions.includes("file.read-content") ||
             !access.membershipAllowed(id, user.id, user.email) ||
             !principal.copySourceAcceptedAt ||
@@ -4290,10 +4314,18 @@ export async function createFleet(options = {}) {
   try {
     access = await createAccessService({
       dataDir,
-      getUser: async (serverId, userId) =>
-        (await accessRuntime(serverId))
-          ?.subusers?.()
-          .find((user) => user.id === userId) ?? null,
+      listServerIds: () => registry.servers.map((entry) => entry.id),
+      listLegacyUsers: () =>
+        [...runtimes].flatMap(([serverId, runtime]) =>
+          (runtime.subusers?.() ?? []).map((user) => ({ serverId, user })),
+        ),
+      getUser: async (serverId, userId) => {
+        const base =
+          (await accessRuntime(serverId))
+            ?.subusers?.()
+            .find((user) => user.id === userId) ?? null;
+        return access ? access.resolveUser(serverId, userId, base) : base;
+      },
     });
   } catch (cause) {
     await Promise.allSettled(
@@ -4378,12 +4410,16 @@ export async function createFleet(options = {}) {
     await access.hostAuthority(req, authority);
     const target = {
       serverId: entry.id,
-      userId: entry.creatorUserId,
+      userId: authority.accountId ?? entry.creatorUserId,
       email: authority.email,
     };
-    let user = runtime
-      .subusers()
-      .find((item) => item.id === target.userId && item.email === target.email);
+    const resolveCreator = () =>
+      access.resolveUser(
+        entry.id,
+        target.userId,
+        runtime.subusers().find((item) => item.id === target.userId),
+      );
+    let user = resolveCreator();
     if (entry.creatorAccessReady) {
       const session = await access.authenticate(req);
       if (
@@ -4399,9 +4435,15 @@ export async function createFleet(options = {}) {
           "Your access to this created server has been revoked. Contact the panel owner.",
         );
     } else {
-      user = await runtime.ensureCreator(target);
+      if (!authority.accountId) await runtime.ensureCreator(target);
       await access.enrollCreated(req, authority, target);
+      user = resolveCreator();
     }
+    if (!user || user.email !== authority.email)
+      throw error(
+        403,
+        "Your access to this created server has been revoked. Contact the panel owner.",
+      );
     if (!entry.creatorAccessReady) {
       const completed = { ...entry, creatorAccessReady: true };
       await persist({
@@ -4414,6 +4456,57 @@ export async function createFleet(options = {}) {
     return { ...runtime.descriptor(), accessPermissions: user.permissions };
   };
   app.get("/api/access/session", (_req, res) => res.json({ role: "owner" }));
+  // Panel accounts belong to the host and remain manageable with no servers.
+  // Keep these routes off remoteHostApp: server delegation is not host ownership.
+  app.get("/api/panel-users", (_req, res) =>
+    res.json({
+      users: access.listAccounts(),
+      servers: registry.servers.map((entry) => ({
+        id: entry.id,
+        name: runtimes.get(entry.id)?.descriptor().name ?? entry.name,
+        available: !runtimes.get(entry.id)?.unavailable,
+      })),
+    }),
+  );
+  const accountAudit = async (label, email) => {
+    try {
+      await panelAudit("user", label, email);
+    } catch {
+      return "The change was saved, but its audit history could not be saved.";
+    }
+  };
+  app.post("/api/panel-users", async (req, res) => {
+    const user = await access.createAccount(req.body ?? {});
+    await accountAudit("Panel account created", user.email);
+    res.status(201).json(user);
+  });
+  app.patch("/api/panel-users/:id", async (req, res) => {
+    const user = await access.updateAccount(req.params.id, req.body ?? {});
+    await accountAudit("Panel account access updated", user.email);
+    res.json(user);
+  });
+  app.delete("/api/panel-users/:id", async (req, res) => {
+    const user = access.account(req.params.id);
+    await access.deleteAccount(req.params.id);
+    const warning = await accountAudit(
+      "Panel account removed",
+      user?.email ?? "",
+    );
+    res.json({ ok: true, ...(warning ? { warning } : {}) });
+  });
+  app.post("/api/panel-users/:id/invite", async (req, res) => {
+    const invitation = await access.inviteAccount(req.params.id);
+    const warning = await accountAudit(
+      "Panel invitation link created",
+      invitation.account.email,
+    );
+    res.json({
+      user: invitation.account,
+      invitationUrl: invitation.invitationUrl,
+      inviteExpiresAt: invitation.inviteExpiresAt,
+      ...(warning ? { warning } : {}),
+    });
+  });
   app.get("/api/access/settings", (_req, res) => res.json(remote.status()));
   app.get("/api/access/network", async (_req, res) =>
     res.json({
@@ -4686,7 +4779,10 @@ export async function createFleet(options = {}) {
           ? { importRequestId: requestId, importFingerprint: fingerprint }
           : {}),
         ...(authority
-          ? { createdBy: authority, creatorUserId: randomUUID() }
+          ? {
+              createdBy: authority,
+              creatorUserId: authority.accountId ?? randomUUID(),
+            }
           : {}),
       };
       const runtime = await makeRuntime(entry);
@@ -4888,7 +4984,10 @@ export async function createFleet(options = {}) {
           version: "Configured JAR",
           software: "Java",
           ...(authority
-            ? { createdBy: authority, creatorUserId: randomUUID() }
+            ? {
+                createdBy: authority,
+                creatorUserId: authority.accountId ?? randomUUID(),
+              }
             : {}),
           ...(requestId
             ? { setupRequestId: requestId, setupFingerprint: fingerprint }
@@ -4979,15 +5078,17 @@ export async function createFleet(options = {}) {
       const principal = req?.[remotePrincipal];
       if (principal) {
         const session = await access.authenticate(req);
-        const user = runtimes
-          .get(id)
-          ?.subusers?.()
-          .find(
-            (item) =>
-              item.id === principal.userId && item.email === principal.email,
-          );
+        const user = access.resolveUser(
+          id,
+          principal.userId,
+          runtimes
+            .get(id)
+            ?.subusers?.()
+            .find((item) => item.id === principal.userId),
+        );
         if (
           principal.serverId !== id ||
+          user?.email !== principal.email ||
           !session?.memberships.some(
             (scope) =>
               scope.serverId === id && scope.userId === principal.userId,

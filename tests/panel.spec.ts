@@ -40,7 +40,7 @@ async function openPage(page: Page, hash: string, heading: string) {
       console: "/api/server",
       files: "/api/files",
       backups: "/api/backups",
-      subusers: "/api/subusers",
+      subusers: "/api/panel-users",
       audit: "/api/audit",
       players: "/api/players",
     } as Record<string, string>
@@ -522,6 +522,7 @@ test("subusers can be prepared before remote setup, searched, and revoked", asyn
     }),
   ).toBeDisabled();
   await dialog.getByLabel("Email address").fill("operator@example.com");
+  await dialog.locator(".subusers-permission-details summary").click();
   await dialog
     .getByRole("checkbox", { name: "View audit logs", exact: true })
     .check();
@@ -532,11 +533,11 @@ test("subusers can be prepared before remote setup, searched, and revoked", asyn
   const row = page.getByRole("row").filter({ hasText: "operator@example.com" });
   await expect(row).toContainText("1 selected");
   await expect(row).toContainText("Not invited");
-  expect((await (await request.get("/api/subusers")).json()).users).toEqual(
+  expect((await (await request.get("/api/panel-users")).json()).users).toEqual(
     expect.arrayContaining([
       expect.objectContaining({
         email: "operator@example.com",
-        role: "custom",
+        accessMode: "all",
         permissions: ["audit.read"],
       }),
     ]),
@@ -566,7 +567,7 @@ test("subusers can be prepared before remote setup, searched, and revoked", asyn
   await expect(dialog).not.toBeVisible();
   await expect(row).toHaveCount(0);
   expect(
-    (await (await request.get("/api/subusers")).json()).users.some(
+    (await (await request.get("/api/panel-users")).json()).users.some(
       (user: { email: string }) => user.email === "operator@example.com",
     ),
   ).toBe(false);
@@ -919,7 +920,7 @@ test("editable server names and the selected workspace persist across reloads", 
   ).toBeVisible();
 });
 
-test("server selection scopes file edits and downloads, console commands, backups, and access records", async ({
+test("server workspaces isolate files, commands and backups while panel users retain explicit server access", async ({
   page,
   request,
 }, testInfo) => {
@@ -1132,6 +1133,20 @@ test("server selection scopes file edits and downloads, console commands, backup
   dialog = page.getByRole("dialog", { name: "Create new subuser" });
   await dialog.getByLabel("Email address").fill("secondary-only@example.com");
   await dialog
+    .getByRole("combobox", { name: "Servers available to this person" })
+    .selectOption("selected");
+  const accessChoices = dialog
+    .getByRole("group", { name: "Allowed servers" })
+    .getByRole("checkbox");
+  for (const choice of await accessChoices.all()) await choice.uncheck();
+  await dialog
+    .getByRole("checkbox", {
+      name: "Access to E2E Isolated World",
+      exact: true,
+    })
+    .check();
+  await dialog.locator(".subusers-permission-details summary").click();
+  await dialog
     .getByRole("checkbox", { name: "View audit logs", exact: true })
     .check();
   await dialog
@@ -1154,9 +1169,10 @@ test("server selection scopes file edits and downloads, console commands, backup
     ]),
   );
   await switchServer(page, defaultServerId);
+  await openPage(page, "subusers", "Subusers");
   await expect(
     page.getByRole("row").filter({ hasText: "secondary-only@example.com" }),
-  ).toHaveCount(0);
+  ).toBeVisible();
 });
 test("Players grants and removes OP through the subprocess independently of panel access and other servers", async ({
   page,

@@ -1551,3 +1551,246 @@ for (const invitation of [false, true]) {
     expect(localCredentials).toEqual([]);
   });
 }
+
+for (const width of [1280, 375]) {
+  test(`owners can manage panel users before creating any server at ${width}px`, async ({
+    page,
+  }, testInfo) => {
+    await page.setViewportSize({ width, height: 900 });
+    const calls: { path: string; scope?: string }[] = [];
+    await page.route("**/api/**", (route) => {
+      const path = new URL(route.request().url()).pathname;
+      calls.push({ path, scope: route.request().headers()["x-server-id"] });
+      if (path === "/api/access/session")
+        return route.fulfill({ json: { role: "owner" } });
+      if (path === "/api/servers")
+        return route.fulfill({ json: { servers: [], defaultServerId: null } });
+      if (path === "/api/panel-users")
+        return route.fulfill({ json: { users: [], servers: [] } });
+      if (path === "/api/access/settings")
+        return route.fulfill({
+          json: {
+            enabled: false,
+            ready: false,
+            publicUrl: "",
+            transport: "direct",
+            port: 3002,
+          },
+        });
+      return route.fulfill({
+        status: 404,
+        json: { error: "Unavailable in panel account fixture." },
+      });
+    });
+    await page.goto("/");
+    await page
+      .getByRole("button", { name: "Manage panel users", exact: true })
+      .click();
+    await expect(page).toHaveURL(/#subusers$/);
+    await expect(
+      page.getByRole("heading", { name: /^(Panel users|Subusers)$/ }),
+    ).toBeVisible();
+    await expect
+      .poll(
+        () => calls.filter((call) => call.path === "/api/panel-users").length,
+      )
+      .toBeGreaterThan(0);
+    expect(
+      calls.some((call) =>
+        ["/api/server", "/api/console", "/api/subusers"].includes(call.path),
+      ),
+    ).toBe(false);
+    expect(
+      calls
+        .filter((call) => call.path === "/api/panel-users")
+        .every((call) => call.scope === undefined),
+    ).toBe(true);
+    await page.screenshot({
+      path: testInfo.outputPath(`empty-fleet-panel-users-${width}.png`),
+      fullPage: true,
+    });
+    await page
+      .getByRole("button", { name: "Back to servers", exact: true })
+      .click();
+    await expect(
+      page.getByRole("heading", { name: "Welcome to MC Panel" }),
+    ).toBeVisible();
+    await page.goto("/#subusers");
+    await expect(
+      page.getByRole("heading", { name: /^(Panel users|Subusers)$/ }),
+    ).toBeVisible();
+  });
+}
+
+test("a panel account discovers grants automatically and survives individual or all-server revocation", async ({
+  page,
+}) => {
+  await page.clock.install();
+  const permissions = ["control.console", "file.read"];
+  const first = {
+    ...localServer,
+    id: "survival",
+    name: "Account survival",
+    accessPermissions: permissions,
+  };
+  const second = {
+    ...localServer,
+    id: "creative",
+    name: "Account creative",
+    accessPermissions: permissions,
+  };
+  let servers: (typeof first)[] = [];
+  let hostPermissions: string[] = [];
+  let credentialRequests = 0;
+  const scopes: string[] = [];
+  await desktopBridge(page, {
+    activeId: "pc-one",
+    remoteServers: { "pc-two": cachedRemoteServers["pc-two"] },
+  });
+  await page.route("**/api/**", (route) => {
+    const request = route.request();
+    const path = new URL(request.url()).pathname;
+    if (["/api/access/login", "/api/access/accept"].includes(path))
+      credentialRequests++;
+    if (path === "/api/access/session")
+      return route.fulfill({
+        json: {
+          role: "subuser",
+          accountId: "panel-account",
+          userId: "panel-account",
+          email: "panel-account@example.test",
+          serverId: null,
+          permissions: [],
+          hostPermissions: [],
+        },
+      });
+    if (path === "/api/servers")
+      return route.fulfill({
+        json: {
+          servers,
+          defaultServerId: servers[0]?.id ?? null,
+          hostPermissions,
+        },
+      });
+    if (["/api/server", "/api/console", "/api/files"].includes(path)) {
+      const id = request.headers()["x-server-id"];
+      const server = servers.find((item) => item.id === id);
+      if (!server)
+        return route.fulfill({
+          status: 403,
+          json: { error: "This server is no longer shared." },
+        });
+      scopes.push(id!);
+      return route.fulfill({
+        json:
+          path === "/api/server"
+            ? server
+            : path === "/api/console"
+              ? { lines: [] }
+              : { path: "", entries: [] },
+      });
+    }
+    return route.fulfill({
+      status: 404,
+      json: { error: "Unavailable in account fixture." },
+    });
+  });
+  const roster = () =>
+    page.evaluate(
+      async () =>
+        (await window.mcPanelConnections!.list()).panels
+          .find((panel) => panel.id === "pc-one")
+          ?.servers?.map((server) => server.id) ?? [],
+    );
+  await page.goto("/#console");
+  await expect(
+    page.getByRole("heading", { name: "No shared servers" }),
+  ).toBeVisible();
+  await expect(
+    page.getByText(
+      "Servers you gain access to will appear here automatically.",
+      { exact: false },
+    ),
+  ).toBeVisible();
+  expect(scopes).toEqual([]);
+  await expect(
+    page.getByRole("button", { name: "Manage panel users", exact: true }),
+  ).toHaveCount(0);
+
+  servers = [first];
+  await page.clock.runFor(5100);
+  await expect(
+    page.getByRole("heading", { name: first.name, exact: true }),
+  ).toBeVisible();
+  await expect.poll(roster).toEqual([first.id]);
+  servers = [first, second];
+  await page.clock.runFor(5100);
+  await expect(
+    page.getByRole("button", {
+      name: `Select server ${second.name}`,
+      exact: true,
+    }),
+  ).toBeVisible();
+  await expect(
+    page.getByRole("heading", { name: first.name, exact: true }),
+  ).toBeVisible();
+  await expect.poll(roster).toEqual([first.id, second.id]);
+  await page.getByRole("link", { name: "File Manager", exact: true }).click();
+  await expect(page).toHaveURL(/#files$/);
+  await page
+    .getByRole("button", { name: `Select server ${second.name}`, exact: true })
+    .click();
+  await expect(page).toHaveURL(/#console$/);
+  await expect(
+    page.getByRole("heading", { name: second.name, exact: true }),
+  ).toBeVisible();
+
+  servers = [second];
+  await page.clock.runFor(5100);
+  await expect.poll(roster).toEqual([second.id]);
+  await expect(
+    page.getByRole("heading", { name: second.name, exact: true }),
+  ).toBeVisible();
+  servers = [];
+  await page.clock.runFor(5100);
+  await expect(
+    page.getByRole("heading", { name: "No shared servers" }),
+  ).toBeVisible();
+  await expect.poll(roster).toEqual([]);
+  await expect(page.getByLabel("Password", { exact: true })).toHaveCount(0);
+  hostPermissions = ["server.create"];
+  await page.evaluate(() => window.dispatchEvent(new Event("focus")));
+  await expect(
+    page.getByRole("button", { name: "Create a new server", exact: true }),
+  ).toBeVisible();
+  hostPermissions = [];
+  await page.evaluate(() =>
+    document.dispatchEvent(new Event("visibilitychange")),
+  );
+  await expect(
+    page.getByRole("button", { name: "Create a new server", exact: true }),
+  ).toHaveCount(0);
+
+  servers = [first, second];
+  await page.clock.runFor(5100);
+  await expect(
+    page.getByRole("heading", { name: first.name, exact: true }),
+  ).toBeVisible();
+  await expect.poll(roster).toEqual([first.id, second.id]);
+  expect(credentialRequests).toBe(0);
+  expect(
+    await page.evaluate(() =>
+      (window as ConnectionMock).connectionReports
+        .filter((report) => report.panelId === "pc-one")
+        .every((report) => report.servers !== null),
+    ),
+  ).toBe(true);
+  expect(
+    await page.evaluate(
+      async () =>
+        (await window.mcPanelConnections!.list()).panels.find(
+          (panel) => panel.id === "pc-two",
+        )?.servers,
+    ),
+  ).toEqual(cachedRemoteServers["pc-two"]);
+});

@@ -8,6 +8,7 @@ import {
   expect,
   type APIRequestContext,
   type Page,
+  type Locator,
 } from "@playwright/test";
 import catalog from "../shared/subuser-permissions.json" with { type: "json" };
 
@@ -17,6 +18,9 @@ const permissionIds = catalog.groups.flatMap((group) =>
 type Fixture = { id: string; otherServerId: string };
 const test = base.extend<{ server: Fixture }>({
   server: async ({ request }, use) => {
+    const originalUsers = new Set(
+      (await users(request)).map((user) => user.id),
+    );
     const fleet = await (await request.get("/api/servers")).json();
     const occupied = new Set(
       fleet.servers.map((server: { port: number }) => server.port),
@@ -36,6 +40,13 @@ const test = base.extend<{ server: Fixture }>({
     try {
       await use({ id: server.id, otherServerId: fleet.defaultServerId });
     } finally {
+      for (const user of await users(request))
+        if (!originalUsers.has(user.id)) {
+          const removed = await request.delete(
+            `/api/panel-users/${encodeURIComponent(user.id)}`,
+          );
+          expect(removed.ok()).toBe(true);
+        }
       await removeTestServer(request, server.id);
     }
   },
@@ -49,16 +60,24 @@ async function openSubusers(page: Page, id: string) {
   ).toBeVisible();
 }
 
-async function users(request: APIRequestContext, id: string) {
-  const response = await request.get("/api/subusers", {
-    headers: { "X-Server-Id": id },
-  });
+async function showPermissionDetails(dialog: Locator) {
+  await expect(dialog).toBeVisible();
+  const details = dialog.locator(".subusers-permission-details");
+  if ((await details.count()) && (await details.getAttribute("open")) === null)
+    await details.locator("summary").click();
+}
+
+async function users(request: APIRequestContext) {
+  const response = await request.get("/api/panel-users");
   expect(response.status()).toBe(200);
   return (await response.json()).users as {
     id: string;
     email: string;
     permissions: string[];
     hostPermissions?: string[];
+    accessMode: "all" | "selected";
+    serverIds: string[];
+    excludedServerIds: string[];
   }[];
 }
 
@@ -73,6 +92,7 @@ test("permission presets select explicit grantable permissions", async ({
     name: "Create new subuser",
     exact: true,
   });
+  await showPermissionDetails(dialog);
   await dialog
     .getByLabel("Email address", { exact: true })
     .fill("viewer-preset@example.test");
@@ -90,11 +110,304 @@ test("permission presets select explicit grantable permissions", async ({
     .click();
   await expect(dialog).not.toBeVisible();
   expect(
-    (await users(request, server.id))
+    (await users(request))
       .find((user) => user.email === "viewer-preset@example.test")
       ?.permissions.slice()
       .sort(),
   ).toEqual(catalog.roleDefaults.viewer.slice().sort());
+});
+
+test("one panel account includes future servers and excludes an individual server without another invitation", async ({
+  page,
+  request,
+  server,
+}, testInfo) => {
+  await openSubusers(page, server.id);
+  let creates = 0;
+  const patches: Record<string, unknown>[] = [];
+  await page.route("**/api/panel-users**", (route) => {
+    expect(route.request().headers()["x-server-id"]).toBeUndefined();
+    if (route.request().method() === "POST") creates++;
+    if (route.request().method() === "PATCH")
+      patches.push(route.request().postDataJSON());
+    return route.continue();
+  });
+  await page.getByRole("button", { name: "New user", exact: true }).click();
+  let dialog = page.getByRole("dialog", {
+    name: "Create new subuser",
+    exact: true,
+  });
+  await expect(
+    dialog.getByLabel("Servers available to this person", { exact: true }),
+  ).toHaveValue("all");
+  await expect(
+    dialog.locator(".subusers-permission-details"),
+  ).not.toHaveAttribute("open");
+  await expect(
+    dialog
+      .getByRole("group", { name: "Allowed servers", exact: true })
+      .getByRole("checkbox", { checked: true }),
+  ).toHaveCount(
+    (await (await request.get("/api/servers")).json()).servers.length,
+  );
+  await dialog
+    .getByLabel("Email address", { exact: true })
+    .fill("panel-all@example.test");
+  await dialog
+    .getByRole("button", { name: "Use Viewer preset", exact: true })
+    .click();
+  await dialog
+    .getByRole("button", { name: "Create subuser", exact: true })
+    .click();
+  await expect(dialog).not.toBeVisible();
+  const account = (await users(request)).find(
+    (user) => user.email === "panel-all@example.test",
+  )!;
+  expect(account).toMatchObject({
+    accessMode: "all",
+    serverIds: [],
+    excludedServerIds: [],
+  });
+
+  const fleet = await (await request.get("/api/servers")).json();
+  let port = 29300;
+  while (fleet.servers.some((item: { port: number }) => item.port === port))
+    port++;
+  const created = await createProcessServer(request, {
+    data: { name: "Future panel server", mode: "live", port },
+  });
+  expect(created.status()).toBe(201);
+  const future = (await created.json()).server;
+  try {
+    await page.reload();
+    await page
+      .getByRole("button", {
+        name: "Edit permissions for panel-all@example.test",
+        exact: true,
+      })
+      .click();
+    dialog = page.getByRole("dialog", {
+      name: "Edit subuser permissions",
+      exact: true,
+    });
+    const futureAccess = dialog.getByRole("checkbox", {
+      name: "Access to Future panel server",
+      exact: true,
+    });
+    await expect(futureAccess).toBeChecked();
+    const currentAccess = dialog.getByRole("checkbox", {
+      name: "Access to Granular subusers fixture",
+      exact: true,
+    });
+    await currentAccess.uncheck();
+    await expect(futureAccess).toBeChecked();
+    await page.setViewportSize({ width: 390, height: 844 });
+    await expect
+      .poll(() =>
+        page.evaluate(() => document.documentElement.scrollWidth <= innerWidth),
+      )
+      .toBe(true);
+    await dialog.screenshot({
+      path: testInfo.outputPath("panel-users-server-exclusions-mobile.png"),
+      animations: "disabled",
+    });
+    await dialog
+      .getByRole("button", { name: "Save permissions", exact: true })
+      .click();
+    await expect(dialog).not.toBeVisible();
+    expect(patches).toHaveLength(1);
+    expect(patches[0]).toMatchObject({
+      accessMode: "all",
+      serverIds: [],
+      excludedServerIds: [server.id],
+    });
+    expect(patches[0]).not.toHaveProperty("serverOverrides");
+    expect(
+      (await users(request)).find((user) => user.id === account.id),
+    ).toMatchObject({ accessMode: "all", excludedServerIds: [server.id] });
+    await expect(
+      page.getByRole("row").filter({ hasText: account.email }),
+    ).toContainText("All current and future servers except 1");
+    await page.reload();
+    await page
+      .getByRole("button", {
+        name: "Edit permissions for panel-all@example.test",
+        exact: true,
+      })
+      .click();
+    await expect(currentAccess).not.toBeChecked();
+    await expect(futureAccess).toBeChecked();
+    await dialog.getByRole("button", { name: "Cancel", exact: true }).click();
+    expect(creates).toBe(1);
+  } finally {
+    await removeTestServer(request, future.id);
+  }
+});
+
+test("selected legacy account access and per-server permissions are preserved unless explicitly changed", async ({
+  page,
+  server,
+}, testInfo) => {
+  const serverList = [
+    { id: server.id, name: "Existing selected server" },
+    { id: server.otherServerId, name: "Another server" },
+  ];
+  let account = {
+    id: "legacy:legacy@example.test",
+    legacy: true,
+    email: "legacy@example.test",
+    permissions: [] as string[],
+    hostPermissions: [] as string[],
+    accessMode: "selected",
+    serverIds: [server.id],
+    excludedServerIds: [] as string[],
+    serverOverrides: { [server.id]: { permissions: ["control.console"] } },
+    createdAt: new Date().toISOString(),
+  };
+  const patches: Record<string, unknown>[] = [];
+  await page.route("**/api/panel-users**", (route) => {
+    if (route.request().method() === "PATCH") {
+      const body = route.request().postDataJSON();
+      patches.push(body);
+      if (patches.length < 3)
+        expect(body).not.toHaveProperty("serverOverrides");
+      account = {
+        ...account,
+        ...body,
+        id: "a6d4a390-444c-47d6-9b7f-b8f7a3e8f731",
+        legacy: false,
+      };
+      return route.fulfill({ json: { user: account } });
+    }
+    return route.fulfill({ json: { users: [account], servers: serverList } });
+  });
+  await openSubusers(page, server.id);
+  await page
+    .getByRole("button", {
+      name: `Edit permissions for ${account.email}`,
+      exact: true,
+    })
+    .click();
+  let dialog = page.getByRole("dialog", {
+    name: "Edit subuser permissions",
+    exact: true,
+  });
+  await expect(
+    dialog.getByLabel("Servers available to this person", { exact: true }),
+  ).toHaveValue("selected");
+  await expect(
+    dialog.getByRole("checkbox", {
+      name: "Access to Existing selected server",
+      exact: true,
+    }),
+  ).toBeChecked();
+  await expect(
+    dialog.getByRole("checkbox", {
+      name: "Access to Another server",
+      exact: true,
+    }),
+  ).not.toBeChecked();
+  await dialog
+    .getByText("Custom permissions for Existing selected server", {
+      exact: true,
+    })
+    .click();
+  await expect(dialog.locator(".subusers-server-override")).toContainText(
+    "Console",
+  );
+  await expect(dialog).toContainText(
+    "Custom server permissions are preserved.",
+  );
+  await expect(dialog).toContainText(
+    "Existing sign-ins keep their previous server access until a panel invitation is accepted.",
+  );
+  await dialog.screenshot({
+    path: testInfo.outputPath("panel-users-selected-legacy-desktop.png"),
+    animations: "disabled",
+  });
+  await dialog
+    .getByRole("button", { name: "Use Viewer preset", exact: true })
+    .click();
+  await dialog
+    .getByRole("button", { name: "Save permissions", exact: true })
+    .click();
+  await expect(dialog).not.toBeVisible();
+  expect(patches[0]).toMatchObject({
+    accessMode: "selected",
+    serverIds: [server.id],
+    excludedServerIds: [],
+  });
+  expect(account.serverOverrides[server.id].permissions).toEqual([
+    "control.console",
+  ]);
+  await page
+    .getByRole("button", {
+      name: `Edit permissions for ${account.email}`,
+      exact: true,
+    })
+    .click();
+  dialog = page.getByRole("dialog", {
+    name: "Edit subuser permissions",
+    exact: true,
+  });
+  await dialog
+    .getByLabel("Servers available to this person", { exact: true })
+    .selectOption("all");
+  await expect(
+    dialog.getByRole("checkbox", {
+      name: "Access to Existing selected server",
+      exact: true,
+    }),
+  ).toBeChecked();
+  await expect(
+    dialog.getByRole("checkbox", {
+      name: "Access to Another server",
+      exact: true,
+    }),
+  ).not.toBeChecked();
+  await dialog
+    .getByRole("checkbox", { name: "Access to Another server", exact: true })
+    .check();
+  await dialog
+    .getByRole("button", { name: "Save permissions", exact: true })
+    .click();
+  await expect(dialog).not.toBeVisible();
+  expect(patches[1]).toMatchObject({
+    accessMode: "all",
+    serverIds: [],
+    excludedServerIds: [],
+  });
+  expect(account.serverOverrides[server.id].permissions).toEqual([
+    "control.console",
+  ]);
+  await page
+    .getByRole("button", {
+      name: `Edit permissions for ${account.email}`,
+      exact: true,
+    })
+    .click();
+  dialog = page.getByRole("dialog", {
+    name: "Edit subuser permissions",
+    exact: true,
+  });
+  const replaceOverrides = dialog.getByRole("checkbox", {
+    name: "Use these permissions on every allowed server",
+    exact: true,
+  });
+  await expect(replaceOverrides).not.toBeChecked();
+  await replaceOverrides.check();
+  await dialog
+    .getByRole("button", { name: "Use Operator preset", exact: true })
+    .click();
+  await dialog
+    .getByRole("button", { name: "Save permissions", exact: true })
+    .click();
+  await expect(dialog).not.toBeVisible();
+  expect(patches[2]).toMatchObject({
+    serverOverrides: {},
+    permissions: catalog.roleDefaults.operator,
+  });
+  expect(account.serverOverrides).toEqual({});
 });
 
 test("only the owner explicitly grants computer access outside server permission presets", async ({
@@ -106,6 +419,7 @@ test("only the owner explicitly grants computer access outside server permission
   await openSubusers(page, server.id);
   await page.getByRole("button", { name: "New user", exact: true }).click();
   const dialog = page.getByRole("dialog");
+  await showPermissionDetails(dialog);
   const hostPermission = dialog.getByRole("checkbox", {
     name: "Create and import servers",
     exact: true,
@@ -128,7 +442,7 @@ test("only the owner explicitly grants computer access outside server permission
     .click();
   await expect(dialog).not.toBeVisible();
   expect(
-    (await users(request, server.id)).find((user) => user.email === email)
+    (await users(request)).find((user) => user.email === email)
       ?.hostPermissions,
   ).toEqual(["server.create"]);
   await page
@@ -141,7 +455,7 @@ test("only the owner explicitly grants computer access outside server permission
     .click();
   await expect(dialog).not.toBeVisible();
   expect(
-    (await users(request, server.id)).find((user) => user.email === email)
+    (await users(request)).find((user) => user.email === email)
       ?.hostPermissions,
   ).toEqual([]);
 });
@@ -158,6 +472,7 @@ test("granular subuser permissions persist, edit, and expose accurate mixed grou
     name: "Create new subuser",
     exact: true,
   });
+  await showPermissionDetails(dialog);
   await expect(dialog).toContainText("No invitation link can be created");
   await expect(
     dialog.getByRole("checkbox", {
@@ -213,14 +528,11 @@ test("granular subuser permissions persist, edit, and expose accurate mixed grou
     "file.update",
   ];
   expect(
-    (await users(request, server.id)).find((user) => user.email === email)
-      ?.permissions,
+    (await users(request)).find((user) => user.email === email)?.permissions,
   ).toEqual(expected);
-  expect(
-    (await users(request, server.otherServerId)).some(
-      (user) => user.email === email,
-    ),
-  ).toBe(false);
+  await selectServer(page, server.otherServerId);
+  await expect(page.getByRole("row").filter({ hasText: email })).toBeVisible();
+  await selectServer(page, server.id);
   await page.reload();
   await page
     .getByRole("button", { name: `Edit permissions for ${email}`, exact: true })
@@ -229,6 +541,7 @@ test("granular subuser permissions persist, edit, and expose accurate mixed grou
     name: "Edit subuser permissions",
     exact: true,
   });
+  await showPermissionDetails(dialog);
   await expect(dialog).toContainText("Permission changes apply immediately");
   await expect(
     dialog.getByLabel("Email address", { exact: true }),
@@ -264,8 +577,7 @@ test("granular subuser permissions persist, edit, and expose accurate mixed grou
   await expect(dialog).not.toBeVisible();
   const updated = permissionIds.filter((id) => !id.startsWith("file."));
   expect(
-    (await users(request, server.id)).find((user) => user.email === email)
-      ?.permissions,
+    (await users(request)).find((user) => user.email === email)?.permissions,
   ).toEqual(updated);
   await page
     .getByRole("button", { name: `Edit permissions for ${email}`, exact: true })
@@ -274,6 +586,7 @@ test("granular subuser permissions persist, edit, and expose accurate mixed grou
     name: "Edit subuser permissions",
     exact: true,
   });
+  await showPermissionDetails(dialog);
   await expect(
     dialog.getByRole("checkbox", { name: "Select all Files", exact: true }),
   ).not.toBeChecked();
@@ -282,8 +595,7 @@ test("granular subuser permissions persist, edit, and expose accurate mixed grou
     .check();
   await dialog.getByRole("button", { name: "Cancel", exact: true }).click();
   expect(
-    (await users(request, server.id)).find((user) => user.email === email)
-      ?.permissions,
+    (await users(request)).find((user) => user.email === email)?.permissions,
   ).toEqual(updated);
 });
 
@@ -295,10 +607,10 @@ test("subuser cancellation and save errors preserve deliberate selections withou
   await openSubusers(page, server.id);
   let deny = true;
   let submitted = 0;
-  await page.route("**/api/subusers", async (route) => {
+  await page.route("**/api/panel-users", async (route) => {
     if (route.request().method() !== "POST") return route.continue();
     submitted++;
-    expect(route.request().headers()["x-server-id"]).toBe(server.id);
+    expect(route.request().headers()["x-server-id"]).toBeUndefined();
     if (deny)
       await route.fulfill({
         status: 403,
@@ -311,18 +623,20 @@ test("subuser cancellation and save errors preserve deliberate selections withou
     name: "Create new subuser",
     exact: true,
   });
+  await showPermissionDetails(dialog);
   await dialog
     .getByLabel("Email address", { exact: true })
     .fill("cancelled@example.test");
   await dialog.getByRole("checkbox", { name: "Console", exact: true }).check();
   await dialog.getByRole("button", { name: "Cancel", exact: true }).click();
   expect(submitted).toBe(0);
-  expect(await users(request, server.id)).toEqual([]);
+  expect(await users(request)).toEqual([]);
   await page.getByRole("button", { name: "New user", exact: true }).click();
   dialog = page.getByRole("dialog", {
     name: "Create new subuser",
     exact: true,
   });
+  await showPermissionDetails(dialog);
   const email = dialog.getByLabel("Email address", { exact: true });
   await expect(email).toHaveValue("");
   await expect(
@@ -350,14 +664,14 @@ test("subuser cancellation and save errors preserve deliberate selections withou
   await expect(
     dialog.getByRole("checkbox", { name: "Start", exact: true }),
   ).toBeChecked();
-  expect(await users(request, server.id)).toEqual([]);
+  expect(await users(request)).toEqual([]);
   deny = false;
   await dialog
     .getByRole("button", { name: "Create subuser", exact: true })
     .click();
   await expect(dialog).not.toBeVisible();
   expect(submitted).toBe(2);
-  expect((await users(request, server.id))[0]).toMatchObject({
+  expect((await users(request))[0]).toMatchObject({
     email: "retry@example.test",
     permissions: ["control.start"],
   });
@@ -397,19 +711,19 @@ test("a failed invitation preserves the subuser and clipboard retries keep the s
   );
   let creates = 0;
   let invitations = 0;
-  await page.route("**/api/subusers", (route) => {
+  await page.route("**/api/panel-users", (route) => {
     if (route.request().method() === "POST") creates++;
     return route.continue();
   });
-  await page.route("**/api/subusers/*/invite", async (route) => {
+  await page.route("**/api/panel-users/*/invite", async (route) => {
     invitations++;
-    expect(route.request().headers()["x-server-id"]).toBe(server.id);
+    expect(route.request().headers()["x-server-id"]).toBeUndefined();
     if (invitations === 1)
       return route.fulfill({
         status: 503,
         json: { error: "Remote access is unavailable." },
       });
-    const user = (await users(request, server.id))[0];
+    const user = (await users(request))[0];
     return route.fulfill({
       json: {
         message: "Invitation link created.",
@@ -455,7 +769,7 @@ test("a failed invitation preserves the subuser and clipboard retries keep the s
   await expect(
     page.getByRole("alert").filter({ hasText: "The subuser is saved" }),
   ).toContainText("Remote access is unavailable.");
-  const saved = await users(request, server.id);
+  const saved = await users(request);
   expect(saved).toHaveLength(1);
   expect(saved[0].permissions).toEqual([
     "control.console",
@@ -475,6 +789,7 @@ test("a failed invitation preserves the subuser and clipboard retries keep the s
     name: "Share invitation link",
     exact: true,
   });
+  await showPermissionDetails(dialog);
   await expect(dialog).toBeVisible();
   const link = dialog.getByLabel("Invitation link", { exact: true });
   await expect(link).toHaveValue(invitationUrl);
@@ -538,7 +853,7 @@ test("a failed invitation preserves the subuser and clipboard retries keep the s
   ).toEqual({ value: invitationUrl, inDialog: true });
   expect(creates).toBe(1);
   expect(invitations).toBe(2);
-  expect(await users(request, server.id)).toHaveLength(1);
+  expect(await users(request)).toHaveLength(1);
   expect(await page.evaluate(() => JSON.stringify(localStorage))).not.toContain(
     "fixture-secret-token",
   );
@@ -589,11 +904,11 @@ test("resetting activated access explains immediate revocation and allows cancel
       },
     }),
   );
-  await page.route("**/api/subusers", (route) =>
+  await page.route("**/api/panel-users", (route) =>
     route.fulfill({ json: { users: [user] } }),
   );
   let resets = 0;
-  await page.route("**/api/subusers/activated-user/invite", (route) => {
+  await page.route("**/api/panel-users/activated-user/invite", (route) => {
     resets++;
     return route.fulfill({
       json: {
@@ -614,6 +929,7 @@ test("resetting activated access explains immediate revocation and allows cancel
     name: "Reset subuser access?",
     exact: true,
   });
+  await showPermissionDetails(dialog);
   await expect(dialog).toContainText(
     "Their current password and sessions stop working immediately",
   );
@@ -633,6 +949,7 @@ test("resetting activated access explains immediate revocation and allows cancel
     name: "Reset subuser access?",
     exact: true,
   });
+  await showPermissionDetails(dialog);
   await dialog
     .getByRole("button", { name: "Reset and create link", exact: true })
     .click();
@@ -719,7 +1036,10 @@ test("direct remote setup detects the public IP on request, supports a proxy, an
   await expect(
     setup.getByLabel("Public panel address", { exact: true }),
   ).toHaveValue("https://203.0.113.20:3004");
-  await expect(setup).toContainText("192.168.1.5");
+  await expect(setup).not.toContainText("192.168.1.5");
+  await expect(setup).not.toContainText("mobile data");
+  await expect(setup).not.toContainText("Forward only the remote access port");
+  await expect(setup).toContainText("Compare the certificate below.");
   await expect(setup).toContainText(
     "These settings do not open router or firewall ports",
   );
@@ -814,6 +1134,7 @@ test("permission groups and confirmation controls fit a mobile viewport", async 
     name: "Create new subuser",
     exact: true,
   });
+  await showPermissionDetails(dialog);
   await dialog
     .getByLabel("Email address", { exact: true })
     .fill("mobile@example.test");

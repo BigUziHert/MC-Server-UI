@@ -975,6 +975,50 @@ test("remote rosters stay with their sending sessions across local switches and 
   await h.controller.close();
 });
 
+test("a connected panel discovers new grants after an empty roster without dropping its session or other servers", async () => {
+  const h = harness();
+  const connected = await h.controller.open(origin);
+  const remote = h.views[0].webContents;
+  const sender = { sender: remote, senderFrame: remote.mainFrame };
+  const roster = () =>
+    h.controller.list().panels.find((panel) => panel.id === connected.activeId)
+      .servers;
+  const survival = { id: "survival", name: "Survival", status: "offline" };
+  const creative = { id: "creative", name: "Creative", status: "offline" };
+
+  h.controller.activate("local");
+  h.controller.reportServers(sender, []);
+  h.controller.reportServers(sender, [survival]);
+  h.controller.reportServers(sender, [survival, creative]);
+  assert.deepEqual(roster(), [survival, creative]);
+  assert.equal(h.controller.list().activeId, "local");
+  h.controller.reportServers(sender, [creative]);
+  assert.deepEqual(roster(), [creative]);
+  assert.throws(
+    () => h.controller.selectRemoteServer(connected.activeId, survival.id),
+    { status: 404 },
+  );
+  h.controller.reportServers(sender, []);
+  assert.deepEqual(roster(), []);
+  assert.equal(remote.isDestroyed(), false);
+  assert.equal(h.partitions[0].cleared, undefined);
+
+  h.controller.reportServers(sender, [survival, creative]);
+  h.controller.selectRemoteServer(connected.activeId, survival.id);
+  assert.deepEqual(
+    remote.sent.filter(
+      ([channel]) => channel === "mc-panel-remote-server-selected",
+    ),
+    [["mc-panel-remote-server-selected", survival.id]],
+  );
+  assert.equal(
+    h.views[0].loads.length,
+    1,
+    "new grants do not require signing in again",
+  );
+  await h.controller.close();
+});
+
 test("selector icons stay with their host for colliding IDs and reject unsafe image sources", async () => {
   const icon = (fill) =>
     `data:image/png;base64,${new Resvg(`<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64"><rect width="64" height="64" fill="${fill}"/></svg>`).render().asPng().toString("base64")}`;

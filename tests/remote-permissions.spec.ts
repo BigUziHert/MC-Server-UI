@@ -36,6 +36,13 @@ async function sharedPanel(page: Page, permissions: string[]) {
       permissions: ["control.console"],
       createdAt: stamp,
     },
+    {
+      id: "panel-managed",
+      email: "panel-managed@example.test",
+      permissions: ["file.read"],
+      panelAccount: true,
+      createdAt: stamp,
+    },
   ];
   await page.route("**/api/**", (route) => {
     const request = route.request();
@@ -458,6 +465,21 @@ test("remote subuser managers grant only their own permissions and invite withou
   ];
   const calls = await sharedPanel(page, permissions);
   await page.goto("/#subusers");
+  const panelAccount = page
+    .getByRole("row")
+    .filter({ hasText: "panel-managed@example.test" });
+  await expect(panelAccount).toContainText("Managed by panel owner");
+  for (const action of [
+    "Edit permissions for",
+    "Remove access record for",
+    "Create invite link for",
+  ])
+    await expect(
+      panelAccount.getByRole("button", {
+        name: `${action} panel-managed@example.test`,
+        exact: true,
+      }),
+    ).toBeDisabled();
   await expect(
     page.getByRole("button", {
       name: "Edit permissions for limited@example.test",
@@ -518,6 +540,9 @@ test("remote subuser managers grant only their own permissions and invite withou
     ),
   ).toEqual([]);
   expect(calls.filter((call) => call.path.endsWith("/invite"))).toHaveLength(1);
+  expect(
+    calls.filter((call) => call.path.startsWith("/api/panel-users")),
+  ).toEqual([]);
 });
 
 test("remote managers cannot reset their own access but can reset another user's access", async ({

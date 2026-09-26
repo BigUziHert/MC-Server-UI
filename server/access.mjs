@@ -8,6 +8,7 @@ import {
 import fs from "node:fs/promises";
 import path from "node:path";
 import { promisify } from "node:util";
+import permissionCatalog from "../shared/subuser-permissions.json" with { type: "json" };
 
 export const SUBUSER_COOKIE = "__Host-mc-subuser";
 const invitationLifetime = 24 * 60 * 60 * 1000;
@@ -141,24 +142,31 @@ export function validateAccessConfiguration(input, current = {}) {
 export async function createAccessService({
   dataDir,
   getUser,
+  listServerIds = () => [],
+  listLegacyUsers = () => [],
   now = Date.now,
 }) {
   const storage = path.join(dataDir, "remote-access.json");
   let state = {
-    version: 2,
+    version: 3,
     configuration: validateAccessConfiguration({}),
     memberships: [],
     tokens: [],
     sessions: [],
     creationRevocations: [],
+    accounts: [],
+    retiredLegacyEmails: [],
   };
   try {
     const saved = JSON.parse(await fs.readFile(storage, "utf8"));
     if (
-      ![1, 2].includes(saved.version) ||
+      ![1, 2, 3].includes(saved.version) ||
       !Array.isArray(saved.memberships) ||
       !Array.isArray(saved.tokens) ||
-      !Array.isArray(saved.sessions)
+      !Array.isArray(saved.sessions) ||
+      (saved.version === 3 &&
+        (!Array.isArray(saved.accounts) ||
+          !Array.isArray(saved.retiredLegacyEmails)))
     )
       throw new Error("Invalid access storage.");
     const configuration = { ...saved.configuration };
@@ -169,7 +177,7 @@ export async function createAccessService({
     )
       configuration.transport ??= "proxy";
     state = {
-      version: 2,
+      version: 3,
       configuration: validateAccessConfiguration(configuration),
       memberships: saved.memberships,
       tokens: saved.tokens,
@@ -177,7 +185,36 @@ export async function createAccessService({
       creationRevocations: Array.isArray(saved.creationRevocations)
         ? saved.creationRevocations
         : [],
+      accounts: Array.isArray(saved.accounts) ? saved.accounts : [],
+      retiredLegacyEmails: Array.isArray(saved.retiredLegacyEmails)
+        ? saved.retiredLegacyEmails
+        : [],
     };
+    const accountIds = new Set(),
+      accountEmails = new Set();
+    for (const account of state.accounts) {
+      if (
+        !account ||
+        typeof account.id !== "string" ||
+        !account.id ||
+        !validEmail(account.email) ||
+        account.email !== normalizedEmail(account.email) ||
+        accountIds.has(account.id) ||
+        accountEmails.has(account.email) ||
+        !["all", "selected"].includes(account.accessMode) ||
+        !Array.isArray(account.permissions) ||
+        !Array.isArray(account.hostPermissions) ||
+        !Array.isArray(account.serverIds) ||
+        !Array.isArray(account.excludedServerIds) ||
+        !account.serverOverrides ||
+        typeof account.serverOverrides !== "object" ||
+        Array.isArray(account.serverOverrides) ||
+        typeof account.authRevision !== "string"
+      )
+        throw new Error("Invalid panel account storage.");
+      accountIds.add(account.id);
+      accountEmails.add(account.email);
+    }
   } catch (cause) {
     if (cause.code !== "ENOENT")
       throw fail(
@@ -247,8 +284,295 @@ export async function createAccessService({
         "Configure the HTTPS panel address and enable remote access before creating an invitation link.",
       );
   };
+  const permissionIds = new Set(
+    permissionCatalog.groups.flatMap((group) =>
+      group.permissions.map((permission) => permission.id),
+    ),
+  );
+  const hostPermissionIds = new Set(
+    permissionCatalog.hostPermissions.map((permission) => permission.id),
+  );
+  const validPermissions = (value, allowed = permissionIds) => {
+    if (
+      !Array.isArray(value) ||
+      value.length > allowed.size ||
+      value.some((id) => !allowed.has(id))
+    )
+      throw fail(400, "Choose valid account permissions.");
+    return [...new Set(value)];
+  };
+  const serverIds = () => [...new Set(listServerIds())];
+  const accountById = (id) =>
+    state.accounts.find((account) => account.id === id);
+  const permitsServer = (account, serverId) =>
+    serverIds().includes(serverId) &&
+    !account.excludedServerIds.includes(serverId) &&
+    (account.accessMode === "all" || account.serverIds.includes(serverId));
+  const accountPermissions = (account, serverId) =>
+    account.serverOverrides[serverId]?.permissions ?? account.permissions;
+  const accountHostPermissions = (account, serverId) => [
+    ...new Set([
+      ...account.hostPermissions,
+      ...(account.serverOverrides[serverId]?.hostPermissions ?? []),
+    ]),
+  ];
+  const userForServer = (serverId, accountId) => {
+    const account = accountById(accountId);
+    if (!account || !permitsServer(account, serverId)) return null;
+    return {
+      id: account.id,
+      accountId: account.id,
+      panelAccount: true,
+      email: account.email,
+      createdAt: account.createdAt,
+      role: "custom",
+      permissions: [...accountPermissions(account, serverId)],
+      hostPermissions: accountHostPermissions(account, serverId),
+    };
+  };
+  const resolveUser = (serverId, userId, baseUser) => {
+    if (accountById(userId)) return userForServer(serverId, userId);
+    if (!baseUser || baseUser.id !== userId) return null;
+    const email = normalizedEmail(baseUser.email);
+    const linked = state.accounts.find((account) =>
+      account.legacyMembers?.some(
+        (member) => member.serverId === serverId && member.userId === userId,
+      ),
+    );
+    if (linked) {
+      if (linked.legacyPending !== true || !permitsServer(linked, serverId))
+        return null;
+      return {
+        ...baseUser,
+        managedAccountId: linked.id,
+        accountId: linked.id,
+        panelAccount: true,
+        permissions: [...accountPermissions(linked, serverId)],
+        hostPermissions: accountHostPermissions(linked, serverId),
+      };
+    }
+    if (
+      state.accounts.some((account) => account.email === email) ||
+      state.retiredLegacyEmails.includes(email)
+    )
+      return null;
+    return baseUser;
+  };
+  const legacyAccounts = () => {
+    const groups = new Map();
+    for (const { serverId, user } of listLegacyUsers()) {
+      const email = normalizedEmail(user?.email);
+      if (
+        !validEmail(email) ||
+        !user?.id ||
+        !serverIds().includes(serverId) ||
+        state.accounts.some((account) => account.email === email) ||
+        state.retiredLegacyEmails.includes(email)
+      )
+        continue;
+      let account = groups.get(email);
+      if (!account) {
+        account = {
+          id: `legacy:${email}`,
+          email,
+          legacy: true,
+          permissions: [],
+          hostPermissions: [],
+          accessMode: "selected",
+          serverIds: [],
+          excludedServerIds: [],
+          serverOverrides: {},
+          legacyMembers: [],
+        };
+        groups.set(email, account);
+      }
+      const createdAt =
+        typeof user.createdAt === "string" ? Date.parse(user.createdAt) : NaN;
+      if (
+        Number.isFinite(createdAt) &&
+        (!account.createdAt || createdAt < Date.parse(account.createdAt))
+      )
+        account.createdAt = new Date(createdAt).toISOString();
+      if (!account.serverIds.includes(serverId))
+        account.serverIds.push(serverId);
+      const previous = account.serverOverrides[serverId];
+      account.serverOverrides[serverId] = {
+        permissions: [
+          ...new Set([
+            ...(previous?.permissions ?? []),
+            ...(user.permissions ?? []).filter((id) => permissionIds.has(id)),
+          ]),
+        ],
+        hostPermissions: [
+          ...new Set([
+            ...(previous?.hostPermissions ?? []),
+            ...(user.hostPermissions ?? []).filter((id) =>
+              hostPermissionIds.has(id),
+            ),
+          ]),
+        ],
+      };
+      account.legacyMembers.push({ serverId, userId: user.id });
+    }
+    return [...groups.values()];
+  };
+  const accountInvitation = (account) => {
+    if (!account?.invitedAt) return {};
+    const token = state.tokens.find(
+      (item) => item.accountId === account.id && item.expiresAt > now(),
+    );
+    return {
+      invitedAt: new Date(account.invitedAt).toISOString(),
+      inviteExpiresAt: token ? new Date(token.expiresAt).toISOString() : null,
+      acceptedAt: account.acceptedAt
+        ? new Date(account.acceptedAt).toISOString()
+        : null,
+      inviteStatus: token
+        ? "pending"
+        : account.acceptedAt
+          ? "accepted"
+          : "expired",
+    };
+  };
+  const publicAccount = (account) => {
+    if (!account) return null;
+    const { password, authRevision, ...visible } = account;
+    return structuredClone({ ...visible, ...accountInvitation(account) });
+  };
+  const findAccount = (id) =>
+    accountById(id) ?? legacyAccounts().find((account) => account.id === id);
+  const promoted = (account) =>
+    account.legacy
+      ? {
+          ...account,
+          id: randomUUID(),
+          legacy: false,
+          legacyPending: true,
+          createdAt: new Date(now()).toISOString(),
+          authRevision: randomUUID(),
+        }
+      : { ...account };
+  const validateAccount = (input, current) => {
+    if (!input || typeof input !== "object" || Array.isArray(input))
+      throw fail(400, "Enter valid panel account settings.");
+    const allowed = new Set([
+      "email",
+      "permissions",
+      "hostPermissions",
+      "accessMode",
+      "serverIds",
+      "excludedServerIds",
+      "serverOverrides",
+      "role",
+    ]);
+    if (Object.keys(input).some((key) => !allowed.has(key)))
+      throw fail(400, "Choose valid panel account settings.");
+    const email = normalizedEmail(input.email ?? current?.email);
+    if (!validEmail(email))
+      throw fail(400, "Enter a valid account email address.");
+    if (current && email !== current.email)
+      throw fail(400, "Create a new account to use a different email address.");
+    const account = {
+      id: randomUUID(),
+      createdAt: new Date(now()).toISOString(),
+      authRevision: randomUUID(),
+      permissions: [],
+      hostPermissions: [],
+      accessMode: "all",
+      serverIds: [],
+      excludedServerIds: [],
+      serverOverrides: {},
+      ...current,
+      email,
+    };
+    if (Object.hasOwn(input, "permissions"))
+      account.permissions = validPermissions(input.permissions);
+    else if (!current && input.role)
+      account.permissions = validPermissions(
+        permissionCatalog.roleDefaults[input.role] ?? [],
+      );
+    if (Object.hasOwn(input, "hostPermissions"))
+      account.hostPermissions = validPermissions(
+        input.hostPermissions,
+        hostPermissionIds,
+      );
+    if (Object.hasOwn(input, "accessMode")) {
+      if (!["all", "selected"].includes(input.accessMode))
+        throw fail(400, "Choose all servers or selected servers.");
+      account.accessMode = input.accessMode;
+    }
+    const knownIds = new Set([
+      ...serverIds(),
+      ...(current?.serverIds ?? []),
+      ...(current?.excludedServerIds ?? []),
+      ...Object.keys(current?.serverOverrides ?? {}),
+    ]);
+    const validIds = (ids) => {
+      if (
+        !Array.isArray(ids) ||
+        ids.length > 10000 ||
+        ids.some((id) => typeof id !== "string" || !knownIds.has(id))
+      )
+        throw fail(400, "Choose existing servers for this account.");
+      return [...new Set(ids)];
+    };
+    for (const field of ["serverIds", "excludedServerIds"])
+      if (Object.hasOwn(input, field)) account[field] = validIds(input[field]);
+    if (Object.hasOwn(input, "serverOverrides")) {
+      if (
+        !input.serverOverrides ||
+        typeof input.serverOverrides !== "object" ||
+        Array.isArray(input.serverOverrides)
+      )
+        throw fail(400, "Enter valid per-server permissions.");
+      validIds(Object.keys(input.serverOverrides));
+      account.serverOverrides = Object.fromEntries(
+        Object.entries(input.serverOverrides).map(([id, value]) => {
+          if (
+            !value ||
+            typeof value !== "object" ||
+            Array.isArray(value) ||
+            Object.keys(value).some(
+              (key) => !["permissions", "hostPermissions"].includes(key),
+            )
+          )
+            throw fail(400, "Enter valid per-server permissions.");
+          return [
+            id,
+            {
+              permissions: validPermissions(value.permissions),
+              ...(Object.hasOwn(value, "hostPermissions")
+                ? {
+                    hostPermissions: validPermissions(
+                      value.hostPermissions,
+                      hostPermissionIds,
+                    ),
+                  }
+                : {}),
+            },
+          ];
+        }),
+      );
+    }
+    return account;
+  };
+  const replaceAccount = (next, account, previous) => ({
+    ...next,
+    accounts: [
+      ...next.accounts.filter(
+        (item) => item.id !== account.id && item.id !== previous?.id,
+      ),
+      account,
+    ],
+  });
   const liveUser = async (record) => {
-    const user = await getUser(record.serverId, record.userId);
+    const user = accountById(record.userId)
+      ? userForServer(record.serverId, record.userId)
+      : resolveUser(
+          record.serverId,
+          record.userId,
+          await getUser(record.serverId, record.userId),
+        );
     return user && normalizedEmail(user.email) === record.email ? user : null;
   };
   const enrolled = (record) =>
@@ -292,6 +616,42 @@ export async function createAccessService({
       cookie: `${SUBUSER_COOKIE}=${value}; Path=/; HttpOnly; SameSite=Strict; Secure; Max-Age=${sessionLifetime / 1000}`,
     };
   };
+  const accountSessionView = (account) => {
+    const memberships = serverIds()
+      .filter((id) => permitsServer(account, id))
+      .map((serverId) => ({ serverId, userId: account.id }));
+    const serverId = memberships[0]?.serverId ?? null;
+    return {
+      role: "subuser",
+      accountId: account.id,
+      userId: account.id,
+      email: account.email,
+      serverId,
+      permissions: serverId ? [...accountPermissions(account, serverId)] : [],
+      hostPermissions: [
+        ...new Set([
+          ...account.hostPermissions,
+          ...memberships.flatMap((scope) =>
+            accountHostPermissions(account, scope.serverId),
+          ),
+        ]),
+      ],
+      memberships,
+    };
+  };
+  const createAccountSession = (account) => {
+    const value = secret();
+    return {
+      session: {
+        accountId: account.id,
+        authRevision: account.authRevision,
+        email: account.email,
+        hash: digest(value),
+        expiresAt: now() + sessionLifetime,
+      },
+      cookie: `${SUBUSER_COOKIE}=${value}; Path=/; HttpOnly; SameSite=Strict; Secure; Max-Age=${sessionLifetime / 1000}`,
+    };
+  };
   const authenticatedSession = async (req) => {
     if (!status().ready) return null;
     const token = cookieSecret(req);
@@ -300,20 +660,47 @@ export async function createAccessService({
       (item) => item.hash === digest(token) && item.expiresAt > now(),
     );
     if (!record) return null;
+    if (record.accountId) {
+      const account = accountById(record.accountId);
+      return account?.acceptedAt &&
+        account.password &&
+        account.email === record.email &&
+        account.authRevision === record.authRevision
+        ? accountSessionView(account)
+        : null;
+    }
     const memberships = [];
     for (const scope of sessionScopes(record).slice(0, maxEmailMemberships)) {
       const membership = { ...scope, email: record.email };
       if (enrolled(membership) && (await liveUser(membership)))
         memberships.push(scope);
     }
-    // A deleted primary invalidates the session; never expand or rehome it.
-    if (!memberships.some((scope) => scopeKey(scope) === scopeKey(record)))
-      return null;
-    const user = await liveUser(record);
-    return user ? sessionView(record, user, memberships) : null;
+    if (!memberships.length) return null;
+    const primary =
+      memberships.find((scope) => scopeKey(scope) === scopeKey(record)) ??
+      memberships[0];
+    const user = await liveUser({ ...primary, email: record.email });
+    return user
+      ? sessionView({ ...record, ...primary }, user, memberships)
+      : null;
   };
   const hostAuthority = async (req, expected) => {
     const session = await authenticatedSession(req);
+    if (session?.accountId) {
+      if (
+        session.hostPermissions.includes("server.create") &&
+        (!expected || expected.accountId === session.accountId)
+      )
+        return {
+          accountId: session.accountId,
+          userId: session.accountId,
+          email: session.email,
+        };
+      throw fail(
+        403,
+        "The panel owner must grant permission to add servers on this computer.",
+      );
+    }
     for (const scope of session?.memberships ?? []) {
       const record = state.memberships.find(
         (item) =>
@@ -341,7 +728,108 @@ export async function createAccessService({
   return {
     status,
     hostAuthority,
+    account: (id) => publicAccount(findAccount(id)),
+    listAccounts: () =>
+      [...state.accounts, ...legacyAccounts()].map(publicAccount),
+    userForServer,
+    usersForServer: (serverId) =>
+      state.accounts
+        .map((account) => userForServer(serverId, account.id))
+        .filter(Boolean),
+    resolveUser,
+    createAccount: (input) =>
+      serialize(async () => {
+        const account = validateAccount(input);
+        if (
+          [...state.accounts, ...legacyAccounts()].some(
+            (item) => item.email === account.email,
+          ) ||
+          state.memberships.some((item) => item.email === account.email)
+        )
+          throw fail(
+            409,
+            "This email already has a panel account. Edit it or create a new invitation.",
+          );
+        await persist(replaceAccount(cleaned(), account));
+        return publicAccount(account);
+      }),
+    updateAccount: (id, input) =>
+      serialize(async () => {
+        const current = findAccount(id);
+        if (!current) throw fail(404, "Panel account not found.");
+        const account = validateAccount(input, promoted(current));
+        await persist(replaceAccount(cleaned(), account, current));
+        return publicAccount(account);
+      }),
+    deleteAccount: (id) =>
+      serialize(async () => {
+        const current = findAccount(id);
+        if (!current) throw fail(404, "Panel account not found.");
+        const next = cleaned();
+        await persist({
+          ...next,
+          accounts: next.accounts.filter((account) => account.id !== id),
+          retiredLegacyEmails: [
+            ...new Set([...next.retiredLegacyEmails, current.email]),
+          ],
+          memberships: next.memberships.filter(
+            (member) => member.email !== current.email,
+          ),
+          tokens: next.tokens.filter(
+            (token) => token.email !== current.email && token.accountId !== id,
+          ),
+          sessions: next.sessions.filter(
+            (session) =>
+              session.email !== current.email && session.accountId !== id,
+          ),
+        });
+      }),
+    inviteAccount: (id) =>
+      serialize(async () => {
+        requireReady();
+        const current = findAccount(id);
+        if (!current) throw fail(404, "Panel account not found.");
+        const token = secret(),
+          createdAt = now(),
+          expiresAt = createdAt + invitationLifetime;
+        const account = {
+          ...promoted(current),
+          password: undefined,
+          acceptedAt: undefined,
+          invitedAt: createdAt,
+          authRevision: randomUUID(),
+        };
+        const next = replaceAccount(cleaned(), account, current);
+        await persist({
+          ...next,
+          tokens: [
+            ...next.tokens.filter((item) => item.accountId !== account.id),
+            {
+              accountId: account.id,
+              email: account.email,
+              hash: digest(token),
+              createdAt,
+              expiresAt,
+            },
+          ],
+          sessions: next.sessions.filter(
+            (item) => item.accountId !== account.id,
+          ),
+        });
+        return {
+          account: publicAccount(account),
+          invitationUrl: `${state.configuration.publicUrl}/#invite=${token}`,
+          invitedAt: new Date(createdAt).toISOString(),
+          inviteExpiresAt: new Date(expiresAt).toISOString(),
+        };
+      }),
     assertCreationCapacity: (email) => {
+      if (
+        state.accounts.some(
+          (account) => account.email === email && account.acceptedAt,
+        )
+      )
+        return;
       if (
         state.memberships.filter((item) => item.email === email).length >=
         maxEmailMemberships
@@ -366,6 +854,45 @@ export async function createAccessService({
             403,
             "This server creation belongs to a different account.",
           );
+        if (authority.accountId) {
+          const account = accountById(authority.accountId);
+          if (
+            target.userId !== account.id ||
+            !serverIds().includes(target.serverId)
+          )
+            throw fail(
+              403,
+              "This server creation belongs to a different account.",
+            );
+          const key = scopeKey(target);
+          if (
+            state.creationRevocations.includes(key) ||
+            account.excludedServerIds.includes(target.serverId) ||
+            (account.creatorServerIds?.includes(target.serverId) &&
+              !permitsServer(account, target.serverId))
+          )
+            throw fail(
+              403,
+              "Your creator access was revoked. Contact the panel owner.",
+            );
+          if (account.creatorServerIds?.includes(target.serverId)) return;
+          const updated = {
+            ...account,
+            serverIds: [...new Set([...account.serverIds, target.serverId])],
+            creatorServerIds: [
+              ...(account.creatorServerIds ?? []),
+              target.serverId,
+            ],
+            serverOverrides: {
+              ...account.serverOverrides,
+              [target.serverId]: {
+                permissions: [...permissionCatalog.roleDefaults.admin],
+              },
+            },
+          };
+          await persist(replaceAccount(cleaned(), updated));
+          return;
+        }
         const user = await liveUser(target);
         if (!user)
           throw fail(
@@ -444,6 +971,11 @@ export async function createAccessService({
       await queue;
     },
     invitationState(serverId, userId) {
+      const account = accountById(userId);
+      if (account)
+        return permitsServer(account, serverId)
+          ? accountInvitation(account)
+          : null;
       const invited = state.memberships.find(
         (item) => item.serverId === serverId && item.userId === userId,
       );
@@ -470,11 +1002,30 @@ export async function createAccessService({
     },
     // Enrollment alone never grants a browser session another membership's scope.
     membershipAllowed(serverId, userId, email) {
+      const account = accountById(userId);
+      if (account)
+        return Boolean(
+          account.acceptedAt &&
+          account.password &&
+          permitsServer(account, serverId) &&
+          (email === undefined || account.email === normalizedEmail(email)),
+        );
       return state.memberships.some(
         (item) =>
           item.serverId === serverId &&
           item.userId === userId &&
-          (email === undefined || item.email === normalizedEmail(email)),
+          (email === undefined || item.email === normalizedEmail(email)) &&
+          !state.retiredLegacyEmails.includes(item.email) &&
+          !state.accounts.some(
+            (linked) =>
+              linked.email === item.email &&
+              (!linked.legacyMembers?.some(
+                (member) =>
+                  member.serverId === serverId && member.userId === userId,
+              ) ||
+                linked.legacyPending !== true ||
+                !permitsServer(linked, serverId)),
+          ),
       );
     },
     configure: (input) =>
@@ -552,6 +1103,49 @@ export async function createAccessService({
           (item) =>
             item.hash === hash && item.sent !== false && item.expiresAt > now(),
         );
+        if (record?.accountId) {
+          const account = accountById(record.accountId);
+          if (!account || account.email !== record.email)
+            throw fail(401, invalidLink);
+          if (!validPassword(password))
+            throw fail(400, "Choose a password with 12 to 128 characters.");
+          const passwordHash = await hashPassword(password);
+          const acceptedAt = Math.max(now(), (account.lastAcceptedAt ?? 0) + 1);
+          const updated = {
+            ...account,
+            password: passwordHash,
+            acceptedAt,
+            lastAcceptedAt: acceptedAt,
+            legacyPending: false,
+            authRevision: randomUUID(),
+          };
+          const issued = createAccountSession(updated);
+          const next = replaceAccount(cleaned(), updated);
+          await persist({
+            ...next,
+            retiredLegacyEmails: [
+              ...new Set([...next.retiredLegacyEmails, account.email]),
+            ],
+            memberships: next.memberships.filter(
+              (item) => item.email !== account.email,
+            ),
+            tokens: next.tokens.filter(
+              (item) =>
+                item.accountId !== account.id && item.email !== account.email,
+            ),
+            sessions: [
+              ...next.sessions.filter(
+                (item) =>
+                  item.accountId !== account.id && item.email !== account.email,
+              ),
+              issued.session,
+            ],
+          });
+          return {
+            cookie: issued.cookie,
+            session: accountSessionView(updated),
+          };
+        }
         if (!record || !enrolled(record)) throw fail(401, invalidLink);
         const user = await liveUser(record);
         if (!user) throw fail(401, invalidLink);
@@ -563,7 +1157,7 @@ export async function createAccessService({
         // The invitation proves this membership; the existing cookie proves
         // only its live scopes. Sharing an email alone never grants access.
         const retained =
-          current?.email === record.email
+          current?.email === record.email && !current.accountId
             ? current.memberships
                 .filter((scope) => scopeKey(scope) !== key)
                 .map((scope) => ({ ...scope, email: current.email }))
@@ -602,6 +1196,23 @@ export async function createAccessService({
         const password = input?.password;
         if (!status().ready || !validEmail(email) || !validPassword(password))
           throw fail(401, invalidLogin);
+        const account = state.accounts.find(
+          (item) => item.email === email && item.password && item.acceptedAt,
+        );
+        if (account) {
+          if (!(await matchesPassword(password, account.password)))
+            throw fail(401, invalidLogin);
+          const issued = createAccountSession(account);
+          const next = cleaned();
+          await persist({
+            ...next,
+            sessions: [...next.sessions, issued.session],
+          });
+          return {
+            cookie: issued.cookie,
+            session: accountSessionView(account),
+          };
+        }
         const candidates = state.memberships
           .filter((item) => item.email === email && item.password)
           .slice(0, maxEmailMemberships);
@@ -659,8 +1270,46 @@ export async function createAccessService({
       serialize(async () => {
         const key = membershipKey(serverId, userId);
         const next = cleaned();
+        const account =
+          accountById(userId) ??
+          state.accounts.find((item) =>
+            item.legacyMembers?.some(
+              (member) =>
+                member.serverId === serverId && member.userId === userId,
+            ),
+          );
+        if (account && account.id === userId) {
+          const updated = {
+            ...account,
+            excludedServerIds: [
+              ...new Set([...account.excludedServerIds, serverId]),
+            ],
+          };
+          await persist({
+            ...replaceAccount(next, updated),
+            creationRevocations:
+              created || account.creatorServerIds?.includes(serverId)
+                ? [...new Set([...next.creationRevocations, key])]
+                : next.creationRevocations,
+          });
+          return;
+        }
         await persist({
           ...next,
+          ...(account
+            ? {
+                accounts: next.accounts.map((item) =>
+                  item.id === account.id
+                    ? {
+                        ...item,
+                        excludedServerIds: [
+                          ...new Set([...item.excludedServerIds, serverId]),
+                        ],
+                      }
+                    : item,
+                ),
+              }
+            : {}),
           creationRevocations:
             created ||
             next.memberships.some(
@@ -672,9 +1321,16 @@ export async function createAccessService({
             (item) => scopeKey(item) !== key,
           ),
           tokens: next.tokens.filter((item) => scopeKey(item) !== key),
-          sessions: next.sessions.filter(
-            (session) => !sessionIncludes(session, key),
-          ),
+          sessions: next.sessions.flatMap((session) => {
+            if (session.accountId || !sessionIncludes(session, key))
+              return [session];
+            const memberships = sessionScopes(session).filter(
+              (scope) => scopeKey(scope) !== key,
+            );
+            return memberships.length
+              ? [{ ...session, ...memberships[0], memberships }]
+              : [];
+          }),
         });
       }),
   };

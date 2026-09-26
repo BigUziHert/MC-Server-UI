@@ -432,6 +432,69 @@
   margin: 0;
   border: 0;
 }
+.subusers-server-access {
+  min-width: 0;
+  padding: 16px;
+  margin: 0 0 22px;
+  border: 1px solid var(--border);
+  border-radius: 5px;
+}
+.subusers-server-access legend {
+  color: var(--text);
+  font-size: 13px;
+  padding: 0 6px;
+}
+.subusers-server-access > label:not(.subuser-permission) {
+  display: block;
+  font-size: 12px;
+  margin-bottom: 8px;
+}
+.subusers-server-access > select {
+  width: 100%;
+  min-width: 0;
+  padding: 10px;
+  color: var(--text);
+  background: #303140;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+}
+.subusers-server-access p {
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.7;
+  margin: 10px 0 0;
+}
+.subusers-server-checklist {
+  max-height: 240px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  margin-top: 12px;
+  border-top: 1px solid var(--border);
+}
+.subusers-server-checklist .subuser-permission {
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+.subusers-server-override {
+  margin: 0 8px 12px 35px;
+  font-size: 11px;
+  overflow-wrap: anywhere;
+}
+.subusers-server-override summary,
+.subusers-permission-details summary {
+  cursor: pointer;
+  color: var(--text);
+}
+.subusers-permission-details {
+  margin-bottom: 22px;
+}
+.subusers-permission-details > summary {
+  font-size: 13px;
+  margin-bottom: 18px;
+}
+.subuser-server-scope {
+  overflow-wrap: anywhere;
+}
 .subusers-host-permissions .subusers-permission-grid {
   grid-template-columns: minmax(0, 1fr);
 }

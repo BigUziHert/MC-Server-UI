@@ -37,11 +37,22 @@ type Subuser = {
   role?: string;
   permissions?: string[];
   hostPermissions?: string[];
-  createdAt: string;
+  accessMode?: "all" | "selected";
+  serverIds?: string[];
+  excludedServerIds?: string[];
+  serverOverrides?: Record<
+    string,
+    { permissions: string[]; hostPermissions?: string[] }
+  >;
+  legacy?: boolean;
+  legacyPending?: boolean;
+  panelAccount?: boolean;
+  createdAt?: string;
   inviteStatus?: "pending" | "accepted" | "expired" | "not-invited";
   invitedAt?: string;
   acceptedAt?: string;
 };
+type AccessServer = { id: string; name: string; available?: boolean };
 type AccessSettings = {
   enabled: boolean;
   publicUrl: string;
@@ -98,7 +109,6 @@ function RemoteAccessSetup({
   const [expanded, setExpanded] = useState(false);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
-  const [network, setNetwork] = useState<NetworkInfo | null>(null);
   const [discovering, setDiscovering] = useState(false);
   const [networkError, setNetworkError] = useState("");
 
@@ -156,7 +166,6 @@ function RemoteAccessSetup({
     setNetworkError("");
     try {
       const value = await panelApi<NetworkInfo>("/access/network");
-      setNetwork(value);
       if (value.publicIp) {
         const host = value.publicIp.includes(":")
           ? `[${value.publicIp}]`
@@ -353,28 +362,14 @@ function RemoteAccessSetup({
                       port. Allow that port through Windows Firewall.
                     </li>
                     <li>
-                      Save these settings, then open the public panel address on
-                      your phone using mobile data.
-                    </li>
-                    <li>
                       Keep this computer and MC Panel running. Update the
                       address here if your public IP changes.
                     </li>
                   </ol>
-                  {network?.localAddresses.length ? (
-                    <p>
-                      This computer’s local addresses:{" "}
-                      <code>{network.localAddresses.join(", ")}</code>. Choose
-                      the address on your router’s network and reserve it in the
-                      router.
-                    </p>
-                  ) : null}
                   <p>
                     MC Panel provides HTTPS and generates its own certificate.
                     Browsers will show a certificate warning. Compare the
-                    certificate’s SHA-256 fingerprint with the one below through
-                    a trusted channel before trusting it. If they differ, stop
-                    and check the connection.
+                    certificate below.
                   </p>
                   <p>
                     These settings do not open router or firewall ports. If your
@@ -391,10 +386,6 @@ function RemoteAccessSetup({
                   running.
                 </p>
               )}
-              <p>
-                Forward only the remote access port. The Minecraft game port and
-                local owner panel port are separate.
-              </p>
             </div>
             {draft.transport === "direct" && settings.certificate && (
               <div className="subusers-setup-field subusers-certificate">
@@ -426,7 +417,7 @@ function RemoteAccessSetup({
             <div className="subusers-setup-actions">
               <span>
                 {accessReady(settings)
-                  ? "Settings saved. Check that the public address opens from your phone."
+                  ? "Remote access settings saved."
                   : "Save the setup, then create an invitation link below."}
               </span>
               <button className="btn primary" type="submit">
@@ -485,9 +476,11 @@ function PermissionCheckbox({
 function InvitationDialog({
   invitation,
   onClose,
+  panelWide,
 }: {
   invitation: Invitation;
   onClose: () => void;
+  panelWide: boolean;
 }) {
   const dialog = useRef<HTMLDialogElement>(null);
   const link = useRef<HTMLTextAreaElement>(null);
@@ -554,7 +547,8 @@ function InvitationDialog({
             The recipient chooses a password of at least 12 characters, then
             signs in with their email and password. Creating another link
             invalidates their previous unused link. Resetting access disables
-            their previous password and signs them out of this server
+            their previous password and signs them out of{" "}
+            {panelWide ? "this panel" : "this server"}
             immediately. They regain access after accepting the new link.
           </p>
           {invitation.warning && (
@@ -598,7 +592,7 @@ export default function Subusers({
   const canDelete = can("user.delete");
   const manageable = (user: Subuser) =>
     permissionsFor(user).every(can) &&
-    (!remote || !user.hostPermissions?.length);
+    (!remote || (!user.hostPermissions?.length && !user.panelAccount));
   const ownAccess = (user: Subuser) =>
     signedInEmail !== undefined &&
     user.email.toLowerCase() === signedInEmail.toLowerCase();
@@ -609,8 +603,16 @@ export default function Subusers({
       permissions: group.permissions.filter((permission) => can(permission.id)),
     }))
     .filter((group) => group.permissions.length);
-  const { api, post } = useServerApi();
+  const { api: serverApi } = useServerApi();
+  const api = remote ? serverApi : panelApi;
+  const basePath = remote ? "/subusers" : "/panel-users";
+  const post = useCallback(
+    <T,>(path: string, body: unknown = {}) =>
+      api<T>(path, { method: "POST", body: JSON.stringify(body) }),
+    [api],
+  );
   const [users, setUsers] = useState<Subuser[]>([]);
+  const [servers, setServers] = useState<AccessServer[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
   const [search, setSearch] = useState("");
@@ -623,6 +625,10 @@ export default function Subusers({
   const [email, setEmail] = useState("");
   const [selected, setSelected] = useState<string[]>([]);
   const [allowServerCreation, setAllowServerCreation] = useState(false);
+  const [accessMode, setAccessMode] = useState<"all" | "selected">("all");
+  const [serverIds, setServerIds] = useState<string[]>([]);
+  const [excludedServerIds, setExcludedServerIds] = useState<string[]>([]);
+  const [replaceServerOverrides, setReplaceServerOverrides] = useState(false);
   const [deleting, setDeleting] = useState<Subuser | null>(null);
   const [resetting, setResetting] = useState<Subuser | null>(null);
   const [busy, setBusy] = useState(false);
@@ -660,11 +666,15 @@ export default function Subusers({
     if (!loaded.current) setLoading(true);
     setError("");
     try {
-      const result = await api<{ users: Subuser[] }>("/subusers", {
-        signal: controller.signal,
-      });
+      const result = await api<{ users: Subuser[]; servers?: AccessServer[] }>(
+        basePath,
+        {
+          signal: controller.signal,
+        },
+      );
       if (controller.signal.aborted) return false;
       setUsers(result.users);
+      if (!remote) setServers(result.servers ?? []);
       loaded.current = true;
       return true;
     } catch (cause) {
@@ -676,10 +686,11 @@ export default function Subusers({
     } finally {
       if (!controller.signal.aborted) setLoading(false);
     }
-  }, [api, canRead]);
+  }, [api, canRead, basePath, remote]);
   useEffect(() => {
     loaded.current = false;
     setUsers([]);
+    setServers([]);
     setSearch("");
     setPage(1);
     setInvitation(null);
@@ -717,6 +728,10 @@ export default function Subusers({
     setAllowServerCreation(
       user?.hostPermissions?.includes("server.create") ?? false,
     );
+    setAccessMode(user?.accessMode ?? "all");
+    setServerIds(user?.serverIds ?? []);
+    setExcludedServerIds(user?.excludedServerIds ?? []);
+    setReplaceServerOverrides(false);
     setFormError("");
     setInviteOnCreate(invitationReady);
     setEditor(user ?? "create");
@@ -727,7 +742,7 @@ export default function Subusers({
     setInvitationError("");
     try {
       const result = await post<Invitation & { message: string }>(
-        `/subusers/${encodeURIComponent(user.id)}/invite`,
+        `${basePath}/${encodeURIComponent(user.id)}/invite`,
       );
       setUsers((previous) =>
         previous.map((item) => (item.id === user.id ? result.user : item)),
@@ -772,29 +787,40 @@ export default function Subusers({
         setResetting(null);
         return;
       } else if (deleting) {
-        await api(`/subusers/${encodeURIComponent(deleting.id)}`, {
+        await api(`${basePath}/${encodeURIComponent(deleting.id)}`, {
           method: "DELETE",
         });
         notify("Subuser access revoked.");
       } else if (editing) {
-        await api(`/subusers/${encodeURIComponent(editing.id)}`, {
+        await api(`${basePath}/${encodeURIComponent(editing.id)}`, {
           method: "PATCH",
           body: JSON.stringify({
             permissions: selected,
             ...(!remote
               ? {
                   hostPermissions: allowServerCreation ? ["server.create"] : [],
+                  accessMode,
+                  serverIds: accessMode === "selected" ? serverIds : [],
+                  excludedServerIds:
+                    accessMode === "all" ? excludedServerIds : [],
+                  ...(replaceServerOverrides ? { serverOverrides: {} } : {}),
                 }
               : {}),
           }),
         });
         notify("Subuser permissions updated. Changes take effect immediately.");
       } else {
-        const result = await post<Subuser | { user: Subuser }>("/subusers", {
+        const result = await post<Subuser | { user: Subuser }>(basePath, {
           email: email.trim(),
           permissions: selected,
           ...(!remote
-            ? { hostPermissions: allowServerCreation ? ["server.create"] : [] }
+            ? {
+                hostPermissions: allowServerCreation ? ["server.create"] : [],
+                accessMode,
+                serverIds: accessMode === "selected" ? serverIds : [],
+                excludedServerIds:
+                  accessMode === "all" ? excludedServerIds : [],
+              }
             : {}),
         });
         // Creation has succeeded even if the separate invitation request fails.
@@ -847,7 +873,9 @@ export default function Subusers({
         <div>
           <h1>Subusers</h1>
           <p className="subusers-page-description">
-            Invite people to manage this server from their phone or browser.
+            {remote
+              ? "Invite people to manage this server from their phone or browser."
+              : "One account and invitation for this panel. Choose their permissions and which servers they can access."}
           </p>
         </div>
         <button
@@ -928,6 +956,10 @@ export default function Subusers({
             <tbody>
               {visible.map((user) => {
                 const count = permissionsFor(user).length;
+                const createdAt =
+                  user.createdAt && Number.isFinite(Date.parse(user.createdAt))
+                    ? user.createdAt
+                    : null;
                 return (
                   <tr key={user.id}>
                     <td>
@@ -957,6 +989,29 @@ export default function Subusers({
                               Ask the panel owner to reset your own access.
                             </span>
                           )}
+                          {!remote && (
+                            <span className="subuser-server-scope">
+                              {user.accessMode === "all"
+                                ? user.excludedServerIds?.length
+                                  ? `All current and future servers except ${user.excludedServerIds.length}`
+                                  : "All current and future servers"
+                                : `${user.serverIds?.length ?? 0} selected ${(user.serverIds?.length ?? 0) === 1 ? "server" : "servers"}`}
+                              {Object.keys(user.serverOverrides ?? {}).length >
+                                0 && " · Custom server permissions"}
+                            </span>
+                          )}
+                          {!remote && (user.legacy || user.legacyPending) && (
+                            <span>
+                              {user.inviteStatus === "pending"
+                                ? "Accept the panel invitation to combine sign-in."
+                                : "Create a panel invitation to combine sign-in."}{" "}
+                              Existing sign-ins keep their previous server
+                              access until it is accepted.
+                            </span>
+                          )}
+                          {remote && user.panelAccount && (
+                            <span>Managed by panel owner</span>
+                          )}
                           {user.hostPermissions?.includes("server.create") && (
                             <span>
                               Can create and import servers on this computer
@@ -973,12 +1028,16 @@ export default function Subusers({
                       </span>
                     </td>
                     <td className="subuser-added">
-                      <time
-                        dateTime={user.createdAt}
-                        title={new Date(user.createdAt).toLocaleString()}
-                      >
-                        {relativeTime(user.createdAt)}
-                      </time>
+                      {createdAt ? (
+                        <time
+                          dateTime={createdAt}
+                          title={new Date(createdAt).toLocaleString()}
+                        >
+                          {relativeTime(createdAt)}
+                        </time>
+                      ) : (
+                        "—"
+                      )}
                     </td>
                     <td className="subuser-row-actions">
                       <div>
@@ -1098,23 +1157,33 @@ export default function Subusers({
             {resetting ? (
               <p className="subusers-delete-description">
                 Reset access for <strong>{resetting.email}</strong> to this
-                server? Their current password and sessions stop working
-                immediately. Share the new link so they can choose a new
-                password and regain access.
+                {remote ? " server" : " panel"}? Their current password and
+                sessions stop working immediately. Share the new link so they
+                can choose a new password and regain access.
               </p>
             ) : deleting ? (
               <p className="subusers-delete-description">
                 Revoke access for <strong>{deleting.email}</strong>? Their
                 active sessions and invitation links will stop working for this
-                server. You can invite them again later.
+                {remote ? " server" : " panel"}. You can invite them again
+                later.
               </p>
             ) : (
               <>
                 <p className="subusers-editor-notice">
                   {editing
                     ? "Permission changes apply immediately, including to active sessions."
-                    : "Choose what this person can do on this server. Their invitation opens the panel in their phone or browser."}
+                    : remote
+                      ? "Choose what this person can do on this server. Their invitation opens the panel in their phone or browser."
+                      : "New accounts can access all current and future servers. Uncheck any server to exclude it, then choose their permissions."}
                 </p>
+                {!remote && (editing?.legacy || editing?.legacyPending) && (
+                  <p className="subusers-editor-notice">
+                    Existing sign-ins keep their previous server access until a
+                    panel invitation is accepted. Share a panel invitation to
+                    use this account’s selected server access.
+                  </p>
+                )}
                 <div className="subusers-email">
                   <label htmlFor="subuser-email">Email address</label>
                   <input
@@ -1136,6 +1205,140 @@ export default function Subusers({
                     </small>
                   )}
                 </div>
+                {!remote && (
+                  <fieldset
+                    className="subusers-server-access"
+                    disabled={busy || !canSubmitRecord}
+                  >
+                    <legend>Server access</legend>
+                    <label htmlFor="subuser-server-access">
+                      Servers available to this person
+                    </label>
+                    <select
+                      id="subuser-server-access"
+                      value={accessMode}
+                      onChange={(event) => {
+                        const next = event.target.value as "all" | "selected";
+                        if (next === "selected")
+                          setServerIds(
+                            servers
+                              .filter(
+                                (server) =>
+                                  !excludedServerIds.includes(server.id),
+                              )
+                              .map((server) => server.id),
+                          );
+                        else
+                          setExcludedServerIds(
+                            servers
+                              .filter(
+                                (server) => !serverIds.includes(server.id),
+                              )
+                              .map((server) => server.id),
+                          );
+                        setAccessMode(next);
+                      }}
+                    >
+                      <option value="all">
+                        All current and future servers
+                      </option>
+                      <option value="selected">Only selected servers</option>
+                    </select>
+                    <p>
+                      {accessMode === "all"
+                        ? "New servers are included automatically. Uncheck a server to revoke access to it."
+                        : "Only checked servers are available. New servers require you to grant access here."}
+                    </p>
+                    {servers.length > 0 ? (
+                      <div
+                        className="subusers-server-checklist"
+                        role="group"
+                        aria-label="Allowed servers"
+                      >
+                        {servers.map((server) => {
+                          const override =
+                            editing?.serverOverrides?.[server.id];
+                          return (
+                            <div key={server.id}>
+                              <PermissionCheckbox
+                                label={server.name}
+                                accessibleLabel={`Access to ${server.name}`}
+                                description={
+                                  server.available === false
+                                    ? "Server folder currently unavailable"
+                                    : undefined
+                                }
+                                checked={
+                                  accessMode === "all"
+                                    ? !excludedServerIds.includes(server.id)
+                                    : serverIds.includes(server.id)
+                                }
+                                onChange={() => {
+                                  const update = (previous: string[]) =>
+                                    previous.includes(server.id)
+                                      ? previous.filter(
+                                          (id) => id !== server.id,
+                                        )
+                                      : [...previous, server.id];
+                                  if (accessMode === "all")
+                                    setExcludedServerIds(update);
+                                  else setServerIds(update);
+                                }}
+                              />
+                              {override && (
+                                <details className="subusers-server-override">
+                                  <summary>
+                                    Custom permissions for {server.name}
+                                  </summary>
+                                  <p>
+                                    {override.permissions.length
+                                      ? catalog.groups
+                                          .flatMap((group) => group.permissions)
+                                          .filter((permission) =>
+                                            override.permissions.includes(
+                                              permission.id,
+                                            ),
+                                          )
+                                          .map((permission) => permission.label)
+                                          .join(", ")
+                                      : "No server permissions"}
+                                  </p>
+                                  {override.hostPermissions?.includes(
+                                    "server.create",
+                                  ) && <p>Create and import servers</p>}
+                                </details>
+                              )}
+                            </div>
+                          );
+                        })}
+                      </div>
+                    ) : (
+                      <p>
+                        No servers yet.{" "}
+                        {accessMode === "all"
+                          ? "This account will have access when you add one."
+                          : "You can select servers here after adding them."}
+                      </p>
+                    )}
+                    {Object.keys(editing?.serverOverrides ?? {}).length > 0 && (
+                      <>
+                        <p>
+                          {replaceServerOverrides
+                            ? "Custom permissions will be replaced when you save."
+                            : "Custom server permissions are preserved. The permissions below apply to servers without a custom set."}
+                        </p>
+                        <PermissionCheckbox
+                          label="Use these permissions on every allowed server"
+                          description="Replace custom permissions with the selections below, including the setting for creating and importing servers."
+                          checked={replaceServerOverrides}
+                          onChange={() =>
+                            setReplaceServerOverrides(!replaceServerOverrides)
+                          }
+                        />
+                      </>
+                    )}
+                  </fieldset>
+                )}
                 {!editing && (
                   <div className="subusers-invitation-choice">
                     <PermissionCheckbox
@@ -1191,7 +1394,11 @@ export default function Subusers({
                   <div className="subusers-all-permissions">
                     <PermissionCheckbox
                       label="All permissions"
-                      description="Grant every listed permission for this server."
+                      description={
+                        remote
+                          ? "Grant every listed permission for this server."
+                          : "Grant every listed permission on allowed servers without custom permissions."
+                      }
                       checked={
                         grantablePermissions.length > 0 &&
                         selected.length === grantablePermissions.length
@@ -1231,50 +1438,56 @@ export default function Subusers({
                       </button>
                     ))}
                   </div>
-                  {groups.map((group) => {
-                    const ids = group.permissions.map(
-                      (permission) => permission.id,
-                    );
-                    const count = ids.filter((id) =>
-                      selected.includes(id),
-                    ).length;
-                    return (
-                      <section
-                        className="subusers-permission-group"
-                        key={group.id}
-                        aria-labelledby={`permission-group-${group.id}`}
-                      >
-                        <div className="subusers-group-heading">
-                          <div>
-                            <h3 id={`permission-group-${group.id}`}>
-                              {group.label}
-                            </h3>
-                            <p>{group.description}</p>
-                          </div>
-                          <PermissionCheckbox
-                            label="Select all"
-                            accessibleLabel={`Select all ${group.label}`}
-                            checked={count === ids.length}
-                            mixed={count > 0 && count < ids.length}
-                            onChange={() => togglePermissions(ids)}
-                          />
-                        </div>
-                        <div className="subusers-permission-grid">
-                          {group.permissions.map((permission) => (
+                  <details
+                    className="subusers-permission-details"
+                    open={remote || undefined}
+                  >
+                    <summary>Customize permissions</summary>
+                    {groups.map((group) => {
+                      const ids = group.permissions.map(
+                        (permission) => permission.id,
+                      );
+                      const count = ids.filter((id) =>
+                        selected.includes(id),
+                      ).length;
+                      return (
+                        <section
+                          className="subusers-permission-group"
+                          key={group.id}
+                          aria-labelledby={`permission-group-${group.id}`}
+                        >
+                          <div className="subusers-group-heading">
+                            <div>
+                              <h3 id={`permission-group-${group.id}`}>
+                                {group.label}
+                              </h3>
+                              <p>{group.description}</p>
+                            </div>
                             <PermissionCheckbox
-                              key={permission.id}
-                              label={permission.label}
-                              description={permission.description}
-                              checked={selected.includes(permission.id)}
-                              onChange={() =>
-                                togglePermissions([permission.id])
-                              }
+                              label="Select all"
+                              accessibleLabel={`Select all ${group.label}`}
+                              checked={count === ids.length}
+                              mixed={count > 0 && count < ids.length}
+                              onChange={() => togglePermissions(ids)}
                             />
-                          ))}
-                        </div>
-                      </section>
-                    );
-                  })}
+                          </div>
+                          <div className="subusers-permission-grid">
+                            {group.permissions.map((permission) => (
+                              <PermissionCheckbox
+                                key={permission.id}
+                                label={permission.label}
+                                description={permission.description}
+                                checked={selected.includes(permission.id)}
+                                onChange={() =>
+                                  togglePermissions([permission.id])
+                                }
+                              />
+                            ))}
+                          </div>
+                        </section>
+                      );
+                    })}
+                  </details>
                 </fieldset>
                 {!remote && (
                   <fieldset
@@ -1368,6 +1581,7 @@ export default function Subusers({
       {invitation && (
         <InvitationDialog
           invitation={invitation}
+          panelWide={!remote}
           onClose={() => setInvitation(null)}
         />
       )}
