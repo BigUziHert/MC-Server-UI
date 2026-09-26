@@ -634,3 +634,175 @@ test("a delegated server administrator cannot edit a promoted legacy account thr
       .some((user) => user.id === legacyId),
   );
 });
+
+for (const interruptedEnrollment of [false, true]) {
+  test(`promoting a legacy creator adds only the newly proven server scope${interruptedEnrollment ? " after an interrupted enrollment" : ""}`, async (t) => {
+    const { root, boot } = await fixture(t);
+    const panel = await boot();
+    const first = (await panel.local("/api/servers")).body.servers[0];
+    const unrelated = await panel.createServer(
+      "Separately authenticated legacy server",
+    );
+    const email = "legacy-creator@example.test";
+    const legacy = async (serverId, secret) => {
+      const created = await panel.local(
+        "/api/subusers",
+        scoped(
+          serverId,
+          json("POST", {
+            email,
+            permissions: ["control.console"],
+            hostPermissions: ["server.create"],
+          }),
+        ),
+      );
+      assert.equal(created.status, 201, JSON.stringify(created.body));
+      const invited = await panel.local(
+        `/api/subusers/${created.body.id}/invite`,
+        scoped(serverId, json("POST", {})),
+      );
+      assert.equal(invited.status, 200, JSON.stringify(invited.body));
+      const accepted = await panel.signed()(
+        "/api/access/accept",
+        json("POST", {
+          token: new URL(invited.body.invitationUrl).hash.slice(
+            "#invite=".length,
+          ),
+          password: secret,
+        }),
+      );
+      assert.equal(accepted.status, 200, JSON.stringify(accepted.body));
+      return { request: panel.signed(accepted.cookie), user: created.body };
+    };
+    const actor = await legacy(first.id, "Original-creator-password!");
+    const other = await legacy(unrelated.id, "Unproven-legacy-password!");
+    const promoted = await panel.local(
+      `/api/panel-users/${encodeURIComponent(`legacy:${email}`)}`,
+      json("PATCH", { accessMode: "selected" }),
+    );
+    assert.equal(promoted.status, 200, JSON.stringify(promoted.body));
+    assert.deepEqual(
+      (await roster(actor)).servers.map((server) => server.id),
+      [first.id],
+    );
+    const input = {
+      requestId: randomUUID(),
+      confirmed: true,
+      acceptedEula: true,
+      configuration: {
+        name: "Created after legacy promotion",
+        mode: "live",
+        port: 25701,
+        memoryLimitMB: 2048,
+      },
+    };
+    if (interruptedEnrollment) {
+      const rename = fs.rename;
+      let failed = false;
+      t.mock.method(fs, "rename", async (...args) => {
+        if (!failed && args[1] === path.join(root, "remote-access.json")) {
+          failed = true;
+          throw Object.assign(
+            new Error("Injected access persistence failure"),
+            { code: "EACCES" },
+          );
+        }
+        return rename(...args);
+      });
+      const interrupted = await actor.request(
+        "/api/server-setup",
+        json("POST", input),
+      );
+      assert.equal(interrupted.status, 500, JSON.stringify(interrupted.body));
+      assert.equal(failed, true);
+      const pending = (await panel.local("/api/servers")).body.servers.find(
+        (server) => ![first.id, unrelated.id].includes(server.id),
+      );
+      assert.ok(
+        pending,
+        "the registry commit and raw creator row precede access enrollment",
+      );
+      assert.ok(
+        panel.fleet.runtimes
+          .get(pending.id)
+          .subusers()
+          .some((user) => user.email === email),
+      );
+      assert.deepEqual(
+        (await roster(actor)).servers.map((server) => server.id),
+        [first.id],
+      );
+      assert.equal(
+        (await actor.request("/api/server", scoped(pending.id))).status,
+        403,
+      );
+      assert.deepEqual(
+        (await roster(other)).servers.map((server) => server.id),
+        [unrelated.id],
+      );
+      const persisted = JSON.parse(
+        await fs.readFile(path.join(root, "remote-access.json"), "utf8"),
+      );
+      assert.equal(
+        persisted.accounts
+          .find((account) => account.id === promoted.body.id)
+          .legacyMembers.some((member) => member.serverId === pending.id),
+        false,
+      );
+      assert.equal(
+        persisted.memberships.some((member) => member.serverId === pending.id),
+        false,
+      );
+    }
+    const result = await actor.request(
+      "/api/server-setup",
+      json("POST", input),
+    );
+    const ownerRoster = (await panel.local("/api/servers")).body.servers;
+    assert.equal(
+      result.status,
+      interruptedEnrollment ? 200 : 201,
+      JSON.stringify({
+        response: result.body,
+        ownerServerCount: ownerRoster.length,
+      }),
+    );
+    const createdId = result.body.server.id;
+    assert.deepEqual(
+      [...result.body.server.accessPermissions].sort(),
+      [...catalog.roleDefaults.admin].sort(),
+    );
+    assert.deepEqual(
+      (await roster(actor)).servers.map((server) => server.id).sort(),
+      [first.id, createdId].sort(),
+    );
+    assert.equal(
+      (await actor.request("/api/server", scoped(unrelated.id))).status,
+      403,
+    );
+    assert.deepEqual(
+      (await roster(other)).servers.map((server) => server.id),
+      [unrelated.id],
+    );
+    const retry = await actor.request("/api/server-setup", json("POST", input));
+    assert.equal(retry.status, 200, JSON.stringify(retry.body));
+    assert.equal(retry.body.server.id, createdId);
+    assert.equal((await panel.local("/api/servers")).body.servers.length, 3);
+    for (const [secret, expected] of [
+      ["Original-creator-password!", [first.id, createdId]],
+      ["Unproven-legacy-password!", [unrelated.id]],
+    ]) {
+      const login = await panel.signed()(
+        "/api/access/login",
+        json("POST", { email, password: secret }),
+      );
+      assert.equal(login.status, 200, JSON.stringify(login.body));
+      assert.deepEqual(
+        (await roster({ request: panel.signed(login.cookie) })).servers
+          .map((server) => server.id)
+          .sort(),
+        expected.sort(),
+      );
+    }
+  });
+}

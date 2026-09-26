@@ -4320,11 +4320,13 @@ export async function createFleet(options = {}) {
           (runtime.subusers?.() ?? []).map((user) => ({ serverId, user })),
         ),
       getUser: async (serverId, userId) => {
-        const base =
+        // The access service applies the live account policy itself. Retain the
+        // original record so authorized creation can enroll its new member.
+        return (
           (await accessRuntime(serverId))
             ?.subusers?.()
-            .find((user) => user.id === userId) ?? null;
-        return access ? access.resolveUser(serverId, userId, base) : base;
+            .find((user) => user.id === userId) ?? null
+        );
       },
     });
   } catch (cause) {

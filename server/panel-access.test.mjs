@@ -401,6 +401,110 @@ test("creator enrollment adds a selected server once and cannot restore later re
   );
 });
 
+test("promoted legacy creators enroll only the new server atomically without widening other proofs", async (t) => {
+  const f = await fixture(t);
+  const first = await f.legacyEnroll("server-a", "legacy-a", password, [
+    "file.read",
+  ]);
+  const second = await f.legacyEnroll("server-b", "legacy-b", secondPassword, [
+    "control.start",
+  ]);
+  const account = await f.access.updateAccount(f.access.listAccounts()[0].id, {
+    hostPermissions: ["server.create"],
+  });
+  const authority = await f.access.hostAuthority(req(first.cookie));
+  f.servers.push("server-c");
+  const target = {
+    serverId: "server-c",
+    userId: "legacy-created",
+    email: account.email,
+  };
+  const base = { id: target.userId, email: target.email, permissions: [] };
+  f.legacy.push({ serverId: target.serverId, user: base });
+  assert.equal(
+    f.access.resolveUser(target.serverId, target.userId, base),
+    null,
+  );
+  const rename = fs.rename;
+  const injected = t.mock.method(fs, "rename", async (source, destination) => {
+    if (destination === path.join(f.root, "remote-access.json"))
+      throw new Error("Fixture enrollment persistence failure");
+    return rename(source, destination);
+  });
+  await assert.rejects(
+    f.access.enrollCreated(req(first.cookie), authority, target),
+    { status: 500 },
+  );
+  assert.deepEqual(f.access.account(account.id), account);
+  assert.equal(
+    f.access.resolveUser(target.serverId, target.userId, base),
+    null,
+  );
+  assert.equal(
+    (await f.access.authenticate(req(first.cookie))).memberships.length,
+    1,
+  );
+  injected.mock.restore();
+  await f.access.enrollCreated(req(first.cookie), authority, target);
+  await f.access.enrollCreated(req(first.cookie), authority, target);
+  assert.deepEqual(
+    (await f.access.authenticate(req(first.cookie))).memberships,
+    [
+      { serverId: "server-a", userId: "legacy-a" },
+      { serverId: target.serverId, userId: target.userId },
+    ],
+  );
+  assert.deepEqual(
+    (await f.access.authenticate(req(second.cookie))).memberships,
+    [{ serverId: "server-b", userId: "legacy-b" }],
+  );
+  assert.deepEqual(
+    f.access.resolveUser(target.serverId, target.userId, base).permissions,
+    catalog.roleDefaults.admin,
+  );
+  const enrolled = f.access.account(account.id);
+  assert.equal(enrolled.legacyMembers.length, 3);
+  assert.deepEqual(enrolled.creatorServerIds, [target.serverId]);
+  await f.access.updateAccount(account.id, {
+    serverOverrides: {
+      ...enrolled.serverOverrides,
+      [target.serverId]: { permissions: ["file.read"] },
+    },
+  });
+  await f.access.enrollCreated(req(first.cookie), authority, target);
+  assert.deepEqual(
+    f.access.resolveUser(target.serverId, target.userId, base).permissions,
+    ["file.read"],
+    "retry cannot restore permissions changed by the owner",
+  );
+  await f.access.close();
+  const restarted = await f.boot();
+  assert.deepEqual(
+    (await restarted.login({ email: account.email, password })).session
+      .memberships,
+    [
+      { serverId: "server-a", userId: "legacy-a" },
+      { serverId: target.serverId, userId: target.userId },
+    ],
+  );
+  assert.deepEqual(
+    (await restarted.login({ email: account.email, password: secondPassword }))
+      .session.memberships,
+    [{ serverId: "server-b", userId: "legacy-b" }],
+  );
+  await restarted.revoke(target.serverId, target.userId);
+  await assert.rejects(
+    restarted.enrollCreated(req(first.cookie), authority, target),
+    { status: 403 },
+  );
+  await restarted.updateAccount(account.id, { excludedServerIds: [] });
+  await assert.rejects(
+    restarted.enrollCreated(req(first.cookie), authority, target),
+    { status: 403 },
+    "creator tombstone survives re-enabling the server policy",
+  );
+});
+
 test("invalid account grants and failed persistence cannot publish partial account changes", async (t) => {
   const f = await fixture(t);
   const member = await f.enroll();

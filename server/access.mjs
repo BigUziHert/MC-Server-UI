@@ -893,11 +893,44 @@ export async function createAccessService({
           await persist(replaceAccount(cleaned(), updated));
           return;
         }
-        const user = await liveUser(target);
+        const pendingAccount = state.accounts.find(
+          (account) =>
+            account.legacyPending === true &&
+            account.email === authority.email &&
+            account.legacyMembers?.some(
+              (member) => scopeKey(member) === scopeKey(authority),
+            ),
+        );
+        if (
+          pendingAccount &&
+          (pendingAccount.excludedServerIds.includes(target.serverId) ||
+            (pendingAccount.creatorServerIds?.includes(target.serverId) &&
+              !permitsServer(pendingAccount, target.serverId)))
+        )
+          throw fail(
+            403,
+            "Your creator access was revoked. Contact the panel owner.",
+          );
+        // A newly created legacy row is intentionally not yet linked to the
+        // promoted account. Only this trusted creation path may attach its raw
+        // identity; ordinary resolution must keep rejecting unlinked rows.
+        const user = pendingAccount
+          ? await getUser(target.serverId, target.userId)
+          : await liveUser(target);
         if (!user)
           throw fail(
             409,
             "The created server's access record is unavailable. Retry this request.",
+          );
+        if (
+          pendingAccount &&
+          (user.id !== target.userId ||
+            normalizedEmail(user.email) !== authority.email ||
+            !serverIds().includes(target.serverId))
+        )
+          throw fail(
+            403,
+            "This server creation belongs to a different account.",
           );
         const session = await authenticatedSession(req);
         const sourceRecord = state.memberships.find(
@@ -934,9 +967,35 @@ export async function createAccessService({
             403,
             "This server's access record was changed or reset. Sign in to it separately.",
           );
+        const updatedAccount =
+          pendingAccount &&
+          !pendingAccount.creatorServerIds?.includes(target.serverId)
+            ? {
+                ...pendingAccount,
+                serverIds: [
+                  ...new Set([...pendingAccount.serverIds, target.serverId]),
+                ],
+                creatorServerIds: [
+                  ...(pendingAccount.creatorServerIds ?? []),
+                  target.serverId,
+                ],
+                legacyMembers: [
+                  ...(pendingAccount.legacyMembers ?? []).filter(
+                    (member) => scopeKey(member) !== key,
+                  ),
+                  { serverId: target.serverId, userId: target.userId },
+                ],
+                serverOverrides: {
+                  ...pendingAccount.serverOverrides,
+                  [target.serverId]: {
+                    permissions: [...permissionCatalog.roleDefaults.admin],
+                  },
+                },
+              }
+            : null;
         const hash = digest(cookieSecret(req));
         await persist({
-          ...next,
+          ...(updatedAccount ? replaceAccount(next, updatedAccount) : next),
           memberships: existing
             ? next.memberships
             : [
