@@ -2226,6 +2226,9 @@ test("import retries retain their request ID and changed settings receive a new 
     await dialog
       .getByRole("button", { name: "Inspect folder", exact: true })
       .click();
+    await expect(
+      dialog.getByText("Folder inspected", { exact: true }),
+    ).toBeVisible();
     const fleet = await listServers(request);
     let unusedPort = 28600;
     while (fleet.servers.some((server) => server.port === unusedPort))
