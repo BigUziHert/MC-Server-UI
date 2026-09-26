@@ -614,13 +614,22 @@ test("granular permissions validate, deduplicate, remain scoped, and persist edi
     "/api/subusers",
     json("POST", {
       email: "Builder@example.com",
-      permissions: ["control.start", "file.read", "control.start"],
+      permissions: [
+        "server.view",
+        "control.start",
+        "file.read",
+        "control.start",
+      ],
     }),
     first,
   );
   assert.equal(created.status, 201);
   assert.equal(created.body.role, "custom");
-  assert.deepEqual(created.body.permissions, ["control.start", "file.read"]);
+  assert.deepEqual(created.body.permissions, [
+    "server.view",
+    "control.start",
+    "file.read",
+  ]);
   assert.equal(
     (await panel.request("/api/subusers", {}, second)).body.users.length,
     0,
@@ -657,7 +666,7 @@ test("granular permissions validate, deduplicate, remain scoped, and persist edi
     (
       await panel.request(
         `/api/subusers/${created.body.id}`,
-        json("PATCH", { permissions: ["backup.read"] }),
+        json("PATCH", { permissions: ["server.view", "backup.read"] }),
         second,
       )
     ).status,
@@ -665,7 +674,9 @@ test("granular permissions validate, deduplicate, remain scoped, and persist edi
   );
   const edited = await panel.request(
     `/api/subusers/${created.body.id}`,
-    json("PATCH", { permissions: ["backup.read", "backup.download"] }),
+    json("PATCH", {
+      permissions: ["server.view", "backup.read", "backup.download"],
+    }),
     first,
   );
   assert.equal(edited.status, 200);
@@ -675,7 +686,7 @@ test("granular permissions validate, deduplicate, remain scoped, and persist edi
   assert.deepEqual(
     (await restarted.request("/api/subusers", {}, first)).body.users[0]
       .permissions,
-    ["backup.read", "backup.download"],
+    ["server.view", "backup.read", "backup.download"],
   );
   assert.equal(
     (await restarted.request("/api/subusers", {}, second)).body.users.length,
@@ -720,12 +731,12 @@ test("legacy role-only subusers keep old defaults without gaining new settings a
     );
   const edited = await restarted.request(
     `/api/subusers/${users[0].id}`,
-    json("PATCH", { permissions: ["audit.read"] }),
+    json("PATCH", { permissions: ["server.view", "audit.read"] }),
     id,
   );
   assert.equal(edited.status, 200);
   assert.equal(edited.body.role, "custom");
-  assert.deepEqual(edited.body.permissions, ["audit.read"]);
+  assert.deepEqual(edited.body.permissions, ["server.view", "audit.read"]);
   const audit = (await restarted.request("/api/audit", {}, id)).body.entries;
   assert.ok(
     audit.some(

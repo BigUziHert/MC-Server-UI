@@ -1,0 +1,102 @@
+.panel-settings-dialog {
+  margin: auto;
+  width: min(760px, calc(100vw - 32px));
+  max-height: calc(100dvh - 32px);
+  overflow: auto;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 26px;
+  background: #20212b;
+  color: var(--text);
+  box-shadow: 0 25px 90px #0008;
+}
+.panel-settings-dialog::backdrop {
+  background: #101016c9;
+  backdrop-filter: blur(5px);
+}
+.panel-settings-heading {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 20px;
+  margin-bottom: 24px;
+}
+.panel-settings-heading h2 {
+  margin: 0;
+  font-size: 23px;
+}
+.panel-settings-heading p {
+  margin: 8px 0 0;
+  color: var(--muted);
+  font-size: 13px;
+}
+.panel-startup-settings {
+  padding: 20px;
+  margin-bottom: 22px;
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  background: var(--panel);
+}
+.panel-startup-settings h3 {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  margin: 0 0 20px;
+  font-size: 14px;
+}
+.panel-startup-settings h3 svg {
+  color: #a9b4e7;
+}
+.panel-startup-settings fieldset {
+  padding: 0;
+  margin: 0;
+  border: 0;
+  min-width: 0;
+}
+.panel-startup-settings .form-field {
+  margin-bottom: 20px;
+}
+.panel-startup-settings .form-field small,
+.panel-tray-setting p,
+.panel-settings-unavailable {
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.7;
+}
+.panel-tray-setting .shared-switch {
+  align-items: flex-start;
+  text-align: left;
+  font-size: 13px;
+}
+.panel-tray-setting .shared-switch-track {
+  margin-top: 2px;
+  flex-shrink: 0;
+}
+.panel-tray-setting p {
+  margin: 9px 0 0;
+}
+.panel-settings-actions {
+  display: flex;
+  justify-content: flex-end;
+  margin-top: 20px;
+}
+.panel-settings-warning,
+.panel-settings-error {
+  font-size: 12px;
+  line-height: 1.7;
+  color: #f2b9c6;
+}
+.panel-settings-dialog .subusers-setup {
+  margin-bottom: 0;
+}
+@media (max-width: 540px) {
+  .panel-settings-dialog {
+    padding: 18px;
+  }
+  .panel-startup-settings {
+    padding: 16px;
+  }
+  .panel-settings-dialog .subusers-setup-heading {
+    flex-wrap: wrap;
+  }
+}

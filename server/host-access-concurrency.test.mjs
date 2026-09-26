@@ -121,7 +121,7 @@ test("concurrent login skips unavailable memberships while creation owns the fle
       serverId,
       body: {
         email,
-        permissions: ["file.read"],
+        permissions: ["server.view", "file.read"],
         hostPermissions: ["server.create"],
       },
     });

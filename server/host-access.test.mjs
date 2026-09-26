@@ -134,7 +134,11 @@ async function fixture(t) {
     } = {}) {
       const headers = { "X-Server-Id": serverId };
       const created = await local("/api/subusers", {
-        ...json("POST", { email, permissions, hostPermissions }),
+        ...json("POST", {
+          email,
+          permissions: [...new Set(["server.view", ...permissions])],
+          hostPermissions,
+        }),
         headers,
       });
       assert.equal(created.status, 201, JSON.stringify(created.body));
@@ -238,7 +242,7 @@ test("created server membership is complete, idempotent, and survives fresh sign
   );
   assert.deepEqual(
     roster.find((server) => server.id === panel.id).accessPermissions,
-    ["control.start"],
+    ["server.view", "control.start"],
   );
   assert.equal(
     (await actor.request("/api/files", { headers: { "X-Server-Id": id } }))

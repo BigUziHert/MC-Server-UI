@@ -22,6 +22,7 @@ const server = {
 };
 
 async function sharedPanel(page: Page, permissions: string[]) {
+  permissions = [...new Set(["server.view", ...permissions])];
   const calls: { path: string; method: string; body: unknown }[] = [];
   const users = [
     {
@@ -514,6 +515,7 @@ test("remote subuser managers grant only their own permissions and invite withou
   page,
 }) => {
   const permissions = [
+    "server.view",
     "user.read",
     "user.create",
     "user.update",
@@ -577,6 +579,13 @@ test("remote subuser managers grant only their own permissions and invite withou
   await editor
     .getByRole("button", { name: "Create subuser", exact: true })
     .click();
+  await expect(editor).not.toBeVisible();
+  await page
+    .getByRole("button", {
+      name: "Create invite link for helper@example.test",
+      exact: true,
+    })
+    .click();
   const invitation = page.getByRole("dialog", {
     name: "Share invitation link",
     exact: true,
@@ -605,7 +614,13 @@ test("remote subuser managers grant only their own permissions and invite withou
 test("remote managers cannot reset their own access but can reset another user's access", async ({
   page,
 }) => {
-  const permissions = ["user.read", "user.create"];
+  const permissions = [
+    "server.view",
+    "user.read",
+    "user.create",
+    "user.update",
+    "user.delete",
+  ];
   const calls = await sharedPanel(page, permissions);
   const ownUser = {
     id: "manager",
@@ -646,10 +661,22 @@ test("remote managers cannot reset their own access but can reset another user's
     "Ask the panel owner to reset your own access.",
   );
   await expect(
-    page.getByText("Ask the panel owner to reset your own access.", {
+    page.getByText("Ask the panel owner to change your own access.", {
       exact: true,
     }),
   ).toBeVisible();
+  await expect(
+    page.getByRole("button", {
+      name: "Edit permissions for manager@example.test",
+      exact: true,
+    }),
+  ).toBeDisabled();
+  await expect(
+    page.getByRole("button", {
+      name: "Remove access record for manager@example.test",
+      exact: true,
+    }),
+  ).toBeDisabled();
   await page
     .getByRole("button", {
       name: "Reset access for helper@example.test",

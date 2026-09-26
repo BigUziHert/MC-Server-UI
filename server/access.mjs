@@ -148,7 +148,7 @@ export async function createAccessService({
 }) {
   const storage = path.join(dataDir, "remote-access.json");
   let state = {
-    version: 3,
+    version: 4,
     configuration: validateAccessConfiguration({}),
     memberships: [],
     tokens: [],
@@ -157,14 +157,15 @@ export async function createAccessService({
     accounts: [],
     retiredLegacyEmails: [],
   };
+  let migrationNeeded = false;
   try {
     const saved = JSON.parse(await fs.readFile(storage, "utf8"));
     if (
-      ![1, 2, 3].includes(saved.version) ||
+      ![1, 2, 3, 4].includes(saved.version) ||
       !Array.isArray(saved.memberships) ||
       !Array.isArray(saved.tokens) ||
       !Array.isArray(saved.sessions) ||
-      (saved.version === 3 &&
+      (saved.version >= 3 &&
         (!Array.isArray(saved.accounts) ||
           !Array.isArray(saved.retiredLegacyEmails)))
     )
@@ -177,7 +178,7 @@ export async function createAccessService({
     )
       configuration.transport ??= "proxy";
     state = {
-      version: 3,
+      version: 4,
       configuration: validateAccessConfiguration(configuration),
       memberships: saved.memberships,
       tokens: saved.tokens,
@@ -212,8 +213,93 @@ export async function createAccessService({
         typeof account.authRevision !== "string"
       )
         throw new Error("Invalid panel account storage.");
+      for (const override of Object.values(account.serverOverrides)) {
+        if (
+          !override ||
+          typeof override !== "object" ||
+          Array.isArray(override) ||
+          !Array.isArray(override.permissions) ||
+          override.permissions.some((id) => typeof id !== "string") ||
+          (override.hostPermissions !== undefined &&
+            (!Array.isArray(override.hostPermissions) ||
+              override.hostPermissions.some((id) => typeof id !== "string")))
+        )
+          throw new Error("Invalid per-server account storage.");
+      }
+      if (
+        saved.version === 4 &&
+        (account.accessMode !== "selected" ||
+          account.permissions.length ||
+          account.serverIds.some((id) => typeof id !== "string") ||
+          account.excludedServerIds.some((id) => typeof id !== "string"))
+      )
+        throw new Error("Invalid scoped account storage.");
       accountIds.add(account.id);
       accountEmails.add(account.email);
+    }
+    if (saved.version < 4) {
+      migrationNeeded = true;
+      const existing = new Set(listServerIds());
+      state.accounts = state.accounts.map((account) => {
+        // Materialize the old policy against today's registry only. New servers
+        // must never inherit a previous account-wide permission template.
+        const mapped = (
+          account.accessMode === "all" ? [...existing] : account.serverIds
+        ).filter(
+          (id) => existing.has(id) && !account.excludedServerIds.includes(id),
+        );
+        const unresolved = [
+          ...new Set([
+            ...account.serverIds,
+            ...account.excludedServerIds,
+            ...Object.keys(account.serverOverrides),
+          ]),
+        ].filter(
+          (id) =>
+            !existing.has(id) ||
+            (Object.hasOwn(account.serverOverrides, id) &&
+              !mapped.includes(id)),
+        );
+        return {
+          ...account,
+          accessMode: "selected",
+          permissions: [],
+          serverIds: mapped,
+          excludedServerIds: [],
+          serverOverrides: Object.fromEntries(
+            mapped.map((id) => [
+              id,
+              {
+                ...account.serverOverrides[id],
+                permissions: [
+                  ...new Set([
+                    "server.view",
+                    ...(account.serverOverrides[id]?.permissions ??
+                      account.permissions),
+                  ]),
+                ],
+              },
+            ]),
+          ),
+          ...(unresolved.length ||
+          (account.permissions.length && !mapped.length)
+            ? {
+                accessReview: {
+                  message:
+                    "Some previous permissions have no active server mapping. They are retained for owner review and are not active.",
+                  serverIds: unresolved,
+                  previousPolicy: {
+                    accessMode: account.accessMode,
+                    permissions: account.permissions,
+                    serverIds: account.serverIds,
+                    excludedServerIds: account.excludedServerIds,
+                    serverOverrides: account.serverOverrides,
+                  },
+                },
+              }
+            : {}),
+        };
+      });
     }
   } catch (cause) {
     if (cause.code !== "ENOENT")
@@ -264,6 +350,7 @@ export async function createAccessService({
       );
     }
   };
+  if (migrationNeeded) await persist(state);
   const cleaned = () => ({
     ...state,
     tokens: state.tokens.filter(
@@ -307,9 +394,10 @@ export async function createAccessService({
   const permitsServer = (account, serverId) =>
     serverIds().includes(serverId) &&
     !account.excludedServerIds.includes(serverId) &&
-    (account.accessMode === "all" || account.serverIds.includes(serverId));
+    account.serverIds.includes(serverId) &&
+    account.serverOverrides[serverId]?.permissions?.includes("server.view");
   const accountPermissions = (account, serverId) =>
-    account.serverOverrides[serverId]?.permissions ?? account.permissions;
+    account.serverOverrides[serverId]?.permissions ?? [];
   const accountHostPermissions = (account, serverId) => [
     ...new Set([
       ...account.hostPermissions,
@@ -396,9 +484,25 @@ export async function createAccessService({
       if (!account.serverIds.includes(serverId))
         account.serverIds.push(serverId);
       const previous = account.serverOverrides[serverId];
+      if (previous) {
+        // Multiple legacy identities on the same server are not a single
+        // permission grant. Keep their original records and credentials until
+        // the owner resolves the duplicate; never union them during promotion.
+        account.accessReview = {
+          message:
+            "Duplicate legacy identities share an email on this server. Review their server access before combining them into one panel account.",
+          serverIds: [
+            ...new Set([...(account.accessReview?.serverIds ?? []), serverId]),
+          ],
+          duplicateLegacyIdentities: true,
+        };
+        account.legacyMembers.push({ serverId, userId: user.id });
+        continue;
+      }
       account.serverOverrides[serverId] = {
         permissions: [
           ...new Set([
+            ...(user.permissionVersion !== 2 ? ["server.view"] : []),
             ...(previous?.permissions ?? []),
             ...(user.permissions ?? []).filter((id) => permissionIds.has(id)),
           ]),
@@ -441,8 +545,13 @@ export async function createAccessService({
   };
   const findAccount = (id) =>
     accountById(id) ?? legacyAccounts().find((account) => account.id === id);
-  const promoted = (account) =>
-    account.legacy
+  const promoted = (account) => {
+    if (account.accessReview?.duplicateLegacyIdentities)
+      throw fail(
+        409,
+        "Review duplicate legacy identities on their server before combining this account.",
+      );
+    return account.legacy
       ? {
           ...account,
           id: randomUUID(),
@@ -452,21 +561,16 @@ export async function createAccessService({
           authRevision: randomUUID(),
         }
       : { ...account };
+  };
   const validateAccount = (input, current) => {
     if (!input || typeof input !== "object" || Array.isArray(input))
       throw fail(400, "Enter valid panel account settings.");
-    const allowed = new Set([
-      "email",
-      "permissions",
-      "hostPermissions",
-      "accessMode",
-      "serverIds",
-      "excludedServerIds",
-      "serverOverrides",
-      "role",
-    ]);
+    const allowed = new Set(["email", "hostPermissions"]);
     if (Object.keys(input).some((key) => !allowed.has(key)))
-      throw fail(400, "Choose valid panel account settings.");
+      throw fail(
+        400,
+        "Manage server permissions from that server's Subusers page.",
+      );
     const email = normalizedEmail(input.email ?? current?.email);
     if (!validEmail(email))
       throw fail(400, "Enter a valid account email address.");
@@ -478,82 +582,18 @@ export async function createAccessService({
       authRevision: randomUUID(),
       permissions: [],
       hostPermissions: [],
-      accessMode: "all",
+      accessMode: "selected",
       serverIds: [],
       excludedServerIds: [],
       serverOverrides: {},
       ...current,
       email,
     };
-    if (Object.hasOwn(input, "permissions"))
-      account.permissions = validPermissions(input.permissions);
-    else if (!current && input.role)
-      account.permissions = validPermissions(
-        permissionCatalog.roleDefaults[input.role] ?? [],
-      );
     if (Object.hasOwn(input, "hostPermissions"))
       account.hostPermissions = validPermissions(
         input.hostPermissions,
         hostPermissionIds,
       );
-    if (Object.hasOwn(input, "accessMode")) {
-      if (!["all", "selected"].includes(input.accessMode))
-        throw fail(400, "Choose all servers or selected servers.");
-      account.accessMode = input.accessMode;
-    }
-    const knownIds = new Set([
-      ...serverIds(),
-      ...(current?.serverIds ?? []),
-      ...(current?.excludedServerIds ?? []),
-      ...Object.keys(current?.serverOverrides ?? {}),
-    ]);
-    const validIds = (ids) => {
-      if (
-        !Array.isArray(ids) ||
-        ids.length > 10000 ||
-        ids.some((id) => typeof id !== "string" || !knownIds.has(id))
-      )
-        throw fail(400, "Choose existing servers for this account.");
-      return [...new Set(ids)];
-    };
-    for (const field of ["serverIds", "excludedServerIds"])
-      if (Object.hasOwn(input, field)) account[field] = validIds(input[field]);
-    if (Object.hasOwn(input, "serverOverrides")) {
-      if (
-        !input.serverOverrides ||
-        typeof input.serverOverrides !== "object" ||
-        Array.isArray(input.serverOverrides)
-      )
-        throw fail(400, "Enter valid per-server permissions.");
-      validIds(Object.keys(input.serverOverrides));
-      account.serverOverrides = Object.fromEntries(
-        Object.entries(input.serverOverrides).map(([id, value]) => {
-          if (
-            !value ||
-            typeof value !== "object" ||
-            Array.isArray(value) ||
-            Object.keys(value).some(
-              (key) => !["permissions", "hostPermissions"].includes(key),
-            )
-          )
-            throw fail(400, "Enter valid per-server permissions.");
-          return [
-            id,
-            {
-              permissions: validPermissions(value.permissions),
-              ...(Object.hasOwn(value, "hostPermissions")
-                ? {
-                    hostPermissions: validPermissions(
-                      value.hostPermissions,
-                      hostPermissionIds,
-                    ),
-                  }
-                : {}),
-            },
-          ];
-        }),
-      );
-    }
     return account;
   };
   const replaceAccount = (next, account, previous) => ({
@@ -737,6 +777,64 @@ export async function createAccessService({
         .map((account) => userForServer(serverId, account.id))
         .filter(Boolean),
     resolveUser,
+    grantServer: (serverId, id, input) =>
+      serialize(async () => {
+        if (!serverIds().includes(serverId))
+          throw fail(404, "Server not found.");
+        const current = findAccount(id);
+        if (!current) throw fail(404, "Panel account not found.");
+        if (
+          !input ||
+          typeof input !== "object" ||
+          Array.isArray(input) ||
+          Object.keys(input).some(
+            (key) => !["permissions", "hostPermissions"].includes(key),
+          )
+        )
+          throw fail(400, "Enter valid permissions for this server.");
+        const permissions = validPermissions(input.permissions);
+        if (permissions.length && !permissions.includes("server.view"))
+          throw fail(
+            400,
+            "Select Can View Server before granting other server permissions.",
+          );
+        const account = promoted(current);
+        const override = {
+          permissions,
+          hostPermissions: Object.hasOwn(input, "hostPermissions")
+            ? validPermissions(input.hostPermissions, hostPermissionIds)
+            : (account.serverOverrides[serverId]?.hostPermissions ?? []),
+        };
+        if (
+          override.hostPermissions.length &&
+          !permissions.includes("server.view")
+        )
+          throw fail(
+            400,
+            "Select Can View Server before granting this server's host access.",
+          );
+        const updated = {
+          ...account,
+          accessMode: "selected",
+          permissions: [],
+          serverIds: [...new Set([...account.serverIds, serverId])],
+          excludedServerIds: account.excludedServerIds.filter(
+            (id) => id !== serverId,
+          ),
+          serverOverrides: { ...account.serverOverrides, [serverId]: override },
+        };
+        await persist(replaceAccount(cleaned(), updated, current));
+        return {
+          id: updated.id,
+          accountId: updated.id,
+          panelAccount: true,
+          email: updated.email,
+          createdAt: updated.createdAt,
+          role: "custom",
+          permissions: [...permissions],
+          hostPermissions: accountHostPermissions(updated, serverId),
+        };
+      }),
     createAccount: (input) =>
       serialize(async () => {
         const account = validateAccount(input);

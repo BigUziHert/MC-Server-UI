@@ -662,7 +662,7 @@ test("legacy settings strip email secrets on save while preserving primary-scope
   );
   await migrated.configure({ port: 3443 });
   const stored = await f.read();
-  assert.equal(stored.version, 3);
+  assert.equal(stored.version, 4);
   assert.equal(JSON.stringify(stored).includes("old-provider-secret"), false);
   assert.equal(stored.sessions.length, 1);
   assert.equal(stored.tokens.length, 1);

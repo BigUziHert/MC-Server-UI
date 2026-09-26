@@ -2,6 +2,7 @@ import { expect, test, type Page } from "@playwright/test";
 import catalog from "../shared/subuser-permissions.json" with { type: "json" };
 
 const initialPermissions = [
+  "server.view",
   "control.start",
   "control.stop",
   "control.console",
@@ -44,7 +45,7 @@ async function remotePanel(page: Page, granted = true) {
       {
         id: "host-grantee",
         email: "creator@example.test",
-        permissions: ["control.start"],
+        permissions: ["server.view", "control.start"],
         hostPermissions: ["server.create"],
         createdAt: "2026-09-25T12:00:00Z",
       },

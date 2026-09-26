@@ -40,7 +40,7 @@ async function openPage(page: Page, hash: string, heading: string) {
       console: "/api/server",
       files: "/api/files",
       backups: "/api/backups",
-      subusers: "/api/panel-users",
+      subusers: "/api/subusers",
       audit: "/api/audit",
       players: "/api/players",
     } as Record<string, string>
@@ -505,16 +505,15 @@ test("manual backups download a real archive and automatic schedules persist", a
   });
 });
 
-test("subusers can be prepared before remote setup, searched, and revoked", async ({
+test("panel accounts can be prepared before remote setup, searched, and removed without server access", async ({
   page,
   request,
 }) => {
   await openPage(page, "subusers", "Subusers");
-  await page.getByRole("button", { name: "New user", exact: true }).click();
-  let dialog = page.getByRole("dialog", { name: "Create new subuser" });
-  await expect(
-    dialog.getByText(/No invitation link can be created/),
-  ).toBeVisible();
+  await page
+    .getByRole("button", { name: "Invite person", exact: true })
+    .click();
+  let dialog = page.getByRole("dialog", { name: "Invite person", exact: true });
   await expect(
     dialog.getByRole("checkbox", {
       name: "Create invitation link",
@@ -522,23 +521,22 @@ test("subusers can be prepared before remote setup, searched, and revoked", asyn
     }),
   ).toBeDisabled();
   await dialog.getByLabel("Email address").fill("operator@example.com");
-  await dialog.locator(".subusers-permission-details summary").click();
+  await expect(
+    dialog.getByRole("checkbox", { name: "Can View Server", exact: true }),
+  ).toHaveCount(0);
   await dialog
-    .getByRole("checkbox", { name: "View audit logs", exact: true })
-    .check();
-  await dialog
-    .getByRole("button", { name: "Create subuser", exact: true })
+    .getByRole("button", { name: "Create account", exact: true })
     .click();
   await expect(dialog).not.toBeVisible();
   const row = page.getByRole("row").filter({ hasText: "operator@example.com" });
-  await expect(row).toContainText("1 selected");
   await expect(row).toContainText("Not invited");
   expect((await (await request.get("/api/panel-users")).json()).users).toEqual(
     expect.arrayContaining([
       expect.objectContaining({
         email: "operator@example.com",
-        accessMode: "all",
-        permissions: ["audit.read"],
+        accessMode: "selected",
+        permissions: [],
+        serverIds: [],
       }),
     ]),
   );
@@ -559,10 +557,10 @@ test("subusers can be prepared before remote setup, searched, and revoked", asyn
     .click();
   dialog = page.getByRole("dialog", { name: "Remove access record?" });
   await expect(dialog).toContainText(
-    "active sessions and invitation links will stop working",
+    "sign-in, invitation links, and all server grants will be revoked",
   );
   await dialog
-    .getByRole("button", { name: "Remove record", exact: true })
+    .getByRole("button", { name: "Remove account", exact: true })
     .click();
   await expect(dialog).not.toBeVisible();
   await expect(row).toHaveCount(0);
@@ -1129,28 +1127,38 @@ test("server workspaces isolate files, commands and backups while panel users re
   await expect(
     page.getByRole("button", { name: /Grant OP|Revoke OP|Remove OP/ }),
   ).toHaveCount(0);
-  await page.getByRole("button", { name: "New user", exact: true }).click();
-  dialog = page.getByRole("dialog", { name: "Create new subuser" });
+  await page
+    .getByRole("button", { name: "Invite person", exact: true })
+    .click();
+  dialog = page.getByRole("dialog", { name: "Invite person", exact: true });
   await dialog.getByLabel("Email address").fill("secondary-only@example.com");
   await dialog
-    .getByRole("combobox", { name: "Servers available to this person" })
-    .selectOption("selected");
-  const accessChoices = dialog
-    .getByRole("group", { name: "Allowed servers" })
-    .getByRole("checkbox");
-  for (const choice of await accessChoices.all()) await choice.uncheck();
+    .getByRole("button", { name: "Create account", exact: true })
+    .click();
+  await expect(dialog).not.toBeVisible();
+  await page.getByRole("tab", { name: "This server", exact: true }).click();
+  await page
+    .getByRole("button", { name: "Grant server access", exact: true })
+    .click();
+  dialog = page.getByRole("dialog", {
+    name: "Grant server access",
+    exact: true,
+  });
   await dialog
-    .getByRole("checkbox", {
-      name: "Access to E2E Isolated World",
-      exact: true,
-    })
+    .getByRole("combobox", { name: "Panel account", exact: true })
+    .selectOption({ label: "secondary-only@example.com" });
+  await dialog
+    .getByRole("checkbox", { name: "Can View Server", exact: true })
     .check();
+  await expect(
+    dialog.getByRole("combobox", { name: "Servers available to this person" }),
+  ).toHaveCount(0);
   await dialog.locator(".subusers-permission-details summary").click();
   await dialog
     .getByRole("checkbox", { name: "View audit logs", exact: true })
     .check();
   await dialog
-    .getByRole("button", { name: "Create subuser", exact: true })
+    .getByRole("button", { name: "Grant access", exact: true })
     .click();
   await expect(dialog).not.toBeVisible();
   await expect(
@@ -1171,7 +1179,7 @@ test("server workspaces isolate files, commands and backups while panel users re
   await switchServer(page, defaultServerId);
   await expect(
     page.getByRole("row").filter({ hasText: "secondary-only@example.com" }),
-  ).toBeVisible();
+  ).toHaveCount(0);
 });
 test("Players grants and removes OP through the subprocess independently of panel access and other servers", async ({
   page,
@@ -1318,7 +1326,7 @@ test("Players grants and removes OP through the subprocess independently of pane
     page.getByRole("button", { name: /Grant OP|Remove OP|Revoke OP/ }),
   ).toHaveCount(0);
   await expect(
-    page.getByRole("button", { name: "New user", exact: true }),
+    page.getByRole("button", { name: "Grant server access", exact: true }),
   ).toBeVisible();
 
   await openPage(page, "console", "Console");

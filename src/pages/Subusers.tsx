@@ -1,5 +1,6 @@
 import {
   useCallback,
+  useContext,
   useEffect,
   useId,
   useRef,
@@ -21,6 +22,7 @@ import {
   api as panelApi,
   useServerApi,
   relativeTime,
+  ServerScope,
   type PageProps,
 } from "../api";
 import SearchField, { useDebouncedValue } from "../SearchField";
@@ -51,8 +53,8 @@ type Subuser = {
   inviteStatus?: "pending" | "accepted" | "expired" | "not-invited";
   invitedAt?: string;
   acceptedAt?: string;
+  accessReview?: { message: string };
 };
-type AccessServer = { id: string; name: string; available?: boolean };
 type AccessSettings = {
   enabled: boolean;
   publicUrl: string;
@@ -73,6 +75,7 @@ type Invitation = {
   invitationUrl: string;
   inviteExpiresAt: string;
   warning?: string;
+  panelWide?: boolean;
 };
 function accessReady(settings: AccessSettings | null) {
   return !!settings?.ready && !settings.error && settings.listening !== false;
@@ -90,7 +93,7 @@ function permissionsFor(user: Subuser) {
   return permissionIds.filter((permission) => selected.has(permission));
 }
 
-function RemoteAccessSetup({
+export function RemoteAccessSetup({
   onSettings,
   notify,
 }: {
@@ -205,6 +208,9 @@ function RemoteAccessSetup({
         }),
       });
       applySettings(result);
+      window.dispatchEvent(
+        new CustomEvent("mc-panel-access-settings-changed", { detail: result }),
+      );
       if (result.error) setError(result.error);
       else notify("Remote access settings saved.");
     } catch (cause) {
@@ -219,6 +225,11 @@ function RemoteAccessSetup({
         const current = await panelApi<AccessSettings>("/access/settings");
         setSettings(current);
         onSettings(current);
+        window.dispatchEvent(
+          new CustomEvent("mc-panel-access-settings-changed", {
+            detail: current,
+          }),
+        );
       } catch {
         setSettings((current) =>
           current ? { ...current, ready: false } : null,
@@ -256,12 +267,12 @@ function RemoteAccessSetup({
           <h2>
             {accessReady(settings)
               ? "Remote access is configured"
-              : "Set up phone access"}
+              : "Remote access"}
           </h2>
           <p>
             {accessReady(settings)
               ? "Create an invitation link and send it yourself by text or email."
-              : "Use your public IP and a forwarded port. No domain or email service needed."}
+              : "Allow invited accounts to sign in to this panel. Server access is granted separately."}
           </p>
         </div>
         <button
@@ -527,6 +538,7 @@ function InvitationDialog({
           <p className="subusers-editor-notice">
             Send this link privately to <strong>{invitation.user.email}</strong>{" "}
             using your own text or email app. MC Panel does not send an email.
+            {panelWide && " This invitation grants no server access."}
           </p>
           <div className="subusers-setup-field">
             <label htmlFor="subuser-invitation-url">Invitation link</label>
@@ -548,7 +560,7 @@ function InvitationDialog({
             signs in with their email and password. Creating another link
             invalidates their previous unused link. Resetting access disables
             their previous password and signs them out of{" "}
-            {panelWide ? "this panel" : "this server"}
+            {panelWide ? "this panel " : "this server "}
             immediately. They regain access after accepting the new link.
           </p>
           {invitation.warning && (
@@ -583,52 +595,51 @@ export default function Subusers({
   permissions,
   signedInEmail,
 }: PageProps & { permissions?: string[]; signedInEmail?: string }) {
+  const serverId = useContext(ServerScope);
   const remote = permissions !== undefined;
+  const [view, setView] = useState<"server" | "accounts">("server");
+  const accountsView = !remote && (!serverId || view === "accounts");
   const can = (permission: string) =>
     permissions === undefined || permissions.includes(permission);
   const canRead = can("user.read");
   const canCreate = can("user.create");
   const canUpdate = can("user.update");
   const canDelete = can("user.delete");
-  const manageable = (user: Subuser) =>
-    permissionsFor(user).every(can) &&
-    (!remote || (!user.hostPermissions?.length && !user.panelAccount));
   const ownAccess = (user: Subuser) =>
     signedInEmail !== undefined &&
     user.email.toLowerCase() === signedInEmail.toLowerCase();
+  const manageable = (user: Subuser) =>
+    !ownAccess(user) &&
+    permissionsFor(user).every(can) &&
+    (!remote || (!user.hostPermissions?.length && !user.panelAccount));
   const grantablePermissions = permissionIds.filter(can);
   const groups = catalog.groups
     .map((group) => ({
       ...group,
-      permissions: group.permissions.filter((permission) => can(permission.id)),
+      permissions: group.permissions.filter(
+        (permission) => permission.id !== "server.view" && can(permission.id),
+      ),
     }))
     .filter((group) => group.permissions.length);
   const { api: serverApi } = useServerApi();
-  const api = remote ? serverApi : panelApi;
-  const basePath = remote ? "/subusers" : "/panel-users";
-  const post = useCallback(
-    <T,>(path: string, body: unknown = {}) =>
-      api<T>(path, { method: "POST", body: JSON.stringify(body) }),
-    [api],
-  );
+  const api = accountsView ? panelApi : serverApi;
+  const basePath = accountsView ? "/panel-users" : "/subusers";
   const [users, setUsers] = useState<Subuser[]>([]);
-  const [servers, setServers] = useState<AccessServer[]>([]);
+  const [accounts, setAccounts] = useState<Subuser[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
   const [search, setSearch] = useState("");
   const debouncedSearch = useDebouncedValue(search);
-  const [page, setPage] = useState(1),
-    [pageSize, setPageSize] = useState(25);
+  const [page, setPage] = useState(1);
+  const [pageSize, setPageSize] = useState(25);
   const loaded = useRef(false);
-  useEffect(() => setPage(1), [debouncedSearch, pageSize]);
-  const [editor, setEditor] = useState<"create" | Subuser | null>(null);
+  const [editor, setEditor] = useState<"invite" | "grant" | Subuser | null>(
+    null,
+  );
   const [email, setEmail] = useState("");
+  const [accountId, setAccountId] = useState("");
   const [selected, setSelected] = useState<string[]>([]);
   const [allowServerCreation, setAllowServerCreation] = useState(false);
-  const [accessMode, setAccessMode] = useState<"all" | "selected">("all");
-  const [serverIds, setServerIds] = useState<string[]>([]);
-  const [excludedServerIds, setExcludedServerIds] = useState<string[]>([]);
-  const [replaceServerOverrides, setReplaceServerOverrides] = useState(false);
   const [deleting, setDeleting] = useState<Subuser | null>(null);
   const [resetting, setResetting] = useState<Subuser | null>(null);
   const [busy, setBusy] = useState(false);
@@ -645,16 +656,33 @@ export default function Subusers({
   const cancelButton = useRef<HTMLButtonElement>(null);
   const request = useRef<AbortController | null>(null);
   const errorMessage = useRef<HTMLParagraphElement>(null);
-  const editing = editor && editor !== "create" ? editor : null;
+  const editing = editor && typeof editor === "object" ? editor : null;
+  const invitingAccount = editor === "invite";
+  const accountEditor = invitingAccount || (accountsView && !!editing);
   const invitationReady = canCreate && (remote || accessReady(accessSettings));
   const canSubmitRecord = resetting
-    ? canCreate && manageable(resetting) && !ownAccess(resetting)
+    ? canCreate && manageable(resetting)
     : deleting
       ? canDelete && manageable(deleting)
       : editing
         ? canUpdate && manageable(editing)
         : canCreate;
+  const candidates = accounts.filter(
+    (account) =>
+      !users.some(
+        (user) => user.email.toLowerCase() === account.email.toLowerCase(),
+      ),
+  );
 
+  useEffect(() => setPage(1), [debouncedSearch, pageSize]);
+  useEffect(() => {
+    if (remote) return;
+    const update = (event: Event) =>
+      setAccessSettings((event as CustomEvent<AccessSettings>).detail);
+    window.addEventListener("mc-panel-access-settings-changed", update);
+    return () =>
+      window.removeEventListener("mc-panel-access-settings-changed", update);
+  }, [remote]);
   const refresh = useCallback(async () => {
     request.current?.abort();
     if (!canRead) {
@@ -666,15 +694,23 @@ export default function Subusers({
     if (!loaded.current) setLoading(true);
     setError("");
     try {
-      const result = await api<{ users: Subuser[]; servers?: AccessServer[] }>(
-        basePath,
-        {
-          signal: controller.signal,
-        },
-      );
+      const [result, panelResult, settings] = await Promise.all([
+        api<{ users: Subuser[] }>(basePath, { signal: controller.signal }),
+        !remote && !accountsView
+          ? panelApi<{ users: Subuser[] }>("/panel-users", {
+              signal: controller.signal,
+            })
+          : Promise.resolve(null),
+        !remote
+          ? panelApi<AccessSettings>("/access/settings", {
+              signal: controller.signal,
+            }).catch(() => null)
+          : Promise.resolve(null),
+      ]);
       if (controller.signal.aborted) return false;
       setUsers(result.users);
-      if (!remote) setServers(result.servers ?? []);
+      setAccounts(panelResult?.users ?? (accountsView ? result.users : []));
+      setAccessSettings(settings);
       loaded.current = true;
       return true;
     } catch (cause) {
@@ -686,15 +722,15 @@ export default function Subusers({
     } finally {
       if (!controller.signal.aborted) setLoading(false);
     }
-  }, [api, canRead, basePath, remote]);
+  }, [api, canRead, basePath, remote, accountsView]);
   useEffect(() => {
     loaded.current = false;
     setUsers([]);
-    setServers([]);
+    setAccounts([]);
     setSearch("");
     setPage(1);
-    setInvitation(null);
-    setInvitationError("");
+    setDeleting(null);
+    setResetting(null);
     void refresh();
     return () => request.current?.abort();
   }, [refresh]);
@@ -703,13 +739,14 @@ export default function Subusers({
     if (editor || deleting || resetting) {
       element?.showModal();
       if (deleting || resetting) cancelButton.current?.focus();
-      else if (editor === "create") emailInput.current?.focus();
+      else if (editor === "invite" || (editor === "grant" && remote))
+        emailInput.current?.focus();
       else
         element
-          ?.querySelector<HTMLInputElement>('input[type="checkbox"]')
+          ?.querySelector<HTMLElement>("select, input[type=checkbox]")
           ?.focus();
     } else element?.close();
-  }, [editor, deleting, resetting]);
+  }, [editor, deleting, resetting, remote]);
   useEffect(() => {
     if (formError) errorMessage.current?.scrollIntoView({ block: "nearest" });
   }, [formError]);
@@ -721,45 +758,45 @@ export default function Subusers({
     setResetting(null);
     setFormError("");
   }
-  function openEditor(user?: Subuser) {
+  function openEditor(user?: Subuser, invite = false) {
     if (user ? !canUpdate || !manageable(user) : !canCreate) return;
     setEmail(user?.email ?? "");
+    setAccountId("");
     setSelected(user ? permissionsFor(user) : []);
     setAllowServerCreation(
       user?.hostPermissions?.includes("server.create") ?? false,
     );
-    setAccessMode(user?.accessMode ?? "all");
-    setServerIds(user?.serverIds ?? []);
-    setExcludedServerIds(user?.excludedServerIds ?? []);
-    setReplaceServerOverrides(false);
     setFormError("");
-    setInviteOnCreate(invitationReady);
-    setEditor(user ?? "create");
+    setInviteOnCreate(invite && invitationReady);
+    setEditor(user ?? (invite ? "invite" : "grant"));
   }
-  async function createInvitation(user: Subuser) {
-    if (!canCreate || !manageable(user) || ownAccess(user)) return;
+  async function createInvitation(user: Subuser, panelAccount = accountsView) {
+    if (!canCreate || (remote && !manageable(user))) return false;
     setInviting(user.id);
     setInvitationError("");
     try {
-      const result = await post<Invitation & { message: string }>(
-        `${basePath}/${encodeURIComponent(user.id)}/invite`,
+      const result = await (panelAccount ? panelApi : serverApi)<Invitation>(
+        `${panelAccount ? "/panel-users" : "/subusers"}/${encodeURIComponent(user.id)}/invite`,
+        { method: "POST", body: "{}" },
       );
       setUsers((previous) =>
         previous.map((item) => (item.id === user.id ? result.user : item)),
       );
-      setInvitation(result);
+      setInvitation({ ...result, panelWide: panelAccount });
+      return true;
     } catch (cause) {
       const message =
         cause instanceof Error
           ? cause.message
           : "Unable to create the invitation link.";
       setInvitationError(
-        `The subuser is saved, but an invitation link for ${user.email} could not be created. ${message} Use ${user.inviteStatus === "accepted" ? "Reset access" : "Create invite link"} to retry.`,
+        `The ${panelAccount ? "account" : "subuser"} is saved, but an invitation link for ${user.email} could not be created. ${message} Use ${user.inviteStatus === "accepted" ? "Reset access" : "Create invite link"} to retry.`,
       );
       notify(
-        "Invitation link could not be created. The subuser is still saved.",
+        "Invitation link could not be created. The account is still saved.",
         true,
       );
+      return false;
     } finally {
       setInviting(null);
     }
@@ -773,12 +810,24 @@ export default function Subusers({
         if (allSelected) next.delete(id);
         else next.add(id);
       }
+      if (!next.has("server.view")) return [];
       return grantablePermissions.filter((id) => next.has(id));
     });
   }
   async function submit(event: FormEvent) {
     event.preventDefault();
     if (busy || !canSubmitRecord || !selected.every(can)) return;
+    if (
+      !accountEditor &&
+      !deleting &&
+      !resetting &&
+      !selected.includes("server.view")
+    ) {
+      setFormError(
+        "Select Can View Server to grant access, or use Revoke access to remove this person's access.",
+      );
+      return;
+    }
     setBusy(true);
     setFormError("");
     try {
@@ -786,53 +835,76 @@ export default function Subusers({
         await createInvitation(resetting);
         setResetting(null);
         return;
-      } else if (deleting) {
-        await api(`${basePath}/${encodeURIComponent(deleting.id)}`, {
-          method: "DELETE",
-        });
-        notify("Subuser access revoked.");
+      }
+      if (deleting) {
+        const result = await api<{ warning?: string } | undefined>(
+          `${basePath}/${encodeURIComponent(deleting.id)}`,
+          { method: "DELETE" },
+        );
+        notify(
+          result?.warning ||
+            (accountsView
+              ? "Panel account removed."
+              : "Access to this server revoked."),
+          !!result?.warning,
+        );
       } else if (editing) {
-        await api(`${basePath}/${encodeURIComponent(editing.id)}`, {
-          method: "PATCH",
-          body: JSON.stringify({
-            permissions: selected,
-            ...(!remote
-              ? {
-                  hostPermissions: allowServerCreation ? ["server.create"] : [],
-                  accessMode,
-                  serverIds: accessMode === "selected" ? serverIds : [],
-                  excludedServerIds:
-                    accessMode === "all" ? excludedServerIds : [],
-                  ...(replaceServerOverrides ? { serverOverrides: {} } : {}),
-                }
-              : {}),
-          }),
-        });
-        notify("Subuser permissions updated. Changes take effect immediately.");
-      } else {
-        const result = await post<Subuser | { user: Subuser }>(basePath, {
-          email: email.trim(),
-          permissions: selected,
-          ...(!remote
-            ? {
-                hostPermissions: allowServerCreation ? ["server.create"] : [],
-                accessMode,
-                serverIds: accessMode === "selected" ? serverIds : [],
-                excludedServerIds:
-                  accessMode === "all" ? excludedServerIds : [],
-              }
-            : {}),
-        });
-        // Creation has succeeded even if the separate invitation request fails.
+        const result = await api<{ warning?: string }>(
+          `${basePath}/${encodeURIComponent(editing.id)}`,
+          {
+            method: "PATCH",
+            body: JSON.stringify(
+              accountsView
+                ? {
+                    hostPermissions: allowServerCreation
+                      ? ["server.create"]
+                      : [],
+                  }
+                : { permissions: selected },
+            ),
+          },
+        );
+        notify(
+          result.warning ||
+            (accountsView
+              ? "Account updated."
+              : "Subuser permissions updated. Changes take effect immediately."),
+          !!result.warning,
+        );
+      } else if (invitingAccount) {
+        const result = await panelApi<Subuser | { user: Subuser }>(
+          "/panel-users",
+          {
+            method: "POST",
+            body: JSON.stringify({ email: email.trim() }),
+          },
+        );
+        const user = "user" in result ? result.user : result;
         setEditor(null);
-        await refresh();
-        if (inviteOnCreate)
-          await createInvitation("user" in result ? result.user : result);
+        // Show the saved identity even if the separate invitation request fails.
+        setView("accounts");
+        if (accountsView) await refresh();
+        if (inviteOnCreate) await createInvitation(user, true);
         else
           notify(
-            "Subuser created. Create an invitation link when access is configured.",
+            invitationReady
+              ? "Account created with no server access. Use Create invite link when you are ready to share it."
+              : "Account created with no server access. Enable Remote Access in Panel Settings to share an invitation.",
           );
         return;
+      } else {
+        const result = await serverApi<{ warning?: string }>("/subusers", {
+          method: "POST",
+          body: JSON.stringify(
+            remote
+              ? { email: email.trim(), permissions: selected }
+              : { accountId, permissions: selected },
+          ),
+        });
+        notify(
+          result.warning || "Access granted to this server.",
+          !!result.warning,
+        );
       }
       setEditor(null);
       setDeleting(null);
@@ -850,7 +922,6 @@ export default function Subusers({
   const filtered = users.filter((user) =>
     user.email.toLowerCase().includes(debouncedSearch.toLowerCase()),
   );
-
   const currentPage = Math.min(
     page,
     Math.max(1, Math.ceil(filtered.length / pageSize)),
@@ -873,22 +944,61 @@ export default function Subusers({
         <div>
           <h1>Subusers</h1>
           <p className="subusers-page-description">
-            {remote
-              ? "Invite people to manage this server from their phone or browser."
-              : "One account and invitation for this panel. Choose their permissions and which servers they can access."}
+            {accountsView
+              ? "Invite people to create an account and sign in. Invitations grant no server access."
+              : "Manage access to this server. Can View Server is required; every permission below applies only to this server."}
           </p>
         </div>
-        <button
-          className="btn primary"
-          disabled={!canCreate || busy || !!inviting}
-          onClick={() => openEditor()}
-        >
-          <Plus size={16} />
-          New user
-        </button>
+        <div className="subusers-heading-actions">
+          {!remote && (
+            <button
+              className="btn"
+              disabled={busy || !!inviting}
+              onClick={() => openEditor(undefined, true)}
+            >
+              <Plus size={16} /> Invite person
+            </button>
+          )}
+          {!accountsView && (
+            <button
+              className="btn primary"
+              disabled={!canCreate || busy || !!inviting || loading}
+              onClick={() => openEditor()}
+            >
+              <Plus size={16} />
+              {remote ? "New user" : "Grant server access"}
+            </button>
+          )}
+        </div>
       </header>
+      {!remote && serverId && (
+        <div
+          className="subusers-view-tabs"
+          role="tablist"
+          aria-label="Access management"
+        >
+          <button
+            role="tab"
+            aria-selected={!accountsView}
+            onClick={() => setView("server")}
+          >
+            This server
+          </button>
+          <button
+            role="tab"
+            aria-selected={accountsView}
+            onClick={() => setView("accounts")}
+          >
+            Panel accounts
+          </button>
+        </div>
+      )}
       {!remote && (
-        <RemoteAccessSetup onSettings={setAccessSettings} notify={notify} />
+        <p className="subusers-editor-notice">
+          {accessReady(accessSettings)
+            ? "Remote Access is enabled. Invited people can sign in, and see only servers the host has shared with them."
+            : "Enable Remote Access and configure the public panel address in Panel Settings before sharing invitation links."}
+        </p>
       )}
       {invitationError && (
         <p className="subusers-form-error" role="alert">
@@ -900,7 +1010,7 @@ export default function Subusers({
         <div className="subusers-toolbar">
           <div className="subusers-list-title">
             <Users size={17} />
-            <h2>Users</h2>
+            <h2>{accountsView ? "Panel accounts" : "Users"}</h2>
             <span>{users.length}</span>
           </div>
           <div className="subusers-controls">
@@ -934,11 +1044,19 @@ export default function Subusers({
           <StatePanel
             variant="empty"
             icon={<Users size={25} />}
-            title={search ? "No matching people" : "No subusers"}
+            title={
+              search
+                ? "No matching people"
+                : accountsView
+                  ? "No panel accounts"
+                  : "No subusers"
+            }
             message={
               search
                 ? "Try another email address."
-                : "Add someone, choose their permissions, and share an invitation link."
+                : accountsView
+                  ? "Invite a person to create an account. Grant server access separately from that server's Subusers page."
+                  : "Grant an existing account access to this server. An invitation alone does not share it."
             }
           />
         ) : (
@@ -946,7 +1064,7 @@ export default function Subusers({
             <thead>
               <tr>
                 <th>User</th>
-                <th>Permissions</th>
+                <th>{accountsView ? "Account" : "Permissions"}</th>
                 <th className="subuser-added">Added</th>
                 <th className="subuser-row-actions">
                   <span className="subusers-sr-only">Actions</span>
@@ -969,13 +1087,7 @@ export default function Subusers({
                         </span>
                         <div>
                           <strong>{user.email}</strong>
-                          <span
-                            title={
-                              user.invitedAt
-                                ? `Last invitation created ${new Date(user.invitedAt).toLocaleString()}`
-                                : undefined
-                            }
-                          >
+                          <span>
                             {user.inviteStatus === "accepted"
                               ? "Access activated"
                               : user.inviteStatus === "pending"
@@ -984,47 +1096,46 @@ export default function Subusers({
                                   ? "Invitation expired · create a new link"
                                   : "Not invited"}
                           </span>
-                          {ownAccess(user) && canCreate && (
+                          {accountsView && (
                             <span>
-                              Ask the panel owner to reset your own access.
+                              Server access is managed from each server’s
+                              Subusers page.
                             </span>
                           )}
-                          {!remote && (
-                            <span className="subuser-server-scope">
-                              {user.accessMode === "all"
-                                ? user.excludedServerIds?.length
-                                  ? `All current and future servers except ${user.excludedServerIds.length}`
-                                  : "All current and future servers"
-                                : `${user.serverIds?.length ?? 0} selected ${(user.serverIds?.length ?? 0) === 1 ? "server" : "servers"}`}
-                              {Object.keys(user.serverOverrides ?? {}).length >
-                                0 && " · Custom server permissions"}
-                            </span>
+                          {user.accessReview && (
+                            <span role="note">{user.accessReview.message}</span>
                           )}
-                          {!remote && (user.legacy || user.legacyPending) && (
-                            <span>
-                              {user.inviteStatus === "pending"
-                                ? "Accept the panel invitation to combine sign-in."
-                                : "Create a panel invitation to combine sign-in."}{" "}
-                              Existing sign-ins keep their previous server
-                              access until it is accepted.
-                            </span>
-                          )}
+                          {accountsView &&
+                            (user.legacy || user.legacyPending) && (
+                              <span>
+                                Existing sign-ins keep their previous server
+                                access until a panel invitation is accepted.
+                              </span>
+                            )}
                           {remote && user.panelAccount && (
                             <span>Managed by panel owner</span>
                           )}
-                          {user.hostPermissions?.includes("server.create") && (
+                          {ownAccess(user) && (
                             <span>
-                              Can create and import servers on this computer
+                              Ask the panel owner to change your own access.
                             </span>
                           )}
+                          {accountsView &&
+                            user.hostPermissions?.includes("server.create") && (
+                              <span>
+                                Can create and import servers on this computer
+                              </span>
+                            )}
                         </div>
                       </div>
                     </td>
                     <td>
                       <span className="subuser-permission-count">
-                        {count === permissionIds.length
-                          ? "All permissions"
-                          : `${count} selected`}
+                        {accountsView
+                          ? "Panel sign-in"
+                          : count === permissionIds.length
+                            ? "All permissions"
+                            : `${count} selected`}
                       </span>
                     </td>
                     <td className="subuser-added">
@@ -1041,41 +1152,44 @@ export default function Subusers({
                     </td>
                     <td className="subuser-row-actions">
                       <div>
-                        <button
-                          className="btn subuser-invite"
-                          aria-label={`${user.inviteStatus === "accepted" ? "Reset access for" : "Create invite link for"} ${user.email}`}
-                          title={
-                            ownAccess(user)
-                              ? "Ask the panel owner to reset your own access."
-                              : invitationReady
-                                ? "Create a one-time link. Any previous unused link will stop working."
-                                : "Complete remote access setup to create invitation links"
-                          }
-                          disabled={
-                            !canCreate ||
-                            !manageable(user) ||
-                            ownAccess(user) ||
-                            busy ||
-                            !!inviting ||
-                            !invitationReady
-                          }
-                          onClick={() =>
-                            user.inviteStatus === "accepted"
-                              ? setResetting(user)
-                              : void createInvitation(user)
-                          }
-                        >
-                          <Link size={14} />
-                          {inviting === user.id
-                            ? "Creating…"
-                            : user.inviteStatus === "accepted"
-                              ? "Reset access"
-                              : "Create invite link"}
-                        </button>
+                        {(accountsView || remote) && (
+                          <button
+                            className="btn subuser-invite"
+                            aria-label={`${user.inviteStatus === "accepted" ? "Reset access for" : "Create invite link for"} ${user.email}`}
+                            title={
+                              ownAccess(user)
+                                ? "Ask the panel owner to reset your own access."
+                                : invitationReady
+                                  ? "Create a one-time link. Any previous unused link will stop working."
+                                  : "Enable Remote Access in Panel Settings before creating invitation links."
+                            }
+                            disabled={
+                              !canCreate ||
+                              !manageable(user) ||
+                              busy ||
+                              !!inviting ||
+                              !invitationReady
+                            }
+                            onClick={() =>
+                              user.inviteStatus === "accepted"
+                                ? setResetting(user)
+                                : void createInvitation(user)
+                            }
+                          >
+                            <Link size={14} />
+                            {inviting === user.id
+                              ? "Creating…"
+                              : user.inviteStatus === "accepted"
+                                ? "Reset access"
+                                : "Create invite link"}
+                          </button>
+                        )}
                         <button
                           className="btn icon"
-                          aria-label={`Edit permissions for ${user.email}`}
-                          title="Edit permissions"
+                          aria-label={`${accountsView ? "Edit account" : "Edit permissions"} for ${user.email}`}
+                          title={
+                            accountsView ? "Edit account" : "Edit permissions"
+                          }
                           disabled={
                             !canUpdate ||
                             !manageable(user) ||
@@ -1089,7 +1203,11 @@ export default function Subusers({
                         <button
                           className="btn icon subuser-delete"
                           aria-label={`Remove access record for ${user.email}`}
-                          title="Revoke access"
+                          title={
+                            accountsView
+                              ? "Remove panel account"
+                              : "Revoke access"
+                          }
                           disabled={
                             !canDelete ||
                             !manageable(user) ||
@@ -1122,7 +1240,6 @@ export default function Subusers({
           />
         )}
       </section>
-
       <dialog
         ref={dialog}
         className={`subusers-dialog ${deleting || resetting ? "subusers-delete-dialog" : ""}`}
@@ -1139,9 +1256,15 @@ export default function Subusers({
                 ? "Remove access record?"
                 : resetting
                   ? "Reset subuser access?"
-                  : editing
-                    ? "Edit subuser permissions"
-                    : "Create new subuser"}
+                  : invitingAccount
+                    ? "Invite person"
+                    : editing
+                      ? accountsView
+                        ? "Edit account"
+                        : "Edit subuser permissions"
+                      : remote
+                        ? "Create new subuser"
+                        : "Grant server access"}
             </h2>
             <button
               type="button"
@@ -1156,198 +1279,96 @@ export default function Subusers({
           <div className="subusers-editor-body">
             {resetting ? (
               <p className="subusers-delete-description">
-                Reset access for <strong>{resetting.email}</strong> to this
-                {remote ? " server" : " panel"}? Their current password and
-                sessions stop working immediately. Share the new link so they
-                can choose a new password and regain access.
+                Reset access for <strong>{resetting.email}</strong>? Their
+                current password and sessions stop working immediately. Share
+                the new link so they can choose a new password. Their existing
+                server grants stay the same.
               </p>
             ) : deleting ? (
               <p className="subusers-delete-description">
-                Revoke access for <strong>{deleting.email}</strong>? Their
-                active sessions and invitation links will stop working for this
-                {remote ? " server" : " panel"}. You can invite them again
-                later.
+                {accountsView ? (
+                  <>
+                    Remove the panel account for{" "}
+                    <strong>{deleting.email}</strong>? Their sign-in, invitation
+                    links, and all server grants will be revoked.
+                  </>
+                ) : (
+                  <>
+                    Revoke access for <strong>{deleting.email}</strong> to this
+                    server? Their panel account and access to other servers stay
+                    the same.
+                  </>
+                )}
               </p>
             ) : (
               <>
                 <p className="subusers-editor-notice">
-                  {editing
-                    ? "Permission changes apply immediately, including to active sessions."
-                    : remote
-                      ? "Choose what this person can do on this server. Their invitation opens the panel in their phone or browser."
-                      : "New accounts can access all current and future servers. Uncheck any server to exclude it, then choose their permissions."}
+                  {invitingAccount
+                    ? "Create a panel account with no server access. Share an invitation to let them choose a password and sign in. Grant access separately from a server’s Subusers page."
+                    : editing
+                      ? accountsView
+                        ? "Computer permissions are separate from access to existing servers."
+                        : "Permission changes apply immediately, including to active sessions. These permissions apply only to this server."
+                      : remote
+                        ? "Explicitly grant this person access to this server. Creating an invitation afterward only lets them set up sign-in; it does not grant additional server access."
+                        : "Choose an existing panel account and explicitly grant access to this server. No other server is shared."}
                 </p>
-                {!remote && (editing?.legacy || editing?.legacyPending) && (
-                  <p className="subusers-editor-notice">
-                    Existing sign-ins keep their previous server access until a
-                    panel invitation is accepted. Share a panel invitation to
-                    use this account’s selected server access.
-                  </p>
-                )}
-                <div className="subusers-email">
-                  <label htmlFor="subuser-email">Email address</label>
-                  <input
-                    ref={emailInput}
-                    id="subuser-email"
-                    type="email"
-                    required
-                    maxLength={254}
-                    placeholder="user@example.com"
-                    value={email}
-                    onChange={(event) => setEmail(event.target.value)}
-                    readOnly={!!editing}
-                    disabled={busy}
-                  />
-                  {!editing && (
-                    <small className="subusers-email-help">
-                      Used for sign-in. You will share the invitation link
-                      yourself; no email is sent.
-                    </small>
-                  )}
-                </div>
-                {!remote && (
-                  <fieldset
-                    className="subusers-server-access"
-                    disabled={busy || !canSubmitRecord}
-                  >
-                    <legend>Server access</legend>
-                    <label htmlFor="subuser-server-access">
-                      Servers available to this person
-                    </label>
+                {editor === "grant" && !remote ? (
+                  <div className="subusers-email">
+                    <label htmlFor="subuser-account">Panel account</label>
                     <select
-                      id="subuser-server-access"
-                      value={accessMode}
-                      onChange={(event) => {
-                        const next = event.target.value as "all" | "selected";
-                        if (next === "selected")
-                          setServerIds(
-                            servers
-                              .filter(
-                                (server) =>
-                                  !excludedServerIds.includes(server.id),
-                              )
-                              .map((server) => server.id),
-                          );
-                        else
-                          setExcludedServerIds(
-                            servers
-                              .filter(
-                                (server) => !serverIds.includes(server.id),
-                              )
-                              .map((server) => server.id),
-                          );
-                        setAccessMode(next);
-                      }}
+                      id="subuser-account"
+                      required
+                      value={accountId}
+                      disabled={busy}
+                      onChange={(event) => setAccountId(event.target.value)}
                     >
-                      <option value="all">
-                        All current and future servers
-                      </option>
-                      <option value="selected">Only selected servers</option>
+                      <option value="">Choose a person</option>
+                      {candidates.map((account) => (
+                        <option key={account.id} value={account.id}>
+                          {account.email}
+                        </option>
+                      ))}
                     </select>
-                    <p>
-                      {accessMode === "all"
-                        ? "New servers are included automatically. Uncheck a server to revoke access to it."
-                        : "Only checked servers are available. New servers require you to grant access here."}
-                    </p>
-                    {servers.length > 0 ? (
-                      <div
-                        className="subusers-server-checklist"
-                        role="group"
-                        aria-label="Allowed servers"
-                      >
-                        {servers.map((server) => {
-                          const override =
-                            editing?.serverOverrides?.[server.id];
-                          return (
-                            <div key={server.id}>
-                              <PermissionCheckbox
-                                label={server.name}
-                                accessibleLabel={`Access to ${server.name}`}
-                                description={
-                                  server.available === false
-                                    ? "Server folder currently unavailable"
-                                    : undefined
-                                }
-                                checked={
-                                  accessMode === "all"
-                                    ? !excludedServerIds.includes(server.id)
-                                    : serverIds.includes(server.id)
-                                }
-                                onChange={() => {
-                                  const update = (previous: string[]) =>
-                                    previous.includes(server.id)
-                                      ? previous.filter(
-                                          (id) => id !== server.id,
-                                        )
-                                      : [...previous, server.id];
-                                  if (accessMode === "all")
-                                    setExcludedServerIds(update);
-                                  else setServerIds(update);
-                                }}
-                              />
-                              {override && (
-                                <details className="subusers-server-override">
-                                  <summary>
-                                    Custom permissions for {server.name}
-                                  </summary>
-                                  <p>
-                                    {override.permissions.length
-                                      ? catalog.groups
-                                          .flatMap((group) => group.permissions)
-                                          .filter((permission) =>
-                                            override.permissions.includes(
-                                              permission.id,
-                                            ),
-                                          )
-                                          .map((permission) => permission.label)
-                                          .join(", ")
-                                      : "No server permissions"}
-                                  </p>
-                                  {override.hostPermissions?.includes(
-                                    "server.create",
-                                  ) && <p>Create and import servers</p>}
-                                </details>
-                              )}
-                            </div>
-                          );
-                        })}
-                      </div>
-                    ) : (
-                      <p>
-                        No servers yet.{" "}
-                        {accessMode === "all"
-                          ? "This account will have access when you add one."
-                          : "You can select servers here after adding them."}
-                      </p>
+                    {!candidates.length && (
+                      <small className="subusers-email-help">
+                        No accounts are waiting for access. Close this dialog
+                        and use Invite person to create one.
+                      </small>
                     )}
-                    {Object.keys(editing?.serverOverrides ?? {}).length > 0 && (
-                      <>
-                        <p>
-                          {replaceServerOverrides
-                            ? "Custom permissions will be replaced when you save."
-                            : "Custom server permissions are preserved. The permissions below apply to servers without a custom set."}
-                        </p>
-                        <PermissionCheckbox
-                          label="Use these permissions on every allowed server"
-                          description="Replace custom permissions with the selections below, including the setting for creating and importing servers."
-                          checked={replaceServerOverrides}
-                          onChange={() =>
-                            setReplaceServerOverrides(!replaceServerOverrides)
-                          }
-                        />
-                      </>
+                  </div>
+                ) : (
+                  <div className="subusers-email">
+                    <label htmlFor="subuser-email">Email address</label>
+                    <input
+                      ref={emailInput}
+                      id="subuser-email"
+                      type="email"
+                      required
+                      maxLength={254}
+                      placeholder="user@example.com"
+                      value={email}
+                      onChange={(event) => setEmail(event.target.value)}
+                      readOnly={!!editing}
+                      disabled={busy}
+                    />
+                    {!editing && (
+                      <small className="subusers-email-help">
+                        Used for sign-in. You will share the invitation link
+                        yourself; no email is sent.
+                      </small>
                     )}
-                  </fieldset>
+                  </div>
                 )}
-                {!editing && (
+                {invitingAccount && (
                   <div className="subusers-invitation-choice">
                     <PermissionCheckbox
                       label="Create invitation link"
                       disabled={busy || !invitationReady}
                       description={
                         invitationReady
-                          ? "Show a one-time link to copy after this subuser is created."
-                          : "Complete remote access setup before creating links. You can save the subuser now and invite them later."
+                          ? "Show a one-time link to copy after the account is created."
+                          : "Enable Remote Access in Panel Settings before creating links. You can save the account now and invite them later."
                       }
                       checked={inviteOnCreate}
                       onChange={() => setInviteOnCreate(!inviteOnCreate)}
@@ -1360,169 +1381,174 @@ export default function Subusers({
                     )}
                   </div>
                 )}
-                <fieldset
-                  className="subusers-permissions"
-                  disabled={busy || !canSubmitRecord}
-                >
-                  <legend className="subusers-sr-only">
-                    Server permissions
-                  </legend>
-                  <div className="subusers-preset">
-                    <div>
-                      <strong>Server controls</strong>
-                      <p>Start, stop, restart, and use the console.</p>
-                    </div>
-                    <button
-                      type="button"
-                      className="btn"
-                      disabled={
-                        !grantablePermissions.some((id) =>
-                          id.startsWith("control."),
-                        )
-                      }
-                      onClick={() =>
-                        setSelected(
-                          grantablePermissions.filter((id) =>
-                            id.startsWith("control."),
-                          ),
-                        )
-                      }
-                    >
-                      Use Control preset
-                    </button>
-                  </div>
-                  <div className="subusers-all-permissions">
-                    <PermissionCheckbox
-                      label="All permissions"
-                      description={
-                        remote
-                          ? "Grant every listed permission for this server."
-                          : "Grant every listed permission on allowed servers without custom permissions."
-                      }
-                      checked={
-                        grantablePermissions.length > 0 &&
-                        selected.length === grantablePermissions.length
-                      }
-                      disabled={!grantablePermissions.length}
-                      mixed={
-                        selected.length > 0 &&
-                        selected.length < grantablePermissions.length
-                      }
-                      onChange={() => togglePermissions(grantablePermissions)}
-                    />
-                    <span>
-                      {selected.length} / {grantablePermissions.length}
-                    </span>
-                  </div>
-                  <div
-                    className="subusers-preset"
-                    role="group"
-                    aria-label="Permission presets"
-                  >
-                    {(["admin", "operator", "viewer"] as const).map((role) => (
-                      <button
-                        key={role}
-                        type="button"
-                        className="btn"
-                        onClick={() =>
-                          setSelected(catalog.roleDefaults[role].filter(can))
-                        }
-                      >
-                        Use{" "}
-                        {role === "admin"
-                          ? "Admin"
-                          : role === "operator"
-                            ? "Operator"
-                            : "Viewer"}{" "}
-                        preset
-                      </button>
-                    ))}
-                  </div>
-                  <details
-                    className="subusers-permission-details"
-                    open={remote || undefined}
-                  >
-                    <summary>Customize permissions</summary>
-                    {groups.map((group) => {
-                      const ids = group.permissions.map(
-                        (permission) => permission.id,
-                      );
-                      const count = ids.filter((id) =>
-                        selected.includes(id),
-                      ).length;
-                      return (
-                        <section
-                          className="subusers-permission-group"
-                          key={group.id}
-                          aria-labelledby={`permission-group-${group.id}`}
-                        >
-                          <div className="subusers-group-heading">
-                            <div>
-                              <h3 id={`permission-group-${group.id}`}>
-                                {group.label}
-                              </h3>
-                              <p>{group.description}</p>
-                            </div>
-                            <PermissionCheckbox
-                              label="Select all"
-                              accessibleLabel={`Select all ${group.label}`}
-                              checked={count === ids.length}
-                              mixed={count > 0 && count < ids.length}
-                              onChange={() => togglePermissions(ids)}
-                            />
-                          </div>
-                          <div className="subusers-permission-grid">
-                            {group.permissions.map((permission) => (
-                              <PermissionCheckbox
-                                key={permission.id}
-                                label={permission.label}
-                                description={permission.description}
-                                checked={selected.includes(permission.id)}
-                                onChange={() =>
-                                  togglePermissions([permission.id])
-                                }
-                              />
-                            ))}
-                          </div>
-                        </section>
-                      );
-                    })}
-                  </details>
-                </fieldset>
-                {!remote && (
+                {!accountEditor && (
                   <fieldset
-                    className="subusers-permissions subusers-host-permissions"
+                    className="subusers-permissions"
                     disabled={busy || !canSubmitRecord}
                   >
                     <legend className="subusers-sr-only">
-                      Computer permissions
+                      Server permissions
                     </legend>
-                    <section
-                      className="subusers-permission-group"
-                      aria-labelledby="permission-group-host"
+                    <div className="subusers-basic-access">
+                      <PermissionCheckbox
+                        label="Can View Server"
+                        description="Show this server in their panel. Required for all other permissions on this server."
+                        checked={selected.includes("server.view")}
+                        disabled={!can("server.view")}
+                        onChange={() => togglePermissions(["server.view"])}
+                      />
+                    </div>
+                    <div className="subusers-preset">
+                      <div>
+                        <strong>Server controls</strong>
+                        <p>Start, stop, restart, and use the console.</p>
+                      </div>
+                      <button
+                        type="button"
+                        className="btn"
+                        disabled={!can("server.view")}
+                        onClick={() =>
+                          setSelected(
+                            grantablePermissions.filter(
+                              (id) =>
+                                id === "server.view" ||
+                                id.startsWith("control."),
+                            ),
+                          )
+                        }
+                      >
+                        Use Control preset
+                      </button>
+                    </div>
+                    <div className="subusers-all-permissions">
+                      <PermissionCheckbox
+                        label="All permissions"
+                        description="Grant every listed permission for this server."
+                        checked={
+                          grantablePermissions.length > 0 &&
+                          selected.length === grantablePermissions.length
+                        }
+                        disabled={!can("server.view")}
+                        mixed={
+                          selected.length > 0 &&
+                          selected.length < grantablePermissions.length
+                        }
+                        onChange={() => togglePermissions(grantablePermissions)}
+                      />
+                      <span>
+                        {selected.length} / {grantablePermissions.length}
+                      </span>
+                    </div>
+                    <div
+                      className="subusers-preset"
+                      role="group"
+                      aria-label="Permission presets"
                     >
-                      <div className="subusers-group-heading">
-                        <div>
-                          <h3 id="permission-group-host">
-                            Computer permissions
-                          </h3>
-                          <p>
-                            Only the owner of this computer can grant this
-                            access.
-                          </p>
-                        </div>
-                      </div>
-                      <div className="subusers-permission-grid">
-                        <PermissionCheckbox
-                          label="Create and import servers"
-                          description="Browse this computer’s folders, install Java and server software, and fully manage servers they add. Grant only to people you trust with this computer."
-                          checked={allowServerCreation}
-                          onChange={() =>
-                            setAllowServerCreation(!allowServerCreation)
-                          }
-                        />
-                      </div>
-                    </section>
+                      {(["admin", "operator", "viewer"] as const).map(
+                        (role) => (
+                          <button
+                            key={role}
+                            type="button"
+                            className="btn"
+                            disabled={!can("server.view")}
+                            onClick={() =>
+                              setSelected(
+                                permissionIds.filter(
+                                  (id) =>
+                                    can(id) &&
+                                    (id === "server.view" ||
+                                      (
+                                        catalog.roleDefaults[role] as string[]
+                                      ).includes(id)),
+                                ),
+                              )
+                            }
+                          >
+                            Use{" "}
+                            {role === "admin"
+                              ? "Admin"
+                              : role === "operator"
+                                ? "Operator"
+                                : "Viewer"}{" "}
+                            preset
+                          </button>
+                        ),
+                      )}
+                    </div>
+                    <fieldset
+                      className="subusers-additional-permissions"
+                      disabled={!selected.includes("server.view")}
+                    >
+                      <legend className="subusers-sr-only">
+                        Additional permissions
+                      </legend>
+                      <details
+                        className="subusers-permission-details"
+                        open={remote || undefined}
+                      >
+                        <summary>Customize permissions</summary>
+                        {groups.map((group) => {
+                          const ids = group.permissions.map(
+                            (permission) => permission.id,
+                          );
+                          const count = ids.filter((id) =>
+                            selected.includes(id),
+                          ).length;
+                          return (
+                            <section
+                              className="subusers-permission-group"
+                              key={group.id}
+                              aria-labelledby={`permission-group-${group.id}`}
+                            >
+                              <div className="subusers-group-heading">
+                                <div>
+                                  <h3 id={`permission-group-${group.id}`}>
+                                    {group.label}
+                                  </h3>
+                                  <p>{group.description}</p>
+                                </div>
+                                <PermissionCheckbox
+                                  label="Select all"
+                                  accessibleLabel={`Select all ${group.label}`}
+                                  checked={count === ids.length}
+                                  mixed={count > 0 && count < ids.length}
+                                  onChange={() => togglePermissions(ids)}
+                                />
+                              </div>
+                              <div className="subusers-permission-grid">
+                                {group.permissions.map((permission) => (
+                                  <PermissionCheckbox
+                                    key={permission.id}
+                                    label={permission.label}
+                                    description={permission.description}
+                                    checked={selected.includes(permission.id)}
+                                    onChange={() =>
+                                      togglePermissions([permission.id])
+                                    }
+                                  />
+                                ))}
+                              </div>
+                            </section>
+                          );
+                        })}
+                      </details>
+                    </fieldset>
+                  </fieldset>
+                )}
+                {accountsView && editing && (
+                  <fieldset
+                    className="subusers-permissions subusers-host-permissions"
+                    disabled={busy}
+                  >
+                    <legend>Computer permissions</legend>
+                    <PermissionCheckbox
+                      label="Create and import servers"
+                      description="Browse this computer’s folders, install Java and server software, and fully manage servers they add. Grant only to people you trust with this computer."
+                      checked={allowServerCreation}
+                      onChange={() =>
+                        setAllowServerCreation(!allowServerCreation)
+                      }
+                    />
                   </fieldset>
                 )}
               </>
@@ -1541,12 +1567,11 @@ export default function Subusers({
           <footer className="subusers-dialog-actions">
             {!deleting && !resetting && (
               <span>
-                {selected.length}{" "}
-                {selected.length === 1
-                  ? "server permission"
-                  : "server permissions"}{" "}
-                selected
-                {allowServerCreation && " · Computer access enabled"}
+                {accountEditor
+                  ? invitingAccount
+                    ? "No server access is granted."
+                    : "Existing server grants are preserved."
+                  : `${selected.length} server ${selected.length === 1 ? "permission" : "permissions"} selected`}
               </span>
             )}
             <div>
@@ -1567,12 +1592,20 @@ export default function Subusers({
                 {busy
                   ? "Saving…"
                   : deleting
-                    ? "Remove record"
+                    ? accountsView
+                      ? "Remove account"
+                      : "Revoke access"
                     : resetting
                       ? "Reset and create link"
-                      : editing
-                        ? "Save permissions"
-                        : "Create subuser"}
+                      : invitingAccount
+                        ? "Create account"
+                        : editing
+                          ? accountsView
+                            ? "Save account"
+                            : "Save permissions"
+                          : remote
+                            ? "Create subuser"
+                            : "Grant access"}
               </button>
             </div>
           </footer>
@@ -1581,7 +1614,7 @@ export default function Subusers({
       {invitation && (
         <InvitationDialog
           invitation={invitation}
-          panelWide={!remote}
+          panelWide={invitation.panelWide === true}
           onClose={() => setInvitation(null)}
         />
       )}

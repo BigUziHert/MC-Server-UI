@@ -97,7 +97,10 @@ async function fixture(t) {
     existingCookie,
   ) => {
     const response = await local("/api/subusers", {
-      ...json("POST", { email, permissions }),
+      ...json("POST", {
+        email,
+        permissions: [...new Set(["server.view", ...permissions])],
+      }),
       headers: { "X-Server-Id": serverId },
     });
     assert.equal(response.status, 201);
@@ -219,7 +222,10 @@ test("remote settings require an explicit grant and only update the selected ser
     headers: { "X-Server-Id": secondId },
   });
   assert.equal(visible.status, 200, JSON.stringify(visible.body));
-  assert.deepEqual(visible.body.server.accessPermissions, ["server.update"]);
+  assert.deepEqual(visible.body.server.accessPermissions, [
+    "server.view",
+    "server.update",
+  ]);
   for (const field of [
     "javaPath",
     "jar",
@@ -283,7 +289,10 @@ test("remote settings require an explicit grant and only update the selected ser
   assert.equal(saved.status, 200, JSON.stringify(saved.body));
   assert.equal(saved.body.server.name, "Creative renamed");
   assert.equal(saved.body.server.jar, undefined);
-  assert.deepEqual(saved.body.server.accessPermissions, ["server.update"]);
+  assert.deepEqual(saved.body.server.accessPermissions, [
+    "server.view",
+    "server.update",
+  ]);
   const registry = JSON.parse(
     await fs.readFile(path.join(root, "servers.json"), "utf8"),
   );
@@ -414,7 +423,7 @@ test("remote copy checks proven source read access and destination create access
     "Completed requests cannot be replayed after source permission is revoked.",
   );
   await local(`/api/subusers/${unprovenTarget.user.id}`, {
-    ...json("PATCH", { permissions: ["file.read"] }),
+    ...json("PATCH", { permissions: ["server.view", "file.read"] }),
     headers: { "X-Server-Id": targetId },
   });
   assert.equal(
@@ -580,6 +589,7 @@ test("invited phone sessions are server-scoped, honor changed permissions, and r
     [id],
   );
   assert.deepEqual(fleet.servers[0].accessPermissions, [
+    "server.view",
     "control.console",
     "control.start",
   ]);
@@ -636,7 +646,10 @@ test("invited phone sessions are server-scoped, honor changed permissions, and r
     ).status,
     400,
   );
-  await local(`/api/subusers/${user.id}`, json("PATCH", { permissions: [] }));
+  await local(
+    `/api/subusers/${user.id}`,
+    json("PATCH", { permissions: ["server.view"] }),
+  );
   assert.equal((await asUser("/api/console")).status, 403);
   assert.equal((await asUser("/api/server")).status, 200);
   await local(`/api/subusers/${user.id}`, { method: "DELETE" });
@@ -701,7 +714,7 @@ test("remote subuser managers cannot escalate through roles, explicit permission
     (
       await asUser(
         `/api/subusers/${user.id}`,
-        json("PATCH", { permissions: ["control.start"] }),
+        json("PATCH", { permissions: ["server.view", "control.start"] }),
       )
     ).status,
     403,
@@ -728,7 +741,7 @@ test("remote subuser managers cannot escalate through roles, explicit permission
         "/api/subusers",
         json("POST", {
           email: "limited@example.test",
-          permissions: ["user.read"],
+          permissions: ["server.view", "user.read"],
         }),
       )
     ).status,
@@ -1024,7 +1037,7 @@ test("remote recycle progress is readable only within the current live file-read
     assert.equal(
       (
         await local(`/api/subusers/${reader.user.id}`, {
-          ...json("PATCH", { permissions: ["file.read"] }),
+          ...json("PATCH", { permissions: ["server.view", "file.read"] }),
           headers: { "X-Server-Id": id },
         })
       ).status,
@@ -1211,7 +1224,7 @@ test("Recycle Bin action progress requires both read grants and remains isolated
   );
   await local(
     `/api/subusers/${reader.user.id}`,
-    json("PATCH", { permissions: ["file.read"] }),
+    json("PATCH", { permissions: ["server.view", "file.read"] }),
   );
   assert.equal(
     (await reader.asUser(`${route}?requestId=${requestId}`)).status,
@@ -1304,7 +1317,10 @@ test("a second invitation in the same browser keeps both servers with independen
   );
   assert.deepEqual(
     roster.servers.map((server) => server.accessPermissions),
-    [["control.console"], ["file.read"]],
+    [
+      ["server.view", "control.console"],
+      ["server.view", "file.read"],
+    ],
   );
   assert.equal(roster.defaultServerId, secondId);
   for (const [serverId, consoleStatus, filesStatus] of [
@@ -1427,7 +1443,7 @@ test("subuser creation and permission changes publish only after persistence suc
       await local(
         `/api/subusers/${created.body.id}`,
         json("PATCH", {
-          permissions: ["control.start"],
+          permissions: ["server.view", "control.start"],
         }),
       )
     ).status,
@@ -1442,7 +1458,7 @@ test("subuser creation and permission changes publish only after persistence suc
       await local(
         `/api/subusers/${created.body.id}`,
         json("PATCH", {
-          permissions: ["control.start"],
+          permissions: ["server.view", "control.start"],
         }),
       )
     ).status,

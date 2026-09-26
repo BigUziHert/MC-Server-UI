@@ -75,24 +75,14 @@ test("a copied invitation works over direct HTTPS through password setup, sign-i
     const serverName = registered.servers.find(
       (server: { id: string }) => server.id === serverId,
     ).name;
-    const created = await ownerApi(
-      "/subusers",
-      "POST",
-      {
-        email: "sister@example.test",
-        permissions: [
-          "control.start",
-          "control.stop",
-          "control.restart",
-          "control.console",
-        ],
-      },
-      serverId,
-    );
+    const created = await ownerApi("/panel-users", "POST", {
+      email: "sister@example.test",
+    });
     expect(created.status).toBe(201);
-    const user = await created.json();
+    const accountResult = await created.json();
+    const user = accountResult.user ?? accountResult;
     const invitation = await ownerApi(
-      `/subusers/${user.id}/invite`,
+      `/panel-users/${user.id}/invite`,
       "POST",
       {},
       serverId,
@@ -123,6 +113,39 @@ test("a copied invitation works over direct HTTPS through password setup, sign-i
     await phone
       .getByRole("button", { name: "Set password and continue" })
       .click();
+    await expect(
+      phone.getByRole("heading", { name: "No shared servers" }),
+    ).toBeVisible();
+    expect(
+      (await context.request.get(`${publicUrl}/api/servers`)).status(),
+    ).toBe(200);
+    const noServers = await (
+      await context.request.get(`${publicUrl}/api/servers`)
+    ).json();
+    expect(noServers.servers).toEqual([]);
+    expect(
+      (
+        await context.request.get(
+          `${publicUrl}/api/server?serverId=${serverId}`,
+        )
+      ).status(),
+    ).toBe(403);
+    const granted = await ownerApi(
+      "/subusers",
+      "POST",
+      {
+        accountId: user.id,
+        permissions: [
+          "server.view",
+          "control.start",
+          "control.stop",
+          "control.restart",
+          "control.console",
+        ],
+      },
+      serverId,
+    );
+    expect(granted.status).toBe(201);
     await expect(
       phone.getByRole("heading", { name: serverName, exact: true }),
     ).toBeVisible();
@@ -182,17 +205,26 @@ test("a copied invitation works over direct HTTPS through password setup, sign-i
     );
     expect(revoked.status).toBe(200);
     await expect(
-      phone.getByRole("heading", { name: "Welcome to your server" }),
+      phone.getByRole("heading", { name: "No shared servers" }),
     ).toBeVisible();
     await expect(
       phone.getByRole("heading", { name: serverName, exact: true }),
     ).toHaveCount(0);
-    await phone.getByLabel("Email address").fill("sister@example.test");
-    await phone
-      .getByLabel("Password", { exact: true })
-      .fill("A memorable family password");
-    await phone.getByRole("button", { name: "Sign in", exact: true }).click();
-    await expect(phone.getByRole("alert")).toBeVisible();
+    await phone.reload();
+    await expect(
+      phone.getByRole("heading", { name: "No shared servers" }),
+    ).toBeVisible();
+    const stillSignedIn = await (
+      await context.request.get(`${publicUrl}/api/access/session`)
+    ).json();
+    expect(stillSignedIn.accountId).toBe(user.id);
+    expect(
+      (
+        await context.request.get(
+          `${publicUrl}/api/server?serverId=${serverId}`,
+        )
+      ).status(),
+    ).toBe(403);
     await expect(
       phone.getByRole("heading", { name: serverName, exact: true }),
     ).toHaveCount(0);

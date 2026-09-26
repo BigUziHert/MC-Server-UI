@@ -124,14 +124,32 @@ async function fixture(t, { createDefaultServer = true } = {}) {
         "/api/panel-users",
         json("POST", {
           email: "account@example.test",
-          permissions: ["control.console"],
-          hostPermissions: [],
-          accessMode: "all",
-          ...input,
+          hostPermissions: input.hostPermissions ?? [],
+          ...(input.email ? { email: input.email } : {}),
         }),
       );
       assert.equal(created.status, 201, JSON.stringify(created.body));
       const user = created.body.user ?? created.body;
+      // Fixture grants are explicit owner actions, independent of enrollment.
+      const targets =
+        input.serverIds ??
+        (await local("/api/servers")).body.servers.map((server) => server.id);
+      for (const serverId of targets) {
+        const permissions =
+          input.serverOverrides?.[serverId]?.permissions ?? input.permissions;
+        if (!permissions) continue;
+        const granted = await local(
+          "/api/subusers",
+          scoped(
+            serverId,
+            json("POST", {
+              accountId: user.id,
+              permissions: [...new Set(["server.view", ...permissions])],
+            }),
+          ),
+        );
+        assert.equal(granted.status, 201, JSON.stringify(granted.body));
+      }
       const invited = await local(
         `/api/panel-users/${user.id}/invite`,
         json("POST", {}),
@@ -173,83 +191,72 @@ async function roster(actor) {
   return result.body;
 }
 
-test("one panel account sees existing and future servers and survives per-server revocation with the same cookie", async (t) => {
+test("an invitation grants zero servers; explicit server grants update and revoke with the same cookie", async (t) => {
   const { boot } = await fixture(t);
   const panel = await boot();
   const first = (await panel.local("/api/servers")).body.servers[0];
-  const second = await panel.createServer("Existing creative");
-  const actor = await panel.invite({ hostPermissions: ["server.create"] });
-  assert.deepEqual(
-    (await roster(actor)).servers.map((server) => server.id).sort(),
-    [first.id, second.id].sort(),
+  const second = await panel.createServer("Private creative");
+  const actor = await panel.invite();
+  assert.deepEqual((await roster(actor)).servers, []);
+  assert.equal(actor.session.serverId, null);
+  for (const server of [first, second])
+    assert.equal(
+      (await actor.request("/api/server", scoped(server.id))).status,
+      403,
+    );
+  const grant = await panel.local(
+    "/api/subusers",
+    scoped(
+      first.id,
+      json("POST", {
+        accountId: actor.user.id,
+        permissions: ["server.view", "control.console"],
+      }),
+    ),
   );
-  const third = await panel.createServer("Future adventure");
+  assert.equal(grant.status, 201, JSON.stringify(grant.body));
   assert.deepEqual(
-    (await roster(actor)).servers.map((server) => server.id).sort(),
-    [first.id, second.id, third.id].sort(),
+    (await roster(actor)).servers.map((server) => server.id),
+    [first.id],
   );
+  const third = await panel.createServer("Future private adventure");
   assert.equal(
     (await actor.request("/api/server", scoped(third.id))).status,
+    403,
+  );
+  assert.equal(
+    (await actor.request("/api/server", scoped(first.id))).status,
     200,
   );
-
-  const update = async (input) => {
-    const result = await panel.local(
-      `/api/panel-users/${actor.user.id}`,
-      json("PATCH", input),
-    );
-    assert.equal(result.status, 200, JSON.stringify(result.body));
-  };
-  await update({ excludedServerIds: [first.id] });
-  assert.deepEqual(
-    (await roster(actor)).servers.map((server) => server.id).sort(),
-    [second.id, third.id].sort(),
+  const update = await panel.local(
+    `/api/subusers/${actor.user.id}`,
+    scoped(first.id, json("PATCH", { permissions: ["server.view"] })),
   );
+  assert.equal(update.status, 200, JSON.stringify(update.body));
+  assert.equal(
+    (await actor.request("/api/console", scoped(first.id))).status,
+    403,
+  );
+  const revoke = await panel.local(
+    `/api/subusers/${actor.user.id}`,
+    scoped(first.id, { method: "DELETE" }),
+  );
+  assert.equal(revoke.status, 200, JSON.stringify(revoke.body));
+  assert.deepEqual((await roster(actor)).servers, []);
+  assert.equal((await actor.request("/api/access/session")).status, 200);
   assert.equal(
     (await actor.request("/api/server", scoped(first.id))).status,
     403,
   );
-  assert.equal(
-    (await actor.request("/api/server", scoped(second.id))).status,
-    200,
+  const login = await panel.signed()(
+    "/api/access/login",
+    json("POST", { email: actor.user.email, password }),
   );
-  const session = await actor.request("/api/access/session");
-  assert.equal(session.body.accountId, actor.user.id);
-  assert.notEqual(session.body.serverId, first.id);
-
-  await update({
-    accessMode: "selected",
-    serverIds: [],
-    excludedServerIds: [],
-  });
-  const empty = await roster(actor);
-  assert.deepEqual(empty.servers, []);
-  assert.equal(empty.defaultServerId, null);
-  assert.deepEqual(empty.hostPermissions, ["server.create"]);
-  const emptySession = await actor.request("/api/access/session");
-  assert.equal(emptySession.status, 200);
-  assert.equal(emptySession.body.accountId, actor.user.id);
-  assert.equal(emptySession.body.serverId, null);
-  assert.deepEqual(emptySession.body.permissions, []);
-  assert.equal(
-    (await actor.request("/api/server", scoped(second.id))).status,
-    403,
-  );
-
-  await update({ serverIds: [second.id], hostPermissions: [] });
-  const regranted = await roster(actor);
-  assert.deepEqual(
-    regranted.servers.map((server) => server.id),
-    [second.id],
-  );
-  assert.deepEqual(regranted.hostPermissions, []);
-  assert.equal(
-    (await actor.request("/api/server", scoped(second.id))).status,
-    200,
-  );
+  assert.equal(login.status, 200);
+  assert.deepEqual(login.body.memberships, []);
 });
 
-test("an account created before the first server stays signed in across restart and later gains new servers", async (t) => {
+test("an account created before the first server stays signed in across restart without gaining new servers", async (t) => {
   const { boot } = await fixture(t, { createDefaultServer: false });
   let panel = await boot();
   const actor = await panel.invite();
@@ -266,7 +273,7 @@ test("an account created before the first server stays signed in across restart 
   const created = await panel.createServer("First shared world");
   assert.deepEqual(
     (await roster(actor)).servers.map((server) => server.id),
-    [created.id],
+    [],
   );
   const login = await panel.signed()(
     "/api/access/login",
@@ -274,7 +281,7 @@ test("an account created before the first server stays signed in across restart 
   );
   assert.equal(login.status, 200, JSON.stringify(login.body));
   assert.equal(login.body.accountId, actor.user.id);
-  assert.equal(login.body.serverId, created.id);
+  assert.equal(login.body.serverId, null);
 });
 
 test("server administration grants never permit remote management of panel-wide accounts", async (t) => {
@@ -391,8 +398,8 @@ test("virtual panel-account memberships support scoped rename and same-PC copy w
   assert.equal(progress.body.operation.status, "completed");
 
   const revoked = await panel.local(
-    `/api/panel-users/${actor.user.id}`,
-    json("PATCH", { excludedServerIds: [source.id] }),
+    `/api/subusers/${actor.user.id}`,
+    scoped(source.id, { method: "DELETE" }),
   );
   assert.equal(revoked.status, 200, JSON.stringify(revoked.body));
   assert.equal(
@@ -474,8 +481,8 @@ test("an account without shared servers can create only with an explicit host gr
     "a selected-only account must not inherit unrelated future servers",
   );
   const revoked = await panel.local(
-    `/api/panel-users/${actor.user.id}`,
-    json("PATCH", { serverIds: [] }),
+    `/api/subusers/${actor.user.id}`,
+    scoped(created.body.server.id, { method: "DELETE" }),
   );
   assert.equal(revoked.status, 200, JSON.stringify(revoked.body));
   assert.deepEqual((await roster(actor)).servers, []);
@@ -589,14 +596,17 @@ test("a delegated server administrator cannot edit a promoted legacy account thr
   const email = "legacy-member@example.test";
   const created = await panel.local(
     "/api/subusers",
-    scoped(serverId, json("POST", { email, permissions: ["control.console"] })),
+    scoped(
+      serverId,
+      json("POST", { email, permissions: ["server.view", "control.console"] }),
+    ),
   );
   assert.equal(created.status, 201, JSON.stringify(created.body));
   const legacyId = created.body.id;
   const actor = await panel.invite({ permissions: catalog.roleDefaults.admin });
   const promoted = await panel.local(
     `/api/panel-users/${encodeURIComponent(`legacy:${email}`)}`,
-    json("PATCH", { accessMode: "selected", serverIds: [serverId] }),
+    json("PATCH", {}),
   );
   assert.equal(promoted.status, 200, JSON.stringify(promoted.body));
   assert.notEqual(promoted.body.id, legacyId);
@@ -625,6 +635,7 @@ test("a delegated server administrator cannot edit a promoted legacy account thr
   );
   assert.deepEqual(unchanged.serverIds, [serverId]);
   assert.deepEqual(unchanged.serverOverrides[serverId].permissions, [
+    "server.view",
     "control.console",
   ]);
   assert.ok(
@@ -651,7 +662,7 @@ for (const interruptedEnrollment of [false, true]) {
           serverId,
           json("POST", {
             email,
-            permissions: ["control.console"],
+            permissions: ["server.view", "control.console"],
             hostPermissions: ["server.create"],
           }),
         ),
@@ -678,7 +689,7 @@ for (const interruptedEnrollment of [false, true]) {
     const other = await legacy(unrelated.id, "Unproven-legacy-password!");
     const promoted = await panel.local(
       `/api/panel-users/${encodeURIComponent(`legacy:${email}`)}`,
-      json("PATCH", { accessMode: "selected" }),
+      json("PATCH", {}),
     );
     assert.equal(promoted.status, 200, JSON.stringify(promoted.body));
     assert.deepEqual(
@@ -806,3 +817,123 @@ for (const interruptedEnrollment of [false, true]) {
     }
   });
 }
+
+test("delegated managers cannot grant themselves a private server or alter panel account grants", async (t) => {
+  const { boot } = await fixture(t);
+  const panel = await boot();
+  const shared = (await panel.local("/api/servers")).body.servers[0];
+  const actor = await panel.invite({ permissions: catalog.roleDefaults.admin });
+  const hidden = await panel.createServer("Private owner server");
+  const second = await panel.invite({ email: "other@example.test" });
+  for (const [serverId, route, options] of [
+    [
+      hidden.id,
+      "/api/subusers",
+      json("POST", {
+        accountId: actor.user.id,
+        permissions: catalog.roleDefaults.admin,
+      }),
+    ],
+    [
+      shared.id,
+      "/api/subusers",
+      json("POST", { accountId: second.user.id, permissions: ["server.view"] }),
+    ],
+    [
+      shared.id,
+      `/api/subusers/${actor.user.id}`,
+      json("PATCH", { permissions: catalog.roleDefaults.admin }),
+    ],
+    [shared.id, `/api/subusers/${actor.user.id}`, { method: "DELETE" }],
+    [shared.id, `/api/subusers/${actor.user.id}/invite`, json("POST", {})],
+  ]) {
+    const result = await actor.request(route, scoped(serverId, options));
+    assert.equal(result.status, 403, JSON.stringify(result.body));
+  }
+  assert.deepEqual(
+    (await roster(actor)).servers.map((server) => server.id),
+    [shared.id],
+  );
+  assert.deepEqual((await roster(second)).servers, []);
+  assert.equal(
+    (await actor.request(`/api/server?serverId=${hidden.id}`)).status,
+    403,
+  );
+  assert.equal(
+    (await actor.request(`/api/subusers?serverId=${hidden.id}`)).status,
+    403,
+  );
+});
+
+test("committed server grants, edits, and revocation return audit warnings instead of false failures", async (t) => {
+  const { boot } = await fixture(t);
+  const panel = await boot();
+  const shared = (await panel.local("/api/servers")).body.servers[0];
+  const actor = await panel.invite();
+  const target = path.join(
+    panel.fleet.runtimes.get(shared.id).dataDir,
+    "panel.json",
+  );
+  const rename = fs.rename;
+  const failure = t.mock.method(fs, "rename", async (...args) => {
+    if (args[1] === target) throw new Error("Injected audit write failure");
+    return rename(...args);
+  });
+  const granted = await panel.local(
+    "/api/subusers",
+    scoped(
+      shared.id,
+      json("POST", {
+        accountId: actor.user.id,
+        permissions: ["server.view"],
+      }),
+    ),
+  );
+  assert.equal(granted.status, 201, JSON.stringify(granted.body));
+  assert.match(granted.body.warning, /access change was saved/);
+  assert.deepEqual(
+    (await roster(actor)).servers.map((server) => server.id),
+    [shared.id],
+  );
+  const edited = await panel.local(
+    `/api/subusers/${actor.user.id}`,
+    scoped(
+      shared.id,
+      json("PATCH", {
+        permissions: ["server.view", "file.read"],
+      }),
+    ),
+  );
+  assert.equal(edited.status, 200, JSON.stringify(edited.body));
+  assert.match(edited.body.warning, /access change was saved/);
+  assert.deepEqual((await roster(actor)).servers[0].accessPermissions, [
+    "server.view",
+    "file.read",
+  ]);
+  const removed = await panel.local(
+    `/api/subusers/${actor.user.id}`,
+    scoped(shared.id, { method: "DELETE" }),
+  );
+  assert.equal(removed.status, 200, JSON.stringify(removed.body));
+  assert.match(removed.body.warning, /access change was saved/);
+  assert.deepEqual((await roster(actor)).servers, []);
+  failure.mock.restore();
+  const recovered = await panel.local(
+    "/api/subusers",
+    scoped(
+      shared.id,
+      json("POST", { accountId: actor.user.id, permissions: ["server.view"] }),
+    ),
+  );
+  assert.equal(recovered.status, 201);
+  assert.equal(recovered.body.warning, undefined);
+  assert.equal(
+    (
+      await panel.local(
+        `/api/subusers/${actor.user.id}`,
+        scoped(shared.id, { method: "DELETE" }),
+      )
+    ).status,
+    200,
+  );
+});

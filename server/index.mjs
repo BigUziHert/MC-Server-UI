@@ -78,19 +78,29 @@ const permissionIds = new Set(
 );
 const userWithPermissions = (user) => ({
   ...user,
+  permissionVersion: 2,
   hostPermissions: (Array.isArray(user.hostPermissions)
     ? user.hostPermissions
     : []
   ).filter((id) => id === "server.create"),
-  permissions: (
-    user.permissions ??
-    // Existing role-only records retain their old grants. New permissions
-    // require an explicit owner action, including selecting a role preset.
-    permissionsCatalog.roleDefaults[user.role]?.filter(
-      (id) => id !== "server.update",
-    ) ??
-    []
-  ).filter((permission) => permissionIds.has(permission)),
+  permissions: [
+    ...new Set([
+      // Old per-server records already allowed server visibility. Keep that exact
+      // scope while making visibility explicit for every newly saved grant.
+      ...(user.id && user.permissionVersion !== 2 && !user.panelAccount
+        ? ["server.view"]
+        : []),
+      ...(
+        user.permissions ??
+        // Existing role-only records retain their old grants. New permissions
+        // require an explicit owner action, including selecting a role preset.
+        permissionsCatalog.roleDefaults[user.role]?.filter(
+          (id) => id !== "server.update",
+        ) ??
+        []
+      ).filter((permission) => permissionIds.has(permission)),
+    ]),
+  ],
 });
 function validatePermissions(value) {
   if (
@@ -99,6 +109,11 @@ function validatePermissions(value) {
     value.some((id) => !permissionIds.has(id))
   )
     throw error(400, "Choose permissions from the available list.");
+  if (value.length && !value.includes("server.view"))
+    throw error(
+      400,
+      "Select Can View Server before granting other server permissions.",
+    );
   return [...new Set(value)];
 }
 function validateHostPermissions(value) {
@@ -579,6 +594,7 @@ export async function createPanel(options = {}) {
   };
   if (await exists(statePath))
     state = { ...state, ...JSON.parse(await fs.readFile(statePath, "utf8")) };
+  state.users = state.users.map(userWithPermissions);
   state.iconPreference =
     state.iconPreference === "default" ? "default" : "server";
   const timezone = Intl.DateTimeFormat().resolvedOptions().timeZone;
@@ -3386,6 +3402,17 @@ export async function createPanel(options = {}) {
       subuserChain = pending.catch(() => {});
       return pending;
     });
+  const committedAccessAudit = async (action, email) => {
+    try {
+      await audit("user", action, email);
+      return {};
+    } catch {
+      return {
+        warning:
+          "The access change was saved, but its audit history could not be saved.",
+      };
+    }
+  };
   const checkSubuserAccess = (req, permission, target, requested = []) => {
     const principal = req[remotePrincipal];
     if (!principal) return;
@@ -3396,8 +3423,10 @@ export async function createPanel(options = {}) {
     if (target && (!effectiveTarget || effectiveTarget.panelAccount))
       throw error(
         403,
-        "The panel owner manages this account's access in Panel users.",
+        "The panel owner manages this account's access from this server's Subusers page.",
       );
+    if (target?.email === principal.email)
+      throw error(403, "Ask the panel owner to change your own access.");
     if (
       Object.hasOwn(req.body ?? {}, "hostPermissions") ||
       userWithPermissions(effectiveTarget ?? {}).hostPermissions.length
@@ -3431,6 +3460,21 @@ export async function createPanel(options = {}) {
   app.post(
     "/api/subusers/:id/invite",
     subuserOperation(async (req, res) => {
+      const accountUser = options.accessUserForServer?.(req.params.id);
+      if (accountUser) {
+        if (req[remotePrincipal])
+          throw error(403, "Only the panel owner can invite a panel account.");
+        const invitation = await options.inviteAccount(accountUser.accountId);
+        const warning = await committedAccessAudit(
+          "Panel invitation link created",
+          accountUser.email,
+        );
+        return res.json({
+          ...invitation,
+          user: presentedUser(accountUser),
+          ...warning,
+        });
+      }
       const user = getItem(state.users, req.params.id);
       checkSubuserAccess(req, "user.create", user);
       if (req[remotePrincipal]?.email === user.email)
@@ -3461,6 +3505,22 @@ export async function createPanel(options = {}) {
   app.post(
     "/api/subusers",
     subuserOperation(async (req, res) => {
+      if (Object.hasOwn(req.body ?? {}, "accountId")) {
+        if (req[remotePrincipal])
+          throw error(
+            403,
+            "Only the panel owner can grant panel account access.",
+          );
+        if (!options.grantAccount)
+          throw error(503, "Panel accounts are unavailable.");
+        const { accountId, ...input } = req.body;
+        const user = await options.grantAccount(accountId, input);
+        const warning = await committedAccessAudit(
+          "Server access granted",
+          user.email,
+        );
+        return res.status(201).json({ ...presentedUser(user), ...warning });
+      }
       const { email, role = "custom", permissions } = req.body ?? {};
       if (
         typeof email !== "string" ||
@@ -3473,6 +3533,7 @@ export async function createPanel(options = {}) {
         throw error(409, "This email already has access to this server.");
       const item = {
         id: randomUUID(),
+        permissionVersion: 2,
         email: email.toLowerCase(),
         role,
         hostPermissions: validateHostPermissions(
@@ -3498,6 +3559,23 @@ export async function createPanel(options = {}) {
   app.patch(
     "/api/subusers/:id",
     subuserOperation(async (req, res) => {
+      const accountUser = options.accessUserForServer?.(req.params.id);
+      if (accountUser) {
+        if (req[remotePrincipal])
+          throw error(
+            403,
+            "Only the panel owner can change panel account access.",
+          );
+        const user = await options.grantAccount(
+          accountUser.accountId,
+          req.body ?? {},
+        );
+        const warning = await committedAccessAudit(
+          "Server permissions updated",
+          user.email,
+        );
+        return res.json({ ...presentedUser(user), ...warning });
+      }
       const item = getItem(state.users, req.params.id);
       const permissions = validatePermissions(req.body?.permissions);
       checkSubuserAccess(req, "user.update", item, permissions);
@@ -3516,6 +3594,20 @@ export async function createPanel(options = {}) {
   app.delete(
     "/api/subusers/:id",
     subuserOperation(async (req, res) => {
+      const accountUser = options.accessUserForServer?.(req.params.id);
+      if (accountUser) {
+        if (req[remotePrincipal])
+          throw error(
+            403,
+            "Only the panel owner can revoke panel account access.",
+          );
+        await options.revokeUser(accountUser.accountId);
+        const warning = await committedAccessAudit(
+          "Server access revoked",
+          accountUser.email,
+        );
+        return res.json({ ok: true, ...warning });
+      }
       const item = getItem(state.users, req.params.id);
       checkSubuserAccess(req, "user.delete", item);
       // Revoke credentials first. A later panel-state failure leaves a visible,
@@ -4026,6 +4118,10 @@ export async function createFleet(options = {}) {
       useEnvironment: false,
       resolveAccessUser: (userId, base) =>
         access ? access.resolveUser(entry.id, userId, base) : base,
+      accessUserForServer: (userId) => access?.userForServer(entry.id, userId),
+      grantAccount: (accountId, input) =>
+        access.grantServer(entry.id, accountId, input),
+      inviteAccount: (accountId) => access.inviteAccount(accountId),
       subusersForDisplay: (users) =>
         access
           ? [

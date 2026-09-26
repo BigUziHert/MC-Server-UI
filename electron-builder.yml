@@ -60,6 +60,7 @@ files:
   - desktop/updates-preload.cjs
   - desktop/selection.mjs
   - desktop/preferences.mjs
+  - desktop/panel-settings.mjs
   - desktop/shutdown.mjs
   - desktop/external-links.mjs
   - desktop/remote-panels.mjs

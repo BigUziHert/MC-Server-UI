@@ -92,7 +92,10 @@ async function fixture(t) {
   const serverDir = fleet.runtimes.get(id).serverDir;
   const invite = async (permissions, email, serverId = id, existingCookie) => {
     const created = await local("/api/subusers", {
-      ...json("POST", { email, permissions }),
+      ...json("POST", {
+        email,
+        permissions: [...new Set(["server.view", ...permissions])],
+      }),
       headers: { "X-Server-Id": serverId },
     });
     assert.equal(created.status, 201, JSON.stringify(created.body));
@@ -580,7 +583,7 @@ test("remote downloads require content permission and remain scoped to each gran
   assert.equal(
     (
       await local(`/api/subusers/${reader.user.id}`, {
-        ...json("PATCH", { permissions: ["file.read"] }),
+        ...json("PATCH", { permissions: ["server.view", "file.read"] }),
         headers: { "X-Server-Id": id },
       })
     ).status,

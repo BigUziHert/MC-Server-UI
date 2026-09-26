@@ -46,7 +46,6 @@ async function fixture(t) {
   const enroll = async (input = {}) => {
     const account = await access.createAccount({
       email: "member@example.test",
-      permissions: ["file.read"],
       ...input,
     });
     const invitation = await access.inviteAccount(account.id);
@@ -70,45 +69,33 @@ async function fixture(t) {
   return { root, access, servers, legacy, boot, enroll, legacyEnroll };
 }
 
-test("panel accounts include future servers dynamically and retain one durable credential", async (t) => {
+test("panel invitations start with no grants and retain one durable credential across future servers", async (t) => {
   const f = await fixture(t);
   const member = await f.enroll();
-  assert.equal(member.account.accessMode, "all");
-  assert.equal(
-    f.access.userForServer("server-a", member.account.id).createdAt,
-    member.account.createdAt,
-  );
+  assert.equal(member.account.accessMode, "selected");
+  assert.equal(f.access.userForServer("server-a", member.account.id), null);
   assert.equal(member.session.accountId, member.account.id);
-  assert.equal(member.session.userId, member.account.id);
-  assert.deepEqual(
-    member.session.memberships.map((scope) => scope.serverId),
-    f.servers,
-  );
+  assert.deepEqual(member.session.memberships, []);
   f.servers.push("server-c");
   assert.deepEqual(
-    (await f.access.authenticate(req(member.cookie))).memberships.map(
-      (scope) => scope.serverId,
-    ),
-    f.servers,
+    (await f.access.authenticate(req(member.cookie))).memberships,
+    [],
   );
   await f.access.close();
   const restarted = await f.boot();
   assert.deepEqual(
-    (await restarted.authenticate(req(member.cookie))).memberships.map(
-      (scope) => scope.serverId,
-    ),
-    f.servers,
+    (await restarted.authenticate(req(member.cookie))).memberships,
+    [],
   );
   assert.deepEqual(
-    (
-      await restarted.login({ email: member.account.email, password })
-    ).session.memberships.map((scope) => scope.serverId),
-    f.servers,
+    (await restarted.login({ email: member.account.email, password })).session
+      .memberships,
+    [],
   );
   const saved = JSON.parse(
     await fs.readFile(path.join(f.root, "remote-access.json"), "utf8"),
   );
-  assert.equal(saved.version, 3);
+  assert.equal(saved.version, 4);
   assert.equal(saved.accounts.length, 1);
   assert.equal(saved.memberships.length, 0);
   assert.equal(JSON.stringify(saved).includes(password), false);
@@ -119,15 +106,20 @@ test("panel accounts include future servers dynamically and retain one durable c
   );
 });
 
-test("per-server exclusions and overrides are live without logging out unrelated or zero-server accounts", async (t) => {
+test("per-server grants and revocation are live without logging out unrelated or zero-server accounts", async (t) => {
   const f = await fixture(t);
   const member = await f.enroll({ hostPermissions: ["server.create"] });
-  await f.access.updateAccount(member.account.id, {
-    excludedServerIds: ["server-a"],
-    serverOverrides: {
-      "server-b": { permissions: ["file.read", "file.create"] },
-    },
+  await f.access.grantServer("server-a", member.account.id, {
+    permissions: ["server.view"],
   });
+  await f.access.grantServer("server-b", member.account.id, {
+    permissions: ["server.view", "file.read", "file.create"],
+  });
+  assert.equal(
+    f.access.userForServer("server-a", member.account.id).createdAt,
+    member.account.createdAt,
+  );
+  await f.access.revoke("server-a", member.account.id);
   assert.equal(f.access.userForServer("server-a", member.account.id), null);
   assert.equal(
     f.access.membershipAllowed("server-a", member.account.id),
@@ -135,15 +127,14 @@ test("per-server exclusions and overrides are live without logging out unrelated
   );
   assert.deepEqual(
     f.access.userForServer("server-b", member.account.id).permissions,
-    ["file.read", "file.create"],
+    ["server.view", "file.read", "file.create"],
   );
   assert.equal(
     (await f.access.authenticate(req(member.cookie))).serverId,
     "server-b",
   );
-  await f.access.updateAccount(member.account.id, {
-    excludedServerIds: [...f.servers],
-    permissions: ["control.start"],
+  await f.access.grantServer("server-b", member.account.id, {
+    permissions: [],
   });
   const empty = await f.access.authenticate(req(member.cookie));
   assert.equal(empty.serverId, null);
@@ -156,13 +147,14 @@ test("per-server exclusions and overrides are live without logging out unrelated
   f.servers.push("server-c");
   assert.deepEqual(
     (await f.access.authenticate(req(member.cookie))).memberships,
-    [{ serverId: "server-c", userId: member.account.id }],
+    [],
   );
-  await f.access.updateAccount(member.account.id, { excludedServerIds: [] });
+  await f.access.grantServer("server-b", member.account.id, {
+    permissions: ["server.view", "file.read"],
+  });
   assert.deepEqual(
-    f.access.userForServer("server-b", member.account.id).permissions,
-    ["file.read", "file.create"],
-    "omitted overrides survive base edits",
+    (await f.access.authenticate(req(member.cookie))).memberships,
+    [{ serverId: "server-b", userId: member.account.id }],
   );
 });
 
@@ -186,10 +178,11 @@ test("legacy aggregation and promotion preserve independent passwords and proven
   assert.equal(row.createdAt, "2024-01-01T00:00:00.000Z");
   assert.equal(row.id, "legacy:legacy@example.test");
   assert.equal(row.accessMode, "selected");
-  assert.deepEqual(row.serverOverrides["server-a"].permissions, ["file.read"]);
-  const promoted = await f.access.updateAccount(row.id, {
-    permissions: ["backup.read"],
-  });
+  assert.deepEqual(row.serverOverrides["server-a"].permissions, [
+    "server.view",
+    "file.read",
+  ]);
+  const promoted = await f.access.updateAccount(row.id, {});
   assert.notEqual(promoted.id, row.id);
   assert.equal(promoted.legacyPending, true);
   const effectiveLegacy = f.access.resolveUser(
@@ -224,9 +217,7 @@ test("legacy aggregation and promotion preserve independent passwords and proven
     (await f.access.login({ email: row.email, password })).session.memberships,
     [{ serverId: "server-a", userId: "legacy-a" }],
   );
-  await f.access.updateAccount(promoted.id, {
-    excludedServerIds: ["server-a"],
-  });
+  await f.access.revoke("server-a", promoted.id);
   assert.equal(
     f.access.resolveUser("server-a", "legacy-a", f.legacy[0].user),
     null,
@@ -320,7 +311,6 @@ test("panel invitation reset and account deletion revoke sessions without resurr
     user: {
       id: "new-legacy-id",
       email: "legacy@example.test",
-      permissions: ["file.read"],
     },
   };
   f.legacy.push(extraLegacy);
@@ -344,27 +334,23 @@ test("panel invitation reset and account deletion revoke sessions without resurr
   );
 });
 
-test("removing a server leaves its account policy editable and preserves its exclusion if restored", async (t) => {
+test("removing a server leaves its explicit grant editable and preserves revocation if restored", async (t) => {
   const f = await fixture(t);
-  const member = await f.enroll({
-    accessMode: "selected",
-    serverIds: ["server-a", "server-b"],
-    excludedServerIds: ["server-b"],
-    serverOverrides: { "server-b": { permissions: ["file.read"] } },
+  const member = await f.enroll();
+  await f.access.grantServer("server-a", member.account.id, {
+    permissions: ["server.view"],
   });
+  await f.access.grantServer("server-b", member.account.id, {
+    permissions: ["server.view", "file.read"],
+  });
+  await f.access.revoke("server-b", member.account.id);
   f.servers.splice(f.servers.indexOf("server-b"), 1);
-  const current = f.access.account(member.account.id);
-  await f.access.updateAccount(member.account.id, {
-    permissions: ["control.start"],
-    serverIds: current.serverIds,
-    excludedServerIds: current.excludedServerIds,
-    serverOverrides: current.serverOverrides,
-  });
+  await f.access.updateAccount(member.account.id, { hostPermissions: [] });
   await assert.rejects(
-    f.access.updateAccount(member.account.id, {
-      serverIds: [...current.serverIds, "unknown-id"],
+    f.access.grantServer("unknown-id", member.account.id, {
+      permissions: ["server.view"],
     }),
-    { status: 400 },
+    { status: 404 },
   );
   f.servers.push("server-b");
   assert.equal(f.access.userForServer("server-b", member.account.id), null);
@@ -377,8 +363,6 @@ test("removing a server leaves its account policy editable and preserves its exc
 test("creator enrollment adds a selected server once and cannot restore later revoked access", async (t) => {
   const f = await fixture(t);
   const member = await f.enroll({
-    accessMode: "selected",
-    serverIds: [],
     hostPermissions: ["server.create"],
   });
   const authority = await f.access.hostAuthority(req(member.cookie));
@@ -394,7 +378,7 @@ test("creator enrollment adds a selected server once and cannot restore later re
   );
   await f.access.enrollCreated(req(member.cookie), authority, target);
   assert.deepEqual(f.access.account(member.account.id).serverIds, ["server-a"]);
-  await f.access.updateAccount(member.account.id, { serverIds: [] });
+  await f.access.revoke("server-a", member.account.id);
   await assert.rejects(
     f.access.enrollCreated(req(member.cookie), authority, target),
     { status: 403 },
@@ -465,16 +449,13 @@ test("promoted legacy creators enroll only the new server atomically without wid
   const enrolled = f.access.account(account.id);
   assert.equal(enrolled.legacyMembers.length, 3);
   assert.deepEqual(enrolled.creatorServerIds, [target.serverId]);
-  await f.access.updateAccount(account.id, {
-    serverOverrides: {
-      ...enrolled.serverOverrides,
-      [target.serverId]: { permissions: ["file.read"] },
-    },
+  await f.access.grantServer(target.serverId, account.id, {
+    permissions: ["server.view", "file.read"],
   });
   await f.access.enrollCreated(req(first.cookie), authority, target);
   assert.deepEqual(
     f.access.resolveUser(target.serverId, target.userId, base).permissions,
-    ["file.read"],
+    ["server.view", "file.read"],
     "retry cannot restore permissions changed by the owner",
   );
   await f.access.close();
@@ -497,7 +478,9 @@ test("promoted legacy creators enroll only the new server atomically without wid
     restarted.enrollCreated(req(first.cookie), authority, target),
     { status: 403 },
   );
-  await restarted.updateAccount(account.id, { excludedServerIds: [] });
+  await restarted.grantServer(target.serverId, account.id, {
+    permissions: ["server.view", "file.read"],
+  });
   await assert.rejects(
     restarted.enrollCreated(req(first.cookie), authority, target),
     { status: 403 },
@@ -526,20 +509,20 @@ test("invalid account grants and failed persistence cannot publish partial accou
     return rename(source, destination);
   });
   await assert.rejects(
-    f.access.updateAccount(member.account.id, {
-      excludedServerIds: [...f.servers],
+    f.access.grantServer("server-a", member.account.id, {
+      permissions: ["server.view", "control.start"],
     }),
     { status: 500 },
   );
   assert.deepEqual(f.access.account(member.account.id), before);
   assert.equal(
     (await f.access.authenticate(req(member.cookie))).memberships.length,
-    2,
+    0,
   );
   injected.mock.restore();
 });
 
-test("malformed v3 account storage fails closed without rewriting durable credentials", async (t) => {
+test("malformed account storage fails closed without rewriting durable credentials", async (t) => {
   const f = await fixture(t);
   await f.enroll();
   const storage = path.join(f.root, "remote-access.json");
@@ -556,14 +539,13 @@ test("malformed v3 account storage fails closed without rewriting durable creden
   await fs.writeFile(storage, JSON.stringify(saved));
 });
 
-test("an unavailable legacy profile cannot be silently replaced by a new all-server account", async (t) => {
+test("an unavailable legacy profile cannot be silently replaced by a new account", async (t) => {
   const f = await fixture(t);
   await f.legacyEnroll("server-a", "legacy-a", password, ["file.read"]);
   const saved = f.legacy.splice(0);
   await assert.rejects(
     f.access.createAccount({
       email: "legacy@example.test",
-      permissions: ["file.read"],
     }),
     { status: 409 },
   );
@@ -573,4 +555,157 @@ test("an unavailable legacy profile cannot be silently replaced by a new all-ser
       .memberships,
     [{ serverId: "server-a", userId: "legacy-a" }],
   );
+});
+
+test("v3 migration freezes existing grants and retains unavailable mappings for owner review", async (t) => {
+  const f = await fixture(t);
+  const member = await f.enroll();
+  const storage = path.join(f.root, "remote-access.json");
+  const saved = JSON.parse(await fs.readFile(storage, "utf8"));
+  saved.version = 3;
+  Object.assign(saved.accounts[0], {
+    accessMode: "all",
+    permissions: ["file.read"],
+    serverIds: ["missing-server"],
+    excludedServerIds: ["server-b"],
+    serverOverrides: {
+      "server-a": { permissions: ["control.start"] },
+      "missing-server": { permissions: ["file.delete"] },
+    },
+  });
+  await f.access.close();
+  await fs.writeFile(storage, JSON.stringify(saved));
+  const migrated = await f.boot();
+  const account = migrated.account(member.account.id);
+  assert.deepEqual(account.serverIds, ["server-a"]);
+  assert.equal(account.accessMode, "selected");
+  assert.deepEqual(account.permissions, []);
+  assert.deepEqual(migrated.userForServer("server-a", account.id).permissions, [
+    "server.view",
+    "control.start",
+  ]);
+  assert.equal(migrated.userForServer("server-b", account.id), null);
+  assert.deepEqual(account.accessReview.serverIds, ["missing-server"]);
+  assert.deepEqual(
+    account.accessReview.previousPolicy.serverOverrides["missing-server"]
+      .permissions,
+    ["file.delete"],
+  );
+  f.servers.push("server-c", "missing-server");
+  assert.equal(migrated.userForServer("server-c", account.id), null);
+  assert.equal(migrated.userForServer("missing-server", account.id), null);
+  assert.deepEqual(
+    (await migrated.authenticate(req(member.cookie))).memberships,
+    [{ serverId: "server-a", userId: account.id }],
+  );
+  const durable = JSON.parse(await fs.readFile(storage, "utf8"));
+  assert.equal(durable.version, 4);
+  assert.deepEqual(durable.accounts[0].accessReview, account.accessReview);
+  await migrated.close();
+  const restarted = await f.boot();
+  assert.deepEqual(restarted.account(account.id).serverIds, ["server-a"]);
+});
+
+test("v3 unmapped permissions are retained without granting existing or future servers", async (t) => {
+  const f = await fixture(t);
+  const member = await f.enroll();
+  const storage = path.join(f.root, "remote-access.json");
+  const saved = JSON.parse(await fs.readFile(storage, "utf8"));
+  saved.version = 3;
+  saved.accounts[0].permissions = ["file.delete"];
+  await f.access.close();
+  await fs.writeFile(storage, JSON.stringify(saved));
+  const migrated = await f.boot();
+  const account = migrated.account(member.account.id);
+  assert.deepEqual(account.accessReview.previousPolicy.permissions, [
+    "file.delete",
+  ]);
+  assert.deepEqual(
+    (await migrated.authenticate(req(member.cookie))).memberships,
+    [],
+  );
+  f.servers.push("server-c");
+  assert.equal(migrated.userForServer("server-c", account.id), null);
+});
+
+test("v4 malformed server overrides fail closed without altering the access file", async (t) => {
+  const f = await fixture(t);
+  await f.enroll();
+  const storage = path.join(f.root, "remote-access.json");
+  const saved = JSON.parse(await fs.readFile(storage, "utf8"));
+  for (const override of [
+    {},
+    null,
+    { permissions: "server.view" },
+    { permissions: [], hostPermissions: "server.create" },
+  ]) {
+    saved.accounts[0].serverOverrides = { "server-a": override };
+    const bytes = JSON.stringify(saved);
+    await fs.writeFile(storage, bytes);
+    await assert.rejects(f.boot(), { status: 500 });
+    assert.equal(await fs.readFile(storage, "utf8"), bytes);
+  }
+});
+
+test("a basic server view grant is required and account-wide server policies are rejected", async (t) => {
+  const f = await fixture(t);
+  const member = await f.enroll();
+  for (const permissions of [["file.read"], ["user.update"], ["unknown"]])
+    await assert.rejects(
+      f.access.grantServer("server-a", member.account.id, { permissions }),
+      { status: 400 },
+    );
+  await assert.rejects(
+    f.access.updateAccount(member.account.id, { accessMode: "all" }),
+    { status: 400 },
+  );
+  await assert.rejects(
+    f.access.createAccount({
+      email: "broad@example.test",
+      permissions: ["server.view"],
+      serverIds: ["server-a"],
+    }),
+    { status: 400 },
+  );
+  assert.deepEqual(
+    (await f.access.authenticate(req(member.cookie))).memberships,
+    [],
+  );
+  await f.access.grantServer("server-a", member.account.id, {
+    permissions: ["server.view"],
+  });
+  assert.deepEqual(
+    f.access.userForServer("server-a", member.account.id).permissions,
+    ["server.view"],
+  );
+});
+
+test("ambiguous duplicate legacy identities retain independent scopes instead of unioning grants", async (t) => {
+  const f = await fixture(t);
+  const first = await f.legacyEnroll("server-a", "legacy-a", password, [
+    "file.read",
+  ]);
+  const second = await f.legacyEnroll(
+    "server-a",
+    "legacy-duplicate",
+    secondPassword,
+    ["control.start"],
+  );
+  const row = f.access.listAccounts()[0];
+  assert.equal(row.accessReview.duplicateLegacyIdentities, true);
+  assert.deepEqual(row.serverOverrides["server-a"].permissions, [
+    "server.view",
+    "file.read",
+  ]);
+  await assert.rejects(f.access.inviteAccount(row.id), { status: 409 });
+  await assert.rejects(f.access.updateAccount(row.id, {}), { status: 409 });
+  assert.deepEqual(
+    (await f.access.authenticate(req(first.cookie))).permissions,
+    ["file.read"],
+  );
+  assert.deepEqual(
+    (await f.access.authenticate(req(second.cookie))).permissions,
+    ["control.start"],
+  );
+  assert.equal(f.legacy.length, 2);
 });

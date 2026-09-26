@@ -60,6 +60,7 @@ import PlayerHead from "./PlayerHead";
 import SearchField, { useDebouncedValue } from "./SearchField";
 import Switch from "./Switch";
 import DesktopUpdates from "./DesktopUpdates";
+import PanelSettings from "./PanelSettings";
 import ServerIcon, { ServerIconImage } from "./ServerIcon";
 import { copyText } from "./clipboard";
 import { readPreference, writePreference } from "./preferences";
@@ -780,6 +781,7 @@ function EmptyFleet({
           </span>
         </div>
         <div className="welcome-header-actions">
+          {!session && <PanelSettings notify={notify} />}
           <DesktopUpdates remote={Boolean(session)} />
           <a
             className="help-button"
@@ -1277,6 +1279,7 @@ function ServerWorkspace({
             )}
           </nav>
           <div className="topbar-right">
+            {!session && <PanelSettings notify={notify} />}
             <DesktopUpdates remote={Boolean(session)} />
             <button
               className="help-button"

@@ -757,7 +757,7 @@ test("remote authentication restores an imported runtime after its folder return
       "/api/subusers",
       json("POST", {
         email: "returning@example.test",
-        permissions: ["control.console"],
+        permissions: ["server.view", "control.console"],
       }),
     )
   ).body;

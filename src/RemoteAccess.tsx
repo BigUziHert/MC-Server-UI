@@ -278,7 +278,7 @@ function SignIn({
           {invalidInvitation
             ? "Ask the server owner for a new invitation link. If you already have a password, you can sign in below."
             : token
-              ? "Choose a password to accept this invitation. Next time, sign in with the email address your server owner added and this password."
+              ? "Choose a password to create your panel login. This invitation grants no server access. Shared servers appear after the owner grants access."
               : "Sign in with your email address and the password you set when you accepted your invitation."}
         </p>
         {error && (
@@ -328,9 +328,8 @@ function SignIn({
             {token && (
               <>
                 <p id="remote-password-hint" className="remote-field-hint">
-                  Use 12–128 characters. For multiple servers on this panel, use
-                  the same password for each invitation to sign in to them
-                  together.
+                  Use 12–128 characters. Your account uses one password for this
+                  panel and the servers shared with you.
                 </p>
                 <label htmlFor="remote-password-confirmation">
                   Confirm password

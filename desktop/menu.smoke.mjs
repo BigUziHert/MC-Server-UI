@@ -208,8 +208,56 @@ try {
     secondToken,
     "UI preference persistence must not persist the owner credential",
   );
+  await reopened
+    .getByRole("button", { name: "Panel Settings", exact: true })
+    .click();
+  const settingsDialog = reopened.getByRole("dialog", {
+    name: "Panel Settings",
+    exact: true,
+  });
+  await expect(settingsDialog).toBeVisible();
+  await expect(
+    settingsDialog.getByLabel("When this PC starts", { exact: true }),
+  ).toBeDisabled();
+  const keepInTray = settingsDialog.getByRole("switch", {
+    name: "Keep MC Panel in the system tray when its window is closed",
+    exact: true,
+  });
+  await expect(keepInTray).toBeChecked();
+  await keepInTray.click();
+  await settingsDialog
+    .getByRole("button", { name: "Save startup settings", exact: true })
+    .click();
+  await expect
+    .poll(() =>
+      reopened.evaluate(
+        async () =>
+          (await (await fetch("/api/desktop/settings")).json()).keepInTray,
+      ),
+    )
+    .toBe(false);
+  await settingsDialog
+    .getByRole("button", { name: "Close Panel Settings", exact: true })
+    .click();
+  await application.close();
+  application = await launch();
+  const withoutTrayClose = await application.firstWindow();
+  await expect
+    .poll(() =>
+      withoutTrayClose.evaluate(
+        async () =>
+          (await (await fetch("/api/desktop/settings")).json()).keepInTray,
+      ),
+    )
+    .toBe(false);
+  const closed = application.waitForEvent("close", { timeout: 15000 });
+  await application.evaluate(({ BrowserWindow }) =>
+    BrowserWindow.getAllWindows()[0].close(),
+  );
+  await closed;
+  application = undefined;
   console.log(
-    "Passed real Electron source smoke: native menu removed including Alt, tray lifecycle preserved, unsupported updates disabled, immediate update dialog, local display preferences survive relaunch with a new private credential, and owner selection flush/persist/event ordering.",
+    "Passed real Electron source smoke: native menu removed including Alt, tray lifecycle preserved, disabling close-to-tray persists and quits on window close, unsupported startup and updates disabled, immediate update dialog, local display preferences survive relaunch with a new private credential, and owner selection flush/persist/event ordering.",
   );
 } finally {
   if (application) await application.close().catch(() => {});

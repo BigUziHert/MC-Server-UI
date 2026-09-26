@@ -4,6 +4,45 @@
   font-size: 12px;
   line-height: 1.6;
 }
+.subusers-heading-actions,
+.subusers-view-tabs {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 9px;
+}
+.subusers-heading-actions {
+  flex-shrink: 0;
+}
+.subusers-view-tabs {
+  margin-bottom: 18px;
+  border-bottom: 1px solid var(--border);
+}
+.subusers-view-tabs button {
+  padding: 12px 14px;
+  background: transparent;
+  border: 0;
+  border-bottom: 2px solid transparent;
+  border-radius: 0;
+  color: var(--muted);
+  font-size: 12px;
+}
+.subusers-view-tabs button[aria-selected="true"] {
+  color: var(--text);
+  border-bottom-color: var(--accent);
+}
+.subusers-basic-access {
+  padding: 7px;
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  margin-bottom: 22px;
+}
+.subusers-additional-permissions {
+  border: 0;
+  padding: 0;
+  margin: 0;
+  min-width: 0;
+}
 .subusers-setup {
   background: var(--panel);
   border: 1px solid var(--border);
@@ -411,7 +450,8 @@
   font-size: 13px;
   color: var(--text);
 }
-.subusers-email input {
+.subusers-email input,
+.subusers-email select {
   width: 100%;
   padding: 12px 13px;
   color: var(--text);
@@ -671,6 +711,11 @@
 @media (max-width: 650px) {
   .subusers-page .page-heading {
     align-items: flex-start;
+    flex-wrap: wrap;
+  }
+  .subusers-heading-actions {
+    flex-wrap: wrap;
+    width: 100%;
   }
   .subusers-setup-heading {
     flex-wrap: wrap;

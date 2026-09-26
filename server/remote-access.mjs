@@ -347,6 +347,7 @@ export function createRemoteGateway({
         ? access.resolveUser(serverId, userId, base)
         : base;
       return user?.email === session.email &&
+        user.permissions?.includes("server.view") &&
         access.membershipAllowed(serverId, user.id, user.email)
         ? [{ serverId, user, runtime }]
         : [];

@@ -34,6 +34,7 @@ import {
 import updaterPackage from "electron-updater";
 import { applyDownloadedUpdate, createUpdateController } from "./updates.mjs";
 import { createUpdatesOverlay } from "./updates-overlay.mjs";
+import { keepWindowInTray } from "./panel-settings.mjs";
 
 const { autoUpdater } = updaterPackage;
 
@@ -143,7 +144,7 @@ async function requestQuit(installUpdate = false) {
         message: installUpdate
           ? "Stop your servers and update MC Panel?"
           : "Quit and stop your Minecraft servers?",
-        detail: `${running.map((server) => server.name).join(", ")} will shut down after active backups finish. ${installUpdate ? "MC Panel will install the update and reopen. Your files and settings stay in place; start your servers again when you are ready." : "Scheduled backups resume when you open MC Panel again. Closing the window keeps everything running in the system tray."}`,
+        detail: `${running.map((server) => server.name).join(", ")} will shut down after active backups finish. ${installUpdate ? "MC Panel will install the update and reopen. Your files and settings stay in place; start your servers again when you are ready." : `Scheduled backups resume when you open MC Panel again.${runtime?.panelSettings.snapshot().keepInTray ? " Closing the window keeps everything running in the system tray." : " Choose Keep running to leave the panel and servers open."}`}`,
         buttons: [
           "Keep running",
           installUpdate ? "Stop servers and update" : "Stop servers and quit",
@@ -241,7 +242,11 @@ async function requestQuit(installUpdate = false) {
           "Update could not start",
           "Your servers have been stopped safely, but the update installer could not start. MC Panel will reopen so you can retry. Your server files and settings are unchanged. Details are in desktop.log.",
         );
-        app.relaunch();
+        app.relaunch({
+          args: process.argv
+            .slice(1)
+            .filter((argument) => argument !== "--startup"),
+        });
         app.exit(1);
       });
     else app.quit();
@@ -371,6 +376,19 @@ async function launch() {
     dataDir: path.join(userData, "data"),
     selectServerDirectory,
     updates,
+    loginItem: {
+      supported,
+      reason:
+        "Automatic startup is available in the installed Windows desktop app. Portable and development copies do not register at sign-in.",
+      setEnabled: async (enabled) => {
+        const options = { path: app.getPath("exe"), args: ["--startup"] };
+        app.setLoginItemSettings({ ...options, openAtLogin: enabled, enabled });
+        if (app.getLoginItemSettings(options).openAtLogin !== enabled)
+          throw new Error(
+            "Windows could not update the panel's sign-in setting.",
+          );
+      },
+    },
     openRemotePanel: (url) => {
       if (quitting)
         throw Object.assign(new Error("MC Panel is shutting down."), {
@@ -478,13 +496,24 @@ async function launch() {
   window.on("close", (event) => {
     if (canQuit) return;
     event.preventDefault();
-    if (tray && !quitting) window.hide();
+    if (
+      keepWindowInTray({
+        trayAvailable: !!tray,
+        quitting,
+        keepInTray: runtime.panelSettings.snapshot().keepInTray,
+      })
+    )
+      window.hide();
     else void requestQuit();
   });
   window.on("query-session-end", endWindowsSession);
   window.on("session-end", endWindowsSession);
   createTray();
   await window.loadURL(runtime.url);
+  // The login entry uses this explicit flag. Opening the panel manually, an
+  // update relaunch, or a second instance must never start a server implicitly.
+  if (process.argv.includes("--startup"))
+    void runtime.startConfiguredServer({ startupLaunch: true }).catch(logError);
   // The owner UI and servers are ready before any saved remote host is tried.
   // Independent restore attempts never hold startup or the local view hostage.
   void remotePanels.restore().catch(logError);

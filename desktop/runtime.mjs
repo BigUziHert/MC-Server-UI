@@ -5,6 +5,10 @@ import { createFleet } from "../server/index.mjs";
 import { createDesktopSelection, readSelectionBody } from "./selection.mjs";
 import { readPanelConnectionBody } from "./remote-panels.mjs";
 import {
+  createPanelSettings,
+  readPanelSettingsBody,
+} from "./panel-settings.mjs";
+import {
   createDesktopPreferences,
   readPreferenceBody,
 } from "./preferences.mjs";
@@ -39,6 +43,7 @@ export async function startDesktopRuntime({
   selectServerDirectory,
   updates,
   openRemotePanel,
+  loginItem,
 } = {}) {
   if (typeof dataDir !== "string" || !path.isAbsolute(dataDir))
     throw new Error(
@@ -60,6 +65,17 @@ export async function startDesktopRuntime({
     hasServer: (id) => fleet.runtimes.has(id),
   });
   const preferences = createDesktopPreferences({ dataDir: fleet.dataDir });
+  const panelSettings = createPanelSettings({
+    dataDir: fleet.dataDir,
+    hasServer: (id) => {
+      const server = fleet.runtimes.get(id);
+      return !!server && !server.descriptor().unavailable;
+    },
+    loginItem,
+  });
+  // A broken settings file must not stop the owner opening the panel to inspect
+  // it. Read/save still report the failure instead of overwriting that file.
+  await panelSettings.read().catch(() => {});
   let url;
   let host;
   let closing;
@@ -85,6 +101,28 @@ export async function startDesktopRuntime({
     if (!authenticated(req.headers.cookie, expectedToken))
       return reject(401, "An authenticated desktop session is required.");
     const requestPath = new URL(req.url, url).pathname;
+    if (requestPath === "/api/desktop/settings") {
+      if (!["GET", "PUT"].includes(req.method))
+        return reject(405, "Use GET to read or PUT to save panel settings.");
+      void (async () => {
+        const result =
+          req.method === "GET"
+            ? await panelSettings.read()
+            : await panelSettings.save(await readPanelSettingsBody(req));
+        res.writeHead(200, {
+          "Content-Type": "application/json; charset=utf-8",
+        });
+        res.end(JSON.stringify(result));
+      })().catch((cause) =>
+        reject(
+          cause.status ?? 500,
+          cause.status && cause.status < 500
+            ? cause.message
+            : "Panel settings could not be saved or read.",
+        ),
+      );
+      return;
+    }
     if (requestPath === "/api/desktop/preferences") {
       if (!["GET", "PUT"].includes(req.method))
         return reject(
@@ -223,6 +261,42 @@ export async function startDesktopRuntime({
     url,
     token,
     fleet,
+    panelSettings,
+    async startConfiguredServer({ startupLaunch = false } = {}) {
+      if (!startupLaunch || closing) return;
+      const settings = await panelSettings.read();
+      if (!settings.startupSupported || settings.startupMode !== "server")
+        return;
+      try {
+        if (settings.missingStartupServer)
+          throw new Error(
+            "The startup server is no longer available. Choose another server in Panel Settings.",
+          );
+        await selection.save(settings.startupServerId);
+        // Use the normal power operation, retaining EULA, path, installation,
+        // process ownership, backup, and audit checks.
+        const response = await fetch(`${url}/api/server/power`, {
+          method: "POST",
+          headers: {
+            Cookie: `${DESKTOP_COOKIE_NAME}=${token}`,
+            "Content-Type": "application/json",
+            "X-Server-Id": settings.startupServerId,
+          },
+          body: JSON.stringify({ action: "start" }),
+        });
+        if (!response.ok) {
+          const body = await response.json().catch(() => ({}));
+          throw new Error(
+            body.error || "The configured startup server could not start.",
+          );
+        }
+      } catch (cause) {
+        panelSettings.setStartupError(
+          cause.message || "The configured startup server could not start.",
+        );
+        throw cause;
+      }
+    },
     listLocalServers() {
       return [...fleet.runtimes.values()].map((server) => {
         const { id, name, status, software, minecraftVersion } =
@@ -269,7 +343,11 @@ export async function startDesktopRuntime({
           // The fleet sends stop to its managed Java processes and waits for their exit.
           // Stop accepting HTTP first, but keep current responses alive during that shutdown.
           try {
-            await Promise.all([selection.close(), preferences.close()]);
+            await Promise.all([
+              selection.close(),
+              preferences.close(),
+              panelSettings.close(),
+            ]);
             await fleet.close({ gracefulOnly });
           } finally {
             listener.closeAllConnections();

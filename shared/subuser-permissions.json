@@ -1,5 +1,5 @@
 {
-  "version": 1,
+  "version": 2,
   "hostPermissions": [
     {
       "id": "server.create",
@@ -13,6 +13,11 @@
       "label": "Settings",
       "description": "Configure this server's identity and resource settings.",
       "permissions": [
+        {
+          "id": "server.view",
+          "label": "Can View Server",
+          "description": "See this server in the panel. Required for every other permission on this server."
+        },
         {
           "id": "server.update",
           "label": "Edit server settings",
@@ -158,6 +163,7 @@
   ],
   "roleDefaults": {
     "admin": [
+      "server.view",
       "server.update",
       "control.console",
       "control.start",
@@ -181,6 +187,7 @@
       "audit.read"
     ],
     "operator": [
+      "server.view",
       "control.console",
       "control.start",
       "control.stop",
@@ -199,6 +206,7 @@
       "audit.read"
     ],
     "viewer": [
+      "server.view",
       "file.read",
       "file.read-content",
       "backup.read",

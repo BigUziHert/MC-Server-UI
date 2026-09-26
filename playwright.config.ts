@@ -23,6 +23,7 @@ export default defineConfig({
   testDir: "./tests",
   testMatch: [
     "panel.spec.ts",
+    "panel-settings.spec.ts",
     "updates.spec.ts",
     "file-selection.spec.ts",
     "file-uploads.spec.ts",
