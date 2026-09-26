@@ -8,6 +8,7 @@ import { EventEmitter } from "node:events";
 import { PassThrough, Writable } from "node:stream";
 import { spawn } from "node:child_process";
 import * as tar from "tar";
+import { recycleStorageDirectories } from "./recycle-bin.mjs";
 import {
   createFleet,
   terminateProcessTree,
@@ -111,6 +112,54 @@ async function snapshot(root, relative = "") {
   }
   return result;
 }
+
+test("private recovery folders stay reserved across import and custom installation", async (t) => {
+  const { root, directory, prepare, boot } = await fixture(t);
+  await prepare();
+  const panel = await boot();
+  const imported = await panel.request(
+    "/api/server-import",
+    json("POST", { directory, jar: "server.jar", port: 25571 }),
+  );
+  assert.equal(imported.status, 201, JSON.stringify(imported.body));
+  const runtime = panel.runtimes.get(imported.body.server.id);
+  const reserved = await recycleStorageDirectories(
+    runtime.dataDir,
+    runtime.serverDir,
+  );
+  assert.deepEqual(runtime.recycleDirectories, reserved);
+  assert.equal(reserved.length, 2);
+  // Even before a same-drive bin is needed, creation must not claim its path.
+  await assert.rejects(fs.stat(reserved[1]), { code: "ENOENT" });
+  const pending = await panel.request(
+    "/api/server-setup/preflight",
+    json("POST", {
+      installationDirectory: path.join(reserved[1], "new-server"),
+    }),
+  );
+  assert.equal(pending.status, 409, JSON.stringify(pending.body));
+  for (const storage of [
+    ...reserved,
+    path.join(root, ".mc-recycle-bin-0123456789abcdef"),
+  ]) {
+    const recovered = await prepare(path.join(storage, "saved-server"));
+    const before = await snapshot(recovered);
+    for (const route of ["/api/server-import/inspect", "/api/server-import"]) {
+      const result = await panel.request(
+        route,
+        json("POST", { directory: recovered, jar: "server.jar", port: 25572 }),
+      );
+      assert.ok([400, 409].includes(result.status), JSON.stringify(result));
+    }
+    const result = await panel.request(
+      "/api/server-setup/preflight",
+      json("POST", { installationDirectory: path.join(storage, "new-server") }),
+    );
+    assert.ok([400, 409].includes(result.status), JSON.stringify(result));
+    assert.deepEqual(await snapshot(recovered), before);
+  }
+  assert.equal((await panel.request("/api/servers")).body.servers.length, 1);
+});
 
 test("Java properties parsing preserves escaped separators, continuations, comments and duplicate semantics", () => {
   const values = parseProperties(

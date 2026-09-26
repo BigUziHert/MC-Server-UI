@@ -152,6 +152,52 @@
 .recycle-action-dialog::backdrop {
   background: #080910c9;
 }
+.recycle-action-progress {
+  margin-bottom: 20px;
+  padding: 16px 18px;
+  border: 1px solid var(--border, #373948);
+  border-radius: 10px;
+  background: var(--panel, #1f202b);
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.recycle-action-progress-heading {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  font-size: 13px;
+}
+.recycle-action-progress-heading > strong {
+  min-width: 0;
+}
+.recycle-action-progress-heading > button {
+  flex-shrink: 0;
+}
+.recycle-action-progress p {
+  margin: 8px 0 0;
+  color: var(--muted, #969bb3);
+  font-size: 12px;
+  line-height: 1.6;
+}
+.recycle-action-progress p > svg {
+  vertical-align: middle;
+  margin-right: 5px;
+}
+.recycle-action-progress progress {
+  width: 100%;
+  margin-top: 10px;
+  accent-color: var(--accent, #ffd000);
+}
+.recycle-action-progress-actions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-top: 12px;
+}
+.recycle-action-dialog .recycle-action-progress {
+  margin: 16px 0;
+}
 @media (max-width: 1100px) {
   .recycle-selection-bar {
     grid-template-columns: 1fr;

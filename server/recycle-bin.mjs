@@ -27,6 +27,49 @@ const validBackup = (backup) =>
   (backup.trigger === undefined ||
     ["manual", "scheduled"].includes(backup.trigger));
 
+const canonicalPlannedPath = async (target, io) => {
+  let current = path.resolve(target);
+  const missing = [];
+  for (;;) {
+    try {
+      return path.join(await io.realpath(current), ...missing.reverse());
+    } catch (cause) {
+      if (
+        !["ENOENT", "ENOTDIR", "ENODEV", "ENXIO", "EACCES", "EPERM"].includes(
+          cause.code,
+        )
+      )
+        throw cause;
+      if (path.dirname(current) === current) return path.resolve(target);
+      missing.push(path.basename(current));
+      current = path.dirname(current);
+    }
+  }
+};
+
+// Includes planned storage even before it exists, so server creation/import can
+// reserve it without writing to the source drive or moving existing recovery data.
+export async function recycleStorageDirectories(
+  dataDir,
+  serverDir,
+  { fileSystem = fs } = {},
+) {
+  const data = await canonicalPlannedPath(dataDir, fileSystem);
+  const server = await canonicalPlannedPath(serverDir, fileSystem);
+  const directories = [path.join(data, "recycle-bin")];
+  if (path.dirname(server) !== server) {
+    const identity = process.platform === "win32" ? data.toLowerCase() : data;
+    const suffix = createHash("sha256")
+      .update(identity)
+      .digest("hex")
+      .slice(0, 16);
+    directories.push(
+      path.join(path.dirname(server), `.mc-recycle-bin-${suffix}`),
+    );
+  }
+  return [...new Set(directories)];
+}
+
 /** Private per-server recovery storage. The public file tree never contains it.
  * Each entry journals its intent before touching source data. A same-volume
  * rename is atomic; cross-volume deletion only follows a complete verified copy.
@@ -38,6 +81,7 @@ export async function createRecycleBin({
   serverDir,
   backupDir,
   safePath,
+  preferSiblingStorage = false,
   fileSystem = fs,
   now = () => new Date(),
   newId = randomUUID,
@@ -111,15 +155,103 @@ export async function createRecycleBin({
       "Recycle Bin storage must be outside the Minecraft server folder.",
     );
   await io.mkdir(directory, { recursive: true });
-  const storageRoot = await io.realpath(directory);
-  const storage = async () => {
-    const checked = await safePath(dataDir, "recycle-bin");
-    if ((await io.realpath(checked)) !== storageRoot)
+  const directories = await recycleStorageDirectories(dataDir, serverDir, {
+    fileSystem: io,
+  });
+  const sameIdentity = (a, b) =>
+    a.ino === b.ino && a.dev === b.dev && a.birthtimeMs === b.birthtimeMs;
+  const stores = [];
+  const optionalUnavailable = (cause) =>
+    [
+      "ENOENT",
+      "ENOTDIR",
+      "ENODEV",
+      "ENXIO",
+      "EACCES",
+      "EPERM",
+      "EROFS",
+    ].includes(cause.code);
+  for (const location of directories) {
+    const parent = path.dirname(location);
+    const optional = location !== directories[0];
+    stores.push({
+      directory: location,
+      parent,
+      parentStat: await io.lstat(parent).catch((cause) => {
+        if (optional && optionalUnavailable(cause)) return null;
+        throw cause;
+      }),
+      rootStat: await io.lstat(location).catch((cause) => {
+        if (cause.code === "ENOENT" || (optional && optionalUnavailable(cause)))
+          return null;
+        throw cause;
+      }),
+    });
+  }
+  const legacy = stores[0],
+    sibling = stores[1];
+  const preferSibling = Boolean(
+    preferSiblingStorage &&
+    sibling &&
+    originalRootStat.dev !== (await io.lstat(dataDir)).dev &&
+    sibling.parentStat?.dev === originalRootStat.dev,
+  );
+  const storage = async (store = legacy, { create = false } = {}) => {
+    const parentStat = await io.lstat(store.parent);
+    if (
+      !parentStat.isDirectory() ||
+      parentStat.isSymbolicLink() ||
+      (store.parentStat && !sameIdentity(parentStat, store.parentStat)) ||
+      (await io.realpath(store.parent)) !== store.parent
+    )
+      throw error(
+        409,
+        "The Recycle Bin storage parent changed. Its files have been retained.",
+      );
+    store.parentStat ??= parentStat;
+    const checked = await safePath(
+      store.parent,
+      path.basename(store.directory),
+    );
+    let current = await io.lstat(checked).catch((cause) => {
+      if (cause.code === "ENOENT") return null;
+      throw cause;
+    });
+    if (!current && create && !store.rootStat) {
+      await io.mkdir(checked, { mode: 0o700 });
+      current = await io.lstat(checked);
+    }
+    if (!current) {
+      if (store.rootStat)
+        throw error(
+          409,
+          "The Recycle Bin storage location changed. Its files have been retained.",
+        );
+      return null;
+    }
+    if (
+      !current.isDirectory() ||
+      current.isSymbolicLink() ||
+      (store.rootStat && !sameIdentity(current, store.rootStat)) ||
+      (await io.realpath(checked)) !== store.directory
+    )
       throw error(
         409,
         "The Recycle Bin storage location changed. Its files have been retained.",
       );
+    store.rootStat ??= current;
     return checked;
+  };
+  const readableStorage = async (store) => {
+    try {
+      return await storage(store);
+    } catch (cause) {
+      // An unused optional location may be inaccessible or on an absent drive.
+      // Never hide a store whose recovery directory was already observed.
+      if (store === sibling && !store.rootStat && optionalUnavailable(cause))
+        return null;
+      throw cause;
+    }
   };
   let busy = false;
   const exclusive = async (work) => {
@@ -140,10 +272,45 @@ export async function createRecycleBin({
       throw cause;
     }
   };
+  const entryStores = new Map();
   const entryDirectory = async (id) => {
     if (typeof id !== "string" || !ids.test(id))
       throw error(400, "Choose an item from this server's Recycle Bin.");
+    const known = entryStores.get(id);
+    if (known) return safePath(await storage(known), id);
+    for (const store of stores) {
+      const root = await readableStorage(store);
+      if (!root) continue;
+      const entry = await safePath(root, id);
+      if (await lstat(entry)) {
+        entryStores.set(id, store);
+        return entry;
+      }
+    }
     return safePath(await storage(), id);
+  };
+  const createEntry = async (id, backup) => {
+    const prepare = async (store) => {
+      const root = await storage(store, { create: true });
+      const entry = await safePath(root, id);
+      await io.mkdir(entry, { mode: 0o700 });
+      entryStores.set(id, store);
+      return entry;
+    };
+    if (!backup && preferSibling) {
+      try {
+        return await prepare(sibling);
+      } catch (cause) {
+        // Only preparation failures may fall back. No source data has moved and
+        // no journal/payload exists yet; failures after this boundary never retry
+        // into another store or discard a partial recovery copy.
+        if (
+          !["EACCES", "EPERM", "EROFS", "ENOSPC", "EDQUOT"].includes(cause.code)
+        )
+          throw cause;
+      }
+    }
+    return prepare(legacy);
   };
   const persist = async (entryDir, metadata) => {
     const target = await safePath(entryDir, "entry.json");
@@ -161,7 +328,7 @@ export async function createRecycleBin({
       await io.rm(temporary, { force: true });
     }
   };
-  const read = async (id) => {
+  const read = async (id, { validateOriginal = true } = {}) => {
     const entryDir = await entryDirectory(id);
     let metadata;
     try {
@@ -184,6 +351,12 @@ export async function createRecycleBin({
       !["file", "directory"].includes(metadata.type) ||
       typeof metadata.originalPath !== "string" ||
       !metadata.originalPath ||
+      path.isAbsolute(metadata.originalPath) ||
+      metadata.originalPath.includes("\\") ||
+      metadata.originalPath.includes("\0") ||
+      metadata.originalPath
+        .split("/")
+        .some((part) => part === "." || part === ".." || part.includes(":")) ||
       !Number.isFinite(metadata.size) ||
       metadata.size < 0 ||
       !Number.isFinite(Date.parse(metadata.deletedAt)) ||
@@ -197,36 +370,68 @@ export async function createRecycleBin({
         409,
         "This recovery record is incomplete. Its stored files have been retained.",
       );
-    await originalPathFor(metadata)(metadata.originalPath);
+    if (validateOriginal)
+      await originalPathFor(metadata)(metadata.originalPath);
     return { entryDir, metadata, payload: await safePath(entryDir, "content") };
   };
   const walk = async (root, base = "", rows = [], onEntry) => {
-    if ((await io.lstat(root)).isSymbolicLink())
-      throw error(400, "Recycle Bin operations do not follow symbolic links.");
-    const target = await safePath(root, base);
-    const stat = await io.lstat(target);
-    if (stat.isSymbolicLink() || (!stat.isDirectory() && !stat.isFile()))
-      throw error(
-        400,
-        "Recycle Bin operations do not follow symbolic links or special files.",
-      );
-    const type = stat.isDirectory() ? "directory" : "file";
-    const row = {
-      path: base,
-      type,
-      size: type === "file" ? stat.size : 0,
-      mtimeMs: stat.mtimeMs,
-      mode: stat.mode & 0o777,
-      ino: stat.ino,
-      dev: stat.dev,
+    // Bound filesystem work across the entire tree, while collecting results in
+    // stable parent-first order for snapshot comparisons and safe reverse removal.
+    let active = 0;
+    const waiting = [];
+    const limited = async (work) => {
+      if (active < 8) active++;
+      else await new Promise((resolve) => waiting.push(resolve));
+      try {
+        return await work();
+      } finally {
+        if (waiting.length) waiting.shift()();
+        else active--;
+      }
     };
-    rows.push(row);
-    onEntry?.(row);
-    if (type === "directory") {
-      const names = (await io.readdir(target)).sort();
-      for (const name of names)
-        await walk(root, [base, name].filter(Boolean).join("/"), rows, onEntry);
-    }
+    const visit = async (relative) => {
+      const { row, names } = await limited(async () => {
+        if ((await io.lstat(root)).isSymbolicLink())
+          throw error(
+            400,
+            "Recycle Bin operations do not follow symbolic links.",
+          );
+        const target = await safePath(root, relative);
+        const stat = await io.lstat(target);
+        if (stat.isSymbolicLink() || (!stat.isDirectory() && !stat.isFile()))
+          throw error(
+            400,
+            "Recycle Bin operations do not follow symbolic links or special files.",
+          );
+        const type = stat.isDirectory() ? "directory" : "file";
+        return {
+          row: {
+            path: relative,
+            type,
+            size: type === "file" ? stat.size : 0,
+            mtimeMs: stat.mtimeMs,
+            mode: stat.mode & 0o777,
+            ino: stat.ino,
+            dev: stat.dev,
+          },
+          names: type === "directory" ? (await io.readdir(target)).sort() : [],
+        };
+      });
+      onEntry?.(row);
+      // allSettled is essential: one invalid entry must not release the operation
+      // lock while other directory reads are still running.
+      const children = await Promise.allSettled(
+        names.map((name) => visit([relative, name].filter(Boolean).join("/"))),
+      );
+      const failed = children.find((item) => item.status === "rejected");
+      if (failed) throw failed.reason;
+      return { row, children: children.map((item) => item.value) };
+    };
+    const collect = (node) => {
+      rows.push(node.row);
+      for (const child of node.children) collect(child);
+    };
+    collect(await visit(base));
     return rows;
   };
   const hashFile = async (target, algorithm = "sha256", signal, onBytes) => {
@@ -515,6 +720,7 @@ export async function createRecycleBin({
   };
   return {
     directory,
+    directories,
     inspect(id, { signal, includeHash = true } = {}) {
       return exclusive(async () => {
         signal?.throwIfAborted();
@@ -534,9 +740,27 @@ export async function createRecycleBin({
       });
     },
     async list() {
-      const entries = await io.readdir(await storage(), {
-        withFileTypes: true,
-      });
+      const entries = [];
+      for (const store of stores) {
+        const root = await readableStorage(store);
+        if (!root) continue;
+        for (const entry of await io.readdir(root, { withFileTypes: true })) {
+          if (
+            !entry.isDirectory() ||
+            entry.isSymbolicLink() ||
+            !ids.test(entry.name)
+          )
+            continue;
+          const existing = entryStores.get(entry.name);
+          if (existing && existing !== store)
+            throw error(
+              409,
+              "Duplicate Recycle Bin recovery IDs were found. Recovery files have been retained.",
+            );
+          entryStores.set(entry.name, store);
+          entries.push(entry);
+        }
+      }
       const items = [];
       for (const entry of entries) {
         if (
@@ -546,7 +770,7 @@ export async function createRecycleBin({
         )
           continue;
         try {
-          const record = await read(entry.name);
+          const record = await read(entry.name, { validateOriginal: false });
           if (record.metadata.phase !== "restored")
             items.push(await view(record));
         } catch (cause) {
@@ -633,8 +857,7 @@ export async function createRecycleBin({
             400,
             "Only regular backup archives can be moved to the Recycle Bin.",
           );
-        const entryDir = await entryDirectory(metadata.id);
-        await io.mkdir(entryDir);
+        const entryDir = await createEntry(metadata.id, backup);
         const payload = await safePath(entryDir, "content");
         await persist(entryDir, metadata);
         try {
@@ -689,8 +912,20 @@ export async function createRecycleBin({
         }
       });
     },
-    restore(id, { commitBackup } = {}) {
+    restore(id, { commitBackup, onProgress } = {}) {
       return exclusive(async () => {
+        const progress = (update) => {
+          try {
+            onProgress?.(update);
+          } catch {}
+        };
+        progress({
+          phase: "scanning",
+          filesProcessed: 0,
+          totalFiles: null,
+          bytesProcessed: 0,
+          totalBytes: null,
+        });
         const record = await read(id);
         const { entryDir, payload, metadata } = record;
         if (metadata.kind === "backup" && typeof commitBackup !== "function")
@@ -703,7 +938,19 @@ export async function createRecycleBin({
             409,
             "This recovery copy is incomplete and cannot be restored automatically.",
           );
-        await walk(payload);
+        let scannedFiles = 0,
+          scannedBytes = 0;
+        await walk(payload, "", [], (row) => {
+          if (row.type === "file") {
+            scannedFiles++;
+            scannedBytes += row.size;
+          }
+          progress({
+            filesProcessed: scannedFiles,
+            bytesProcessed: scannedBytes,
+          });
+        });
+        progress({ totalFiles: scannedFiles, totalBytes: scannedBytes });
         const destinationPath = originalPathFor(metadata);
         const destination = await destinationPath(metadata.originalPath);
         const existing = await lstat(destination);
@@ -730,11 +977,19 @@ export async function createRecycleBin({
         metadata.phase = "restoring";
         await persist(entryDir, metadata);
         if (!resume)
-          await copyVerified(payload, (relative) =>
-            destinationPath(
-              [metadata.originalPath, relative].filter(Boolean).join("/"),
-            ),
+          await copyVerified(
+            payload,
+            (relative) =>
+              destinationPath(
+                [metadata.originalPath, relative].filter(Boolean).join("/"),
+              ),
+            progress,
           );
+        progress({
+          phase: "finalizing",
+          filesProcessed: scannedFiles,
+          bytesProcessed: scannedBytes,
+        });
         if (metadata.kind === "backup")
           await commitBackup({ ...metadata.backup });
         metadata.phase = "restored";
@@ -749,10 +1004,22 @@ export async function createRecycleBin({
         return metadata.originalPath;
       });
     },
-    deletePermanently(id, { details = false } = {}) {
+    deletePermanently(id, { details = false, onProgress } = {}) {
       return exclusive(async () => {
+        const progress = (update) => {
+          try {
+            onProgress?.(update);
+          } catch {}
+        };
+        progress({
+          phase: "scanning",
+          filesProcessed: 0,
+          totalFiles: null,
+          bytesProcessed: 0,
+          totalBytes: null,
+        });
         const metadata = details
-          ? await read(id)
+          ? await read(id, { validateOriginal: false })
               .then((record) => record.metadata)
               .catch(() => null)
           : null;
@@ -766,7 +1033,18 @@ export async function createRecycleBin({
             400,
             "Choose a directory from this server's Recycle Bin.",
           );
-        await walk(entryDir); // Reject links/special files before modifying anything.
+        let totalFiles = 0,
+          totalBytes = 0;
+        const rows = await walk(entryDir, "", [], (row) => {
+          if (
+            row.type === "file" &&
+            !["entry.json", ".deleting"].includes(row.path)
+          ) {
+            totalFiles++;
+            totalBytes += row.size;
+          }
+          progress({ filesProcessed: totalFiles, bytesProcessed: totalBytes });
+        }); // Reject links/special files before modifying anything.
         const marker = await safePath(await entryDirectory(id), ".deleting");
         try {
           const handle = await io.open(marker, "wx");
@@ -781,8 +1059,21 @@ export async function createRecycleBin({
         } catch (cause) {
           if (cause.code !== "EEXIST") throw cause;
         }
-        const rows = await walk(await entryDirectory(id));
         const byPath = new Map(rows.map((row) => [row.path, row]));
+        if (!byPath.has(".deleting")) {
+          const markerStat = await io.lstat(
+            await safePath(await entryDirectory(id), ".deleting"),
+          );
+          if (!markerStat.isFile() || markerStat.isSymbolicLink())
+            throw error(409, "The Recycle Bin deletion marker changed.");
+          byPath.set(".deleting", {
+            path: ".deleting",
+            type: "file",
+            size: markerStat.size,
+            ino: markerStat.ino,
+            dev: markerStat.dev,
+          });
+        }
         // Keep the journal and deletion marker until payload deletion succeeds.
         // A locked file may leave a partial archive, which must never be restored.
         const ordered = rows
@@ -791,10 +1082,17 @@ export async function createRecycleBin({
               row.path && !["entry.json", ".deleting"].includes(row.path),
           )
           .reverse();
-        for (const special of ["entry.json", ".deleting", ""])
-          if (byPath.has(special)) ordered.push(byPath.get(special));
+        let filesProcessed = 0,
+          bytesProcessed = 0;
+        progress({
+          phase: "deleting",
+          filesProcessed,
+          bytesProcessed,
+          totalFiles,
+          totalBytes,
+        });
         try {
-          for (const row of ordered) {
+          const remove = async (row) => {
             const target = await safePath(await entryDirectory(id), row.path);
             const stat = await io.lstat(target);
             if (
@@ -809,6 +1107,31 @@ export async function createRecycleBin({
               );
             if (row.type === "directory") await io.rmdir(target);
             else await io.unlink(target);
+          };
+          const files = ordered.filter((row) => row.type === "file");
+          let nextFile = 0,
+            stopped;
+          await Promise.all(
+            Array.from({ length: Math.min(8, files.length) }, async () => {
+              while (!stopped && nextFile < files.length) {
+                const row = files[nextFile++];
+                try {
+                  await remove(row);
+                  filesProcessed++;
+                  bytesProcessed += row.size;
+                  progress({ filesProcessed, bytesProcessed });
+                } catch (cause) {
+                  stopped ??= cause;
+                }
+              }
+            }),
+          );
+          if (stopped) throw stopped;
+          for (const row of ordered.filter((row) => row.type === "directory"))
+            await remove(row);
+          progress({ phase: "finalizing" });
+          for (const special of ["entry.json", ".deleting", ""]) {
+            if (byPath.has(special)) await remove(byPath.get(special));
           }
         } catch (cause) {
           if (

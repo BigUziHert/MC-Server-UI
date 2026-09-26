@@ -63,6 +63,16 @@ import {
   UnconfirmedTransfer,
   type Transfer,
 } from "../file-transfer-state";
+import {
+  useRecoveryBatch,
+  recoveryPending,
+  startRecoveryBatch,
+  checkRecoveryStatus,
+  dismissRecoveryBatch,
+  recoverySummary,
+  type RecoveryBatch,
+  type RecoveryOperation,
+} from "../recycle-action-state";
 
 function TransferProgress({
   transfer,
@@ -1827,6 +1837,140 @@ export default function FileManager({
   );
 }
 
+function RecoveryProgress({
+  batch,
+  onCheck,
+  onDismiss,
+}: {
+  batch: RecoveryBatch;
+  onCheck: () => void;
+  onDismiss: () => void;
+}) {
+  const active = batch.running || batch.checking;
+  const operation = batch.operation;
+  const item =
+    batch.unconfirmed?.item ||
+    batch.targets.find((target) => target.id === batch.currentItemId);
+  const phase = operation
+    ? {
+        scanning: "Scanning recovery files",
+        copying: "Copying recovery files",
+        verifying: "Verifying restored files",
+        deleting: "Deleting recovery files",
+        restoring: "Restoring files",
+        removing: "Removing recovery files",
+        finalizing: "Finishing the operation",
+        completed: "Operation complete",
+        failed: "Operation stopped",
+      }[operation.phase] || "Working on recovery files"
+    : "Preparing the operation";
+  return (
+    <section
+      className="recycle-action-progress"
+      role="status"
+      aria-label="Recovery operation progress"
+    >
+      <div className="recycle-action-progress-heading">
+        <strong>
+          {batch.unconfirmed
+            ? "Recovery action not confirmed"
+            : batch.running
+              ? batch.type === "delete"
+                ? "Permanently deleting recovery data"
+                : "Restoring recovery data"
+              : batch.failures.length
+                ? "Recovery action needs attention"
+                : "Recovery action complete"}
+        </strong>
+        {!active && !batch.unconfirmed && (
+          <button
+            type="button"
+            className="btn icon"
+            aria-label="Dismiss recovery status"
+            onClick={onDismiss}
+          >
+            <X size={16} />
+          </button>
+        )}
+      </div>
+      {item && (
+        <p className="recycle-action-current">
+          {item.name} ·{" "}
+          {item.kind === "backup"
+            ? "Backups"
+            : `/${item.originalPath || item.id}`}
+        </p>
+      )}
+      <p>
+        {batch.completed.length + batch.failures.length} of{" "}
+        {batch.targets.length} items finished
+      </p>
+      {active && (
+        <>
+          <p>
+            <LoaderCircle size={14} className="spin" /> {batch.message || phase}
+          </p>
+          <progress
+            aria-label="Recovery file progress"
+            max={operation?.totalFiles || undefined}
+            value={
+              operation?.totalFiles
+                ? Math.min(operation.filesProcessed, operation.totalFiles)
+                : undefined
+            }
+          />
+          {operation && (
+            <p>
+              {operation.totalFiles === null
+                ? `${operation.filesProcessed} files processed`
+                : `${operation.filesProcessed} of ${operation.totalFiles} files`}
+              {operation.totalBytes
+                ? ` · ${formatBytes(operation.bytesProcessed)} of ${formatBytes(operation.totalBytes)}`
+                : ""}
+            </p>
+          )}
+        </>
+      )}
+      {!batch.running && (
+        <p>{batch.unconfirmed ? batch.message : recoverySummary(batch)}</p>
+      )}
+      {batch.unconfirmed && (
+        <>
+          <p>
+            After inspecting Recycle Bin and the original location, you can
+            dismiss this notice. Dismissing it does not cancel work on the
+            server.
+          </p>
+          <div className="recycle-action-progress-actions">
+            <button
+              type="button"
+              className="btn small"
+              disabled={active}
+              onClick={onCheck}
+            >
+              Check recovery status
+            </button>
+            <button
+              type="button"
+              className="btn small"
+              disabled={active}
+              onClick={onDismiss}
+            >
+              I've checked the files
+            </button>
+          </div>
+        </>
+      )}
+      {active && (
+        <p>
+          You can close this dialog and keep using the panel. Closing does not
+          cancel the operation.
+        </p>
+      )}
+    </section>
+  );
+}
+
 function RecycleBin({
   notify,
   onBack,
@@ -1840,32 +1984,38 @@ function RecycleBin({
     permissions === undefined ||
     (permissions.includes("file.delete") &&
       permissions.includes("backup.delete"));
-  const { api, post } = useServerApi();
+  const { api, downloadUrl } = useServerApi();
+  const recoveryKey = `${window.location.origin}:${downloadUrl("/files/recycle-bin")}`;
+  const batch = useRecoveryBatch(recoveryKey);
+  const pending = recoveryPending(batch);
+  const [checkingOperation, setCheckingOperation] = useState(true);
+  const [reviewingItem, setReviewingItem] = useState<string | null>(null);
+  const restoring = batch?.running ? batch.currentItemId : reviewingItem;
   const [items, setItems] = useState<RecycledItem[]>([]);
   const [query, setQuery] = useState("");
   const debouncedQuery = useDebouncedValue(query);
   const loaded = useRef(false);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
-  const [restoring, setRestoring] = useState<string | null>(null);
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [action, setAction] = useState<{
     type: "restore" | "delete";
     targets: RecycledItem[];
     failures?: { item: RecycledItem; message: string }[];
+    batchId?: string;
   } | null>(null);
   const [actionError, setActionError] = useState("");
   const [restoreWarnings, setRestoreWarnings] = useState<string[]>([]);
   const [checkingRestore, setCheckingRestore] = useState(false);
   const restoreReview = useRef(0);
-  const [completed, setCompleted] = useState(0);
+  const previewRequest = useRef<AbortController | null>(null);
   const actionDialog = useRef<HTMLDialogElement>(null);
   const cancelAction = useRef<HTMLButtonElement>(null);
   const [restoreErrors, setRestoreErrors] = useState<Record<string, string>>(
     {},
   );
   const requestId = useRef(0);
-  const restorePending = useRef(false);
+  const handledBatch = useRef("");
   const searchInput = useRef<HTMLInputElement>(null);
   const load = useCallback(async () => {
     const id = ++requestId.current;
@@ -1902,26 +2052,107 @@ function RecycleBin({
       requestId.current++;
     };
   }, [load]);
+  useEffect(() => {
+    let current = true;
+    setCheckingOperation(true);
+    void api<{ operation: RecoveryOperation | null }>(
+      "/files/recycle-bin/operation",
+      {
+        signal: AbortSignal.timeout(5000),
+      },
+    )
+      .then(({ operation }) => {
+        if (!current || operation?.status !== "running") return;
+        const item = operation.item || {
+          id: operation.itemId,
+          name: "Recovery item",
+          originalPath: "",
+          type: "file" as const,
+          size: 0,
+          deletedAt: new Date().toISOString(),
+          status: "ready" as const,
+        };
+        startRecoveryBatch(api, recoveryKey, operation.type, [item], notify, {
+          existing: operation,
+        });
+      })
+      .catch(() => {
+        // Older hosts can still perform the action. Its original response and a
+        // bounded status check determine the outcome without a duplicate request.
+      })
+      .finally(() => {
+        if (current) setCheckingOperation(false);
+      });
+    return () => {
+      current = false;
+      restoreReview.current++;
+      previewRequest.current?.abort();
+    };
+  }, [api, recoveryKey, notify]);
+  useEffect(() => {
+    if (!batch) return;
+    const signature = `${batch.id}:${batch.completed.join(",")}:${batch.failures.length}:${batch.running}:${!!batch.unconfirmed}:${batch.checking}`;
+    if (handledBatch.current === signature) return;
+    handledBatch.current = signature;
+    const removed = new Set(batch.completed);
+    setItems((previous) => previous.filter((item) => !removed.has(item.id)));
+    setSelected((previous) => {
+      const next = new Set([...previous].filter((id) => !removed.has(id)));
+      if (!batch.running)
+        batch.failures.forEach(({ item }) => next.add(item.id));
+      return next;
+    });
+    if (batch.running || batch.checking) return;
+    setRestoreErrors((previous) => ({
+      ...previous,
+      ...Object.fromEntries(
+        batch.failures.map(({ item, message }) => [item.id, message]),
+      ),
+    }));
+    if (!batch.unconfirmed) {
+      setAction((previous) => {
+        if (previous?.batchId !== batch.id) return previous;
+        if (!batch.failures.length) return null;
+        return {
+          type: batch.type,
+          targets: batch.failures.map(({ item }) => item),
+          failures: batch.failures,
+        };
+      });
+      if (action?.batchId === batch.id && batch.failures.length)
+        setActionError(recoverySummary(batch));
+    }
+    void load();
+  }, [batch, load, action?.batchId]);
   const actionOpen = !!action;
   useEffect(() => {
     if (actionOpen) {
       actionDialog.current?.showModal();
       cancelAction.current?.focus();
-    } else actionDialog.current?.close();
+    } else if (actionDialog.current?.open) {
+      actionDialog.current.close();
+      searchInput.current?.focus();
+    }
   }, [actionOpen]);
 
-  async function checkRestore(targets: RecycledItem[]) {
+  async function checkRestore(targets: RecycledItem[], signal: AbortSignal) {
     const warnings: string[] = [];
     for (const item of targets.filter(
       (value) =>
         value.kind !== "backup" &&
         /^mods\/[^/]+\.jar$/i.test(value.originalPath),
     )) {
+      if (signal.aborted) break;
       try {
         const result = await api<{
           duplicates: { path: string; title: string }[];
           warnings: string[];
-        }>(`/files/recycle-bin/${encodeURIComponent(item.id)}/restore-preview`);
+        }>(
+          `/files/recycle-bin/${encodeURIComponent(item.id)}/restore-preview`,
+          {
+            signal: AbortSignal.any([signal, AbortSignal.timeout(5000)]),
+          },
+        );
         warnings.push(
           ...result.duplicates.map(
             (duplicate) =>
@@ -1930,6 +2161,7 @@ function RecycleBin({
           ...result.warnings,
         );
       } catch (cause) {
+        if (signal.aborted) break;
         warnings.push(
           `Could not check ${item.name} for duplicate mods: ${messageOf(cause)}`,
         );
@@ -1938,41 +2170,34 @@ function RecycleBin({
     return [...new Set(warnings)];
   }
   async function restore(item: RecycledItem) {
-    if (!canRestore || restorePending.current || item.status !== "ready")
+    if (
+      !canRestore ||
+      pending ||
+      checkingOperation ||
+      reviewingItem ||
+      item.status !== "ready"
+    )
       return;
-    restorePending.current = true;
-    setRestoring(item.id);
+    const token = ++restoreReview.current;
+    previewRequest.current?.abort();
+    const controller = new AbortController();
+    previewRequest.current = controller;
+    setReviewingItem(item.id);
     setRestoreErrors((previous) => ({ ...previous, [item.id]: "" }));
     try {
-      const warnings = await checkRestore([item]);
+      const warnings = await checkRestore([item], controller.signal);
+      if (token !== restoreReview.current) return;
       if (warnings.length) {
         setRestoreWarnings(warnings);
         setActionError("");
         setAction({ type: "restore", targets: [item] });
         return;
       }
-      await post(
-        `/files/recycle-bin/${encodeURIComponent(item.id)}/restore`,
-        {},
-      );
-      setItems((previous) => previous.filter((entry) => entry.id !== item.id));
-      setSelected(
-        (previous) => new Set([...previous].filter((id) => id !== item.id)),
-      );
-      notify(
-        item.kind === "backup"
-          ? `${item.name} restored to Backups.`
-          : `${item.name} restored to /${item.originalPath}.`,
-      );
-      searchInput.current?.focus();
-    } catch (failure) {
-      setRestoreErrors((previous) => ({
-        ...previous,
-        [item.id]: messageOf(failure),
-      }));
+      startRecoveryBatch(api, recoveryKey, "restore", [item], notify, {
+        single: true,
+      });
     } finally {
-      restorePending.current = false;
-      setRestoring(null);
+      if (token === restoreReview.current) setReviewingItem(null);
     }
   }
 
@@ -1983,17 +2208,21 @@ function RecycleBin({
     if (
       (type === "restore" ? !canRestore : !canDelete) ||
       !targets.length ||
-      restorePending.current
+      pending ||
+      checkingOperation ||
+      reviewingItem
     )
       return;
     setActionError("");
-    setCompleted(0);
     setRestoreWarnings([]);
     setAction({ type, targets: [...targets] });
     const token = ++restoreReview.current;
+    previewRequest.current?.abort();
+    const controller = new AbortController();
+    previewRequest.current = controller;
     if (type === "restore") {
       setCheckingRestore(true);
-      const warnings = await checkRestore(targets);
+      const warnings = await checkRestore(targets, controller.signal);
       if (token === restoreReview.current) {
         setRestoreWarnings(warnings);
         setCheckingRestore(false);
@@ -2001,74 +2230,39 @@ function RecycleBin({
     }
   }
   function closeAction() {
-    if (restorePending.current) return;
     restoreReview.current++;
+    previewRequest.current?.abort();
     setCheckingRestore(false);
+    setReviewingItem(null);
     setRestoreWarnings([]);
     setAction(null);
     setActionError("");
+    actionDialog.current?.close();
     searchInput.current?.focus();
   }
-  async function submitAction(event: FormEvent) {
+  function submitAction(event: FormEvent) {
     event.preventDefault();
     if (
       !action ||
       (action.type === "restore" ? !canRestore : !canDelete) ||
-      restorePending.current ||
+      pending ||
+      checkingOperation ||
       checkingRestore
     )
       return;
-    restorePending.current = true;
-    const successes = new Set<string>();
-    const failures: { item: RecycledItem; message: string }[] = [];
     setActionError("");
-    setCompleted(0);
-    try {
-      for (const item of action.targets) {
-        setRestoring(item.id);
-        try {
-          const url = `/files/recycle-bin/${encodeURIComponent(item.id)}`;
-          if (action.type === "restore") await post(`${url}/restore`, {});
-          else await api(url, { method: "DELETE" });
-          successes.add(item.id);
-        } catch (cause) {
-          failures.push({ item, message: messageOf(cause) });
-        }
-        setCompleted(successes.size + failures.length);
-      }
-      setItems((previous) =>
-        previous.filter((item) => !successes.has(item.id)),
-      );
-      setSelected((previous) => {
-        const remaining = new Set(
-          [...previous].filter((id) => !successes.has(id)),
-        );
-        failures.forEach(({ item }) => remaining.add(item.id));
-        return remaining;
-      });
-      const restoredBackups =
-        action.type === "restore" &&
-        action.targets.some(
-          (item) => item.kind === "backup" && successes.has(item.id),
-        );
-      const summary = `${successes.size} ${successes.size === 1 ? "item" : "items"} ${action.type === "restore" ? "restored" : "permanently deleted"}.${restoredBackups ? " Restored archives are available in Backups." : ""}${failures.length ? ` ${failures.length} ${failures.length === 1 ? "item failed and remains" : "items failed and remain"} selected.` : ""}`;
-      notify(summary, failures.length > 0);
-      if (failures.length) {
-        setAction({
-          ...action,
-          targets: failures.map(({ item }) => item),
-          failures,
-        });
-        setActionError(summary);
-      } else {
-        setAction(null);
-        searchInput.current?.focus();
-      }
-      await load();
-    } finally {
-      restorePending.current = false;
-      setRestoring(null);
-    }
+    const id = startRecoveryBatch(
+      api,
+      recoveryKey,
+      action.type,
+      action.targets,
+      notify,
+    );
+    if (id) setAction({ ...action, batchId: id });
+  }
+  function dismissStatus() {
+    dismissRecoveryBatch(recoveryKey);
+    if (action?.batchId === batch?.id) closeAction();
   }
 
   const visible = items.filter((item) =>
@@ -2105,6 +2299,13 @@ function RecycleBin({
           <Folder size={16} /> Back to files
         </button>
       </div>
+      {batch && (
+        <RecoveryProgress
+          batch={batch}
+          onCheck={() => checkRecoveryStatus(api, recoveryKey, notify)}
+          onDismiss={dismissStatus}
+        />
+      )}
       <section
         className="panel files-panel"
         aria-label="Recycled server files and backups"
@@ -2128,7 +2329,6 @@ function RecycleBin({
             </span>
             <RefreshButton
               label="Refresh Recycle Bin"
-              disabled={!!restoring}
               onRefresh={load}
               notify={notify}
               successMessage="Recycle Bin refreshed."
@@ -2178,7 +2378,14 @@ function RecycleBin({
                     input.indeterminate = visibleSelected > 0 && !allSelected;
                 }}
                 onChange={toggleVisible}
-                disabled={!visible.length || !!restoring || loading || !!error}
+                disabled={
+                  !visible.length ||
+                  pending ||
+                  checkingOperation ||
+                  !!reviewingItem ||
+                  loading ||
+                  !!error
+                }
               />
               <span>{selectedItems.length} selected</span>
             </label>
@@ -2191,7 +2398,12 @@ function RecycleBin({
           <div className="recycle-selection-actions">
             <button
               className="btn small"
-              disabled={!selectedItems.length || !!restoring}
+              disabled={
+                !selectedItems.length ||
+                pending ||
+                checkingOperation ||
+                !!reviewingItem
+              }
               onClick={() => setSelected(new Set())}
             >
               Clear selection
@@ -2201,7 +2413,9 @@ function RecycleBin({
               disabled={
                 !canRestore ||
                 !selectedItems.length ||
-                !!restoring ||
+                pending ||
+                checkingOperation ||
+                !!reviewingItem ||
                 loading ||
                 !!error ||
                 selectedItems.some((item) => item.status !== "ready")
@@ -2220,7 +2434,9 @@ function RecycleBin({
               disabled={
                 !canDelete ||
                 !selectedItems.length ||
-                !!restoring ||
+                pending ||
+                checkingOperation ||
+                !!reviewingItem ||
                 loading ||
                 !!error
               }
@@ -2270,7 +2486,7 @@ function RecycleBin({
                   type="checkbox"
                   aria-label={`Select recycled ${item.name}`}
                   checked={selected.has(item.id)}
-                  disabled={!!restoring}
+                  disabled={pending || checkingOperation || !!reviewingItem}
                   onChange={() =>
                     setSelected((previous) => {
                       const next = new Set(previous);
@@ -2334,24 +2550,45 @@ function RecycleBin({
                     className="btn small"
                     aria-label={`Restore ${item.name}`}
                     disabled={
-                      !canRestore || !!restoring || item.status !== "ready"
+                      !canRestore ||
+                      pending ||
+                      checkingOperation ||
+                      !!reviewingItem ||
+                      item.status !== "ready"
                     }
                     onClick={() => void restore(item)}
                   >
-                    {restoring === item.id ? (
+                    {restoring === item.id &&
+                    (reviewingItem || batch?.type === "restore") ? (
                       <LoaderCircle size={15} className="spin" />
                     ) : (
                       <Undo2 size={15} />
                     )}
-                    {restoring === item.id ? "Restoring…" : "Restore"}
+                    {reviewingItem === item.id
+                      ? "Checking…"
+                      : restoring === item.id && batch?.type === "restore"
+                        ? "Restoring…"
+                        : "Restore"}
                   </button>
                   <button
                     className="btn danger small"
                     aria-label={`Permanently delete ${item.name}`}
-                    disabled={!canDelete || !!restoring}
+                    disabled={
+                      !canDelete ||
+                      pending ||
+                      checkingOperation ||
+                      !!reviewingItem
+                    }
                     onClick={() => openAction("delete", [item])}
                   >
-                    <Trash2 size={15} /> Delete permanently
+                    {restoring === item.id && batch?.type === "delete" ? (
+                      <LoaderCircle size={15} className="spin" />
+                    ) : (
+                      <Trash2 size={15} />
+                    )}{" "}
+                    {restoring === item.id && batch?.type === "delete"
+                      ? "Deleting…"
+                      : "Delete permanently"}
                   </button>
                 </div>
               </li>
@@ -2394,7 +2631,6 @@ function RecycleBin({
                 type="button"
                 className="btn icon"
                 aria-label="Close recovery confirmation"
-                disabled={!!restoring}
                 onClick={closeAction}
               >
                 <X size={18} />
@@ -2441,6 +2677,13 @@ function RecycleBin({
                 </li>
               ))}
             </ul>
+            {batch && action.batchId === batch.id && (
+              <RecoveryProgress
+                batch={batch}
+                onCheck={() => checkRecoveryStatus(api, recoveryKey, notify)}
+                onDismiss={dismissStatus}
+              />
+            )}
             {checkingRestore && (
               <StatePanel variant="loading" title="Checking restored mods…" />
             )}
@@ -2476,27 +2719,32 @@ function RecycleBin({
                 ref={cancelAction}
                 className="btn"
                 type="button"
-                disabled={!!restoring}
                 onClick={closeAction}
               >
-                Cancel
+                {action.batchId === batch?.id && pending
+                  ? "Continue in background"
+                  : "Cancel"}
               </button>
               <button
                 type="submit"
                 className={`btn ${action.type === "delete" ? "danger" : "primary"}`}
                 disabled={
-                  !!restoring ||
+                  pending ||
+                  checkingOperation ||
+                  !!reviewingItem ||
                   checkingRestore ||
                   (action.type === "restore" ? !canRestore : !canDelete)
                 }
               >
-                {restoring
-                  ? `${action.type === "delete" ? "Deleting" : "Restoring"} ${completed} of ${action.targets.length}…`
-                  : action.failures?.length
-                    ? "Retry failed items"
-                    : action.type === "delete"
-                      ? "Delete permanently"
-                      : "Restore selected items"}
+                {batch?.running && action.batchId === batch.id
+                  ? `${action.type === "delete" ? "Deleting" : "Restoring"} ${batch.completed.length + batch.failures.length} of ${action.targets.length}…`
+                  : batch?.unconfirmed && action.batchId === batch.id
+                    ? "Awaiting confirmed outcome"
+                    : action.failures?.length
+                      ? "Retry failed items"
+                      : action.type === "delete"
+                        ? "Delete permanently"
+                        : "Restore selected items"}
               </button>
             </div>
           </form>

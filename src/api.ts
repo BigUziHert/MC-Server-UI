@@ -2,6 +2,7 @@ import { createContext, useContext, useMemo } from "react";
 
 export const ServerScope = createContext<string | null>(null);
 export const SessionExpiredContext = createContext<(() => void) | null>(null);
+export const SessionActiveContext = createContext<() => boolean>(() => true);
 
 export function messageOf(
   cause: unknown,
@@ -92,8 +93,20 @@ window.__mcPanelFlushSelection = flushDesktopSelection;
 export function useServerApi() {
   const serverId = useContext(ServerScope);
   const onSessionExpired = useContext(SessionExpiredContext);
+  const isSessionActive = useContext(SessionActiveContext);
   return useMemo(() => {
     const scopedApi = <T = any>(path: string, options: RequestInit = {}) => {
+      // A background queue can outlive its workspace. Do not let its next
+      // request use credentials from an account that signed in afterward.
+      if (!isSessionActive())
+        return Promise.reject<T>(
+          Object.assign(
+            new Error(
+              "This session has ended. Sign in again before starting another operation.",
+            ),
+            { status: 401 },
+          ),
+        );
       const headers = new Headers(options.headers);
       if (serverId) headers.set("X-Server-Id", serverId);
       return api<T>(path, { ...options, headers }).catch((cause) => {
@@ -108,7 +121,7 @@ export function useServerApi() {
       downloadUrl: (path: string) =>
         `/api${path}${serverId ? `${path.includes("?") ? "&" : "?"}serverId=${encodeURIComponent(serverId)}` : ""}`,
     };
-  }, [serverId, onSessionExpired]);
+  }, [serverId, onSessionExpired, isSessionActive]);
 }
 export function formatBytes(bytes: number) {
   if (!bytes) return "0 B";

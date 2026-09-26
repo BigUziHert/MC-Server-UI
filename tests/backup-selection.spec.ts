@@ -804,9 +804,12 @@ test("Recycle Bin restores archive bytes and backup history without changing ser
     .getByRole("button", { name: "Restore Alpha backup", exact: true })
     .click();
   await expect(alphaRow).toHaveCount(0);
-  await expect(page.getByRole("status")).toContainText(
-    "Alpha backup restored to Backups.",
-  );
+  await expect(
+    page.getByRole("status", {
+      name: "Recovery operation progress",
+      exact: true,
+    }),
+  ).toContainText("Alpha backup restored to Backups.");
   for (const name of ["Beta backup", "Gamma backup"])
     await page
       .getByRole("checkbox", { name: `Select recycled ${name}`, exact: true })
@@ -833,9 +836,12 @@ test("Recycle Bin restores archive bytes and backup history without changing ser
     .getByRole("button", { name: "Restore selected items", exact: true })
     .click();
   await expect(dialog).not.toBeVisible();
-  await expect(page.getByRole("status")).toContainText(
-    "Restored archives are available in Backups.",
-  );
+  await expect(
+    page.getByRole("status", {
+      name: "Recovery operation progress",
+      exact: true,
+    }),
+  ).toContainText("Restored archives are available in Backups.");
   await expect(
     page.getByText("Recycle Bin is empty", { exact: true }),
   ).toBeVisible();

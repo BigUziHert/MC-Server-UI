@@ -87,7 +87,9 @@ export function requiredPermissions(req) {
       return ["file.read-content"];
     // Recycle Bin contains both server files and backup archives.
     if (
-      route === "/api/files/recycle-bin" ||
+      ["/api/files/recycle-bin", "/api/files/recycle-bin/operation"].includes(
+        route,
+      ) ||
       /^\/api\/files\/recycle-bin\/[^/]+\/restore-preview$/.test(route)
     )
       return ["file.read", "backup.read"];

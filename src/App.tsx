@@ -44,6 +44,7 @@ import {
   saveDesktopSelection,
   ServerScope,
   SessionExpiredContext,
+  SessionActiveContext,
   useServerApi,
 } from "./api";
 import FileManager from "./pages/FileManager";
@@ -294,6 +295,7 @@ export default function App({
 }) {
   const remote = Boolean(session);
   const sessionMounted = useRef(true);
+  const isSessionActive = useCallback(() => sessionMounted.current, []);
   useEffect(() => {
     sessionMounted.current = true;
     return () => {
@@ -600,7 +602,7 @@ export default function App({
     );
     void loadServers();
   };
-  return (
+  const workspace = (
     <SessionExpiredContext.Provider value={session ? expireSession : null}>
       {active && !firstServerSetup ? (
         <ServerScope.Provider value={active.id}>
@@ -721,6 +723,11 @@ export default function App({
         </div>
       )}
     </SessionExpiredContext.Provider>
+  );
+  return (
+    <SessionActiveContext.Provider value={isSessionActive}>
+      {workspace}
+    </SessionActiveContext.Provider>
   );
 }
 

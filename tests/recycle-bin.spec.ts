@@ -583,7 +583,12 @@ test("restore conflicts retain both versions and missing parent folders are recr
   await row
     .getByRole("button", { name: "Restore treasure.txt", exact: true })
     .click();
-  await expect(row).toHaveCount(0);
+  await expect(
+    page.getByRole("status", {
+      name: "Recovery operation progress",
+      exact: true,
+    }),
+  ).toContainText("treasure.txt restored to /recovery/treasure.txt.");
   expect(await contents(request, bin, "recovery/treasure.txt")).toBe(
     "Original treasure bytes\n",
   );
@@ -1054,4 +1059,538 @@ test("bulk restore keeps conflicts selected while restoring other entries withou
   expect(remaining.map((item: { id: string }) => item.id)).toEqual([
     conflict.id,
   ]);
+});
+
+for (const action of ["delete", "restore"] as const) {
+  test(`slow recovery ${action} stays closeable and scoped while navigating, then preserves a newer dialog`, async ({
+    page,
+    request,
+    bin,
+  }, testInfo) => {
+    const recycled = [
+      await recycle(request, bin, "recovery/archive"),
+      await recycle(request, bin, "recovery/treasure.txt"),
+    ];
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let operation: any = null;
+    const writes: { itemId: string; requestId: string; serverId: string }[] =
+      [];
+    await page.route("**/api/files/recycle-bin/**", async (route) => {
+      const request = route.request();
+      const url = new URL(request.url());
+      const mutation =
+        action === "delete"
+          ? request.method() === "DELETE"
+          : request.method() === "POST" && url.pathname.endsWith("/restore");
+      if (!mutation) return route.continue();
+      const itemId = url.pathname.split("/").at(action === "delete" ? -1 : -2)!;
+      const id =
+        action === "delete"
+          ? url.searchParams.get("requestId")
+          : request.postDataJSON().requestId;
+      writes.push({
+        itemId,
+        requestId: id,
+        serverId: request.headers()["x-server-id"],
+      });
+      operation = {
+        id,
+        itemId,
+        type: action,
+        item: recycled.find((item) => item.id === itemId),
+        status: "running",
+        phase: action === "delete" ? "deleting" : "copying",
+        filesProcessed: 2,
+        totalFiles: 10,
+        bytesProcessed: 1024,
+        totalBytes: 4096,
+      };
+      await held;
+      const response = await route.fetch();
+      operation = { ...operation, status: "completed", phase: "completed" };
+      await route.fulfill({ response });
+    });
+    await page.route("**/api/files/recycle-bin/operation*", (route) =>
+      route.fulfill({
+        json: {
+          operation:
+            route.request().headers()["x-server-id"] === bin.id
+              ? operation
+              : null,
+        },
+      }),
+    );
+    try {
+      await openFiles(page, bin);
+      await openBin(page);
+      await page
+        .getByRole("checkbox", {
+          name: "Select all visible recycled items",
+          exact: true,
+        })
+        .check();
+      await page
+        .getByRole("button", {
+          name:
+            action === "delete"
+              ? "Delete selected permanently"
+              : "Restore selected",
+          exact: true,
+        })
+        .click();
+      const dialog = page.getByRole("dialog", {
+        name:
+          action === "delete"
+            ? "Permanently delete from Recycle Bin?"
+            : "Restore selected items?",
+        exact: true,
+      });
+      await dialog
+        .getByRole("button", {
+          name:
+            action === "delete"
+              ? "Delete permanently"
+              : "Restore selected items",
+          exact: true,
+        })
+        .click();
+      await expect(
+        dialog.getByRole("button", {
+          name: "Close recovery confirmation",
+          exact: true,
+        }),
+      ).toBeEnabled();
+      await expect(dialog).toContainText("2 of 10 files");
+      if (action === "delete")
+        await expect(
+          page.getByRole("button", { name: "Restore archive", exact: true }),
+        ).toHaveText("Restore");
+      await page.screenshot({
+        path: testInfo.outputPath(`slow-recovery-${action}-desktop.png`),
+        fullPage: true,
+      });
+      await dialog
+        .getByRole("button", { name: "Continue in background", exact: true })
+        .click();
+      await expect(dialog).not.toBeVisible();
+      await page.getByRole("link", { name: "Console", exact: true }).click();
+      await page
+        .getByRole("link", { name: "File Manager", exact: true })
+        .click();
+      await expect(
+        page.getByRole("heading", { name: "Recycle Bin", exact: true }),
+      ).toBeVisible();
+      const progress = page.getByRole("status", {
+        name: "Recovery operation progress",
+        exact: true,
+      });
+      await expect(progress).toContainText("2 of 10 files");
+      await selectServer(page, bin.otherServerId);
+      await openBin(page);
+      await expect(progress).toHaveCount(0);
+      await selectServer(page, bin.id);
+      await openBin(page);
+      await expect(progress).toContainText("2 of 10 files");
+      await page.setViewportSize({ width: 390, height: 844 });
+      expect(
+        await page.evaluate(() => document.documentElement.scrollWidth),
+      ).toBeLessThanOrEqual(390);
+      await page.screenshot({
+        path: testInfo.outputPath(`slow-recovery-${action}-mobile.png`),
+        fullPage: true,
+      });
+      await page
+        .getByRole("button", { name: "Back to files", exact: true })
+        .click();
+      await page.getByRole("button", { name: "New file", exact: true }).click();
+      const newer = page.getByRole("dialog", { name: "New file", exact: true });
+      await newer
+        .getByLabel("File name", { exact: true })
+        .fill("keep-my-draft.txt");
+      release();
+      await expect.poll(() => writes.length).toBe(2);
+      await expect.poll(() => operation?.status).toBe("completed");
+      await expect(newer).toBeVisible();
+      await expect(newer.getByLabel("File name", { exact: true })).toHaveValue(
+        "keep-my-draft.txt",
+      );
+      await newer.getByRole("button", { name: "Cancel", exact: true }).click();
+      await openBin(page);
+      await expect(progress).toContainText("Recovery action complete");
+      await expect(progress).toContainText("2 of 2 items finished");
+      expect(writes.every((write) => write.serverId === bin.id)).toBe(true);
+      expect(new Set(writes.map((write) => write.requestId)).size).toBe(2);
+      await expect(
+        page.getByRole("heading", {
+          name: "Recycle Bin is empty",
+          exact: true,
+        }),
+      ).toBeVisible();
+    } finally {
+      release();
+    }
+  });
+}
+
+test("unconfirmed permanent deletion stops remaining items and checks the original request without replaying it", async ({
+  page,
+  request,
+  bin,
+}) => {
+  await recycle(request, bin, "recovery/archive");
+  await recycle(request, bin, "recovery/treasure.txt");
+  const writes: { itemId: string; requestId: string }[] = [];
+  await page.route("**/api/files/recycle-bin/**", async (route) => {
+    if (route.request().method() !== "DELETE") return route.continue();
+    const url = new URL(route.request().url());
+    writes.push({
+      itemId: url.pathname.split("/").at(-1)!,
+      requestId: url.searchParams.get("requestId")!,
+    });
+    await route.abort("failed");
+  });
+  let operation: any = null;
+  await page.route("**/api/files/recycle-bin/operation*", (route) =>
+    route.fulfill({ json: { operation } }),
+  );
+  await openFiles(page, bin);
+  await openBin(page);
+  await page
+    .getByRole("checkbox", {
+      name: "Select all visible recycled items",
+      exact: true,
+    })
+    .check();
+  await page
+    .getByRole("button", { name: "Delete selected permanently", exact: true })
+    .click();
+  const dialog = page.getByRole("dialog", {
+    name: "Permanently delete from Recycle Bin?",
+    exact: true,
+  });
+  await dialog
+    .getByRole("button", { name: "Delete permanently", exact: true })
+    .click();
+  await expect(dialog).toContainText("outcome could not be confirmed");
+  expect(writes).toHaveLength(1);
+  await dialog
+    .getByRole("button", { name: "Close recovery confirmation", exact: true })
+    .click();
+  const progress = page.getByRole("status", {
+    name: "Recovery operation progress",
+    exact: true,
+  });
+  await expect(progress).toContainText("remaining items were not sent");
+  await expect(
+    page.getByRole("button", {
+      name: "Delete selected permanently",
+      exact: true,
+    }),
+  ).toBeDisabled();
+  operation = {
+    id: writes[0].requestId,
+    itemId: writes[0].itemId,
+    type: "delete",
+    status: "completed",
+    phase: "completed",
+    filesProcessed: 0,
+    totalFiles: 0,
+    bytesProcessed: 0,
+    totalBytes: 0,
+  };
+  const deletion = await request.delete(
+    `/api/files/recycle-bin/${writes[0].itemId}`,
+    { headers: bin.headers },
+  );
+  expect(deletion.ok()).toBe(true);
+  await progress
+    .getByRole("button", { name: "Check recovery status", exact: true })
+    .click();
+  await expect(progress).toContainText(
+    "1 item permanently deleted. 1 remaining item was not sent.",
+  );
+  expect(writes).toHaveLength(1);
+  await expect(
+    page
+      .getByRole("list", { name: "Recycled items", exact: true })
+      .getByRole("listitem"),
+  ).toHaveCount(1);
+});
+
+test("reloading Recycle Bin adopts a running operation without sending a second permanent deletion", async ({
+  page,
+  request,
+  bin,
+}) => {
+  const item = await recycle(request, bin, "recovery/archive");
+  const id = "6b90736c-1304-4b49-9e63-6045cc59c355";
+  let operation: any = {
+    id,
+    itemId: item.id,
+    item,
+    type: "delete",
+    status: "running",
+    phase: "deleting",
+    filesProcessed: 3,
+    totalFiles: 8,
+    bytesProcessed: 0,
+    totalBytes: null,
+  };
+  let writes = 0;
+  await page.route("**/api/files/recycle-bin/**", (route) => {
+    if (route.request().method() === "DELETE") writes++;
+    return route.continue();
+  });
+  await page.route("**/api/files/recycle-bin/operation*", (route) =>
+    route.fulfill({ json: { operation } }),
+  );
+  await openFiles(page, bin);
+  await openBin(page);
+  const progress = page.getByRole("status", {
+    name: "Recovery operation progress",
+    exact: true,
+  });
+  await expect(progress).toContainText("3 of 8 files");
+  await page.reload();
+  await openBin(page);
+  await expect(progress).toContainText("3 of 8 files");
+  const deletion = await request.delete(`/api/files/recycle-bin/${item.id}`, {
+    headers: bin.headers,
+  });
+  expect(deletion.ok()).toBe(true);
+  operation = { ...operation, status: "completed", phase: "completed" };
+  await expect(progress).toContainText("1 item permanently deleted.");
+  expect(writes).toBe(0);
+});
+
+test("recovery permission loss stops observation and remaining deletions until the notice is reviewed", async ({
+  page,
+  request,
+  bin,
+}) => {
+  await recycle(request, bin, "recovery/archive");
+  await recycle(request, bin, "recovery/treasure.txt");
+  await page.clock.install();
+  let writes = 0;
+  let deniedChecks = 0;
+  await page.route("**/api/files/recycle-bin/**", (route) => {
+    if (route.request().method() !== "DELETE") return route.continue();
+    writes++;
+    return route.fulfill({
+      status: 503,
+      json: { error: "Response unavailable." },
+    });
+  });
+  await page.route("**/api/files/recycle-bin/operation*", (route) => {
+    if (!writes) return route.fulfill({ json: { operation: null } });
+    deniedChecks++;
+    return route.fulfill({
+      status: 403,
+      json: { error: "Permission revoked." },
+    });
+  });
+  await openFiles(page, bin);
+  await openBin(page);
+  await page
+    .getByRole("checkbox", {
+      name: "Select all visible recycled items",
+      exact: true,
+    })
+    .check();
+  await page
+    .getByRole("button", { name: "Delete selected permanently", exact: true })
+    .click();
+  const dialog = page.getByRole("dialog", {
+    name: "Permanently delete from Recycle Bin?",
+    exact: true,
+  });
+  await dialog
+    .getByRole("button", { name: "Delete permanently", exact: true })
+    .click();
+  await expect(dialog).toContainText("outcome could not be confirmed");
+  await page.clock.fastForward(10000);
+  expect(writes).toBe(1);
+  expect(deniedChecks).toBe(1);
+  await page.keyboard.press("Escape");
+  await expect(dialog).not.toBeVisible();
+  await expect(
+    page.getByRole("textbox", { name: "Search recycled items", exact: true }),
+  ).toBeFocused();
+  const progress = page.getByRole("status", {
+    name: "Recovery operation progress",
+    exact: true,
+  });
+  await expect(progress).toContainText("does not cancel work on the server");
+  await progress
+    .getByRole("button", { name: "I've checked the files", exact: true })
+    .click();
+  await expect(progress).toHaveCount(0);
+  await expect(
+    page.getByRole("button", {
+      name: "Delete selected permanently",
+      exact: true,
+    }),
+  ).toBeEnabled();
+  expect(writes).toBe(1);
+});
+
+test("a recovery queue cannot send remaining deletions with a newly signed-in account", async ({
+  page,
+}) => {
+  const permissions = [
+    "file.read",
+    "backup.read",
+    "file.delete",
+    "backup.delete",
+  ];
+  const server = {
+    id: "recovery-session-fixture",
+    name: "Session fixture",
+    mode: "live",
+    status: "offline",
+    software: "Paper",
+    version: "1.21.1",
+    players: [],
+    maxPlayers: 20,
+    memory: 0,
+    cpu: 0,
+    memoryLimit: 1024,
+    disk: 0,
+    diskLimit: 1024 ** 3,
+    uptime: 0,
+    address: "localhost:25565",
+  };
+  const session = (userId: string) => ({
+    role: "subuser",
+    userId,
+    email: `${userId}@example.test`,
+    serverId: server.id,
+    permissions,
+  });
+  let currentUser = "first";
+  const items = ["alpha", "beta"].map((id) => ({
+    id,
+    name: `${id}.txt`,
+    originalPath: `${id}.txt`,
+    type: "file",
+    size: 8,
+    deletedAt: "2026-09-25T12:00:00Z",
+    status: "ready",
+  }));
+  let release!: () => void;
+  const held = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  let heldStatus!: () => void;
+  const statusGate = new Promise<void>((resolve) => {
+    heldStatus = resolve;
+  });
+  const writes: { id: string; user: string }[] = [];
+  let completed = false;
+  await page.route("**/api/**", async (route) => {
+    const request = route.request();
+    const url = new URL(request.url());
+    const path = url.pathname;
+    const reply = (json: unknown) => route.fulfill({ json });
+    if (path === "/api/access/session") return reply(session(currentUser));
+    if (path === "/api/access/logout") {
+      currentUser = "guest";
+      return reply({ ok: true });
+    }
+    if (path === "/api/access/login") {
+      currentUser = "second";
+      return reply(session(currentUser));
+    }
+    if (path === "/api/servers")
+      return reply({
+        servers: [{ ...server, accessPermissions: permissions }],
+        defaultServerId: server.id,
+      });
+    if (path === "/api/server") return reply(server);
+    if (path === "/api/files") return reply({ path: "", entries: [] });
+    if (path === "/api/files/recycle-bin")
+      return reply({
+        items: completed ? items.slice(1) : items,
+        protected: true,
+      });
+    if (path === "/api/files/recycle-bin/operation") {
+      if (url.searchParams.has("requestId")) await statusGate;
+      return reply({ operation: null });
+    }
+    if (
+      path.startsWith("/api/files/recycle-bin/") &&
+      request.method() === "DELETE"
+    ) {
+      writes.push({ id: path.split("/").at(-1)!, user: currentUser });
+      await held;
+      completed = true;
+      return reply({ ok: true });
+    }
+    return route.fulfill({
+      status: 404,
+      json: { error: "Not part of this fixture." },
+    });
+  });
+  try {
+    await page.goto("/#files?recycle=1");
+    await page
+      .getByRole("checkbox", {
+        name: "Select all visible recycled items",
+        exact: true,
+      })
+      .check();
+    await page
+      .getByRole("button", { name: "Delete selected permanently", exact: true })
+      .click();
+    const dialog = page.getByRole("dialog", {
+      name: "Permanently delete from Recycle Bin?",
+      exact: true,
+    });
+    await dialog
+      .getByRole("button", { name: "Delete permanently", exact: true })
+      .click();
+    await expect.poll(() => writes.length).toBe(1);
+    await dialog
+      .getByRole("button", { name: "Continue in background", exact: true })
+      .click();
+    await page
+      .getByRole("button", {
+        name: "Account menu for first@example.test",
+        exact: true,
+      })
+      .click();
+    await page.getByRole("menuitem", { name: "Sign out", exact: true }).click();
+    await page.getByLabel("Email address").fill("second@example.test");
+    await page
+      .getByLabel("Password", { exact: true })
+      .fill("A valid password 123!");
+    await page.getByRole("button", { name: "Sign in", exact: true }).click();
+    await expect(
+      page.getByRole("button", {
+        name: "Account menu for second@example.test",
+        exact: true,
+      }),
+    ).toBeVisible();
+    release();
+    const progress = page.getByRole("status", {
+      name: "Recovery operation progress",
+      exact: true,
+    });
+    await expect(progress).toContainText("remaining items were not sent");
+    await expect(progress).toContainText("1 of 2 items finished");
+    heldStatus();
+    await expect(
+      page.getByRole("button", {
+        name: "Account menu for second@example.test",
+        exact: true,
+      }),
+    ).toBeVisible();
+    expect(writes).toEqual([{ id: "alpha", user: "first" }]);
+  } finally {
+    release();
+    heldStatus();
+  }
 });

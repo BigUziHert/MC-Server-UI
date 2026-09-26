@@ -816,6 +816,8 @@ test("remote route permissions fail closed for unassigned routes and distinguish
   const routes = [
     ["GET", "/api/files/recycle-operation", ["file.read"]],
     ["HEAD", "/api/files/recycle-operation", ["file.read"]],
+    ["GET", "/api/files/recycle-bin/operation", ["file.read", "backup.read"]],
+    ["HEAD", "/api/files/recycle-bin/operation", ["file.read", "backup.read"]],
     ["GET", "/api/server/settings", ["server.update"]],
     ["HEAD", "/api/server/settings", ["server.update"]],
     ["PATCH", "/api/server/settings", ["server.update"]],
@@ -1138,6 +1140,82 @@ test("remote recycle failure progress never exposes host paths or records invali
   assert.equal(
     await fs.readFile(source, "utf8"),
     "fixture contents are retained",
+  );
+});
+
+test("Recycle Bin action progress requires both read grants and remains isolated to the selected membership", async (t) => {
+  const { local, invite, id, fleet } = await fixture(t);
+  const route = "/api/files/recycle-bin/operation";
+  for (const [index, permissions] of [
+    [],
+    ["file.read"],
+    ["backup.read"],
+    ["file.delete", "backup.delete"],
+  ].entries()) {
+    const { asUser } = await invite(
+      permissions,
+      `bin-reader-${index}@example.test`,
+    );
+    assert.equal((await asUser(route)).status, 403);
+  }
+  const reader = await invite(
+    ["file.read", "backup.read"],
+    "bin-reader@example.test",
+  );
+  assert.deepEqual((await reader.asUser(route)).body, { operation: null });
+  await fs.writeFile(
+    path.join(fleet.runtimes.get(id).serverDir, "private-bin-item"),
+    "contents",
+  );
+  const moved = await local("/api/files?path=private-bin-item", {
+    method: "DELETE",
+  });
+  const requestId = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+  assert.equal(
+    (
+      await local(
+        `/api/files/recycle-bin/${moved.body.recycled.id}?requestId=${requestId}`,
+        { method: "DELETE" },
+      )
+    ).status,
+    200,
+  );
+  const operation = (await reader.asUser(`${route}?requestId=${requestId}`))
+    .body.operation;
+  assert.equal(operation.status, "completed");
+  assert.equal(operation.type, "delete");
+  assert.equal(operation.itemId, moved.body.recycled.id);
+  assert.equal(
+    JSON.stringify(operation).includes(
+      JSON.stringify(fleet.runtimes.get(id).dataDir).slice(1, -1),
+    ),
+    false,
+  );
+  const other = await local(
+    "/api/servers",
+    json("POST", { name: "Other history", port: 25566 }),
+  );
+  const otherHeaders = { "X-Server-Id": other.body.server.id };
+  assert.equal(
+    (
+      await reader.asUser(`${route}?requestId=${requestId}`, {
+        headers: otherHeaders,
+      })
+    ).status,
+    403,
+  );
+  assert.deepEqual(
+    (await local(`${route}?requestId=${requestId}`, { headers: otherHeaders }))
+      .body,
+    { operation: null },
+  );
+  await local(
+    `/api/subusers/${reader.user.id}`,
+    json("PATCH", { permissions: ["file.read"] }),
+  );
+  assert.equal(
+    (await reader.asUser(`${route}?requestId=${requestId}`)).status,
+    403,
   );
 });
 

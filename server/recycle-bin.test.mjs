@@ -7,7 +7,7 @@ import { randomUUID, createHash } from "node:crypto";
 import { EventEmitter } from "node:events";
 import { PassThrough, Writable } from "node:stream";
 import * as tar from "tar";
-import { createRecycleBin } from "./recycle-bin.mjs";
+import { createRecycleBin, recycleStorageDirectories } from "./recycle-bin.mjs";
 import { createPanel, createFleet, safePath } from "./index.mjs";
 
 const json = (method, body = {}) => ({ method, body: JSON.stringify(body) });
@@ -22,6 +22,22 @@ const missing = async (target) =>
   assert.rejects(fs.stat(target), { code: "ENOENT" });
 const exdev = () =>
   Object.assign(new Error("fixture crosses volumes"), { code: "EXDEV" });
+
+// Keep real I/O isolated in TEMP while modeling panel metadata on another drive.
+function metadataOnAnotherDrive(dataDir, overrides = {}) {
+  return {
+    ...fs,
+    lstat: async (target) => {
+      const stat = await fs.lstat(target);
+      return path.resolve(target) === path.resolve(dataDir)
+        ? Object.assign(Object.create(Object.getPrototypeOf(stat)), stat, {
+            dev: stat.dev + 1,
+          })
+        : stat;
+    },
+    ...overrides,
+  };
+}
 
 async function fixture(t) {
   // Windows CI can expose TEMP through an 8.3 alias. Fault injection and
@@ -1249,7 +1265,16 @@ test("failed final journal after atomic rename remains recoverable after restart
   const [item] = await restarted.list();
   assert.equal(item.id, recoveryId);
   assert.equal(item.status, "ready");
-  await restarted.restore(item.id);
+  const restorePhases = [];
+  await restarted.restore(item.id, {
+    onProgress: (update) => {
+      if (update.phase) restorePhases.push(update.phase);
+    },
+  });
+  assert.deepEqual(
+    [...new Set(restorePhases)],
+    ["scanning", "copying", "finalizing"],
+  );
   assert.equal(
     await fs.readFile(path.join(f.serverDir, "proof"), "utf8"),
     "recover after crash",
@@ -1640,6 +1665,292 @@ test("permanent deletion removes only the chosen recovery entry and supports dam
   await assert.rejects(bin.deletePermanently(randomUUID()), { status: 404 });
   await bin.deletePermanently(second.id);
   assert.deepEqual(await bin.list(), []);
+});
+
+test("storage planning is deterministic, reserves absent paths, and never creates an optional sibling on the same volume", async (t) => {
+  const f = await fixture(t);
+  const planned = await recycleStorageDirectories(f.dataDir, f.serverDir);
+  assert.equal(planned[0], path.join(f.dataDir, "recycle-bin"));
+  assert.match(path.basename(planned[1]), /^\.mc-recycle-bin-[a-f0-9]{16}$/);
+  assert.equal(path.dirname(planned[1]), path.dirname(f.serverDir));
+  assert.deepEqual(
+    await recycleStorageDirectories(f.dataDir, f.serverDir),
+    planned,
+  );
+  await missing(planned[1]);
+  const unavailable = path.join(f.root, "disconnected", "server");
+  const plannedUnavailable = await recycleStorageDirectories(
+    f.dataDir,
+    unavailable,
+    {
+      fileSystem: {
+        ...fs,
+        realpath: async (target) => {
+          if (target.startsWith(path.join(f.root, "disconnected")))
+            throw Object.assign(new Error("fixture disconnected drive"), {
+              code: "ENODEV",
+            });
+          return fs.realpath(target);
+        },
+      },
+    },
+  );
+  assert.equal(path.dirname(plannedUnavailable[1]), path.dirname(unavailable));
+  const bin = await f.boot({ preferSiblingStorage: true });
+  assert.deepEqual(bin.directories, planned);
+  assert.deepEqual(await bin.list(), []);
+  await fs.writeFile(path.join(f.serverDir, "proof"), "same-volume rename");
+  const item = await bin.recycle("proof");
+  assert.equal(
+    await fs.readFile(path.join(planned[0], item.id, "content"), "utf8"),
+    "same-volume rename",
+  );
+  await missing(planned[1]);
+});
+
+test("external-drive moves use a lazy sibling rename while legacy recovery and backup entries remain available across restart", async (t) => {
+  const f = await fixture(t);
+  await fs.writeFile(path.join(f.serverDir, "old"), "legacy recovery");
+  const oldBin = await f.boot(),
+    old = await oldBin.recycle("old");
+  const backupDir = path.join(f.dataDir, "backups");
+  await fs.mkdir(backupDir);
+  const backup = {
+    id: randomUUID(),
+    name: "Backup",
+    size: 7,
+    createdAt: new Date().toISOString(),
+    status: "completed",
+  };
+  await fs.writeFile(path.join(backupDir, `${backup.id}.tar.gz`), "archive");
+  await fs.mkdir(path.join(f.serverDir, "world"));
+  await fs.writeFile(
+    path.join(f.serverDir, "world", "proof"),
+    "external-drive recovery",
+  );
+  let copies = 0;
+  const io = metadataOnAnotherDrive(f.dataDir, {
+    copyFile: async (...args) => {
+      copies++;
+      return fs.copyFile(...args);
+    },
+  });
+  const bin = await f.boot({
+    preferSiblingStorage: true,
+    backupDir,
+    fileSystem: io,
+  });
+  const sibling = bin.directories[1];
+  assert.equal((await bin.list()).length, 1);
+  await missing(sibling);
+  const item = await bin.recycle("world");
+  assert.equal(
+    copies,
+    0,
+    "same-drive private storage must avoid copies and checksum reads",
+  );
+  await missing(path.join(f.serverDir, "world"));
+  assert.equal(
+    await fs.readFile(path.join(sibling, item.id, "content", "proof"), "utf8"),
+    "external-drive recovery",
+  );
+  const archive = await bin.recycle(`backups/${backup.id}.tar.gz`, { backup });
+  assert.equal(
+    await fs.readFile(path.join(bin.directory, archive.id, "content"), "utf8"),
+    "archive",
+  );
+  await missing(path.join(sibling, archive.id));
+  const restarted = await f.boot({
+    preferSiblingStorage: true,
+    backupDir,
+    fileSystem: metadataOnAnotherDrive(f.dataDir),
+  });
+  assert.deepEqual(
+    new Set((await restarted.list()).map((entry) => entry.id)),
+    new Set([old.id, item.id, archive.id]),
+  );
+  await restarted.restore(item.id);
+  assert.equal(
+    await fs.readFile(path.join(f.serverDir, "world", "proof"), "utf8"),
+    "external-drive recovery",
+  );
+  await restarted.restore(old.id);
+  assert.equal(
+    await fs.readFile(path.join(f.serverDir, "old"), "utf8"),
+    "legacy recovery",
+  );
+  await restarted.deletePermanently(archive.id);
+  assert.deepEqual(await restarted.list(), []);
+});
+
+for (const failurePoint of ["mkdir", "stat", "parent"]) {
+  test(`an unused sibling with denied ${failurePoint} access leaves legacy listing and safe fallback usable`, async (t) => {
+    const f = await fixture(t);
+    await fs.writeFile(path.join(f.serverDir, "old"), "legacy data");
+    const oldBin = await f.boot(),
+      old = await oldBin.recycle("old");
+    const sibling = (
+      await recycleStorageDirectories(f.dataDir, f.serverDir)
+    )[1];
+    const base = metadataOnAnotherDrive(f.dataDir);
+    const denied = () =>
+      Object.assign(new Error("fixture unavailable sibling"), {
+        code: failurePoint === "parent" ? "ENODEV" : "EACCES",
+      });
+    const io = {
+      ...base,
+      lstat: async (target) => {
+        if (
+          (failurePoint === "stat" && target === sibling) ||
+          (failurePoint === "parent" && target === path.dirname(sibling))
+        )
+          throw denied();
+        return base.lstat(target);
+      },
+      mkdir: async (target, ...args) => {
+        if (failurePoint === "mkdir" && target === sibling) throw denied();
+        return fs.mkdir(target, ...args);
+      },
+    };
+    const bin = await f.boot({ preferSiblingStorage: true, fileSystem: io });
+    assert.equal((await bin.list())[0].id, old.id);
+    await fs.writeFile(path.join(f.serverDir, "new"), "fallback data");
+    const item = await bin.recycle("new");
+    assert.equal(
+      await fs.readFile(path.join(bin.directory, item.id, "content"), "utf8"),
+      "fallback data",
+    );
+    await missing(sibling);
+    await bin.deletePermanently(old.id);
+    assert.equal((await bin.list())[0].id, item.id);
+  });
+}
+
+test("an observed sibling storage substitution is rejected without touching the replacement", async (t) => {
+  const f = await fixture(t);
+  await fs.writeFile(path.join(f.serverDir, "proof"), "private recovery");
+  const bin = await f.boot({
+    preferSiblingStorage: true,
+    fileSystem: metadataOnAnotherDrive(f.dataDir),
+  });
+  const item = await bin.recycle("proof"),
+    sibling = bin.directories[1];
+  const parked = path.join(f.root, "original-recovery"),
+    outside = path.join(f.root, "outside");
+  await fs.mkdir(outside);
+  await fs.writeFile(path.join(outside, "keep"), "outside");
+  await fs.rename(sibling, parked);
+  await fs.symlink(
+    outside,
+    sibling,
+    process.platform === "win32" ? "junction" : "dir",
+  );
+  await assert.rejects(
+    bin.deletePermanently(item.id),
+    /symbolic links|storage.*changed/i,
+  );
+  assert.equal(
+    await fs.readFile(path.join(outside, "keep"), "utf8"),
+    "outside",
+  );
+  assert.equal(
+    await fs.readFile(path.join(parked, item.id, "content"), "utf8"),
+    "private recovery",
+  );
+  await fs.unlink(sibling);
+});
+
+test("legacy listing and purge never probe the original server folder and progress counts only recovery payloads", async (t) => {
+  const f = await fixture(t);
+  await fs.mkdir(path.join(f.serverDir, "world"));
+  await fs.writeFile(path.join(f.serverDir, "world", "a"), "first");
+  await fs.writeFile(path.join(f.serverDir, "world", "b"), "second");
+  let rejectOriginal = false;
+  const bin = await f.boot({
+    fileSystem: {
+      ...fs,
+      lstat: async (target) => {
+        if (
+          rejectOriginal &&
+          path.resolve(target) === path.resolve(f.serverDir)
+        )
+          throw new Error("Original drive must not be probed");
+        return fs.lstat(target);
+      },
+    },
+  });
+  const item = await bin.recycle("world");
+  rejectOriginal = true;
+  assert.equal((await bin.list())[0].id, item.id);
+  let progress = {},
+    events = [];
+  const result = await bin.deletePermanently(item.id, {
+    details: true,
+    onProgress: (update) => {
+      progress = { ...progress, ...update };
+      events.push(progress);
+    },
+  });
+  assert.equal(result.originalPath, "world");
+  assert.deepEqual(
+    [...new Set(events.map((event) => event.phase))],
+    ["scanning", "deleting", "finalizing"],
+  );
+  assert.equal(progress.filesProcessed, 2);
+  assert.equal(progress.totalFiles, 2);
+  assert.equal(progress.bytesProcessed, 11);
+});
+
+test("parallel permanent deletion drains every active unlink before reporting failure or releasing the bin", async (t) => {
+  const f = await fixture(t);
+  await fs.mkdir(path.join(f.serverDir, "world"));
+  for (let i = 0; i < 12; i++)
+    await fs.writeFile(
+      path.join(f.serverDir, "world", String(i).padStart(2, "0")),
+      "data",
+    );
+  const original = await f.boot(),
+    item = await original.recycle("world");
+  const entered = deferred(),
+    release = deferred();
+  const bin = await f.boot({
+    fileSystem: {
+      ...fs,
+      unlink: async (target) => {
+        if (path.basename(target) === "11")
+          throw Object.assign(new Error("locked file"), { code: "EPERM" });
+        if (path.basename(target) === "10") {
+          entered.resolve();
+          await release.promise;
+        }
+        return fs.unlink(target);
+      },
+    },
+  });
+  let finished = false;
+  const pending = bin.deletePermanently(item.id).then(
+    () => {
+      finished = true;
+    },
+    (cause) => {
+      finished = true;
+      return cause;
+    },
+  );
+  try {
+    await entered.promise;
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    assert.equal(finished, false);
+    await assert.rejects(bin.inspect(item.id), { status: 409 });
+    release.resolve();
+    assert.equal((await pending).code, "EPERM");
+    assert.equal((await bin.list())[0].status, "incomplete");
+    await assert.rejects(bin.restore(item.id), /incomplete/);
+    await original.deletePermanently(item.id);
+  } finally {
+    release.resolve();
+    await pending;
+  }
 });
 
 test("permanent deletion refuses private entry junctions and nested symlinks without touching outside files", async (t) => {

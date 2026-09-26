@@ -16,7 +16,7 @@ import {
   legacyConnectionHost,
 } from "./connection.mjs";
 import { decodeIcon, readServerIcon, writeServerIcon } from "./server-icon.mjs";
-import { createRecycleBin } from "./recycle-bin.mjs";
+import { createRecycleBin, recycleStorageDirectories } from "./recycle-bin.mjs";
 import { copyServerFiles, uploadServerFiles } from "./file-transfer.mjs";
 import { createBackupArchive } from "./backup-archive.mjs";
 import { restoreBackupArchive } from "./backup-restore.mjs";
@@ -566,6 +566,7 @@ export async function createPanel(options = {}) {
     serverDir,
     backupDir,
     safePath,
+    preferSiblingStorage: true,
   });
   let state = {
     users: [],
@@ -1933,7 +1934,12 @@ export async function createPanel(options = {}) {
   let diskError = false;
   app.get("/api/server", async (_req, res) => {
     await refreshStartupMetadata();
-    if (!diskScan && Date.now() - diskCache.at > 10000)
+    if (
+      !diskScan &&
+      !recycleBusy &&
+      !activeMutations &&
+      Date.now() - diskCache.at > 10000
+    )
       diskScan = directorySize(serverDir)
         .then((value) => {
           diskCache = { value, at: Date.now() };
@@ -2479,22 +2485,107 @@ export async function createPanel(options = {}) {
   app.get("/api/files/recycle-bin", async (_req, res) => {
     res.json({ items: await recycleBin.list(), protected: true });
   });
+  const recycleActions = new Map();
+  let latestRecycleAction = null;
+  app.get("/api/files/recycle-bin/operation", (req, res) => {
+    const requestId = recycleRequestId(req.query.requestId);
+    res.set("Cache-Control", "no-store");
+    res.json({
+      operation: requestId
+        ? (recycleActions.get(requestId) ?? null)
+        : latestRecycleAction,
+    });
+  });
+  const runRecycleAction = async (req, res, type, work) => {
+    const itemId = recycleRequestId(req.params.id);
+    const id =
+      recycleRequestId(
+        type === "delete" ? req.query.requestId : req.body?.requestId,
+      ) ?? randomUUID();
+    const previous = recycleActions.get(id);
+    if (previous) {
+      if (previous.itemId !== itemId || previous.type !== type)
+        throw error(409, "This recovery request ID belongs to another action.");
+      if (previous.status === "completed") return res.json(previous.result);
+      throw error(
+        409,
+        previous.error ?? "This recovery action is still in progress.",
+      );
+    }
+    const operation = {
+      id,
+      itemId,
+      type,
+      status: "running",
+      phase: "scanning",
+      filesProcessed: 0,
+      totalFiles: null,
+      bytesProcessed: 0,
+      totalBytes: null,
+      startedAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    };
+    recycleActions.set(id, operation);
+    latestRecycleAction = operation;
+    // Mutation leases serialize actions. Preserve recent settled outcomes so a
+    // reconnect never repeats a destructive request whose response was lost.
+    while (recycleActions.size > 64)
+      recycleActions.delete(recycleActions.keys().next().value);
+    const onProgress = (update) =>
+      Object.assign(operation, update, { updatedAt: new Date().toISOString() });
+    try {
+      const result = await work(itemId, onProgress, operation);
+      Object.assign(operation, {
+        status: "completed",
+        phase: "completed",
+        result,
+        updatedAt: new Date().toISOString(),
+      });
+      diskCache.at = 0;
+      res.json(result);
+    } catch (cause) {
+      const message =
+        cause.code === "ENOSPC"
+          ? "The destination drive is full. Recovery data and any completed restored files have been retained."
+          : cause.status >= 400 && cause.status < 500
+            ? cause.message
+            : type === "delete"
+              ? "Permanent deletion could not finish. Remaining recovery data has been retained; release files in use and retry."
+              : "Restore could not finish. Recovery data and any completed restored files have been retained; check the destination before retrying.";
+      Object.assign(operation, {
+        status: "failed",
+        phase: "failed",
+        error: message,
+        updatedAt: new Date().toISOString(),
+      });
+      diskCache.at = 0;
+      throw error(
+        cause.status >= 400 && cause.status < 500 ? cause.status : 409,
+        message,
+      );
+    }
+  };
   app.delete(
     "/api/files/recycle-bin/:id",
     trackOperation(async (req, res) => {
-      const removed = await recycleBin.deletePermanently(req.params.id, {
-        details: true,
+      await runRecycleAction(req, res, "delete", async (itemId, onProgress) => {
+        const removed = await recycleBin.deletePermanently(itemId, {
+          details: true,
+          onProgress,
+        });
+        void trackTask(() =>
+          audit(
+            removed.kind === "backup" ? "backup" : "file",
+            removed.kind === "backup"
+              ? "Backup permanently deleted"
+              : "Recycle Bin item permanently deleted",
+            removed.backup?.name ??
+              removed.originalPath ??
+              `Recovery item ${req.params.id} (original path unavailable)`,
+          ),
+        ).catch(() => {});
+        return { ok: true, id: itemId };
       });
-      await audit(
-        removed.kind === "backup" ? "backup" : "file",
-        removed.kind === "backup"
-          ? "Backup permanently deleted"
-          : "Recycle Bin item permanently deleted",
-        removed.backup?.name ??
-          removed.originalPath ??
-          `Recovery item ${req.params.id} (original path unavailable)`,
-      );
-      res.json({ ok: true, id: req.params.id });
     }),
   );
   app.get(
@@ -2534,49 +2625,56 @@ export async function createPanel(options = {}) {
   app.post(
     "/api/files/recycle-bin/:id/restore",
     trackOperation(async (req, res) => {
-      const item = await recycleBin.inspect(req.params.id, {
-        includeHash: false,
-      });
-      if (item.kind === "backup") {
-        // A failed final recycle journal write can leave a stale history row.
-        // The bin verifies the archive destination itself and refuses conflicts;
-        // an existing history ID must not prevent recovering its missing file.
-        await recycleBin.restore(req.params.id, {
-          commitBackup: async (backup) => {
-            const previous = state.backups;
-            state.backups = [
-              backup,
-              ...previous.filter((entry) => entry.id !== backup.id),
-            ].sort((a, b) => b.createdAt.localeCompare(a.createdAt));
-            try {
-              await save();
-            } catch (cause) {
-              state.backups = previous;
-              throw cause;
-            }
-          },
-        });
-        await audit(
-          "backup",
-          "Backup restored",
-          `${item.backup.name} · restored from Recycle Bin.`,
-        );
-        res.json({ ok: true, kind: "backup", backup: item.backup });
-        return;
-      }
-      const restoredPath = await recycleBin.restore(req.params.id);
-      const restored = await fs.stat(await safePath(serverDir, restoredPath));
-      const kind = await fileKind(
-        restoredPath,
-        restored.isDirectory() ? "directory" : "file",
+      await runRecycleAction(
+        req,
+        res,
+        "restore",
+        async (itemId, onProgress, operation) => {
+          const item = await recycleBin.inspect(itemId, {
+            includeHash: false,
+          });
+          operation.item = item;
+          if (item.kind === "backup") {
+            // A failed final recycle journal write can leave a stale history row.
+            // The bin verifies the archive destination itself and refuses conflicts;
+            // an existing history ID must not prevent recovering its missing file.
+            await recycleBin.restore(itemId, {
+              onProgress,
+              commitBackup: async (backup) => {
+                const previous = state.backups;
+                state.backups = [
+                  backup,
+                  ...previous.filter((entry) => entry.id !== backup.id),
+                ].sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+                try {
+                  await save();
+                } catch (cause) {
+                  state.backups = previous;
+                  throw cause;
+                }
+              },
+            });
+            void trackTask(() =>
+              audit(
+                "backup",
+                "Backup restored",
+                `${item.backup.name} · restored from Recycle Bin.`,
+              ),
+            ).catch(() => {});
+            return { ok: true, kind: "backup", backup: item.backup };
+          }
+          const restoredPath = await recycleBin.restore(itemId, { onProgress });
+          void trackTask(async () => {
+            const kind = await fileKind(restoredPath, item.type);
+            await audit(
+              "file",
+              `${kind} restored`,
+              `${restoredPath} · restored from Recycle Bin.`,
+            );
+          }).catch(() => {});
+          return { ok: true, path: restoredPath };
+        },
       );
-      await audit(
-        "file",
-        `${kind} restored`,
-        `${restoredPath} · restored from Recycle Bin.`,
-      );
-      diskCache.at = 0;
-      res.json({ ok: true, path: restoredPath });
     }),
   );
   app.get("/api/files", async (req, res) => {
@@ -2693,13 +2791,11 @@ export async function createPanel(options = {}) {
           await fs.rm(file.path, { force: true }).catch(() => {});
       }
       if (uploadFailure)
-        res
-          .status(uploadFailure.status)
-          .json({
-            error: uploadFailure.error,
-            uploaded: uploadedPaths.length,
-            directories: createdDirectories.length,
-          });
+        res.status(uploadFailure.status).json({
+          error: uploadFailure.error,
+          uploaded: uploadedPaths.length,
+          directories: createdDirectories.length,
+        });
       else res.status(201).json(result);
     }),
   );
@@ -2785,12 +2881,10 @@ export async function createPanel(options = {}) {
           throw error(409, "This request ID belongs to another file copy.");
         if (previous.status === "completed")
           return res.status(201).json(previous.result);
-        return res
-          .status(409)
-          .json({
-            error: previous.error ?? "This file copy is still in progress.",
-            ...previous.result,
-          });
+        return res.status(409).json({
+          error: previous.error ?? "This file copy is still in progress.",
+          ...previous.result,
+        });
       }
       const operation = {
         id: requestId,
@@ -3417,6 +3511,7 @@ export async function createPanel(options = {}) {
     app,
     dataDir,
     serverDir,
+    recycleDirectories: recycleBin.directories,
     tick,
     descriptor,
     iconDataUrl: () =>
@@ -3690,43 +3785,75 @@ export async function createFleet(options = {}) {
         `Port ${port} is already assigned to another server. Choose a different port.`,
       );
   };
-  const inspectImport = (directory, exceptId, requireCanonical = false) =>
-    inspectServerDirectory(directory, {
-      forbiddenDirectories: [
-        dataDir,
-        ...registry.servers
-          .filter((entry) => entry.id !== exceptId)
-          .flatMap((entry) => [entry.serverDir, entry.dataDir]),
-      ],
-      requireCanonical,
-    });
-  const installationOptions = (exceptId) => ({
+  const installationOptions = async (
+    exceptId,
+    ownSupportDirectory = false,
+  ) => ({
     forbiddenDirectories: [
       dataDir,
       ...registry.servers
         .filter((entry) => entry.id !== exceptId)
         .flatMap((entry) => [entry.serverDir, entry.dataDir]),
+      ...(
+        await Promise.all(
+          registry.servers.map(async (entry) => {
+            const directories = await recycleStorageDirectories(
+              entry.dataDir,
+              entry.serverDir,
+            );
+            // A server's support directory contains its legacy bin. All other
+            // recovery locations remain reserved, including its sibling bin.
+            return ownSupportDirectory && entry.id === exceptId
+              ? directories.slice(1)
+              : directories;
+          }),
+        )
+      ).flat(),
     ],
   });
+  const inspectImport = async (
+    directory,
+    exceptId,
+    requireCanonical = false,
+  ) => {
+    const inspected = await inspectServerDirectory(directory, {
+      ...(await installationOptions(exceptId)),
+      requireCanonical,
+    });
+    if (
+      inspected.directory
+        .split(path.sep)
+        .some((part) => /^\.mc-recycle-bin-[a-f0-9]{16}$/i.test(part))
+    )
+      throw error(
+        400,
+        "Choose a server folder outside MC Panel's Recycle Bin folders.",
+      );
+    return inspected;
+  };
   const inspectInstallation = async (directory) => {
     const target = await inspectInstallationDirectory(
       directory,
-      installationOptions(),
+      await installationOptions(),
     );
     if (
       target.directory
         .split(path.sep)
-        .some((part) => part.toLowerCase() === ".mc-panel")
+        .some(
+          (part) =>
+            part.toLowerCase() === ".mc-panel" ||
+            /^\.mc-recycle-bin-[a-f0-9]{16}$/i.test(part),
+        )
     )
       throw error(
         400,
-        "Choose a server folder outside MC Panel's .mc-panel support folders.",
+        "Choose a server folder outside MC Panel's support and Recycle Bin folders.",
       );
     const supportRoot = path.join(path.dirname(target.directory), ".mc-panel");
     // Check the support location too, without reserving or writing anything.
     await inspectInstallationDirectory(
       path.join(supportRoot, "setup-check"),
-      installationOptions(),
+      await installationOptions(),
     );
     return { ...target, supportRoot };
   };
@@ -3787,13 +3914,13 @@ export async function createFleet(options = {}) {
       }
     } else if (entry.storage === "custom") {
       await inspectInstallationDirectory(entry.serverDir, {
-        ...installationOptions(entry.id),
+        ...(await installationOptions(entry.id)),
         requireEmpty: false,
         requireExisting: true,
       });
       await inspectInstallationDirectory(entry.dataDir, {
         forbiddenDirectories: [
-          ...installationOptions(entry.id).forbiddenDirectories,
+          ...(await installationOptions(entry.id, true)).forbiddenDirectories,
           entry.serverDir,
         ],
         requireEmpty: false,
@@ -4691,13 +4818,16 @@ export async function createFleet(options = {}) {
           );
       }
       if (installation)
-        await prepareInstallationDirectory(instanceDir, installationOptions());
+        await prepareInstallationDirectory(
+          instanceDir,
+          await installationOptions(),
+        );
       else await fs.mkdir(instanceDir, { recursive: true });
       const serverDir = installation
         ? (
             await prepareInstallationDirectory(installation.directory, {
               forbiddenDirectories: [
-                ...installationOptions().forbiddenDirectories,
+                ...(await installationOptions()).forbiddenDirectories,
                 instanceDir,
               ],
             })
