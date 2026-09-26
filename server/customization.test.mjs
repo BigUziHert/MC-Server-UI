@@ -693,7 +693,7 @@ test("granular permissions validate, deduplicate, remain scoped, and persist edi
   );
 });
 
-test("legacy role-only subusers receive intended permission defaults and can be edited after restart", async (t) => {
+test("legacy role-only subusers keep old defaults without gaining new settings access after restart", async (t) => {
   const { boot } = await fixture(t);
   const panel = await boot();
   const id = await panel.create();
@@ -714,7 +714,10 @@ test("legacy role-only subusers receive intended permission defaults and can be 
   const restarted = await boot();
   const users = (await restarted.request("/api/subusers", {}, id)).body.users;
   for (const user of users)
-    assert.deepEqual(user.permissions, catalog.roleDefaults[user.role]);
+    assert.deepEqual(
+      user.permissions,
+      catalog.roleDefaults[user.role].filter((id) => id !== "server.update"),
+    );
   const edited = await restarted.request(
     `/api/subusers/${users[0].id}`,
     json("PATCH", { permissions: ["audit.read"] }),

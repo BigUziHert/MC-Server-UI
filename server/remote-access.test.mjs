@@ -185,6 +185,380 @@ test("host folder browsing is local-only even for an authenticated user with fil
   assert.equal(Object.hasOwn(response.body, "folders"), false);
 });
 
+test("remote settings require an explicit grant and only update the selected server's safe configuration", async (t) => {
+  const { local, invite, id, root, fleet } = await fixture(t);
+  const first = await invite(["control.console"]);
+  assert.equal((await first.asUser("/api/server/settings")).status, 403);
+  assert.equal(
+    (
+      await first.asUser(
+        "/api/server/settings",
+        json("PATCH", { name: "Denied" }),
+      )
+    ).status,
+    403,
+  );
+  const created = await local(
+    "/api/servers",
+    json("POST", { name: "Creative", port: 25566 }),
+  );
+  assert.equal(created.status, 201);
+  const secondId = created.body.server.id;
+  const second = await invite(
+    ["server.update"],
+    "sister@example.test",
+    secondId,
+    "Another-test-password!",
+    first.cookie,
+  );
+  const scoped = (body) => ({
+    ...json("PATCH", body),
+    headers: { "X-Server-Id": secondId },
+  });
+  const visible = await second.asUser("/api/server/settings", {
+    headers: { "X-Server-Id": secondId },
+  });
+  assert.equal(visible.status, 200, JSON.stringify(visible.body));
+  assert.deepEqual(visible.body.server.accessPermissions, ["server.update"]);
+  for (const field of [
+    "javaPath",
+    "jar",
+    "launchScript",
+    "launchExecutable",
+    "launchArgs",
+    "serverDir",
+    "dataDir",
+  ])
+    assert.equal(Object.hasOwn(visible.body.server, field), false, field);
+  for (const unsafe of [
+    { javaPath: "other" },
+    { launchExecutable: "other" },
+    { jar: "other.jar" },
+    { serverDir: root },
+    { mode: "live" },
+    { hostPermissions: ["server.create"] },
+  ])
+    assert.equal(
+      (
+        await second.asUser(
+          "/api/server/settings",
+          scoped({ name: "Unsafe", ...unsafe }),
+        )
+      ).status,
+      400,
+    );
+  assert.equal(
+    (
+      await second.asUser(
+        `/api/servers/${secondId}`,
+        scoped({ name: "Owner route" }),
+      )
+    ).status,
+    403,
+  );
+  assert.equal(
+    (
+      await second.asUser("/api/server/settings", {
+        ...json("PATCH", { name: "Wrong membership" }),
+        headers: { "X-Server-Id": id },
+      })
+    ).status,
+    403,
+  );
+  assert.equal(
+    (await second.asUser("/api/server/settings", scoped({ port: 25565 })))
+      .status,
+    409,
+  );
+  const saved = await second.asUser(
+    "/api/server/settings",
+    scoped({
+      name: "Creative renamed",
+      connectionHost: "play.example.test",
+      port: 25567,
+      memoryLimitMB: 3072,
+      motd: "Shared creative world",
+    }),
+  );
+  assert.equal(saved.status, 200, JSON.stringify(saved.body));
+  assert.equal(saved.body.server.name, "Creative renamed");
+  assert.equal(saved.body.server.jar, undefined);
+  assert.deepEqual(saved.body.server.accessPermissions, ["server.update"]);
+  const registry = JSON.parse(
+    await fs.readFile(path.join(root, "servers.json"), "utf8"),
+  );
+  assert.equal(
+    registry.servers.find((entry) => entry.id === secondId).name,
+    "Creative renamed",
+  );
+  assert.equal(registry.servers.find((entry) => entry.id === id).port, 25565);
+  const properties = await fs.readFile(
+    path.join(fleet.runtimes.get(secondId).serverDir, "server.properties"),
+    "utf8",
+  );
+  assert.match(properties, /server-port=25567/);
+  assert.match(properties, /motd=Shared creative world/);
+  assert.equal(
+    (
+      await local(`/api/subusers/${second.user.id}`, {
+        ...json("PATCH", { permissions: [] }),
+        headers: { "X-Server-Id": secondId },
+      })
+    ).status,
+    200,
+  );
+  assert.equal(
+    (await second.asUser("/api/server/settings", scoped({ name: "Revoked" })))
+      .status,
+    403,
+  );
+});
+
+test("remote copy checks proven source read access and destination create access independently", async (t) => {
+  const { local, invite, id, fleet } = await fixture(t);
+  const created = await local(
+    "/api/servers",
+    json("POST", { name: "Copy destination", port: 25566 }),
+  );
+  const targetId = created.body.server.id;
+  const sourceDir = fleet.runtimes.get(id).serverDir;
+  const targetDir = fleet.runtimes.get(targetId).serverDir;
+  await fs.writeFile(
+    path.join(sourceDir, "source.txt"),
+    "Only proven readers can copy this.",
+  );
+  const source = await invite(["file.read-content"]);
+  const unprovenTarget = await invite(
+    ["file.create"],
+    "sister@example.test",
+    targetId,
+    "Destination-test-password!",
+  );
+  const request = (paths = ["source.txt"]) => ({
+    ...json("POST", {
+      sourceServerId: id,
+      paths,
+      destinationPath: "",
+      requestId: "cccccccc-cccc-cccc-cccc-cccccccccccc",
+    }),
+    headers: {
+      "X-Server-Id": targetId,
+      "X-Copy-Source-Server-Id": id,
+      "X-Copy-Source-User-Id": source.user.id,
+    },
+  });
+  assert.equal(
+    (await unprovenTarget.asUser("/api/files/copy", request())).status,
+    403,
+  );
+  // Accept a new invitation with the proven source cookie to join both scopes.
+  const invitation = await local(
+    `/api/subusers/${unprovenTarget.user.id}/invite`,
+    { method: "POST", headers: { "X-Server-Id": targetId } },
+  );
+  const token = new URL(invitation.body.invitationUrl).hash.slice(
+    "#invite=".length,
+  );
+  const accepted = await source.asUser(
+    "/api/access/accept",
+    json("POST", { token, password: "Destination-test-password!" }),
+  );
+  assert.equal(accepted.status, 200);
+  const cookie = accepted.cookie.split(";")[0];
+  const asBoth = (route, options = {}) =>
+    source.asUser(route, {
+      ...options,
+      headers: { ...options.headers, Cookie: cookie },
+    });
+  const copied = await asBoth("/api/files/copy", request());
+  assert.equal(copied.status, 201, JSON.stringify(copied.body));
+  assert.equal(copied.body.copiedFiles, 1);
+  assert.equal(
+    await fs.readFile(path.join(targetDir, "source.txt"), "utf8"),
+    await fs.readFile(path.join(sourceDir, "source.txt"), "utf8"),
+  );
+  const progress = await asBoth("/api/files/copy-operation", {
+    headers: { "X-Server-Id": targetId },
+  });
+  assert.equal(progress.status, 200);
+  assert.equal(progress.body.operation.status, "completed");
+  assert.equal(
+    (
+      await asBoth("/api/files/copy-operation", {
+        headers: { "X-Server-Id": id },
+      })
+    ).status,
+    403,
+  );
+  assert.equal(
+    (
+      await asBoth("/api/files/copy", {
+        ...request(),
+        headers: { "X-Server-Id": id },
+      })
+    ).status,
+    403,
+  );
+  assert.equal(
+    (
+      await local(
+        `/api/subusers/${source.user.id}`,
+        json("PATCH", { permissions: [] }),
+      )
+    ).status,
+    200,
+  );
+  assert.equal(
+    (await asBoth("/api/files/copy", request())).status,
+    403,
+    "Completed requests cannot be replayed after source permission is revoked.",
+  );
+  await local(`/api/subusers/${unprovenTarget.user.id}`, {
+    ...json("PATCH", { permissions: ["file.read"] }),
+    headers: { "X-Server-Id": targetId },
+  });
+  assert.equal(
+    (
+      await asBoth("/api/files/copy-operation", {
+        headers: { "X-Server-Id": targetId },
+      })
+    ).status,
+    403,
+  );
+});
+
+test("remote settings recheck a grant after entering the fleet update operation", async (t) => {
+  const { local, invite, fleet } = await fixture(t);
+  const { asUser, user } = await invite(["server.update"]);
+  const authenticate = fleet.access.authenticate;
+  let calls = 0;
+  let reached;
+  let release;
+  const entered = new Promise((resolve) => {
+    reached = resolve;
+  });
+  const held = new Promise((resolve) => {
+    release = resolve;
+  });
+  t.mock.method(fleet.access, "authenticate", async (req) => {
+    if (req.path === "/api/server/settings" && ++calls === 2) {
+      reached();
+      await held;
+    }
+    return authenticate(req);
+  });
+  const saving = asUser(
+    "/api/server/settings",
+    json("PATCH", { name: "Must not be saved" }),
+  );
+  try {
+    await entered;
+    assert.equal(
+      (
+        await local(
+          `/api/subusers/${user.id}`,
+          json("PATCH", { permissions: [] }),
+        )
+      ).status,
+      200,
+    );
+  } finally {
+    release();
+  }
+  const result = await saving;
+  assert.equal(result.status, 403, JSON.stringify(result.body));
+  assert.notEqual(
+    (await local("/api/servers")).body.servers[0].name,
+    "Must not be saved",
+  );
+});
+
+for (const resetScope of ["source", "target"]) {
+  test(`a running remote copy stops when the ${resetScope} invitation is reset`, async (t) => {
+    const { local, invite, id, fleet } = await fixture(t);
+    const created = await local(
+      "/api/servers",
+      json("POST", { name: "Reset destination", port: 25566 }),
+    );
+    const targetId = created.body.server.id;
+    const sourceFile = path.join(
+      fleet.runtimes.get(id).serverDir,
+      "large-copy.bin",
+    );
+    const targetFile = path.join(
+      fleet.runtimes.get(targetId).serverDir,
+      "large-copy.bin",
+    );
+    const originalBytes = Buffer.alloc(2 * 1024 * 1024, 91);
+    await fs.writeFile(sourceFile, originalBytes);
+    const source = await invite(["file.read-content"]);
+    const target = await invite(
+      ["file.create"],
+      "sister@example.test",
+      targetId,
+      "Reset-test-password!",
+      source.cookie,
+    );
+    let entered;
+    let release;
+    const reading = new Promise((resolve) => {
+      entered = resolve;
+    });
+    const held = new Promise((resolve) => {
+      release = resolve;
+    });
+    const open = fs.open;
+    let blocked = false;
+    t.mock.method(fs, "open", async (...args) => {
+      const handle = await open(...args);
+      if (args[0] === sourceFile && args[1] === "r" && !blocked) {
+        const read = handle.read.bind(handle);
+        t.mock.method(handle, "read", async (...readArgs) => {
+          const result = await read(...readArgs);
+          if (!blocked) {
+            blocked = true;
+            entered();
+            await held;
+          }
+          return result;
+        });
+      }
+      return handle;
+    });
+    const copying = target.asUser("/api/files/copy", {
+      ...json("POST", {
+        sourceServerId: id,
+        paths: ["large-copy.bin"],
+        destinationPath: "",
+      }),
+      headers: { "X-Server-Id": targetId },
+    });
+    try {
+      await Promise.race([
+        reading,
+        copying.then((response) => {
+          throw new Error(
+            `Copy finished before the held read: ${JSON.stringify(response)}`,
+          );
+        }),
+      ]);
+      const membership = resetScope === "source" ? source : target;
+      const reset = await local(`/api/subusers/${membership.user.id}/invite`, {
+        method: "POST",
+        headers: { "X-Server-Id": resetScope === "source" ? id : targetId },
+      });
+      assert.equal(reset.status, 200, JSON.stringify(reset.body));
+    } finally {
+      release();
+    }
+    const result = await copying;
+    assert.equal(result.status, 403, JSON.stringify(result.body));
+    assert.equal(result.body.copiedFiles, 0);
+    await assert.rejects(fs.stat(targetFile), { code: "ENOENT" });
+    assert.deepEqual(await fs.readFile(sourceFile), originalBytes);
+  });
+}
+
 test("invited phone sessions are server-scoped, honor changed permissions, and revoke immediately", async (t) => {
   const { local, guest, invite, id } = await fixture(t);
   const { user, asUser, token } = await invite([
@@ -442,6 +816,12 @@ test("remote route permissions fail closed for unassigned routes and distinguish
   const routes = [
     ["GET", "/api/files/recycle-operation", ["file.read"]],
     ["HEAD", "/api/files/recycle-operation", ["file.read"]],
+    ["GET", "/api/server/settings", ["server.update"]],
+    ["HEAD", "/api/server/settings", ["server.update"]],
+    ["PATCH", "/api/server/settings", ["server.update"]],
+    ["POST", "/api/files/copy", ["file.create"]],
+    ["GET", "/api/files/copy-operation", ["file.create"]],
+    ["HEAD", "/api/files/copy-operation", ["file.create"]],
     ["GET", "/api/files/download", ["file.read-content"]],
     ["POST", "/api/files/upload", ["file.create"]],
     ["PUT", "/api/backups/schedule", ["backup.update"]],

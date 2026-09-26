@@ -17,6 +17,7 @@ import {
 } from "./connection.mjs";
 import { decodeIcon, readServerIcon, writeServerIcon } from "./server-icon.mjs";
 import { createRecycleBin } from "./recycle-bin.mjs";
+import { copyServerFiles, uploadServerFiles } from "./file-transfer.mjs";
 import { createBackupArchive } from "./backup-archive.mjs";
 import { restoreBackupArchive } from "./backup-restore.mjs";
 import { createMinecraft } from "./minecraft.mjs";
@@ -82,7 +83,11 @@ const userWithPermissions = (user) => ({
   ).filter((id) => id === "server.create"),
   permissions: (
     user.permissions ??
-    permissionsCatalog.roleDefaults[user.role] ??
+    // Existing role-only records retain their old grants. New permissions
+    // require an explicit owner action, including selecting a role preset.
+    permissionsCatalog.roleDefaults[user.role]?.filter(
+      (id) => id !== "server.update",
+    ) ??
     []
   ).filter((permission) => permissionIds.has(permission)),
 });
@@ -1393,6 +1398,22 @@ export async function createPanel(options = {}) {
   let activeMutations = 0;
   let recycleBusy = false;
   let minecraftBusy = false;
+  const withFileSource = (work) => {
+    if (closed) throw error(503, "The source server is shutting down.");
+    if (minecraftBusy || configBusy || backupBusy || activeMutations)
+      throw error(
+        409,
+        "Wait for the source server's current operation to finish.",
+      );
+    // A native copy reads another runtime. Reserve it synchronously, and keep
+    // both its mutation guard and shutdown tracking until those reads finish.
+    recycleBusy = true;
+    activeMutations++;
+    return trackTask(work).finally(() => {
+      recycleBusy = false;
+      activeMutations--;
+    });
+  };
   function withMinecraftMutation(work, { requireStopped = true } = {}) {
     if (closed) throw error(503, "The panel is shutting down.");
     if (minecraftBusy || configBusy || backupBusy || activeMutations)
@@ -1872,6 +1893,8 @@ export async function createPanel(options = {}) {
           ),
         );
       const recycling =
+        (req.method === "POST" &&
+          ["/api/files/copy", "/api/files/upload"].includes(req.path)) ||
         (req.method === "DELETE" && req.path === "/api/files") ||
         (req.method === "DELETE" && /^\/api\/backups\/[^/]+$/.test(req.path)) ||
         (req.method === "DELETE" &&
@@ -1989,6 +2012,69 @@ export async function createPanel(options = {}) {
       playersAvailable: true,
     });
   });
+  const safeServerSettings = (req) => {
+    const current = descriptor();
+    const fields = [
+      "id",
+      "name",
+      "status",
+      "mode",
+      "address",
+      "connectionHost",
+      "port",
+      "memoryLimitMB",
+      "motd",
+      "launchType",
+      "software",
+      "version",
+      "minecraftVersion",
+      "iconVersion",
+      "serverIconVersion",
+      "iconPreference",
+    ];
+    const user =
+      req[remotePrincipal] &&
+      state.users.find(
+        (item) =>
+          item.id === req[remotePrincipal].userId &&
+          item.email === req[remotePrincipal].email,
+      );
+    return {
+      ...Object.fromEntries(fields.map((key) => [key, current[key]])),
+      ...(user
+        ? { accessPermissions: userWithPermissions(user).permissions }
+        : {}),
+    };
+  };
+  app.get("/api/server/settings", (req, res) =>
+    res.json({ server: safeServerSettings(req) }),
+  );
+  app.patch(
+    "/api/server/settings",
+    trackOperation(async (req, res) => {
+      const allowed = new Set([
+        "name",
+        "connectionHost",
+        "port",
+        "memoryLimitMB",
+        "motd",
+      ]);
+      if (
+        !req.body ||
+        typeof req.body !== "object" ||
+        Array.isArray(req.body) ||
+        Object.keys(req.body).some((key) => !allowed.has(key))
+      )
+        throw error(
+          400,
+          "Only the server name, connection address, port, memory, and server list message can be changed here.",
+        );
+      if (!options.updateServerSettings)
+        throw error(503, "Server settings are unavailable in this panel.");
+      await options.updateServerSettings(req.body, req);
+      res.json({ server: safeServerSettings(req) });
+    }),
+  );
   app.get("/api/server/icon", async (_req, res) => {
     await refreshIcon(true);
     const icon = cachedIcon;
@@ -2525,7 +2611,12 @@ export async function createPanel(options = {}) {
   });
   const upload = multer({
     dest: uploadDir,
-    limits: { fileSize: 256 * 1024 * 1024, files: 20, fields: 5 },
+    limits: {
+      fileSize: 256 * 1024 * 1024,
+      files: 20,
+      fields: 5,
+      fieldSize: 128 * 1024,
+    },
   });
   const fileKind = async (relative, type = "file") => {
     let world = "world";
@@ -2563,44 +2654,229 @@ export async function createPanel(options = {}) {
     upload.array("files", 20),
     trackOperation(async (req, res) => {
       const files = req.files ?? [];
+      const uploadedPaths = [],
+        createdDirectories = [];
+      let result, uploadFailure;
       try {
-        const directory = req.query.path ?? "";
-        const parent = await safePath(serverDir, directory);
-        if (!(await fs.stat(parent)).isDirectory())
-          throw error(400, "Choose a directory to upload into.");
-        if (!files.length) throw error(400, "Choose at least one file.");
-        const destinations = [];
-        for (const file of files) {
-          const name = validateName(file.originalname);
-          const target = await safePath(
-            serverDir,
-            [directory, name].filter(Boolean).join("/"),
-          );
-          if (destinations.includes(target) || (await exists(target)))
-            throw error(
-              409,
-              `A file named “${name}” already exists. Rename it before uploading.`,
-            );
-          destinations.push(target);
-        }
-        const uploadedPaths = [];
+        let auditStarted = false;
         try {
-          for (let i = 0; i < files.length; i++) {
-            await fs.copyFile(files[i].path, destinations[i], 1);
-            uploadedPaths.push(
-              [directory, files[i].originalname].filter(Boolean).join("/"),
-            );
-          }
+          result = await uploadServerFiles({
+            serverDir,
+            directory: req.query.path ?? "",
+            files,
+            fields: req.body,
+            safePath,
+            onUploaded: (relative) => uploadedPaths.push(relative),
+            onDirectory: (relative) => createdDirectories.push(relative),
+          });
+          auditStarted = true;
+          await auditUploads(uploadedPaths);
         } catch (cause) {
-          await auditUploads(uploadedPaths).catch(() => {});
-          diskCache.at = 0;
-          throw cause;
+          if (!auditStarted) await auditUploads(uploadedPaths).catch(() => {});
+          uploadFailure = {
+            status: cause.status ?? (cause.code === "EEXIST" ? 409 : 500),
+            error:
+              cause.status >= 400 && cause.status < 500
+                ? cause.message
+                : cause.code === "EEXIST"
+                  ? "A destination file appeared during the upload. Existing files were not overwritten."
+                  : cause.code === "ENOSPC"
+                    ? "The destination drive is full. Completed uploads have been retained."
+                    : "The upload could not finish. Completed uploads have been retained; check the destination before retrying.",
+          };
         }
-        await auditUploads(uploadedPaths);
         diskCache.at = 0;
-        res.status(201).json({ uploaded: files.length });
       } finally {
-        for (const file of files) await fs.rm(file.path, { force: true });
+        // Finish bounded temp cleanup before acknowledging a batch, allowing the
+        // next sequential batch to acquire the file lock immediately.
+        for (const file of files)
+          await fs.rm(file.path, { force: true }).catch(() => {});
+      }
+      if (uploadFailure)
+        res
+          .status(uploadFailure.status)
+          .json({
+            error: uploadFailure.error,
+            uploaded: uploadedPaths.length,
+            directories: createdDirectories.length,
+          });
+      else res.status(201).json(result);
+    }),
+  );
+  const copyOperations = new Map();
+  let latestCopyOperation = null;
+  app.get("/api/files/copy-operation", (req, res) => {
+    const requestId = recycleRequestId(req.query.requestId);
+    res.json({
+      operation: requestId
+        ? (copyOperations.get(requestId) ?? null)
+        : latestCopyOperation,
+    });
+  });
+  app.post(
+    "/api/files/copy",
+    trackOperation(async (req, res) => {
+      const {
+        paths,
+        destinationPath = "",
+        sourceServerId = options.id,
+      } = req.body ?? {};
+      const requestId = recycleRequestId(req.body?.requestId) ?? randomUUID();
+      if (
+        !Array.isArray(paths) ||
+        !paths.length ||
+        paths.length > 5000 ||
+        paths.some((item) => typeof item !== "string" || !item)
+      )
+        throw error(
+          400,
+          "Select between 1 and 5,000 files or folders to copy.",
+        );
+      if (
+        sourceServerId !== undefined &&
+        (typeof sourceServerId !== "string" ||
+          !sourceServerId ||
+          sourceServerId.length > 100)
+      )
+        throw error(400, "Choose a source server on this computer.");
+      const principal = req[remotePrincipal];
+      const self = { serverDir, withFileSource };
+      const getSource = async () => {
+        if (principal) {
+          const targetUser = state.users.find(
+            (user) =>
+              user.id === principal.userId && user.email === principal.email,
+          );
+          if (
+            !targetUser ||
+            !userWithPermissions(targetUser).permissions.includes("file.create")
+          )
+            throw error(
+              403,
+              "Your permission to create files on the destination server changed.",
+            );
+        }
+        if (options.getCopySource)
+          return options.getCopySource(sourceServerId, principal);
+        if (
+          principal ||
+          (sourceServerId !== undefined && sourceServerId !== options.id)
+        )
+          throw error(
+            403,
+            "You do not have permission to copy from this source server.",
+          );
+        return self;
+      };
+      const source = await getSource();
+      await safePath(serverDir, destinationPath);
+      for (const selected of paths) await safePath(source.serverDir, selected);
+      const normalizedPaths = paths.map((item) =>
+        item.split("/").filter(Boolean).join("/"),
+      );
+      const destination = destinationPath.split("/").filter(Boolean).join("/");
+      const previous = copyOperations.get(requestId);
+      if (previous) {
+        if (
+          previous.sourceServerId !== (sourceServerId ?? null) ||
+          previous.destinationPath !== destination ||
+          JSON.stringify(previous.paths) !== JSON.stringify(normalizedPaths)
+        )
+          throw error(409, "This request ID belongs to another file copy.");
+        if (previous.status === "completed")
+          return res.status(201).json(previous.result);
+        return res
+          .status(409)
+          .json({
+            error: previous.error ?? "This file copy is still in progress.",
+            ...previous.result,
+          });
+      }
+      const operation = {
+        id: requestId,
+        sourceServerId: sourceServerId ?? null,
+        destinationPath: destination,
+        paths: normalizedPaths,
+        status: "running",
+        phase: "scanning",
+        filesProcessed: 0,
+        totalFiles: null,
+        bytesProcessed: 0,
+        totalBytes: null,
+        startedAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+      };
+      latestCopyOperation = operation;
+      copyOperations.set(requestId, operation);
+      while (copyOperations.size > 64)
+        copyOperations.delete(copyOperations.keys().next().value);
+      try {
+        const work = () =>
+          copyServerFiles({
+            sourceDir: source.serverDir,
+            serverDir,
+            destinationPath: destination,
+            paths: normalizedPaths,
+            safePath,
+            assertAccess: async () => {
+              if ((await getSource()) !== source)
+                throw error(409, "The source server changed during the copy.");
+            },
+            onProgress: (update) =>
+              Object.assign(operation, update, {
+                updatedAt: new Date().toISOString(),
+              }),
+          });
+        const result =
+          source.serverDir === serverDir
+            ? await work()
+            : await source.withFileSource(work);
+        Object.assign(operation, {
+          status: "completed",
+          phase: "completed",
+          result,
+          updatedAt: new Date().toISOString(),
+        });
+        diskCache.at = 0;
+        void audit(
+          "file",
+          "Files copied",
+          `${result.copiedFiles} files and ${result.copiedDirectories} folders copied to ${destination || "the server root"}.`,
+        ).catch(() => {});
+        res.status(201).json(result);
+      } catch (cause) {
+        const message =
+          cause.status >= 400 && cause.status < 500
+            ? cause.message
+            : cause.code === "EEXIST"
+              ? "A destination item appeared during the copy. Existing items were not overwritten."
+              : cause.code === "ENOSPC"
+                ? "The destination drive is full. Completed copies have been retained."
+                : "The copy could not finish. Completed copies have been retained; source files were not removed.";
+        const result = cause.transferResult ?? {
+          copiedFiles: 0,
+          copiedDirectories: 0,
+          paths: [],
+        };
+        Object.assign(operation, {
+          status: "failed",
+          phase: "failed",
+          error: message,
+          result,
+          updatedAt: new Date().toISOString(),
+        });
+        diskCache.at = 0;
+        if (result.copiedFiles || result.copiedDirectories)
+          void audit(
+            "file",
+            "Files partially copied",
+            `${result.copiedFiles} files and ${result.copiedDirectories} folders copied before the operation stopped. ${message}`,
+          ).catch(() => {});
+        res
+          .status(
+            cause.status >= 400 && cause.status < 500 ? cause.status : 409,
+          )
+          .json({ error: message, ...result });
       }
     }),
   );
@@ -3185,6 +3461,7 @@ export async function createPanel(options = {}) {
       return pending;
     },
     refreshStartupMetadata,
+    withFileSource,
     assertRemovable: () => {
       if (closed) throw error(409, "This server is already shutting down.");
       if (status !== "offline" || processHandle || terminationPromise)
@@ -3345,6 +3622,7 @@ export async function createFleet(options = {}) {
   };
   const runtimes = new Map();
   let access;
+  let updateManagedServer;
   let registry;
   let changeChain = Promise.resolve();
   let fleetMutationsPending = 0;
@@ -3576,6 +3854,8 @@ export async function createFleet(options = {}) {
           created: entry.creatorUserId === userId,
         }),
       creationAllowed: (userId) => access.creationAllowed(entry.id, userId),
+      updateServerSettings: (input, req) =>
+        updateManagedServer(entry.id, input, req),
       existingServerDir:
         ["external", "custom"].includes(entry.storage) || preserveFiles,
       scheduler: options.scheduler,
@@ -3593,6 +3873,47 @@ export async function createFleet(options = {}) {
       extraProviders: options.extraProviders,
       panelAuditEntries: () =>
         panelAuditEntries.filter((event) => event.serverId === entry.id),
+      getCopySource: (id, principal) => {
+        const runtime = runtimes.get(id);
+        if (!runtime || runtime.unavailable)
+          throw error(409, "The source server is unavailable.");
+        if (principal) {
+          const user = runtime
+            .subusers()
+            .find(
+              (item) =>
+                item.id === principal.copySourceUserId &&
+                item.email === principal.email,
+            );
+          if (
+            principal.copySourceServerId !== id ||
+            !user?.permissions.includes("file.read-content") ||
+            !access.membershipAllowed(id, user.id, user.email) ||
+            !principal.copySourceAcceptedAt ||
+            access.invitationState(id, user.id)?.acceptedAt !==
+              principal.copySourceAcceptedAt
+          )
+            throw error(
+              403,
+              "Your permission to read files from the source server changed.",
+            );
+          if (
+            !principal.copyTargetAcceptedAt ||
+            access.invitationState(entry.id, principal.userId)?.acceptedAt !==
+              principal.copyTargetAcceptedAt ||
+            !access.membershipAllowed(
+              entry.id,
+              principal.userId,
+              principal.email,
+            )
+          )
+            throw error(
+              403,
+              "Your permission to create files on the destination server changed.",
+            );
+        }
+        return runtime;
+      },
       persistMinecraftConfiguration: (next) =>
         serialize(async () => {
           checkPort(next.port, entry.id);
@@ -4494,12 +4815,35 @@ export async function createFleet(options = {}) {
     });
     res.status(result.reused ? 200 : 201).json(result);
   });
-  app.patch("/api/servers/:id", async (req, res) => {
-    const server = await serialize(async () => {
-      const entry = registry.servers.find((item) => item.id === req.params.id);
+  updateManagedServer = (id, input, req) =>
+    serialize(async () => {
+      const entry = registry.servers.find((item) => item.id === id);
       if (!entry) throw error(404, "Server not found.");
+      const principal = req?.[remotePrincipal];
+      if (principal) {
+        const session = await access.authenticate(req);
+        const user = runtimes
+          .get(id)
+          ?.subusers?.()
+          .find(
+            (item) =>
+              item.id === principal.userId && item.email === principal.email,
+          );
+        if (
+          principal.serverId !== id ||
+          !session?.memberships.some(
+            (scope) =>
+              scope.serverId === id && scope.userId === principal.userId,
+          ) ||
+          !user?.permissions.includes("server.update")
+        )
+          throw error(
+            403,
+            "You no longer have permission to change this server's settings.",
+          );
+      }
       const config = validateServerConfiguration(
-        req.body,
+        input,
         onlyConfig(entry),
         entry.storage === "external",
       );
@@ -4563,6 +4907,8 @@ export async function createFleet(options = {}) {
         throw cause;
       }
     });
+  app.patch("/api/servers/:id", async (req, res) => {
+    const server = await updateManagedServer(req.params.id, req.body);
     res.json({ server });
   });
   app.delete("/api/servers/:id", async (req, res) => {

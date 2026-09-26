@@ -230,7 +230,7 @@ export default function ConnectPanel({
       </form>
       <p className="connect-panel-note">
         {inDesktop
-          ? "Switch between this computer and connected panels in the account menu."
+          ? "Use the server list to open servers on this computer or a connected panel."
           : "The panel opens in this tab."}{" "}
         Your local servers keep running.
       </p>

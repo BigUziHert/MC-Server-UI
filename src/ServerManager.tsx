@@ -9,7 +9,7 @@ import {
   Trash2,
   X,
 } from "lucide-react";
-import { api, ServerScope } from "./api";
+import { api, ServerScope, useServerApi } from "./api";
 import AddServer from "./AddServer";
 import { CachedServerIconImage, ServerIconImage } from "./ServerIcon";
 import { useDesktopConnections } from "./desktop-connections";
@@ -401,7 +401,13 @@ type ServerManagerProps = {
 
 export default function ServerManager(props: ServerManagerProps) {
   return props.editing ? (
-    <ServerSettings {...props} editing={props.editing} />
+    <ServerScope.Provider value={props.editing.id}>
+      {props.remoteHost ? (
+        <RemoteServerSettings {...props} editing={props.editing} />
+      ) : (
+        <ServerSettings {...props} editing={props.editing} />
+      )}
+    </ServerScope.Provider>
   ) : (
     <AddServer
       remoteHost={props.remoteHost}
@@ -413,14 +419,83 @@ export default function ServerManager(props: ServerManagerProps) {
   );
 }
 
+function RemoteServerSettings(
+  props: ServerManagerProps & { editing: ServerRecord },
+) {
+  const { api: scopedApi } = useServerApi();
+  const [settings, setSettings] = useState<ServerRecord | null>(null);
+  const [error, setError] = useState("");
+  const [attempt, setAttempt] = useState(0);
+  const dialog = useRef<HTMLDialogElement>(null);
+  useEffect(() => {
+    if (settings) return;
+    const element = dialog.current;
+    element?.showModal();
+    return () => element?.close();
+  }, [settings]);
+  useEffect(() => {
+    const controller = new AbortController();
+    setError("");
+    void scopedApi<{ server: ServerRecord }>("/server/settings", {
+      signal: controller.signal,
+    })
+      .then((result) => {
+        if (!controller.signal.aborted) setSettings(result.server);
+      })
+      .catch((cause: Error) => {
+        if (!controller.signal.aborted) setError(cause.message);
+      });
+    return () => controller.abort();
+  }, [scopedApi, attempt]);
+  if (settings) return <ServerSettings {...props} editing={settings} />;
+  return (
+    <dialog
+      ref={dialog}
+      className="server-dialog"
+      aria-labelledby="loading-settings-title"
+      onCancel={(event) => {
+        event.preventDefault();
+        props.onClose();
+      }}
+    >
+      <h2 id="loading-settings-title">Server settings</h2>
+      {error ? (
+        <p role="alert">{error}</p>
+      ) : (
+        <p role="status">Loading settings from {props.remoteHost}…</p>
+      )}
+      <div className="server-dialog-actions">
+        <button type="button" className="btn" onClick={props.onClose}>
+          Cancel
+        </button>
+        {error && (
+          <button
+            type="button"
+            className="btn primary"
+            onClick={() => setAttempt((value) => value + 1)}
+          >
+            Retry
+          </button>
+        )}
+      </div>
+    </dialog>
+  );
+}
+
 function ServerSettings({
   editing,
+  remoteHost,
   onClose,
   onSaved,
   onRemoved,
-}: Pick<ServerManagerProps, "onClose" | "onSaved" | "onRemoved"> & {
+}: Pick<
+  ServerManagerProps,
+  "onClose" | "onSaved" | "onRemoved" | "remoteHost"
+> & {
   editing: ServerRecord;
 }) {
+  const remote = Boolean(remoteHost);
+  const { api: scopedApi } = useServerApi();
   const [name, setName] = useState(editing.name);
   const [connectionHost, setConnectionHost] = useState(
     editing.connectionHost ?? "",
@@ -458,17 +533,19 @@ function ServerSettings({
     const settings = {
       name: name.trim(),
       connectionHost: connectionHost.trim(),
-      mode: "live",
+      ...(!remote ? { mode: "live" } : {}),
       port: Number(port),
       ...(startup.launchType === "jar"
         ? { memoryLimitMB: Number(memory) }
         : {}),
-      ...startupPayload(startup),
+      ...(!remote ? startupPayload(startup) : {}),
       motd,
     };
     try {
-      const result = await api<{ server: ServerRecord }>(
-        `/servers/${encodeURIComponent(editing.id)}`,
+      const result = await scopedApi<{ server: ServerRecord }>(
+        remote
+          ? "/server/settings"
+          : `/servers/${encodeURIComponent(editing.id)}`,
         {
           method: "PATCH",
           body: JSON.stringify(
@@ -566,7 +643,7 @@ function ServerSettings({
             set up port forwarding.
           </small>
         </div>
-        {editing.serverDir && (
+        {!remote && editing.serverDir && (
           <div className="form-field">
             <label htmlFor="saved-server-directory">Server folder</label>
             <input
@@ -581,7 +658,7 @@ function ServerSettings({
             </small>
           </div>
         )}
-        {editing.sourceError && (
+        {!remote && editing.sourceError && (
           <div className="server-form-error server-source-error" role="alert">
             <AlertCircle size={17} />
             <span>{editing.sourceError}</span>
@@ -623,11 +700,13 @@ function ServerSettings({
               Shown in Minecraft’s multiplayer server list after the next start.
             </small>
           </div>
-          <LaunchMethodFields
-            idPrefix="server"
-            value={startup}
-            onChange={setStartup}
-          />
+          {!remote && (
+            <LaunchMethodFields
+              idPrefix="server"
+              value={startup}
+              onChange={setStartup}
+            />
+          )}
           {startup.launchType === "jar" && (
             <div className="form-field">
               <label htmlFor="server-memory">Memory (MB)</label>
@@ -644,11 +723,13 @@ function ServerSettings({
             </div>
           )}
           <LaunchMemoryNote type={startup.launchType} />
-          <LaunchAdvancedFields
-            idPrefix="server"
-            value={startup}
-            onChange={setStartup}
-          />
+          {!remote && (
+            <LaunchAdvancedFields
+              idPrefix="server"
+              value={startup}
+              onChange={setStartup}
+            />
+          )}
         </fieldset>
         <div className="server-setup-note">
           <Box size={17} />
@@ -680,64 +761,66 @@ function ServerSettings({
             <Save size={15} /> {busy ? "Saving…" : "Save changes"}
           </button>
         </div>
-        <div className="server-remove">
-          {confirmingRemoval ? (
-            <div role="group" aria-labelledby="remove-server-title">
-              <h3 id="remove-server-title">
-                Remove this server from the panel?
-              </h3>
-              <p>
-                <strong>{editing.name}</strong> will disappear from your server
-                list, and its scheduled backups will stop. Its Minecraft server
-                files, worlds, backups, and Recycle Bin data will stay on your
-                computer.{" "}
-                {editing.source === "imported"
-                  ? "You can import the server folder again later."
-                  : "Keep the saved files if you want to use this world again."}
-              </p>
-              <div className="server-remove-actions">
+        {!remote && (
+          <div className="server-remove">
+            {confirmingRemoval ? (
+              <div role="group" aria-labelledby="remove-server-title">
+                <h3 id="remove-server-title">
+                  Remove this server from the panel?
+                </h3>
+                <p>
+                  <strong>{editing.name}</strong> will disappear from your
+                  server list, and its scheduled backups will stop. Its
+                  Minecraft server files, worlds, backups, and Recycle Bin data
+                  will stay on your computer.{" "}
+                  {editing.source === "imported"
+                    ? "You can import the server folder again later."
+                    : "Keep the saved files if you want to use this world again."}
+                </p>
+                <div className="server-remove-actions">
+                  <button
+                    ref={removalCancel}
+                    className="btn"
+                    type="button"
+                    disabled={busy}
+                    onClick={() => {
+                      setConfirmingRemoval(false);
+                      setError("");
+                    }}
+                  >
+                    Cancel removal
+                  </button>
+                  <button
+                    className="btn danger"
+                    type="button"
+                    disabled={busy || running}
+                    onClick={() => void removeServer()}
+                  >
+                    <Trash2 size={15} />
+                    {busy ? "Removing…" : "Remove server"}
+                  </button>
+                </div>
+              </div>
+            ) : (
+              <div>
                 <button
-                  ref={removalCancel}
-                  className="btn"
+                  className="server-remove-link"
                   type="button"
-                  disabled={busy}
+                  disabled={busy || running}
                   onClick={() => {
-                    setConfirmingRemoval(false);
+                    setConfirmingRemoval(true);
                     setError("");
                   }}
                 >
-                  Cancel removal
+                  <Trash2 size={14} /> Remove server
                 </button>
-                <button
-                  className="btn danger"
-                  type="button"
-                  disabled={busy || running}
-                  onClick={() => void removeServer()}
-                >
-                  <Trash2 size={15} />
-                  {busy ? "Removing…" : "Remove server"}
-                </button>
+                {running && (
+                  <p>Stop this server from Console before removing it.</p>
+                )}
               </div>
-            </div>
-          ) : (
-            <div>
-              <button
-                className="server-remove-link"
-                type="button"
-                disabled={busy || running}
-                onClick={() => {
-                  setConfirmingRemoval(true);
-                  setError("");
-                }}
-              >
-                <Trash2 size={14} /> Remove server
-              </button>
-              {running && (
-                <p>Stop this server from Console before removing it.</p>
-              )}
-            </div>
-          )}
-        </div>
+            )}
+          </div>
+        )}
       </form>
     </dialog>
   );

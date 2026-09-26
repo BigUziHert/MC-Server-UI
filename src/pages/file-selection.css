@@ -64,6 +64,52 @@
   display: flex;
   flex-shrink: 0;
   gap: 8px;
+  flex-wrap: wrap;
+}
+.file-manager-heading > div,
+.file-transfer-title,
+.file-clipboard-notice {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+.file-manager-heading > div {
+  flex-wrap: wrap;
+}
+.file-transfer-progress,
+.file-clipboard-notice {
+  margin-bottom: 18px;
+  padding: 16px 20px;
+  border: 1px solid var(--border, #373948);
+  border-radius: 10px;
+  background: var(--panel, #20212b);
+  overflow-wrap: anywhere;
+  font-size: 13px;
+}
+.file-transfer-title {
+  justify-content: space-between;
+}
+.file-transfer-progress p,
+.file-transfer-progress small {
+  color: var(--muted, #969bb3);
+  line-height: 1.6;
+}
+.file-transfer-progress p:last-child {
+  margin-bottom: 0;
+}
+.file-transfer-progress progress {
+  display: block;
+  width: 100%;
+  height: 8px;
+  margin: 14px 0 8px;
+  accent-color: var(--accent, #ffd000);
+}
+.file-clipboard-notice > svg {
+  flex-shrink: 0;
+  color: var(--accent, #ffd000);
+}
+.file-clipboard-notice > span {
+  flex: 1;
 }
 .file-selection-actions .btn.small {
   min-height: 32px;
@@ -132,6 +178,9 @@
   }
 }
 @media (max-width: 600px) {
+  .files-toolbar .storage-actions {
+    flex-wrap: wrap;
+  }
   .file-selection-summary {
     font-size: 11px;
     min-width: 0;
@@ -142,9 +191,11 @@
   .file-selection-bar {
     gap: 8px;
     min-height: 52px;
+    flex-wrap: wrap;
   }
   .file-selection-actions {
     gap: 6px;
+    max-width: 100%;
   }
   .file-selection-actions .btn.small {
     padding: 6px 8px;

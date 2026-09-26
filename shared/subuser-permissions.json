@@ -9,6 +9,18 @@
   ],
   "groups": [
     {
+      "id": "server",
+      "label": "Settings",
+      "description": "Configure this server's identity and resource settings.",
+      "permissions": [
+        {
+          "id": "server.update",
+          "label": "Edit server settings",
+          "description": "Change the server name, player address, port, memory, and server list message. Startup executables and server removal remain owner-only."
+        }
+      ]
+    },
+    {
       "id": "control",
       "label": "Control",
       "description": "Console access and server power controls.",
@@ -146,6 +158,7 @@
   ],
   "roleDefaults": {
     "admin": [
+      "server.update",
       "control.console",
       "control.start",
       "control.stop",

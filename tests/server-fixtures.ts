@@ -43,6 +43,7 @@ export function serverButton(page: Page, id: string) {
 }
 
 export async function selectServer(page: Page, id: string) {
+  const requestedHash = new URL(page.url()).hash;
   const open = page.getByRole("button", {
     name: "Open navigation",
     exact: true,
@@ -61,6 +62,15 @@ export async function selectServer(page: Page, id: string) {
     await servers.click();
   await serverButton(page, id).click();
   await expect(serverButton(page, id)).toHaveAttribute("aria-pressed", "true");
+  await expect(page).toHaveURL(/#console$/);
+  // Test setup selects a fixture for the requested page. User-facing server
+  // selection itself always opens Console; direct-click tests cover that.
+  if (requestedHash && requestedHash !== "#console") {
+    await page.evaluate((hash) => {
+      window.location.hash = hash;
+    }, requestedHash);
+    await expect.poll(() => new URL(page.url()).hash).toBe(requestedHash);
+  }
 }
 
 // Use only with server IDs created by fixtures in the isolated E2E runtime.

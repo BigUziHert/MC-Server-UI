@@ -1,5 +1,6 @@
 import {
   useCallback,
+  useContext,
   useEffect,
   useRef,
   useState,
@@ -8,6 +9,8 @@ import {
 } from "react";
 import {
   ChevronRight,
+  Copy,
+  ClipboardPaste,
   Download,
   File as FileIcon,
   FileArchive,
@@ -30,6 +33,7 @@ import {
   formatBytes,
   relativeTime,
   messageOf,
+  ServerScope,
   type PageProps,
 } from "../api";
 import "./storage.css";
@@ -40,6 +44,89 @@ import StatePanel from "../StatePanel";
 import Pagination from "../Pagination";
 import "./file-selection.css";
 import "./recycle-bin.css";
+import {
+  copyFiles,
+  clearFileClipboard,
+  useFileClipboard,
+} from "../file-clipboard";
+import {
+  collectDroppedUpload,
+  collectSelectedUpload,
+  uploadInBatches,
+  type UploadSource,
+} from "../file-uploads";
+import {
+  startFileTransfer,
+  useFileTransfer,
+  dismissFileTransfer,
+  pasteFiles,
+  UnconfirmedTransfer,
+  type Transfer,
+} from "../file-transfer-state";
+
+function TransferProgress({
+  transfer,
+  onDismiss,
+}: {
+  transfer: Transfer;
+  onDismiss: () => void;
+}) {
+  const running = transfer.status === "running";
+  return (
+    <section
+      className="file-transfer-progress"
+      role="status"
+      aria-label="File transfer progress"
+    >
+      <div className="file-transfer-title">
+        <strong>
+          {running
+            ? transfer.kind === "upload"
+              ? "Uploading files"
+              : "Copying files"
+            : transfer.status === "completed"
+              ? "Transfer complete"
+              : "Transfer needs attention"}
+        </strong>
+        {!running && (
+          <button
+            className="btn icon"
+            onClick={onDismiss}
+            aria-label="Dismiss transfer status"
+          >
+            <X size={16} />
+          </button>
+        )}
+      </div>
+      <p>{transfer.message}</p>
+      {running && (
+        <>
+          <p>
+            {transfer.serverName} · /{transfer.destination || "server"}
+          </p>
+          <progress
+            aria-label="File transfer progress"
+            max={transfer.totalBytes || undefined}
+            value={
+              transfer.totalBytes
+                ? Math.min(transfer.completedBytes, transfer.totalBytes)
+                : undefined
+            }
+          />
+          <small>
+            {transfer.totalFiles === null
+              ? `${transfer.completedFiles} files found`
+              : `${transfer.completedFiles} of ${transfer.totalFiles} files`}
+            {transfer.totalBytes
+              ? ` · ${formatBytes(transfer.completedBytes)} of ${formatBytes(transfer.totalBytes)}`
+              : ""}
+          </small>
+          <p>You can browse the panel while this finishes.</p>
+        </>
+      )}
+    </section>
+  );
+}
 
 type Entry = {
   name: string;
@@ -453,12 +540,14 @@ function EntryIcon({ entry }: { entry: Entry }) {
 
 export default function FileManager({
   notify,
+  serverName = "This server",
   permissions,
   path,
   onPathChange: setPath,
   showingBin,
   onBinChange: setShowingBin,
 }: PageProps & {
+  serverName?: string;
   permissions?: string[];
   path: string;
   onPathChange: (path: string) => void;
@@ -479,6 +568,12 @@ export default function FileManager({
     canRead &&
     (permissions === undefined || permissions.includes("backup.read"));
   const { api, post, downloadUrl } = useServerApi();
+  const serverId = useContext(ServerScope);
+  const transferKey = `${window.location.origin}:${serverId || "default"}`;
+  const transfer = useFileTransfer(transferKey);
+  const transferring = transfer?.status === "running";
+  const uploading = transferring && transfer.kind === "upload";
+  const clipboard = useFileClipboard();
   const [entries, setEntries] = useState<Entry[]>([]);
   const [query, setQuery] = useState("");
   const debouncedQuery = useDebouncedValue(query);
@@ -488,7 +583,6 @@ export default function FileManager({
   useEffect(() => setPage(1), [debouncedQuery, pageSize, path]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
-  const [uploading, setUploading] = useState(false);
   const [dragging, setDragging] = useState(false);
   const [dialog, setDialog] = useState<FileDialog | null>(null);
   const canSubmitDialog =
@@ -516,6 +610,7 @@ export default function FileManager({
   const [checkingMove, setCheckingMove] = useState(true);
   const [dialogMoveId, setDialogMoveId] = useState<string | null>(null);
   const uploadInput = useRef<HTMLInputElement>(null);
+  const folderInput = useRef<HTMLInputElement>(null);
   const searchInput = useRef<HTMLInputElement>(null);
   const requestId = useRef(0);
   const dialogRef = useRef<HTMLDialogElement>(null);
@@ -525,6 +620,7 @@ export default function FileManager({
   const savingRef = useRef(false);
   const pathRef = useRef(path);
   const handledMove = useRef<string | null>(null);
+  const handledTransfer = useRef<string | null>(null);
   savingRef.current = saving;
   pathRef.current = path;
 
@@ -558,6 +654,17 @@ export default function FileManager({
       if (id === requestId.current) setLoading(false);
     }
   }, [path, api, canRead]);
+
+  useEffect(() => {
+    if (
+      !transfer ||
+      transfer.status === "running" ||
+      handledTransfer.current === `${transfer.id}:${transfer.status}`
+    )
+      return;
+    handledTransfer.current = `${transfer.id}:${transfer.status}`;
+    void load();
+  }, [transfer, load]);
 
   useEffect(() => {
     let active = true;
@@ -778,29 +885,115 @@ export default function FileManager({
     }
   }
 
-  async function uploadFiles(files: FileList | File[]) {
-    if (!canCreate || !files.length || uploading) return;
+  function uploadFiles(source: () => UploadSource | Promise<UploadSource>) {
+    if (!canCreate || transferring || movePending) return;
     const uploadPath = path;
-    setUploading(true);
-    const form = new FormData();
-    Array.from(files).forEach((file) => form.append("files", file));
-    try {
-      await api(`/files/upload?path=${encodeURIComponent(path)}`, {
-        method: "POST",
-        body: form,
-      });
-      notify(
-        `${files.length} ${files.length === 1 ? "file uploaded" : "files uploaded"}.`,
-      );
-      if (pathRef.current === uploadPath) await load();
-    } catch (failure) {
-      notify(messageOf(failure), true);
-      if (pathRef.current === uploadPath) await load();
-    } finally {
-      setUploading(false);
-      if (uploadInput.current) uploadInput.current.value = "";
-    }
+    startFileTransfer(
+      transferKey,
+      { kind: "upload", destination: uploadPath, serverName },
+      async (report) => {
+        report({ message: "Reading files and folders…" });
+        const files = await source();
+        const result = await uploadInBatches({
+          source: files,
+          destination: uploadPath,
+          request: api,
+          onProgress: (progress) =>
+            report({
+              message: "Uploading files…",
+              completedFiles: progress.uploadedFiles,
+              totalFiles: progress.totalFiles,
+              completedBytes: progress.uploadedBytes,
+              totalBytes: progress.totalBytes,
+            }),
+        });
+        if (result.phase !== "completed")
+          throw new (
+            result.phase === "uncertain" ? UnconfirmedTransfer : Error
+          )(
+            result.message ||
+              `Upload stopped after ${result.uploadedFiles} files. Check the destination before retrying.`,
+          );
+        return `${result.uploadedFiles} ${result.uploadedFiles === 1 ? "file uploaded" : "files uploaded"}${result.totalDirectories ? ` with ${result.totalDirectories} folders` : ""} to /${uploadPath || "server"}.`;
+      },
+      notify,
+    );
+    if (uploadInput.current) uploadInput.current.value = "";
+    if (folderInput.current) folderInput.current.value = "";
   }
+
+  function copySelection() {
+    if (!canContent || !serverId || loading) return;
+    const targets = entries.filter((entry) => selected.has(entry.path));
+    if (!targets.length) return;
+    copyFiles({
+      origin: window.location.origin,
+      sourceServerId: serverId,
+      sourceName: serverName,
+      paths: targets.map((entry) => entry.path),
+    });
+    notify(
+      `${targets.length} ${targets.length === 1 ? "item" : "items"} ready to paste.`,
+    );
+  }
+  function pasteSelection() {
+    if (
+      !canCreate ||
+      !clipboard ||
+      clipboard.origin !== window.location.origin ||
+      transferring ||
+      movePending ||
+      loading
+    )
+      return;
+    const destination = path;
+    startFileTransfer(
+      transferKey,
+      { kind: "copy", destination, serverName },
+      (report, requestId) =>
+        pasteFiles(
+          api,
+          {
+            sourceServerId: clipboard.sourceServerId,
+            paths: [...clipboard.paths],
+            destinationPath: destination,
+          },
+          report,
+          requestId,
+        ),
+      notify,
+    );
+  }
+
+  useEffect(() => {
+    const shortcut = (event: KeyboardEvent) => {
+      if (
+        !(event.ctrlKey || event.metaKey) ||
+        event.altKey ||
+        dialog ||
+        showingBin
+      )
+        return;
+      if (
+        event.target instanceof Element &&
+        event.target.closest(
+          "input:not([type=checkbox]):not([type=radio]):not([type=button]),textarea,[contenteditable=true],[role=textbox]",
+        )
+      )
+        return;
+      if (window.getSelection()?.toString()) return;
+      if (event.key.toLowerCase() === "c" && selected.size && canContent) {
+        event.preventDefault();
+        copySelection();
+      }
+      if (event.key.toLowerCase() === "v" && clipboard && canCreate) {
+        event.preventDefault();
+        pasteSelection();
+      }
+    };
+    window.addEventListener("keydown", shortcut);
+    return () => window.removeEventListener("keydown", shortcut);
+  });
 
   async function submitDialog(event: FormEvent) {
     event.preventDefault();
@@ -903,6 +1096,12 @@ export default function FileManager({
   if (showingBin && canBin)
     return (
       <>
+        {transfer && (
+          <TransferProgress
+            transfer={transfer}
+            onDismiss={() => dismissFileTransfer(transferKey)}
+          />
+        )}
         {movePending && moveBatch && (
           <MoveProgress
             batch={moveBatch}
@@ -922,34 +1121,92 @@ export default function FileManager({
     );
   return (
     <div className="storage-page">
-      <div className="page-heading">
+      <div className="page-heading file-manager-heading">
         <div>
           <h1>File Manager</h1>
         </div>
-        <button
-          className="btn primary"
-          onClick={() => uploadInput.current?.click()}
-          disabled={!canCreate || uploading || loading}
-        >
-          {uploading ? (
-            <LoaderCircle size={16} className="spin" />
-          ) : (
-            <Upload size={16} />
-          )}
-          {uploading ? "Uploading…" : "Upload files"}
-        </button>
+        <div className="storage-actions">
+          <button
+            className="btn"
+            disabled={!canCreate || transferring || movePending || loading}
+            onClick={() => folderInput.current?.click()}
+          >
+            <FolderPlus size={16} /> Upload folder
+          </button>
+          <button
+            className="btn primary"
+            onClick={() => uploadInput.current?.click()}
+            disabled={!canCreate || transferring || movePending || loading}
+          >
+            {uploading ? (
+              <LoaderCircle size={16} className="spin" />
+            ) : (
+              <Upload size={16} />
+            )}
+            {uploading ? "Uploading…" : "Upload files"}
+          </button>
+        </div>
         <input
           ref={uploadInput}
           type="file"
           multiple
           hidden
           onChange={(event) => {
-            if (event.target.files) void uploadFiles(event.target.files);
+            if (event.target.files) {
+              const files = Array.from(event.target.files);
+              uploadFiles(() => collectSelectedUpload(files));
+            }
           }}
           disabled={!canCreate}
           aria-label="Upload server files"
         />
+        <input
+          ref={(element) => {
+            folderInput.current = element;
+            element?.setAttribute("webkitdirectory", "");
+          }}
+          type="file"
+          multiple
+          hidden
+          disabled={!canCreate}
+          aria-label="Upload server folder"
+          onChange={(event) => {
+            if (event.target.files) {
+              const files = Array.from(event.target.files);
+              uploadFiles(() => collectSelectedUpload(files));
+            }
+          }}
+        />
       </div>
+
+      {clipboard && clipboard.origin === window.location.origin && (
+        <div
+          className="file-clipboard-notice"
+          role="status"
+          aria-label="Copied files"
+        >
+          <Copy size={16} />
+          <span>
+            {clipboard.paths.length}{" "}
+            {clipboard.paths.length === 1 ? "item" : "items"} copied from{" "}
+            <strong>{clipboard.sourceName}</strong>. Open a folder or another
+            server on this PC, then Paste.
+          </span>
+          <button
+            className="btn icon"
+            onClick={clearFileClipboard}
+            aria-label="Clear copied files"
+          >
+            <X size={16} />
+          </button>
+        </div>
+      )}
+      {transfer && (
+        <TransferProgress
+          transfer={transfer}
+          onDismiss={() => dismissFileTransfer(transferKey)}
+        />
+      )}
 
       {movePending && moveBatch && (
         <MoveProgress
@@ -963,7 +1220,12 @@ export default function FileManager({
         className={`panel files-panel ${dragging ? "files-dragging" : ""}`}
         aria-label="Server files"
         onDragEnter={(event) => {
-          if (canCreate && event.dataTransfer.types.includes("Files")) {
+          if (
+            canCreate &&
+            !transferring &&
+            !movePending &&
+            event.dataTransfer.types.includes("Files")
+          ) {
             event.preventDefault();
             dragDepth.current++;
             setDragging(true);
@@ -985,13 +1247,14 @@ export default function FileManager({
           event.preventDefault();
           dragDepth.current = 0;
           setDragging(false);
-          void uploadFiles(event.dataTransfer.files);
+          const transfer = event.dataTransfer;
+          uploadFiles(() => collectDroppedUpload(transfer));
         }}
       >
         {dragging && (
           <div className="files-drop-overlay">
             <Upload size={34} />
-            <strong>Drop files to upload</strong>
+            <strong>Drop files or folders to upload</strong>
             <span>Upload to /{path || "server"}</span>
           </div>
         )}
@@ -1018,6 +1281,21 @@ export default function FileManager({
             ))}
           </nav>
           <div className="storage-actions">
+            <button
+              className="btn small"
+              onClick={pasteSelection}
+              disabled={
+                !canCreate ||
+                !clipboard ||
+                clipboard.origin !== window.location.origin ||
+                transferring ||
+                movePending ||
+                loading
+              }
+              title="Paste copied files into this folder (Ctrl+V)"
+            >
+              <ClipboardPaste size={15} /> Paste
+            </button>
             <button
               className="btn small"
               onClick={() => openCreate("directory")}
@@ -1073,6 +1351,14 @@ export default function FileManager({
                 </span>
               </div>
               <div className="file-selection-actions">
+                <button
+                  className="btn small"
+                  onClick={copySelection}
+                  disabled={!canContent || loading || saving}
+                  title="Copy selected files and folders (Ctrl+C)"
+                >
+                  <Copy size={15} /> Copy
+                </button>
                 <button
                   className="btn small"
                   onClick={() => setSelected(new Set())}
@@ -1131,7 +1417,11 @@ export default function FileManager({
                               input.indeterminate =
                                 visibleSelectedCount > 0 && !allVisibleSelected;
                           }}
-                          disabled={!canDelete || !visible.length || saving}
+                          disabled={
+                            (!canDelete && !canContent) ||
+                            !visible.length ||
+                            saving
+                          }
                           onChange={toggleVisibleSelection}
                         />
                         <span>Name</span>
@@ -1203,7 +1493,7 @@ export default function FileManager({
                           type="checkbox"
                           aria-label={`Select ${entry.name}`}
                           checked={selected.has(entry.path)}
-                          disabled={!canDelete || saving}
+                          disabled={(!canDelete && !canContent) || saving}
                           onChange={() => toggleSelection(entry.path)}
                         />
                         <button

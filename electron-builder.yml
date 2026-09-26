@@ -26,6 +26,7 @@ files:
   - server/server-icon.mjs
   - server/telemetry.mjs
   - server/recycle-bin.mjs
+  - server/file-transfer.mjs
   - server/backup-archive.mjs
   - server/backup-restore.mjs
   - server/player-history.mjs

@@ -58,6 +58,8 @@ export function requiredPermissions(req) {
     "control.stop",
   ];
   if (read(req)) {
+    if (route === "/api/server/settings") return ["server.update"];
+    if (route === "/api/files/copy-operation") return ["file.create"];
     if (["/api/server", "/api/server/icon"].includes(route)) return [];
     if (route === "/api/console") return ["control.console"];
     if (route === "/api/players") return [];
@@ -98,6 +100,7 @@ export function requiredPermissions(req) {
       return ["audit.read"];
   }
   if (req.method === "POST") {
+    if (route === "/api/files/copy") return ["file.create"];
     if (
       /^\/api\/players\/(?:op|deop|kick|ban|unban)$/.test(route) ||
       /^\/api\/players\/whitelist\/(?:add|remove|state)$/.test(route)
@@ -157,8 +160,10 @@ export function requiredPermissions(req) {
     if (route === "/api/files/content") return ["file.update"];
     if (route === "/api/backups/schedule") return ["backup.update"];
   }
-  if (req.method === "PATCH" && /^\/api\/subusers\/[^/]+$/.test(route))
-    return ["user.update"];
+  if (req.method === "PATCH") {
+    if (route === "/api/server/settings") return ["server.update"];
+    if (/^\/api\/subusers\/[^/]+$/.test(route)) return ["user.update"];
+  }
   if (req.method === "DELETE") {
     if (route === "/api/files") return ["file.delete"];
     if (/^\/api\/files\/recycle-bin\/[^/]+$/.test(route))
@@ -403,10 +408,32 @@ export function createRemoteGateway({
       membership.user.permissions,
       session.email,
     );
+    let copySource;
+    if (req.method === "POST" && req.path === "/api/files/copy") {
+      const sourceId = req.body?.sourceServerId ?? id;
+      const source = memberships.find((item) => item.serverId === sourceId);
+      if (!source?.user.permissions.includes("file.read-content"))
+        throw failure(
+          403,
+          "You need permission to read files on the source server before copying them.",
+        );
+      copySource = {
+        copySourceServerId: source.serverId,
+        copySourceUserId: source.user.id,
+        copySourceAcceptedAt: access.invitationState(
+          source.serverId,
+          source.user.id,
+        )?.acceptedAt,
+        copyTargetAcceptedAt: access.invitationState(id, membership.user.id)
+          ?.acceptedAt,
+      };
+    }
     req[remotePrincipal] = {
       ...session,
       serverId: id,
+      userId: membership.user.id,
       permissions: membership.user.permissions,
+      ...copySource,
     };
     requestActor.run(session.email, () =>
       membership.runtime.app(req, res, next),

@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { Globe2, KeyRound, LogIn, LogOut, Monitor, Unplug } from "lucide-react";
+import { Globe2, LogIn, LogOut, Monitor } from "lucide-react";
 import AccountMenu, { type AccountMenuAction } from "./AccountMenu";
 import { post } from "./api";
 import type { ConnectionMode } from "./ConnectPanel";
@@ -71,33 +71,22 @@ export default function PanelAccount({
     }
   }
   const actions: AccountMenuAction[] = (connections?.panels ?? [])
-    .filter((panel) => panel.id !== connections?.activeId)
+    .filter((panel) => !panel.local && panel.id !== connections?.activeId)
     .map((panel) => ({
       id: panel.id,
-      label: panel.local
-        ? "Switch to this computer"
-        : `Switch to ${panel.label}`,
-      icon: panel.local ? <Monitor size={16} /> : <Globe2 size={16} />,
+      label: `Switch to ${panel.label}`,
+      icon: <Globe2 size={16} />,
       disabled: busy,
       onSelect: () =>
         void perform(() => window.mcPanelConnections!.activate(panel.id)),
     }));
-  actions.push(
-    {
-      id: "signin",
-      label: "Sign in to another panel",
-      icon: <LogIn size={16} />,
-      disabled: busy,
-      onSelect: () => onConnect("signin"),
-    },
-    {
-      id: "invitation",
-      label: "Accept an invitation",
-      icon: <KeyRound size={16} />,
-      disabled: busy,
-      onSelect: () => onConnect("invitation"),
-    },
-  );
+  actions.push({
+    id: "signin",
+    label: "Sign in to another panel",
+    icon: <LogIn size={16} />,
+    disabled: busy,
+    onSelect: () => onConnect("signin"),
+  });
   if (session)
     actions.push({
       id: "signout",
@@ -114,20 +103,6 @@ export default function PanelAccount({
           if (mounted.current) onSignedOut?.();
         }),
     });
-  for (const panel of connections?.panels ?? []) {
-    if (panel.local) continue;
-    actions.push({
-      id: `disconnect:${panel.id}`,
-      label:
-        panel.id === connections?.activeId
-          ? "Disconnect from this panel"
-          : `Disconnect from ${panel.label}`,
-      icon: <Unplug size={16} />,
-      disabled: busy,
-      onSelect: () =>
-        void perform(() => window.mcPanelConnections!.disconnect(panel.id)),
-    });
-  }
   return (
     <>
       {error && (

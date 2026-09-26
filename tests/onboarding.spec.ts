@@ -249,6 +249,53 @@ async function openCreate(page: Page, screenshots?: TestInfo) {
   return dialog;
 }
 
+test("welcome choices are centered at desktop, tablet, and mobile widths", async ({
+  page,
+  setup,
+}, testInfo) => {
+  await page.goto("/");
+  await expect(
+    page.getByRole("heading", { name: "Welcome to MC Panel", exact: true }),
+  ).toBeVisible();
+  for (const viewport of [
+    { width: 1440, height: 900 },
+    { width: 800, height: 900 },
+    { width: 390, height: 844 },
+  ]) {
+    await page.setViewportSize(viewport);
+    const intro = page.getByRole("region", {
+      name: "Welcome to MC Panel",
+      exact: true,
+    });
+    const bounds = await intro.boundingBox();
+    expect(bounds).not.toBeNull();
+    expect(
+      Math.abs(bounds!.x + bounds!.width / 2 - viewport.width / 2),
+    ).toBeLessThanOrEqual(1);
+    expect(bounds!.width).toBeLessThanOrEqual(520);
+    await expect
+      .poll(() =>
+        page.evaluate(() => document.documentElement.scrollWidth <= innerWidth),
+      )
+      .toBe(true);
+    await expect(
+      page.getByRole("button", { name: "Create a new server", exact: true }),
+    ).toBeInViewport();
+    await expect(
+      page.getByRole("button", {
+        name: "Import an existing server",
+        exact: true,
+      }),
+    ).toBeInViewport();
+    if (viewport.width !== 800)
+      await page.screenshot({
+        path: testInfo.outputPath(`welcome-centered-${viewport.width}.png`),
+        fullPage: true,
+      });
+  }
+  expect(setup.creationRequests).toEqual([]);
+});
+
 async function choosePaper(page: Page) {
   const dialog = page.getByRole("dialog");
   await dialog

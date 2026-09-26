@@ -1,17 +1,17 @@
-.fleet-welcome-simple {
+.fleet-welcome-shell {
   display: grid;
   grid-template-rows: auto 1fr auto;
   min-height: 100dvh;
   background: #101016;
 }
 
-.fleet-welcome-simple .fleet-welcome-header {
+.fleet-welcome-shell .fleet-welcome-header {
   width: 100%;
   height: 88px;
   padding: 0 32px;
 }
 
-.fleet-welcome-simple .fleet-welcome-main {
+.fleet-welcome-shell .fleet-welcome-main {
   display: grid;
   place-items: center;
   width: 100%;
@@ -19,18 +19,18 @@
   padding: 48px 24px 72px;
 }
 
-.fleet-welcome-simple .fleet-welcome-intro {
+.fleet-welcome-shell .fleet-welcome-intro {
   display: block;
   width: min(100%, 520px);
   min-height: 0;
   padding: 0;
 }
 
-.fleet-welcome-simple .fleet-welcome-copy {
+.fleet-welcome-shell .fleet-welcome-copy {
   padding: 0;
 }
 
-.fleet-welcome-simple .fleet-welcome-copy h1 {
+.fleet-welcome-shell .fleet-welcome-copy h1 {
   margin: 0 0 14px;
   font-size: clamp(28px, 4vw, 36px);
   line-height: 1.2;
@@ -38,7 +38,7 @@
   text-align: center;
 }
 
-.fleet-welcome-simple .fleet-welcome-copy > p {
+.fleet-welcome-shell .fleet-welcome-copy > p {
   max-width: none;
   margin: 0 0 36px;
   font-size: 14px;
@@ -113,7 +113,7 @@
   color: #969bb3;
 }
 
-.fleet-welcome-simple .fleet-welcome-footer {
+.fleet-welcome-shell .fleet-welcome-footer {
   justify-content: center;
   border: 0;
   margin: 0;
@@ -121,16 +121,16 @@
 }
 
 @media (max-width: 600px) {
-  .fleet-welcome-simple .fleet-welcome-header {
+  .fleet-welcome-shell .fleet-welcome-header {
     height: 76px;
     padding: 0 20px;
   }
 
-  .fleet-welcome-simple .fleet-welcome-main {
+  .fleet-welcome-shell .fleet-welcome-main {
     padding: 32px 20px 48px;
   }
 
-  .fleet-welcome-simple .fleet-welcome-copy > p {
+  .fleet-welcome-shell .fleet-welcome-copy > p {
     margin-bottom: 28px;
     font-size: 13px;
   }

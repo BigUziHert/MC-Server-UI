@@ -24,6 +24,19 @@ export async function api<T = any>(
       new Error(body.error || `Request failed (${response.status})`),
       {
         status: response.status,
+        ...(Number.isSafeInteger(body.uploaded) && body.uploaded >= 0
+          ? { uploaded: body.uploaded }
+          : {}),
+        ...(Number.isSafeInteger(body.directories) && body.directories >= 0
+          ? { directories: body.directories }
+          : {}),
+        ...(Number.isSafeInteger(body.copiedFiles) && body.copiedFiles >= 0
+          ? { copiedFiles: body.copiedFiles }
+          : {}),
+        ...(Number.isSafeInteger(body.copiedDirectories) &&
+        body.copiedDirectories >= 0
+          ? { copiedDirectories: body.copiedDirectories }
+          : {}),
       },
     );
   }

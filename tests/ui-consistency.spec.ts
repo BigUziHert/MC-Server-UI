@@ -161,7 +161,7 @@ test("partially failed file uploads reload files that reached disk", async ({
   await expect(
     page.getByRole("heading", { name: "A fresh start", exact: true }),
   ).toBeVisible();
-  await page.locator('input[type="file"]').setInputFiles([
+  await page.getByLabel("Upload server files", { exact: true }).setInputFiles([
     {
       name: "landed.txt",
       mimeType: "text/plain",
@@ -174,8 +174,8 @@ test("partially failed file uploads reload files that reached disk", async ({
     },
   ]);
   await expect(
-    page.getByText("second.txt could not be uploaded", { exact: true }),
-  ).toBeVisible();
+    page.getByRole("status", { name: "File transfer progress" }),
+  ).toContainText("second.txt could not be uploaded");
   await expect(
     page.getByRole("checkbox", { name: "Select landed.txt", exact: true }),
   ).toBeVisible();

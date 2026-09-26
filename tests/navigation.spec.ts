@@ -34,6 +34,41 @@ test.beforeEach(async ({ page, serverId }) => {
   }, serverId);
 });
 
+test("clicking the current or another local server opens Console", async ({
+  page,
+  request,
+  serverId,
+}) => {
+  const fleet = await (await request.get("/api/servers")).json();
+  const other = fleet.servers.find(
+    (item: { id: string }) => item.id !== serverId,
+  );
+  await page.goto("/#properties");
+  await expect(
+    page.getByRole("heading", { name: "Properties", exact: true }),
+  ).toBeVisible();
+  await serverButton(page, serverId).click();
+  await expect(page).toHaveURL(/#console$/);
+  await expect(
+    page.getByRole("heading", { name: "Console", exact: true }),
+  ).toBeVisible();
+  await page.evaluate(() => {
+    window.location.hash = "players";
+  });
+  await expect(
+    page.getByRole("heading", { name: "Players", exact: true }),
+  ).toBeVisible();
+  await serverButton(page, other.id).click();
+  await expect(page).toHaveURL(/#console$/);
+  await expect(serverButton(page, other.id)).toHaveAttribute(
+    "aria-pressed",
+    "true",
+  );
+  await expect(
+    page.getByRole("heading", { name: "Console", exact: true }),
+  ).toBeVisible();
+});
+
 test("desktop selection is restored before scoped requests and persists subsequent changes", async ({
   page,
   request,

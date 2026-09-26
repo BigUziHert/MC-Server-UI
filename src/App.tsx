@@ -504,8 +504,21 @@ export default function App({
     };
   }, [loadServers]);
   useEffect(() => {
-    if (!canAddServer) setManager(null);
-  }, [canAddServer]);
+    setManager((current) => {
+      if (!current) return current;
+      if (!current.editing) return canAddServer ? current : null;
+      if (!remote) return current;
+      const currentServer = servers.find(
+        (item) => item.id === current.editing?.id,
+      );
+      const permissions =
+        currentServer?.accessPermissions ??
+        (currentServer?.id === session?.serverId
+          ? (session?.permissions ?? [])
+          : []);
+      return permissions.includes("server.update") ? current : null;
+    });
+  }, [canAddServer, remote, servers, session]);
   useEffect(() => {
     try {
       if (activeId) localStorage.setItem(selectionKey, activeId);
@@ -534,6 +547,12 @@ export default function App({
     return () => clearTimeout(timer);
   }, [notice]);
   const active = servers.find((server) => server.id === activeId);
+  const canEditActive =
+    !remote ||
+    (
+      active?.accessPermissions ??
+      (active?.id === session?.serverId ? (session?.permissions ?? []) : [])
+    ).includes("server.update");
   // Registration can finish before installation. Keep the first setup in its
   // welcome screen until the wizard hands the completed server back to us.
   const firstServerSetup = manager?.firstServer === true;
@@ -599,7 +618,7 @@ export default function App({
             selected={active}
             onSelect={(id) => {
               nativeSelection.current = null;
-              if (remote && id !== active.id) window.location.hash = "console";
+              window.location.hash = "console";
               setActiveId(id);
             }}
             onConnect={setConnection}
@@ -609,7 +628,7 @@ export default function App({
                 : undefined
             }
             onSettings={
-              remote
+              !canEditActive
                 ? undefined
                 : (status) =>
                     setManager({
@@ -675,7 +694,7 @@ export default function App({
           }}
         />
       )}
-      {manager && canAddServer && (!remote || !manager.editing) && (
+      {manager && (manager.editing ? canEditActive : canAddServer) && (
         <ServerManager
           editing={manager.editing}
           remoteHost={remote ? window.location.host : undefined}
@@ -1241,6 +1260,7 @@ function ServerWorkspace({
           )}
           {page === "files" && (
             <FileManager
+              serverName={selected?.name}
               notify={notify}
               path={filePath}
               onPathChange={setFilePath}

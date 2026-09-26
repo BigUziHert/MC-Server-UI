@@ -377,10 +377,14 @@ async function openConnection(page: Page, invitation = false) {
     .click();
   await page
     .getByRole("menuitem", {
-      name: invitation ? "Accept an invitation" : "Sign in to another panel",
+      name: "Sign in to another panel",
       exact: true,
     })
     .click();
+  if (invitation)
+    await page
+      .getByRole("button", { name: "Use invitation", exact: true })
+      .click();
   const dialog = page.getByRole("dialog", {
     name: invitation ? "Accept an invitation" : "Connect to a panel",
     exact: true,
@@ -427,7 +431,7 @@ test("the account menu and connection dialog support Escape and restore keyboard
   ).toBeVisible();
   await expect(
     page.getByRole("menuitem", { name: "Accept an invitation", exact: true }),
-  ).toBeVisible();
+  ).toHaveCount(0);
   await page.keyboard.press("Escape");
   await expect(page.getByRole("menuitem")).toHaveCount(0);
   await expect(account).toBeFocused();
@@ -608,7 +612,7 @@ test("a failed desktop connection preserves the address and allows an explicit r
   await expect(page).toHaveURL(/\/#console$/);
 });
 
-test("desktop account switches between this computer and multiple connected panels in one window", async ({
+test("desktop account switches connected panels without local-switch or disconnect actions", async ({
   page,
   context,
 }) => {
@@ -626,8 +630,20 @@ test("desktop account switches between this computer and multiple connected pane
     })
     .click();
   await account.click();
+  await expect(
+    page.getByRole("menuitem", {
+      name: "Switch to this computer",
+      exact: true,
+    }),
+  ).toHaveCount(0);
+  await expect(
+    page.getByRole("menuitem", { name: /Disconnect from/ }),
+  ).toHaveCount(0);
   await page
-    .getByRole("menuitem", { name: "Switch to this computer", exact: true })
+    .getByRole("menuitem", {
+      name: "Switch to pc-one.example:3002",
+      exact: true,
+    })
     .click();
   expect(
     await page.evaluate(
@@ -635,13 +651,13 @@ test("desktop account switches between this computer and multiple connected pane
     ),
   ).toEqual([
     { action: "activate", value: "pc-two" },
-    { action: "activate", value: "local" },
+    { action: "activate", value: "pc-one" },
   ]);
   expect(context.pages()).toHaveLength(1);
 });
 
 for (const empty of [false, true]) {
-  test(`the local account can disconnect an offline saved panel ${empty ? "without local servers" : "with a local workspace"}`, async ({
+  test(`an offline saved panel stays available without account disconnect actions ${empty ? "without local servers" : "with a local workspace"}`, async ({
     page,
   }) => {
     await desktopBridge(page, { unavailablePanels: ["pc-one"] });
@@ -666,25 +682,21 @@ for (const empty of [false, true]) {
       "This saved panel is offline.",
     );
     await account.click();
-    await page
-      .getByRole("menuitem", {
-        name: "Disconnect from pc-one.example:3002",
-        exact: true,
-      })
-      .click();
+    await expect(
+      page.getByRole("menuitem", { name: /Disconnect from/ }),
+    ).toHaveCount(0);
     await expect
       .poll(() => page.evaluate(async () => window.mcPanelConnections!.list()))
       .toMatchObject({
         activeId: "local",
-        panels: [{ id: "local" }, { id: "pc-two" }],
+        panels: [{ id: "local" }, { id: "pc-one" }, { id: "pc-two" }],
       });
-    await account.click();
     await expect(
       page.getByRole("menuitem", { name: /pc-one\.example/ }),
-    ).toHaveCount(0);
+    ).toBeEnabled();
     await expect(
       page.getByRole("menuitem", {
-        name: "Disconnect from pc-two.example:3002",
+        name: "Switch to pc-two.example:3002",
         exact: true,
       }),
     ).toBeEnabled();
@@ -693,10 +705,7 @@ for (const empty of [false, true]) {
         () =>
           (window as unknown as { connectionCalls: unknown }).connectionCalls,
       ),
-    ).toEqual([
-      { action: "activate", value: "pc-one" },
-      { action: "disconnect", value: "pc-one" },
-    ]);
+    ).toEqual([{ action: "activate", value: "pc-one" }]);
     expect(localCredentials).toEqual([]);
   });
 }
@@ -1212,9 +1221,14 @@ for (const reason of ["sign-out", "expired session"] as const) {
         exact: true,
       })
       .click();
-    await page
-      .getByRole("menuitem", { name: "Switch to this computer", exact: true })
-      .click();
+    await expect(
+      page.getByRole("menuitem", {
+        name: "Switch to this computer",
+        exact: true,
+      }),
+    ).toHaveCount(0);
+    await page.keyboard.press("Escape");
+    await page.evaluate(() => window.mcPanelConnections!.activate("local"));
     expect((await roster()).map((item) => item.id)).toEqual([server.id]);
     fleetMode = "unavailable";
     await refreshSelected();
@@ -1455,7 +1469,7 @@ test("desktop invitations use the scoped connection bridge and keep credentials 
   await page.goto("/#console");
   const dialog = await openConnection(page, true);
   await expect(dialog).toContainText(
-    "Switch between this computer and connected panels",
+    "Use the server list to open servers on this computer or a connected panel.",
   );
   await dialog
     .getByLabel("Panel address or invitation link")

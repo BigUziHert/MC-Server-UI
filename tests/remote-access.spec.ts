@@ -240,6 +240,118 @@ test("switching shared servers drops the previous console and uses the next memb
   ).toBeEnabled();
 });
 
+for (const width of [1280, 390]) {
+  test(`a granted remote user edits safe server settings and can return to Console at ${width}px`, async ({
+    page,
+  }) => {
+    const permissions = ["server.update", "control.console"];
+    await sharedEndpoints(page, permissions);
+    await page.route("**/api/access/session", (route) =>
+      route.fulfill({ json: { ...sister, permissions } }),
+    );
+    let settings = {
+      ...server,
+      mode: "live",
+      launchType: "jar",
+      connectionHost: "play.example.com",
+      port: 25565,
+      memoryLimitMB: 2048,
+      motd: "Family server",
+      accessPermissions: permissions,
+    };
+    const patches: unknown[] = [];
+    await page.route("**/api/server/settings", async (route) => {
+      expect(route.request().headers()["x-server-id"]).toBe(server.id);
+      if (route.request().method() === "PATCH") {
+        const update = route.request().postDataJSON();
+        patches.push(update);
+        settings = { ...settings, ...update };
+      }
+      await route.fulfill({ json: { server: settings } });
+    });
+    await page.setViewportSize({ width, height: 900 });
+    await page.goto("/#players");
+    const openNavigation = async () => {
+      if (width < 768)
+        await page
+          .getByRole("button", { name: "Open navigation", exact: true })
+          .click();
+    };
+    await openNavigation();
+    await page
+      .getByRole("button", {
+        name: "Select server Family survival",
+        exact: true,
+      })
+      .click();
+    await expect(page).toHaveURL(/#console$/);
+    await expect(
+      page.getByRole("heading", { name: "Console", exact: true }),
+    ).toBeVisible();
+    await page
+      .getByRole("button", { name: "Rename server", exact: true })
+      .click();
+    const dialog = page.getByRole("dialog", {
+      name: "Server settings",
+      exact: true,
+    });
+    await expect(dialog.getByLabel("Server name", { exact: true })).toHaveValue(
+      server.name,
+    );
+    await expect(dialog.getByLabel("Server port", { exact: true })).toHaveValue(
+      "25565",
+    );
+    await expect(dialog.getByLabel("Memory (MB)", { exact: true })).toHaveValue(
+      "2048",
+    );
+    await expect(
+      dialog.getByText("Launch method", { exact: true }),
+    ).toHaveCount(0);
+    await expect(
+      dialog.getByRole("button", { name: "Remove server", exact: true }),
+    ).toHaveCount(0);
+    await expect(
+      dialog.getByLabel("Server folder", { exact: true }),
+    ).toHaveCount(0);
+    await dialog
+      .getByLabel("Server name", { exact: true })
+      .fill("Family renamed");
+    await dialog.getByLabel("Memory (MB)", { exact: true }).fill("3072");
+    await dialog
+      .getByRole("button", { name: "Save changes", exact: true })
+      .click();
+    await expect(dialog).toHaveCount(0);
+    expect(patches).toEqual([
+      {
+        name: "Family renamed",
+        connectionHost: "play.example.com",
+        port: 25565,
+        memoryLimitMB: 3072,
+        motd: "Family server",
+      },
+    ]);
+    await expect(page.getByRole("status")).toContainText(
+      "Server settings saved.",
+    );
+    await openNavigation();
+    const account = page.getByRole("button", {
+      name: `Account menu for ${sister.email}`,
+      exact: true,
+    });
+    await account.click();
+    for (const name of [
+      "Switch to this computer",
+      "Disconnect from this panel",
+      "Accept an invitation",
+    ])
+      await expect(
+        page.getByRole("menuitem", { name, exact: true }),
+      ).toHaveCount(0);
+    await page.keyboard.press("Escape");
+    await expect(account).toBeFocused();
+  });
+}
+
 test("a fully shared account uses the complete desktop workspace and mobile navigation", async ({
   page,
 }, testInfo) => {
@@ -281,9 +393,9 @@ test("a fully shared account uses the complete desktop workspace and mobile navi
   ).toHaveCount(0);
   await expect(
     page.getByRole("button", { name: "Server settings", exact: true }),
-  ).toHaveCount(0);
+  ).toBeVisible();
   await expect(page.getByRole("button", { name: "Rename server" })).toHaveCount(
-    0,
+    1,
   );
   await page.screenshot({
     path: testInfo.outputPath("shared-desktop-workspace.png"),

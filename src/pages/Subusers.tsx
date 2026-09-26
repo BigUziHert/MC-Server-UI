@@ -72,7 +72,9 @@ const permissionIds = catalog.groups.flatMap((group) =>
 
 function permissionsFor(user: Subuser) {
   const defaults =
-    catalog.roleDefaults[user.role as keyof typeof catalog.roleDefaults] ?? [];
+    catalog.roleDefaults[
+      user.role as keyof typeof catalog.roleDefaults
+    ]?.filter((id) => id !== "server.update") ?? [];
   const selected = new Set(user.permissions ?? defaults);
   return permissionIds.filter((permission) => selected.has(permission));
 }
