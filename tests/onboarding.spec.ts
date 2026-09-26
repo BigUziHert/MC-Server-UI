@@ -920,9 +920,21 @@ test("browser Browse navigates host folders and chooses a new folder without cre
   const parent = path.join(root, "Minecraft servers");
   await fs.mkdir(parent);
   await fs.writeFile(path.join(root, "private.txt"), "not a folder");
-  await page.route("**/api/server-setup/directories*", (route) => {
-    if (new URL(route.request().url()).searchParams.has("directory"))
-      return route.continue();
+  let parentReads = 0;
+  let releaseReturn!: () => void;
+  const returning = new Promise<void>((resolve) => {
+    releaseReturn = resolve;
+  });
+  await page.route("**/api/server-setup/directories*", async (route) => {
+    const directory = new URL(route.request().url()).searchParams.get(
+      "directory",
+    );
+    if (directory === parent && ++parentReads === 2) {
+      const response = await route.fetch();
+      await returning;
+      return route.fulfill({ response });
+    }
+    if (directory) return route.continue();
     return route.fulfill({
       json: {
         directory: null,
@@ -963,9 +975,22 @@ test("browser Browse navigates host folders and chooses a new folder without cre
     await picker
       .getByRole("button", { name: "Minecraft servers", exact: true })
       .click();
+    await expect(
+      picker.getByLabel("New folder name (optional)", { exact: true }),
+    ).toBeHidden();
+    await expect(
+      picker.getByRole("button", { name: "Use this folder", exact: true }),
+    ).toBeDisabled();
+    releaseReturn();
+    await expect(picker.getByLabel("Folder path", { exact: true })).toHaveValue(
+      parent,
+    );
     await picker
       .getByLabel("New folder name (optional)", { exact: true })
       .fill("bad/name");
+    await expect(
+      picker.getByLabel("New folder name (optional)", { exact: true }),
+    ).toHaveValue("bad/name");
     await expect(
       picker.getByRole("button", { name: "Use new folder", exact: true }),
     ).toBeDisabled();
@@ -1005,6 +1030,7 @@ test("browser Browse navigates host folders and chooses a new folder without cre
       .toBe(false);
     expect(setup.creationRequests).toEqual([]);
   } finally {
+    releaseReturn();
     expect(path.dirname(root)).toBe(temporary);
     expect(path.basename(root)).toMatch(/^mc-onboarding-browse-/);
     await fs.rm(root, { recursive: true, force: true });

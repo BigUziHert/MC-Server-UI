@@ -36,16 +36,16 @@ export default function HostDirectoryPicker({
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
   const [refresh, setRefresh] = useState(0);
+  const navigation = useRef(0);
   const heading = useRef<HTMLHeadingElement>(null);
   useEffect(() => {
     heading.current?.focus();
   }, []);
   useEffect(() => {
     const controller = new AbortController();
-    setLoading(true);
-    setError("");
-    setListing(null);
-    setNewFolder("");
+    const generation = navigation.current;
+    const current = () =>
+      !controller.signal.aborted && generation === navigation.current;
     void api<Listing>(
       `/server-setup/directories${target ? `?${new URLSearchParams({ directory: target })}` : ""}`,
       {
@@ -56,20 +56,28 @@ export default function HostDirectoryPicker({
       },
     )
       .then((result) => {
-        if (controller.signal.aborted) return;
+        if (!current()) return;
         setListing(result);
         setAddress(result.directory || "");
       })
       .catch((cause) => {
-        if (!controller.signal.aborted)
+        if (current())
           setError(messageOf(cause, "This folder could not be opened."));
       })
       .finally(() => {
-        if (!controller.signal.aborted) setLoading(false);
+        if (current()) setLoading(false);
       });
     return () => controller.abort();
   }, [target, refresh]);
   const navigate = (directory: string | null) => {
+    // Invalidate the displayed folder in the same event as navigation. A
+    // passive-effect reset leaves its name input usable briefly and can erase
+    // a name entered before the next listing arrives.
+    navigation.current++;
+    setLoading(true);
+    setError("");
+    setListing(null);
+    setNewFolder("");
     setTarget(directory);
     setRefresh((value) => value + 1);
   };
