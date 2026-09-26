@@ -150,6 +150,7 @@ export async function createAccessService({
     memberships: [],
     tokens: [],
     sessions: [],
+    creationRevocations: [],
   };
   try {
     const saved = JSON.parse(await fs.readFile(storage, "utf8"));
@@ -173,6 +174,9 @@ export async function createAccessService({
       memberships: saved.memberships,
       tokens: saved.tokens,
       sessions: saved.sessions,
+      creationRevocations: Array.isArray(saved.creationRevocations)
+        ? saved.creationRevocations
+        : [],
     };
   } catch (cause) {
     if (cause.code !== "ENOENT")
@@ -308,9 +312,131 @@ export async function createAccessService({
     const user = await liveUser(record);
     return user ? sessionView(record, user, memberships) : null;
   };
+  const hostAuthority = async (req, expected) => {
+    const session = await authenticatedSession(req);
+    for (const scope of session?.memberships ?? []) {
+      const record = state.memberships.find(
+        (item) =>
+          scopeKey(item) === scopeKey(scope) && item.email === session.email,
+      );
+      if (
+        !record?.password ||
+        (expected && scopeKey(record) !== scopeKey(expected))
+      )
+        continue;
+      const user = await liveUser(record);
+      if (user?.hostPermissions?.includes("server.create"))
+        return {
+          serverId: record.serverId,
+          userId: record.userId,
+          email: record.email,
+        };
+    }
+    throw fail(
+      403,
+      "The panel owner must grant permission to add servers on this computer.",
+    );
+  };
 
   return {
     status,
+    hostAuthority,
+    assertCreationCapacity: (email) => {
+      if (
+        state.memberships.filter((item) => item.email === email).length >=
+        maxEmailMemberships
+      )
+        throw fail(
+          400,
+          "This email has reached the limit of 32 remote server memberships.",
+        );
+    },
+    creationAllowed: (serverId, userId) =>
+      !state.creationRevocations.includes(membershipKey(serverId, userId)),
+    // Creation proves only the granting membership. Copy its credential, never
+    // another same-email password, and persist enrollment + session together.
+    enrollCreated: (req, source, target) =>
+      serialize(async () => {
+        const authority = await hostAuthority(req, source);
+        if (
+          authority.email !== source.email ||
+          target.email !== authority.email
+        )
+          throw fail(
+            403,
+            "This server creation belongs to a different account.",
+          );
+        const user = await liveUser(target);
+        if (!user)
+          throw fail(
+            409,
+            "The created server's access record is unavailable. Retry this request.",
+          );
+        const session = await authenticatedSession(req);
+        const sourceRecord = state.memberships.find(
+          (item) => scopeKey(item) === scopeKey(source),
+        );
+        const key = scopeKey(target);
+        const next = cleaned();
+        if (next.creationRevocations.includes(key))
+          throw fail(
+            403,
+            "Your creator access was revoked. Contact the panel owner.",
+          );
+        if (
+          next.memberships.filter(
+            (item) => item.email === authority.email && scopeKey(item) !== key,
+          ).length >= maxEmailMemberships
+        )
+          throw fail(
+            400,
+            "This email has reached the limit of 32 remote server memberships.",
+          );
+        const existing = next.memberships.find(
+          (item) => scopeKey(item) === key,
+        );
+        if (
+          existing &&
+          (existing.email !== authority.email ||
+            !existing.password ||
+            !existing.acceptedAt ||
+            existing.creationSource !== scopeKey(source) ||
+            !session.memberships.some((scope) => scopeKey(scope) === key))
+        )
+          throw fail(
+            403,
+            "This server's access record was changed or reset. Sign in to it separately.",
+          );
+        const hash = digest(cookieSecret(req));
+        await persist({
+          ...next,
+          memberships: existing
+            ? next.memberships
+            : [
+                ...next.memberships,
+                {
+                  ...target,
+                  invitedAt: now(),
+                  acceptedAt: now(),
+                  password: { ...sourceRecord.password },
+                  creationSource: scopeKey(source),
+                },
+              ],
+          sessions: next.sessions.map((item) =>
+            item.hash === hash
+              ? {
+                  ...item,
+                  memberships: [
+                    ...session.memberships.filter(
+                      (scope) => scopeKey(scope) !== key,
+                    ),
+                    { serverId: target.serverId, userId: target.userId },
+                  ],
+                }
+              : item,
+          ),
+        });
+      }),
     validateConfiguration: (input) =>
       validateAccessConfiguration(input, state.configuration),
     async close() {
@@ -529,12 +655,19 @@ export async function createAccessService({
         return clearCookie;
       });
     },
-    revoke: (serverId, userId) =>
+    revoke: (serverId, userId, { created = false } = {}) =>
       serialize(async () => {
         const key = membershipKey(serverId, userId);
         const next = cleaned();
         await persist({
           ...next,
+          creationRevocations:
+            created ||
+            next.memberships.some(
+              (item) => scopeKey(item) === key && item.creationSource,
+            )
+              ? [...new Set([...next.creationRevocations, key])]
+              : next.creationRevocations,
           memberships: next.memberships.filter(
             (item) => scopeKey(item) !== key,
           ),

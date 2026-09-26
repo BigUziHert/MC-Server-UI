@@ -921,6 +921,10 @@ test("browser Browse navigates host folders and chooses a new folder without cre
   await fs.mkdir(parent);
   await fs.writeFile(path.join(root, "private.txt"), "not a folder");
   let parentReads = 0;
+  let releaseRoots!: () => void;
+  const rootsReady = new Promise<void>((resolve) => {
+    releaseRoots = resolve;
+  });
   let releaseReturn!: () => void;
   const returning = new Promise<void>((resolve) => {
     releaseReturn = resolve;
@@ -935,6 +939,7 @@ test("browser Browse navigates host folders and chooses a new folder without cre
       return route.fulfill({ response });
     }
     if (directory) return route.continue();
+    await rootsReady;
     return route.fulfill({
       json: {
         directory: null,
@@ -958,12 +963,15 @@ test("browser Browse navigates host folders and chooses a new folder without cre
       exact: true,
     });
     await expect(picker).toBeVisible();
-    await picker
-      .getByRole("button", { name: "Test drive", exact: true })
-      .click();
+    await picker.getByLabel("Folder path", { exact: true }).fill(root);
+    releaseRoots();
+    await expect(
+      picker.getByRole("button", { name: "Test drive", exact: true }),
+    ).toBeVisible();
     await expect(picker.getByLabel("Folder path", { exact: true })).toHaveValue(
       root,
     );
+    await picker.getByRole("button", { name: "Open", exact: true }).click();
     await expect(picker).not.toContainText("private.txt");
     await picker
       .getByRole("button", { name: "Minecraft servers", exact: true })
@@ -1030,6 +1038,7 @@ test("browser Browse navigates host folders and chooses a new folder without cre
       .toBe(false);
     expect(setup.creationRequests).toEqual([]);
   } finally {
+    releaseRoots();
     releaseReturn();
     expect(path.dirname(root)).toBe(temporary);
     expect(path.basename(root)).toMatch(/^mc-onboarding-browse-/);
@@ -1080,10 +1089,18 @@ test("browser folder cancellation and switching back to default leave setup usab
   expect(setup.creationRequests).toEqual([]);
 });
 
-test("desktop folder browsing fills setup and folder validation errors keep the chosen path editable", async ({
+test("desktop setup uses the same inline folder browser and keeps validation errors editable", async ({
   page,
   setup,
 }) => {
+  let importCapabilityRequests = 0;
+  page.on("request", (request) => {
+    if (
+      request.method() === "GET" &&
+      new URL(request.url()).pathname === "/api/server-import"
+    )
+      importCapabilityRequests++;
+  });
   await page.route("**/api/server-setup", async (route) => {
     if (route.request().method() !== "GET") return route.fallback();
     return route.fulfill({
@@ -1098,9 +1115,25 @@ test("desktop folder browsing fills setup and folder validation errors keep the 
     });
   });
   const directory = "D:\\Minecraft\\Survival";
-  await page.route("**/api/server-setup/browse", (route) =>
-    route.fulfill({ json: { directory } }),
-  );
+  let nativeBrowseRequests = 0;
+  await page.route("**/api/server-setup/browse", (route) => {
+    nativeBrowseRequests++;
+    return route.fulfill({ json: { directory: null } });
+  });
+  await page.route("**/api/server-setup/directories*", (route) => {
+    const selected = new URL(route.request().url()).searchParams.has(
+      "directory",
+    );
+    return route.fulfill({
+      json: {
+        directory: selected ? directory : null,
+        parent: selected ? "D:\\Minecraft" : null,
+        separator: "\\",
+        folders: selected ? [] : [{ name: "Survival", path: directory }],
+        truncated: false,
+      },
+    });
+  });
   await page.route("**/api/server-setup/preflight", (route) =>
     route.fulfill({
       status: 409,
@@ -1114,6 +1147,21 @@ test("desktop folder browsing fills setup and folder validation errors keep the 
     .getByLabel("Installation location", { exact: true })
     .selectOption("custom");
   await dialog.getByRole("button", { name: "Browse", exact: true }).click();
+  const picker = dialog.getByRole("region", {
+    name: "Choose installation folder",
+    exact: true,
+  });
+  await expect(picker).toBeVisible();
+  await picker.getByRole("button", { name: "Survival", exact: true }).click();
+  await expect(picker.getByLabel("Folder path", { exact: true })).toHaveValue(
+    directory,
+  );
+  await picker
+    .getByRole("button", { name: "Use this folder", exact: true })
+    .click();
+  await expect(picker).not.toBeVisible();
+  expect(nativeBrowseRequests).toBe(0);
+  expect(importCapabilityRequests).toBe(0);
   await expect(
     dialog.getByLabel("Installation folder", { exact: true }),
   ).toHaveValue(directory);

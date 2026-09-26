@@ -76,6 +76,10 @@ const permissionIds = new Set(
 );
 const userWithPermissions = (user) => ({
   ...user,
+  hostPermissions: (Array.isArray(user.hostPermissions)
+    ? user.hostPermissions
+    : []
+  ).filter((id) => id === "server.create"),
   permissions: (
     user.permissions ??
     permissionsCatalog.roleDefaults[user.role] ??
@@ -89,6 +93,15 @@ function validatePermissions(value) {
     value.some((id) => !permissionIds.has(id))
   )
     throw error(400, "Choose permissions from the available list.");
+  return [...new Set(value)];
+}
+function validateHostPermissions(value) {
+  if (
+    !Array.isArray(value) ||
+    value.length > 1 ||
+    value.some((id) => id !== "server.create")
+  )
+    throw error(400, "Choose host permissions from the available list.");
   return [...new Set(value)];
 }
 const defaultSchedule = {
@@ -2873,6 +2886,14 @@ export async function createPanel(options = {}) {
   const checkSubuserAccess = (req, permission, target, requested = []) => {
     const principal = req[remotePrincipal];
     if (!principal) return;
+    if (
+      Object.hasOwn(req.body ?? {}, "hostPermissions") ||
+      userWithPermissions(target ?? {}).hostPermissions.length
+    )
+      throw error(
+        403,
+        "Only the local panel owner can manage host permissions or users who have them.",
+      );
     const actor = state.users.find((user) => user.email === principal.email);
     const allowed = actor ? userWithPermissions(actor).permissions : [];
     if (
@@ -2938,6 +2959,11 @@ export async function createPanel(options = {}) {
         id: randomUUID(),
         email: email.toLowerCase(),
         role,
+        hostPermissions: validateHostPermissions(
+          Object.hasOwn(req.body ?? {}, "hostPermissions")
+            ? req.body.hostPermissions
+            : [],
+        ),
         permissions:
           permissions === undefined
             ? [...(permissionsCatalog.roleDefaults[role] ?? [])]
@@ -2959,7 +2985,10 @@ export async function createPanel(options = {}) {
       const item = getItem(state.users, req.params.id);
       const permissions = validatePermissions(req.body?.permissions);
       checkSubuserAccess(req, "user.update", item, permissions);
-      const updated = { ...item, permissions, role: "custom" };
+      const hostPermissions = Object.hasOwn(req.body ?? {}, "hostPermissions")
+        ? validateHostPermissions(req.body.hostPermissions)
+        : userWithPermissions(item).hostPermissions;
+      const updated = { ...item, permissions, hostPermissions, role: "custom" };
       await saveSubusers(
         state.users.map((user) => (user.id === item.id ? updated : user)),
         "Subuser permissions updated",
@@ -3027,6 +3056,42 @@ export async function createPanel(options = {}) {
         ? (cachedIcon.dataUrl ??= `data:image/png;base64,${cachedIcon.bytes.toString("base64")}`)
         : null,
     subusers: () => state.users.map(userWithPermissions),
+    ensureCreator: (creator) => {
+      const pending = subuserChain.then(async () => {
+        if (options.creationAllowed?.(creator.userId) === false)
+          throw error(
+            403,
+            "Your creator access was revoked. Contact the panel owner.",
+          );
+        const existing = state.users.find((user) => user.id === creator.userId);
+        if (existing) {
+          if (existing.email !== creator.email)
+            throw error(409, "The creator access record has changed.");
+          return userWithPermissions(existing);
+        }
+        if (state.users.some((user) => user.email === creator.email))
+          throw error(
+            409,
+            "This email already has another access record on the server.",
+          );
+        const user = {
+          id: creator.userId,
+          email: creator.email,
+          role: "admin",
+          permissions: [...permissionsCatalog.roleDefaults.admin],
+          hostPermissions: [],
+          createdAt: new Date().toISOString(),
+        };
+        await saveSubusers(
+          [...state.users, user],
+          "Server creator access granted",
+          creator.email,
+        );
+        return userWithPermissions(user);
+      });
+      subuserChain = pending.catch(() => {});
+      return pending;
+    },
     refreshStartupMetadata,
     assertRemovable: () => {
       if (closed) throw error(409, "This server is already shutting down.");
@@ -3190,11 +3255,18 @@ export async function createFleet(options = {}) {
   let access;
   let registry;
   let changeChain = Promise.resolve();
+  let fleetMutationsPending = 0;
   let closed = false;
   const serialize = (work) => {
     if (closed)
       return Promise.reject(error(503, "The panel is shutting down."));
-    const pending = changeChain.catch(() => {}).then(work);
+    fleetMutationsPending += 1;
+    const pending = changeChain
+      .catch(() => {})
+      .then(work)
+      .finally(() => {
+        fleetMutationsPending -= 1;
+      });
     changeChain = pending;
     return pending;
   };
@@ -3407,7 +3479,11 @@ export async function createFleet(options = {}) {
           serverId: entry.id,
           user,
         }),
-      revokeUser: (userId) => access.revoke(entry.id, userId),
+      revokeUser: (userId) =>
+        access.revoke(entry.id, userId, {
+          created: entry.creatorUserId === userId,
+        }),
+      creationAllowed: (userId) => access.creationAllowed(entry.id, userId),
       existingServerDir:
         ["external", "custom"].includes(entry.storage) || preserveFiles,
       scheduler: options.scheduler,
@@ -3644,11 +3720,26 @@ export async function createFleet(options = {}) {
     throw cause;
   }
 
+  // Only start access-triggered recovery while the fleet queue is empty. A
+  // shared promise lets simultaneous authenticated requests wait on that same
+  // safe recovery without queuing behind a creation waiting for access writes.
+  const accessRecoveries = new Map();
+  const accessRuntime = async (serverId) => {
+    const current = runtimes.get(serverId);
+    if (!current?.unavailable) return current;
+    if (accessRecoveries.has(serverId)) return accessRecoveries.get(serverId);
+    if (fleetMutationsPending) return current;
+    const pending = resolveRuntime(serverId).finally(() =>
+      accessRecoveries.delete(serverId),
+    );
+    accessRecoveries.set(serverId, pending);
+    return pending;
+  };
   try {
     access = await createAccessService({
       dataDir,
       getUser: async (serverId, userId) =>
-        (await resolveRuntime(serverId))
+        (await accessRuntime(serverId))
           ?.subusers?.()
           .find((user) => user.id === userId) ?? null,
     });
@@ -3659,11 +3750,18 @@ export async function createFleet(options = {}) {
     if (!options.telemetry) telemetry.close();
     throw cause;
   }
+  const remoteHostApp = express.Router();
+  remoteHostApp.use(async (req, _res, next) => {
+    if (closed) throw error(503, "The panel is shutting down.");
+    await access.hostAuthority(req);
+    next();
+  });
   const remoteApp = createRemoteGateway({
     access,
     runtimes,
     distDir: path.join(projectDir, "dist"),
     localAddresses: options.localAddresses,
+    hostApp: remoteHostApp,
   });
   const remote = createRemoteListener({
     app: remoteApp,
@@ -3709,6 +3807,60 @@ export async function createFleet(options = {}) {
     next();
   });
   app.use(express.json({ limit: "2mb" }));
+  const hostRoute = (method, route, handler) => {
+    app[method](route, handler);
+    remoteHostApp[method](route, handler);
+  };
+  const creationAuthority = (req) =>
+    req?.[remotePrincipal] ? access.hostAuthority(req) : null;
+  const sameCreator = (left, right) =>
+    JSON.stringify(left ?? null) === JSON.stringify(right ?? null);
+  const finishCreatorAccess = async (entry, req, authority) => {
+    const runtime = runtimes.get(entry.id);
+    if (!authority) return runtime.descriptor();
+    if (!sameCreator(entry.createdBy, authority))
+      throw error(
+        409,
+        "This request belongs to a different server creation. Begin a new request.",
+      );
+    await access.hostAuthority(req, authority);
+    const target = {
+      serverId: entry.id,
+      userId: entry.creatorUserId,
+      email: authority.email,
+    };
+    let user = runtime
+      .subusers()
+      .find((item) => item.id === target.userId && item.email === target.email);
+    if (entry.creatorAccessReady) {
+      const session = await access.authenticate(req);
+      if (
+        !user ||
+        !session?.memberships.some(
+          (scope) =>
+            scope.serverId === target.serverId &&
+            scope.userId === target.userId,
+        )
+      )
+        throw error(
+          403,
+          "Your access to this created server has been revoked. Contact the panel owner.",
+        );
+    } else {
+      user = await runtime.ensureCreator(target);
+      await access.enrollCreated(req, authority, target);
+    }
+    if (!entry.creatorAccessReady) {
+      const completed = { ...entry, creatorAccessReady: true };
+      await persist({
+        ...registry,
+        servers: registry.servers.map((item) =>
+          item.id === entry.id ? completed : item,
+        ),
+      });
+    }
+    return { ...runtime.descriptor(), accessPermissions: user.permissions };
+  };
   app.get("/api/access/session", (_req, res) => res.json({ role: "owner" }));
   app.get("/api/access/settings", (_req, res) => res.json(remote.status()));
   app.get("/api/access/network", async (_req, res) =>
@@ -3742,9 +3894,11 @@ export async function createFleet(options = {}) {
       return res.json({ entries: auditHistory(panelAuditEntries) });
     next();
   });
-  app.get("/api/server-import", (_req, res) =>
+  hostRoute("get", "/api/server-import", (req, res) =>
     res.json({
-      canBrowse: typeof options.selectServerDirectory === "function",
+      canBrowse:
+        !req[remotePrincipal] &&
+        typeof options.selectServerDirectory === "function",
     }),
   );
   app.post("/api/server-import/browse", async (_req, res) => {
@@ -3756,7 +3910,7 @@ export async function createFleet(options = {}) {
     const directory = await options.selectServerDirectory();
     res.json({ directory: directory ?? null });
   });
-  app.post("/api/server-import/inspect", async (req, res) => {
+  hostRoute("post", "/api/server-import/inspect", async (req, res) => {
     res.json(await inspectImport(req.body?.directory));
   });
   const recovery = createPanelRecovery({
@@ -3840,10 +3994,12 @@ export async function createFleet(options = {}) {
     });
     res.status(201).json({ server });
   });
-  app.post("/api/server-import", async (req, res) => {
-    const server = await serialize(async () => {
+  hostRoute("post", "/api/server-import", async (req, res) => {
+    const result = await serialize(async () => {
+      const authority = await creationAuthority(req);
       const input = req.body;
       const allowed = new Set([
+        "requestId",
         "directory",
         "name",
         "jar",
@@ -3865,6 +4021,48 @@ export async function createFleet(options = {}) {
           400,
           "Provide the folder, server name, launch method, Java executable, memory, and port.",
         );
+      const requestId = input.requestId;
+      if (
+        (authority || requestId !== undefined) &&
+        (typeof requestId !== "string" ||
+          !/^[a-z0-9-]{16,100}$/i.test(requestId))
+      )
+        throw error(
+          400,
+          "Provide a unique import request ID so a retry cannot import another server.",
+        );
+      const fingerprint = requestId
+        ? createHash("sha256")
+            .update(
+              JSON.stringify({
+                input: Object.fromEntries(
+                  Object.entries(input).sort(([a], [b]) => a.localeCompare(b)),
+                ),
+                authority,
+              }),
+            )
+            .digest("hex")
+        : null;
+      if (requestId) {
+        const previous = registry.servers.find(
+          (entry) => entry.importRequestId === requestId,
+        );
+        if (previous) {
+          if (
+            previous.importFingerprint !== fingerprint ||
+            !sameCreator(previous.createdBy, authority)
+          )
+            throw error(
+              409,
+              "This import request already created a server with different settings. Begin a new import.",
+            );
+          return {
+            server: await finishCreatorAccess(previous, req, authority),
+            reused: true,
+          };
+        }
+      }
+      if (authority) access.assertCreationCapacity(authority.email);
       const inspected = await inspectImport(input.directory);
       const launchType = input.launchType ?? "jar";
       if (launchType === "jar") {
@@ -3932,6 +4130,12 @@ export async function createFleet(options = {}) {
           startup.software ??
           candidate?.software ??
           (launchType === "executable" ? "Custom" : "Java"),
+        ...(requestId
+          ? { importRequestId: requestId, importFingerprint: fingerprint }
+          : {}),
+        ...(authority
+          ? { createdBy: authority, creatorUserId: randomUUID() }
+          : {}),
       };
       const runtime = await makeRuntime(entry);
       try {
@@ -3945,14 +4149,19 @@ export async function createFleet(options = {}) {
         await runtime.close();
         throw cause;
       }
-      await runtime.audit(
-        "server",
-        "Existing server imported",
-        `Existing folder linked in place: ${inspected.directory}. No source files were changed and the server was not started.`,
-      );
-      return runtime.descriptor();
+      const server = await finishCreatorAccess(entry, req, authority);
+      await runtime
+        .audit(
+          "server",
+          "Existing server imported",
+          `Existing folder linked in place: ${inspected.directory}. No source files were changed and the server was not started.`,
+        )
+        .catch((cause) =>
+          console.error("Import audit could not be saved:", cause),
+        );
+      return { server, reused: false };
     });
-    res.status(201).json({ server });
+    res.status(result.reused ? 200 : 201).json(result);
   });
   app.get("/api/servers", async (_req, res) => {
     await Promise.all(
@@ -3985,11 +4194,13 @@ export async function createFleet(options = {}) {
         : "java"),
   });
   setup.mount(app);
+  setup.mount(remoteHostApp);
   const createManagedServer = async (
     input,
-    { requestId, acceptedEula = false } = {},
+    { requestId, acceptedEula = false, req } = {},
   ) => {
     return serialize(async () => {
+      const authority = await creationAuthority(req);
       if (!input || typeof input !== "object" || Array.isArray(input))
         throw error(400, "Provide server settings.");
       const { installationDirectory, ...settings } = input ?? {};
@@ -4000,6 +4211,7 @@ export async function createFleet(options = {}) {
               JSON.stringify({
                 config,
                 acceptedEula,
+                authority,
                 ...(installationDirectory === undefined
                   ? {}
                   : { installationDirectory }),
@@ -4012,17 +4224,24 @@ export async function createFleet(options = {}) {
           (entry) => entry.setupRequestId === requestId,
         );
         if (previous) {
-          if (previous.setupFingerprint !== fingerprint)
+          if (
+            previous.setupFingerprint !== fingerprint ||
+            !sameCreator(previous.createdBy, authority)
+          )
             throw error(
               409,
               "This setup request already created a server with different settings. Resume that server or begin a new setup.",
             );
           return {
-            server: { ...descriptor(previous), serverDir: previous.serverDir },
+            server: {
+              ...(await finishCreatorAccess(previous, req, authority)),
+              serverDir: previous.serverDir,
+            },
             reused: true,
           };
         }
       }
+      if (authority) access.assertCreationCapacity(authority.email);
       checkPort(config.port);
       const id = randomUUID();
       const installation =
@@ -4098,6 +4317,9 @@ export async function createFleet(options = {}) {
           address: `localhost:${config.port}`,
           version: "Configured JAR",
           software: "Java",
+          ...(authority
+            ? { createdBy: authority, creatorUserId: randomUUID() }
+            : {}),
           ...(requestId
             ? { setupRequestId: requestId, setupFingerprint: fingerprint }
             : {}),
@@ -4115,20 +4337,30 @@ export async function createFleet(options = {}) {
         await initialFiles.rollback().catch(() => {});
         throw cause;
       }
-      await runtime.audit(
-        "server",
-        "Server created",
-        `${config.name} created on port ${config.port}.`,
-      );
-      if (acceptedEula)
-        await runtime.audit(
+      const createdEntry = registry.servers.find((entry) => entry.id === id);
+      const server = await finishCreatorAccess(createdEntry, req, authority);
+      await runtime
+        .audit(
           "server",
-          "EULA accepted",
-          "Minecraft EULA accepted during server setup.",
+          "Server created",
+          `${config.name} created on port ${config.port}.`,
+        )
+        .catch((cause) =>
+          console.error("Creation audit could not be saved:", cause),
         );
+      if (acceptedEula)
+        await runtime
+          .audit(
+            "server",
+            "EULA accepted",
+            "Minecraft EULA accepted during server setup.",
+          )
+          .catch((cause) =>
+            console.error("EULA audit could not be saved:", cause),
+          );
       return {
         server: {
-          ...runtime.descriptor(),
+          ...server,
           ...(requestId ? { serverDir } : {}),
         },
         reused: false,
@@ -4139,7 +4371,7 @@ export async function createFleet(options = {}) {
     const { server } = await createManagedServer(req.body);
     res.status(201).json({ server });
   });
-  app.post("/api/server-setup", async (req, res) => {
+  hostRoute("post", "/api/server-setup", async (req, res) => {
     const {
       requestId,
       confirmed,
@@ -4166,6 +4398,7 @@ export async function createFleet(options = {}) {
     const result = await createManagedServer(configuration, {
       requestId,
       acceptedEula,
+      req,
     });
     res.status(result.reused ? 200 : 201).json(result);
   });

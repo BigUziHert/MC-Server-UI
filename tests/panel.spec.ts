@@ -1968,7 +1968,9 @@ async function existingServerFixture({
   neoforge = false,
   customLauncher = false,
 } = {}) {
-  const directory = await mkdtemp(path.join(tmpdir(), "mc-panel-import-e2e-"));
+  const directory = await realpath(
+    await mkdtemp(path.join(tmpdir(), "mc-panel-import-e2e-")),
+  );
   const files: Record<string, string | Buffer> = {
     "server.properties":
       "# Existing server: preserve these exact bytes\r\nserver-port=25681\r\nmotd=Imported E2E world\r\nlevel-name=existing-world\r\nmax-players=37\r\nonline-mode=true\r\n",
@@ -2073,8 +2075,23 @@ test("imports an existing external server in place without changing its files or
     let dialog = await chooseImportServer(page);
     await expect(
       dialog.getByRole("button", { name: "Browse", exact: true }),
-    ).toHaveCount(0);
+    ).toBeVisible();
     await dialog.getByLabel("Server folder", { exact: true }).fill(directory);
+    await dialog.getByRole("button", { name: "Browse", exact: true }).click();
+    const picker = dialog.getByRole("region", {
+      name: "Choose server folder",
+      exact: true,
+    });
+    await expect(picker.getByLabel("Folder path", { exact: true })).toHaveValue(
+      directory,
+    );
+    await expect(
+      picker.getByLabel("New folder name (optional)", { exact: true }),
+    ).toHaveCount(0);
+    await picker
+      .getByRole("button", { name: "Use this folder", exact: true })
+      .click();
+    await expect(picker).not.toBeVisible();
     await dialog
       .getByRole("button", { name: "Inspect folder", exact: true })
       .click();
@@ -2185,6 +2202,67 @@ test("imports an existing external server in place without changing its files or
   }
 });
 
+test("import retries retain their request ID and changed settings receive a new one", async ({
+  page,
+  request,
+}) => {
+  const directory = await existingServerFixture();
+  const original = await snapshotExistingFolder(directory);
+  const submissions: { requestId: string; name: string }[] = [];
+  await page.route("**/api/server-import", async (route) => {
+    if (route.request().method() !== "POST") return route.continue();
+    submissions.push(route.request().postDataJSON());
+    return route.fulfill({
+      status: 503,
+      json: {
+        error: `Fixture import attempt ${submissions.length} failed; retry.`,
+      },
+    });
+  });
+  try {
+    await page.goto("/");
+    const dialog = await chooseImportServer(page);
+    await dialog.getByLabel("Server folder", { exact: true }).fill(directory);
+    await dialog
+      .getByRole("button", { name: "Inspect folder", exact: true })
+      .click();
+    const fleet = await listServers(request);
+    let unusedPort = 28600;
+    while (fleet.servers.some((server) => server.port === unusedPort))
+      unusedPort++;
+    const port = dialog.getByLabel("Server port", { exact: true });
+    if (!(await port.isVisible()))
+      await dialog.getByText("Advanced settings", { exact: true }).click();
+    await port.fill(String(unusedPort));
+    const submit = dialog.getByRole("button", {
+      name: "Import server",
+      exact: true,
+    });
+    await expect(submit).toBeEnabled();
+    await submit.click();
+    await expect(dialog.getByRole("alert")).toContainText(
+      "Fixture import attempt 1 failed",
+    );
+    await submit.click();
+    await expect(dialog.getByRole("alert")).toContainText(
+      "Fixture import attempt 2 failed",
+    );
+    await dialog
+      .getByLabel("Server name", { exact: true })
+      .fill("Changed import settings");
+    await submit.click();
+    await expect(dialog.getByRole("alert")).toContainText(
+      "Fixture import attempt 3 failed",
+    );
+    expect(submissions[0].requestId).toMatch(/^[a-f0-9-]{36}$/i);
+    expect(submissions[1].requestId).toBe(submissions[0].requestId);
+    expect(submissions[2].requestId).not.toBe(submissions[0].requestId);
+    expect(await snapshotExistingFolder(directory)).toEqual(original);
+  } finally {
+    await removeExistingFixture(directory);
+  }
+});
+
 test("import review handles canceled folder selection, invalid folders, and multiple JARs on mobile", async ({
   page,
 }, testInfo) => {
@@ -2212,7 +2290,20 @@ test("import review handles canceled folder selection, invalid folders, and mult
     const folder = dialog.getByLabel("Server folder", { exact: true });
     await folder.fill(invalidDirectory);
     await dialog.getByRole("button", { name: "Browse", exact: true }).click();
-    await expect.poll(() => browseCalls).toBe(1);
+    const picker = dialog.getByRole("region", {
+      name: "Choose server folder",
+      exact: true,
+    });
+    await expect(picker).toBeVisible();
+    await expect(
+      picker.getByLabel("New folder name (optional)", { exact: true }),
+    ).toHaveCount(0);
+    await picker.getByRole("button", { name: "Cancel", exact: true }).click();
+    await expect(picker).not.toBeVisible();
+    await expect(
+      dialog.getByRole("button", { name: "Browse", exact: true }),
+    ).toBeFocused();
+    expect(browseCalls).toBe(0);
     await expect(folder).toHaveValue(invalidDirectory);
     await dialog
       .getByRole("button", { name: "Inspect folder", exact: true })

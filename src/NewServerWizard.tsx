@@ -93,7 +93,6 @@ type Catalog = {
   java: Java;
   warnings?: string[];
   managedServersDir?: string;
-  canBrowse?: boolean;
   managedJavaDirectory?: string;
 };
 type Project = {
@@ -151,6 +150,7 @@ type Job = {
 type Step = "source" | "catalog" | "configure" | "review" | "install" | "done";
 type Props = {
   servers: ServerRecord[];
+  remoteHost?: string;
   onBack: () => void;
   onClose: () => void;
   onSaved: (server: ServerRecord) => void;
@@ -212,6 +212,7 @@ const wait = (signal: AbortSignal) =>
 
 export default function NewServerWizard({
   servers,
+  remoteHost,
   onBack,
   onClose,
   onSaved,
@@ -633,7 +634,7 @@ export default function NewServerWizard({
     }
   }
   async function saveKey() {
-    if (!apiKey.trim() || busyRef.current) return;
+    if (remoteHost || !apiKey.trim() || busyRef.current) return;
     busyRef.current = true;
     setBusy(true);
     setError("");
@@ -653,27 +654,10 @@ export default function NewServerWizard({
       setBusy(false);
     }
   }
-  async function browseInstallationDirectory() {
+  function browseInstallationDirectory() {
     if (busyRef.current) return;
-    if (!catalog?.canBrowse) {
-      setFolderBrowserOpen(true);
-      return;
-    }
-    busyRef.current = true;
-    setBusy(true);
     setError("");
-    try {
-      const result = await request<{ directory: string | null }>(
-        "/server-setup/browse",
-        {},
-      );
-      if (result.directory) setInstallationDirectory(result.directory);
-    } catch (cause) {
-      if (!controller.current.signal.aborted) setError(message(cause));
-    } finally {
-      busyRef.current = false;
-      if (!controller.current.signal.aborted) setBusy(false);
-    }
+    setFolderBrowserOpen(true);
   }
   async function review(event: FormEvent) {
     event.preventDefault();
@@ -740,7 +724,7 @@ export default function NewServerWizard({
       }
       if (check.ready === false)
         throw new Error(
-          "Choose a smaller memory allocation so this PC has RAM available for Windows and other apps.",
+          "Choose a smaller memory allocation so the server PC has RAM available for its operating system and other apps.",
         );
       setWarnings(check.warnings || []);
       if (check.installationDirectory)
@@ -1076,6 +1060,11 @@ export default function NewServerWizard({
                   ? "Your server is ready"
                   : "Setting up your server"}
       </h2>
+      {remoteHost && (
+        <p className="setup-host-context">
+          Server PC: <strong>{remoteHost}</strong>
+        </p>
+      )}
       <p className="setup-intro">
         {step === "source"
           ? "Start with server software or a complete modpack."
@@ -1309,26 +1298,35 @@ export default function NewServerWizard({
               </div>
               {source?.requiresKey && !source.keyConfigured ? (
                 <div className="setup-key">
-                  <p>
-                    Enter your {source.name} API key to browse and install its
-                    modpacks.
-                  </p>
-                  <label className="form-field">
-                    API key
-                    <input
-                      type="password"
-                      value={apiKey}
-                      autoComplete="off"
-                      onChange={(event) => setApiKey(event.target.value)}
-                    />
-                  </label>
-                  <button
-                    className="btn"
-                    onClick={() => void saveKey()}
-                    disabled={busy || !apiKey.trim()}
-                  >
-                    Save key
-                  </button>
+                  {remoteHost ? (
+                    <p>
+                      Ask the owner of {remoteHost} to configure the{" "}
+                      {source.name} API key before browsing its modpacks.
+                    </p>
+                  ) : (
+                    <>
+                      <p>
+                        Enter your {source.name} API key to browse and install
+                        its modpacks.
+                      </p>
+                      <label className="form-field">
+                        API key
+                        <input
+                          type="password"
+                          value={apiKey}
+                          autoComplete="off"
+                          onChange={(event) => setApiKey(event.target.value)}
+                        />
+                      </label>
+                      <button
+                        className="btn"
+                        onClick={() => void saveKey()}
+                        disabled={busy || !apiKey.trim()}
+                      >
+                        Save key
+                      </button>
+                    </>
+                  )}
                 </div>
               ) : !source?.available ? (
                 <p className="setup-empty">
@@ -1609,9 +1607,9 @@ export default function NewServerWizard({
             </div>
             <small>
               {catalog?.hostMemoryMB
-                ? `${(catalog.hostMemoryMB / 1024).toFixed(0)} GB installed on this PC. `
+                ? `${(catalog.hostMemoryMB / 1024).toFixed(0)} GB installed on the server PC. `
                 : ""}
-              Leave memory available for Windows and other apps.
+              Leave memory available for its operating system and other apps.
             </small>
           </div>
           <div className="form-field setup-location-field">
@@ -1648,7 +1646,7 @@ export default function NewServerWizard({
                     className="btn"
                     type="button"
                     disabled={busy}
-                    onClick={() => void browseInstallationDirectory()}
+                    onClick={browseInstallationDirectory}
                   >
                     <FolderOpen size={15} /> Browse
                   </button>
@@ -1656,6 +1654,7 @@ export default function NewServerWizard({
                 {folderBrowserOpen && (
                   <HostDirectoryPicker
                     initialDirectory={installationDirectory}
+                    remoteHost={remoteHost}
                     onClose={() => {
                       setFolderBrowserOpen(false);
                       browseFolderButton.current?.focus();
@@ -1723,7 +1722,7 @@ export default function NewServerWizard({
                     ? javaChoices.requirement
                     : canInstallJava
                       ? `${javaChoices.requirement} is needed for this Minecraft version.`
-                      : `${javaChoices?.requirement || "A compatible Java runtime is required."} Install it on this PC, then select Refresh Java.`}
+                      : `${javaChoices?.requirement || "A compatible Java runtime is required."} Install it on the server PC, then select Refresh Java.`}
             </small>
             {!javaLoading && !selectedJava && canInstallJava && (
               <div className="setup-java-install">

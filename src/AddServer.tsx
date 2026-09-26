@@ -15,6 +15,7 @@ import {
 import { api, post } from "./api";
 import type { ServerRecord } from "./ServerManager";
 import NewServerWizard from "./NewServerWizard";
+import HostDirectoryPicker from "./HostDirectoryPicker";
 import {
   LaunchAdvancedFields,
   LaunchMemoryNote,
@@ -46,24 +47,25 @@ type Inspection = {
   memoryLimitMB?: number;
 };
 type Step = "choice" | "create" | "import";
-type Work = "browse" | "inspect" | "import" | null;
+type Work = "inspect" | "import" | null;
 
 export default function AddServer({
   servers,
   initialStep = "choice",
+  remoteHost,
   onClose,
   onSaved,
 }: {
   servers: ServerRecord[];
   initialStep?: "choice" | "create" | "import";
+  remoteHost?: string;
   onClose: () => void;
   onSaved: (server: ServerRecord) => void;
 }) {
   const [step, setStep] = useState<Step>(initialStep);
   const [wizardLocked, setWizardLocked] = useState(false);
   const wizardClose = useRef<(() => void) | null>(null);
-  const [canBrowse, setCanBrowse] = useState(false);
-  const [browseUnavailable, setBrowseUnavailable] = useState(false);
+  const [folderBrowserOpen, setFolderBrowserOpen] = useState(false);
   const [directory, setDirectory] = useState("");
   const [inspection, setInspection] = useState<Inspection | null>(null);
   const [importName, setImportName] = useState("");
@@ -78,10 +80,14 @@ export default function AddServer({
   const dialog = useRef<HTMLDialogElement>(null);
   const choiceButton = useRef<HTMLButtonElement>(null);
   const directoryInput = useRef<HTMLInputElement>(null);
+  const browseButton = useRef<HTMLButtonElement>(null);
   const inspectedName = useRef<HTMLInputElement>(null);
   const operation = useRef(0);
   const inspectionRequest = useRef<AbortController | null>(null);
-  const locked = wizardLocked || work === "import" || work === "browse";
+  const importRequest = useRef<{ fingerprint: string; id: string } | null>(
+    null,
+  );
+  const locked = wizardLocked || work === "import";
   const freshInspection = inspection?.directory === directory;
   const portConflict = servers.find(
     (server) => server.port === Number(importPort),
@@ -97,18 +103,8 @@ export default function AddServer({
   useEffect(() => {
     const element = dialog.current;
     element?.showModal();
-    const capabilities = new AbortController();
-    void api<{ canBrowse: boolean }>("/server-import", {
-      signal: capabilities.signal,
-    }).then(
-      (result) => setCanBrowse(result.canBrowse),
-      () => {
-        if (!capabilities.signal.aborted) setBrowseUnavailable(true);
-      },
-    );
     return () => {
       operation.current++;
-      capabilities.abort();
       inspectionRequest.current?.abort();
       element?.close();
     };
@@ -129,6 +125,11 @@ export default function AddServer({
   }
   function close() {
     if (locked) return;
+    if (folderBrowserOpen) {
+      setFolderBrowserOpen(false);
+      browseButton.current?.focus();
+      return;
+    }
     cancelInspection();
     onClose();
   }
@@ -138,6 +139,7 @@ export default function AddServer({
     setWork(null);
     setError("");
     setInspection(null);
+    setFolderBrowserOpen(false);
     setStep(next);
   }
   function changeDirectory(value: string) {
@@ -171,36 +173,14 @@ export default function AddServer({
     return "";
   }
 
-  async function browse() {
-    if (work || !canBrowse) return;
-    const request = ++operation.current;
-    setWork("browse");
+  function browse() {
+    if (work) return;
     setError("");
-    try {
-      const result = await post<{ directory: string | null }>(
-        "/server-import/browse",
-      );
-      if (request !== operation.current) return;
-      if (result.directory) {
-        setDirectory(result.directory);
-        setInspection(null);
-        setImportStartup(startupDraft({ jar: "" }));
-      }
-      directoryInput.current?.focus();
-    } catch (cause) {
-      if (request === operation.current)
-        setError(
-          cause instanceof Error
-            ? cause.message
-            : "Unable to browse. Enter the server folder path instead.",
-        );
-    } finally {
-      if (request === operation.current) setWork(null);
-    }
+    setFolderBrowserOpen(true);
   }
 
   async function inspect() {
-    if (work || !directory.trim()) return;
+    if (work || folderBrowserOpen || !directory.trim()) return;
     const enteredDirectory = directory.trim();
     const inspectedDirectory =
       enteredDirectory.startsWith('"') && enteredDirectory.endsWith('"')
@@ -246,7 +226,7 @@ export default function AddServer({
 
   async function importServer(event: FormEvent) {
     event.preventDefault();
-    if (!inspection || !freshInspection || work) return;
+    if (!inspection || !freshInspection || work || folderBrowserOpen) return;
     if (!importName.trim()) {
       setError("Give your server a name.");
       inspectedName.current?.focus();
@@ -270,7 +250,7 @@ export default function AddServer({
     setWork("import");
     setError("");
     try {
-      const result = await post<{ server: ServerRecord }>("/server-import", {
+      const settings = {
         directory: inspection.directory,
         name: importName.trim(),
         ...startupPayload(importStartup),
@@ -278,6 +258,13 @@ export default function AddServer({
           ? { memoryLimitMB: Number(importMemory) }
           : {}),
         port: Number(importPort),
+      };
+      const fingerprint = JSON.stringify(settings);
+      if (importRequest.current?.fingerprint !== fingerprint)
+        importRequest.current = { fingerprint, id: crypto.randomUUID() };
+      const result = await post<{ server: ServerRecord }>("/server-import", {
+        ...settings,
+        requestId: importRequest.current.id,
       });
       if (request === operation.current) onSaved(result.server);
     } catch (cause) {
@@ -337,6 +324,11 @@ export default function AddServer({
             </button>
           </div>
           <h2 id="add-server-title">{title}</h2>
+          {remoteHost && (
+            <p className="setup-host-context">
+              Server PC: <strong>{remoteHost}</strong>
+            </p>
+          )}
           <p className="server-add-intro">
             {step === "choice"
               ? "Start a fresh world or bring the server you already have."
@@ -348,6 +340,7 @@ export default function AddServer({
       {step === "create" && (
         <NewServerWizard
           servers={servers}
+          remoteHost={remoteHost}
           onBack={() => navigate("choice")}
           onClose={close}
           onSaved={onSaved}
@@ -411,7 +404,7 @@ export default function AddServer({
                 id="import-directory"
                 value={directory}
                 onChange={(event) => changeDirectory(event.target.value)}
-                disabled={locked}
+                disabled={locked || folderBrowserOpen}
                 placeholder="C:\Minecraft\My server"
                 autoComplete="off"
                 spellCheck={false}
@@ -422,30 +415,47 @@ export default function AddServer({
                   }
                 }}
               />
-              {canBrowse && (
-                <button
-                  className="btn"
-                  type="button"
-                  disabled={!!work}
-                  onClick={() => void browse()}
-                >
-                  <FolderOpen size={15} />
-                  {work === "browse" ? "Choosing…" : "Browse"}
-                </button>
-              )}
+              <button
+                ref={browseButton}
+                className="btn"
+                type="button"
+                disabled={!!work}
+                onClick={browse}
+              >
+                <FolderOpen size={15} />
+                Browse
+              </button>
             </div>
+            {folderBrowserOpen && (
+              <HostDirectoryPicker
+                purpose="import"
+                remoteHost={remoteHost}
+                initialDirectory={directory}
+                onClose={() => {
+                  setFolderBrowserOpen(false);
+                  browseButton.current?.focus();
+                }}
+                onSelect={(selected) => {
+                  changeDirectory(selected);
+                  setFolderBrowserOpen(false);
+                  browseButton.current?.focus();
+                }}
+              />
+            )}
             <small>
-              {browseUnavailable ? "Folder browsing is unavailable. " : ""}Enter
-              the folder containing your server launcher and existing world. For
-              a server on another PC, open MC Panel on that PC and select its
-              folder there.
+              Choose the folder containing your server launcher and existing
+              world on{" "}
+              {remoteHost
+                ? "the connected server PC"
+                : "the computer running MC Panel"}
+              .
             </small>
           </div>
           <div className="server-import-inspect">
             <button
               className="btn"
               type="button"
-              disabled={!!work || !directory.trim()}
+              disabled={!!work || folderBrowserOpen || !directory.trim()}
               onClick={() => void inspect()}
             >
               <RefreshCw
@@ -654,6 +664,7 @@ export default function AddServer({
               className="btn primary"
               disabled={
                 !!work ||
+                folderBrowserOpen ||
                 !freshInspection ||
                 !validImportLaunch ||
                 !importName.trim() ||

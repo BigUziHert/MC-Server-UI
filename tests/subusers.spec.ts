@@ -58,6 +58,7 @@ async function users(request: APIRequestContext, id: string) {
     id: string;
     email: string;
     permissions: string[];
+    hostPermissions?: string[];
   }[];
 }
 
@@ -94,6 +95,55 @@ test("permission presets select explicit grantable permissions", async ({
       ?.permissions.slice()
       .sort(),
   ).toEqual(catalog.roleDefaults.viewer.slice().sort());
+});
+
+test("only the owner explicitly grants computer access outside server permission presets", async ({
+  page,
+  request,
+  server,
+}) => {
+  const email = "host-creator@example.test";
+  await openSubusers(page, server.id);
+  await page.getByRole("button", { name: "New user", exact: true }).click();
+  const dialog = page.getByRole("dialog");
+  const hostPermission = dialog.getByRole("checkbox", {
+    name: "Create and import servers",
+    exact: true,
+  });
+  await dialog.getByLabel("Email address", { exact: true }).fill(email);
+  await dialog
+    .getByRole("button", { name: "Use Admin preset", exact: true })
+    .click();
+  await expect(hostPermission).not.toBeChecked();
+  await dialog
+    .getByRole("checkbox", { name: "All permissions", exact: true })
+    .uncheck();
+  await dialog
+    .getByRole("checkbox", { name: "All permissions", exact: true })
+    .check();
+  await expect(hostPermission).not.toBeChecked();
+  await hostPermission.check();
+  await dialog
+    .getByRole("button", { name: "Create subuser", exact: true })
+    .click();
+  await expect(dialog).not.toBeVisible();
+  expect(
+    (await users(request, server.id)).find((user) => user.email === email)
+      ?.hostPermissions,
+  ).toEqual(["server.create"]);
+  await page
+    .getByRole("button", { name: `Edit permissions for ${email}`, exact: true })
+    .click();
+  await expect(hostPermission).toBeChecked();
+  await hostPermission.uncheck();
+  await dialog
+    .getByRole("button", { name: "Save permissions", exact: true })
+    .click();
+  await expect(dialog).not.toBeVisible();
+  expect(
+    (await users(request, server.id)).find((user) => user.email === email)
+      ?.hostPermissions,
+  ).toEqual([]);
 });
 
 test("granular subuser permissions persist, edit, and expose accurate mixed group states", async ({

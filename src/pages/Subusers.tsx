@@ -36,6 +36,7 @@ type Subuser = {
   email: string;
   role?: string;
   permissions?: string[];
+  hostPermissions?: string[];
   createdAt: string;
   inviteStatus?: "pending" | "accepted" | "expired" | "not-invited";
   invitedAt?: string;
@@ -593,7 +594,9 @@ export default function Subusers({
   const canCreate = can("user.create");
   const canUpdate = can("user.update");
   const canDelete = can("user.delete");
-  const manageable = (user: Subuser) => permissionsFor(user).every(can);
+  const manageable = (user: Subuser) =>
+    permissionsFor(user).every(can) &&
+    (!remote || !user.hostPermissions?.length);
   const ownAccess = (user: Subuser) =>
     signedInEmail !== undefined &&
     user.email.toLowerCase() === signedInEmail.toLowerCase();
@@ -617,6 +620,7 @@ export default function Subusers({
   const [editor, setEditor] = useState<"create" | Subuser | null>(null);
   const [email, setEmail] = useState("");
   const [selected, setSelected] = useState<string[]>([]);
+  const [allowServerCreation, setAllowServerCreation] = useState(false);
   const [deleting, setDeleting] = useState<Subuser | null>(null);
   const [resetting, setResetting] = useState<Subuser | null>(null);
   const [busy, setBusy] = useState(false);
@@ -708,6 +712,9 @@ export default function Subusers({
     if (user ? !canUpdate || !manageable(user) : !canCreate) return;
     setEmail(user?.email ?? "");
     setSelected(user ? permissionsFor(user) : []);
+    setAllowServerCreation(
+      user?.hostPermissions?.includes("server.create") ?? false,
+    );
     setFormError("");
     setInviteOnCreate(invitationReady);
     setEditor(user ?? "create");
@@ -770,13 +777,23 @@ export default function Subusers({
       } else if (editing) {
         await api(`/subusers/${encodeURIComponent(editing.id)}`, {
           method: "PATCH",
-          body: JSON.stringify({ permissions: selected }),
+          body: JSON.stringify({
+            permissions: selected,
+            ...(!remote
+              ? {
+                  hostPermissions: allowServerCreation ? ["server.create"] : [],
+                }
+              : {}),
+          }),
         });
         notify("Subuser permissions updated. Changes take effect immediately.");
       } else {
         const result = await post<Subuser | { user: Subuser }>("/subusers", {
           email: email.trim(),
           permissions: selected,
+          ...(!remote
+            ? { hostPermissions: allowServerCreation ? ["server.create"] : [] }
+            : {}),
         });
         // Creation has succeeded even if the separate invitation request fails.
         setEditor(null);
@@ -936,6 +953,11 @@ export default function Subusers({
                           {ownAccess(user) && canCreate && (
                             <span>
                               Ask the panel owner to reset your own access.
+                            </span>
+                          )}
+                          {user.hostPermissions?.includes("server.create") && (
+                            <span>
+                              Can create and import servers on this computer
                             </span>
                           )}
                         </div>
@@ -1252,6 +1274,42 @@ export default function Subusers({
                     );
                   })}
                 </fieldset>
+                {!remote && (
+                  <fieldset
+                    className="subusers-permissions subusers-host-permissions"
+                    disabled={busy || !canSubmitRecord}
+                  >
+                    <legend className="subusers-sr-only">
+                      Computer permissions
+                    </legend>
+                    <section
+                      className="subusers-permission-group"
+                      aria-labelledby="permission-group-host"
+                    >
+                      <div className="subusers-group-heading">
+                        <div>
+                          <h3 id="permission-group-host">
+                            Computer permissions
+                          </h3>
+                          <p>
+                            Only the owner of this computer can grant this
+                            access.
+                          </p>
+                        </div>
+                      </div>
+                      <div className="subusers-permission-grid">
+                        <PermissionCheckbox
+                          label="Create and import servers"
+                          description="Browse this computer’s folders, install Java and server software, and fully manage servers they add. Grant only to people you trust with this computer."
+                          checked={allowServerCreation}
+                          onChange={() =>
+                            setAllowServerCreation(!allowServerCreation)
+                          }
+                        />
+                      </div>
+                    </section>
+                  </fieldset>
+                )}
               </>
             )}
             {formError && (
@@ -1269,7 +1327,11 @@ export default function Subusers({
             {!deleting && !resetting && (
               <span>
                 {selected.length}{" "}
-                {selected.length === 1 ? "permission" : "permissions"} selected
+                {selected.length === 1
+                  ? "server permission"
+                  : "server permissions"}{" "}
+                selected
+                {allowServerCreation && " · Computer access enabled"}
               </span>
             )}
             <div>

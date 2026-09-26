@@ -28,6 +28,7 @@ export default defineConfig({
     "subusers.spec.ts",
     "remote-access.spec.ts",
     "remote-permissions.spec.ts",
+    "remote-server-creation.spec.ts",
     "panel-connections.spec.ts",
     "direct-remote.spec.ts",
     "server-customization.spec.ts",

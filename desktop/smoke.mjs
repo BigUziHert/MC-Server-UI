@@ -800,7 +800,7 @@ async function assertOutsideProfile(directory) {
 
 async function importSmokeExisting(page) {
   step(
-    "Importing an existing external folder through the native picker, with cancellation and source preservation checks.",
+    "Importing an existing external folder through the inline host browser, with cancellation and source preservation checks.",
   );
   const directory = path.join(temporaryRoot, "existing-minecraft-server");
   const files = {
@@ -822,7 +822,7 @@ async function importSmokeExisting(page) {
   const capabilities = await browserApi(page, "/server-import");
   assert.equal(capabilities.status, 200);
   assert.equal(capabilities.data.canBrowse, true);
-  await application.evaluate(({ dialog }, directory) => {
+  await application.evaluate(({ dialog }) => {
     globalThis.__panelSmokePicker = {
       original: dialog.showOpenDialog,
       calls: [],
@@ -830,11 +830,9 @@ async function importSmokeExisting(page) {
     dialog.showOpenDialog = async (_window, options) => {
       const calls = globalThis.__panelSmokePicker.calls;
       calls.push({ title: options.title, properties: options.properties });
-      return calls.length === 1
-        ? { canceled: true, filePaths: [] }
-        : { canceled: false, filePaths: [directory] };
+      return { canceled: true, filePaths: [] };
     };
-  }, directory);
+  });
   try {
     await page.getByRole("button", { name: "Add server", exact: true }).click();
     await page
@@ -847,20 +845,36 @@ async function importSmokeExisting(page) {
     });
     const folder = dialog.getByLabel("Server folder", { exact: true });
     await dialog.getByRole("button", { name: "Browse", exact: true }).click();
-    await ui
-      .poll(() =>
-        application.evaluate(() => globalThis.__panelSmokePicker.calls.length),
-      )
-      .toBe(1);
+    const picker = dialog.getByRole("region", {
+      name: "Choose server folder",
+      exact: true,
+    });
+    await ui(picker).toBeVisible();
+    await picker.getByRole("button", { name: "Cancel", exact: true }).click();
+    await ui(picker).not.toBeVisible();
     await ui(folder).toHaveValue("");
     await dialog.getByRole("button", { name: "Browse", exact: true }).click();
+    await picker.getByLabel("Folder path", { exact: true }).fill(directory);
+    await picker.getByRole("button", { name: "Open", exact: true }).click();
+    await ui(
+      picker.getByLabel("New folder name (optional)", { exact: true }),
+    ).toHaveCount(0);
+    await ui(
+      picker.getByRole("button", { name: "Use this folder", exact: true }),
+    ).toBeEnabled();
+    await picker
+      .getByRole("button", { name: "Use this folder", exact: true })
+      .click();
+    await ui(picker).not.toBeVisible();
     await ui(folder).toHaveValue(directory);
     const calls = await application.evaluate(
       () => globalThis.__panelSmokePicker.calls,
     );
-    assert.equal(calls.length, 2);
-    assert.deepEqual(calls[1].properties, ["openDirectory", "dontAddToRecent"]);
-    assert.equal(calls[1].title, "Choose existing Minecraft server folder");
+    assert.equal(
+      calls.length,
+      0,
+      "Import browsing must use the same inline browser as the web panel.",
+    );
     await dialog
       .getByRole("button", { name: "Inspect folder", exact: true })
       .click();
@@ -1166,8 +1180,8 @@ try {
   downloadDirectory = await fs.mkdtemp(
     path.join(outputDirectory, "downloads-"),
   );
-  temporaryRoot = await fs.mkdtemp(
-    path.join(tmpdir(), "mc-panel-desktop-smoke-"),
+  temporaryRoot = await fs.realpath(
+    await fs.mkdtemp(path.join(tmpdir(), "mc-panel-desktop-smoke-")),
   );
   profileDirectory = path.join(temporaryRoot, "profile");
   await fs.mkdir(profileDirectory);
@@ -1417,7 +1431,7 @@ ${processFixture}`,
   );
   await quitPackaged("query-session-end");
   step(
-    `Passed: clean startup, real process start/restart/commands, read-only update status, catalog browser links and blocked external navigation, explicit creation, native folder picker cancellation/import, JAR and NeoForge imports, source/JVM/EULA preservation, isolation, authenticated API, sandboxing, uploads/downloads, backup recovery, persistence, tray close, normal quit, and Windows-session shutdown with owned-process exit. Artifacts: ${outputDirectory}`,
+    `Passed: clean startup, real process start/restart/commands, read-only update status, catalog browser links and blocked external navigation, explicit creation, inline folder browser cancellation/import without native dialogs, JAR and NeoForge imports, source/JVM/EULA preservation, isolation, authenticated API, sandboxing, uploads/downloads, backup recovery, persistence, tray close, normal quit, and Windows-session shutdown with owned-process exit. Artifacts: ${outputDirectory}`,
   );
 } catch (error) {
   failed = true;

@@ -1,5 +1,12 @@
 {
   "version": 1,
+  "hostPermissions": [
+    {
+      "id": "server.create",
+      "label": "Add servers on this computer",
+      "description": "Browse host folders, install software, and create or import servers. Only the local owner can grant this trusted host access."
+    }
+  ],
   "groups": [
     {
       "id": "control",

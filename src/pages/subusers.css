@@ -432,6 +432,9 @@
   margin: 0;
   border: 0;
 }
+.subusers-host-permissions .subusers-permission-grid {
+  grid-template-columns: minmax(0, 1fr);
+}
 .subusers-all-permissions {
   display: flex;
   align-items: center;

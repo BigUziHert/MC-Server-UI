@@ -20,6 +20,34 @@ const failure = (status, message) =>
   Object.assign(new Error(message), { status });
 const read = (req) => ["GET", "HEAD"].includes(req.method);
 
+export function isHostCreationRoute(req) {
+  if (read(req))
+    return (
+      [
+        "/api/server-import",
+        "/api/server-setup",
+        "/api/server-setup/directories",
+        "/api/server-setup/java",
+        "/api/server-setup/versions",
+        "/api/server-setup/launchpad/search",
+        "/api/server-setup/launchpad/versions",
+      ].includes(req.path) ||
+      /^\/api\/server-setup\/java\/jobs\/[^/]+$/.test(req.path) ||
+      /^\/api\/server-setup\/versions\/[^/]+(?:\/[^/]+)?$/.test(req.path)
+    );
+  return (
+    req.method === "POST" &&
+    [
+      "/api/server-import",
+      "/api/server-import/inspect",
+      "/api/server-setup",
+      "/api/server-setup/preflight",
+      "/api/server-setup/java/install",
+      "/api/server-setup/modpack-preview",
+    ].includes(req.path)
+  );
+}
+
 export function requiredPermissions(req) {
   const route = req.path;
   const contentChanges = [
@@ -143,6 +171,11 @@ export function requiredPermissions(req) {
 
 function preventEscalation(req, runtime, permissions, email) {
   if (!req.path.startsWith("/api/subusers") || read(req)) return;
+  if (Object.hasOwn(req.body ?? {}, "hostPermissions"))
+    throw failure(
+      403,
+      "Only the local panel owner can change host permissions.",
+    );
   let targetId;
   try {
     targetId = decodeURIComponent(req.path.split("/")[3] ?? "");
@@ -152,6 +185,11 @@ function preventEscalation(req, runtime, permissions, email) {
   const target = targetId
     ? runtime.subusers().find((user) => user.id === targetId)
     : null;
+  if (target?.hostPermissions?.length)
+    throw failure(
+      403,
+      "Only the local panel owner can manage a user with host permissions.",
+    );
   if (
     req.method === "POST" &&
     req.path.endsWith("/invite") &&
@@ -180,6 +218,7 @@ export function createRemoteGateway({
   distDir,
   accepted,
   localAddresses = localNetworkAddresses,
+  hostApp,
 }) {
   const app = express();
   app.disable("x-powered-by");
@@ -304,6 +343,11 @@ export function createRemoteGateway({
         )
         .map((user) => ({ serverId, user, runtime })),
     );
+    const hostPermissions = memberships.some(({ user }) =>
+      user.hostPermissions?.includes("server.create"),
+    )
+      ? ["server.create"]
+      : [];
     if (req.path === "/api/servers" && read(req)) {
       const servers = memberships.map(({ serverId, user, runtime }) => {
         const d = runtime.descriptor();
@@ -312,6 +356,7 @@ export function createRemoteGateway({
           name: d.name,
           status: d.status,
           address: d.address,
+          port: d.port,
           software: d.software,
           version: d.version,
           minecraftVersion: d.minecraftVersion,
@@ -321,10 +366,20 @@ export function createRemoteGateway({
       });
       return res.json({
         servers,
+        hostPermissions,
         defaultServerId: servers.some((s) => s.id === session.serverId)
           ? session.serverId
           : (servers[0]?.id ?? null),
       });
+    }
+    if (isHostCreationRoute(req)) {
+      if (!hostApp || !hostPermissions.includes("server.create"))
+        throw failure(
+          403,
+          "The panel owner must grant permission to add servers on this computer.",
+        );
+      req[remotePrincipal] = { ...session, hostPermissions };
+      return requestActor.run(session.email, () => hostApp(req, res, next));
     }
     const header = req.headers["x-server-id"],
       query = req.query.serverId;

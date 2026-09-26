@@ -305,6 +305,8 @@ export default function App({
     : "mc-panel.active-server";
   const [connection, setConnection] = useState<ConnectionMode | null>(null);
   const [servers, setServers] = useState<ServerRecord[]>([]);
+  const [hostPermissions, setHostPermissions] = useState<string[]>([]);
+  const canAddServer = !remote || hostPermissions.includes("server.create");
   const [activeId, setActiveId] = useState(() => {
     try {
       return localStorage.getItem(selectionKey) || session?.serverId || "";
@@ -348,6 +350,7 @@ export default function App({
           fleetApi<{
             servers: ServerRecord[];
             defaultServerId: string | null;
+            hostPermissions?: string[];
           }>("/servers", { signal: AbortSignal.timeout(10_000) }),
           !remote && desktopSelection.current === null
             ? fleetApi<{ desktop: boolean; activeServerId: string | null }>(
@@ -403,6 +406,7 @@ export default function App({
           persistedSelection.current = selection?.activeServerId ?? "";
         }
         setServers(result.servers);
+        setHostPermissions(result.hostPermissions ?? []);
         const nativePreferred = nativeSelection.current;
         nativeSelection.current = null;
         setActiveId((current) => {
@@ -499,6 +503,9 @@ export default function App({
       fleetInFlight.current = false;
     };
   }, [loadServers]);
+  useEffect(() => {
+    if (!canAddServer) setManager(null);
+  }, [canAddServer]);
   useEffect(() => {
     try {
       if (activeId) localStorage.setItem(selectionKey, activeId);
@@ -597,9 +604,9 @@ export default function App({
             }}
             onConnect={setConnection}
             onAdd={
-              remote
-                ? undefined
-                : () => setManager({ editing: null, initialStep: "choice" })
+              canAddServer
+                ? () => setManager({ editing: null, initialStep: "choice" })
+                : undefined
             }
             onSettings={
               remote
@@ -649,6 +656,7 @@ export default function App({
       ) : (
         <EmptyFleet
           session={session}
+          canAddServer={canAddServer}
           onSignedOut={expireSession}
           onConnect={setConnection}
           onAdd={(initialStep) =>
@@ -667,9 +675,10 @@ export default function App({
           }}
         />
       )}
-      {!remote && manager && (
+      {manager && canAddServer && (!remote || !manager.editing) && (
         <ServerManager
           editing={manager.editing}
+          remoteHost={remote ? window.location.host : undefined}
           initialStep={manager.initialStep}
           servers={servers}
           onClose={() => setManager(null)}
@@ -698,11 +707,13 @@ export default function App({
 
 function EmptyFleet({
   onAdd,
+  canAddServer,
   onConnect,
   session,
   onSignedOut,
 }: {
   onAdd: (step: "create" | "import") => void;
+  canAddServer: boolean;
   onConnect: (mode: ConnectionMode) => void;
   session?: PanelSession;
   onSignedOut?: () => void;
@@ -741,11 +752,13 @@ function EmptyFleet({
               {session ? "No shared servers" : "Welcome to MC Panel"}
             </h1>
             <p>
-              {session
+              {session && !canAddServer
                 ? "Your access may have been removed. Ask the server owner for a new invitation."
-                : "Start a new Minecraft server, or bring one you already have."}
+                : session
+                  ? `Create or import a server on ${window.location.host}.`
+                  : "Start a new Minecraft server, or bring one you already have."}
             </p>
-            {!session && (
+            {canAddServer && (
               <div className="fleet-welcome-choices">
                 <button
                   className="fleet-welcome-choice"
@@ -776,7 +789,8 @@ function EmptyFleet({
                   <span>
                     <strong>Import an existing server</strong>
                     <span id="welcome-import-description">
-                      Connect a server folder on your computer.
+                      Connect a server folder on{" "}
+                      {session ? "the connected computer" : "your computer"}.
                     </span>
                   </span>
                   <ArrowRight size={19} />

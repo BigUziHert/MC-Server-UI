@@ -391,6 +391,7 @@ export function ServerSwitcher({
 
 type ServerManagerProps = {
   editing: ServerRecord | null;
+  remoteHost?: string;
   initialStep?: "choice" | "create" | "import";
   servers: ServerRecord[];
   onClose: () => void;
@@ -403,6 +404,7 @@ export default function ServerManager(props: ServerManagerProps) {
     <ServerSettings {...props} editing={props.editing} />
   ) : (
     <AddServer
+      remoteHost={props.remoteHost}
       initialStep={props.initialStep}
       servers={props.servers}
       onClose={props.onClose}

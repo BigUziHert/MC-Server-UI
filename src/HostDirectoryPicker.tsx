@@ -20,10 +20,14 @@ type Listing = {
 
 export default function HostDirectoryPicker({
   initialDirectory,
+  purpose = "installation",
+  remoteHost,
   onSelect,
   onClose,
 }: {
   initialDirectory: string;
+  purpose?: "installation" | "import";
+  remoteHost?: string;
   onSelect: (directory: string) => void;
   onClose: () => void;
 }) {
@@ -37,6 +41,7 @@ export default function HostDirectoryPicker({
   const [error, setError] = useState("");
   const [refresh, setRefresh] = useState(0);
   const navigation = useRef(0);
+  const addressEdited = useRef(false);
   const heading = useRef<HTMLHeadingElement>(null);
   useEffect(() => {
     heading.current?.focus();
@@ -58,7 +63,7 @@ export default function HostDirectoryPicker({
       .then((result) => {
         if (!current()) return;
         setListing(result);
-        setAddress(result.directory || "");
+        if (!addressEdited.current) setAddress(result.directory || "");
       })
       .catch((cause) => {
         if (current())
@@ -74,6 +79,8 @@ export default function HostDirectoryPicker({
     // passive-effect reset leaves its name input usable briefly and can erase
     // a name entered before the next listing arrives.
     navigation.current++;
+    addressEdited.current = false;
+    setAddress(directory || "");
     setLoading(true);
     setError("");
     setListing(null);
@@ -109,9 +116,15 @@ export default function HostDirectoryPicker({
       <div className="host-folder-heading">
         <div>
           <h3 id="host-folder-title" ref={heading} tabIndex={-1}>
-            Choose installation folder
+            {purpose === "import"
+              ? "Choose server folder"
+              : "Choose installation folder"}
           </h3>
-          <p>Folders on the computer running MC Panel</p>
+          <p>
+            {remoteHost
+              ? `Folders on ${remoteHost}`
+              : "Folders on the computer running MC Panel"}
+          </p>
         </div>
         <button
           type="button"
@@ -143,7 +156,10 @@ export default function HostDirectoryPicker({
           id="host-folder-address"
           value={address}
           placeholder="Enter a folder path"
-          onChange={(event) => setAddress(event.target.value)}
+          onChange={(event) => {
+            addressEdited.current = true;
+            setAddress(event.target.value);
+          }}
           onKeyDown={(event) => {
             if (event.key === "Enter") {
               event.preventDefault();
@@ -199,7 +215,9 @@ export default function HostDirectoryPicker({
         ) : (
           <p>
             {listing?.directory
-              ? "No subfolders. You can use this folder or name a new folder below."
+              ? purpose === "import"
+                ? "No subfolders. You can select this folder."
+                : "No subfolders. You can use this folder or name a new folder below."
               : "No available drives were found. Enter a folder path above."}
           </p>
         )}
@@ -212,29 +230,34 @@ export default function HostDirectoryPicker({
       )}
       {listing?.directory && !loading && !error && (
         <>
-          <label className="host-folder-address" htmlFor="host-new-folder">
-            New folder name (optional)
-          </label>
-          <input
-            id="host-new-folder"
-            value={newFolder}
-            placeholder="For example, Survival"
-            onChange={(event) => setNewFolder(event.target.value)}
-            aria-invalid={invalidName}
-            onKeyDown={(event) => {
-              if (event.key === "Enter") event.preventDefault();
-            }}
-          />
-          {invalidName && (
-            <p role="alert" className="host-folder-note">
-              Enter a valid folder name without path separators or reserved
-              characters.
-            </p>
+          {purpose === "installation" && (
+            <>
+              <label className="host-folder-address" htmlFor="host-new-folder">
+                New folder name (optional)
+              </label>
+              <input
+                id="host-new-folder"
+                value={newFolder}
+                placeholder="For example, Survival"
+                onChange={(event) => setNewFolder(event.target.value)}
+                aria-invalid={invalidName}
+                onKeyDown={(event) => {
+                  if (event.key === "Enter") event.preventDefault();
+                }}
+              />
+              {invalidName && (
+                <p role="alert" className="host-folder-note">
+                  Enter a valid folder name without path separators or reserved
+                  characters.
+                </p>
+              )}
+            </>
           )}
           <p className="host-folder-selected">{selected}</p>
           <p className="host-folder-note">
-            The installation folder must be empty. A new folder is created only
-            after you confirm installation.
+            {purpose === "import"
+              ? "Choose the existing folder containing your server launcher and world. Selecting it does not change its files."
+              : "The installation folder must be empty. A new folder is created only after you confirm installation."}
           </p>
         </>
       )}

@@ -368,6 +368,12 @@
 .setup-java-install small {
   overflow-wrap: anywhere;
 }
+.setup-host-context {
+  margin: 0 0 12px;
+  color: var(--muted);
+  font-size: 13px;
+  overflow-wrap: anywhere;
+}
 .setup-java-header label {
   margin-bottom: 0;
 }
