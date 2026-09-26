@@ -33,6 +33,7 @@ import {
 } from "./external-links.mjs";
 import updaterPackage from "electron-updater";
 import { applyDownloadedUpdate, createUpdateController } from "./updates.mjs";
+import { createUpdatesWindow } from "./updates-window.mjs";
 
 const { autoUpdater } = updaterPackage;
 
@@ -65,6 +66,7 @@ let updateTimer;
 let initialUpdateTimer;
 let remotePanels;
 let removeConnectionIpc;
+let updatesWindow;
 
 async function logError(cause) {
   const message =
@@ -307,10 +309,9 @@ function createTray() {
         : "Updates require the Setup edition",
       enabled: updates?.snapshot().supported === true,
       click: () => {
-        remotePanels?.activate("local");
         showWindow();
         updates?.check();
-        window?.webContents.send("mc-panel-updates-open");
+        void updatesWindow?.open().catch(logError);
       },
     },
     { label: "Help and documentation", click: () => void openWebsite() },
@@ -431,6 +432,14 @@ async function launch() {
     },
   });
   window.setMenu(null);
+  updatesWindow = createUpdatesWindow({
+    BrowserWindow,
+    parent: window,
+    origin: runtime.url,
+    session: panelSession,
+    icon: path.join(desktopDir, "assets", "icon.ico"),
+  });
+  window.on("closed", () => updatesWindow?.close());
   remotePanels = createRemotePanelController({
     window,
     localOrigin: runtime.url,
@@ -440,6 +449,7 @@ async function launch() {
     downloadsDirectory: app.getPath("downloads"),
     preload: path.join(desktopDir, "connections-preload.cjs"),
     openWebsite,
+    openUpdatesWindow: () => updatesWindow.open(),
     remoteFrontend: await createRemoteFrontend({
       directory: path.join(desktopDir, "../dist"),
     }),

@@ -137,6 +137,7 @@ export function createRemotePanelController({
   preload,
   remoteFrontend,
   openWebsite = () => {},
+  openUpdatesWindow,
   listLocalServers = () => [],
   selectLocalServer,
   store,
@@ -354,22 +355,15 @@ export function createRemotePanelController({
     activate,
     openUpdates() {
       ensureOpen();
-      const contents = local.contents;
-      if (
-        !controller.isManagedSender({
-          sender: contents,
-          senderFrame: contents.mainFrame,
-        }) ||
-        contents.isLoadingMainFrame()
-      )
+      if (!openUpdatesWindow)
         throw failure(
-          409,
-          "The local panel is not ready to show app updates. Try again shortly.",
+          503,
+          "The app updates window is unavailable. Try again shortly.",
         );
       // Remote pages can open the trusted local UI, but cannot read updater
-      // state or start a check, download, or install through this bridge.
-      activate(local.id);
-      contents.send("mc-panel-updates-open");
+      // state or start a check, download, or install through this bridge. The
+      // active connection and its persisted selection stay exactly as they are.
+      return openUpdatesWindow();
     },
     reportServers(event, value) {
       if (!controller.isManagedSender(event))

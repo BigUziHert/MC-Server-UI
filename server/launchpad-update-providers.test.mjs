@@ -361,12 +361,16 @@ test("missing or invalid later responses cannot overwrite a previously discovere
   assert.match(missingCurrent.warnings.join(" "), /404/);
 });
 
-test("an eight-second batch budget covers both update and current-version requests without cooling down unrelated projects", async (t) => {
+test("bulk update and current-version verification have independent request deadlines", async (t) => {
   const timeout = AbortSignal.timeout.bind(AbortSignal);
   const budgets = [];
+  const deadlines = new Map();
   t.mock.method(AbortSignal, "timeout", (milliseconds) => {
     budgets.push(milliseconds);
-    return timeout(milliseconds === 8000 ? 20 : milliseconds);
+    if (![4000, 8000].includes(milliseconds)) return timeout(milliseconds);
+    const controller = new AbortController();
+    deadlines.set(milliseconds, controller);
+    return controller.signal;
   });
   let calls = 0;
   const signals = [];
@@ -375,29 +379,203 @@ test("an eight-second batch budget covers both update and current-version reques
     calls++;
     signals.push(options.signal);
     if (url.endsWith("/update")) return json({ [row.sha512]: raw(row) });
-    return new Promise((resolve, reject) => {
-      const timer = setTimeout(
-        () => reject(new Error("Timeout was not forwarded")),
-        1000,
-      );
-      options.signal.addEventListener(
-        "abort",
-        () => {
-          clearTimeout(timer);
-          reject(options.signal.reason);
-        },
-        { once: true },
-      );
-    });
+    deadlines
+      .get(4000)
+      .abort(new DOMException("Earlier bulk deadline", "TimeoutError"));
+    options.signal.throwIfAborted();
+    return json([current(row)]);
   });
   const result = await p.updates(input, [row]);
-  assert.deepEqual(budgets, [8000, 60000, 60000]);
-  assert.ok(signals.every((signal) => signal.aborted));
-  assert.equal(signals[0].reason, signals[1].reason);
-  assert.deepEqual(result.updates, {});
-  assert.match(result.warnings[0], /took too long/);
-  await p.updates(input, [row]);
-  assert.equal(calls, 4, "timeouts do not poison the next attempt");
+  assert.ok(budgets.includes(4000));
+  assert.ok(budgets.includes(8000));
+  assert.notEqual(signals[0], signals[1]);
+  assert.equal(result.updates[row.sha512].id, raw(row).id);
+  assert.deepEqual(result.warnings, []);
+  assert.equal(calls, 2);
+});
+
+test("220 installed mods recover from failed hash POSTs using bounded cached GET project histories", async (t) => {
+  let now = Date.now(),
+    posts = 0,
+    reads = 0,
+    active = 0,
+    peak = 0;
+  t.mock.method(Date, "now", () => now);
+  const rows = Array.from({ length: 220 }, (_, index) => item(index));
+  const p = provider(async (url, options) => {
+    if (options.method === "POST") {
+      posts++;
+      return new Response("gateway unavailable", { status: 502 });
+    }
+    const parsed = new URL(url);
+    const project = parsed.pathname.match(
+      /^\/v2\/project\/project(\d+)\/version$/,
+    );
+    assert.ok(project, `Expected only metadata GET: ${url}`);
+    assert.equal(parsed.searchParams.get("include_changelog"), "false");
+    assert.deepEqual(JSON.parse(parsed.searchParams.get("loaders")), [
+      "neoforge",
+    ]);
+    assert.deepEqual(JSON.parse(parsed.searchParams.get("game_versions")), [
+      "1.21.1",
+    ]);
+    reads++;
+    peak = Math.max(peak, ++active);
+    await delay(1);
+    active--;
+    const row = rows[Number(project[1])];
+    return json([current(row), raw(row)]);
+  });
+  const result = await p.updates(input, rows);
+  assert.equal(Object.keys(result.updates).length, 220);
+  assert.ok(rows.every((row) => result.updates[row.sha512].id === raw(row).id));
+  assert.deepEqual(result.issues, {});
+  assert.deepEqual(result.warnings, []);
+  assert.ok(
+    posts <= 2,
+    "queued batches stop retrying the failing POST endpoint",
+  );
+  assert.equal(reads, 220);
+  assert.ok(peak <= 6);
+  await p.updates({ ...input, refresh: true }, rows);
+  assert.equal(reads, 220, "repeated Refresh reuses recent project histories");
+  now += 30001;
+  await p.updates(input, [rows[0]]);
+  assert.equal(
+    reads,
+    221,
+    "mutable project history is checked again after its short expiry",
+  );
+});
+
+test("GET recovery verifies an installed release outside the filtered history and rejects forged metadata", async () => {
+  const row = item(0);
+  for (const scenario of [
+    "valid",
+    "wrong-current-project",
+    "wrong-current-hash",
+    "wrong-project",
+    "wrong-loader",
+    "client-only",
+    "unsafe-download",
+    "invalid-date",
+    "older",
+  ]) {
+    let candidate = raw(row),
+      installed = current(row),
+      currentReads = 0;
+    if (scenario === "wrong-current-project") installed.project_id = "other";
+    if (scenario === "wrong-current-hash") installed.files = raw(row).files;
+    if (scenario === "wrong-project") candidate.project_id = "other";
+    if (scenario === "wrong-loader") candidate.loaders = ["fabric"];
+    if (scenario === "client-only") candidate.environment = "client_only";
+    if (scenario === "unsafe-download")
+      candidate.files[0].url = "https://untrusted.example/mod.jar";
+    if (scenario === "invalid-date") candidate.date_published = "invalid";
+    if (scenario === "older") candidate.date_published = "2026-01-01T00:00:00Z";
+    const p = provider(async (url, options) => {
+      if (options.method === "POST")
+        return new Response("gateway", { status: 503 });
+      if (url.includes("/project/")) return json([candidate]);
+      assert.equal(new URL(url).pathname, "/v2/version/old0");
+      currentReads++;
+      return json(installed);
+    });
+    const result = await p.updates(input, [row]);
+    if (scenario === "valid") {
+      assert.equal(result.updates[row.sha512].id, candidate.id);
+      assert.equal(currentReads, 1);
+      assert.deepEqual(result.warnings, []);
+    } else if (scenario === "older") {
+      assert.equal(result.updates[row.sha512], null);
+      assert.deepEqual(result.issues, {});
+    } else {
+      assert.deepEqual(result.updates, {}, scenario);
+      assert.ok(result.issues[row.sha512], scenario);
+    }
+  }
+});
+
+test("successful primary update batches survive a neighboring fallback failure", async () => {
+  const rows = Array.from({ length: 201 }, (_, index) => item(index));
+  const byHash = new Map(rows.map((row) => [row.sha512, row]));
+  const p = provider(async (url, options) => {
+    if (options.method === "POST") {
+      const hashes = JSON.parse(options.body).hashes;
+      if (hashes.includes(rows[0].sha512))
+        return json(
+          Object.fromEntries(
+            hashes.map((value) => [value, current(byHash.get(value))]),
+          ),
+        );
+      return new Response("gateway", { status: 502 });
+    }
+    const index = Number(new URL(url).pathname.match(/project(\d+)/)[1]);
+    if (index === 100) return new Response("not found", { status: 404 });
+    return json([current(rows[index]), raw(rows[index])]);
+  });
+  const result = await p.updates(input, rows);
+  for (const row of rows.slice(0, 100))
+    assert.equal(result.updates[row.sha512], null);
+  assert.equal(Object.keys(result.updates).length, 200);
+  assert.equal(Object.hasOwn(result.updates, rows[100].sha512), false);
+  assert.match(result.issues[rows[100].sha512], /404/);
+  assert.equal(result.updates[rows[200].sha512].id, raw(rows[200]).id);
+});
+
+test("failed GET checks briefly cache only affected file scopes without extending the retry deadline", async (t) => {
+  let now = Date.now(),
+    requests = 0,
+    failing = true;
+  t.mock.method(Date, "now", () => now);
+  const p = provider(async (url, options) => {
+    requests++;
+    if (options.method === "POST")
+      return new Response("gateway", { status: 502 });
+    const index = Number(new URL(url).pathname.match(/project(\d+)/)[1]);
+    if (failing && index === 0)
+      return new Response("unavailable", { status: 503 });
+    return json([current(item(index))]);
+  });
+  const first = await p.updates(input, [item(0)]);
+  assert.deepEqual(first.updates, {});
+  assert.match(first.issues[item(0).sha512], /503/);
+  const afterFailure = requests;
+  now += 15000;
+  const cached = await p.updates({ ...input, refresh: true }, [item(0)]);
+  assert.deepEqual(cached.updates, {});
+  assert.equal(requests, afterFailure);
+  assert.deepEqual((await p.updates(input, [item(1)])).updates, {
+    [item(1).sha512]: null,
+  });
+  failing = false;
+  now += 15001;
+  const recovered = await p.updates(input, [item(0)]);
+  assert.deepEqual(recovered.updates, { [item(0).sha512]: null });
+  assert.deepEqual(recovered.warnings, []);
+  assert.equal(requests, afterFailure + 2);
+});
+
+test("unverified current-version GET metadata is never retained as a trusted cached identity", async () => {
+  const row = item(0);
+  let mismatched = true,
+    currentReads = 0;
+  const p = provider(async (url, options) => {
+    if (options.method === "POST")
+      return new Response("gateway", { status: 502 });
+    if (url.includes("/project/")) return json([raw(row)]);
+    currentReads++;
+    return json(
+      mismatched ? current(row, { files: raw(row).files }) : current(row),
+    );
+  });
+  const first = await p.updates(input, [row]);
+  assert.deepEqual(first.updates, {});
+  assert.match(first.issues[row.sha512], /checksum/);
+  mismatched = false;
+  const recovered = await p.updates(input, [row]);
+  assert.equal(recovered.updates[row.sha512].id, raw(row).id);
+  assert.equal(currentReads, 2);
 });
 
 test("caller cancellation aborts in-flight batch requests, skips queued batches, and does not impose provider cooldown", async () => {
@@ -442,7 +620,7 @@ for (const stalled of ["request", "response body"])
     const timeout = AbortSignal.timeout.bind(AbortSignal);
     t.mock.method(AbortSignal, "timeout", (milliseconds) => {
       if (milliseconds === 60000) return timeout(milliseconds);
-      assert.equal(milliseconds, 8000);
+      assert.ok([4000, 8000].includes(milliseconds));
       const controller = new AbortController();
       deadlines.push(controller);
       return controller.signal;
@@ -456,10 +634,15 @@ for (const stalled of ["request", "response body"])
     const ready = new Promise((resolve) => {
       entered = resolve;
     });
-    const p = provider(async () => {
+    const p = provider(async (url) => {
       calls++;
       if (calls === 2) entered();
-      if (!failing) return json({});
+      if (!failing) {
+        const project = new URL(url).pathname.match(
+          /\/project\/project(\d+)\/version/,
+        );
+        return project ? json([current(item(Number(project[1])))]) : json({});
+      }
       if (stalled === "request")
         return new Promise((resolve, reject) => lateFailures.push(reject));
       return new Response(
@@ -482,28 +665,25 @@ for (const stalled of ["request", "response body"])
         new DOMException("Batch deadline reached", "TimeoutError"),
       );
     const results = await Promise.all([first, queued]);
-    assert.equal(calls, 3, "the queued unrelated project gets its own attempt");
-    assert.ok(
-      results.every((result) => Object.keys(result.updates).length === 0),
+    assert.equal(
+      calls,
+      104,
+      "both failed batches and the queued project recover using bounded GET reads",
     );
-    assert.match(results[0].warnings.join(" "), /took too long/);
-    assert.deepEqual(results[1].warnings, []);
+    assert.equal(Object.keys(results[0].updates).length, 101);
+    assert.deepEqual(results[1].updates, { [item(200).sha512]: null });
+    assert.ok(results.every((result) => result.warnings.length === 0));
     failing = false;
     now += 30_001;
     const retry = await p.updates(input, [item(201)]);
-    assert.deepEqual(retry.updates, {});
+    assert.deepEqual(retry.updates, { [item(201).sha512]: null });
     assert.deepEqual(retry.warnings, []);
-    assert.match(
-      retry.issues[item(201).sha512],
-      /did not return an update result/,
-    );
-    assert.equal(calls, 4);
+    assert.deepEqual(retry.issues, {});
+    assert.equal(calls, 105);
     for (const reject of lateFailures)
       reject(new Error("Late uncooperative network failure"));
     await delay(0);
-    assert.ok(
-      results.every((result) => Object.keys(result.updates).length === 0),
-    );
+    assert.equal(Object.keys(results[0].updates).length, 101);
   });
 
 test("caller cancellation releases uncooperative update requests so the next caller can use both lanes immediately", async () => {
@@ -593,15 +773,17 @@ test("Quilt mod compatibility uses Fabric in update requests and catalog validat
   );
 });
 
-test("a failed update batch gives every affected file a reason and does not poison a later project", async () => {
+test("a failed fallback gives the affected file a reason without blocking a later project", async () => {
   let failed = true;
-  const p = provider(async (_url, options) => {
+  const p = provider(async (url, options) => {
     if (failed) {
       failed = false;
       return new Response("bad", { status: 503 });
     }
-    const hashes = JSON.parse(options.body).hashes;
-    return json({ [hashes[0]]: current(item(1)) });
+    if (url.includes("/project/project0/"))
+      return new Response("bad", { status: 503 });
+    if (url.includes("/project/project1/")) return json([current(item(1))]);
+    assert.fail(`Unexpected fallback request: ${url}`);
   });
   const first = await p.updates(input, [item(0)]);
   assert.match(first.issues[item(0).sha512], /503/);

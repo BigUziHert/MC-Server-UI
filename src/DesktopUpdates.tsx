@@ -71,20 +71,41 @@ function RemoteUpdates() {
   );
 }
 
-function LocalUpdates() {
+export function DesktopUpdatesWindow() {
+  return <LocalUpdates standalone />;
+}
+
+function LocalUpdates({ standalone = false }: { standalone?: boolean }) {
   const [state, setState] = useState<UpdateState | null>(null);
-  const [open, setOpen] = useState(false);
+  const [open, setOpen] = useState(standalone);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
+  const [loadError, setLoadError] = useState("");
   const dialog = useRef<HTMLDialogElement>(null);
+  const close = () => {
+    if (standalone) window.close();
+    else setOpen(false);
+  };
   useEffect(() => {
     let active = true;
     const refresh = () =>
       api<UpdateState>("/desktop/updates")
         .then((next) => {
-          if (active && next.desktop) setState(next);
+          if (!active) return;
+          if (next.desktop) {
+            setState(next);
+            setLoadError("");
+          } else if (standalone)
+            setLoadError("App updates are only available in MC Panel desktop.");
         })
-        .catch(() => {});
+        .catch((cause) => {
+          if (active && standalone)
+            setLoadError(
+              cause instanceof Error
+                ? cause.message
+                : "Unable to contact the updater.",
+            );
+        });
     void refresh();
     const showUpdates = () => {
       setOpen(true);
@@ -97,7 +118,7 @@ function LocalUpdates() {
       clearInterval(timer);
       window.removeEventListener("mc-panel-updates-open", showUpdates);
     };
-  }, [open]);
+  }, [open, standalone]);
   useEffect(() => {
     if (open) dialog.current?.showModal();
     else dialog.current?.close();
@@ -133,27 +154,30 @@ function LocalUpdates() {
       setBusy(false);
     }
   }
-  if (!state) return null;
+  if (!state && !standalone) return null;
   const working =
-    busy || ["checking", "downloading", "installing"].includes(state.status);
-  const ready = ["available", "downloaded"].includes(state.status);
+    busy ||
+    ["checking", "downloading", "installing"].includes(state?.status || "");
+  const ready = ["available", "downloaded"].includes(state?.status || "");
   return (
     <>
-      <button
-        className={`help-button update-button ${ready ? "update-ready" : ""}`}
-        onClick={() => setOpen(true)}
-        aria-label="App updates"
-      >
-        <ArrowDownToLine size={16} />
-        <span>{ready ? "Update available" : "Updates"}</span>
-      </button>
+      {!standalone && (
+        <button
+          className={`help-button update-button ${ready ? "update-ready" : ""}`}
+          onClick={() => setOpen(true)}
+          aria-label="App updates"
+        >
+          <ArrowDownToLine size={16} />
+          <span>{ready ? "Update available" : "Updates"}</span>
+        </button>
+      )}
       <dialog
         className="updates-dialog"
         ref={dialog}
         aria-labelledby="updates-title"
         onCancel={(event) => {
           event.preventDefault();
-          setOpen(false);
+          close();
         }}
       >
         <div className="updates-heading">
@@ -161,33 +185,39 @@ function LocalUpdates() {
           <button
             className="btn icon"
             aria-label="Close app updates"
-            onClick={() => setOpen(false)}
+            onClick={close}
           >
             <X size={18} />
           </button>
         </div>
         <p>Get the latest tested build from the dev branch.</p>
-        <dl className="updates-versions">
-          <div>
-            <dt>Installed version</dt>
-            <dd>{state.version}</dd>
-          </div>
-          <div>
-            <dt>Update channel</dt>
-            <dd>{state.channel === "dev" ? "Dev" : state.channel}</dd>
-          </div>
-          {state.availableVersion && (
+        {state && (
+          <dl className="updates-versions">
             <div>
-              <dt>Available version</dt>
-              <dd>{state.availableVersion}</dd>
+              <dt>Installed version</dt>
+              <dd>{state.version}</dd>
             </div>
-          )}
-        </dl>
+            <div>
+              <dt>Update channel</dt>
+              <dd>{state.channel === "dev" ? "Dev" : state.channel}</dd>
+            </div>
+            {state.availableVersion && (
+              <div>
+                <dt>Available version</dt>
+                <dd>{state.availableVersion}</dd>
+              </div>
+            )}
+          </dl>
+        )}
         <p className="updates-message" role="status">
-          {state.message ||
-            "Check for a new build. Your server files and settings are kept when you update."}
+          {state
+            ? state.message ||
+              "Check for a new build. Your server files and settings are kept when you update."
+            : loadError
+              ? "Waiting for the local updater to respond…"
+              : "Loading app updates…"}
         </p>
-        {state.status === "downloading" && (
+        {state?.status === "downloading" && (
           <div className="update-progress">
             <progress
               max={100}
@@ -197,22 +227,22 @@ function LocalUpdates() {
             <span>{Math.round(state.progress ?? 0)}%</span>
           </div>
         )}
-        {state.status === "downloaded" && (
+        {state?.status === "downloaded" && (
           <p>
             Installing restarts MC Panel. Running servers will be stopped after
             active backups finish. Start them again after the update.
           </p>
         )}
-        {error && (
+        {(error || loadError) && (
           <p role="alert" className="form-error">
-            {error}
+            {error || loadError}
           </p>
         )}
         <div className="updates-actions">
-          <button className="btn" onClick={() => setOpen(false)}>
+          <button className="btn" onClick={close}>
             Close
           </button>
-          {state.supported &&
+          {state?.supported &&
             (state.status === "available" ? (
               <button
                 className="btn primary"

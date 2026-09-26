@@ -228,7 +228,12 @@ export async function createLaunchpad(ctx) {
   const key = async () =>
     (await ctx.platformConfig?.get?.())?.curseforgeApiKey ?? null;
   const providers = [
-    ...createCoreProviders({ fetch: request, key }),
+    ...createCoreProviders({
+      fetch: request,
+      recoveryFetch: rawRequest,
+      lifetimeSignal: lifetime.signal,
+      key,
+    }),
     ...(ctx.extraProviders ?? []),
   ];
   // Fleet onboarding can browse every provider before any server exists.
@@ -1219,7 +1224,9 @@ export async function createLaunchpad(ctx) {
         const warnings = [...scanWarnings];
         const signal = AbortSignal.any([
           lifetime.signal,
-          AbortSignal.timeout(enabled(input.refresh) ? 90000 : 30000),
+          // GET recovery may span a provider rate-limit window. Local results
+          // are already visible, and polling joins this bounded background job.
+          AbortSignal.timeout(90000),
         ]);
         try {
           await installedDetails({ ...input, signal }, items, warnings);

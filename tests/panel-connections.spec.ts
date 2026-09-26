@@ -150,8 +150,6 @@ async function desktopBridge(
             );
           }
           calls.push({ action: "openUpdates", value: "local" });
-          state.activeId = "local";
-          changed();
         },
         disconnect: async (id) => {
           calls.push({ action: "disconnect", value: id });
@@ -234,7 +232,8 @@ for (const empty of [false, true]) {
     test(`remote app updates ${desktop ? "open the local desktop updater" : "stay unavailable in a browser"} ${empty ? "without shared servers" : "with a selected server"}`, async ({
       page,
     }) => {
-      if (desktop) await desktopBridge(page, { activeId: "pc-one" });
+      if (desktop)
+        await desktopBridge(page, { activeId: "pc-one", localServers: [] });
       await localPanel(page);
       await page.route("**/api/access/session", (route) =>
         route.fulfill({
@@ -289,6 +288,16 @@ for (const empty of [false, true]) {
             ),
           )
           .toEqual([{ action: "openUpdates", value: "local" }]);
+        expect(
+          (await page.evaluate(() => window.mcPanelConnections!.list()))
+            .activeId,
+        ).toBe("pc-one");
+        await expect(
+          page.getByRole("heading", {
+            name: empty ? "No shared servers" : localServer.name,
+            exact: true,
+          }),
+        ).toBeVisible();
       } else {
         await expect(updates).toHaveCount(0);
       }

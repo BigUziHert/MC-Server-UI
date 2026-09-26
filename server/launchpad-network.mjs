@@ -75,13 +75,27 @@ async function responseFor(
     }
     if (!response.ok) {
       await response.body?.cancel();
-      throw launchpadError(
-        response.status === 404 ? 404 : response.status === 429 ? 429 : 502,
-        response.status === 429
-          ? "The provider's request limit was reached. Wait a little and try again."
-          : response.status === 401 || response.status === 403
-            ? "The provider denied access. Check its API key or download restrictions."
-            : `The provider request failed (${response.status}). Try again shortly.`,
+      const retryAfter = response.headers.get("retry-after");
+      const retryAfterMs = retryAfter
+        ? /^\d+(?:\.\d+)?$/.test(retryAfter)
+          ? Number(retryAfter) * 1000
+          : Date.parse(retryAfter) - Date.now()
+        : undefined;
+      throw Object.assign(
+        launchpadError(
+          response.status === 404 ? 404 : response.status === 429 ? 429 : 502,
+          response.status === 429
+            ? "The provider's request limit was reached. Wait a little and try again."
+            : response.status === 401 || response.status === 403
+              ? "The provider denied access. Check its API key or download restrictions."
+              : `The provider request failed (${response.status}). Try again shortly.`,
+        ),
+        {
+          upstreamStatus: response.status,
+          ...(Number.isFinite(retryAfterMs) && retryAfterMs >= 0
+            ? { retryAfterMs: Math.min(retryAfterMs, 3600000) }
+            : {}),
+        },
       );
     }
     return response;

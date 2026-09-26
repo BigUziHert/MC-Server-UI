@@ -144,6 +144,8 @@ async function fixture() {
     downloadsDirectory: path.join(root, "downloads"),
     listLocalServers: () => runtime.listLocalServers(),
     selectLocalServer: (id) => runtime.selectLocalServer(id),
+    openUpdatesWindow: () =>
+      ownerWindow.webContents.send("mc-panel-updates-open"),
     dialog: {
       async showMessageBox(window, options) {
         assert.equal(window, ownerWindow);
@@ -461,8 +463,8 @@ async function smoke() {
     state = await application.evaluate(() =>
       globalThis.__remotePanelSmoke.inspect(),
     );
-    assert.equal(state.context.activeId, "local");
-    assert.equal(state.title, "MC Panel");
+    assert.equal(state.context.activeId, firstId);
+    assert.match(state.title, /^127\.0\.0\.1:\d+ · MC Panel$/);
     assert.deepEqual(state.context.panels, connectedPanels);
     assert.deepEqual(state.views, [{ destroyed: true }, { destroyed: false }]);
     assert.deepEqual(state.cookies, connectedCookies);
@@ -482,11 +484,7 @@ async function smoke() {
       ),
       "opening local updates must not call the remote updater",
     );
-    const returnedToRemote = await application.evaluate(
-      (_electron, id) => globalThis.__remotePanelSmoke.invoke("activate", id),
-      firstId,
-    );
-    assert.equal(returnedToRemote.activeId, firstId);
+    assert.equal(state.context.activeId, firstId);
     state = await application.evaluate(() =>
       globalThis.__remotePanelSmoke.inspect(),
     );

@@ -46,6 +46,7 @@ async function fixture() {
     await import("./runtime.mjs");
   const { createRemotePanelController } = await import("./remote-panels.mjs");
   const { installConnectionIpc } = await import("./connections-ipc.mjs");
+  const { createUpdatesWindow } = await import("./updates-window.mjs");
   const { createRemoteFrontend, configureRemoteCertificateVerification } =
     await import("./remote-frontend.mjs");
   configureRemoteCertificateVerification(app.commandLine);
@@ -128,9 +129,27 @@ async function fixture() {
   );
   await new Promise((resolve) => host.listen(0, "127.0.0.1", resolve));
   const origin = `https://127.0.0.1:${host.address().port}`;
+  const updaterCalls = [];
+  const updateState = {
+    desktop: true,
+    supported: true,
+    version: "0.0.0-dev.smoke",
+    channel: "dev",
+    status: "idle",
+    message: "Ready to check this computer for updates.",
+  };
   const runtime = await startDesktopRuntime({
     dataDir: path.join(root, "data"),
     scheduler: false,
+    updates: {
+      snapshot: () => updateState,
+      check: async () => {
+        updaterCalls.push("check");
+        updateState.status = "current";
+        updateState.message = "This computer is up to date.";
+        return updateState;
+      },
+    },
   });
   const ownerSession = session.fromPartition("frontend-smoke-owner");
   await ownerSession.cookies.set({
@@ -171,12 +190,20 @@ async function fixture() {
   }
   const prompts = [];
   const answers = [0, 1];
+  const updatesWindow = createUpdatesWindow({
+    BrowserWindow,
+    parent: window,
+    origin: runtime.url,
+    session: ownerSession,
+    show: false,
+  });
   const controller = createRemotePanelController({
     window,
     localOrigin: runtime.url,
     WebContentsView: TrackedView,
     session,
     preload,
+    openUpdatesWindow: () => updatesWindow.open(),
     remoteFrontend: await createRemoteFrontend({
       directory: path.join(project, "dist"),
     }),
@@ -217,6 +244,8 @@ async function fixture() {
         prompts,
         requests,
         downloads,
+        updaterCalls,
+        localServers: runtime.listLocalServers(),
         context: controller.list(),
         cookies: remoteContents.at(-1).isDestroyed()
           ? []
@@ -225,6 +254,7 @@ async function fixture() {
     },
     async stop() {
       removeIpc();
+      updatesWindow.close();
       await controller.close();
       await runtime.close();
       host.closeAllConnections();
@@ -355,26 +385,101 @@ async function smoke() {
       await fs.readFile(path.join(root, "server-console.log"), "utf8"),
       /Remote error/,
     );
-    await remote
-      .getByRole("button", { name: "App updates", exact: true })
-      .click();
-    await expect(
-      local.getByRole("dialog", { name: "App updates" }),
-    ).toBeVisible();
-    await local
-      .getByRole("button", { name: "Close app updates", exact: true })
-      .click();
     state = await application.evaluate(() =>
       globalThis.__frontendSmoke.inspect(),
     );
-    const remoteId = state.context.panels.find((panel) => !panel.local).id;
-    await local.evaluate(
-      (id) => window.mcPanelConnections.activate(id),
+    const remoteId = state.context.activeId;
+    const remoteUrl = remote.url();
+    assert.deepEqual(
+      state.localServers,
+      [],
+      "The gaming PC has no local servers",
+    );
+    await remote
+      .getByRole("button", { name: "App updates", exact: true })
+      .click();
+    await expect
+      .poll(
+        () =>
+          application
+            .windows()
+            .filter((page) => page.url().includes("?app-updates=1")).length,
+      )
+      .toBe(1);
+    const updater = application
+      .windows()
+      .find((page) => page.url().includes("?app-updates=1"));
+    await expect(
+      updater.getByRole("dialog", { name: "App updates" }),
+    ).toBeVisible();
+    await expect(
+      updater.getByText("0.0.0-dev.smoke", { exact: true }),
+    ).toBeVisible();
+    assert.equal(
+      await updater.evaluate(() => window.mcPanelConnections),
+      undefined,
+    );
+    state = await application.evaluate(() =>
+      globalThis.__frontendSmoke.inspect(),
+    );
+    assert.equal(
+      state.context.activeId,
       remoteId,
+      "Updates must not switch to local Welcome",
+    );
+    assert.equal(remote.url(), remoteUrl);
+    await expect(
+      local.getByRole("dialog", { name: "App updates" }),
+    ).toHaveCount(0);
+    await updater
+      .getByRole("button", { name: "Check for updates", exact: true })
+      .click();
+    await expect(updater.getByRole("status")).toHaveText(
+      "This computer is up to date.",
+    );
+    await updater
+      .getByRole("button", { name: "Close app updates", exact: true })
+      .click();
+    await expect.poll(() => updater.isClosed()).toBe(true);
+    state = await application.evaluate(() =>
+      globalThis.__frontendSmoke.inspect(),
+    );
+    assert.equal(state.context.activeId, remoteId);
+    assert.deepEqual(state.updaterCalls, ["check"]);
+    assert.ok(
+      state.requests.every(
+        (request) => !request.path.startsWith("/api/desktop/updates"),
+      ),
     );
     await expect(output.locator(".log-message")).toHaveText([
       "New remote output",
     ]);
+    await remote
+      .getByRole("button", { name: "App updates", exact: true })
+      .click();
+    await expect
+      .poll(
+        () =>
+          application
+            .windows()
+            .filter((page) => page.url().includes("?app-updates=1")).length,
+      )
+      .toBe(1);
+    const reopenedUpdates = application
+      .windows()
+      .find((page) => page.url().includes("?app-updates=1"));
+    await expect(
+      reopenedUpdates.getByRole("dialog", { name: "App updates" }),
+    ).toBeVisible();
+    await reopenedUpdates
+      .getByRole("button", { name: "Close", exact: true })
+      .click();
+    await expect.poll(() => reopenedUpdates.isClosed()).toBe(true);
+    assert.equal(
+      (await application.evaluate(() => globalThis.__frontendSmoke.inspect()))
+        .context.activeId,
+      remoteId,
+    );
     await remote.reload();
     await expect(
       remote.getByRole("heading", { name: server.name, exact: true }),

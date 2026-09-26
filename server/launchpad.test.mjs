@@ -848,14 +848,110 @@ test("local inventory needs no provider, reuses unchanged hashes and notices sam
   assert.notEqual(changed.items[0].sha512, first.items[0].sha512);
 });
 
+test("real Launchpad runtimes share recovery transport while closing one leaves the other's requests usable", async (t) => {
+  const secondBytes = bytes("a different server's installed mod");
+  const secondHash = hashes(secondBytes).sha512;
+  let entered, release, secondSignal;
+  const reading = new Promise((resolve) => {
+    entered = resolve;
+  });
+  const f = await fixture(t, {
+    request: async (url, options) => {
+      const pathname = new URL(url).pathname;
+      if (pathname === "/v2/version_files")
+        return new Response(null, { status: 502 });
+      if (pathname.startsWith("/v2/version_file/")) {
+        if (pathname.endsWith(secondHash) && !release) {
+          secondSignal = options.signal;
+          const response = new Promise((resolve) => {
+            release = () => resolve(new Response(null, { status: 404 }));
+          });
+          entered();
+          return response;
+        }
+        return new Response(null, { status: 404 });
+      }
+    },
+  });
+  const secondDir = path.join(f.root, "second-server");
+  const secondData = path.join(f.root, "second-panel");
+  await fs.mkdir(path.join(secondDir, "mods"), { recursive: true });
+  await fs.mkdir(secondData);
+  await fs.writeFile(path.join(secondDir, "mods", "other.jar"), secondBytes);
+  const second = await f.boot({ serverDir: secondDir, dataDir: secondData });
+  const firstResult = await f.service.installed(selection);
+  assert.equal(firstResult.items.length, 1);
+  assert.deepEqual(firstResult.warnings, []);
+  const pending = second.installed(selection);
+  try {
+    await Promise.race([
+      reading,
+      pending.then((result) => {
+        throw new Error(
+          `Second runtime finished before its held GET: ${JSON.stringify(result)}`,
+        );
+      }),
+    ]);
+    const posts = () =>
+      f.requests.filter(
+        ({ url }) => new URL(url).pathname === "/v2/version_files",
+      ).length;
+    assert.equal(
+      posts(),
+      1,
+      "the second runtime observes the first runtime's failed POST circuit",
+    );
+    await f.service.close();
+    assert.equal(
+      secondSignal.aborted,
+      false,
+      "closing the first runtime must not cancel another runtime's shared transport request",
+    );
+    release();
+    const secondResult = await pending;
+    assert.equal(secondResult.items.length, 1);
+    assert.deepEqual(secondResult.warnings, []);
+    await fs.writeFile(
+      path.join(secondDir, "mods", "later.jar"),
+      "new content after the first runtime closed",
+    );
+    const later = await second.installed(selection);
+    assert.equal(later.items.length, 2);
+    assert.deepEqual(later.warnings, []);
+    assert.equal(
+      posts(),
+      1,
+      "recovery remains usable without binding to the closed runtime's lifetime",
+    );
+    assert.equal(
+      f.requests.filter(({ url }) =>
+        new URL(url).pathname.startsWith("/v2/version_file/"),
+      ).length,
+      3,
+    );
+  } finally {
+    release?.();
+    await pending.catch(() => {});
+  }
+});
+
 test("a 220-mod inventory keeps identification warnings atomic across repeated reads and retries", async (t) => {
   let now = Date.now(),
     unavailable = true;
   t.mock.method(Date, "now", () => now);
   const f = await fixture(t, {
     request: async (url) => {
-      if (unavailable && new URL(url).pathname === "/v2/version_files")
+      const pathname = new URL(url).pathname;
+      if (
+        unavailable &&
+        (pathname === "/v2/version_files" ||
+          pathname.startsWith("/v2/version_file/"))
+      )
         return new Response(null, { status: 503 });
+      if (pathname.startsWith("/v2/version_file/"))
+        return pathname.endsWith(hashes(f.old).sha512)
+          ? Response.json(f.versions.old)
+          : new Response(null, { status: 404 });
     },
   });
   await Promise.all(
@@ -871,11 +967,21 @@ test("a 220-mod inventory keeps identification warnings atomic across repeated r
   assert.equal(first.warnings.length, 1);
   assert.match(first.warnings[0], /Modrinth identification:/);
   const requests = () =>
-    f.requests.filter(
-      ({ url }) => new URL(url).pathname === "/v2/version_files",
+    f.requests.filter(({ url }) =>
+      /^\/v2\/version_files?(?:\/|$)/.test(new URL(url).pathname),
     ).length;
   const initialRequests = requests();
+  const initialPosts = f.requests.filter(
+    ({ url }) => new URL(url).pathname === "/v2/version_files",
+  ).length;
+  const initialReads = initialRequests - initialPosts;
+  assert.ok(initialPosts >= 1 && initialPosts <= 2);
+  assert.ok(
+    initialReads >= 3 && initialReads <= 8,
+    `the GET outage circuit must stop the 220-file queue after three failures and drain only already-started reads, got ${initialReads}`,
+  );
   for (let attempt = 0; attempt < 5; attempt++) {
+    now += 5000;
     const result = await f.service.installed(selection);
     assert.deepEqual(result.warnings, first.warnings);
     assert.equal(result.items.length, 220);
@@ -889,12 +995,10 @@ test("a 220-mod inventory keeps identification warnings atomic across repeated r
     `220 mods: warning payload stayed ${Buffer.byteLength(JSON.stringify(first.warnings))} bytes across six reads; ${initialRequests} initial provider requests and zero additional cached requests.`,
   );
   unavailable = false;
-  // Frequent reads must not postpone recovery indefinitely.
-  let recovered;
-  for (let attempt = 0; attempt < 7; attempt++) {
-    now += 10_000;
-    recovered = await f.service.installed(selection);
-  }
+  // Frequent reads must not postpone recovery; advance past both the negative
+  // identity lifetime and the shared request budget's one-minute window.
+  now += 35_001;
+  const recovered = await f.service.installed(selection);
   assert.ok(requests() > initialRequests);
   assert.equal(
     recovered.items.find((item) => item.name === "old.jar").projectId,

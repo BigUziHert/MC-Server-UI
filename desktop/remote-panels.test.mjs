@@ -28,6 +28,7 @@ function harness({
   restoreTimeoutMs,
   onError,
   remoteFrontend,
+  openUpdatesWindow,
 } = {}) {
   const views = [];
   const partitions = [];
@@ -107,6 +108,7 @@ function harness({
     restoreTimeoutMs,
     onError,
     remoteFrontend,
+    openUpdatesWindow,
     session: {
       fromPartition(name) {
         const value = new EventEmitter();
@@ -1220,8 +1222,17 @@ test("remote roster reports and selection reject untrusted scopes and invalid bo
   await h.controller.close();
 });
 
-test("opening app updates from a remote panel activates only the trusted local UI", async () => {
-  const h = harness();
+test("opening app updates preserves the active remote panel and saved selection", async () => {
+  let opened = 0;
+  let fail = false;
+  const store = memoryStore();
+  const h = harness({
+    store,
+    openUpdatesWindow: () => {
+      if (fail) throw new Error("Updates window could not load.");
+      opened += 1;
+    },
+  });
   const handlers = new Map();
   const remove = installConnectionIpc(
     {
@@ -1232,56 +1243,31 @@ test("opening app updates from a remote panel activates only the trusted local U
   );
   const connection = await h.controller.open(origin);
   const remote = h.views[0].webContents;
-  const local = h.owner.webContents;
   const openUpdates = () =>
     handlers.get(CONNECTION_CHANNELS.openUpdates)({
       sender: remote,
       senderFrame: remote.mainFrame,
     });
-  const updateEvents = (contents) =>
-    contents.sent.filter(([channel]) => channel === "mc-panel-updates-open");
-
+  const before = h.controller.list();
+  assert.deepEqual(before.localServers, []);
   assert.equal(openUpdates(), undefined);
-  assert.equal(h.controller.list().activeId, "local");
-  assert.deepEqual(updateEvents(local), [["mc-panel-updates-open"]]);
-  assert.deepEqual(updateEvents(remote), []);
-  assert.equal(h.owner.contentView.children.length, 0);
+  assert.equal(opened, 1);
+  assert.deepEqual(h.controller.list(), before);
+  assert.deepEqual(h.owner.contentView.children, [h.views[0]]);
   assert.equal(remote.isDestroyed(), false);
-  assert.equal(local.focused, true);
-
-  h.controller.activate(connection.activeId);
-  const originalFrame = local.mainFrame;
-  const originalUrl = local.url;
-  for (const change of [
-    () => {
-      local.loading = true;
-    },
-    () => {
-      local.mainFrame = { ...originalFrame, origin: "https://evil.example" };
-    },
-    () => {
-      local.mainFrame = { ...originalFrame, url: "https://evil.example/" };
-    },
-    () => {
-      local.url = "https://evil.example/";
-    },
-    () => {
-      local.destroyed = true;
-    },
-  ]) {
-    change();
-    assert.throws(openUpdates, /local panel is not ready/);
-    assert.equal(h.controller.list().activeId, connection.activeId);
-    assert.deepEqual(updateEvents(local), [["mc-panel-updates-open"]]);
-    local.mainFrame = originalFrame;
-    local.url = originalUrl;
-    local.loading = false;
-    local.destroyed = false;
-  }
+  assert.ok(
+    !remote.sent.some(([channel]) => channel === "mc-panel-updates-open"),
+  );
+  fail = true;
+  assert.throws(openUpdates, /could not load/);
+  assert.deepEqual(h.controller.list(), before);
+  // Opening updates does not depend on the hidden local Welcome renderer.
+  fail = false;
+  h.owner.webContents.loading = true;
   assert.equal(openUpdates(), undefined);
-  assert.equal(updateEvents(local).length, 2);
-  assert.deepEqual(updateEvents(remote), []);
+  assert.equal(opened, 2);
   await h.controller.close();
+  assert.equal(store.snapshot.activeId, connection.activeId);
   assert.throws(() => h.controller.openUpdates(), /shutting down/);
   remove();
 });

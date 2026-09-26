@@ -6,6 +6,24 @@ import os from "node:os";
 import { createHash } from "node:crypto";
 import { downloadVerified, providerJson } from "./launchpad-network.mjs";
 
+test("provider errors preserve upstream status and retry-after for safe recovery", async () => {
+  for (const status of [401, 403, 429, 503]) {
+    await assert.rejects(
+      providerJson("https://api.modrinth.com/v2/version_files", {
+        fetch: async () =>
+          new Response("Unavailable", {
+            status,
+            headers: { "Retry-After": "120" },
+          }),
+      }),
+      (cause) =>
+        cause.upstreamStatus === status &&
+        cause.retryAfterMs === 120000 &&
+        cause.status === (status === 429 ? 429 : 502),
+    );
+  }
+});
+
 test("catalog requests keep a deadline when a caller supplies a lifetime signal", async (t) => {
   const caller = new AbortController(),
     deadline = new AbortController();

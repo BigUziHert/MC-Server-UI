@@ -6,6 +6,7 @@ import {
 } from "./launchpad-network.mjs";
 import { safeInstallPath } from "./launchpad-archives.mjs";
 import { createInstalledIdentification } from "./launchpad-identification.mjs";
+import { createModrinthRecovery } from "./launchpad-recovery.mjs";
 
 const mr = "https://api.modrinth.com/v2";
 const cf = "https://api.curseforge.com/v1";
@@ -208,36 +209,34 @@ function mrUpdateFile(value, input) {
 // version, so its publication date can be checked before offering an update.
 // https://docs.modrinth.com/api/operations/getlatestversionsfromhashes/
 // https://docs.modrinth.com/api/operations/getversions/
-function modrinthUpdates(json) {
-  // Releasing a queue lane must not depend on a fetch implementation or response
-  // reader honoring abort. The same signal still cancels cooperative network I/O.
-  const request = (url, options) =>
-    new Promise((resolve, reject) => {
-      const { signal } = options;
-      let settled = false;
-      const finish = (complete, value) => {
-        if (settled) return;
-        settled = true;
-        signal.removeEventListener("abort", aborted);
-        complete(value);
-      };
-      const aborted = () => finish(reject, signal.reason);
-      signal.addEventListener("abort", aborted, { once: true });
-      if (signal.aborted) {
-        aborted();
-        return;
-      }
-      Promise.resolve()
-        .then(() => {
-          signal.throwIfAborted();
-          return json(url, options);
-        })
-        .then(
-          (value) => finish(resolve, value),
-          (cause) => finish(reject, cause),
-        );
-    });
+function modrinthUpdates(json, recovery) {
   const lanes = [Promise.resolve(), Promise.resolve()];
+  const failedReads = new Map();
+  const failureKey = (input, item) =>
+    JSON.stringify([
+      input.type,
+      input.loader,
+      input.gameVersion,
+      item.sha512,
+      item.projectId,
+      item.versionId,
+    ]);
+  const rememberReadFailure = (input, item, cause) => {
+    const transient =
+      cause.upstreamStatus !== undefined
+        ? [408, 425, 500, 502, 503, 504].includes(cause.upstreamStatus)
+        : ["TimeoutError", "TypeError"].includes(cause.name);
+    if (!transient || input.signal?.aborted) return;
+    failedReads.set(failureKey(input, item), {
+      message:
+        cause.name === "TimeoutError"
+          ? "Modrinth update checks took too long. Try again shortly."
+          : cause.message,
+      until: Date.now() + 30000,
+    });
+    while (failedReads.size > 5000)
+      failedReads.delete(failedReads.keys().next().value);
+  };
   let nextLane = 0,
     failureUntil = 0,
     failureWarning = "";
@@ -272,7 +271,15 @@ function modrinthUpdates(json) {
         );
       distinct.set(normalized.sha512, normalized);
     }
-    const rows = [...distinct.values()];
+    for (const [key, failure] of failedReads)
+      if (failure.until <= Date.now()) failedReads.delete(key);
+    const cachedIssues = {};
+    const rows = [...distinct.values()].filter((item) => {
+      const failure = failedReads.get(failureKey(input, item));
+      if (!failure) return true;
+      cachedIssues[item.sha512] = failure.message;
+      return false;
+    });
     const tasks = [];
     for (let offset = 0; offset < rows.length; offset += 100) {
       const batch = rows.slice(offset, offset + 100);
@@ -292,23 +299,123 @@ function modrinthUpdates(json) {
             warnings: [message],
           };
         }
-        const timeout = AbortSignal.timeout(8000);
-        const signal = input.signal
-          ? AbortSignal.any([input.signal, timeout])
-          : timeout;
+        const signal = input.signal;
         try {
-          const result = await request(`${mr}/version_files/update`, {
-            method: "POST",
-            signal,
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-              hashes: batch.map((item) => item.sha512),
-              algorithm: "sha512",
-              loaders: compatibleLoaders(input),
-              game_versions: input.gameVersion ? [input.gameVersion] : [],
-            }),
-          });
-          signal.throwIfAborted();
+          let result;
+          let recoveredCurrent;
+          try {
+            result = await recovery.bulk(`${mr}/version_files/update`, {
+              method: "POST",
+              signal,
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({
+                hashes: batch.map((item) => item.sha512),
+                algorithm: "sha512",
+                loaders: compatibleLoaders(input),
+                game_versions: input.gameVersion ? [input.gameVersion] : [],
+              }),
+            });
+          } catch (cause) {
+            if (!cause.useFallback) throw cause;
+            // The hash POST routes can fail while ordinary project/version GETs
+            // remain healthy. Recover only these affected files, with the shared
+            // request limiter, cancellation and short mutable-history cache.
+            result = {};
+            recoveredCurrent = new Map();
+            let cursor = 0;
+            await Promise.all(
+              Array.from({ length: Math.min(6, batch.length) }, async () => {
+                while (cursor < batch.length) {
+                  signal?.throwIfAborted();
+                  const item = batch[cursor++];
+                  try {
+                    const query = new URLSearchParams({
+                      include_changelog: "false",
+                      ...(input.loader
+                        ? { loaders: JSON.stringify(compatibleLoaders(input)) }
+                        : {}),
+                      ...(input.gameVersion
+                        ? { game_versions: JSON.stringify([input.gameVersion]) }
+                        : {}),
+                    });
+                    const versions = await recovery.read(
+                      `${mr}/project/${enc(item.projectId)}/version?${query}`,
+                      { signal, ttlMs: 30000 },
+                    );
+                    if (
+                      !Array.isArray(versions) ||
+                      versions.some(
+                        (value) =>
+                          !value ||
+                          value.project_id !== item.projectId ||
+                          typeof value.id !== "string" ||
+                          !/^[A-Za-z0-9_-]{1,100}$/.test(value.id) ||
+                          !Array.isArray(value.game_versions) ||
+                          !value.game_versions.every(
+                            (version) => typeof version === "string",
+                          ) ||
+                          !Array.isArray(value.loaders) ||
+                          !value.loaders.every(
+                            (loader) => typeof loader === "string",
+                          ) ||
+                          !Array.isArray(value.files) ||
+                          value.files.some(
+                            (file) => !file || typeof file !== "object",
+                          ),
+                      )
+                    )
+                      throw launchpadError(
+                        502,
+                        "Modrinth returned invalid project version metadata.",
+                      );
+                    const installed = versions.find(
+                      (value) => value.id === item.versionId,
+                    );
+                    if (installed)
+                      recoveredCurrent.set(item.versionId, installed);
+                    const compatible = versions.filter(
+                      (value) =>
+                        serverEnvironment(value.environment) &&
+                        (!input.gameVersion ||
+                          value.game_versions.includes(input.gameVersion)) &&
+                        (!input.loader ||
+                          compatibleLoaders(input).some((loader) =>
+                            value.loaders.includes(loader),
+                          )) &&
+                        mrVersion(value).downloadable,
+                    );
+                    if (!compatible.length)
+                      throw launchpadError(
+                        404,
+                        "No compatible downloadable releases were returned. Update status could not be checked.",
+                      );
+                    if (
+                      compatible.some(
+                        (value) =>
+                          !Number.isFinite(Date.parse(value.date_published)),
+                      )
+                    )
+                      throw launchpadError(
+                        502,
+                        "Modrinth returned an invalid publication date, so a newer version could not be verified.",
+                      );
+                    compatible.sort(
+                      (a, b) =>
+                        Date.parse(b.date_published) -
+                        Date.parse(a.date_published),
+                    );
+                    result[item.sha512] = compatible[0];
+                  } catch (failure) {
+                    signal?.throwIfAborted();
+                    rememberReadFailure(input, item, failure);
+                    issues[item.sha512] = failure.message;
+                    warnings.add(failure.message);
+                  }
+                }
+              }),
+            );
+          }
+          signal?.throwIfAborted();
           if (!result || typeof result !== "object" || Array.isArray(result))
             throw launchpadError(
               502,
@@ -318,7 +425,7 @@ function modrinthUpdates(json) {
           for (const item of batch) {
             const value = result[item.sha512];
             if (!value) {
-              issues[item.sha512] =
+              issues[item.sha512] ??=
                 "Modrinth did not return an update result for this file checksum.";
               continue;
             }
@@ -414,11 +521,33 @@ function modrinthUpdates(json) {
             const ids = [
               ...new Set(candidates.map(({ item }) => item.versionId)),
             ];
-            const current = await request(
-              `${mr}/versions?${new URLSearchParams({ ids: JSON.stringify(ids) })}`,
-              { signal },
-            );
-            signal.throwIfAborted();
+            const current = recoveredCurrent
+              ? await Promise.all(
+                  ids.map(async (versionId) => {
+                    if (recoveredCurrent.has(versionId))
+                      return recoveredCurrent.get(versionId);
+                    try {
+                      return await recovery.read(
+                        `${mr}/version/${enc(versionId)}`,
+                        { signal, ttlMs: 0 },
+                      );
+                    } catch (cause) {
+                      signal?.throwIfAborted();
+                      warnings.add(cause.message);
+                      for (const { item } of candidates)
+                        if (item.versionId === versionId) {
+                          rememberReadFailure(input, item, cause);
+                          issues[item.sha512] = cause.message;
+                        }
+                      return null;
+                    }
+                  }),
+                )
+              : await recovery.read(
+                  `${mr}/versions?${new URLSearchParams({ ids: JSON.stringify(ids) })}`,
+                  { signal, ttlMs: 0 },
+                );
+            signal?.throwIfAborted();
             if (!Array.isArray(current))
               throw launchpadError(
                 502,
@@ -430,7 +559,7 @@ function modrinthUpdates(json) {
               const before = Date.parse(installed?.date_published);
               const after = Date.parse(version.publishedAt);
               if (!installed) {
-                issues[item.sha512] =
+                issues[item.sha512] ??=
                   "Modrinth did not return metadata for the installed version, so this update could not be verified.";
                 continue;
               }
@@ -463,7 +592,7 @@ function modrinthUpdates(json) {
           if (input.signal?.aborted) throw input.signal.reason;
           if (cause.status === 429) failureUntil = Date.now() + 60_000;
           failureWarning =
-            timeout.aborted || cause.name === "TimeoutError"
+            cause.name === "TimeoutError"
               ? "Modrinth update checks took too long. Try again shortly."
               : cause.message;
           const message =
@@ -472,8 +601,10 @@ function modrinthUpdates(json) {
               : failureWarning;
           warnings.add(message);
           for (const item of batch)
-            if (!Object.hasOwn(updates, item.sha512))
+            if (!Object.hasOwn(updates, item.sha512)) {
+              rememberReadFailure(input, item, cause);
               issues[item.sha512] ??= message;
+            }
         }
         return { updates, issues, warnings: [...warnings] };
       });
@@ -483,8 +614,17 @@ function modrinthUpdates(json) {
     const results = await Promise.all(tasks);
     return {
       updates: Object.assign({}, ...results.map((result) => result.updates)),
-      issues: Object.assign({}, ...results.map((result) => result.issues)),
-      warnings: [...new Set(results.flatMap((result) => result.warnings))],
+      issues: Object.assign(
+        {},
+        cachedIssues,
+        ...results.map((result) => result.issues),
+      ),
+      warnings: [
+        ...new Set([
+          ...Object.values(cachedIssues),
+          ...results.flatMap((result) => result.warnings),
+        ]),
+      ],
     };
   };
 }
@@ -568,17 +708,41 @@ function cfVersion(value, type) {
 }
 export function createCoreProviders({
   fetch: request = fetch,
+  recoveryFetch = request,
+  lifetimeSignal,
   key = async () => null,
 } = {}) {
   const json = (url, options) =>
     providerJson(url, { ...options, fetch: request });
-  const identifyInstalled = createInstalledIdentification((hashes, signal) =>
-    json(`${mr}/version_files`, {
-      method: "POST",
-      signal,
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ hashes, algorithm: "sha512" }),
-    }),
+  // Shared public lookups must never capture the first server's lifetime-bound
+  // fetch wrapper. Each subscriber carries its own cancellation separately.
+  const recoveryJson = (url, options) =>
+    providerJson(url, { ...options, fetch: recoveryFetch });
+  const recovery = createModrinthRecovery(recoveryJson, {
+    sharingKey: recoveryFetch,
+  });
+  const lookupSignal = (signal) =>
+    lifetimeSignal
+      ? signal
+        ? AbortSignal.any([lifetimeSignal, signal])
+        : lifetimeSignal
+      : signal;
+  const updateInstalled = modrinthUpdates(json, recovery);
+  const identifyInstalled = createInstalledIdentification(
+    (hashes, signal) =>
+      recovery.bulk(`${mr}/version_files`, {
+        method: "POST",
+        signal: lookupSignal(signal),
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ hashes, algorithm: "sha512" }),
+      }),
+    {
+      loadOne: (hash, signal) =>
+        recovery.read(`${mr}/version_file/${hash}?algorithm=sha512`, {
+          signal: lookupSignal(signal),
+          ttlMs: 0,
+        }),
+    },
   );
   const mrProject = async (projectId) =>
     json(`${mr}/project/${enc(id(projectId))}`);
@@ -785,7 +949,11 @@ export function createCoreProviders({
       sortOptions: mrSortOptions,
       downloadHosts: ["cdn.modrinth.com"],
       projectMetadata: mrProjectMetadata,
-      updates: modrinthUpdates(json),
+      updates: (input, items) =>
+        updateInstalled(
+          { ...input, signal: lookupSignal(input.signal) },
+          items,
+        ),
       async search(input) {
         const facets = [
           [`all_project_types:${input.type}`],

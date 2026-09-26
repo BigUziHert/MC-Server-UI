@@ -24,13 +24,73 @@ function waitFor(operation, signal) {
 // Identity depends on file content, not on the selected loader or game version.
 // Keep successful batches when another batch fails, and stop queued work during
 // a provider outage rather than spending a full timeout on every hundred JARs.
-export function createInstalledIdentification(loadBatch) {
+export function createInstalledIdentification(loadBatch, { loadOne } = {}) {
   const cache = new Map(),
     pending = new Map(),
     lanes = [Promise.resolve(), Promise.resolve()];
   let nextLane = 0,
     failureUntil = 0,
     failureWarning = "";
+  const remember = (hash, entry) => {
+    cache.delete(hash);
+    cache.set(hash, entry);
+    while (cache.size > 5000) cache.delete(cache.keys().next().value);
+    return entry;
+  };
+  const recover = async (batch, signal) =>
+    new Map(
+      await Promise.all(
+        batch.map(async (hash) => {
+          let value, warning;
+          try {
+            // The shared reader bounds concurrency, request rate and each GET.
+            // Use the batch lifetime, never the expired bulk deadline or one
+            // caller's signal. Queued work shares this same bounded lifetime.
+            signal.throwIfAborted();
+            value = await waitFor(loadOne(hash, signal), signal);
+            if (
+              !value ||
+              typeof value !== "object" ||
+              ![Object.prototype, null].includes(
+                Object.getPrototypeOf(value),
+              ) ||
+              !/^[A-Za-z0-9_-]{1,100}$/.test(value.id ?? "") ||
+              typeof value.id !== "string" ||
+              !/^[A-Za-z0-9_-]{1,100}$/.test(value.project_id ?? "") ||
+              typeof value.project_id !== "string" ||
+              !Array.isArray(value.files) ||
+              !value.files.some(
+                (file) =>
+                  typeof file?.hashes?.sha512 === "string" &&
+                  file.hashes.sha512.toLowerCase() === hash,
+              )
+            )
+              throw launchpadError(
+                502,
+                "Modrinth returned an unverified file identification. Try again shortly.",
+              );
+          } catch (cause) {
+            value = undefined;
+            // Only a genuine not-found result means this checksum is unknown.
+            if (cause?.status !== 404)
+              warning =
+                cause?.name === "TimeoutError"
+                  ? "Modrinth identification took too long. Try again shortly."
+                  : cause?.message ||
+                    "Modrinth identification could not finish. Try again shortly.";
+          }
+          return [
+            hash,
+            remember(hash, {
+              value,
+              warning,
+              expiresAt:
+                Date.now() + (warning ? 30_000 : value ? 600_000 : 60_000),
+            }),
+          ];
+        }),
+      ),
+    );
   return async (hashes, { signal } = {}) => {
     signal?.throwIfAborted();
     if (
@@ -53,12 +113,16 @@ export function createInstalledIdentification(loadBatch) {
     for (let offset = 0; offset < missing.length; offset += 100) {
       const batch = missing.slice(offset, offset + 100);
       const lane = nextLane++ % lanes.length;
+      const recoveryDeadline = loadOne ? AbortSignal.timeout(90_000) : null;
       const task = lanes[lane].then(async () => {
+        if (recoveryDeadline?.aborted) return recover(batch, recoveryDeadline);
         let matches = {},
           warning;
         if (failureUntil > Date.now()) warning = failureWarning;
         else {
-          const deadline = AbortSignal.timeout(8000);
+          const deadline = recoveryDeadline
+            ? AbortSignal.any([AbortSignal.timeout(8000), recoveryDeadline])
+            : AbortSignal.timeout(8000);
           try {
             matches = await waitFor(
               Promise.resolve().then(() => {
@@ -78,6 +142,8 @@ export function createInstalledIdentification(loadBatch) {
                 "Modrinth returned invalid file identification data.",
               );
           } catch (cause) {
+            if (cause?.useFallback && loadOne)
+              return recover(batch, recoveryDeadline);
             matches = {};
             warning =
               deadline.aborted || cause?.name === "TimeoutError"
@@ -102,11 +168,8 @@ export function createInstalledIdentification(loadBatch) {
               ? failureUntil
               : Date.now() + (value ? 600_000 : 60_000),
           };
-          cache.delete(hash);
-          cache.set(hash, entry);
-          entries.set(hash, entry);
+          entries.set(hash, remember(hash, entry));
         }
-        while (cache.size > 5000) cache.delete(cache.keys().next().value);
         return entries;
       });
       lanes[lane] = task.catch(() => {});
