@@ -73,7 +73,12 @@ export default function PanelAccount({
     }
   }
   const actions: AccountMenuAction[] = (connections?.panels ?? [])
-    .filter((panel) => !panel.local && panel.id !== connections?.activeId)
+    .filter(
+      (panel) =>
+        !panel.local &&
+        panel.signedIn !== false &&
+        panel.id !== connections?.activeId,
+    )
     .map((panel) => ({
       id: panel.id,
       label: `Switch to ${panel.label}`,

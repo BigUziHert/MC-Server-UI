@@ -16,6 +16,7 @@ export type PanelConnections = {
     label: string;
     origin: string;
     local: boolean;
+    signedIn?: boolean;
     servers?: PanelServer[];
   }[];
   localServers: {

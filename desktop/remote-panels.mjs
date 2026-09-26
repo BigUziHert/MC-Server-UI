@@ -182,11 +182,12 @@ export function createRemotePanelController({
     return restoreRead;
   };
   const remember = (panel) => {
-    const { id, origin, trustedFingerprint } = panel;
+    const { id, origin, trustedFingerprint, signedIn } = panel;
     registry.set(id, {
       id,
       origin,
       ...(trustedFingerprint ? { trustedFingerprint } : {}),
+      ...(typeof signedIn === "boolean" ? { signedIn } : {}),
     });
   };
   const persist = () => {
@@ -200,11 +201,14 @@ export function createRemotePanelController({
           activeId: savedPanels.some((panel) => panel.id === preferredActiveId)
             ? preferredActiveId
             : "local",
-          panels: savedPanels.map(({ id, origin, trustedFingerprint }) => ({
-            id,
-            origin,
-            ...(trustedFingerprint ? { trustedFingerprint } : {}),
-          })),
+          panels: savedPanels.map(
+            ({ id, origin, trustedFingerprint, signedIn }) => ({
+              id,
+              origin,
+              ...(trustedFingerprint ? { trustedFingerprint } : {}),
+              ...(typeof signedIn === "boolean" ? { signedIn } : {}),
+            }),
+          ),
         });
       });
     savedWrites = write;
@@ -238,13 +242,16 @@ export function createRemotePanelController({
     // Only the selector's display fields may cross into remote renderers.
     localServers: localServerEntries(),
     panels: [...panels.values()].map(
-      ({ id, label, origin, local, servers }) => ({
+      ({ id, label, origin, local, servers, signedIn }) => ({
         id,
         label,
         origin,
         local,
         ...(!local
-          ? { servers: servers.map((server) => ({ ...server })) }
+          ? {
+              servers: servers.map((server) => ({ ...server })),
+              ...(typeof signedIn === "boolean" ? { signedIn } : {}),
+            }
           : {}),
       }),
     ),
@@ -378,13 +385,22 @@ export function createRemotePanelController({
       const servers = serverRoster(value);
       const rosterChanged =
         JSON.stringify(panel.servers) !== JSON.stringify(servers);
+      // An empty authenticated roster can still have host permissions or gain
+      // new grants. Only null means that this session has actually signed out.
+      const signedIn = value !== null;
+      const sessionChanged = panel.signedIn !== signedIn;
       panel.servers = servers;
+      panel.signedIn = signedIn;
+      if (sessionChanged && panel.saved) {
+        remember(panel);
+        void persist().catch(onError);
+      }
       if (value === null) panel.pendingServerId = undefined;
       // An authenticated renderer report proves the app has mounted after a
       // reload. did-finish-load alone can precede its selection listener.
       panel.selectionNeedsReport = false;
       deliverRemoteSelection(panel);
-      if (rosterChanged) changed();
+      if (rosterChanged || sessionChanged) changed();
     },
     selectRemoteServer(panelId, serverId) {
       ensureOpen();
@@ -536,6 +552,8 @@ export function createRemotePanelController({
         session: remoteSession,
         saved: Boolean(savedEntry),
         trustedFingerprint: savedEntry?.trustedFingerprint,
+        // This is only a display hint; the remote server verifies access.
+        signedIn: savedEntry?.signedIn,
         failed: true,
         allowCertificatePrompt: !background,
       };

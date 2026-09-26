@@ -27,7 +27,8 @@ function panelRecord(value) {
   if (
     !object(value) ||
     Object.keys(value).some(
-      (key) => !["id", "origin", "trustedFingerprint"].includes(key),
+      (key) =>
+        !["id", "origin", "trustedFingerprint", "signedIn"].includes(key),
     ) ||
     typeof value.id !== "string" ||
     !uuid.test(value.id) ||
@@ -47,12 +48,15 @@ function panelRecord(value) {
       !fingerprint.test(value.trustedFingerprint))
   )
     throw invalid();
+  if (value.signedIn !== undefined && typeof value.signedIn !== "boolean")
+    throw invalid();
   return {
     id: value.id,
     origin: value.origin,
     ...(value.trustedFingerprint !== undefined
       ? { trustedFingerprint: value.trustedFingerprint }
       : {}),
+    ...(value.signedIn !== undefined ? { signedIn: value.signedIn } : {}),
   };
 }
 

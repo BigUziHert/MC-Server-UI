@@ -50,6 +50,23 @@ test("connection identities, exact leaf trust, and active panel survive a store 
   await reopened.close();
 });
 
+test("known sign-in display hints survive restart while legacy entries stay unknown", async (t) => {
+  const { dataDir, store } = await fixture(t);
+  const saved = {
+    activeId: "local",
+    panels: [
+      { ...first, signedIn: false },
+      { ...second, signedIn: true },
+      { id: randomUUID(), origin: "https://legacy.example" },
+    ],
+  };
+  assert.deepEqual(await store.save(saved), saved);
+  await store.close();
+  const reopened = createConnectionStore({ dataDir });
+  assert.deepEqual(await reopened.read(), saved);
+  await reopened.close();
+});
+
 test("saving accepts only canonical origins, generated IDs, fingerprints, and registry fields", async (t) => {
   const { store, target } = await fixture(t);
   await store.save(snapshot());
@@ -89,6 +106,7 @@ test("saving accepts only canonical origins, generated IDs, fingerprints, and re
     { ...first, invitation: "private" },
     { ...first, servers: [] },
     { ...first, token: "private" },
+    ...[null, "false", 0, {}, []].map((signedIn) => ({ ...first, signedIn })),
   ];
   for (const record of records)
     await assert.rejects(store.save({ activeId: "local", panels: [record] }), {

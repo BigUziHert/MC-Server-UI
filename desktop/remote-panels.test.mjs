@@ -1021,6 +1021,49 @@ test("a connected panel discovers new grants after an empty roster without dropp
   await h.controller.close();
 });
 
+test("sign-in state distinguishes empty authenticated rosters from signout without disrupting other sessions", async () => {
+  const h = harness();
+  const first = await h.controller.open(origin);
+  const second = await h.controller.open("https://other.example:3002");
+  const state = (id) =>
+    h.controller.list().panels.find((panel) => panel.id === id);
+  const report = (index, value) => {
+    const sender = h.views[index].webContents;
+    h.controller.reportServers(
+      { sender, senderFrame: sender.mainFrame },
+      value,
+    );
+  };
+  const changedCount = () =>
+    h.owner.webContents.sent.filter(
+      ([channel]) => channel === "mc-panel-connections:changed",
+    ).length;
+  assert.equal(Object.hasOwn(state(first.activeId), "signedIn"), false);
+  assert.equal(Object.hasOwn(state("local"), "signedIn"), false);
+  report(0, []);
+  report(1, [{ id: "world", name: "Survival", status: "offline" }]);
+  const secondState = state(second.activeId);
+  h.controller.activate(first.activeId);
+  const beforeSignout = changedCount();
+  report(0, null);
+  assert.equal(state(first.activeId).signedIn, false);
+  assert.deepEqual(state(first.activeId).servers, []);
+  assert.equal(changedCount(), beforeSignout + 1);
+  assert.deepEqual(state(second.activeId), secondState);
+  assert.equal(h.controller.list().activeId, first.activeId);
+  assert.equal(h.views[0].webContents.isDestroyed(), false);
+  assert.equal(h.partitions[0].cleared, undefined);
+  report(0, null);
+  assert.equal(changedCount(), beforeSignout + 1);
+  report(0, []);
+  assert.equal(state(first.activeId).signedIn, true);
+  assert.equal(changedCount(), beforeSignout + 2);
+  report(0, []);
+  assert.equal(changedCount(), beforeSignout + 2);
+  assert.equal(h.views[0].loads.length, 1);
+  await h.controller.close();
+});
+
 test("selector icons stay with their host for colliding IDs and reject unsafe image sources", async () => {
   const icon = (fill) =>
     `data:image/png;base64,${new Resvg(`<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64"><rect width="64" height="64" fill="${fill}"/></svg>`).render().asPng().toString("base64")}`;
@@ -1330,7 +1373,7 @@ test("connection IPC validates managed sender, main frame, origin and bounded ar
   assert.equal(handlers.size, 0);
 });
 
-test("persistent connections save only origins/trust and preserve the same partitions through shutdown and restore", async () => {
+test("persistent connections save origins/trust and preserve the same partitions through shutdown and restore", async () => {
   const cert = await certificate();
   const store = memoryStore();
   const h = harness({
@@ -1430,6 +1473,75 @@ test("offline restores keep retryable entries, suppress certificate dialogs, and
   assert.equal(h.views.length, 2);
   await h.controller.close();
   assert.equal(store.snapshot.panels.length, 2);
+});
+
+test("signout is saved only on session changes and remains known through offline restore and re-login", async () => {
+  const store = memoryStore();
+  const save = store.save;
+  let writes = 0;
+  store.save = async function (value) {
+    writes++;
+    return save.call(this, value);
+  };
+  const h = harness({ store });
+  const first = await h.controller.open(origin);
+  const second = await h.controller.open("https://other.example:3002");
+  const report = (controller, contents, value) =>
+    controller.reportServers(
+      { sender: contents, senderFrame: contents.mainFrame },
+      value,
+    );
+  const flush = () => new Promise((resolve) => setImmediate(resolve));
+  report(h.controller, h.views[0].webContents, []);
+  report(h.controller, h.views[1].webContents, []);
+  await flush();
+  const beforeSignout = writes;
+  report(h.controller, h.views[0].webContents, null);
+  await flush();
+  assert.equal(writes, beforeSignout + 1);
+  report(h.controller, h.views[0].webContents, null);
+  report(h.controller, h.views[1].webContents, [
+    { id: "world", name: "Survival", status: "offline" },
+  ]);
+  await flush();
+  assert.equal(writes, beforeSignout + 1);
+  await h.controller.close();
+  assert.deepEqual(store.snapshot.panels, [
+    { id: first.activeId, origin, signedIn: false },
+    {
+      id: second.activeId,
+      origin: "https://other.example:3002",
+      signedIn: true,
+    },
+  ]);
+  const restartedStore = memoryStore(store.snapshot);
+  let online = false;
+  const restarted = harness({
+    store: restartedStore,
+    load: async () => {
+      if (!online) throw new Error("Offline");
+    },
+  });
+  const restored = await restarted.controller.restore();
+  assert.equal(restored.activeId, "local");
+  assert.deepEqual(
+    restored.panels
+      .filter((panel) => !panel.local)
+      .map(({ id, signedIn }) => ({
+        id,
+        signedIn,
+      })),
+    [
+      { id: first.activeId, signedIn: false },
+      { id: second.activeId, signedIn: true },
+    ],
+  );
+  online = true;
+  await restarted.controller.open(origin);
+  report(restarted.controller, restarted.views[0].webContents, []);
+  await restarted.controller.close();
+  assert.equal(restartedStore.snapshot.panels[0].signedIn, true);
+  assert.equal(restarted.partitions[0].name, h.partitions[0].name);
 });
 
 test("background certificate changes are rejected without prompts until an explicit retry", async () => {

@@ -52,6 +52,7 @@ async function desktopBridge(
     listFailure?: "reject" | "hang";
     updatesFailure?: boolean;
     unavailablePanels?: string[];
+    signedOutPanels?: string[];
   } = {},
 ) {
   await page.addInitScript(
@@ -63,6 +64,7 @@ async function desktopBridge(
       listFailure,
       updatesFailure,
       unavailablePanels,
+      signedOutPanels,
     }) => {
       // The sending renderer stays fixed when native activation hides its view.
       const state = {
@@ -84,6 +86,11 @@ async function desktopBridge(
                 ? location.origin
                 : "https://pc-one.example:3002",
             local: false,
+            signedIn: signedOutPanels.includes("pc-one")
+              ? false
+              : remoteServers["pc-one"]
+                ? true
+                : undefined,
             servers: remoteServers["pc-one"],
           },
           {
@@ -94,6 +101,11 @@ async function desktopBridge(
                 ? location.origin
                 : "https://pc-two.example:3002",
             local: false,
+            signedIn: signedOutPanels.includes("pc-two")
+              ? false
+              : remoteServers["pc-two"]
+                ? true
+                : undefined,
             servers: remoteServers["pc-two"],
           },
         ],
@@ -112,6 +124,7 @@ async function desktopBridge(
       ) => {
         const panel = state.panels.find((item) => item.id === panelId);
         if (!panel || panel.local) return;
+        panel.signedIn = servers !== null;
         panel.servers = servers ?? undefined;
         reports.push({ panelId, servers });
         changed();
@@ -192,6 +205,7 @@ async function desktopBridge(
       listFailure: options.listFailure,
       updatesFailure: options.updatesFailure,
       unavailablePanels: options.unavailablePanels ?? [],
+      signedOutPanels: options.signedOutPanels ?? [],
     },
   );
 }
@@ -664,6 +678,60 @@ test("desktop account switches connected panels without local-switch or disconne
   ]);
   expect(context.pages()).toHaveLength(1);
 });
+
+for (const empty of [false, true]) {
+  test(`signed-out panels stay out of the account menu until signed in again ${empty ? "without local servers" : "with a local workspace"}`, async ({
+    page,
+  }) => {
+    await desktopBridge(page, {
+      signedOutPanels: ["pc-one"],
+      remoteServers: { "pc-two": [] },
+    });
+    await localPanel(page, true);
+    if (empty)
+      await page.route("**/api/servers", (route) =>
+        route.fulfill({ json: { servers: [], defaultServerId: null } }),
+      );
+    await page.goto("/#console");
+    await page
+      .getByRole("button", { name: "Account menu for Local administrator" })
+      .click();
+    const signedOutPanel = page.getByRole("menuitem", {
+      name: "Switch to pc-one.example:3002",
+      exact: true,
+    });
+    const otherPanel = page.getByRole("menuitem", {
+      name: "Switch to pc-two.example:3002",
+      exact: true,
+    });
+    // A remembered sign-out stays hidden when returning to the local panel.
+    await expect(otherPanel).toBeEnabled();
+    await expect(signedOutPanel).toHaveCount(0);
+    await expect(
+      page.getByRole("menuitem", { name: "Sign in to another panel" }),
+    ).toBeEnabled();
+    await page.evaluate((servers) => {
+      (window as ConnectionMock).connectionFixture.report("pc-one", servers);
+    }, cachedRemoteServers["pc-one"]);
+    await expect(signedOutPanel).toBeEnabled();
+    // Sign-out and session revocation both report null from the remote view.
+    await page.evaluate(() =>
+      (window as ConnectionMock).connectionFixture.report("pc-one", null),
+    );
+    await expect(signedOutPanel).toHaveCount(0);
+    await expect(otherPanel).toBeEnabled();
+    // An authenticated account with no server grants can still switch panels.
+    await page.evaluate(() =>
+      (window as ConnectionMock).connectionFixture.report("pc-one", []),
+    );
+    await expect(signedOutPanel).toBeEnabled();
+    await page.evaluate(() =>
+      (window as ConnectionMock).connectionFixture.report("pc-one", null),
+    );
+    await expect(signedOutPanel).toHaveCount(0);
+    await expect(otherPanel).toBeEnabled();
+  });
+}
 
 for (const empty of [false, true]) {
   test(`an offline saved panel stays available without account disconnect actions ${empty ? "without local servers" : "with a local workspace"}`, async ({
@@ -1294,6 +1362,16 @@ for (const reason of ["sign-out", "expired session"] as const) {
       }
       await expect(page.getByLabel("Password", { exact: true })).toBeVisible();
       await expect.poll(roster).toEqual([]);
+      await expect
+        .poll(() =>
+          page.evaluate(
+            async () =>
+              (await window.mcPanelConnections!.list()).panels.find(
+                (panel) => panel.id === "pc-one",
+              )?.signedIn,
+          ),
+        )
+        .toBe(false);
       const responseArrived = page.waitForResponse(
         (response) =>
           new URL(response.url()).pathname === "/api/servers" &&
