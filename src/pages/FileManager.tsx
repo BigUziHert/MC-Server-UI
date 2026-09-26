@@ -845,6 +845,29 @@ export default function FileManager({
       return next;
     });
   }
+  function downloadSelection() {
+    if (!canContent || loading || saving || error) return;
+    const targets = entries.filter((entry) => selected.has(entry.path));
+    if (!targets.length) return;
+    const query = new URLSearchParams();
+    targets.forEach((entry) => query.append("path", entry.path));
+    const url = downloadUrl(`/files/download?${query}`);
+    if (targets.length >= 1000 || url.length > 7500) {
+      notify(
+        "Select fewer items at once, or download their folder as a ZIP.",
+        true,
+      );
+      return;
+    }
+    // Keep downloads in the browser/native save flow so large archives are
+    // streamed to this computer without buffering them in the renderer.
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = "";
+    document.body.append(link);
+    link.click();
+    link.remove();
+  }
   function openCreate(kind: "file" | "directory") {
     if (!canCreate) return;
     editRequestId.current++;
@@ -1363,6 +1386,14 @@ export default function FileManager({
               <div className="file-selection-actions">
                 <button
                   className="btn small"
+                  onClick={downloadSelection}
+                  disabled={!canContent || loading || saving || !!error}
+                  title="Download to this computer. Folders and multiple items are saved as a ZIP."
+                >
+                  <Download size={15} /> Download selected
+                </button>
+                <button
+                  className="btn small"
                   onClick={copySelection}
                   disabled={!canContent || loading || saving}
                   title="Copy selected files and folders (Ctrl+C)"
@@ -1536,30 +1567,34 @@ export default function FileManager({
                     </td>
                     <td>
                       <div className="file-row-actions">
-                        {entry.type === "file" && canContent && (
-                          <>
-                            {editable(entry.name) && (
-                              <button
-                                className="btn icon"
-                                aria-label={`${canUpdate ? "Edit" : "View"} ${entry.name}`}
-                                title={canUpdate ? "Edit file" : "View file"}
-                                onClick={() => void openEntry(entry)}
-                              >
-                                <Pencil size={14} />
-                              </button>
-                            )}
-                            <a
+                        {entry.type === "file" &&
+                          canContent &&
+                          editable(entry.name) && (
+                            <button
                               className="btn icon"
-                              aria-label={`Download ${entry.name}`}
-                              title="Download file"
-                              href={downloadUrl(
-                                `/files/download?path=${encodeURIComponent(entry.path)}`,
-                              )}
-                              download
+                              aria-label={`${canUpdate ? "Edit" : "View"} ${entry.name}`}
+                              title={canUpdate ? "Edit file" : "View file"}
+                              onClick={() => void openEntry(entry)}
                             >
-                              <Download size={15} />
-                            </a>
-                          </>
+                              <Pencil size={14} />
+                            </button>
+                          )}
+                        {canContent && (
+                          <a
+                            className="btn icon"
+                            aria-label={`Download ${entry.name}`}
+                            title={
+                              entry.type === "directory"
+                                ? "Download folder as ZIP to this computer"
+                                : "Download file to this computer"
+                            }
+                            href={downloadUrl(
+                              `/files/download?path=${encodeURIComponent(entry.path)}`,
+                            )}
+                            download
+                          >
+                            <Download size={15} />
+                          </a>
                         )}
                         <button
                           className="btn icon delete-action"

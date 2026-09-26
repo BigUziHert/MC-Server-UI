@@ -28,7 +28,12 @@ const server = {
   diskLimit: 1024 ** 3,
   uptime: 60,
   address: "localhost:25565",
-  accessPermissions: ["control.console", "audit.read"],
+  accessPermissions: [
+    "control.console",
+    "audit.read",
+    "file.read",
+    "file.read-content",
+  ],
 };
 const user = {
   role: "subuser",
@@ -42,6 +47,7 @@ async function fixture() {
   const { app, BrowserWindow, WebContentsView, ipcMain, session } =
     await import("electron");
   const { default: selfsigned } = await import("selfsigned");
+  const { default: yazl } = await import("yazl");
   const { startDesktopRuntime, DESKTOP_COOKIE_NAME } =
     await import("./runtime.mjs");
   const { createRemotePanelController } = await import("./remote-panels.mjs");
@@ -68,6 +74,24 @@ async function fixture() {
     },
   );
   const fingerprint = new X509Certificate(cert.cert).fingerprint256;
+  const fileBytes = Buffer.from("motd=Downloaded from the server PC\n");
+  const worldBytes = Buffer.from("Remote world data\n".repeat(100000));
+  const archive = async (includeFile) => {
+    const zip = new yazl.ZipFile();
+    const chunks = [];
+    const complete = new Promise((resolve, reject) => {
+      zip.outputStream.on("data", (chunk) => chunks.push(chunk));
+      zip.outputStream.on("end", () => resolve(Buffer.concat(chunks)));
+      zip.outputStream.on("error", reject);
+    });
+    zip.addBuffer(worldBytes, "world/level.dat");
+    zip.addEmptyDirectory("world/empty");
+    if (includeFile) zip.addBuffer(fileBytes, "remote.properties");
+    zip.end();
+    return complete;
+  };
+  const folderBytes = await archive(false);
+  const selectionBytes = await archive(true);
   const requests = [];
   let lines = [
     { id: 1, time: "12:00:00", level: "info", message: "Remote server ready" },
@@ -114,6 +138,57 @@ async function fixture() {
           return json({ servers: [server], defaultServerId: server.id });
         if (req.url === "/api/server") return json(server);
         if (req.url === "/api/console") return json({ lines });
+        const requestUrl = new URL(req.url, "https://fixture.example");
+        if (requestUrl.pathname === "/api/files") {
+          assert.equal(req.headers["x-server-id"], server.id);
+          return json({
+            path: "",
+            entries: [
+              { name: "world", path: "world", type: "directory", size: 0 },
+              {
+                name: "remote.properties",
+                path: "remote.properties",
+                type: "file",
+                size: fileBytes.length,
+              },
+            ].map((entry) => ({
+              ...entry,
+              modified: new Date().toISOString(),
+            })),
+          });
+        }
+        if (requestUrl.pathname === "/api/files/download") {
+          assert.equal(requestUrl.searchParams.get("serverId"), server.id);
+          const paths = requestUrl.searchParams.getAll("path");
+          const selected = paths.length === 2;
+          const folder = paths[0] === "world";
+          assert.deepEqual(
+            [...paths].sort(),
+            selected
+              ? ["remote.properties", "world"]
+              : [folder ? "world" : "remote.properties"],
+          );
+          const filename = selected
+            ? "files.zip"
+            : folder
+              ? "world.zip"
+              : "remote.properties";
+          const bytes = selected
+            ? selectionBytes
+            : folder
+              ? folderBytes
+              : fileBytes;
+          res.writeHead(200, {
+            "Content-Type":
+              selected || folder
+                ? "application/zip"
+                : "application/octet-stream",
+            "Content-Disposition": `attachment; filename="${filename}"`,
+            "Content-Length": bytes.length,
+          });
+          res.write(bytes.subarray(0, 32));
+          return setImmediate(() => res.end(bytes.subarray(32)));
+        }
         if (req.url.startsWith("/api/audit"))
           return json({ entries: [], total: 0 });
         return json({ error: "Owner-only or unavailable fixture route." }, 403);
@@ -570,6 +645,95 @@ async function smoke() {
       globalThis.__frontendSmoke.inspect(),
     );
     assert.deepEqual(state.prompts, [0, 1]);
+    await remote
+      .getByRole("link", { name: "File Manager", exact: true })
+      .click();
+    await expect(
+      remote.getByRole("heading", { name: "File Manager", exact: true }),
+    ).toBeVisible();
+    const filesUrl = remote.url();
+    for (const name of ["remote.properties", "world"]) {
+      await remote
+        .getByRole("link", { name: `Download ${name}`, exact: true })
+        .click();
+    }
+    await remote
+      .getByRole("checkbox", { name: "Select remote.properties", exact: true })
+      .check();
+    await remote
+      .getByRole("checkbox", { name: "Select world", exact: true })
+      .check();
+    await remote
+      .getByRole("button", { name: "Download selected", exact: true })
+      .click();
+    await expect
+      .poll(async () =>
+        (
+          await application.evaluate(() => globalThis.__frontendSmoke.inspect())
+        ).downloads.sort((a, b) => a.name.localeCompare(b.name)),
+      )
+      .toEqual([
+        { name: "files.zip", state: "completed" },
+        { name: "remote.properties", state: "completed" },
+        { name: "server-console.log", state: "completed" },
+        { name: "world.zip", state: "completed" },
+      ]);
+    assert.equal(
+      remote.url(),
+      filesUrl,
+      "Downloads must keep the connected panel open",
+    );
+    assert.equal(
+      await fs.readFile(path.join(root, "remote.properties"), "utf8"),
+      "motd=Downloaded from the server PC\n",
+    );
+    const { default: yauzl } = await import("yauzl");
+    const zipEntries = (filename) =>
+      new Promise((resolve, reject) => {
+        yauzl.open(filename, { lazyEntries: true }, (cause, zip) => {
+          if (cause) return reject(cause);
+          const result = {};
+          zip.on("error", reject);
+          zip.on("end", () => resolve(result));
+          zip.on("entry", (entry) => {
+            zip.openReadStream(entry, (error, stream) => {
+              if (error) return reject(error);
+              const chunks = [];
+              stream.on("error", reject);
+              stream.on("data", (chunk) => chunks.push(chunk));
+              stream.on("end", () => {
+                result[entry.fileName] = Buffer.concat(chunks).toString("utf8");
+                zip.readEntry();
+              });
+            });
+          });
+          zip.readEntry();
+        });
+      });
+    const expectedWorld = {
+      "world/level.dat": "Remote world data\n".repeat(100000),
+      "world/empty/": "",
+    };
+    assert.deepEqual(
+      await zipEntries(path.join(root, "world.zip")),
+      expectedWorld,
+    );
+    assert.deepEqual(await zipEntries(path.join(root, "files.zip")), {
+      ...expectedWorld,
+      "remote.properties": "motd=Downloaded from the server PC\n",
+    });
+    state = await application.evaluate(() =>
+      globalThis.__frontendSmoke.inspect(),
+    );
+    const downloadRequests = state.requests.filter((request) =>
+      request.path.startsWith("/api/files/download?"),
+    );
+    assert.equal(downloadRequests.length, 3);
+    assert.ok(
+      downloadRequests.every((request) =>
+        request.cookie.includes("frontend-fixture=authenticated"),
+      ),
+    );
     assert.ok(
       state.requests.every(
         (request) => !request.cookie.includes("mc-panel-desktop"),
@@ -595,7 +759,7 @@ async function smoke() {
       "Stale remote JavaScript and CSS must not load",
     );
     console.log(
-      "Passed native frontend consistency: stale remote shell replaced by installed UI; certificate consent, remote sign-in/cookies, console filter/clear/export, Updates, switching and reload.",
+      "Passed native frontend consistency: stale remote shell replaced by installed UI; certificate consent, remote sign-in/cookies, console filter/clear/export, client file/folder/selection downloads, Updates, switching and reload.",
     );
   } catch (error) {
     if (stderr) console.error(stderr);

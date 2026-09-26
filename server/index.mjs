@@ -18,6 +18,7 @@ import {
 import { decodeIcon, readServerIcon, writeServerIcon } from "./server-icon.mjs";
 import { createRecycleBin, recycleStorageDirectories } from "./recycle-bin.mjs";
 import { copyServerFiles, uploadServerFiles } from "./file-transfer.mjs";
+import { planFileDownload, streamFileArchive } from "./file-download.mjs";
 import { createBackupArchive } from "./backup-archive.mjs";
 import { restoreBackupArchive } from "./backup-restore.mjs";
 import { createMinecraft } from "./minecraft.mjs";
@@ -2986,10 +2987,39 @@ export async function createPanel(options = {}) {
     }),
   );
   app.get("/api/files/download", async (req, res) => {
-    const target = await safePath(serverDir, req.query.path);
-    if (!(await fs.stat(target)).isFile())
-      throw error(400, "Choose a file to download.");
-    res.download(target);
+    const disconnected = new AbortController();
+    const cancel = () => {
+      if (!res.writableFinished) disconnected.abort();
+    };
+    req.once("aborted", cancel);
+    res.once("close", cancel);
+    try {
+      const plan = await planFileDownload(serverDir, req.query.path, {
+        safePath,
+        signal: disconnected.signal,
+      });
+      res.set("Cache-Control", "private, no-store");
+      if (plan.file) {
+        res.download(plan.file, { dotfiles: "allow" });
+        return;
+      }
+      res.attachment(plan.filename);
+      if (req.method === "HEAD") {
+        res.end();
+        return;
+      }
+      await streamFileArchive(plan, res, { signal: disconnected.signal });
+    } catch (cause) {
+      if (res.headersSent || disconnected.signal.aborted) res.destroy();
+      else {
+        res.removeHeader("Content-Disposition");
+        res.removeHeader("Content-Type");
+        throw cause;
+      }
+    } finally {
+      req.off("aborted", cancel);
+      res.off("close", cancel);
+    }
   });
   app.post(
     "/api/files",

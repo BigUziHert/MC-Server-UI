@@ -151,6 +151,13 @@ async function sharedPanel(page: Page, permissions: string[]) {
             size: 13,
             modified: stamp,
           },
+          {
+            name: "world",
+            path: "world",
+            type: "directory",
+            size: 0,
+            modified: stamp,
+          },
         ],
       });
     if (path === "/api/files/content")
@@ -281,6 +288,16 @@ test("file listing access does not fetch file contents or enable file changes", 
     page.getByRole("link", { name: "Download notes.txt" }),
   ).toHaveCount(0);
   await expect(
+    page.getByRole("link", { name: "Download world", exact: true }),
+  ).toHaveCount(0);
+  await expect(
+    page.getByRole("button", {
+      name: "Download selected",
+      exact: true,
+      includeHidden: true,
+    }),
+  ).toBeDisabled();
+  await expect(
     page.getByRole("button", { name: "Open Recycle Bin" }),
   ).toHaveCount(0);
   expect(
@@ -291,6 +308,46 @@ test("file listing access does not fetch file contents or enable file changes", 
         call.method !== "GET",
     ),
   ).toEqual([]);
+});
+
+test("large download selections explain how to download the folder instead", async ({
+  page,
+}) => {
+  const calls = await sharedPanel(page, ["file.read", "file.read-content"]);
+  await page.route("**/api/files?**", (route) =>
+    route.fulfill({
+      json: {
+        path: "",
+        entries: Array.from({ length: 25 }, (_, index) => ({
+          name: `settings-${index}.txt`,
+          path: `${"long-folder-name/".repeat(24)}settings-${index}.txt`,
+          type: "file",
+          size: 0,
+          modified: stamp,
+        })),
+      },
+    }),
+  );
+  await page.goto("/#files");
+  await page
+    .getByRole("checkbox", {
+      name: "Select all visible files and folders",
+      exact: true,
+    })
+    .check();
+  await page
+    .getByRole("button", { name: "Download selected", exact: true })
+    .click();
+  await expect(
+    page.getByText(
+      "Select fewer items at once, or download their folder as a ZIP.",
+      { exact: true },
+    ),
+  ).toBeVisible();
+  expect(calls.filter((call) => call.path === "/api/files/download")).toEqual(
+    [],
+  );
+  await expect(page).toHaveURL(/#files$/);
 });
 
 test("file readers get a read-only editor and recycling requires both storage grants", async ({

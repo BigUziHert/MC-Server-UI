@@ -338,11 +338,18 @@ test("select visible all respects filters and selection clears on directory and 
     .getByRole("button", { name: "Clear selection", exact: true })
     .click();
   await expect(selection).toHaveCount(0);
-  const mobileHeaderBefore = await all.boundingBox();
+  // Focusing a lower row can scroll the smaller viewport. Compare document
+  // coordinates so this checks layout movement, not the browser's focus scroll.
+  const mobileHeaderPosition = () =>
+    all.evaluate((element) => {
+      const { x, y, width, height } = element.getBoundingClientRect();
+      return { x: x + window.scrollX, y: y + window.scrollY, width, height };
+    });
+  const mobileHeaderBefore = await mobileHeaderPosition();
   await page
     .getByRole("checkbox", { name: "Select beta.txt", exact: true })
     .check();
-  expect(await all.boundingBox()).toEqual(mobileHeaderBefore);
+  expect(await mobileHeaderPosition()).toEqual(mobileHeaderBefore);
   await page.getByRole("button", { name: "archive", exact: true }).click();
   await expect(selection).toHaveCount(0);
   await page
