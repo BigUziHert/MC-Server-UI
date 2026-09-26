@@ -4735,11 +4735,26 @@ export async function createFleet(options = {}) {
   });
   setup.mount(app);
   setup.mount(remoteHostApp);
+  const serializeCreation = (requestId, create) =>
+    serialize(async () => {
+      try {
+        return await create();
+      } catch (cause) {
+        // Check while holding the fleet lock: a lost response or failed access
+        // enrollment can leave a committed server that must keep its settings.
+        if (
+          requestId &&
+          !registry.servers.some((entry) => entry.setupRequestId === requestId)
+        )
+          cause.setupNotCreated = true;
+        throw cause;
+      }
+    });
   const createManagedServer = async (
     input,
     { requestId, acceptedEula = false, req } = {},
   ) => {
-    return serialize(async () => {
+    return serializeCreation(requestId, async () => {
       const authority = await creationAuthority(req);
       if (!input || typeof input !== "object" || Array.isArray(input))
         throw error(400, "Provide server settings.");
@@ -5122,6 +5137,7 @@ export async function createFleet(options = {}) {
         status >= 500 && status !== 503
           ? "The operation failed. Check the API terminal for details."
           : cause.message,
+      ...(cause.setupNotCreated === true ? { setupNotCreated: true } : {}),
     });
   });
   await remote.start();

@@ -25,6 +25,7 @@ export async function api<T = any>(
       new Error(body.error || `Request failed (${response.status})`),
       {
         status: response.status,
+        ...(body.setupNotCreated === true ? { setupNotCreated: true } : {}),
         ...(Number.isSafeInteger(body.uploaded) && body.uploaded >= 0
           ? { uploaded: body.uploaded }
           : {}),

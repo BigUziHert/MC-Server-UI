@@ -280,6 +280,9 @@ export default function NewServerWizard({
   const [warnings, setWarnings] = useState<string[]>([]);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
+  const [creationRejected, setCreationRejected] = useState(false);
+  const [configurationDetailsOpen, setConfigurationDetailsOpen] =
+    useState(false);
   const [progress, setProgress] = useState("");
   const [created, setCreated] = useState<ServerRecord | null>(null);
   const controller = useRef(new AbortController());
@@ -880,6 +883,7 @@ export default function NewServerWizard({
     try {
       setProgress("Creating your server…");
       if (!createdRef.current) {
+        setCreationRejected(false);
         const response = await request<{ server: ServerRecord }>(
           "/server-setup",
           {
@@ -897,7 +901,14 @@ export default function NewServerWizard({
                 : undefined,
             },
           },
-        );
+        ).catch((cause: unknown) => {
+          if (!controller.current.signal.aborted)
+            setCreationRejected(
+              (cause as { setupNotCreated?: boolean })?.setupNotCreated ===
+                true,
+            );
+          throw cause;
+        });
         createdRef.current = response.server;
         setCreated(response.server);
       }
@@ -1014,6 +1025,18 @@ export default function NewServerWizard({
     } else if (step === "catalog") go("source");
     else if (step === "configure") go("catalog");
     else if (step === "review") go("configure");
+  }
+  function editRejectedConfiguration() {
+    if (busyRef.current || createdRef.current || !creationRejected) return;
+    // Keep the request ID: if a response was misleading or another request
+    // finished late, the host must still reject a duplicate creation.
+    setPlan(null);
+    setRuntime(null);
+    setAccepted(false);
+    setAcknowledged(false);
+    setCreationRejected(false);
+    setConfigurationDetailsOpen(true);
+    setStep("configure");
   }
   const configureTitle = kind === "modpack" ? project?.title : provider?.name;
   return (
@@ -1788,7 +1811,13 @@ export default function NewServerWizard({
               <small key={warning}>{warning}</small>
             ))}
           </div>
-          <details className="setup-advanced">
+          <details
+            className="setup-advanced"
+            open={configurationDetailsOpen}
+            onToggle={(event) =>
+              setConfigurationDetailsOpen(event.currentTarget.open)
+            }
+          >
             <summary>
               <Settings2 size={14} /> Advanced settings
             </summary>
@@ -1921,7 +1950,9 @@ export default function NewServerWizard({
               ? "Keep MC Panel open while the downloads are verified and installed."
               : created
                 ? "Your server folder is saved. Retry to continue setting up the same server."
-                : "We couldn’t confirm server creation. Retry to continue without creating a duplicate."}
+                : creationRejected
+                  ? "Your server wasn’t created. Go back to correct your settings; your selections are saved."
+                  : "We couldn’t confirm server creation. Retry to continue without creating a duplicate."}
           </p>
           {busy && <progress aria-label="Installation progress" />}
         </div>
@@ -1950,7 +1981,11 @@ export default function NewServerWizard({
         </div>
       )}
       <div className="setup-actions">
-        {step !== "done" && step !== "install" && !created ? (
+        {step === "install" && !busy && !created && creationRejected ? (
+          <button className="btn" onClick={editRejectedConfiguration}>
+            <ArrowLeft size={15} /> Back to configuration
+          </button>
+        ) : step !== "done" && step !== "install" && !created ? (
           <button className="btn" onClick={back} disabled={busy}>
             <ArrowLeft size={15} /> Back
           </button>

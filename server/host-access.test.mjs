@@ -403,6 +403,38 @@ test("same-email memberships cannot reuse another creator's request or copied pa
   );
 });
 
+test("remote setup reports rejected creation but never calls a committed request uncreated", async (t) => {
+  const { boot } = await fixture(t);
+  const panel = await boot();
+  const actor = await panel.invite();
+  const existing = (await panel.local("/api/servers")).body.servers[0];
+  const input = setupInput(existing.port);
+  const rejected = await actor.request(
+    "/api/server-setup",
+    json("POST", input),
+  );
+  assert.equal(rejected.status, 409);
+  assert.equal(rejected.body.setupNotCreated, true);
+  assert.equal((await panel.local("/api/servers")).body.servers.length, 1);
+
+  input.configuration.port = 25700;
+  const created = await actor.request("/api/server-setup", json("POST", input));
+  assert.equal(created.status, 201, JSON.stringify(created.body));
+  const replay = await actor.request("/api/server-setup", json("POST", input));
+  assert.equal(replay.status, 200);
+  assert.equal(replay.body.server.id, created.body.server.id);
+  const changed = await actor.request(
+    "/api/server-setup",
+    json("POST", {
+      ...input,
+      configuration: { ...input.configuration, port: 25701 },
+    }),
+  );
+  assert.equal(changed.status, 409);
+  assert.equal(changed.body.setupNotCreated, undefined);
+  assert.equal((await panel.local("/api/servers")).body.servers.length, 2);
+});
+
 test("retry repairs access persistence failure without creating or importing a duplicate server", async (t) => {
   const { boot, dataDir } = await fixture(t);
   const panel = await boot();
@@ -419,6 +451,7 @@ test("retry repairs access persistence failure without creating or importing a d
   });
   const failed = await actor.request("/api/server-setup", json("POST", input));
   assert.equal(failed.status, 500);
+  assert.equal(failed.body.setupNotCreated, undefined);
   assert.equal((await panel.local("/api/servers")).body.servers.length, 2);
   assert.equal((await actor.request("/api/servers")).body.servers.length, 1);
   const retry = await actor.request("/api/server-setup", json("POST", input));
@@ -608,6 +641,7 @@ test("revocation after a failed creator-ready registry write cannot resurrect th
   });
   const failed = await actor.request("/api/server-setup", json("POST", input));
   assert.equal(failed.status, 500, JSON.stringify(failed.body));
+  assert.equal(failed.body.setupNotCreated, undefined);
   t.mock.restoreAll();
   const created = (await actor.request("/api/servers")).body.servers.find(
     (server) => server.id !== panel.id,
@@ -632,6 +666,7 @@ test("revocation after a failed creator-ready registry write cannot resurrect th
   const requester = panel.signed(fresh.cookie);
   const retry = await requester("/api/server-setup", json("POST", input));
   assert.equal(retry.status, 403, JSON.stringify(retry.body));
+  assert.equal(retry.body.setupNotCreated, undefined);
   assert.deepEqual(
     (await panel.local("/api/subusers", { headers })).body.users,
     [],

@@ -365,10 +365,9 @@ test("failed guided registry persistence publishes neither the server nor its id
     return rename(source, target);
   });
   const body = requestBody({ acceptedEula: true });
-  assert.equal(
-    (await f.request("/api/server-setup", json("POST", body))).status,
-    503,
-  );
+  const rejected = await f.request("/api/server-setup", json("POST", body));
+  assert.equal(rejected.status, 503);
+  assert.equal(rejected.body.setupNotCreated, true);
   assert.equal(await fs.readFile(registryPath, "utf8"), before);
   assert.equal(f.runtimes.size, 0);
   failure.mock.restore();
@@ -609,6 +608,55 @@ test("guided modpacks install their runtime atomically and switching to Vanilla 
   const state = (await f.request("/api/server", {}, id)).body;
   assert.equal(state.software, "Vanilla");
   assert.equal(state.status, "offline");
+});
+
+test("rejected setup can correct its port with the same request ID without duplicating a server", async (t) => {
+  const f = await fixture(t);
+  const existing = await f.request(
+    "/api/server-setup",
+    json("POST", requestBody()),
+  );
+  assert.equal(existing.status, 201);
+  const registryBefore = await fs.readFile(path.join(f.root, "servers.json"));
+  const instancesBefore = await fs.readdir(path.join(f.root, "instances"));
+  const input = requestBody({ acceptedEula: true });
+  const rejected = await f.request("/api/server-setup", json("POST", input));
+  assert.equal(rejected.status, 409);
+  assert.equal(rejected.body.setupNotCreated, true);
+  assert.match(rejected.body.error, /Port 25565 is already assigned/);
+  assert.deepEqual(
+    await fs.readFile(path.join(f.root, "servers.json")),
+    registryBefore,
+  );
+  assert.deepEqual(
+    await fs.readdir(path.join(f.root, "instances")),
+    instancesBefore,
+  );
+
+  input.configuration = { ...input.configuration, port: 25566 };
+  const corrected = await Promise.all([
+    f.request("/api/server-setup", json("POST", input)),
+    f.request("/api/server-setup", json("POST", input)),
+  ]);
+  assert.deepEqual(
+    corrected.map((response) => response.status).sort(),
+    [200, 201],
+  );
+  assert.equal(corrected[0].body.server.id, corrected[1].body.server.id);
+  assert.equal((await f.request("/api/servers")).body.servers.length, 2);
+
+  for (const configuration of [
+    { ...input.configuration, port: 25567 },
+    { ...input.configuration, port: -1 },
+  ]) {
+    const changed = await f.request(
+      "/api/server-setup",
+      json("POST", { ...input, configuration }),
+    );
+    assert.ok([400, 409].includes(changed.status));
+    assert.equal(changed.body.setupNotCreated, undefined);
+  }
+  assert.equal((await f.request("/api/servers")).body.servers.length, 2);
 });
 
 test("guided creation is confirmed, idempotent across concurrent retries and restart, and leaves EULA off by default", async (t) => {

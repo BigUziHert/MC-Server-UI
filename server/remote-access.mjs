@@ -453,6 +453,7 @@ export function createRemoteGateway({
         status >= 500 && status !== 503
           ? "Remote access could not complete the request. Try again or contact the panel owner."
           : cause.message,
+      ...(cause.setupNotCreated === true ? { setupNotCreated: true } : {}),
     });
   });
   return app;

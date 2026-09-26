@@ -1281,6 +1281,9 @@ test("confirmed software creation retries installation on the same stopped serve
   await page.keyboard.press("Escape");
   await expect(dialog).toBeVisible();
   await expect(dialog).toContainText("Fixture download interrupted");
+  await expect(
+    dialog.getByRole("button", { name: "Back to configuration", exact: true }),
+  ).toHaveCount(0);
   expect(setup.created).toHaveLength(1);
   await expect(
     page.getByRole("heading", { level: 1, name: "Console", exact: true }),
@@ -1334,6 +1337,317 @@ test("confirmed software creation retries installation on the same stopped serve
     page.getByRole("heading", { name: "Guided Paper world", exact: true }),
   ).toBeVisible();
 });
+
+for (const kind of ["software", "modpack"] as const) {
+  test(`a ${kind} creation port conflict returns to configuration without losing choices or duplicating installation`, async ({
+    page,
+    request,
+    setup,
+  }, testInfo) => {
+    const fleet = await (await request.get("/api/servers")).json();
+    const occupiedPort = fleet.servers.find((server: { port?: number }) =>
+      Number.isInteger(server.port),
+    )!.port;
+    const temporary = await fs.realpath(os.tmpdir());
+    const root = await fs.mkdtemp(
+      path.join(temporary, "mc-onboarding-port-fix-"),
+    );
+    const directory = path.join(root, "Preserved world");
+    const selectedJavaPath = "C:\\Program Files\\Fixture JDK 25\\bin\\java.exe";
+    await page.route("**/api/server-setup/java?**", (route) =>
+      route.fulfill({
+        json: {
+          ...javaCatalog,
+          installations: [
+            ...javaInstallations,
+            {
+              path: selectedJavaPath,
+              version: "25.0.1",
+              majorVersion: 25,
+              vendor: "Fixture",
+              architecture: "amd64",
+            },
+          ],
+        },
+      }),
+    );
+    const packPlan = {
+      planId: "port-fix-plan",
+      title: modpack.title,
+      versionName: packVersion.name,
+      expiresAt: "2099-01-01T00:00:00Z",
+      files: [{ path: "mods/adventures.jar", size: 2048, action: "install" }],
+      warnings: [],
+      cleanInstall: true,
+      summary: { fileCount: 1, totalBytes: 2048 },
+      runtime: {
+        provider: "fabric",
+        version: "1.21.1",
+        build: "0.16.10",
+        software: "Fabric",
+      },
+      loaderInstall: {
+        loader: "fabric",
+        gameVersion: "1.21.1",
+        loaderVersion: "0.16.10",
+      },
+    };
+    const packSelections: Record<string, unknown>[] = [];
+    if (kind === "modpack") {
+      await page.route("**/api/server-setup/launchpad", (route) =>
+        route.fulfill({
+          json: {
+            platforms,
+            gameVersions: ["1.21.1"],
+            loaders: ["fabric"],
+            warnings: [],
+          },
+        }),
+      );
+      await page.route("**/api/server-setup/launchpad/search?**", (route) =>
+        route.fulfill({
+          json: {
+            projects: [modpack],
+            total: 1,
+            offset: 0,
+            limit: 10,
+            warnings: [],
+          },
+        }),
+      );
+      await page.route("**/api/server-setup/launchpad/versions?**", (route) =>
+        route.fulfill({ json: { versions: [packVersion] } }),
+      );
+      for (const url of [
+        "**/api/server-setup/modpack-preview",
+        "**/api/launchpad/preview",
+      ])
+        await page.route(url, (route) => {
+          packSelections.push(route.request().postDataJSON());
+          return route.fulfill({ json: packPlan });
+        });
+    }
+    const installs: {
+      endpoint: string;
+      serverId: string;
+      body: Record<string, unknown>;
+    }[] = [];
+    for (const endpoint of ["versions", "launchpad"])
+      await page.route(`**/api/${endpoint}/install`, (route) => {
+        installs.push({
+          endpoint,
+          serverId: route.request().headers()["x-server-id"],
+          body: route.request().postDataJSON(),
+        });
+        return route.fulfill({
+          status: 202,
+          json:
+            endpoint === "versions"
+              ? {
+                  id: "port-fixed-install",
+                  state: "complete",
+                  message: "Paper installed.",
+                }
+              : {
+                  job: {
+                    id: "port-fixed-pack",
+                    status: "completed",
+                    completed: 1,
+                    total: 1,
+                    message: "Modpack installed.",
+                  },
+                },
+        });
+      });
+    try {
+      const dialog = await openCreate(page);
+      if (kind === "software") await choosePaper(page);
+      else {
+        await dialog
+          .getByRole("button", { name: "Modpack", exact: true })
+          .click();
+        await dialog.getByRole("button", { name: /Test Adventures/ }).click();
+        await dialog
+          .getByRole("combobox", { name: "Modpack version", exact: true })
+          .selectOption(packVersion.id);
+        await dialog
+          .getByRole("button", { name: "Continue", exact: true })
+          .click();
+      }
+      const name = `Preserved ${kind} configuration`;
+      await expect(
+        dialog.getByLabel("Java executable", { exact: true }),
+      ).toHaveValue("21");
+      await dialog
+        .getByLabel("Java executable", { exact: true })
+        .selectOption("25");
+      await dialog.getByLabel("Server name", { exact: true }).fill(name);
+      await dialog.getByLabel("Memory (GB)", { exact: true }).fill("6");
+      await dialog
+        .getByLabel("Installation location", { exact: true })
+        .selectOption("custom");
+      await dialog
+        .getByLabel("Installation folder", { exact: true })
+        .fill(directory);
+      await dialog.getByText("Advanced settings", { exact: true }).click();
+      await dialog
+        .getByLabel("Server port", { exact: true })
+        .fill(String(occupiedPort));
+      await dialog
+        .getByRole("button", { name: "Review installation", exact: true })
+        .click();
+      await dialog
+        .getByRole("checkbox", {
+          name: "I agree to the Minecraft EULA",
+          exact: true,
+        })
+        .check();
+      await dialog
+        .getByRole("button", { name: "Create and install", exact: true })
+        .click();
+      await expect(dialog.getByRole("alert")).toContainText(
+        `Port ${occupiedPort} is already assigned`,
+      );
+      expect(setup.creationRequests).toHaveLength(1);
+      expect(setup.created).toEqual([]);
+      expect(installs).toEqual([]);
+      await expect(
+        dialog.getByRole("button", {
+          name: "Back to configuration",
+          exact: true,
+        }),
+      ).toBeEnabled();
+      if (kind === "modpack") {
+        await page.setViewportSize({ width: 390, height: 844 });
+        await expect
+          .poll(() =>
+            page.evaluate(
+              () => document.documentElement.scrollWidth <= innerWidth,
+            ),
+          )
+          .toBe(true);
+        for (const label of ["Back to configuration", "Retry installation"]) {
+          const bounds = await dialog
+            .getByRole("button", { name: label, exact: true })
+            .boundingBox();
+          expect(bounds).not.toBeNull();
+          expect(bounds!.x).toBeGreaterThanOrEqual(0);
+          expect(bounds!.x + bounds!.width).toBeLessThanOrEqual(390);
+        }
+      }
+      await page.screenshot({
+        path: testInfo.outputPath(`port-conflict-${kind}.png`),
+        fullPage: true,
+      });
+      await dialog
+        .getByRole("button", { name: "Back to configuration", exact: true })
+        .click();
+      await expect(
+        dialog.getByLabel("Server name", { exact: true }),
+      ).toHaveValue(name);
+      await expect(
+        dialog.getByLabel("Memory (GB)", { exact: true }),
+      ).toHaveValue("6");
+      await expect(
+        dialog.getByLabel("Installation location", { exact: true }),
+      ).toHaveValue("custom");
+      await expect(
+        dialog.getByLabel("Installation folder", { exact: true }),
+      ).toHaveValue(directory);
+      await expect(
+        dialog.getByLabel("Java executable", { exact: true }),
+      ).toHaveValue("25");
+      const port = dialog.getByLabel("Server port", { exact: true });
+      await expect(port).toBeVisible();
+      await expect(port).toHaveValue(String(occupiedPort));
+      if (kind === "modpack")
+        await page.screenshot({
+          path: testInfo.outputPath("port-fix-configuration-mobile.png"),
+          fullPage: true,
+        });
+      await port.fill(String(setup.port));
+      await dialog
+        .getByRole("button", { name: "Review installation", exact: true })
+        .click();
+      await expect(dialog).toContainText(
+        kind === "software" ? "Paper 151" : packVersion.name,
+      );
+      await expect(dialog).toContainText("1.21.1");
+      await expect(dialog).toContainText("6 GB");
+      await expect(dialog).toContainText(directory);
+      const agreement = dialog.getByRole("checkbox", {
+        name: "I agree to the Minecraft EULA",
+        exact: true,
+      });
+      await expect(agreement).not.toBeChecked();
+      await expect(
+        dialog.getByRole("button", { name: "Create and install", exact: true }),
+      ).toBeDisabled();
+      await agreement.check();
+      await dialog
+        .getByRole("button", { name: "Create and install", exact: true })
+        .click();
+      await expect(
+        dialog.getByRole("button", { name: "Open Console", exact: true }),
+      ).toBeEnabled();
+      expect(setup.creationRequests).toHaveLength(2);
+      expect(setup.created).toHaveLength(1);
+      expect(setup.creationRequests[1].requestId).toBe(
+        setup.creationRequests[0].requestId,
+      );
+      const expectedConfiguration = {
+        name,
+        mode: "live",
+        memoryLimitMB: 6144,
+        javaPath: selectedJavaPath,
+        installationDirectory: directory,
+      };
+      expect(setup.creationRequests[0]).toMatchObject({
+        configuration: { ...expectedConfiguration, port: occupiedPort },
+      });
+      expect(setup.creationRequests[1]).toMatchObject({
+        configuration: { ...expectedConfiguration, port: setup.port },
+      });
+      expect(installs).toHaveLength(1);
+      expect(installs[0]).toMatchObject({
+        endpoint: kind === "software" ? "versions" : "launchpad",
+        serverId: setup.created[0].id,
+      });
+      expect(installs[0].body).toMatchObject(
+        kind === "software"
+          ? {
+              provider: "paper",
+              version: "1.21.1",
+              build: "151",
+              confirmed: true,
+              cleanInstall: true,
+            }
+          : { planId: packPlan.planId, confirmed: true, cleanInstall: true },
+      );
+      if (kind === "modpack") {
+        expect(packSelections).toHaveLength(3);
+        for (const selection of packSelections)
+          expect(selection).toMatchObject({
+            platform: "modrinth",
+            projectId: modpack.id,
+            versionId: packVersion.id,
+            type: "modpack",
+            loader: "fabric",
+            gameVersion: "1.21.1",
+          });
+      }
+      await assertStopped(request, setup.created[0].id);
+      expect(setup.mutations.some((url) => url.endsWith("/power"))).toBe(false);
+    } finally {
+      for (const server of setup.created)
+        await removeTestServer(request, server.id);
+      setup.created.splice(0);
+      expect(path.dirname(root)).toBe(temporary);
+      expect(path.basename(root)).toMatch(/^mc-onboarding-port-fix-/);
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+}
 
 test("mobile software review stays within the viewport and can be cancelled without creation", async ({
   page,
@@ -1476,6 +1790,80 @@ test("an accepted installation with a lost response recovers its completed job a
     serverButton(page, setup.created[0].id).locator(".fleet-mode"),
   ).toContainText("Paper 1.21.1");
   expect(setup.mutations.some((url) => url.endsWith("/power"))).toBe(false);
+});
+
+test("a lost creation response keeps configuration locked and retries the same server before installing once", async ({
+  page,
+  request,
+  setup,
+}) => {
+  let posts = 0;
+  await page.route("**/api/server-setup", async (route) => {
+    if (route.request().method() !== "POST") return route.fallback();
+    posts++;
+    setup.creationRequests.push(route.request().postDataJSON());
+    const response = await route.fetch();
+    expect(response.ok()).toBe(true);
+    const body = await response.json();
+    if (!setup.created.some((server) => server.id === body.server.id))
+      setup.created.push(body.server);
+    if (posts === 1)
+      return route.fulfill({
+        status: 502,
+        json: {
+          error: "The creation response was lost after the server was saved.",
+        },
+      });
+    return route.fulfill({ response, json: body });
+  });
+  const installs: { serverId: string; body: Record<string, unknown> }[] = [];
+  await page.route("**/api/versions/install", (route) => {
+    installs.push({
+      serverId: route.request().headers()["x-server-id"],
+      body: route.request().postDataJSON(),
+    });
+    return route.fulfill({
+      status: 202,
+      json: {
+        id: "recovered-create-install",
+        state: "complete",
+        message: "Paper installed.",
+      },
+    });
+  });
+  await openCreate(page);
+  await choosePaper(page);
+  const dialog = await configure(page, setup, "Ambiguous creation retry");
+  await dialog
+    .getByRole("button", { name: "Create and install", exact: true })
+    .click();
+  await expect(dialog.getByRole("alert")).toContainText(
+    "creation response was lost",
+  );
+  expect(setup.created).toHaveLength(1);
+  expect(installs).toEqual([]);
+  await expect(
+    dialog.getByRole("button", { name: "Back to configuration", exact: true }),
+  ).toHaveCount(0);
+  await dialog
+    .getByRole("button", { name: "Retry installation", exact: true })
+    .click();
+  await expect(
+    dialog.getByRole("button", { name: "Open Console", exact: true }),
+  ).toBeEnabled();
+  expect(posts).toBe(2);
+  expect(setup.created).toHaveLength(1);
+  expect(setup.creationRequests[1]).toEqual(setup.creationRequests[0]);
+  expect(installs).toHaveLength(1);
+  expect(installs[0].serverId).toBe(setup.created[0].id);
+  expect(installs[0].body).toMatchObject({
+    provider: "paper",
+    version: "1.21.1",
+    build: "151",
+    confirmed: true,
+    cleanInstall: true,
+  });
+  await assertStopped(request, setup.created[0].id);
 });
 
 test("modpack creation reviews an exact release and scopes runtime and pack installation to the new server", async ({
