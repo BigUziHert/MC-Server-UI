@@ -75,6 +75,7 @@ async function responseFor(
     }
     if (!response.ok) {
       await response.body?.cancel();
+      const modrinth = new URL(address).hostname === "api.modrinth.com";
       const retryAfter = response.headers.get("retry-after");
       const retryAfterMs = retryAfter
         ? /^\d+(?:\.\d+)?$/.test(retryAfter)
@@ -87,11 +88,14 @@ async function responseFor(
           response.status === 429
             ? "The provider's request limit was reached. Wait a little and try again."
             : response.status === 401 || response.status === 403
-              ? "The provider denied access. Check its API key or download restrictions."
+              ? modrinth
+                ? `Modrinth rejected the catalog request (HTTP ${response.status}). Public mod lookups do not require an API key. Try again shortly.`
+                : "The provider denied access. Check its API key or download restrictions."
               : `The provider request failed (${response.status}). Try again shortly.`,
         ),
         {
           upstreamStatus: response.status,
+          upstreamContentType: response.headers.get("content-type") || "",
           ...(Number.isFinite(retryAfterMs) && retryAfterMs >= 0
             ? { retryAfterMs: Math.min(retryAfterMs, 3600000) }
             : {}),

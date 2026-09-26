@@ -47,6 +47,96 @@ test("authentication errors and rate limits do not fan out into fallback request
   }
 });
 
+test("public hash POST firewall denials use GET recovery and cool down the blocked route", async () => {
+  let now = 0;
+  const calls = [];
+  const recovery = createModrinthRecovery(
+    async (url, options) => {
+      calls.push(url);
+      if (options.method === "POST")
+        throw Object.assign(new Error("Modrinth firewall rejection"), {
+          status: 502,
+          upstreamStatus: 403,
+          upstreamContentType: "text/html; charset=utf-8",
+        });
+      return { id: "known" };
+    },
+    { now: () => now },
+  );
+  const identify = "https://api.modrinth.com/v2/version_files";
+  const updates = `${identify}/update`;
+  const file = "https://api.modrinth.com/v2/version_file/hash";
+  for (const url of [identify, updates, identify, updates])
+    await assert.rejects(recovery.bulk(url, { method: "POST" }), {
+      useFallback: true,
+    });
+  assert.deepEqual(await recovery.read(file), { id: "known" });
+  assert.deepEqual(calls, [identify, updates, file]);
+  now = 60001;
+  await assert.rejects(recovery.bulk(identify, { method: "POST" }), {
+    useFallback: true,
+  });
+  assert.deepEqual(calls, [identify, updates, file, identify]);
+});
+
+test("firewall recovery does not apply to authorization, rate limits or unrelated routes", async () => {
+  const url = "https://api.modrinth.com/v2/version_files";
+  const cases = [
+    { status: 401 },
+    { status: 429 },
+    { contentType: "application/json" },
+    { contentType: "" },
+    { headers: { Authorization: "fixture-token" } },
+    { headers: new Headers({ "X-API-Key": "fixture-key" }) },
+    { method: "GET" },
+    { url: "https://api.modrinth.com/v2/project/private" },
+    { url: "https://api.modrinth.com/v2/version/private" },
+    { url: "https://api.curseforge.com/v1/fingerprints/432" },
+    { url: "https://untrusted.example/v2/version_files" },
+  ];
+  for (const input of cases) {
+    const status = input.status ?? 403;
+    const recovery = createModrinthRecovery(async () => {
+      throw Object.assign(new Error("Rejected"), {
+        status: status === 429 ? 429 : 502,
+        upstreamStatus: status,
+        upstreamContentType: input.contentType ?? "text/html",
+      });
+    });
+    await assert.rejects(
+      recovery.bulk(input.url ?? url, {
+        method: input.method ?? "POST",
+        headers: input.headers,
+      }),
+      (cause) => !cause.useFallback && cause.upstreamStatus === status,
+    );
+  }
+});
+
+test("a cached public firewall denial cannot redirect an authenticated batch into recovery", async () => {
+  let calls = 0;
+  const recovery = createModrinthRecovery(async () => {
+    calls++;
+    throw Object.assign(new Error("Rejected"), {
+      status: 502,
+      upstreamStatus: 403,
+      upstreamContentType: "text/html",
+    });
+  });
+  const url = "https://api.modrinth.com/v2/version_files";
+  await assert.rejects(recovery.bulk(url, { method: "POST" }), {
+    useFallback: true,
+  });
+  await assert.rejects(
+    recovery.bulk(url, {
+      method: "POST",
+      headers: { Authorization: "fixture-token" },
+    }),
+    (cause) => !cause.useFallback && cause.upstreamStatus === 403,
+  );
+  assert.equal(calls, 2);
+});
+
 test("concurrent readers share a cached lookup but leave independently", async () => {
   let finish;
   let calls = 0;

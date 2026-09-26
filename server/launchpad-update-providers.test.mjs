@@ -651,59 +651,69 @@ test("indexed and completed history results publish before a neighboring history
   );
 });
 
-test("220 installed mods recover from failed hash POSTs using bounded cached GET project histories", async (t) => {
-  let now = Date.now(),
-    posts = 0,
-    reads = 0,
-    active = 0,
-    peak = 0;
-  t.mock.method(Date, "now", () => now);
-  const rows = Array.from({ length: 220 }, (_, index) => item(index));
-  const p = historyProvider(async (url, options) => {
-    if (options.method === "POST") {
-      posts++;
-      return new Response("gateway unavailable", { status: 502 });
-    }
-    const parsed = new URL(url);
-    const project = parsed.pathname.match(
-      /^\/v2\/project\/project(\d+)\/version$/,
+for (const status of [502, 403])
+  test(`220 installed mods recover from hash POST ${status} using bounded cached GET project histories`, async (t) => {
+    let now = Date.now(),
+      posts = 0,
+      reads = 0,
+      active = 0,
+      peak = 0;
+    t.mock.method(Date, "now", () => now);
+    const rows = Array.from({ length: 220 }, (_, index) => item(index));
+    const p = historyProvider(async (url, options) => {
+      if (options.method === "POST") {
+        posts++;
+        return new Response("<html><h1>Request blocked at edge</h1></html>", {
+          status,
+          headers: { "Content-Type": "text/html" },
+        });
+      }
+      const parsed = new URL(url);
+      const project = parsed.pathname.match(
+        /^\/v2\/project\/project(\d+)\/version$/,
+      );
+      assert.ok(project, `Expected only metadata GET: ${url}`);
+      assert.equal(parsed.searchParams.get("include_changelog"), "false");
+      assert.deepEqual(JSON.parse(parsed.searchParams.get("loaders")), [
+        "neoforge",
+      ]);
+      assert.deepEqual(JSON.parse(parsed.searchParams.get("game_versions")), [
+        "1.21.1",
+      ]);
+      reads++;
+      peak = Math.max(peak, ++active);
+      await delay(1);
+      active--;
+      const row = rows[Number(project[1])];
+      return json([current(row), raw(row)]);
+    });
+    const result = await p.updates(input, rows);
+    assert.equal(Object.keys(result.updates).length, 220);
+    assert.ok(
+      rows.every((row) => result.updates[row.sha512].id === raw(row).id),
     );
-    assert.ok(project, `Expected only metadata GET: ${url}`);
-    assert.equal(parsed.searchParams.get("include_changelog"), "false");
-    assert.deepEqual(JSON.parse(parsed.searchParams.get("loaders")), [
-      "neoforge",
-    ]);
-    assert.deepEqual(JSON.parse(parsed.searchParams.get("game_versions")), [
-      "1.21.1",
-    ]);
-    reads++;
-    peak = Math.max(peak, ++active);
-    await delay(1);
-    active--;
-    const row = rows[Number(project[1])];
-    return json([current(row), raw(row)]);
+    assert.deepEqual(result.issues, {});
+    assert.deepEqual(result.warnings, []);
+    assert.ok(
+      posts <= 2,
+      "queued batches stop retrying the failing POST endpoint",
+    );
+    assert.equal(reads, 220);
+    assert.ok(peak <= 6);
+    await p.updates({ ...input, refresh: true }, rows);
+    assert.equal(
+      reads,
+      220,
+      "repeated Refresh reuses recent project histories",
+    );
+    now += 30001;
+    await p.updates(input, [rows[0]]);
+    assert.equal(
+      reads,
+      221,
+      "mutable project history is checked again after its short expiry",
+    );
   });
-  const result = await p.updates(input, rows);
-  assert.equal(Object.keys(result.updates).length, 220);
-  assert.ok(rows.every((row) => result.updates[row.sha512].id === raw(row).id));
-  assert.deepEqual(result.issues, {});
-  assert.deepEqual(result.warnings, []);
-  assert.ok(
-    posts <= 2,
-    "queued batches stop retrying the failing POST endpoint",
-  );
-  assert.equal(reads, 220);
-  assert.ok(peak <= 6);
-  await p.updates({ ...input, refresh: true }, rows);
-  assert.equal(reads, 220, "repeated Refresh reuses recent project histories");
-  now += 30001;
-  await p.updates(input, [rows[0]]);
-  assert.equal(
-    reads,
-    221,
-    "mutable project history is checked again after its short expiry",
-  );
-});
 
 test("220 installed mods verify newer multi-loader suffixes with fewer than 20 recovery GETs", async (t) => {
   let now = Date.now(),
@@ -1142,52 +1152,98 @@ test("indexed recovery obeys cancellation and rate limits without launching indi
   }
 });
 
-test("GET recovery verifies an installed release outside the filtered history and rejects forged metadata", async () => {
-  const row = item(0);
-  for (const scenario of [
-    "valid",
-    "wrong-current-project",
-    "wrong-current-hash",
-    "wrong-project",
-    "wrong-loader",
-    "client-only",
-    "unsafe-download",
-    "invalid-date",
-    "older",
-  ]) {
-    let candidate = raw(row),
-      installed = current(row),
-      currentReads = 0;
-    if (scenario === "wrong-current-project") installed.project_id = "other";
-    if (scenario === "wrong-current-hash") installed.files = raw(row).files;
-    if (scenario === "wrong-project") candidate.project_id = "other";
-    if (scenario === "wrong-loader") candidate.loaders = ["fabric"];
-    if (scenario === "client-only") candidate.environment = "client_only";
-    if (scenario === "unsafe-download")
-      candidate.files[0].url = "https://untrusted.example/mod.jar";
-    if (scenario === "invalid-date") candidate.date_published = "invalid";
-    if (scenario === "older") candidate.date_published = "2026-01-01T00:00:00Z";
-    const p = historyProvider(async (url, options) => {
-      if (options.method === "POST")
-        return new Response("gateway", { status: 503 });
-      if (url.includes("/project/")) return json([candidate]);
-      assert.equal(new URL(url).pathname, "/v2/version/old0");
-      currentReads++;
-      return json(installed);
-    });
-    const result = await p.updates(input, [row]);
-    if (scenario === "valid") {
-      assert.equal(result.updates[row.sha512].id, candidate.id);
-      assert.equal(currentReads, 1);
-      assert.deepEqual(result.warnings, []);
-    } else if (scenario === "older") {
-      assert.equal(result.updates[row.sha512], null);
-      assert.deepEqual(result.issues, {});
-    } else {
-      assert.deepEqual(result.updates, {}, scenario);
-      assert.ok(result.issues[row.sha512], scenario);
+for (const status of [503, 403])
+  test(`GET recovery after bulk ${status} verifies an installed release outside the filtered history and rejects forged metadata`, async () => {
+    const row = item(0);
+    for (const scenario of [
+      "valid",
+      "wrong-current-project",
+      "wrong-current-hash",
+      "wrong-project",
+      "unsafe-version-id",
+      "wrong-loader",
+      "wrong-game-version",
+      "client-only",
+      "unsafe-download",
+      "invalid-date",
+      "older",
+    ]) {
+      let candidate = raw(row),
+        installed = current(row),
+        currentReads = 0;
+      if (scenario === "wrong-current-project") installed.project_id = "other";
+      if (scenario === "wrong-current-hash") installed.files = raw(row).files;
+      if (scenario === "wrong-project") candidate.project_id = "other";
+      if (scenario === "unsafe-version-id") candidate.id = "../unsafe";
+      if (scenario === "wrong-loader") candidate.loaders = ["fabric"];
+      if (scenario === "wrong-game-version")
+        candidate.game_versions = ["1.20.1"];
+      if (scenario === "client-only") candidate.environment = "client_only";
+      if (scenario === "unsafe-download")
+        candidate.files[0].url = "https://untrusted.example/mod.jar";
+      if (scenario === "invalid-date") candidate.date_published = "invalid";
+      if (scenario === "older")
+        candidate.date_published = "2026-01-01T00:00:00Z";
+      const p = historyProvider(async (url, options) => {
+        if (options.method === "POST")
+          return new Response("<html><h1>Request blocked at edge</h1></html>", {
+            status,
+            headers: { "Content-Type": "text/html" },
+          });
+        if (url.includes("/project/")) return json([candidate]);
+        assert.equal(new URL(url).pathname, "/v2/version/old0");
+        currentReads++;
+        return json(installed);
+      });
+      const result = await p.updates(input, [row]);
+      if (scenario === "valid") {
+        assert.equal(result.updates[row.sha512].id, candidate.id);
+        assert.equal(currentReads, 1);
+        assert.deepEqual(result.warnings, []);
+      } else if (scenario === "older") {
+        assert.equal(result.updates[row.sha512], null);
+        assert.deepEqual(result.issues, {});
+      } else {
+        assert.deepEqual(result.updates, {}, scenario);
+        assert.ok(result.issues[row.sha512], scenario);
+      }
     }
-  }
+  });
+
+test("a blocked Modrinth POST and denied GET histories remain unchecked instead of up to date", async () => {
+  const rows = [item(0), item(1)];
+  let posts = 0;
+  const reads = [];
+  const p = historyProvider(async (url, options) => {
+    if (options.method === "POST") posts++;
+    else reads.push(new URL(url).pathname);
+    return new Response("<html><h1>Forbidden</h1></html>", {
+      status: 403,
+      headers: { "Content-Type": "text/html" },
+    });
+  });
+  const progress = {};
+  const result = await p.updates(
+    {
+      ...input,
+      onProgress: (partial) => Object.assign(progress, partial.updates),
+    },
+    rows,
+  );
+  assert.equal(posts, 1);
+  assert.deepEqual(
+    reads.sort(),
+    rows.map((row) => `/v2/project/${row.projectId}/version`),
+  );
+  assert.deepEqual(result.updates, {});
+  assert.deepEqual(
+    progress,
+    {},
+    "a denied check cannot publish a current result",
+  );
+  assert.ok(result.warnings.length > 0);
+  for (const row of rows)
+    assert.match(result.issues[row.sha512], /403|denied|blocked/i);
 });
 
 test("successful primary update batches survive a neighboring fallback failure", async () => {

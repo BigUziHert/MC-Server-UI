@@ -39,6 +39,33 @@ function transient(cause) {
   );
 }
 
+// Modrinth's firewall can reject public hash POSTs with an HTML 403 while
+// equivalent GETs still work. This is not an API authentication failure. Keep
+// JSON denials, authenticated requests and every other route out of recovery.
+function blockedPublicHashBatch(url, options, cause) {
+  if (
+    cause?.upstreamStatus !== 403 ||
+    !/^text\/html(?:\s*;|\s*$)/i.test(cause.upstreamContentType ?? "") ||
+    options.method?.toUpperCase() !== "POST"
+  )
+    return false;
+  const headers = new Headers(options.headers);
+  if (headers.has("authorization") || headers.has("x-api-key")) return false;
+  try {
+    const address = new URL(url);
+    return (
+      address.origin === "https://api.modrinth.com" &&
+      !address.username &&
+      !address.password &&
+      ["/v2/version_files", "/v2/version_files/update"].includes(
+        address.pathname,
+      )
+    );
+  } catch {
+    return false;
+  }
+}
+
 function operation(url) {
   try {
     const path = new URL(url).pathname;
@@ -182,7 +209,11 @@ export function createModrinthRecovery(
       options.signal?.throwIfAborted();
       if (rateLimitedUntil > now()) throw rateLimitError();
       const failure = bulkFailures.get(url);
-      if (failure?.until > now())
+      if (
+        failure?.until > now() &&
+        (transient(failure.cause) ||
+          blockedPublicHashBatch(url, options, failure.cause))
+      )
         throw Object.assign(new Error(failure.cause.message), {
           useFallback: true,
         });
@@ -195,7 +226,8 @@ export function createModrinthRecovery(
       } catch (cause) {
         if (options.signal?.aborted) throw aborted(options.signal);
         rememberRateLimit(cause);
-        if (!transient(cause)) throw cause;
+        if (!transient(cause) && !blockedPublicHashBatch(url, options, cause))
+          throw cause;
         bulkFailures.set(url, { cause, until: now() + 60000 });
         throw Object.assign(new Error(cause.message), {
           useFallback: true,

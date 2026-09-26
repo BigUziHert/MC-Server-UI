@@ -265,44 +265,106 @@ const recoveredVersion = (value) => ({
   files: [{ hashes: { sha512: value } }],
 });
 
-test("220 installed identities recover through verified GET requests after the bulk endpoint fails", async () => {
-  let posts = 0,
-    reads = 0,
-    active = 0,
-    peak = 0;
+for (const status of [502, 403])
+  test(`220 installed identities recover through verified GET requests after a bulk ${status}`, async () => {
+    let posts = 0,
+      reads = 0,
+      active = 0,
+      peak = 0;
+    const [provider] = createCoreProviders({
+      fetch: async (url, options) => {
+        const address = new URL(url);
+        if (options.method === "POST") {
+          posts++;
+          assert.equal(address.pathname, "/v2/version_files");
+          return new Response("<html><h1>Request blocked at edge</h1></html>", {
+            status,
+            headers: { "Content-Type": "text/html" },
+          });
+        }
+        assert.equal(address.searchParams.get("algorithm"), "sha512");
+        const value = address.pathname.split("/").at(-1);
+        assert.ok(rows(220).includes(value));
+        reads++;
+        peak = Math.max(peak, ++active);
+        await delay(1);
+        active--;
+        return json(recoveredVersion(value));
+      },
+    });
+    const [result, overlapping] = await Promise.all([
+      provider.identifyInstalled(rows(220)),
+      provider.identifyInstalled(rows(120)),
+    ]);
+    assert.equal(Object.keys(result.matches).length, 220);
+    assert.equal(Object.keys(overlapping.matches).length, 120);
+    assert.deepEqual(result.warnings, []);
+    assert.equal(reads, 220);
+    assert.ok(
+      posts >= 1 && posts <= 2,
+      `expected the failed POST circuit to stop queued batches, got ${posts}`,
+    );
+    assert.ok(peak <= 6, `shared GET recovery exceeded six readers: ${peak}`);
+    await provider.identifyInstalled(rows(220).reverse());
+    assert.equal(reads, 220, "verified recovered identities stay cached");
+  });
+
+test("403 bulk identity recovery verifies GET checksums and IDs and keeps denied reads as errors", async (t) => {
+  let now = Date.now(),
+    repaired = false,
+    posts = 0;
+  t.mock.method(Date, "now", () => now);
+  const reads = new Map();
+  const requested = [1, 2, 3, 4, 5].map(hash);
+  const forbidden = () =>
+    new Response("<html>Forbidden</html>", {
+      status: 403,
+      headers: { "Content-Type": "text/html" },
+    });
   const [provider] = createCoreProviders({
     fetch: async (url, options) => {
-      const address = new URL(url);
       if (options.method === "POST") {
         posts++;
-        assert.equal(address.pathname, "/v2/version_files");
-        return new Response("gateway", { status: 502 });
+        assert.equal(new URL(url).pathname, "/v2/version_files");
+        return forbidden();
       }
-      assert.equal(address.searchParams.get("algorithm"), "sha512");
+      const address = new URL(url);
       const value = address.pathname.split("/").at(-1);
-      assert.ok(rows(220).includes(value));
-      reads++;
-      peak = Math.max(peak, ++active);
-      await delay(1);
-      active--;
+      assert.equal(address.pathname, `/v2/version_file/${value}`);
+      assert.equal(address.searchParams.get("algorithm"), "sha512");
+      assert.ok(requested.includes(value));
+      reads.set(value, (reads.get(value) ?? 0) + 1);
+      if (!repaired && value === hash(2))
+        return json(recoveredVersion(hash(999)));
+      if (!repaired && value === hash(3))
+        return json({ ...recoveredVersion(value), project_id: "../unsafe" });
+      if (!repaired && value === hash(4))
+        return json({ ...recoveredVersion(value), id: "../unsafe" });
+      if (!repaired && value === hash(5)) return forbidden();
       return json(recoveredVersion(value));
     },
   });
-  const [result, overlapping] = await Promise.all([
-    provider.identifyInstalled(rows(220)),
-    provider.identifyInstalled(rows(120)),
-  ]);
-  assert.equal(Object.keys(result.matches).length, 220);
-  assert.equal(Object.keys(overlapping.matches).length, 120);
-  assert.deepEqual(result.warnings, []);
-  assert.equal(reads, 220);
+  const first = await provider.identifyInstalled(requested);
+  assert.deepEqual(Object.keys(first.matches), [hash(1)]);
+  assert.equal(first.warnings.length, 2);
+  assert.ok(first.warnings.some((warning) => /unverified/.test(warning)));
   assert.ok(
-    posts >= 1 && posts <= 2,
-    `expected the failed POST circuit to stop queued batches, got ${posts}`,
+    first.warnings.some((warning) => /403|denied|blocked/i.test(warning)),
   );
-  assert.ok(peak <= 6, `shared GET recovery exceeded six readers: ${peak}`);
-  await provider.identifyInstalled(rows(220).reverse());
-  assert.equal(reads, 220, "verified recovered identities stay cached");
+  assert.equal(reads.size, requested.length);
+  repaired = true;
+  now += 30_001;
+  const retried = await provider.identifyInstalled(requested);
+  assert.equal(Object.keys(retried.matches).length, requested.length);
+  assert.deepEqual(retried.warnings, []);
+  assert.equal(reads.get(hash(1)), 1, "verified identity stays cached");
+  for (const value of requested.slice(1))
+    assert.equal(
+      reads.get(value),
+      2,
+      "failed identities are retried, not cached as missing",
+    );
+  assert.equal(posts, 1, "the blocked POST observes its shared cooldown");
 });
 
 test("GET identity recovery isolates missing files, bad hashes and unsafe IDs while retaining verified successes", async (t) => {

@@ -24,6 +24,30 @@ test("provider errors preserve upstream status and retry-after for safe recovery
   }
 });
 
+test("Modrinth firewall errors retain their response type without API-key advice", async () => {
+  await assert.rejects(
+    providerJson("https://api.modrinth.com/v2/version_files", {
+      method: "POST",
+      fetch: async () =>
+        new Response("<html>Request blocked</html>", {
+          status: 403,
+          headers: { "Content-Type": "text/html; charset=utf-8" },
+        }),
+    }),
+    (cause) =>
+      cause.upstreamStatus === 403 &&
+      cause.upstreamContentType === "text/html; charset=utf-8" &&
+      /Modrinth rejected.*HTTP 403/.test(cause.message) &&
+      /do not require an API key/.test(cause.message),
+  );
+  await assert.rejects(
+    providerJson("https://api.curseforge.com/v1/mods", {
+      fetch: async () => new Response("Forbidden", { status: 403 }),
+    }),
+    /Check its API key or download restrictions/,
+  );
+});
+
 test("catalog requests keep a deadline when a caller supplies a lifetime signal", async (t) => {
   const caller = new AbortController(),
     deadline = new AbortController();
