@@ -137,7 +137,8 @@ export function createRemotePanelController({
   preload,
   remoteFrontend,
   openWebsite = () => {},
-  openUpdatesWindow,
+  openUpdatesOverlay,
+  dismissUpdatesOverlay = () => {},
   listLocalServers = () => [],
   selectLocalServer,
   store,
@@ -310,6 +311,7 @@ export function createRemotePanelController({
             : list();
         });
     }
+    dismissUpdatesOverlay();
     if (attached) window.contentView.removeChildView(attached);
     attached = panel.view;
     if (attached) {
@@ -355,15 +357,12 @@ export function createRemotePanelController({
     activate,
     openUpdates() {
       ensureOpen();
-      if (!openUpdatesWindow)
-        throw failure(
-          503,
-          "The app updates window is unavailable. Try again shortly.",
-        );
+      if (!openUpdatesOverlay)
+        throw failure(503, "App updates are unavailable. Try again shortly.");
       // Remote pages can open the trusted local UI, but cannot read updater
       // state or start a check, download, or install through this bridge. The
       // active connection and its persisted selection stay exactly as they are.
-      return openUpdatesWindow();
+      return openUpdatesOverlay(panels.get(activeId)?.contents);
     },
     reportServers(event, value) {
       if (!controller.isManagedSender(event))

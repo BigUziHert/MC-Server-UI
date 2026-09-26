@@ -7,6 +7,7 @@ import { safeInstallPath, unpackProviderZip } from "./launchpad-archives.mjs";
 import { inspectBundledDependencies } from "./launchpad-bundled.mjs";
 import { installedDependencySatisfies } from "./launchpad-dependency-ranges.mjs";
 import { createModRemoval } from "./launchpad-removal.mjs";
+import { createLaunchpadMetadataCache } from "./launchpad-metadata-cache.mjs";
 import { createVersionsService } from "./versions.mjs";
 import { cleanInstall, prepareCleanSettings } from "./clean-install.mjs";
 import { inferPackRuntime } from "./launchpad-pack-runtime.mjs";
@@ -254,6 +255,12 @@ export async function createLaunchpad(ctx) {
       );
     return safePath(root, relative);
   };
+  const metadataCache = ctx.catalogOnly
+    ? null
+    : await createLaunchpadMetadataCache({
+        pathFor: privatePath,
+        platforms: providers.map((provider) => provider.id),
+      });
   let receipts = [];
   try {
     const saved = ctx.catalogOnly
@@ -699,7 +706,9 @@ export async function createLaunchpad(ctx) {
         const receipt = sha512
           ? receiptIndex.get(`${relativePath}\0${sha512}`)
           : undefined;
-        const known = identities.get(sha512);
+        const known =
+          identities.get(sha512)?.value ??
+          (sha512 ? metadataCache?.identity(sha512) : undefined);
         rows[index] = {
           path: relativePath,
           name: file.name,
@@ -709,7 +718,7 @@ export async function createLaunchpad(ctx) {
           ...Object.fromEntries(
             Object.entries(receipt ?? {}).filter(([, value]) => value != null),
           ),
-          ...(known?.value?.platform ? known.value : {}),
+          ...(known?.platform ? known : {}),
         };
       },
       signal,
@@ -763,7 +772,16 @@ export async function createLaunchpad(ctx) {
     warnings,
     signal = lifetime.signal,
     urlField = "url",
+    cacheGeneration = metadataCache?.generation,
   ) {
+    const apply = (item, project) => {
+      if (typeof project?.title === "string" && project.title.trim())
+        item.title = project.title;
+      if (project?.iconUrl) item.iconUrl = project.iconUrl;
+      if (projectUrl(project?.url)) item[urlField] = projectUrl(project.url);
+      if (typeof project?.author === "string" && project.author.trim())
+        item.author = project.author;
+    };
     for (const item of items) {
       const url = projectPageUrl({ ...item, url: item[urlField] });
       if (url) item[urlField] = url;
@@ -771,9 +789,18 @@ export async function createLaunchpad(ctx) {
     await Promise.all(
       providers.map(async (found) => {
         if (!found.projectMetadata) return;
-        const known = items.filter(
-          (item) => item.platform === found.id && item.projectId,
-        );
+        const known = items
+          .filter((item) => item.platform === found.id && item.projectId)
+          .filter((item) => {
+            const cached = metadataCache?.project(
+              found.id,
+              String(item.projectId),
+            );
+            if (cached) apply(item, cached.value);
+            return (
+              !cached?.checkedAt || cached.checkedAt + 10 * 60_000 <= Date.now()
+            );
+          });
         if (!known.length) return;
         try {
           const result = await abortable(
@@ -786,13 +813,17 @@ export async function createLaunchpad(ctx) {
           );
           for (const item of known) {
             const project = projects.get(String(item.projectId));
-            if (typeof project?.title === "string" && project.title.trim())
-              item.title = project.title;
-            if (project?.iconUrl) item.iconUrl = project.iconUrl;
-            if (projectUrl(project?.url))
-              item[urlField] = projectUrl(project.url);
-            if (typeof project?.author === "string" && project.author.trim())
-              item.author = project.author;
+            apply(item, project);
+            if (project)
+              metadataCache?.rememberProject(
+                found.id,
+                String(item.projectId),
+                project,
+                // A partial metadata failure must remain eligible for the
+                // provider's retry policy (for example a missing team author).
+                result.warnings.length ? 0 : Date.now(),
+                cacheGeneration,
+              );
           }
           warnings.push(
             ...result.warnings.map(
@@ -1122,6 +1153,7 @@ export async function createLaunchpad(ctx) {
   }
   async function installed(input) {
     input = selection(input);
+    const cacheGeneration = metadataCache?.generation;
     const scope = JSON.stringify([input.type, input.gameVersion, input.loader]);
     const existingCheck = backgroundChecks.get(scope);
     if (
@@ -1205,6 +1237,7 @@ export async function createLaunchpad(ctx) {
       }
     }
     const flightKey = JSON.stringify([
+      cacheGeneration,
       input.type,
       input.gameVersion,
       input.loader,
@@ -1229,7 +1262,12 @@ export async function createLaunchpad(ctx) {
           AbortSignal.timeout(90000),
         ]);
         try {
-          await installedDetails({ ...input, signal }, items, warnings);
+          await installedDetails(
+            { ...input, signal },
+            items,
+            warnings,
+            cacheGeneration,
+          );
         } catch (cause) {
           warnings.push(
             signal.aborted
@@ -1245,6 +1283,12 @@ export async function createLaunchpad(ctx) {
         for (const item of items) {
           if (item.updateCheck !== "checked") item.updateCheck = "unavailable";
           if (!item.sha512) continue;
+          if (item.platform)
+            metadataCache?.rememberIdentity(
+              item.sha512,
+              identityFields(item),
+              cacheGeneration,
+            );
           const previous = identities.get(item.sha512);
           // Polling an unchanged negative result must not renew its retry
           // deadline forever while a provider recovers in the background.
@@ -1301,10 +1345,21 @@ export async function createLaunchpad(ctx) {
     }
     return structuredClone(await abortable(task, input.signal));
   }
-  async function installedDetails(input, items, warnings) {
+  async function installedDetails(
+    input,
+    items,
+    warnings,
+    cacheGeneration = metadataCache?.generation,
+  ) {
     if (input.type === "modpack") {
       await Promise.all([
-        enrichProjectMetadata(items, warnings, input.signal),
+        enrichProjectMetadata(
+          items,
+          warnings,
+          input.signal,
+          "url",
+          cacheGeneration,
+        ),
         ...(input.identityOnly
           ? []
           : [
@@ -1452,7 +1507,13 @@ export async function createLaunchpad(ctx) {
     // Names and icons belong to the project, even with All loaders/versions.
     // Failed metadata requests must not suppress identification or updates.
     await Promise.all([
-      enrichProjectMetadata(items, warnings, input.signal),
+      enrichProjectMetadata(
+        items,
+        warnings,
+        input.signal,
+        "url",
+        cacheGeneration,
+      ),
       checkUpdates(input, items, warnings),
     ]);
     input.signal.throwIfAborted();
@@ -2930,6 +2991,7 @@ export async function createLaunchpad(ctx) {
       const clearCaches = () => {
         fileCache.clear();
         identities.clear();
+        metadataCache?.clear();
         updateCache.clear();
         updateFailures.clear();
       };
@@ -3269,6 +3331,7 @@ export async function createLaunchpad(ctx) {
         )
         .catch(() => {});
       identities.clear();
+      metadataCache?.clear();
       updateCache.clear();
       versionCache.clear();
       updateFailures.clear();
@@ -3309,6 +3372,7 @@ export async function createLaunchpad(ctx) {
     snapshotInstalled: () => [...receipts],
     clearInstalled: async () => {
       removal.invalidate();
+      metadataCache?.clear();
       replaceReceipts([]);
       backgroundChecks.clear();
       await saveReceipts();
@@ -3319,6 +3383,7 @@ export async function createLaunchpad(ctx) {
     },
     restoreInstalled: async (value) => {
       removal.invalidate();
+      metadataCache?.clear();
       replaceReceipts([...value]);
       backgroundChecks.clear();
       await saveReceipts();
@@ -3409,6 +3474,7 @@ export async function createLaunchpad(ctx) {
       );
       await terminal?.flush();
       await receiptWrites.catch(() => {});
+      await metadataCache?.close();
       for (const [id] of plans)
         await fs
           .rm(await privatePath(id), { recursive: true, force: true })

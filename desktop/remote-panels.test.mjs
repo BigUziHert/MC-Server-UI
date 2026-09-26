@@ -28,7 +28,7 @@ function harness({
   restoreTimeoutMs,
   onError,
   remoteFrontend,
-  openUpdatesWindow,
+  openUpdatesOverlay,
 } = {}) {
   const views = [];
   const partitions = [];
@@ -108,7 +108,7 @@ function harness({
     restoreTimeoutMs,
     onError,
     remoteFrontend,
-    openUpdatesWindow,
+    openUpdatesOverlay,
     session: {
       fromPartition(name) {
         const value = new EventEmitter();
@@ -1228,7 +1228,7 @@ test("opening app updates preserves the active remote panel and saved selection"
   const store = memoryStore();
   const h = harness({
     store,
-    openUpdatesWindow: () => {
+    openUpdatesOverlay: () => {
       if (fail) throw new Error("Updates window could not load.");
       opened += 1;
     },

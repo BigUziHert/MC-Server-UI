@@ -46,7 +46,7 @@ async function fixture() {
     await import("./runtime.mjs");
   const { createRemotePanelController } = await import("./remote-panels.mjs");
   const { installConnectionIpc } = await import("./connections-ipc.mjs");
-  const { createUpdatesWindow } = await import("./updates-window.mjs");
+  const { createUpdatesOverlay } = await import("./updates-overlay.mjs");
   const { createRemoteFrontend, configureRemoteCertificateVerification } =
     await import("./remote-frontend.mjs");
   configureRemoteCertificateVerification(app.commandLine);
@@ -190,12 +190,13 @@ async function fixture() {
   }
   const prompts = [];
   const answers = [0, 1];
-  const updatesWindow = createUpdatesWindow({
-    BrowserWindow,
+  const updatesOverlay = createUpdatesOverlay({
+    WebContentsView,
+    ipcMain,
     parent: window,
     origin: runtime.url,
     session: ownerSession,
-    show: false,
+    preload: path.join(project, "desktop", "updates-preload.cjs"),
   });
   const controller = createRemotePanelController({
     window,
@@ -203,7 +204,8 @@ async function fixture() {
     WebContentsView: TrackedView,
     session,
     preload,
-    openUpdatesWindow: () => updatesWindow.open(),
+    openUpdatesOverlay: (contents) => updatesOverlay.open(contents),
+    dismissUpdatesOverlay: () => updatesOverlay.dismiss(),
     remoteFrontend: await createRemoteFrontend({
       directory: path.join(project, "dist"),
     }),
@@ -246,6 +248,8 @@ async function fixture() {
         downloads,
         updaterCalls,
         localServers: runtime.listLocalServers(),
+        nativeWindows: BrowserWindow.getAllWindows().length,
+        childViews: window.contentView.children.length,
         context: controller.list(),
         cookies: remoteContents.at(-1).isDestroyed()
           ? []
@@ -254,7 +258,7 @@ async function fixture() {
     },
     async stop() {
       removeIpc();
-      updatesWindow.close();
+      updatesOverlay.close();
       await controller.close();
       await runtime.close();
       host.closeAllConnections();
@@ -419,6 +423,24 @@ async function smoke() {
       await updater.evaluate(() => window.mcPanelConnections),
       undefined,
     );
+    assert.deepEqual(
+      await updater.evaluate(() => Object.keys(window.mcPanelUpdates)),
+      ["close"],
+    );
+    await expect
+      .poll(() =>
+        updater.evaluate(
+          () => getComputedStyle(document.documentElement).backgroundColor,
+        ),
+      )
+      .toBe("rgba(0, 0, 0, 0)");
+    await expect
+      .poll(() =>
+        remote.evaluate(
+          () => getComputedStyle(document.documentElement).filter,
+        ),
+      )
+      .toBe("blur(3px)");
     state = await application.evaluate(() =>
       globalThis.__frontendSmoke.inspect(),
     );
@@ -428,6 +450,29 @@ async function smoke() {
       "Updates must not switch to local Welcome",
     );
     assert.equal(remote.url(), remoteUrl);
+    assert.equal(
+      state.nativeWindows,
+      1,
+      "Updates must stay inside the existing native window",
+    );
+    assert.equal(
+      state.childViews,
+      2,
+      "A transparent local overlay sits above the remote view",
+    );
+    await application.evaluate(({ BrowserWindow }) =>
+      BrowserWindow.getAllWindows()[0].setContentSize(1100, 780),
+    );
+    await expect
+      .poll(() =>
+        updater.evaluate(() => ({ width: innerWidth, height: innerHeight })),
+      )
+      .toEqual({ width: 1100, height: 780 });
+    const modalBounds = await updater
+      .getByRole("dialog", { name: "App updates" })
+      .boundingBox();
+    assert.ok(Math.abs(modalBounds.x + modalBounds.width / 2 - 550) < 2);
+    assert.ok(Math.abs(modalBounds.y + modalBounds.height / 2 - 390) < 2);
     await expect(
       local.getByRole("dialog", { name: "App updates" }),
     ).toHaveCount(0);
@@ -437,6 +482,25 @@ async function smoke() {
     await expect(updater.getByRole("status")).toHaveText(
       "This computer is up to date.",
     );
+    const screenshotDirectory = path.join(project, "release", "review-updates");
+    await fs.mkdir(screenshotDirectory, { recursive: true });
+    const composed = await application.evaluate(async ({ webContents }) =>
+      (
+        await webContents
+          .getAllWebContents()
+          .find((contents) => contents.getURL().includes("?app-updates=1"))
+          .capturePage(undefined, {
+            stayHidden: true,
+            stayAwake: true,
+          })
+      )
+        .toPNG()
+        .toString("base64"),
+    );
+    await fs.writeFile(
+      path.join(screenshotDirectory, "updates-overlay.png"),
+      Buffer.from(composed, "base64"),
+    );
     await updater
       .getByRole("button", { name: "Close app updates", exact: true })
       .click();
@@ -445,6 +509,19 @@ async function smoke() {
       globalThis.__frontendSmoke.inspect(),
     );
     assert.equal(state.context.activeId, remoteId);
+    assert.equal(state.nativeWindows, 1);
+    assert.equal(state.childViews, 1);
+    await expect
+      .poll(() =>
+        remote.evaluate(
+          () => getComputedStyle(document.documentElement).filter,
+        ),
+      )
+      .toBe("none");
+    await remote.getByRole("button", { name: "Filter console levels" }).click();
+    await expect(levels).toBeHidden();
+    await remote.getByRole("button", { name: "Filter console levels" }).click();
+    await expect(levels).toBeVisible();
     assert.deepEqual(state.updaterCalls, ["check"]);
     assert.ok(
       state.requests.every(
@@ -471,9 +548,11 @@ async function smoke() {
     await expect(
       reopenedUpdates.getByRole("dialog", { name: "App updates" }),
     ).toBeVisible();
-    await reopenedUpdates
-      .getByRole("button", { name: "Close", exact: true })
-      .click();
+    await reopenedUpdates.keyboard.press("Escape").catch((cause) => {
+      // Escape destroys this WebContentsView before Chromium can acknowledge
+      // key-up; only that expected close may interrupt the input command.
+      if (!reopenedUpdates.isClosed()) throw cause;
+    });
     await expect.poll(() => reopenedUpdates.isClosed()).toBe(true);
     assert.equal(
       (await application.evaluate(() => globalThis.__frontendSmoke.inspect()))

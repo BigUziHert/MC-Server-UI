@@ -41,6 +41,7 @@ files:
   - server/launchpad-network.mjs
   - server/launchpad-recovery.mjs
   - server/launchpad-identification.mjs
+  - server/launchpad-metadata-cache.mjs
   - server/launchpad-archives.mjs
   - server/launchpad-bundled.mjs
   - server/launchpad-dependency-ranges.mjs
@@ -54,7 +55,8 @@ files:
   - desktop/main.mjs
   - desktop/runtime.mjs
   - desktop/updates.mjs
-  - desktop/updates-window.mjs
+  - desktop/updates-overlay.mjs
+  - desktop/updates-preload.cjs
   - desktop/selection.mjs
   - desktop/preferences.mjs
   - desktop/shutdown.mjs

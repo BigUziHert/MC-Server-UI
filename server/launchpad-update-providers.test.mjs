@@ -43,6 +43,14 @@ const current = (installed, overrides = {}) =>
   });
 const json = (value) => new Response(JSON.stringify(value));
 const provider = (fetch) => createCoreProviders({ fetch })[0];
+// These fixtures exercise the final history fallback after batched search has
+// no indexed project. Bulk-search behavior has separate complete fixtures below.
+const historyProvider = (fetch) =>
+  provider((url, options) => {
+    if (new URL(url).pathname === "/v2/search") return json({ hits: [] });
+    if (new URL(url).pathname === "/v2/projects") return json([]);
+    return fetch(url, options);
+  });
 
 test("Modrinth environment definitions agree across catalogs, current checks, updates and resolution", async () => {
   // Modrinth explicitly permits server installation for client_only_server_optional.
@@ -402,7 +410,7 @@ test("220 installed mods recover from failed hash POSTs using bounded cached GET
     peak = 0;
   t.mock.method(Date, "now", () => now);
   const rows = Array.from({ length: 220 }, (_, index) => item(index));
-  const p = provider(async (url, options) => {
+  const p = historyProvider(async (url, options) => {
     if (options.method === "POST") {
       posts++;
       return new Response("gateway unavailable", { status: 502 });
@@ -448,6 +456,290 @@ test("220 installed mods recover from failed hash POSTs using bounded cached GET
   );
 });
 
+test("220 installed mods verify newer multi-loader suffixes with fewer than 20 recovery GETs", async (t) => {
+  let now = Date.now(),
+    reads = 0,
+    posts = 0;
+  t.mock.method(Date, "now", () => now);
+  const rows = Array.from({ length: 220 }, (_, index) => item(index));
+  const versions = new Map(),
+    projects = new Map();
+  for (const [index, row] of rows.entries()) {
+    const tail = Array.from({ length: index === 0 ? 115 : 13 }, (_, offset) =>
+      raw(row, {
+        id: `v${index}_${offset}`,
+        date_published: new Date(Date.UTC(2026, 7, 1, 0, offset)).toISOString(),
+        loaders: ["fabric"],
+        game_versions: ["1.22"],
+      }),
+    );
+    // Search still points to the installed release. These compatible updates
+    // are absent from the index but present in the authoritative version list.
+    if (index < 2)
+      Object.assign(tail.at(-2), {
+        loaders: ["neoforge"],
+        game_versions: ["1.21.1"],
+      });
+    for (const version of [current(row), ...tail])
+      versions.set(version.id, version);
+    projects.set(row.projectId, {
+      id: row.projectId,
+      versions: [row.versionId, ...tail.map((version) => version.id)],
+    });
+  }
+  const p = provider(async (url, options) => {
+    if (options.method === "POST") {
+      posts++;
+      return new Response("gateway unavailable", { status: 503 });
+    }
+    reads++;
+    const parsed = new URL(url);
+    if (parsed.pathname === "/v2/search") {
+      const facets = JSON.parse(parsed.searchParams.get("facets"));
+      assert.ok(
+        facets.some((values) => values.includes("categories:neoforge")),
+      );
+      assert.ok(facets.some((values) => values.includes("versions:1.21.1")));
+      const environments = facets.find((values) =>
+        values[0].startsWith("environment:"),
+      );
+      assert.ok(
+        environments.includes("environment:client_only_server_optional"),
+      );
+      assert.ok(!environments.includes("environment:client_only"));
+      return json({
+        hits: facets[0].map((value) => {
+          const projectId = value.slice("project_id:".length);
+          return {
+            project_id: projectId,
+            latest_version: projects.get(projectId).versions[0],
+          };
+        }),
+      });
+    }
+    const ids = JSON.parse(parsed.searchParams.get("ids"));
+    if (parsed.pathname === "/v2/projects")
+      return json(ids.map((id) => projects.get(id)));
+    assert.equal(
+      parsed.pathname,
+      "/v2/versions",
+      "no individual release histories are needed",
+    );
+    assert.ok(ids.length <= 300);
+    assert.ok(url.length <= 6000);
+    assert.equal(parsed.searchParams.get("include_changelog"), "false");
+    return json(ids.map((id) => versions.get(id)));
+  });
+  const result = await p.updates(input, rows);
+  assert.equal(Object.keys(result.updates).length, 220);
+  assert.deepEqual(result.issues, {});
+  assert.deepEqual(result.warnings, []);
+  assert.equal(result.updates[rows[0].sha512].id, "v0_113");
+  assert.equal(result.updates[rows[1].sha512].id, "v1_11");
+  for (const row of rows.slice(2))
+    assert.equal(result.updates[row.sha512], null);
+  assert.ok(posts <= 2);
+  assert.ok(
+    reads <= 20,
+    `${reads} update reads must leave room for 220 cold identity reads`,
+  );
+  const firstReads = reads;
+  assert.deepEqual(await p.updates({ ...input, refresh: true }, rows), result);
+  assert.equal(
+    reads,
+    firstReads,
+    "validated metadata has a short, fixed refresh cache",
+  );
+  now += 30001;
+  Object.assign(versions.get("v2_12"), {
+    loaders: ["neoforge"],
+    game_versions: ["1.21.1"],
+  });
+  const changed = await p.updates(input, [rows[2]]);
+  assert.equal(
+    changed.updates[rows[2].sha512].id,
+    "v2_12",
+    "retagged newer releases are rechecked after expiry",
+  );
+});
+
+test("missing, ambiguous, stale or invalid indexed metadata falls back per project without false current results", async () => {
+  for (const scenario of [
+    "missing-hit",
+    "duplicate-hit",
+    "unlisted-current",
+    "missing-candidate",
+    "missing-version",
+    "duplicate-version",
+    "wrong-project",
+    "wrong-hash",
+    "invalid-date",
+    "unordered",
+    "older-index",
+    "long-history",
+    "incompatible",
+    "unsafe-download",
+  ]) {
+    const row = item(0),
+      newer = raw(row),
+      installed = current(row);
+    let historyReads = 0;
+    const p = provider(async (url, options) => {
+      if (options.method === "POST")
+        return new Response("gateway", { status: 503 });
+      const parsed = new URL(url);
+      if (parsed.pathname === "/v2/search") {
+        const hit = {
+          project_id: row.projectId,
+          latest_version: scenario === "older-index" ? "ancient" : installed.id,
+        };
+        return json({
+          hits:
+            scenario === "missing-hit"
+              ? []
+              : scenario === "duplicate-hit"
+                ? [hit, hit]
+                : [hit],
+        });
+      }
+      if (parsed.pathname === "/v2/projects")
+        return json([
+          {
+            id: row.projectId,
+            versions:
+              scenario === "unlisted-current"
+                ? [newer.id]
+                : scenario === "missing-candidate"
+                  ? []
+                  : scenario === "older-index"
+                    ? ["ancient", installed.id, newer.id]
+                    : scenario === "long-history"
+                      ? [
+                          installed.id,
+                          ...Array.from(
+                            { length: 201 },
+                            (_, index) => `extra${index}`,
+                          ),
+                        ]
+                      : [installed.id, newer.id],
+          },
+        ]);
+      if (parsed.pathname === "/v2/versions") {
+        const offered = structuredClone(newer),
+          before = structuredClone(installed);
+        if (scenario === "wrong-project") offered.project_id = "different";
+        if (scenario === "wrong-hash")
+          before.files[0].hashes.sha512 = hash("mismatch");
+        if (scenario === "invalid-date") offered.date_published = "invalid";
+        if (scenario === "unordered") offered.date_published = "2020-01-01";
+        if (scenario === "incompatible") {
+          offered.loaders = ["fabric"];
+          before.loaders = ["fabric"];
+        }
+        if (scenario === "unsafe-download")
+          offered.files[0].url = "https://evil.example/mod.jar";
+        return json(
+          scenario === "missing-version"
+            ? [before]
+            : scenario === "duplicate-version"
+              ? [before, offered, offered]
+              : [before, offered],
+        );
+      }
+      assert.equal(parsed.pathname, `/v2/project/${row.projectId}/version`);
+      historyReads++;
+      return json([installed, newer]);
+    });
+    const result = await p.updates(input, [row]);
+    assert.equal(historyReads, 1, scenario);
+    assert.equal(result.updates[row.sha512].id, newer.id, scenario);
+    assert.deepEqual(result.issues, {}, scenario);
+  }
+});
+
+test("indexed recovery splits long version IDs into bounded GET URLs", async () => {
+  const row = item(0);
+  const versions = [
+    current(row),
+    ...Array.from({ length: 200 }, (_, index) =>
+      raw(row, {
+        id: `v${index}_${"x".repeat(90)}`,
+        date_published: new Date(Date.UTC(2026, 7, 1, 0, index)).toISOString(),
+        loaders: ["fabric"],
+      }),
+    ),
+  ];
+  let reads = 0;
+  const p = provider(async (url, options) => {
+    if (options.method === "POST")
+      return new Response("gateway", { status: 502 });
+    const parsed = new URL(url);
+    if (parsed.pathname === "/v2/search")
+      return json({
+        hits: [{ project_id: row.projectId, latest_version: row.versionId }],
+      });
+    if (parsed.pathname === "/v2/projects")
+      return json([
+        { id: row.projectId, versions: versions.map((version) => version.id) },
+      ]);
+    assert.equal(parsed.pathname, "/v2/versions");
+    assert.ok(url.length <= 6000);
+    reads++;
+    const ids = JSON.parse(parsed.searchParams.get("ids"));
+    return json(versions.filter((version) => ids.includes(version.id)));
+  });
+  const result = await p.updates(input, [row]);
+  assert.deepEqual(result.updates, { [row.sha512]: null });
+  assert.deepEqual(result.issues, {});
+  assert.ok(reads >= 4);
+});
+
+test("indexed recovery obeys cancellation and rate limits without launching individual histories", async () => {
+  for (const scenario of ["cancel", "rate-limit"]) {
+    const controller = new AbortController(),
+      row = item(0);
+    let entered,
+      historyReads = 0;
+    const ready = new Promise((resolve) => {
+      entered = resolve;
+    });
+    const p = provider(async (url, options) => {
+      if (options.method === "POST")
+        return new Response("gateway", { status: 503 });
+      const parsed = new URL(url);
+      if (parsed.pathname === "/v2/search") {
+        entered();
+        if (scenario === "rate-limit")
+          return new Response("limited", {
+            status: 429,
+            headers: { "Retry-After": "20" },
+          });
+        return new Promise((resolve, reject) =>
+          options.signal.addEventListener(
+            "abort",
+            () => reject(options.signal.reason),
+            { once: true },
+          ),
+        );
+      }
+      if (parsed.pathname === "/v2/projects") return json([]);
+      historyReads++;
+      assert.fail(`Unexpected history request: ${url}`);
+    });
+    const work = p.updates({ ...input, signal: controller.signal }, [row]);
+    await ready;
+    if (scenario === "cancel") {
+      controller.abort(new Error("left this server"));
+      await assert.rejects(work, /left this server/);
+    } else {
+      const result = await work;
+      assert.deepEqual(result.updates, {});
+      assert.match(result.issues[row.sha512], /limit/i);
+    }
+    assert.equal(historyReads, 0);
+  }
+});
+
 test("GET recovery verifies an installed release outside the filtered history and rejects forged metadata", async () => {
   const row = item(0);
   for (const scenario of [
@@ -473,7 +765,7 @@ test("GET recovery verifies an installed release outside the filtered history an
       candidate.files[0].url = "https://untrusted.example/mod.jar";
     if (scenario === "invalid-date") candidate.date_published = "invalid";
     if (scenario === "older") candidate.date_published = "2026-01-01T00:00:00Z";
-    const p = provider(async (url, options) => {
+    const p = historyProvider(async (url, options) => {
       if (options.method === "POST")
         return new Response("gateway", { status: 503 });
       if (url.includes("/project/")) return json([candidate]);
@@ -499,7 +791,7 @@ test("GET recovery verifies an installed release outside the filtered history an
 test("successful primary update batches survive a neighboring fallback failure", async () => {
   const rows = Array.from({ length: 201 }, (_, index) => item(index));
   const byHash = new Map(rows.map((row) => [row.sha512, row]));
-  const p = provider(async (url, options) => {
+  const p = historyProvider(async (url, options) => {
     if (options.method === "POST") {
       const hashes = JSON.parse(options.body).hashes;
       if (hashes.includes(rows[0].sha512))
@@ -528,7 +820,7 @@ test("failed GET checks briefly cache only affected file scopes without extendin
     requests = 0,
     failing = true;
   t.mock.method(Date, "now", () => now);
-  const p = provider(async (url, options) => {
+  const p = historyProvider(async (url, options) => {
     requests++;
     if (options.method === "POST")
       return new Response("gateway", { status: 502 });
@@ -560,7 +852,7 @@ test("unverified current-version GET metadata is never retained as a trusted cac
   const row = item(0);
   let mismatched = true,
     currentReads = 0;
-  const p = provider(async (url, options) => {
+  const p = historyProvider(async (url, options) => {
     if (options.method === "POST")
       return new Response("gateway", { status: 502 });
     if (url.includes("/project/")) return json([raw(row)]);
@@ -634,7 +926,7 @@ for (const stalled of ["request", "response body"])
     const ready = new Promise((resolve) => {
       entered = resolve;
     });
-    const p = provider(async (url) => {
+    const p = historyProvider(async (url) => {
       calls++;
       if (calls === 2) entered();
       if (!failing) {
@@ -775,7 +1067,7 @@ test("Quilt mod compatibility uses Fabric in update requests and catalog validat
 
 test("a failed fallback gives the affected file a reason without blocking a later project", async () => {
   let failed = true;
-  const p = provider(async (url, options) => {
+  const p = historyProvider(async (url, options) => {
     if (failed) {
       failed = false;
       return new Response("bad", { status: 503 });

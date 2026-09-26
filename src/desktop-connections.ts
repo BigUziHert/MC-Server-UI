@@ -30,6 +30,7 @@ export type PanelConnections = {
 
 declare global {
   interface Window {
+    mcPanelUpdates?: { close: () => void };
     mcPanelConnections?: {
       list: () => Promise<PanelConnections>;
       open: (url: string) => Promise<PanelConnections>;

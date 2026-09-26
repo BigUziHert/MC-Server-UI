@@ -1,6 +1,14 @@
 .update-ready {
   color: var(--accent, #ffd000);
 }
+:root.updates-overlay,
+.updates-overlay body,
+.updates-overlay #root {
+  background: transparent;
+}
+.updates-overlay .updates-dialog::backdrop {
+  backdrop-filter: none;
+}
 .updates-dialog {
   width: min(480px, calc(100vw - 32px));
   max-height: calc(100dvh - 40px);

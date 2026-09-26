@@ -5051,6 +5051,7 @@ test(
     });
     assert.deepEqual(await fs.readdir(path.join(f.dataDir, "launchpad")), [
       "last-job.json",
+      "metadata-cache.json",
     ]);
   },
 );

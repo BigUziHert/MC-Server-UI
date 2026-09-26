@@ -144,7 +144,7 @@ async function fixture() {
     downloadsDirectory: path.join(root, "downloads"),
     listLocalServers: () => runtime.listLocalServers(),
     selectLocalServer: (id) => runtime.selectLocalServer(id),
-    openUpdatesWindow: () =>
+    openUpdatesOverlay: () =>
       ownerWindow.webContents.send("mc-panel-updates-open"),
     dialog: {
       async showMessageBox(window, options) {

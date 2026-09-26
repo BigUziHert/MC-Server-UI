@@ -33,7 +33,7 @@ import {
 } from "./external-links.mjs";
 import updaterPackage from "electron-updater";
 import { applyDownloadedUpdate, createUpdateController } from "./updates.mjs";
-import { createUpdatesWindow } from "./updates-window.mjs";
+import { createUpdatesOverlay } from "./updates-overlay.mjs";
 
 const { autoUpdater } = updaterPackage;
 
@@ -66,7 +66,7 @@ let updateTimer;
 let initialUpdateTimer;
 let remotePanels;
 let removeConnectionIpc;
-let updatesWindow;
+let updatesOverlay;
 
 async function logError(cause) {
   const message =
@@ -311,7 +311,7 @@ function createTray() {
       click: () => {
         showWindow();
         updates?.check();
-        void updatesWindow?.open().catch(logError);
+        void remotePanels?.openUpdates().catch(logError);
       },
     },
     { label: "Help and documentation", click: () => void openWebsite() },
@@ -432,14 +432,14 @@ async function launch() {
     },
   });
   window.setMenu(null);
-  updatesWindow = createUpdatesWindow({
-    BrowserWindow,
+  updatesOverlay = createUpdatesOverlay({
+    WebContentsView,
+    ipcMain,
     parent: window,
     origin: runtime.url,
     session: panelSession,
-    icon: path.join(desktopDir, "assets", "icon.ico"),
+    preload: path.join(desktopDir, "updates-preload.cjs"),
   });
-  window.on("closed", () => updatesWindow?.close());
   remotePanels = createRemotePanelController({
     window,
     localOrigin: runtime.url,
@@ -449,7 +449,8 @@ async function launch() {
     downloadsDirectory: app.getPath("downloads"),
     preload: path.join(desktopDir, "connections-preload.cjs"),
     openWebsite,
-    openUpdatesWindow: () => updatesWindow.open(),
+    openUpdatesOverlay: (contents) => updatesOverlay.open(contents),
+    dismissUpdatesOverlay: () => updatesOverlay.dismiss(),
     remoteFrontend: await createRemoteFrontend({
       directory: path.join(desktopDir, "../dist"),
     }),

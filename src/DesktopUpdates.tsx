@@ -71,7 +71,7 @@ function RemoteUpdates() {
   );
 }
 
-export function DesktopUpdatesWindow() {
+export function DesktopUpdatesOverlay() {
   return <LocalUpdates standalone />;
 }
 
@@ -83,7 +83,7 @@ function LocalUpdates({ standalone = false }: { standalone?: boolean }) {
   const [loadError, setLoadError] = useState("");
   const dialog = useRef<HTMLDialogElement>(null);
   const close = () => {
-    if (standalone) window.close();
+    if (standalone) window.mcPanelUpdates?.close();
     else setOpen(false);
   };
   useEffect(() => {
