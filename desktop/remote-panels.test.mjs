@@ -1064,6 +1064,116 @@ test("sign-in state distinguishes empty authenticated rosters from signout witho
   await h.controller.close();
 });
 
+test("main-frame reloads hide stale sessions and rosters until the new document verifies access", async () => {
+  const h = harness();
+  const first = await h.controller.open(origin);
+  const second = await h.controller.open("https://other.example:3002");
+  const state = (id) =>
+    h.controller.list().panels.find((panel) => panel.id === id);
+  const contents = h.views[0].webContents;
+  const report = (index, value) => {
+    const sender = h.views[index].webContents;
+    h.controller.reportServers(
+      { sender, senderFrame: sender.mainFrame },
+      value,
+    );
+  };
+  const servers = [{ id: "world", name: "Survival", status: "offline" }];
+  report(0, servers);
+  report(1, servers);
+  const secondState = state(second.activeId);
+  const firstState = state(first.activeId);
+  for (const details of [
+    { isMainFrame: false, isSameDocument: false },
+    { isMainFrame: true, isSameDocument: true },
+  ]) {
+    contents.emit("did-start-navigation", details);
+    assert.deepEqual(state(first.activeId), firstState);
+  }
+  contents.emit("did-start-navigation", {
+    isMainFrame: true,
+    isSameDocument: false,
+  });
+  assert.equal(state(first.activeId).signedIn, undefined);
+  assert.deepEqual(state(first.activeId).servers, []);
+  assert.deepEqual(state(second.activeId), secondState);
+  assert.throws(
+    () => h.controller.selectRemoteServer(first.activeId, "world"),
+    { status: 404 },
+  );
+  contents.emit("did-finish-load");
+  assert.equal(state(first.activeId).signedIn, undefined);
+  report(0, []);
+  assert.equal(state(first.activeId).signedIn, true);
+  assert.deepEqual(state(first.activeId).servers, []);
+  report(0, null);
+  contents.emit("did-start-navigation", {
+    isMainFrame: true,
+    isSameDocument: false,
+  });
+  assert.equal(state(first.activeId).signedIn, false);
+  assert.equal(h.partitions[0].cleared, undefined);
+  assert.equal(h.partitions[0].cacheCleared, undefined);
+  assert.deepEqual(state(second.activeId), secondState);
+  await h.controller.close();
+});
+
+test("explicit panel reloads clear their live state before loading and keep failed connections retryable", async () => {
+  let pending;
+  let failLoad = false;
+  const store = memoryStore();
+  const h = harness({
+    store,
+    load: async () => {
+      if (failLoad) throw new Error("Offline");
+      await pending;
+    },
+  });
+  const first = await h.controller.open(origin);
+  const second = await h.controller.open("https://other.example:3002");
+  const state = (id) =>
+    h.controller.list().panels.find((panel) => panel.id === id);
+  const report = (index, value) => {
+    const sender = h.views[index].webContents;
+    h.controller.reportServers(
+      { sender, senderFrame: sender.mainFrame },
+      value,
+    );
+  };
+  report(0, [{ id: "world", name: "Survival", status: "offline" }]);
+  report(1, []);
+  const secondState = state(second.activeId);
+  let release;
+  pending = new Promise((resolve) => {
+    release = resolve;
+  });
+  const loading = h.controller.open(`${origin}/#invite=${invite}`);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(state(first.activeId).signedIn, undefined);
+  assert.deepEqual(state(first.activeId).servers, []);
+  assert.deepEqual(state(second.activeId), secondState);
+  release();
+  await loading;
+  assert.equal(state(first.activeId).signedIn, undefined);
+  report(0, []);
+  assert.equal(state(first.activeId).signedIn, true);
+  failLoad = true;
+  await assert.rejects(
+    h.controller.open(`${origin}/#invite=${"b".repeat(43)}`),
+    { status: 502 },
+  );
+  assert.equal(state(first.activeId).signedIn, undefined);
+  assert.deepEqual(state(first.activeId).servers, []);
+  assert.deepEqual(state(second.activeId), secondState);
+  assert.equal(h.partitions[0].cleared, undefined);
+  assert.equal(h.views.length, 2);
+  await h.controller.close();
+  assert.deepEqual(
+    store.snapshot.panels.map(({ id }) => id),
+    [first.activeId, second.activeId],
+  );
+});
+
 test("selector icons stay with their host for colliding IDs and reject unsafe image sources", async () => {
   const icon = (fill) =>
     `data:image/png;base64,${new Resvg(`<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64"><rect width="64" height="64" fill="${fill}"/></svg>`).render().asPng().toString("base64")}`;
@@ -1475,7 +1585,7 @@ test("offline restores keep retryable entries, suppress certificate dialogs, and
   assert.equal(store.snapshot.panels.length, 2);
 });
 
-test("signout is saved only on session changes and remains known through offline restore and re-login", async () => {
+test("signout survives offline restore but a remembered login needs fresh verification", async () => {
   const store = memoryStore();
   const save = store.save;
   let writes = 0;
@@ -1533,7 +1643,7 @@ test("signout is saved only on session changes and remains known through offline
       })),
     [
       { id: first.activeId, signedIn: false },
-      { id: second.activeId, signedIn: true },
+      { id: second.activeId, signedIn: undefined },
     ],
   );
   online = true;

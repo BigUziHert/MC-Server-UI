@@ -16,6 +16,7 @@ export type PanelConnections = {
     label: string;
     origin: string;
     local: boolean;
+    // Only true after this running connection confirms its current session.
     signedIn?: boolean;
     servers?: PanelServer[];
   }[];

@@ -183,11 +183,13 @@ export function createRemotePanelController({
   };
   const remember = (panel) => {
     const { id, origin, trustedFingerprint, signedIn } = panel;
+    const savedSignIn =
+      typeof signedIn === "boolean" ? signedIn : registry.get(id)?.signedIn;
     registry.set(id, {
       id,
       origin,
       ...(trustedFingerprint ? { trustedFingerprint } : {}),
-      ...(typeof signedIn === "boolean" ? { signedIn } : {}),
+      ...(typeof savedSignIn === "boolean" ? { signedIn: savedSignIn } : {}),
     });
   };
   const persist = () => {
@@ -264,6 +266,15 @@ export function createRemotePanelController({
     }
     onChange(context);
     return context;
+  };
+  const suspendSession = (panel) => {
+    const hadSession = panel.signedIn === true || panel.servers.length > 0;
+    panel.servers = [];
+    // A remembered login is not proof that access still exists. Keep explicit
+    // signout, but require the new document to verify any authenticated state.
+    if (panel.signedIn === true) panel.signedIn = undefined;
+    panel.selectionNeedsReport = true;
+    if (hadSession) changed();
   };
   const resize = () => {
     if (!attached || window.isDestroyed()) return;
@@ -552,8 +563,9 @@ export function createRemotePanelController({
         session: remoteSession,
         saved: Boolean(savedEntry),
         trustedFingerprint: savedEntry?.trustedFingerprint,
-        // This is only a display hint; the remote server verifies access.
-        signedIn: savedEntry?.signedIn,
+        // Credentials survive restarts, but a previous login must not appear
+        // active until this process receives a freshly authenticated roster.
+        signedIn: savedEntry?.signedIn === false ? false : undefined,
         failed: true,
         allowCertificatePrompt: !background,
       };
@@ -572,6 +584,16 @@ export function createRemotePanelController({
       contents.on("will-navigate", navigation);
       contents.on("will-frame-navigate", navigation);
       contents.on("will-redirect", navigation);
+      contents.on(
+        "did-start-navigation",
+        (details, _url, isInPlace, isMainFrame) => {
+          if (
+            (details.isMainFrame ?? isMainFrame) &&
+            !(details.isSameDocument ?? isInPlace)
+          )
+            suspendSession(panel);
+        },
+      );
       contents.on("will-attach-webview", (event) => event.preventDefault());
       contents.on("page-title-updated", (event) => event.preventDefault());
       // A response redirect cannot escape the selected host, including requests
@@ -708,7 +730,7 @@ export function createRemotePanelController({
           throw failure(404, "This panel connection is no longer available.");
         canceled = false;
         panel.allowCertificatePrompt = !quiet;
-        if (panel.pendingServerId) panel.selectionNeedsReport = true;
+        suspendSession(panel);
         let timeout;
         panel.loading = (async () => {
           try {
@@ -740,6 +762,7 @@ export function createRemotePanelController({
             await persist();
           } catch {
             panel.failed = true;
+            suspendSession(panel);
             if (!panel.saved) await dispose(panel);
             changed();
             throw failure(

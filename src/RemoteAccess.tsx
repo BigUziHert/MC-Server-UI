@@ -41,13 +41,12 @@ export default function RemoteAccess() {
     sequence: number;
   } | null>(null);
   const signedOut = useCallback(() => {
+    // Clear the native account menu as part of the session transition, even
+    // when this view is hidden before React renders the sign-in screen.
+    void reportDesktopServers(null).catch(() => {});
     setRequestedRemoteServer(null);
     setSession({ role: "guest" });
   }, []);
-  useEffect(() => {
-    if (session?.role === "guest")
-      void reportDesktopServers(null).catch(() => {});
-  }, [session]);
   useEffect(() => {
     if (!window.mcPanelConnections || session?.role === "owner") return;
     const selectedRemotely = (event: Event) => {
@@ -85,16 +84,19 @@ export default function RemoteAccess() {
     setError("");
     api<Session>("/access/session", { signal: controller.signal })
       .then((value) => {
-        if (!controller.signal.aborted) setSession(value);
+        if (!controller.signal.aborted) {
+          if (value.role === "guest") signedOut();
+          else setSession(value);
+        }
       })
       .catch((cause) => {
         if (!controller.signal.aborted) {
-          if (unauthorized(cause)) setSession({ role: "guest" });
+          if (unauthorized(cause)) signedOut();
           else setError(messageOf(cause));
         }
       });
     return () => controller.abort();
-  }, [attempt]);
+  }, [attempt, signedOut]);
   if (session?.role === "owner") return <App />;
   if (!session)
     return (

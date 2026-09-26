@@ -76,7 +76,7 @@ export default function PanelAccount({
     .filter(
       (panel) =>
         !panel.local &&
-        panel.signedIn !== false &&
+        panel.signedIn === true &&
         panel.id !== connections?.activeId,
     )
     .map((panel) => ({

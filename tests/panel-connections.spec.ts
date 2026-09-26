@@ -639,7 +639,7 @@ test("desktop account switches connected panels without local-switch or disconne
   page,
   context,
 }) => {
-  await desktopBridge(page);
+  await desktopBridge(page, { remoteServers: { "pc-one": [], "pc-two": [] } });
   await localPanel(page, true);
   await page.goto("/#console");
   const account = page.getByRole("button", {
@@ -680,6 +680,44 @@ test("desktop account switches connected panels without local-switch or disconne
 });
 
 for (const empty of [false, true]) {
+  test(`unverified saved panels stay hidden until the current session is confirmed ${empty ? "without local servers" : "with a local workspace"}`, async ({
+    page,
+  }) => {
+    await desktopBridge(page, { remoteServers: { "pc-two": [] } });
+    await localPanel(page, true);
+    if (empty)
+      await page.route("**/api/servers", (route) =>
+        route.fulfill({ json: { servers: [], defaultServerId: null } }),
+      );
+    await page.goto("/#console");
+    await page
+      .getByRole("button", { name: "Account menu for Local administrator" })
+      .click();
+    const unverified = page.getByRole("menuitem", {
+      name: "Switch to pc-one.example:3002",
+      exact: true,
+    });
+    await expect(unverified).toHaveCount(0);
+    await expect(
+      page.getByRole("menuitem", {
+        name: "Switch to pc-two.example:3002",
+        exact: true,
+      }),
+    ).toBeEnabled();
+    // A confirmed account remains switchable even when it has no server grants.
+    await page.evaluate(() =>
+      (window as ConnectionMock).connectionFixture.report("pc-one", []),
+    );
+    await expect(unverified).toBeEnabled();
+    await page.evaluate(() =>
+      (window as ConnectionMock).connectionFixture.report("pc-one", null),
+    );
+    await expect(unverified).toHaveCount(0);
+    await expect(
+      page.getByRole("menuitem", { name: "Sign in to another panel" }),
+    ).toBeEnabled();
+  });
+
   test(`signed-out panels stay out of the account menu until signed in again ${empty ? "without local servers" : "with a local workspace"}`, async ({
     page,
   }) => {
@@ -737,7 +775,10 @@ for (const empty of [false, true]) {
   test(`an offline saved panel stays available without account disconnect actions ${empty ? "without local servers" : "with a local workspace"}`, async ({
     page,
   }) => {
-    await desktopBridge(page, { unavailablePanels: ["pc-one"] });
+    await desktopBridge(page, {
+      unavailablePanels: ["pc-one"],
+      remoteServers: { "pc-one": [], "pc-two": [] },
+    });
     const { localCredentials } = await localPanel(page, true);
     if (empty)
       await page.route("**/api/servers", (route) =>

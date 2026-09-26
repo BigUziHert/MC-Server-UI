@@ -29,6 +29,7 @@ const server = {
   uptime: 60,
   address: "localhost:25565",
   accessPermissions: [
+    "server.view",
     "control.console",
     "audit.read",
     "file.read",
@@ -93,6 +94,8 @@ async function fixture() {
   const folderBytes = await archive(false);
   const selectionBytes = await archive(true);
   const requests = [];
+  let sessionRevoked = false;
+  let serverShared = true;
   let lines = [
     { id: 1, time: "12:00:00", level: "info", message: "Remote server ready" },
     { id: 2, time: "12:00:01", level: "warn", message: "Remote warning" },
@@ -125,17 +128,35 @@ async function fixture() {
           "Set-Cookie",
           "frontend-fixture=authenticated; Secure; HttpOnly; SameSite=Strict; Path=/",
         );
+        sessionRevoked = false;
         return json(user);
       }
-      const authenticated = req.headers.cookie?.includes(
-        "frontend-fixture=authenticated",
-      );
+      const authenticated =
+        !sessionRevoked &&
+        req.headers.cookie?.includes("frontend-fixture=authenticated");
       if (req.url === "/api/access/session")
         return json(authenticated ? user : { role: "guest" });
       if (req.url.startsWith("/api/")) {
         if (!authenticated) return json({ error: "Sign in first." }, 401);
+        if (req.url === "/api/access/logout") {
+          assert.equal(req.method, "POST");
+          sessionRevoked = true;
+          res.setHeader(
+            "Set-Cookie",
+            "frontend-fixture=; Secure; HttpOnly; SameSite=Strict; Path=/; Max-Age=0",
+          );
+          return json({ ok: true });
+        }
         if (req.url === "/api/servers")
-          return json({ servers: [server], defaultServerId: server.id });
+          return json({
+            servers: serverShared ? [server] : [],
+            defaultServerId: serverShared ? server.id : null,
+          });
+        if (!serverShared)
+          return json(
+            { error: "This server is no longer shared with you." },
+            403,
+          );
         if (req.url === "/api/server") return json(server);
         if (req.url === "/api/console") return json({ lines });
         const requestUrl = new URL(req.url, "https://fixture.example");
@@ -315,6 +336,12 @@ async function fixture() {
         level: "info",
         message: "New remote output",
       });
+    },
+    revokeServerAccess() {
+      serverShared = false;
+    },
+    revokeSession() {
+      sessionRevoked = true;
     },
     async inspect() {
       return {
@@ -758,8 +785,108 @@ async function smoke() {
       state.requests.every((request) => !request.path.startsWith("/assets/")),
       "Stale remote JavaScript and CSS must not load",
     );
+
+    // Exercise the actual installed React UI and native IPC together. A saved
+    // connection must stop advertising a signed-in account after logout.
+    const remotePanel = async () =>
+      (
+        await application.evaluate(() => globalThis.__frontendSmoke.inspect())
+      ).context.panels.find((panel) => panel.id === remoteId);
+    await expect.poll(async () => (await remotePanel()).signedIn).toBe(true);
+    await remote
+      .getByRole("button", {
+        name: `Account menu for ${user.email}`,
+        exact: true,
+      })
+      .click();
+    await remote
+      .getByRole("menuitem", { name: "Sign out", exact: true })
+      .click();
+    await expect(
+      remote.getByRole("heading", { name: "Welcome to your server" }),
+    ).toBeVisible();
+    await expect.poll(async () => (await remotePanel()).signedIn).toBe(false);
+    assert.deepEqual((await remotePanel()).servers, []);
+    state = await application.evaluate(() =>
+      globalThis.__frontendSmoke.inspect(),
+    );
+    assert.equal(
+      state.requests.filter((request) => request.path === "/api/access/logout")
+        .length,
+      1,
+      "Sign out must reach the host before clearing the connected account",
+    );
+    assert.ok(
+      state.cookies.every((cookie) => cookie.name !== "frontend-fixture"),
+      "The remote authentication cookie must be removed by logout",
+    );
+    await remote
+      .getByRole("button", { name: "Back to this computer", exact: true })
+      .click();
+    await expect
+      .poll(
+        async () =>
+          (
+            await application.evaluate(() =>
+              globalThis.__frontendSmoke.inspect(),
+            )
+          ).context.activeId,
+      )
+      .toBe("local");
+    const localAccount = local.getByRole("button", {
+      name: "Account menu for Local administrator",
+      exact: true,
+    });
+    await localAccount.click();
+    await expect(
+      local.getByRole("menuitem", { name: /^Switch to / }),
+    ).toHaveCount(0);
+    await local.keyboard.press("Escape");
+
+    // Removing a server grant is distinct from revoking the account session:
+    // keep a signed-in empty panel available, but remove its cached servers.
+    await application.evaluate(() => globalThis.__frontendSmoke.open());
+    await remote.getByLabel("Email address", { exact: true }).fill(user.email);
+    await remote
+      .getByLabel("Password", { exact: true })
+      .fill("fixture-password");
+    await remote.getByRole("button", { name: "Sign in", exact: true }).click();
+    await expect
+      .poll(async () => (await remotePanel()).servers)
+      .toHaveLength(1);
+    await application.evaluate(() =>
+      globalThis.__frontendSmoke.revokeServerAccess(),
+    );
+    await expect
+      .poll(async () => (await remotePanel()).servers, { timeout: 15000 })
+      .toEqual([]);
+    assert.equal((await remotePanel()).signedIn, true);
+    await remote.evaluate(() => window.mcPanelConnections.activate("local"));
+    await localAccount.click();
+    await expect(
+      local.getByRole("menuitem", {
+        name: `Switch to ${new URL(origin).host}`,
+        exact: true,
+      }),
+    ).toBeVisible();
+
+    // A host-side session revocation while viewing the local PC must also clear
+    // that already-open account menu, without restarting the desktop app.
+    await application.evaluate(() =>
+      globalThis.__frontendSmoke.revokeSession(),
+    );
+    await expect
+      .poll(async () => (await remotePanel()).signedIn, { timeout: 15000 })
+      .toBe(false);
+    await expect(
+      local.getByRole("menuitem", { name: /^Switch to / }),
+    ).toHaveCount(0);
+    assert.deepEqual((await remotePanel()).servers, []);
+    await expect(
+      remote.getByRole("heading", { name: "Welcome to your server" }),
+    ).toBeVisible();
     console.log(
-      "Passed native frontend consistency: stale remote shell replaced by installed UI; certificate consent, remote sign-in/cookies, console filter/clear/export, client file/folder/selection downloads, Updates, switching and reload.",
+      "Passed native frontend consistency: stale remote shell replaced by installed UI; certificate consent, remote sign-in/cookies, console filter/clear/export, client file/folder/selection downloads, Updates, switching, reload, logout and background access revocation.",
     );
   } catch (error) {
     if (stderr) console.error(stderr);
