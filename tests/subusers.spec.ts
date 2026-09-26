@@ -604,6 +604,16 @@ test("subuser cancellation and save errors preserve deliberate selections withou
   request,
   server,
 }) => {
+  const unrelated = await request.post("/api/panel-users", {
+    data: {
+      email: `existing-cancel-${server.id}@example.test`,
+      permissions: ["file.read"],
+      accessMode: "selected",
+      serverIds: [server.id],
+    },
+  });
+  expect(unrelated.status()).toBe(201);
+  const baseline = await users(request);
   await openSubusers(page, server.id);
   let deny = true;
   let submitted = 0;
@@ -630,7 +640,7 @@ test("subuser cancellation and save errors preserve deliberate selections withou
   await dialog.getByRole("checkbox", { name: "Console", exact: true }).check();
   await dialog.getByRole("button", { name: "Cancel", exact: true }).click();
   expect(submitted).toBe(0);
-  expect(await users(request)).toEqual([]);
+  expect(await users(request)).toEqual(baseline);
   await page.getByRole("button", { name: "New user", exact: true }).click();
   dialog = page.getByRole("dialog", {
     name: "Create new subuser",
@@ -664,17 +674,23 @@ test("subuser cancellation and save errors preserve deliberate selections withou
   await expect(
     dialog.getByRole("checkbox", { name: "Start", exact: true }),
   ).toBeChecked();
-  expect(await users(request)).toEqual([]);
+  expect(await users(request)).toEqual(baseline);
   deny = false;
   await dialog
     .getByRole("button", { name: "Create subuser", exact: true })
     .click();
   await expect(dialog).not.toBeVisible();
   expect(submitted).toBe(2);
-  expect((await users(request))[0]).toMatchObject({
+  const saved = await users(request);
+  expect(
+    saved.find((user) => user.email === "retry@example.test"),
+  ).toMatchObject({
     email: "retry@example.test",
     permissions: ["control.start"],
   });
+  expect(saved.filter((user) => user.email !== "retry@example.test")).toEqual(
+    baseline,
+  );
 });
 
 test("a failed invitation preserves the subuser and clipboard retries keep the same private link", async ({
@@ -682,6 +698,16 @@ test("a failed invitation preserves the subuser and clipboard retries keep the s
   request,
   server,
 }, testInfo) => {
+  const unrelated = await request.post("/api/panel-users", {
+    data: {
+      email: `existing-invite-${server.id}@example.test`,
+      permissions: ["file.read"],
+      accessMode: "selected",
+      serverIds: [server.id],
+    },
+  });
+  expect(unrelated.status()).toBe(201);
+  const baseline = await users(request);
   const invitationUrl =
     "https://203.0.113.10:3002/#invite=fixture-secret-token";
   await page.addInitScript(() => {
@@ -723,7 +749,11 @@ test("a failed invitation preserves the subuser and clipboard retries keep the s
         status: 503,
         json: { error: "Remote access is unavailable." },
       });
-    const user = (await users(request))[0];
+    const userId = decodeURIComponent(
+      new URL(route.request().url()).pathname.split("/").at(-2)!,
+    );
+    const user = (await users(request)).find((item) => item.id === userId);
+    expect(user?.email).toBe("phone@example.test");
     return route.fulfill({
       json: {
         message: "Invitation link created.",
@@ -770,8 +800,9 @@ test("a failed invitation preserves the subuser and clipboard retries keep the s
     page.getByRole("alert").filter({ hasText: "The subuser is saved" }),
   ).toContainText("Remote access is unavailable.");
   const saved = await users(request);
-  expect(saved).toHaveLength(1);
-  expect(saved[0].permissions).toEqual([
+  const account = saved.find((user) => user.email === "phone@example.test");
+  expect(saved.filter((user) => user.id !== account?.id)).toEqual(baseline);
+  expect(account?.permissions).toEqual([
     "control.console",
     "control.start",
     "control.stop",
@@ -853,7 +884,13 @@ test("a failed invitation preserves the subuser and clipboard retries keep the s
   ).toEqual({ value: invitationUrl, inDialog: true });
   expect(creates).toBe(1);
   expect(invitations).toBe(2);
-  expect(await users(request)).toHaveLength(1);
+  const afterCopy = await users(request);
+  expect(
+    afterCopy.filter((user) => user.email === "phone@example.test"),
+  ).toHaveLength(1);
+  expect(
+    afterCopy.filter((user) => user.email !== "phone@example.test"),
+  ).toEqual(baseline);
   expect(await page.evaluate(() => JSON.stringify(localStorage))).not.toContain(
     "fixture-secret-token",
   );
