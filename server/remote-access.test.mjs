@@ -440,6 +440,8 @@ test("remote file creation and download use distinct permissions and logout inva
 
 test("remote route permissions fail closed for unassigned routes and distinguish destructive storage actions", () => {
   const routes = [
+    ["GET", "/api/files/recycle-operation", ["file.read"]],
+    ["HEAD", "/api/files/recycle-operation", ["file.read"]],
     ["GET", "/api/files/download", ["file.read-content"]],
     ["POST", "/api/files/upload", ["file.create"]],
     ["PUT", "/api/backups/schedule", ["backup.update"]],
@@ -548,6 +550,215 @@ test("the shared panel exposes standard pages within the user's file and console
     "/api/minecraft/properties/file?path=server.properties",
   ])
     assert.equal((await restricted(route)).status, 403, route);
+});
+
+test("remote recycle progress is readable only within the current live file-reading grant", async (t) => {
+  const { fleet, id, local, invite } = await fixture(t);
+  const runtime = fleet.runtimes.get(id);
+  const source = path.join(runtime.serverDir, "tacz");
+  await fs.mkdir(source);
+  await fs.writeFile(path.join(source, "pack.json"), '{"fixture":true}');
+  const other = await local(
+    "/api/servers",
+    json("POST", { name: "Private server", port: 25566 }),
+  );
+  assert.equal(other.status, 201);
+  const reader = await invite(["file.read"], "reader@example.test");
+  const deleter = await invite(["file.delete"], "deleter@example.test");
+  assert.deepEqual((await reader.asUser("/api/files/recycle-operation")).body, {
+    operation: null,
+  });
+  assert.equal(
+    (await deleter.asUser("/api/files/recycle-operation")).status,
+    403,
+  );
+  let release, entered;
+  const gate = new Promise((resolve) => {
+    release = resolve;
+  });
+  const checkpoint = new Promise((resolve) => {
+    entered = resolve;
+  });
+  const rename = fs.rename;
+  t.mock.method(fs, "rename", async (from, to) => {
+    if (from === source && path.basename(to) === "content") {
+      entered();
+      await gate;
+    }
+    return rename(from, to);
+  });
+  const deletion = deleter.asUser("/api/files?path=tacz", { method: "DELETE" });
+  try {
+    await checkpoint;
+    const running = await reader.asUser("/api/files/recycle-operation");
+    assert.equal(running.status, 200, JSON.stringify(running.body));
+    assert.equal(running.body.operation.path, "tacz");
+    assert.equal(running.body.operation.status, "running");
+    const serialized = JSON.stringify(running.body);
+    for (const privatePath of [runtime.serverDir, runtime.dataDir])
+      assert.equal(
+        serialized.includes(JSON.stringify(privatePath).slice(1, -1)),
+        false,
+        "Progress never exposes host filesystem roots.",
+      );
+    assert.equal(Object.hasOwn(running.body.operation, "backup"), false);
+    for (const request of [
+      { headers: { "X-Server-Id": other.body.server.id } },
+      {
+        route: `/api/files/recycle-operation?serverId=${other.body.server.id}`,
+      },
+    ]) {
+      assert.equal(
+        (
+          await reader.asUser(
+            request.route ?? "/api/files/recycle-operation",
+            request,
+          )
+        ).status,
+        403,
+      );
+    }
+    assert.deepEqual(
+      (
+        await local("/api/files/recycle-operation", {
+          headers: { "X-Server-Id": other.body.server.id },
+        })
+      ).body,
+      { operation: null },
+    );
+    assert.equal(
+      (
+        await local(`/api/subusers/${reader.user.id}`, {
+          ...json("PATCH", { permissions: [] }),
+          headers: { "X-Server-Id": id },
+        })
+      ).status,
+      200,
+    );
+    assert.equal(
+      (await reader.asUser("/api/files/recycle-operation")).status,
+      403,
+    );
+    assert.equal(
+      (
+        await local(`/api/subusers/${reader.user.id}`, {
+          ...json("PATCH", { permissions: ["file.read"] }),
+          headers: { "X-Server-Id": id },
+        })
+      ).status,
+      200,
+    );
+  } finally {
+    release();
+  }
+  const result = await deletion;
+  assert.equal(result.status, 200, JSON.stringify(result.body));
+  const completed = await reader.asUser("/api/files/recycle-operation");
+  assert.equal(completed.status, 200);
+  assert.equal(completed.body.operation.status, "completed");
+  assert.equal(completed.body.operation.path, "tacz");
+  assert.equal(
+    completed.body.operation.recycled.kind,
+    undefined,
+    "File progress cannot expose backup recovery metadata.",
+  );
+  assert.equal(completed.body.operation.recycled.backup, undefined);
+  const firstId = completed.body.operation.id;
+  await fs.writeFile(
+    path.join(runtime.serverDir, "second.txt"),
+    "second fixture",
+  );
+  assert.equal(
+    (await deleter.asUser("/api/files?path=second.txt", { method: "DELETE" }))
+      .status,
+    200,
+  );
+  const retained = await reader.asUser(
+    `/api/files/recycle-operation?requestId=${firstId.toUpperCase()}`,
+  );
+  assert.equal(retained.status, 200);
+  assert.equal(retained.body.operation.id, firstId);
+  assert.equal(retained.body.operation.path, "tacz");
+  assert.equal(retained.body.operation.status, "completed");
+  assert.deepEqual(
+    (
+      await reader.asUser(
+        "/api/files/recycle-operation?requestId=aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+      )
+    ).body,
+    { operation: null },
+  );
+  assert.equal(
+    (await reader.asUser("/api/files/recycle-operation?requestId=invalid"))
+      .status,
+    400,
+  );
+  assert.equal(
+    (
+      await reader.asUser(`/api/files/recycle-operation?requestId=${firstId}`, {
+        headers: { "X-Server-Id": other.body.server.id },
+      })
+    ).status,
+    403,
+  );
+  assert.deepEqual(
+    (
+      await local(`/api/files/recycle-operation?requestId=${firstId}`, {
+        headers: { "X-Server-Id": other.body.server.id },
+      })
+    ).body,
+    { operation: null },
+  );
+});
+
+test("remote recycle failure progress never exposes host paths or records invalid path requests", async (t) => {
+  const { fleet, id, invite } = await fixture(t);
+  t.mock.method(console, "error", () => {});
+  const runtime = fleet.runtimes.get(id);
+  const source = path.join(runtime.serverDir, "locked.txt");
+  await fs.writeFile(source, "fixture contents are retained");
+  const { asUser } = await invite(["file.read", "file.delete"]);
+  const rename = fs.rename;
+  t.mock.method(fs, "rename", async (from, to) => {
+    if (from === source && path.basename(to) === "content")
+      throw Object.assign(
+        new Error(`EPERM: cannot rename '${source}' to '${to}'`),
+        { code: "EPERM" },
+      );
+    return rename(from, to);
+  });
+  const failure = await asUser("/api/files?path=locked.txt", {
+    method: "DELETE",
+  });
+  assert.ok(failure.status >= 400);
+  const progress = await asUser("/api/files/recycle-operation");
+  assert.equal(progress.status, 200);
+  assert.equal(progress.body.operation.status, "failed");
+  assert.equal(progress.body.operation.path, "locked.txt");
+  assert.equal(typeof progress.body.operation.error, "string");
+  const serialized = JSON.stringify(progress.body);
+  for (const privatePath of [runtime.serverDir, runtime.dataDir, source])
+    assert.equal(
+      serialized.includes(JSON.stringify(privatePath).slice(1, -1)),
+      false,
+      "An OS failure must not expose absolute host paths.",
+    );
+  const failedId = progress.body.operation.id;
+  for (const invalid of [
+    encodeURIComponent(source),
+    "..%2Foutside",
+    "x&path=y",
+  ])
+    assert.equal(
+      (await asUser(`/api/files?path=${invalid}`, { method: "DELETE" })).status,
+      400,
+    );
+  const retained = await asUser("/api/files/recycle-operation");
+  assert.equal(retained.body.operation.id, failedId);
+  assert.equal(
+    await fs.readFile(source, "utf8"),
+    "fixture contents are retained",
+  );
 });
 
 test("network discovery is owner-only and does not claim the forwarded port is reachable", async (t) => {

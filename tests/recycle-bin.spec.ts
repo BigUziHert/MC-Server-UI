@@ -123,6 +123,303 @@ async function contents(
   return (await response.json()).content;
 }
 
+test("a slow cross-drive move can close, survive page navigation, and finish without replacing another dialog", async ({
+  page,
+  request,
+  bin,
+}, testInfo) => {
+  const folderName = `tacz-${"long-folder-name-".repeat(9)}`;
+  await create(request, bin, "recovery", folderName, "directory");
+  const target = `recovery/${folderName}`;
+  let release!: () => void;
+  const held = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  let operation: any = null;
+  let deletes = 0;
+  await page.route("**/api/files/recycle-operation*", (route) =>
+    route.fulfill({ json: { operation } }),
+  );
+  await page.route("**/api/files?**", async (route) => {
+    if (route.request().method() !== "DELETE") return route.continue();
+    deletes++;
+    const url = new URL(route.request().url());
+    operation = {
+      id: url.searchParams.get("requestId"),
+      path: target,
+      status: "running",
+      phase: "copying",
+      crossDrive: true,
+      filesProcessed: 2,
+      totalFiles: 10,
+      bytesProcessed: 1024,
+      totalBytes: 4096,
+    };
+    await held;
+    const response = await route.fetch();
+    operation = { ...operation, status: "completed", phase: "completed" };
+    await route.fulfill({ response });
+  });
+  try {
+    await openFiles(page, bin);
+    await page.getByRole("button", { name: "recovery", exact: true }).click();
+    await page
+      .getByRole("button", { name: `Delete ${folderName}`, exact: true })
+      .click();
+    const dialog = page.getByRole("dialog", {
+      name: "Move this item to Recycle Bin?",
+      exact: true,
+    });
+    await dialog
+      .getByRole("button", { name: "Move to Recycle Bin", exact: true })
+      .click();
+    await expect(dialog).toContainText("Moving between drives");
+    await expect(dialog).toContainText("2 of 10 files");
+    await expect(
+      dialog.getByRole("button", { name: "Close", exact: true }),
+    ).toBeEnabled();
+    await page.screenshot({
+      path: testInfo.outputPath("slow-recycle-modal-desktop.png"),
+      fullPage: true,
+    });
+    await dialog.getByRole("button", { name: "Close", exact: true }).click();
+    const progress = page.getByRole("status", {
+      name: "Move to Recycle Bin progress",
+      exact: true,
+    });
+    await expect(progress).toContainText("Copying and checking files");
+    await expect(
+      page.getByRole("button", { name: `Delete ${folderName}`, exact: true }),
+    ).toBeDisabled();
+    await page.getByRole("link", { name: "Console", exact: true }).click();
+    await page.getByRole("link", { name: "File Manager", exact: true }).click();
+    await expect(progress).toContainText("2 of 10 files");
+    await page
+      .getByRole("button", { name: "Server root", exact: true })
+      .click();
+    await page.setViewportSize({ width: 390, height: 844 });
+    await expect
+      .poll(() =>
+        page.evaluate(() => document.documentElement.scrollWidth <= innerWidth),
+      )
+      .toBe(true);
+    await page.screenshot({
+      path: testInfo.outputPath("slow-recycle-progress-mobile.png"),
+      fullPage: true,
+    });
+    await page.getByRole("button", { name: "New file", exact: true }).click();
+    const newDialog = page.getByRole("dialog", {
+      name: "New file",
+      exact: true,
+    });
+    await newDialog
+      .getByLabel("File name", { exact: true })
+      .fill("unrelated.txt");
+    release();
+    await expect(progress).not.toBeVisible();
+    await expect(newDialog).toBeVisible();
+    await expect(
+      newDialog.getByLabel("File name", { exact: true }),
+    ).toHaveValue("unrelated.txt");
+    await newDialog
+      .getByRole("button", { name: "Cancel", exact: true })
+      .click();
+    expect(deletes).toBe(1);
+    const result = await (
+      await request.get("/api/files/recycle-bin", { headers: bin.headers })
+    ).json();
+    expect(
+      result.items.some(
+        (item: { originalPath: string }) => item.originalPath === target,
+      ),
+    ).toBe(true);
+  } finally {
+    release();
+  }
+});
+
+test("a lost delete response is reconciled by request ID without another mutation", async ({
+  page,
+  request,
+  bin,
+}) => {
+  let deletes = 0;
+  let requestId = "";
+  const statusLookups: string[] = [];
+  page.on("request", (request) => {
+    const url = new URL(request.url());
+    if (
+      url.pathname === "/api/files/recycle-operation" &&
+      url.searchParams.has("requestId")
+    )
+      statusLookups.push(url.searchParams.get("requestId")!);
+  });
+  await page.route("**/api/files?**", async (route) => {
+    if (route.request().method() !== "DELETE") return route.continue();
+    deletes++;
+    requestId = new URL(route.request().url()).searchParams.get("requestId")!;
+    const response = await route.fetch();
+    expect(response.ok()).toBe(true);
+    await route.abort("failed");
+  });
+  await openFiles(page, bin);
+  await page.getByRole("button", { name: "recovery", exact: true }).click();
+  await page
+    .getByRole("button", { name: "Delete archive", exact: true })
+    .click();
+  const dialog = page.getByRole("dialog", {
+    name: "Move this item to Recycle Bin?",
+    exact: true,
+  });
+  await dialog
+    .getByRole("button", { name: "Move to Recycle Bin", exact: true })
+    .click();
+  await expect(dialog).not.toBeVisible();
+  await expect(
+    page.getByRole("button", { name: "Delete archive", exact: true }),
+  ).toHaveCount(0);
+  expect(deletes).toBe(1);
+  expect(statusLookups).toContain(requestId);
+  const result = await (
+    await request.get("/api/files/recycle-bin", { headers: bin.headers })
+  ).json();
+  expect(
+    result.items.filter(
+      (item: { originalPath: string }) =>
+        item.originalPath === "recovery/archive",
+    ),
+  ).toHaveLength(1);
+});
+
+test("an unconfirmed move stops the bulk queue and checks status without replaying deletion", async ({
+  page,
+  request,
+  bin,
+}) => {
+  const attempted: { path: string; requestId: string }[] = [];
+  await page.route("**/api/files?**", async (route) => {
+    if (route.request().method() !== "DELETE") return route.continue();
+    const url = new URL(route.request().url());
+    attempted.push({
+      path: url.searchParams.get("path")!,
+      requestId: url.searchParams.get("requestId")!,
+    });
+    await route.abort("failed");
+  });
+  await openFiles(page, bin);
+  await page.getByRole("button", { name: "recovery", exact: true }).click();
+  for (const name of ["archive", "treasure.txt"])
+    await page
+      .getByRole("checkbox", { name: `Select ${name}`, exact: true })
+      .check();
+  await page
+    .getByRole("button", { name: "Delete selected", exact: true })
+    .click();
+  const dialog = page.getByRole("dialog", {
+    name: "Move selected items to Recycle Bin?",
+    exact: true,
+  });
+  await dialog
+    .getByRole("button", { name: "Move to Recycle Bin", exact: true })
+    .click();
+  await expect(dialog.getByRole("alert")).toContainText(
+    "outcome could not be confirmed",
+  );
+  expect(attempted).toHaveLength(1);
+  await dialog.getByRole("button", { name: "Close", exact: true }).click();
+  const progress = page.getByRole("status", {
+    name: "Move to Recycle Bin progress",
+    exact: true,
+  });
+  await expect(progress).toContainText("Move not confirmed");
+  await page.getByRole("button", { name: "New file", exact: true }).click();
+  await expect(
+    page.getByRole("dialog", { name: "New file", exact: true }),
+  ).toBeVisible();
+  await page
+    .getByRole("dialog")
+    .getByRole("button", { name: "Cancel", exact: true })
+    .click();
+  const operation = attempted[0];
+  const response = await request.delete(
+    `/api/files?${new URLSearchParams(operation)}`,
+    { headers: bin.headers },
+  );
+  expect(response.ok()).toBe(true);
+  await progress
+    .getByRole("button", { name: "Check move status", exact: true })
+    .click();
+  await expect(progress).not.toBeVisible();
+  expect(attempted).toHaveLength(1);
+  const files = await (
+    await request.get("/api/files?path=recovery", { headers: bin.headers })
+  ).json();
+  expect(files.entries).toHaveLength(1);
+  expect(files.entries[0].path).not.toBe(operation.path);
+});
+
+test("status permission loss stops polling and an inspected unconfirmed move can be dismissed without retry", async ({
+  page,
+  request,
+  bin,
+}) => {
+  let deletes = 0;
+  let deniedStatusChecks = 0;
+  await page.clock.install();
+  await page.route("**/api/files/recycle-operation*", (route) => {
+    if (!deletes) return route.fulfill({ json: { operation: null } });
+    deniedStatusChecks++;
+    return route.fulfill({
+      status: 403,
+      json: { error: "Permission revoked." },
+    });
+  });
+  await page.route("**/api/files?**", (route) => {
+    if (route.request().method() !== "DELETE") return route.continue();
+    deletes++;
+    return route.fulfill({
+      status: 503,
+      json: { error: "Response unavailable." },
+    });
+  });
+  await openFiles(page, bin);
+  await page.getByRole("button", { name: "recovery", exact: true }).click();
+  await page
+    .getByRole("button", { name: "Delete archive", exact: true })
+    .click();
+  const dialog = page.getByRole("dialog", {
+    name: "Move this item to Recycle Bin?",
+    exact: true,
+  });
+  await dialog
+    .getByRole("button", { name: "Move to Recycle Bin", exact: true })
+    .click();
+  await expect(dialog.getByRole("alert")).toContainText(
+    "outcome could not be confirmed",
+  );
+  await page.clock.fastForward(10000);
+  expect(deniedStatusChecks).toBe(1);
+  await dialog.getByRole("button", { name: "Close", exact: true }).click();
+  const progress = page.getByRole("status", {
+    name: "Move to Recycle Bin progress",
+    exact: true,
+  });
+  await expect(progress).toContainText(
+    "This does not cancel a move on the server.",
+  );
+  await progress
+    .getByRole("button", { name: "I've checked the files", exact: true })
+    .click();
+  await expect(progress).not.toBeVisible();
+  await expect(
+    page.getByRole("button", { name: "Delete archive", exact: true }),
+  ).toBeEnabled();
+  expect(deletes).toBe(1);
+  expect(
+    await contents(request, bin, "recovery/archive/nested/world.dat"),
+  ).toBe("Original nested world bytes\n");
+});
+
 test("protected Recycle Bin restores deleted files and complete folders to their original paths", async ({
   page,
   request,

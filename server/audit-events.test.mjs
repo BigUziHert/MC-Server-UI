@@ -145,13 +145,29 @@ test("file audits distinguish plugin/datapack uploads, directory deletion, resto
     200,
   );
   await f.request("/api/files?path=custom-world", { method: "DELETE" });
-  const events = (await f.request("/api/audit")).body.entries;
-  for (const action of [
+  const expectedActions = [
     "Plugin added",
     "Datapack added",
     "Plugin restored",
     "Directory deleted",
-  ])
+  ];
+  // A committed move responds before audit classification/persistence finishes,
+  // so a slow server.properties read cannot hold its file-operation lock.
+  // Require the exact audit entries once that tracked background work settles.
+  const auditDeadline = performance.now() + 10_000;
+  let events;
+  for (;;) {
+    events = (await f.request("/api/audit")).body.entries;
+    if (
+      expectedActions.every((action) =>
+        events.some((event) => event.action === action),
+      ) ||
+      performance.now() >= auditDeadline
+    )
+      break;
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  for (const action of expectedActions)
     assert.ok(
       events.some((event) => event.action === action),
       action,

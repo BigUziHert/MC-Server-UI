@@ -485,6 +485,333 @@ test("restore revalidates its anchored destination after a parent junction chang
   );
 });
 
+test("cross-drive progress reports scanning, checked bytes and verified removal without letting observers affect safety", async (t) => {
+  const f = await fixture(t);
+  const source = path.join(f.serverDir, "tacz");
+  await fs.mkdir(source);
+  await fs.mkdir(path.join(source, "empty"));
+  await fs.writeFile(
+    path.join(source, "assets.bin"),
+    Buffer.alloc(400_000, 42),
+  );
+  await fs.writeFile(path.join(source, "config.json"), "{}");
+  const bin = await f.boot({ fileSystem: crossVolume(source) });
+  let current = {};
+  const events = [];
+  const item = await bin.recycle("tacz", {
+    onProgress(update) {
+      current = { ...current, ...update };
+      events.push(current);
+      throw new Error("An observer must not stop the move");
+    },
+  });
+  assert.deepEqual(
+    [...new Set(events.map((event) => event.phase))],
+    ["scanning", "copying", "verifying", "removing", "finalizing"],
+  );
+  assert.equal(events[0].totalBytes, null);
+  for (const phase of ["copying", "verifying", "removing"]) {
+    const updates = events.filter((event) => event.phase === phase);
+    assert.ok(
+      updates.some(
+        (event) => event.bytesProcessed > 0 && event.bytesProcessed < 400_002,
+      ),
+    );
+    assert.equal(updates.at(-1).filesProcessed, 2);
+    assert.equal(updates.at(-1).bytesProcessed, 400_002);
+    assert.equal(updates.at(-1).totalBytes, 400_002);
+    assert.equal(updates.at(-1).crossDrive, true);
+  }
+  await missing(source);
+  assert.equal(item.status, "ready");
+  assert.deepEqual(
+    await fs.readFile(
+      path.join(bin.directory, item.id, "content", "assets.bin"),
+    ),
+    Buffer.alloc(400_000, 42),
+  );
+});
+
+test("cross-drive API progress remains readable after disconnect while mutations and shutdown wait for the actual move", async (t) => {
+  const f = await apiFixture(t);
+  const entered = deferred(),
+    release = deferred();
+  f.releases.push(release.resolve);
+  try {
+    const panel = await f.boot();
+    const source = path.join(f.serverDir, "assets.bin");
+    await fs.writeFile(source, Buffer.alloc(400_000, 41));
+    assert.equal(
+      (await panel.request("/api/files/recycle-operation")).body.operation,
+      null,
+    );
+    const rename = fs.rename,
+      open = fs.open;
+    t.mock.method(fs, "rename", async (from, to) => {
+      if (from === source && path.basename(to) === "content") throw exdev();
+      return rename(from, to);
+    });
+    let reads = 0;
+    t.mock.method(fs, "open", async (...args) => {
+      const handle = await open(...args);
+      if (args[0] !== source || args[1] !== "r") return handle;
+      return {
+        stat: () => handle.stat(),
+        close: () => handle.close(),
+        read: async (...readArgs) => {
+          if (++reads === 2) {
+            entered.resolve();
+            await release.promise;
+          }
+          return handle.read(...readArgs);
+        },
+      };
+    });
+    const abort = new AbortController(),
+      requestId = randomUUID();
+    const pending = panel
+      .request(`/api/files?path=assets.bin&requestId=${requestId}`, {
+        method: "DELETE",
+        signal: abort.signal,
+      })
+      .catch((cause) => cause);
+    await entered.promise;
+    const moving = (await panel.request("/api/files/recycle-operation")).body
+      .operation;
+    assert.equal(moving.id, requestId);
+    assert.equal(moving.path, "assets.bin");
+    assert.equal(moving.status, "running");
+    assert.equal(moving.phase, "copying");
+    assert.equal(moving.crossDrive, true);
+    assert.ok(moving.bytesProcessed > 0 && moving.bytesProcessed < 400_000);
+    assert.equal(moving.totalBytes, 400_000);
+    abort.abort();
+    await pending;
+    assert.equal(
+      (await panel.request("/api/files?path=assets.bin", { method: "DELETE" }))
+        .status,
+      409,
+    );
+    assert.equal(
+      (await panel.request("/api/backups", json("POST", { name: "busy" })))
+        .status,
+      409,
+    );
+    let closed = false;
+    const closing = panel.close({ gracefulOnly: true }).then(() => {
+      closed = true;
+    });
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    assert.equal(closed, false);
+    release.resolve();
+    await closing;
+    await missing(source);
+    const restarted = await f.boot();
+    const [completed] = (await restarted.request("/api/files/recycle-bin")).body
+      .items;
+    assert.equal(completed.status, "ready");
+    assert.equal(completed.size, 400_000);
+    assert.deepEqual(
+      await fs.readFile(
+        path.join(f.dataDir, "recycle-bin", completed.id, "content"),
+      ),
+      Buffer.alloc(400_000, 41),
+    );
+  } finally {
+    await f.close();
+  }
+});
+
+test("retained recycle request IDs return the committed outcome without moving a replacement file", async (t) => {
+  const f = await apiFixture(t);
+  try {
+    const panel = await f.boot(),
+      requestId = randomUUID();
+    const source = path.join(f.serverDir, "proof");
+    await fs.writeFile(source, "original");
+    const route = `/api/files?path=proof&requestId=${requestId}`;
+    const first = await panel.request(route, { method: "DELETE" });
+    assert.equal(first.status, 200);
+    await fs.writeFile(source, "replacement");
+    await fs.writeFile(path.join(f.serverDir, "another"), "a later operation");
+    assert.equal(
+      (await panel.request("/api/files?path=another", { method: "DELETE" }))
+        .status,
+      200,
+    );
+    assert.notEqual(
+      (await panel.request("/api/files/recycle-operation")).body.operation.id,
+      requestId,
+    );
+    const retained = (
+      await panel.request(
+        `/api/files/recycle-operation?requestId=${requestId.toUpperCase()}`,
+      )
+    ).body.operation;
+    assert.equal(retained.id, requestId);
+    assert.equal(retained.recycled.id, first.body.recycled.id);
+    const replay = await panel.request(
+      `/api/files?path=proof&requestId=${requestId.toUpperCase()}`,
+      { method: "DELETE" },
+    );
+    assert.deepEqual(replay, first);
+    assert.equal(await fs.readFile(source, "utf8"), "replacement");
+    assert.equal(
+      (
+        await panel.request(`/api/files?path=other&requestId=${requestId}`, {
+          method: "DELETE",
+        })
+      ).status,
+      409,
+    );
+    assert.equal(
+      (
+        await panel.request("/api/files?path=proof&requestId=invalid", {
+          method: "DELETE",
+        })
+      ).status,
+      400,
+    );
+    assert.equal(
+      (
+        await panel.request(
+          `/api/files/recycle-operation?requestId=${requestId}`,
+        )
+      ).body.operation.id,
+      requestId,
+    );
+    assert.equal(
+      (
+        await panel.request(
+          `/api/files/recycle-operation?requestId=${randomUUID()}`,
+        )
+      ).body.operation,
+      null,
+    );
+    assert.equal(
+      (await panel.request("/api/files/recycle-operation?requestId=invalid"))
+        .status,
+      400,
+    );
+  } finally {
+    await f.close();
+  }
+});
+
+test("cross-drive failure reports safe progress errors and retains the original file", async (t) => {
+  const f = await apiFixture(t);
+  try {
+    const panel = await f.boot();
+    t.mock.method(console, "error", () => {});
+    const source = path.join(f.serverDir, "proof");
+    await fs.writeFile(source, "original");
+    const rename = fs.rename,
+      copyFile = fs.copyFile;
+    t.mock.method(fs, "rename", async (from, to) => {
+      if (from === source && path.basename(to) === "content") throw exdev();
+      return rename(from, to);
+    });
+    t.mock.method(fs, "copyFile", async (from, to, flags) => {
+      if (from === source)
+        throw Object.assign(new Error(`ENOSPC: copy '${source}' to '${to}'`), {
+          code: "ENOSPC",
+        });
+      return copyFile(from, to, flags);
+    });
+    const requestId = randomUUID();
+    assert.equal(
+      (
+        await panel.request(`/api/files?path=proof&requestId=${requestId}`, {
+          method: "DELETE",
+        })
+      ).status,
+      500,
+    );
+    const operation = (await panel.request("/api/files/recycle-operation")).body
+      .operation;
+    assert.equal(operation.id, requestId);
+    assert.equal(operation.status, "failed");
+    assert.equal(operation.crossDrive, true);
+    assert.match(operation.error, /drive is full/i);
+    assert.equal(JSON.stringify(operation).includes(f.root), false);
+    assert.equal(await fs.readFile(source, "utf8"), "original");
+    assert.equal(
+      (
+        await panel.request(`/api/files?path=proof&requestId=${requestId}`, {
+          method: "DELETE",
+        })
+      ).status,
+      409,
+    );
+  } finally {
+    await f.close();
+  }
+});
+
+test("a slow or failed audit cannot hold a committed move open or keep its file lock", async (t) => {
+  const f = await apiFixture(t);
+  const entered = deferred(),
+    release = deferred();
+  f.releases.push(release.resolve);
+  try {
+    const panel = await f.boot();
+    t.mock.method(console, "error", () => {});
+    await fs.writeFile(path.join(f.serverDir, "first"), "first original");
+    await fs.writeFile(path.join(f.serverDir, "second"), "second original");
+    const writeFile = fs.writeFile;
+    let blocked = false;
+    t.mock.method(fs, "writeFile", async (target, ...args) => {
+      if (
+        !blocked &&
+        path.dirname(String(target)) === f.dataDir &&
+        path.basename(String(target)).startsWith("panel.json.")
+      ) {
+        blocked = true;
+        entered.resolve();
+        await release.promise;
+        throw new Error("injected audit persistence failure");
+      }
+      return writeFile(target, ...args);
+    });
+    const first = await panel.request("/api/files?path=first", {
+      method: "DELETE",
+    });
+    assert.equal(first.status, 200);
+    await entered.promise;
+    const completed = (await panel.request("/api/files/recycle-operation")).body
+      .operation;
+    assert.equal(completed.status, "completed");
+    assert.equal(completed.recycled.id, first.body.recycled.id);
+    const second = await panel.request("/api/files?path=second", {
+      method: "DELETE",
+    });
+    assert.equal(
+      second.status,
+      200,
+      "the completed move no longer holds the mutation lock",
+    );
+    let closed = false;
+    const closing = panel.close().then(() => {
+      closed = true;
+    });
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    assert.equal(closed, false, "shutdown still drains audit work");
+    release.resolve();
+    await closing;
+    await missing(path.join(f.serverDir, "first"));
+    await missing(path.join(f.serverDir, "second"));
+    assert.equal(
+      await fs.readFile(
+        path.join(f.dataDir, "recycle-bin", first.body.recycled.id, "content"),
+        "utf8",
+      ),
+      "first original",
+    );
+  } finally {
+    await f.close();
+  }
+});
+
 test("cross-volume recycle verifies copies before source removal and restores executable metadata", async (t) => {
   const f = await fixture(t);
   const source = path.join(f.serverDir, "world");

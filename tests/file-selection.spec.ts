@@ -124,10 +124,10 @@ test("file dialogs keep native modal focus and restore search when the deleted t
     .getByRole("button", { name: "Move to Recycle Bin", exact: true })
     .click();
   await expect(
-    dialog.getByRole("button", { name: "Cancel", exact: true }),
-  ).toBeDisabled();
+    dialog.getByRole("button", { name: "Close", exact: true }),
+  ).toBeEnabled();
   await page.keyboard.press("Escape");
-  await expect(dialog).toBeVisible();
+  await expect(dialog).not.toBeVisible();
   release!();
   await expect(dialog).not.toBeVisible();
   await expect(

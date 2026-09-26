@@ -2368,6 +2368,28 @@ export async function createPanel(options = {}) {
     }),
   );
 
+  let latestRecycleOperation = null;
+  const recycleOperations = new Map();
+  const recycleRequestId = (value) => {
+    if (value === undefined) return undefined;
+    if (
+      typeof value !== "string" ||
+      !/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i.test(
+        value,
+      )
+    )
+      throw error(400, "The file operation request ID must be a UUID.");
+    return value.toLowerCase();
+  };
+  app.get("/api/files/recycle-operation", (req, res) => {
+    const requestId = recycleRequestId(req.query.requestId);
+    res.set("Cache-Control", "no-store");
+    res.json({
+      operation: requestId
+        ? (recycleOperations.get(requestId) ?? null)
+        : latestRecycleOperation,
+    });
+  });
   app.get("/api/files/recycle-bin", async (_req, res) => {
     res.json({ items: await recycleBin.list(), protected: true });
   });
@@ -2720,17 +2742,87 @@ export async function createPanel(options = {}) {
     trackOperation(async (req, res) => {
       const relative = req.query.path;
       if (!relative) throw error(400, "The server root cannot be deleted.");
+      const requestId = recycleRequestId(req.query.requestId);
+      // Validate the boundary before publishing a path to other authorized readers.
       const target = await safePath(serverDir, relative);
-      if (!(await exists(target)))
-        throw error(404, "File or directory not found.");
-      const recycled = await recycleBin.recycle(relative);
-      await audit(
-        "file",
-        `${await fileKind(relative, recycled.type)} deleted`,
-        `${relative} · moved to Recycle Bin.`,
-      );
-      diskCache.at = 0;
-      res.json({ ok: true, recycled });
+      const normalizedPath = relative.split("/").filter(Boolean).join("/");
+      // Reconnecting clients can correlate their pending request. Replaying the
+      // retained ID must not delete a new file created at the same path later.
+      const previous = requestId && recycleOperations.get(requestId);
+      if (previous) {
+        if (previous.path !== normalizedPath)
+          throw error(
+            409,
+            "This file operation request ID belongs to another path.",
+          );
+        if (previous.status === "completed")
+          return res.json({ ok: true, recycled: previous.recycled });
+        throw error(
+          409,
+          previous.error ?? "This file operation is still in progress.",
+        );
+      }
+      const operation = {
+        id: requestId ?? randomUUID(),
+        path: normalizedPath,
+        status: "running",
+        phase: "scanning",
+        crossDrive: false,
+        filesProcessed: 0,
+        totalFiles: null,
+        bytesProcessed: 0,
+        totalBytes: null,
+        startedAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+      };
+      latestRecycleOperation = operation;
+      recycleOperations.set(operation.id, operation);
+      // Retain recent outcomes for reconnecting clients without unbounded state.
+      // File moves are serialized, so all entries except this one are settled.
+      while (recycleOperations.size > 64)
+        recycleOperations.delete(recycleOperations.keys().next().value);
+      try {
+        if (!(await exists(target)))
+          throw error(404, "File or directory not found.");
+        const recycled = await recycleBin.recycle(normalizedPath, {
+          onProgress: (progress) =>
+            Object.assign(operation, progress, {
+              updatedAt: new Date().toISOString(),
+            }),
+        });
+        Object.assign(operation, {
+          status: "completed",
+          phase: "completed",
+          recycled,
+          updatedAt: new Date().toISOString(),
+        });
+        diskCache.at = 0;
+        // Moving is already committed. Audit I/O cannot change its outcome or
+        // hold the file lock; tracked work and saveChain still drain on shutdown.
+        void trackTask(async () =>
+          audit(
+            "file",
+            `${await fileKind(normalizedPath, recycled.type)} deleted`,
+            `${normalizedPath} · moved to Recycle Bin.`,
+          ),
+        ).catch(() => {});
+        res.json({ ok: true, recycled });
+      } catch (cause) {
+        const message =
+          cause.code === "ENOSPC"
+            ? "The Recycle Bin drive is full. Original files and any recovery copy have been retained."
+            : cause.status >= 400 && cause.status < 500
+              ? cause.message
+              : "Could not finish moving this item. Check the Recycle Bin before trying again; any recovery data has been retained.";
+        Object.assign(operation, {
+          status: "failed",
+          phase: "failed",
+          error: message,
+          ...(cause.recoveryId ? { recoveryId: cause.recoveryId } : {}),
+          updatedAt: new Date().toISOString(),
+        });
+        throw cause;
+      }
     }),
   );
 

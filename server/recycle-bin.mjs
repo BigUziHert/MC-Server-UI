@@ -200,7 +200,7 @@ export async function createRecycleBin({
     await originalPathFor(metadata)(metadata.originalPath);
     return { entryDir, metadata, payload: await safePath(entryDir, "content") };
   };
-  const walk = async (root, base = "", rows = []) => {
+  const walk = async (root, base = "", rows = [], onEntry) => {
     if ((await io.lstat(root)).isSymbolicLink())
       throw error(400, "Recycle Bin operations do not follow symbolic links.");
     const target = await safePath(root, base);
@@ -211,7 +211,7 @@ export async function createRecycleBin({
         "Recycle Bin operations do not follow symbolic links or special files.",
       );
     const type = stat.isDirectory() ? "directory" : "file";
-    rows.push({
+    const row = {
       path: base,
       type,
       size: type === "file" ? stat.size : 0,
@@ -219,15 +219,17 @@ export async function createRecycleBin({
       mode: stat.mode & 0o777,
       ino: stat.ino,
       dev: stat.dev,
-    });
+    };
+    rows.push(row);
+    onEntry?.(row);
     if (type === "directory") {
       const names = (await io.readdir(target)).sort();
       for (const name of names)
-        await walk(root, [base, name].filter(Boolean).join("/"), rows);
+        await walk(root, [base, name].filter(Boolean).join("/"), rows, onEntry);
     }
     return rows;
   };
-  const hashFile = async (target, algorithm = "sha256", signal) => {
+  const hashFile = async (target, algorithm = "sha256", signal, onBytes) => {
     signal?.throwIfAborted();
     const before = await io.lstat(target);
     if (!before.isFile() || before.isSymbolicLink())
@@ -252,15 +254,29 @@ export async function createRecycleBin({
         signal?.throwIfAborted();
         if (!bytesRead) break;
         hash.update(buffer.subarray(0, bytesRead));
+        onBytes?.(bytesRead);
       }
       return hash.digest("hex");
     } finally {
       await handle.close();
     }
   };
-  const copyVerified = async (source, resolveDestination) => {
+  const copyVerified = async (source, resolveDestination, onProgress) => {
     const initial = await walk(source);
     const hashes = new Map();
+    let filesProcessed = 0,
+      bytesProcessed = 0;
+    const totalFiles = initial.filter((row) => row.type === "file").length;
+    const totalBytes = initial.reduce((total, row) => total + row.size, 0);
+    const report = (partial = 0) =>
+      onProgress?.({
+        phase: "copying",
+        filesProcessed,
+        totalFiles,
+        bytesProcessed: Math.floor(bytesProcessed + partial),
+        totalBytes,
+      });
+    report();
     for (const row of initial) {
       const from = await safePath(source, row.path);
       // Resolve from the server/private boundary each time. An external process
@@ -269,8 +285,23 @@ export async function createRecycleBin({
       if (row.type === "directory") await io.mkdir(target);
       else {
         await io.copyFile(from, target, 1); // COPYFILE_EXCL: never replace existing files.
-        const digest = await hashFile(from);
-        if (digest !== (await hashFile(await resolveDestination(row.path))))
+        let checkedBytes = 0;
+        const checking = (bytes) => {
+          checkedBytes += bytes;
+          // Count each byte once across both checksum passes. copyFile itself
+          // remains an exclusive OS copy; these counters describe checked data.
+          report(Math.min(row.size, checkedBytes / 2));
+        };
+        const digest = await hashFile(from, "sha256", undefined, checking);
+        if (
+          digest !==
+          (await hashFile(
+            await resolveDestination(row.path),
+            "sha256",
+            undefined,
+            checking,
+          ))
+        )
           throw error(
             409,
             "The source changed or its copy could not be verified. The original and recovery data have been retained.",
@@ -285,6 +316,9 @@ export async function createRecycleBin({
           await copied.close();
         }
         hashes.set(row.path, digest);
+        filesProcessed++;
+        bytesProcessed += row.size;
+        report();
       }
     }
     const after = await walk(source);
@@ -301,7 +335,12 @@ export async function createRecycleBin({
     }
     return { rows: initial, hashes };
   };
-  const verifySource = async (source, snapshot) => {
+  const verifySource = async (source, snapshot, onProgress) => {
+    let filesProcessed = 0,
+      bytesProcessed = 0;
+    const report = () =>
+      onProgress?.({ phase: "verifying", filesProcessed, bytesProcessed });
+    report();
     const rows = await walk(source);
     if (JSON.stringify(rows) !== JSON.stringify(snapshot.rows))
       throw error(
@@ -311,13 +350,24 @@ export async function createRecycleBin({
     for (const row of rows) {
       if (
         row.type === "file" &&
-        (await hashFile(await safePath(source, row.path))) !==
-          snapshot.hashes.get(row.path)
+        (await hashFile(
+          await safePath(source, row.path),
+          "sha256",
+          undefined,
+          (bytes) => {
+            bytesProcessed += bytes;
+            report();
+          },
+        )) !== snapshot.hashes.get(row.path)
       )
         throw error(
           409,
           "The source changed before removal. The original and recovery data have been retained.",
         );
+      if (row.type === "file") {
+        filesProcessed++;
+        report();
+      }
     }
     if (JSON.stringify(await walk(source)) !== JSON.stringify(snapshot.rows))
       throw error(
@@ -329,7 +379,17 @@ export async function createRecycleBin({
     originalPath,
     snapshot,
     resolvePath = serverPath,
+    onProgress,
   ) => {
+    let filesProcessed = 0,
+      bytesProcessed = 0;
+    const report = (partial = 0) =>
+      onProgress?.({
+        phase: "removing",
+        filesProcessed,
+        bytesProcessed: bytesProcessed + partial,
+      });
+    report();
     const changed = (relative) =>
       error(
         409,
@@ -373,9 +433,13 @@ export async function createRecycleBin({
       const stat = await io.lstat(target);
       if (!sameIdentity(stat, row)) throw changed(relative);
       if (row.type === "file") {
+        let checkedBytes = 0;
         if (
           !sameFile(stat, row) ||
-          (await hashFile(target)) !== snapshot.hashes.get(row.path)
+          (await hashFile(target, "sha256", undefined, (bytes) => {
+            checkedBytes += bytes;
+            report(Math.min(row.size, checkedBytes));
+          })) !== snapshot.hashes.get(row.path)
         )
           throw changed(relative);
         const checked = await resolvePath(relative);
@@ -385,6 +449,9 @@ export async function createRecycleBin({
         } catch (cause) {
           throw removalFailure(cause, relative);
         }
+        filesProcessed++;
+        bytesProcessed += row.size;
+        report();
       } else {
         const checked = await resolvePath(relative);
         if (!sameIdentity(await io.lstat(checked), row))
@@ -498,8 +565,23 @@ export async function createRecycleBin({
       }
       return items.sort((a, b) => b.deletedAt.localeCompare(a.deletedAt));
     },
-    recycle(originalPath, { backup } = {}) {
+    recycle(originalPath, { backup, onProgress } = {}) {
       return exclusive(async () => {
+        // Progress is observation only. A disconnected or faulty observer must
+        // never interrupt a verified copy or release the mutation lock early.
+        const progress = (update) => {
+          try {
+            onProgress?.(update);
+          } catch {}
+        };
+        progress({
+          phase: "scanning",
+          crossDrive: false,
+          filesProcessed: 0,
+          totalFiles: null,
+          bytesProcessed: 0,
+          totalBytes: null,
+        });
         if (
           backup &&
           (!validBackup(backup) ||
@@ -523,7 +605,19 @@ export async function createRecycleBin({
             "The server root cannot be moved to the Recycle Bin.",
           );
         originalPath = originalPath.split("/").filter(Boolean).join("/");
-        const rows = await walk(source);
+        let scannedFiles = 0,
+          scannedBytes = 0;
+        const rows = await walk(source, "", [], (row) => {
+          if (row.type === "file") {
+            scannedFiles++;
+            scannedBytes += row.size;
+          }
+          progress({
+            filesProcessed: scannedFiles,
+            bytesProcessed: scannedBytes,
+          });
+        });
+        progress({ totalFiles: scannedFiles, totalBytes: scannedBytes });
         const metadata = {
           version: 1,
           id: newId(),
@@ -549,20 +643,39 @@ export async function createRecycleBin({
             await io.rename(source, payload);
           } catch (cause) {
             if (cause.code !== "EXDEV") throw cause;
+            progress({
+              phase: "copying",
+              crossDrive: true,
+              filesProcessed: 0,
+              bytesProcessed: 0,
+            });
             metadata.phase = "copying";
             await persist(entryDir, metadata);
-            const snapshot = await copyVerified(source, async (relative) =>
-              safePath(
-                await entryDirectory(metadata.id),
-                ["content", relative].filter(Boolean).join("/"),
-              ),
+            const snapshot = await copyVerified(
+              source,
+              async (relative) =>
+                safePath(
+                  await entryDirectory(metadata.id),
+                  ["content", relative].filter(Boolean).join("/"),
+                ),
+              progress,
             );
             metadata.phase = "copied";
             await persist(entryDir, metadata);
             await sourcePath(originalPath);
-            await verifySource(source, snapshot);
-            await removeVerifiedSource(originalPath, snapshot, sourcePath);
+            await verifySource(source, snapshot, progress);
+            await removeVerifiedSource(
+              originalPath,
+              snapshot,
+              sourcePath,
+              progress,
+            );
           }
+          progress({
+            phase: "finalizing",
+            filesProcessed: scannedFiles,
+            bytesProcessed: scannedBytes,
+          });
           metadata.phase = "ready";
           await persist(entryDir, metadata);
           return view({ entryDir, metadata, payload });

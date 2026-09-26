@@ -3,6 +3,7 @@ import {
   useEffect,
   useRef,
   useState,
+  useSyncExternalStore,
   type FormEvent,
 } from "react";
 import {
@@ -68,6 +69,373 @@ type FileDialog =
       entries: Entry[];
       failures?: { entry: Entry; message: string }[];
     };
+type RecycleOperation = {
+  id: string;
+  path: string;
+  status: "running" | "completed" | "failed";
+  phase:
+    | "scanning"
+    | "copying"
+    | "verifying"
+    | "removing"
+    | "finalizing"
+    | "completed"
+    | "failed";
+  crossDrive: boolean;
+  filesProcessed: number;
+  totalFiles: number | null;
+  bytesProcessed: number;
+  totalBytes: number | null;
+  error?: string;
+};
+type MoveBatch = {
+  id: string;
+  targets: Entry[];
+  completed: string[];
+  failures: { entry: Entry; message: string }[];
+  unconfirmed: { entry: Entry; requestId: string } | null;
+  running: boolean;
+  operation: RecycleOperation | null;
+  connectionError: string;
+};
+type FileApi = ReturnType<typeof useServerApi>["api"];
+class UnconfirmedMove extends Error {}
+const unconfirmedMessage =
+  "The move's outcome could not be confirmed. It may still finish on the server. Check its status or inspect the source folder and Recycle Bin. No move was retried; remaining items were not sent.";
+// Keep pending moves bound to their server even when its page is unmounted.
+// A dropped response is resolved through the operation ID, never by replaying DELETE.
+const moveBatches = new Map<string, MoveBatch>();
+const moveTransports = new Map<string, Set<AbortController>>();
+const moveListeners = new Set<() => void>();
+const subscribeMoves = (listener: () => void) => {
+  moveListeners.add(listener);
+  return () => {
+    moveListeners.delete(listener);
+  };
+};
+function updateMove(key: string, update: Partial<MoveBatch>, batchId?: string) {
+  const previous = moveBatches.get(key);
+  if (!previous || (batchId && previous.id !== batchId)) return;
+  moveBatches.set(key, { ...previous, ...update });
+  moveListeners.forEach((listener) => listener());
+}
+function waitForMove(
+  api: FileApi,
+  key: string,
+  id: string,
+  target?: string,
+  onLateResult?: (failure?: Error) => void,
+) {
+  const batchId = moveBatches.get(key)?.id;
+  const update = (value: Partial<MoveBatch>) => updateMove(key, value, batchId);
+  return new Promise<void>((resolve, reject) => {
+    let finished = false;
+    let unconfirmed = false;
+    let requestPending = target !== undefined;
+    let unavailableChecks = 0;
+    let statusUnsupported = false;
+    const started = Date.now();
+    let timer: ReturnType<typeof setTimeout>;
+    const finish = (failure?: Error) => {
+      if (finished) return;
+      finished = true;
+      unconfirmed = failure instanceof UnconfirmedMove;
+      clearTimeout(timer);
+      failure ? reject(failure) : resolve();
+    };
+    const poll = async () => {
+      try {
+        const { operation } = await api<{ operation: RecycleOperation | null }>(
+          `/files/recycle-operation?requestId=${encodeURIComponent(id)}`,
+          { signal: AbortSignal.timeout(5000) },
+        );
+        if (finished) return;
+        if (operation?.id === id) {
+          unavailableChecks = 0;
+          update({ operation, connectionError: "" });
+          if (operation.status === "completed") finish();
+          else if (operation.status === "failed")
+            finish(
+              new Error(operation.error || "The item could not be moved."),
+            );
+        } else unavailableChecks++;
+      } catch (failure) {
+        const status = (failure as { status?: number })?.status;
+        if (status === 401 || status === 403) {
+          finish(new UnconfirmedMove(unconfirmedMessage));
+          return;
+        }
+        if (status === 404) statusUnsupported = true;
+        unavailableChecks++;
+        if (!finished)
+          update({
+            connectionError:
+              "Connection interrupted. Checking the move's status; it has not been retried.",
+          });
+      } finally {
+        if (
+          !finished &&
+          unavailableChecks >= 5 &&
+          (!requestPending || Date.now() - started >= 30000)
+        )
+          finish(new UnconfirmedMove(unconfirmedMessage));
+        if (!finished && !(statusUnsupported && requestPending))
+          timer = setTimeout(poll, 1000);
+        else if (!finished)
+          timer = setTimeout(
+            () => finish(new UnconfirmedMove(unconfirmedMessage)),
+            Math.max(0, 30000 - (Date.now() - started)),
+          );
+      }
+    };
+    timer = setTimeout(poll, 100);
+    if (target !== undefined) {
+      const transport = new AbortController();
+      if (batchId) {
+        if (!moveTransports.has(batchId))
+          moveTransports.set(batchId, new Set());
+        moveTransports.get(batchId)!.add(transport);
+      }
+      void api(
+        `/files?${new URLSearchParams({ path: target, requestId: id })}`,
+        { method: "DELETE", signal: transport.signal },
+      )
+        .then(() => {
+          if (finished && unconfirmed) onLateResult?.();
+          else finish();
+        })
+        .catch((failure) => {
+          requestPending = false;
+          if (finished) {
+            if (unconfirmed && failure?.status >= 400 && failure.status < 500)
+              onLateResult?.(failure);
+            return;
+          }
+          // A rejected request is definitive only when the server refused it.
+          // Transport failures and server errors may arrive after the move started.
+          if (failure?.status === 401)
+            finish(new UnconfirmedMove(unconfirmedMessage));
+          else if (failure?.status >= 400 && failure.status < 500)
+            finish(failure);
+          else if (statusUnsupported)
+            finish(new UnconfirmedMove(unconfirmedMessage));
+          else
+            update({
+              connectionError:
+                "The response was interrupted. Checking the move's status; it has not been retried.",
+            });
+        })
+        .finally(() => {
+          if (batchId) {
+            const transports = moveTransports.get(batchId);
+            transports?.delete(transport);
+            if (!transports?.size) moveTransports.delete(batchId);
+          }
+        });
+    }
+  });
+}
+function resolveUnconfirmed(
+  key: string,
+  requestId: string,
+  notify: PageProps["notify"],
+  failure?: Error,
+) {
+  const batch = moveBatches.get(key);
+  if (batch?.unconfirmed?.requestId !== requestId) return;
+  const { entry } = batch.unconfirmed;
+  updateMove(key, {
+    running: false,
+    unconfirmed: null,
+    connectionError: "",
+    completed: failure ? batch.completed : [...batch.completed, entry.path],
+    failures: failure
+      ? [...batch.failures, { entry, message: failure.message }]
+      : batch.failures,
+  });
+  notify(
+    failure ? failure.message : `${entry.name} moved to Recycle Bin.`,
+    !!failure,
+  );
+}
+function checkUnconfirmed(
+  api: FileApi,
+  key: string,
+  notify: PageProps["notify"],
+) {
+  const batch = moveBatches.get(key);
+  if (!batch?.unconfirmed || batch.running) return;
+  const { requestId } = batch.unconfirmed;
+  updateMove(key, {
+    running: true,
+    connectionError: "Checking the move's status…",
+  });
+  void waitForMove(api, key, requestId)
+    .then(() => resolveUnconfirmed(key, requestId, notify))
+    .catch((failure) => {
+      if (failure instanceof UnconfirmedMove)
+        updateMove(
+          key,
+          {
+            running: false,
+            connectionError: unconfirmedMessage,
+          },
+          batch.id,
+        );
+      else resolveUnconfirmed(key, requestId, notify, failure);
+    });
+}
+function dismissUnconfirmed(key: string) {
+  const batch = moveBatches.get(key);
+  if (!batch?.unconfirmed || batch.running) return;
+  moveBatches.delete(key);
+  moveTransports.get(batch.id)?.forEach((transport) => transport.abort());
+  moveTransports.delete(batch.id);
+  moveListeners.forEach((listener) => listener());
+}
+function startMoveBatch(
+  api: FileApi,
+  key: string,
+  targets: Entry[],
+  notify: PageProps["notify"],
+  existing?: RecycleOperation,
+) {
+  if (moveBatches.get(key)?.running || moveBatches.get(key)?.unconfirmed)
+    return null;
+  const id = crypto.randomUUID();
+  moveBatches.set(key, {
+    id,
+    targets,
+    completed: [],
+    failures: [],
+    unconfirmed: null,
+    running: true,
+    operation: existing || null,
+    connectionError: "",
+  });
+  moveListeners.forEach((listener) => listener());
+  void (async () => {
+    const completed: string[] = [];
+    const failures: MoveBatch["failures"] = [];
+    for (const entry of targets) {
+      const requestId = existing?.id || crypto.randomUUID();
+      updateMove(key, { operation: existing || null, connectionError: "" });
+      try {
+        await waitForMove(
+          api,
+          key,
+          requestId,
+          existing ? undefined : entry.path,
+          (failure) => resolveUnconfirmed(key, requestId, notify, failure),
+        );
+        completed.push(entry.path);
+      } catch (failure) {
+        if (failure instanceof UnconfirmedMove) {
+          updateMove(key, {
+            unconfirmed: { entry, requestId },
+            connectionError: unconfirmedMessage,
+          });
+          break;
+        }
+        failures.push({ entry, message: messageOf(failure) });
+      }
+      updateMove(key, { completed: [...completed], failures: [...failures] });
+    }
+    const unconfirmed = moveBatches.get(key)?.unconfirmed;
+    updateMove(key, {
+      running: false,
+      connectionError: unconfirmed ? unconfirmedMessage : "",
+    });
+    const summary = unconfirmed
+      ? unconfirmedMessage
+      : targets.length === 1 && !failures.length
+        ? `${targets[0].name} moved to Recycle Bin.`
+        : `${completed.length} ${completed.length === 1 ? "item" : "items"} moved to Recycle Bin.${failures.length ? ` ${failures.length} ${failures.length === 1 ? "item could not be moved and remains" : "items could not be moved and remain"} selected.` : ""}`;
+    notify(summary, failures.length > 0 || !!unconfirmed);
+  })();
+  return id;
+}
+function moveDescription(batch: MoveBatch) {
+  if (batch.connectionError) return batch.connectionError;
+  const operation = batch.operation;
+  if (!operation) return "Preparing the move…";
+  const phase = {
+    scanning: "Scanning files",
+    copying: "Copying and checking files",
+    verifying: "Verifying files",
+    removing: "Removing the original files",
+    finalizing: "Finishing the move",
+    completed: "Move completed",
+    failed: "Move failed",
+  }[operation.phase];
+  const count =
+    operation.totalFiles === null
+      ? `${operation.filesProcessed} files scanned`
+      : `${operation.filesProcessed} of ${operation.totalFiles} files`;
+  const bytes = operation.totalBytes
+    ? ` · ${formatBytes(operation.bytesProcessed)} of ${formatBytes(operation.totalBytes)}`
+    : "";
+  return `${phase} · ${count}${bytes}${operation.crossDrive ? " · Moving between drives" : ""}`;
+}
+function MoveProgress({
+  batch,
+  onCheck,
+  onDismiss,
+}: {
+  batch: MoveBatch;
+  onCheck: () => void;
+  onDismiss: () => void;
+}) {
+  return (
+    <div
+      className="recycle-bin-notice"
+      role="status"
+      aria-label="Move to Recycle Bin progress"
+    >
+      <LoaderCircle size={18} className={batch.running ? "spin" : ""} />
+      <div style={{ minWidth: 0, overflowWrap: "anywhere" }}>
+        <strong>
+          {batch.unconfirmed ? "Move not confirmed" : "Moving to Recycle Bin"} ·{" "}
+          {batch.completed.length + batch.failures.length} of{" "}
+          {batch.targets.length} items finished
+        </strong>
+        <p>
+          {batch.operation?.path ||
+            batch.targets[batch.completed.length + batch.failures.length]?.path}
+        </p>
+        {batch.unconfirmed && (
+          <>
+            <button
+              type="button"
+              className="btn small"
+              disabled={batch.running}
+              onClick={onCheck}
+            >
+              Check move status
+            </button>
+            <p>
+              After checking the source folder and Recycle Bin, you can dismiss
+              this notice. This does not cancel a move on the server.
+            </p>
+            <button
+              type="button"
+              className="btn small"
+              disabled={batch.running}
+              onClick={onDismiss}
+            >
+              I've checked the files
+            </button>
+          </>
+        )}
+        <p>{moveDescription(batch)}</p>
+        <p>
+          You can keep using the panel. Closing a dialog does not cancel this
+          move.
+        </p>
+      </div>
+    </div>
+  );
+}
 const editable = (name: string) =>
   /\.(txt|log|json|ya?ml|toml|properties|conf|cfg|ini|md|xml|csv|js|ts|sh|bat|mcmeta)$/i.test(
     name,
@@ -138,7 +506,15 @@ export default function FileManager({
   const [readFailed, setReadFailed] = useState(false);
   const [dialogError, setDialogError] = useState("");
   const [selected, setSelected] = useState<Set<string>>(new Set());
-  const [deleteProgress, setDeleteProgress] = useState<number | null>(null);
+  const moveKey = downloadUrl("/files");
+  const moveBatch = useSyncExternalStore(
+    subscribeMoves,
+    () => moveBatches.get(moveKey) || null,
+  );
+  const moving = Boolean(moveBatch?.running);
+  const movePending = moving || Boolean(moveBatch?.unconfirmed);
+  const [checkingMove, setCheckingMove] = useState(true);
+  const [dialogMoveId, setDialogMoveId] = useState<string | null>(null);
   const uploadInput = useRef<HTMLInputElement>(null);
   const searchInput = useRef<HTMLInputElement>(null);
   const requestId = useRef(0);
@@ -148,6 +524,7 @@ export default function FileManager({
   const editRequestId = useRef(0);
   const savingRef = useRef(false);
   const pathRef = useRef(path);
+  const handledMove = useRef<string | null>(null);
   savingRef.current = saving;
   pathRef.current = path;
 
@@ -181,6 +558,99 @@ export default function FileManager({
       if (id === requestId.current) setLoading(false);
     }
   }, [path, api, canRead]);
+
+  useEffect(() => {
+    let active = true;
+    if (!canDelete) {
+      setCheckingMove(false);
+      return;
+    }
+    setCheckingMove(true);
+    void api<{ operation: RecycleOperation | null }>(
+      "/files/recycle-operation",
+      {
+        signal: AbortSignal.timeout(5000),
+      },
+    )
+      .then(({ operation }) => {
+        if (!active || operation?.status !== "running") return;
+        startMoveBatch(
+          api,
+          moveKey,
+          [
+            {
+              name: operation.path.split("/").pop() || operation.path,
+              path: operation.path,
+              type: "directory",
+              size: 0,
+              modified: "",
+            },
+          ],
+          notify,
+          operation,
+        );
+      })
+      .catch(() => {})
+      .finally(() => {
+        if (active) setCheckingMove(false);
+      });
+    return () => {
+      active = false;
+    };
+  }, [api, moveKey, canDelete]);
+
+  useEffect(() => {
+    const resultKey =
+      moveBatch &&
+      `${moveBatch.id}:${moveBatch.completed.length}:${moveBatch.failures.length}:${!!moveBatch.unconfirmed}`;
+    if (!moveBatch || moveBatch.running || handledMove.current === resultKey)
+      return;
+    handledMove.current = resultKey;
+    const completed = new Set(moveBatch.completed);
+    if (
+      !dialog &&
+      moveBatch.targets.some(
+        (entry) =>
+          completed.has(entry.path) &&
+          document.activeElement?.getAttribute("aria-label") ===
+            `Delete ${entry.name}`,
+      )
+    )
+      searchInput.current?.focus();
+    setEntries((previous) =>
+      previous.filter((entry) => !completed.has(entry.path)),
+    );
+    setSelected((previous) => {
+      const remaining = new Set(
+        [...previous].filter((item) => !completed.has(item)),
+      );
+      moveBatch.failures.forEach(({ entry }) => remaining.add(entry.path));
+      return remaining;
+    });
+    // A background completion must not dismiss or overwrite a newer dialog.
+    if (dialogMoveId === moveBatch.id) {
+      if (moveBatch.unconfirmed) {
+        setDialogError(unconfirmedMessage);
+      } else if (moveBatch.failures.length) {
+        if (moveBatch.targets.length > 1)
+          setDialog({
+            type: "delete-many",
+            entries: moveBatch.failures.map(({ entry }) => entry),
+            failures: moveBatch.failures,
+          });
+        setDialogError(
+          moveBatch.targets.length > 1
+            ? `${moveBatch.completed.length} ${moveBatch.completed.length === 1 ? "item" : "items"} moved to Recycle Bin. ${moveBatch.failures.length} ${moveBatch.failures.length === 1 ? "item could not be moved and remains" : "items could not be moved and remain"} selected.`
+            : moveBatch.failures[0].message,
+        );
+        setDialogMoveId(null);
+      } else {
+        focusSearchAfterClose.current = true;
+        closeDialog();
+      }
+    }
+    void load();
+  }, [moveBatch, dialogMoveId, load]);
 
   useEffect(() => {
     loaded.current = false;
@@ -232,16 +702,17 @@ export default function FileManager({
     editRequestId.current++;
     setReading(false);
     setDialog(null);
+    setDialogMoveId(null);
   }
   function openDelete(entry: Entry) {
-    if (!canDelete) return;
+    if (!canDelete || movePending || checkingMove) return;
     editRequestId.current++;
     setReading(false);
     setDialogError("");
     setDialog({ type: "delete", entry });
   }
   function openDeleteSelected() {
-    if (!canDelete) return;
+    if (!canDelete || movePending || checkingMove) return;
     const targets = entries.filter((entry) => selected.has(entry.path));
     if (!targets.length || savingRef.current) return;
     editRequestId.current++;
@@ -334,53 +805,24 @@ export default function FileManager({
   async function submitDialog(event: FormEvent) {
     event.preventDefault();
     if (!dialog || !canSubmitDialog || savingRef.current) return;
+    if (dialog.type === "delete" || dialog.type === "delete-many") {
+      if (movePending || checkingMove) return;
+      setDialogError("");
+      setDialogMoveId(
+        startMoveBatch(
+          api,
+          moveKey,
+          dialog.type === "delete" ? [dialog.entry] : dialog.entries,
+          notify,
+        ),
+      );
+      return;
+    }
     savingRef.current = true;
     setSaving(true);
     setDialogError("");
     try {
-      if (dialog.type === "delete-many") {
-        const deleted = new Set<string>();
-        const failures: { entry: Entry; message: string }[] = [];
-        setDeleteProgress(0);
-        // Freeze the confirmed targets and this server's API binding for the
-        // whole operation. Each deletion finishes before the next one starts.
-        for (const entry of dialog.entries) {
-          try {
-            await api(`/files?path=${encodeURIComponent(entry.path)}`, {
-              method: "DELETE",
-            });
-            deleted.add(entry.path);
-          } catch (failure) {
-            failures.push({ entry, message: messageOf(failure) });
-          }
-          setDeleteProgress(deleted.size + failures.length);
-        }
-        setSelected((previous) => {
-          const remaining = new Set(
-            [...previous].filter((item) => !deleted.has(item)),
-          );
-          failures.forEach(({ entry }) => remaining.add(entry.path));
-          return remaining;
-        });
-        setEntries((previous) =>
-          previous.filter((entry) => !deleted.has(entry.path)),
-        );
-        const summary = `${deleted.size} ${deleted.size === 1 ? "item" : "items"} moved to Recycle Bin.${failures.length ? ` ${failures.length} ${failures.length === 1 ? "item could not be moved and remains" : "items could not be moved and remain"} selected.` : ""}`;
-        notify(summary, failures.length > 0);
-        if (failures.length) {
-          setDialog({
-            type: "delete-many",
-            entries: failures.map(({ entry }) => entry),
-            failures,
-          });
-          setDialogError(summary);
-        } else {
-          focusSearchAfterClose.current = true;
-          closeDialog();
-        }
-        await load();
-        return;
-      } else if (dialog.type === "create") {
+      if (dialog.type === "create") {
         await post("/files", {
           path,
           name: name.trim(),
@@ -399,13 +841,7 @@ export default function FileManager({
           }),
         });
         notify(`${dialog.entry.name} saved.`);
-      } else {
-        await api(`/files?path=${encodeURIComponent(dialog.entry.path)}`, {
-          method: "DELETE",
-        });
-        notify(`${dialog.entry.name} moved to Recycle Bin.`);
       }
-      if (dialog.type === "delete") focusSearchAfterClose.current = true;
       closeDialog();
       await load();
     } catch (failure) {
@@ -413,7 +849,6 @@ export default function FileManager({
     } finally {
       savingRef.current = false;
       setSaving(false);
-      setDeleteProgress(null);
     }
   }
 
@@ -467,14 +902,23 @@ export default function FileManager({
     );
   if (showingBin && canBin)
     return (
-      <RecycleBin
-        notify={notify}
-        permissions={permissions}
-        onBack={() => {
-          setQuery("");
-          setShowingBin(false);
-        }}
-      />
+      <>
+        {movePending && moveBatch && (
+          <MoveProgress
+            batch={moveBatch}
+            onCheck={() => checkUnconfirmed(api, moveKey, notify)}
+            onDismiss={() => dismissUnconfirmed(moveKey)}
+          />
+        )}
+        <RecycleBin
+          notify={notify}
+          permissions={permissions}
+          onBack={() => {
+            setQuery("");
+            setShowingBin(false);
+          }}
+        />
+      </>
     );
   return (
     <div className="storage-page">
@@ -506,6 +950,14 @@ export default function FileManager({
           aria-label="Upload server files"
         />
       </div>
+
+      {movePending && moveBatch && (
+        <MoveProgress
+          batch={moveBatch}
+          onCheck={() => checkUnconfirmed(api, moveKey, notify)}
+          onDismiss={() => dismissUnconfirmed(moveKey)}
+        />
+      )}
 
       <section
         className={`panel files-panel ${dragging ? "files-dragging" : ""}`}
@@ -631,7 +1083,14 @@ export default function FileManager({
                 <button
                   className="btn danger small"
                   onClick={openDeleteSelected}
-                  disabled={!canDelete || saving || loading || !!error}
+                  disabled={
+                    !canDelete ||
+                    saving ||
+                    movePending ||
+                    checkingMove ||
+                    loading ||
+                    !!error
+                  }
                 >
                   <Trash2 size={15} /> Delete selected
                 </button>
@@ -806,7 +1265,7 @@ export default function FileManager({
                           className="btn icon delete-action"
                           aria-label={`Delete ${entry.name}`}
                           title="Move to Recycle Bin"
-                          disabled={!canDelete}
+                          disabled={!canDelete || movePending || checkingMove}
                           onClick={() => openDelete(entry)}
                         >
                           <Trash2 size={14} />
@@ -1020,6 +1479,18 @@ export default function FileManager({
                 {dialogError}
               </p>
             )}
+            {moving && moveBatch && dialogMoveId === moveBatch.id && (
+              <div className="recycle-bin-notice" role="status">
+                <LoaderCircle size={18} className="spin" />
+                <div>
+                  <p>{moveDescription(moveBatch)}</p>
+                  <p>
+                    You can close this dialog while the move continues. Closing
+                    does not cancel it.
+                  </p>
+                </div>
+              </div>
+            )}
             <div className="storage-modal-footer">
               <button
                 type="button"
@@ -1027,26 +1498,33 @@ export default function FileManager({
                 disabled={saving}
                 onClick={closeDialog}
               >
-                Cancel
+                {movePending && dialogMoveId === moveBatch?.id
+                  ? "Close"
+                  : "Cancel"}
               </button>
               <button
                 className={`btn ${dialog.type === "delete" || dialog.type === "delete-many" ? "danger" : "primary"}`}
                 disabled={
                   !canSubmitDialog ||
                   saving ||
+                  ((dialog.type === "delete" ||
+                    dialog.type === "delete-many") &&
+                    (movePending || checkingMove)) ||
                   (dialog.type === "edit" && (reading || readFailed)) ||
                   (dialog.type === "create" && !name.trim())
                 }
               >
                 {saving && <LoaderCircle size={15} className="spin" />}
                 {dialog.type === "delete-many"
-                  ? saving && deleteProgress !== null
-                    ? `Moving ${deleteProgress} of ${dialog.entries.length}…`
+                  ? moving && dialogMoveId === moveBatch?.id
+                    ? `Moving ${moveBatch.completed.length + moveBatch.failures.length} of ${dialog.entries.length}…`
                     : dialog.failures?.length
                       ? "Retry failed moves"
                       : "Move to Recycle Bin"
                   : dialog.type === "delete"
-                    ? "Move to Recycle Bin"
+                    ? moving && dialogMoveId === moveBatch?.id
+                      ? "Moving to Recycle Bin…"
+                      : "Move to Recycle Bin"
                     : dialog.type === "edit"
                       ? "Save changes"
                       : `Create ${dialog.kind === "directory" ? "folder" : "file"}`}
