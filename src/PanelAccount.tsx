@@ -87,6 +87,15 @@ export default function PanelAccount({
       onSelect: () =>
         void perform(() => window.mcPanelConnections!.activate(panel.id)),
     }));
+  if (session && window.mcPanelConnections)
+    actions.unshift({
+      id: "local",
+      label: "Switch to this computer",
+      icon: <Monitor size={16} />,
+      disabled: busy,
+      onSelect: () =>
+        void perform(() => window.mcPanelConnections!.activate("local")),
+    });
   actions.push({
     id: "signin",
     label: "Sign in to another panel",

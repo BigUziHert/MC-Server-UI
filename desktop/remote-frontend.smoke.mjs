@@ -792,7 +792,37 @@ async function smoke() {
       (
         await application.evaluate(() => globalThis.__frontendSmoke.inspect())
       ).context.panels.find((panel) => panel.id === remoteId);
+    const activePanel = async () =>
+      (await application.evaluate(() => globalThis.__frontendSmoke.inspect()))
+        .context.activeId;
+    const localAccount = local.getByRole("button", {
+      name: "Account menu for Local administrator",
+      exact: true,
+    });
+    const switchToRemote = local.getByRole("menuitem", {
+      name: `Switch to ${new URL(origin).host}`,
+      exact: true,
+    });
     await expect.poll(async () => (await remotePanel()).signedIn).toBe(true);
+    // A shared world must not trap a gaming PC with no local servers in the
+    // remote account: its menu can return home without ending that session.
+    await remote
+      .getByRole("button", {
+        name: `Account menu for ${user.email}`,
+        exact: true,
+      })
+      .click();
+    await remote
+      .getByRole("menuitem", { name: "Switch to this computer", exact: true })
+      .click();
+    await expect.poll(activePanel).toBe("local");
+    await expect(
+      local.getByRole("heading", { name: "Welcome to MC Panel" }),
+    ).toBeVisible();
+    await localAccount.click();
+    await switchToRemote.click();
+    await expect.poll(activePanel).toBe(remoteId);
+    assert.equal((await remotePanel()).signedIn, true);
     await remote
       .getByRole("button", {
         name: `Account menu for ${user.email}`,
@@ -833,10 +863,6 @@ async function smoke() {
           ).context.activeId,
       )
       .toBe("local");
-    const localAccount = local.getByRole("button", {
-      name: "Account menu for Local administrator",
-      exact: true,
-    });
     await localAccount.click();
     await expect(
       local.getByRole("menuitem", { name: /^Switch to / }),
@@ -861,14 +887,89 @@ async function smoke() {
       .poll(async () => (await remotePanel()).servers, { timeout: 15000 })
       .toEqual([]);
     assert.equal((await remotePanel()).signedIn, true);
-    await remote.evaluate(() => window.mcPanelConnections.activate("local"));
-    await localAccount.click();
     await expect(
-      local.getByRole("menuitem", {
-        name: `Switch to ${new URL(origin).host}`,
+      remote.getByRole("heading", { name: "No shared servers", exact: true }),
+    ).toBeVisible();
+    await remote
+      .getByRole("button", { name: "Back to this computer", exact: true })
+      .click();
+    await expect.poll(activePanel).toBe("local");
+
+    // The empty remote panel and empty local PC need a visible route into
+    // local creation. Only stub the read-only catalog; native owner routing,
+    // the installed wizard, and the remote authentication remain real.
+    const setupReads = [];
+    await local.route("**/api/server-setup", async (route) => {
+      const request = route.request();
+      assert.equal(request.method(), "GET");
+      assert.equal(new URL(request.url()).origin, new URL(local.url()).origin);
+      setupReads.push(request.url());
+      await route.fulfill({
+        contentType: "application/json",
+        body: JSON.stringify({
+          providers: [],
+          platforms: [],
+          gameVersions: [],
+          hostMemoryMB: 16384,
+          freeMemoryMB: 12288,
+          java: { available: false },
+          warnings: [],
+        }),
+      });
+    });
+    await local
+      .getByRole("button", { name: "Create a new server", exact: true })
+      .click();
+    const createWizard = local.getByRole("dialog", {
+      name: "What would you like to play?",
+      exact: true,
+    });
+    await expect(createWizard).toBeVisible();
+    await expect.poll(() => setupReads.length).toBe(1);
+    await expect(
+      createWizard.getByRole("button", {
+        name: "Server software",
         exact: true,
       }),
     ).toBeVisible();
+    await expect(createWizard.locator(".setup-host-context")).toHaveCount(0);
+    await createWizard
+      .getByRole("button", { name: "Close add server", exact: true })
+      .click();
+    await expect(createWizard).toHaveCount(0);
+    await local.unroute("**/api/server-setup");
+    await localAccount.click();
+    await switchToRemote.click();
+    await expect.poll(activePanel).toBe(remoteId);
+    await expect(
+      remote.getByRole("heading", { name: "No shared servers", exact: true }),
+    ).toBeVisible();
+    await expect(
+      remote.getByRole("button", { name: "Sign in", exact: true }),
+    ).toHaveCount(0);
+    state = await application.evaluate(() =>
+      globalThis.__frontendSmoke.inspect(),
+    );
+    assert.deepEqual(state.localServers, []);
+    assert.equal((await remotePanel()).signedIn, true);
+    assert.equal(
+      state.requests.filter((request) => request.path === "/api/access/logout")
+        .length,
+      1,
+      "Returning home and opening local creation must retain the remote session",
+    );
+    assert.ok(
+      state.requests.every(
+        (request) => !request.path.startsWith("/api/server-setup"),
+      ),
+      "Local creation must not load a catalog or create a server on the remote host",
+    );
+    await remote
+      .getByRole("button", { name: "Back to this computer", exact: true })
+      .click();
+    await expect.poll(activePanel).toBe("local");
+    await localAccount.click();
+    await expect(switchToRemote).toBeVisible();
 
     // A host-side session revocation while viewing the local PC must also clear
     // that already-open account menu, without restarting the desktop app.
@@ -886,7 +987,7 @@ async function smoke() {
       remote.getByRole("heading", { name: "Welcome to your server" }),
     ).toBeVisible();
     console.log(
-      "Passed native frontend consistency: stale remote shell replaced by installed UI; certificate consent, remote sign-in/cookies, console filter/clear/export, client file/folder/selection downloads, Updates, switching, reload, logout and background access revocation.",
+      "Passed native frontend consistency: stale remote shell replaced by installed UI; certificate consent, remote sign-in/cookies, console filter/clear/export, client file/folder/selection downloads, Updates, switching, local creation from an empty remote panel, reload, logout and background access revocation.",
     );
   } catch (error) {
     if (stderr) console.error(stderr);

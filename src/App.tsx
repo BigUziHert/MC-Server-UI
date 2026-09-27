@@ -64,7 +64,10 @@ import PanelSettings from "./PanelSettings";
 import ServerIcon, { ServerIconImage } from "./ServerIcon";
 import { copyText } from "./clipboard";
 import { readPreference, writePreference } from "./preferences";
-import PanelAccount, { type PanelSession } from "./PanelAccount";
+import PanelAccount, {
+  DesktopPanelReturn,
+  type PanelSession,
+} from "./PanelAccount";
 import { reportDesktopServers } from "./desktop-connections";
 import ConnectPanel, { type ConnectionMode } from "./ConnectPanel";
 import { version as appVersion } from "../package.json";
@@ -678,6 +681,7 @@ export default function App({
           )}
           {session && (
             <div className="workspace-account-state">
+              <DesktopPanelReturn />
               {error && window.mcPanelConnections && (
                 <ServerSwitcher
                   servers={[]}
@@ -866,6 +870,7 @@ function EmptyFleet({
                 </div>
               )}
               <div className="welcome-remote-account">
+                {session && <DesktopPanelReturn />}
                 {!session && (
                   <button
                     className="btn"

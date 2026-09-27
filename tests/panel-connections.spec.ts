@@ -241,6 +241,174 @@ async function localPanel(page: Page, desktop = false) {
   return { localCredentials };
 }
 
+async function remoteAccount(page: Page, empty = true) {
+  await localPanel(page);
+  const writes: string[] = [];
+  page.on("request", (request) => {
+    const path = new URL(request.url()).pathname;
+    if (path.startsWith("/api/") && !["GET", "HEAD"].includes(request.method()))
+      writes.push(`${request.method()} ${path}`);
+  });
+  await page.route("**/api/access/session", (route) =>
+    route.fulfill({
+      json: {
+        role: "subuser",
+        accountId: "friend",
+        email: "friend@example.test",
+        userId: "friend",
+        serverId: empty ? null : localServer.id,
+        permissions: empty ? [] : ["server.view", "control.console"],
+        hostPermissions: [],
+      },
+    }),
+  );
+  await page.route("**/api/servers", (route) =>
+    route.fulfill({
+      json: {
+        servers: empty
+          ? []
+          : [
+              {
+                ...localServer,
+                accessPermissions: ["server.view", "control.console"],
+              },
+            ],
+        defaultServerId: empty ? null : localServer.id,
+        hostPermissions: [],
+      },
+    }),
+  );
+  return { writes };
+}
+
+for (const width of [1434, 390]) {
+  test(`a signed-in account with no shared or local servers can return to this computer at ${width}px`, async ({
+    page,
+  }) => {
+    await page.setViewportSize({ width, height: 950 });
+    await desktopBridge(page, { activeId: "pc-one", localServers: [] });
+    const { writes } = await remoteAccount(page);
+    await page.goto("/#console");
+    await expect(
+      page.getByRole("heading", { name: "No shared servers" }),
+    ).toBeVisible();
+    await expect(
+      page.getByRole("button", { name: "Create a new server", exact: true }),
+    ).toHaveCount(0);
+    await expect(
+      page.getByRole("button", {
+        name: "Import an existing server",
+        exact: true,
+      }),
+    ).toHaveCount(0);
+    await page
+      .getByRole("button", { name: "Back to this computer", exact: true })
+      .click();
+    await expect
+      .poll(() =>
+        page.evaluate(async () => {
+          const state = await window.mcPanelConnections!.list();
+          return {
+            activeId: state.activeId,
+            signedIn: state.panels.find((panel) => panel.id === "pc-one")
+              ?.signedIn,
+          };
+        }),
+      )
+      .toEqual({ activeId: "local", signedIn: true });
+    expect(
+      await page.evaluate(
+        () =>
+          (window as unknown as { connectionCalls: unknown }).connectionCalls,
+      ),
+    ).toEqual([{ action: "activate", value: "local" }]);
+    expect(writes).toEqual([]);
+  });
+}
+
+for (const listFailure of [undefined, "reject", "hang"] as const) {
+  test(`a remote account can switch to this computer with a ${listFailure ?? "working"} connection list`, async ({
+    page,
+  }) => {
+    await desktopBridge(page, {
+      activeId: "pc-one",
+      localServers: [],
+      listFailure,
+    });
+    const { writes } = await remoteAccount(page, false);
+    await page.goto("/#console");
+    await expect(
+      page.getByRole("heading", { name: localServer.name, exact: true }),
+    ).toBeVisible();
+    await page
+      .getByRole("button", {
+        name: "Account menu for friend@example.test",
+        exact: true,
+      })
+      .click();
+    await page
+      .getByRole("menuitem", { name: "Switch to this computer", exact: true })
+      .click();
+    await expect
+      .poll(() =>
+        page.evaluate(
+          () =>
+            (window as unknown as { connectionCalls: unknown }).connectionCalls,
+        ),
+      )
+      .toEqual([{ action: "activate", value: "local" }]);
+    expect(writes).toEqual([]);
+    await expect(page.getByLabel("Password", { exact: true })).toHaveCount(0);
+  });
+}
+
+for (const fleetState of ["loading", "failed"] as const) {
+  test(`a signed-in desktop account can return to this computer while its server list is ${fleetState}`, async ({
+    page,
+  }) => {
+    await desktopBridge(page, { activeId: "pc-one", localServers: [] });
+    const { writes } = await remoteAccount(page);
+    let release!: () => void;
+    const pending = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    await page.route("**/api/servers", async (route) => {
+      if (fleetState === "loading") await pending;
+      return route.fulfill({
+        status: 503,
+        json: { error: "The remote panel is unavailable." },
+      });
+    });
+    try {
+      await page.goto("/#console");
+      await expect(
+        page.getByRole("heading", {
+          name:
+            fleetState === "loading"
+              ? "Opening MC Panel…"
+              : "Unable to load your servers",
+          exact: true,
+        }),
+      ).toBeVisible();
+      await page
+        .getByRole("button", { name: "Back to this computer", exact: true })
+        .click();
+      await expect
+        .poll(() =>
+          page.evaluate(
+            () =>
+              (window as unknown as { connectionCalls: unknown })
+                .connectionCalls,
+          ),
+        )
+        .toEqual([{ action: "activate", value: "local" }]);
+      expect(writes).toEqual([]);
+    } finally {
+      release();
+    }
+  });
+}
+
 for (const empty of [false, true]) {
   for (const desktop of [false, true]) {
     test(`remote app updates ${desktop ? "open the local desktop updater" : "stay unavailable in a browser"} ${empty ? "without shared servers" : "with a selected server"}`, async ({
@@ -314,6 +482,24 @@ for (const empty of [false, true]) {
         ).toBeVisible();
       } else {
         await expect(updates).toHaveCount(0);
+        await expect(
+          page.getByRole("button", {
+            name: "Back to this computer",
+            exact: true,
+          }),
+        ).toHaveCount(0);
+        await page
+          .getByRole("button", {
+            name: "Account menu for friend@example.test",
+            exact: true,
+          })
+          .click();
+        await expect(
+          page.getByRole("menuitem", {
+            name: "Switch to this computer",
+            exact: true,
+          }),
+        ).toHaveCount(0);
       }
       expect(updateRequests).toEqual([]);
     });
@@ -635,7 +821,7 @@ test("a failed desktop connection preserves the address and allows an explicit r
   await expect(page).toHaveURL(/\/#console$/);
 });
 
-test("desktop account switches connected panels without local-switch or disconnect actions", async ({
+test("the local owner account switches connected panels without a redundant local-switch or disconnect action", async ({
   page,
   context,
 }) => {
@@ -1339,14 +1525,12 @@ for (const reason of ["sign-out", "expired session"] as const) {
         exact: true,
       })
       .click();
-    await expect(
-      page.getByRole("menuitem", {
+    await page
+      .getByRole("menuitem", {
         name: "Switch to this computer",
         exact: true,
-      }),
-    ).toHaveCount(0);
-    await page.keyboard.press("Escape");
-    await page.evaluate(() => window.mcPanelConnections!.activate("local"));
+      })
+      .click();
     expect((await roster()).map((item) => item.id)).toEqual([server.id]);
     fleetMode = "unavailable";
     await refreshSelected();
