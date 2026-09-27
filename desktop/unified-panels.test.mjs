@@ -6,6 +6,7 @@ import path from "node:path";
 import { createUnifiedPanelController } from "./unified-panels.mjs";
 import { createUnifiedConnectionStore } from "./unified-connection-store.mjs";
 import { startDesktopRuntime } from "./runtime.mjs";
+import { installUnifiedConnectionIpc } from "./connections-ipc.mjs";
 
 const account = {
   role: "subuser",
@@ -25,7 +26,7 @@ const response = (value, status = 200) =>
 
 async function harness(
   t,
-  { hostPermissions = [], behavior, storeRead, pollMs = 60000 } = {},
+  { hostPermissions = [], behavior, storeRead, storeSave, pollMs = 60000 } = {},
 ) {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "mc-unified-test-"));
   let controller;
@@ -49,7 +50,10 @@ async function harness(
     pollMs,
     store: {
       read: storeRead ?? (async () => ({ panels: [], selectedServer: null })),
-      save: async (value) => persisted.push(value),
+      save: async (value) => {
+        await storeSave?.(value);
+        persisted.push(value);
+      },
       close: async () => {},
     },
     session: {
@@ -93,6 +97,8 @@ async function harness(
             });
           if (url.pathname === "/api/access/logout")
             return response({ ok: true });
+          if (url.pathname === "/api/access/leave")
+            return response({ left: true, requestId: JSON.parse(options.body).requestId });
           if (url.pathname === "/api/server")
             return response({
               host: url.host,
@@ -312,6 +318,7 @@ test("failed invitations preserve the account lease and protected route spelling
     "/access/login/",
     "/access/LOGIN",
     "/access/accept/",
+    "/access/LEAVE/",
     "/desktop/settings/",
     "/panel-users/",
   ]) {
@@ -610,4 +617,151 @@ test("unified credentials are encrypted and offline roster persistence excludes 
   assert.equal(saved.panels[0].token, token);
   assert.equal(saved.panels[0].session.email, account.email);
   assert.equal(saved.panels[0].servers[0].status, "unavailable");
+});
+
+test("Forget confirms whole-panel departure before removing only the intended saved connection", async (t) => {
+  let h, requestId;
+  h = await harness(t, {
+    behavior: async (url, options) => {
+      if (url.pathname !== "/api/access/leave") return;
+      const body = JSON.parse(options.body);
+      assert.equal(body.confirmed, true);
+      requestId = body.requestId;
+      assert.equal(h.persisted.at(-1).panels.find((panel) => panel.origin === url.origin).pendingLeave.requestId, requestId);
+      assert.equal(new Headers(options.headers).get("Authorization"), `Bearer ${token}`);
+      return response({ left: true, requestId });
+    },
+  });
+  const a = await h.signIn("https://a.example.test");
+  const c = await h.signIn("https://c.example.test");
+  await h.controller.selectServer(a.id, "same-id");
+  await h.controller.forget(a.id, account.accountId);
+  assert.match(requestId, /^[a-f0-9-]{36}$/);
+  assert.equal(h.controller.list().panels.some((panel) => panel.id === a.id), false);
+  assert.equal(h.controller.list().panels.find((panel) => panel.id === c.id).signedIn, true);
+  assert.equal(h.persisted.at(-1).panels.some((panel) => panel.id === a.id), false);
+  assert.equal(h.calls.some((call) => /power/.test(call.url.pathname)), false);
+});
+
+test("lost Forget response retains original proof across restart and blocks operations until receipt retry", async (t) => {
+  let requestId, originalBearer;
+  const h = await harness(t, {
+    behavior: async (url, options) => {
+      if (url.pathname !== "/api/access/leave") return;
+      requestId = JSON.parse(options.body).requestId;
+      originalBearer = new Headers(options.headers).get("Authorization");
+      throw new Error("Lost success response");
+    },
+  });
+  const panel = await h.signIn("https://a.example.test");
+  await assert.rejects(h.controller.forget(panel.id, account.accountId), /retry proof.*Lost success response/);
+  const pending = h.controller.list().panels.find((entry) => entry.id === panel.id);
+  assert.equal(pending.pendingLeave, true);
+  assert.equal(pending.signedIn, true);
+  assert.equal(pending.connectionState, "unavailable");
+  assert.equal((await h.proxy(pending, "/server?serverId=same-id")).status, 409);
+  await assert.rejects(h.controller.signOut(panel.id), /Retry Forget/);
+  await assert.rejects(h.controller.signIn(panel.id, { email: account.email, password: "password" }), /Retry Forget/);
+  await assert.rejects(h.controller.retry(panel.id), /Retry Forget/);
+  const calls = h.calls.length;
+  await h.controller.restore();
+  assert.equal(h.calls.length, calls);
+  const saved = {
+    selectedServer: h.persisted.at(-1).selectedServer,
+    panels: h.persisted.at(-1).panels.map(({ id, origin, token, session, servers, pendingLeave }) =>
+      ({ id, origin, token, session, servers, pendingLeave })),
+  };
+  await h.controller.close();
+  const restored = await harness(t, {
+    storeRead: async () => saved,
+    behavior: async (url, options) => {
+      assert.equal(url.pathname, "/api/access/leave", "pending departure must not refresh its revoked session");
+      assert.equal(new Headers(options.headers).get("Authorization"), originalBearer);
+      assert.equal(JSON.parse(options.body).requestId, requestId);
+      return response({ left: true, requestId });
+    },
+  });
+  await restored.controller.restore();
+  assert.equal(restored.calls.length, 0);
+  assert.equal(restored.controller.list().panels.find((entry) => entry.id === panel.id).pendingLeave, true);
+  await restored.controller.forget(panel.id, account.accountId);
+  assert.equal(restored.controller.list().panels.some((entry) => entry.id === panel.id), false);
+});
+
+test("definitive Forget rejection permits renewed sign-in and signed-out Forget never claims removal", async (t) => {
+  const h = await harness(t, {
+    behavior: async (url) => url.pathname === "/api/access/leave"
+      ? response({ error: "Session expired" }, 401) : undefined,
+  });
+  const panel = await h.signIn("https://a.example.test");
+  await assert.rejects(h.controller.forget(panel.id, account.accountId), /could not confirm access removal.*Session expired/);
+  assert.equal(h.controller.list().panels.find((entry) => entry.id === panel.id).pendingLeave, false);
+  assert.equal(h.persisted.at(-1).panels[0].pendingLeave, undefined);
+  await h.controller.signIn(panel.id, { email: account.email, password: "password" });
+  await h.controller.signOut(panel.id);
+  await assert.rejects(h.controller.forget(panel.id, account.accountId), /Sign in.*before forgetting/);
+  assert.equal(h.calls.filter((call) => call.url.pathname === "/api/access/leave").length, 1);
+});
+
+test("local removal write failure retains departure proof for the same receipt retry", async (t) => {
+  let failRemoval = true;
+  const requestIds = [];
+  const h = await harness(t, {
+    storeSave: async (value) => {
+      if (failRemoval && !value.panels.length) throw new Error("Fixture disk unavailable");
+    },
+    behavior: async (url, options) => {
+      if (url.pathname !== "/api/access/leave") return;
+      const { requestId } = JSON.parse(options.body);
+      requestIds.push(requestId);
+      return response({ left: true, requestId });
+    },
+  });
+  const panel = await h.signIn("https://a.example.test");
+  await assert.rejects(h.controller.forget(panel.id, account.accountId), /Fixture disk unavailable/);
+  assert.equal(h.controller.list().panels.find((entry) => entry.id === panel.id).pendingLeave, true);
+  failRemoval = false;
+  await h.controller.forget(panel.id, account.accountId);
+  assert.equal(requestIds.length, 2);
+  assert.equal(requestIds[0], requestIds[1]);
+  assert.equal(h.controller.list().panels.some((entry) => entry.id === panel.id), false);
+});
+
+test("Forget rejects a stale confirmed account before changing state or sending the departure", async (t) => {
+  let replacement = false;
+  const h = await harness(t, {
+    behavior: async (url) => replacement && ["/api/access/login", "/api/access/session"].includes(url.pathname)
+      ? response({ ...account, accountId: "replacement", sessionToken: token }) : undefined,
+  });
+  const panel = await h.signIn("https://a.example.test");
+  replacement = true;
+  await h.controller.signIn(panel.id, { email: account.email, password: "password" });
+  const before = h.controller.list();
+  const calls = h.calls.length;
+  await assert.rejects(h.controller.forget(panel.id, account.accountId), /account changed/);
+  await assert.rejects(h.controller.forget(panel.id), /account changed/);
+  assert.equal(h.calls.length, calls);
+  assert.deepEqual(h.controller.list(), before);
+  await h.controller.forget(panel.id, "replacement");
+  assert.equal(h.controller.list().panels.some((entry) => entry.id === panel.id), false);
+});
+
+test("unified Forget IPC requires and forwards the confirmed account identity", () => {
+  const handlers = new Map();
+  const calls = [];
+  const uninstall = installUnifiedConnectionIpc({
+    handle: (channel, handler) => handlers.set(channel, handler),
+    removeHandler: (channel) => handlers.delete(channel),
+  }, {
+    isManagedSender: (event) => event.trusted === true,
+    forget: (...args) => calls.push(args),
+  });
+  const forget = handlers.get("mc-panel-unified:forget");
+  for (const accountId of [undefined, null, "", "x".repeat(129), {}])
+    assert.throws(() => forget({ trusted: true }, "panel", accountId), /Confirm the signed-in account/);
+  assert.throws(() => forget({ trusted: false }, "panel", "account"), /Only this computer/);
+  forget({ trusted: true }, "panel", "account");
+  assert.deepEqual(calls, [["panel", "account"]]);
+  uninstall();
+  assert.equal(handlers.size, 0);
 });

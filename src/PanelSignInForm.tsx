@@ -65,8 +65,8 @@ export default function PanelSignInForm({
       aria-label={`${token ? "Accept invitation" : "Sign in"} on ${panel.label}`}
     >
       <p>
-        Signing in to <strong>{panel.origin}</strong>. Other connections stay
-        signed in.
+        {token ? "Accepting an invitation on" : "Signing in to"}{" "}
+        <strong>{panel.origin}</strong>. Other connections stay signed in.
       </p>
       {!token && (
         <>

@@ -9,6 +9,8 @@ const failure = (status, message) =>
   Object.assign(new Error(message), { status });
 const validToken = (token) =>
   typeof token === "string" && /^[A-Za-z0-9_-]{43}$/.test(token);
+const pendingLeaveMessage =
+  "Forget is not complete. Use Retry Forget in Manage Connections to confirm access removal and finish local cleanup; the saved connection and retry proof are retained.";
 const text = (value, maximum = 256) =>
   typeof value === "string" && value.length <= maximum;
 const strings = (value) =>
@@ -90,18 +92,24 @@ export function createUnifiedPanelController({
       window.webContents.send("mc-panel-connections:changed");
     return list();
   };
-  const persist = () => {
+  const persist = (removeId) => {
     const write = saving
       .catch(() => {})
       .then(async () => {
         if (!ready) await initialize();
         const result = await store?.save({
-          panels: [...panels.values()].map((panel) => ({
+          panels: [...panels.values()].filter((panel) => panel.id !== removeId).map((panel) => ({
             ...panel,
             session: panel.account,
           })),
           selectedServer,
         });
+        // Remove in-memory state only after the corresponding disk write succeeds.
+        // Do it inside the write queue so a later snapshot cannot resurrect it.
+        if (removeId) {
+          panels.delete(removeId);
+          return result;
+        }
         for (const panel of panels.values()) {
           if (panel.legacyImport) {
             await clearLegacy(panel.id);
@@ -141,6 +149,7 @@ export function createUnifiedPanelController({
         connectionState: panel.state,
         session: panel.account,
         sessionEpoch: panel.epoch,
+        pendingLeave: Boolean(panel.pendingLeave),
         servers: panel.servers,
         ...(panel.error ? { error: panel.error } : {}),
       })),
@@ -169,6 +178,7 @@ export function createUnifiedPanelController({
     panel.requests.clear();
   }
   function forgetSession(panel) {
+    if (panel.pendingLeave) return;
     if (panel.token || panel.account || panel.servers.length) invalidate(panel);
     panel.token = null;
     panel.account = undefined;
@@ -202,6 +212,7 @@ export function createUnifiedPanelController({
       panel.account = undefined;
       panel.servers = [];
     }
+    if (panel.pendingLeave) panel.error = pendingLeaveMessage;
     panel.network.setPermissionRequestHandler?.(
       (_contents, _permission, callback) => callback(false),
     );
@@ -307,12 +318,12 @@ export function createUnifiedPanelController({
       throw failure(502, "The host returned invalid JSON.");
     }
     if (!response.ok)
-      throw failure(
+      throw Object.assign(failure(
         response.status,
         typeof body.error === "string"
           ? body.error
           : "The remote request failed.",
-      );
+      ), { remoteResponse: true });
     return body;
   }
   async function request(
@@ -393,6 +404,7 @@ export function createUnifiedPanelController({
     }
   }
   async function refresh(panel, explicit = false) {
+    if (panel.pendingLeave) return;
     if (panel.refreshing) {
       if (!explicit || panel.refreshExplicit) return panel.refreshing;
       await panel.refreshing.catch(() => {});
@@ -453,7 +465,7 @@ export function createUnifiedPanelController({
         panel.nextRefresh = Date.now() + 30000;
         if (explicit) throw failure(cause.status ?? 502, panel.error);
       } finally {
-        panel.allowPrompt = false;
+        if (panel.epoch === epoch) panel.allowPrompt = false;
         panel.refreshExplicit = false;
         panel.refreshing = null;
         changed();
@@ -488,7 +500,7 @@ export function createUnifiedPanelController({
   const timer = setInterval(() => {
     if (closed || !ready) return;
     for (const panel of panels.values())
-      if (!panel.authenticating && Date.now() >= panel.nextRefresh)
+      if (!panel.authenticating && !panel.pendingLeave && Date.now() >= panel.nextRefresh)
         void refresh(panel).catch(onError);
   }, pollMs);
   timer.unref?.();
@@ -547,6 +559,7 @@ export function createUnifiedPanelController({
     async signOut(id) {
       await initialize();
       const panel = get(id);
+      if (panel.pendingLeave) throw failure(409, pendingLeaveMessage);
       const version = ++panel.controls;
       const credential = panel.token;
       panel.authenticating = false;
@@ -582,24 +595,79 @@ export function createUnifiedPanelController({
     },
     async retry(id) {
       await initialize();
-      await refresh(get(id), true);
+      const panel = get(id);
+      if (panel.pendingLeave) throw failure(409, pendingLeaveMessage);
+      await refresh(panel, true);
       return changed();
     },
-    async forget(id) {
+    async forget(id, expectedAccountId) {
       await initialize();
       const panel = get(id);
-      panel.removed = true;
-      panel.controls++;
-      panel.authenticating = false;
-      panel.pendingTrust?.abort.abort();
-      forgetSession(panel);
-      panels.delete(id);
-      await persist();
-      await clearLegacy(id);
-      panel.network.setCertificateVerifyProc(null);
-      await panel.network.clearStorageData?.();
-      await panel.network.closeAllConnections?.();
-      return changed();
+      if (!panel.token || !panel.account)
+        throw failure(409, "Sign in to this panel in Manage Connections before forgetting it. Forget must first remove your account's access on the host.");
+      if (!text(expectedAccountId, 128) || !expectedAccountId ||
+          expectedAccountId !== (panel.account.accountId ?? panel.account.userId))
+        throw failure(409, "The signed-in account changed. Review this panel's current account and confirm Forget again.");
+      if (panel.forgetting) return panel.forgetting;
+      if (!panel.pendingLeave) {
+        panel.controls++;
+        panel.authenticating = false;
+        panel.pendingTrust?.abort.abort();
+        invalidate(panel);
+        panel.pendingLeave = { requestId: randomUUID() };
+        panel.servers = displayRoster(panel.servers);
+        if (selectedServer?.panelId === id) selectedServer = null;
+      }
+      panel.state = "unavailable";
+      panel.error = pendingLeaveMessage;
+      changed();
+      panel.forgetting = (async () => {
+        try {
+          // The original bearer and request ID must be durable before the host
+          // revokes access, because a lost response may outlive this process.
+          await persist();
+          panel.allowPrompt = true;
+          const receipt = await json(panel, "/api/access/leave", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ confirmed: true, requestId: panel.pendingLeave.requestId }),
+            tokenOverride: panel.token,
+            timeout: 30000,
+          });
+          if (receipt.left !== true || receipt.requestId !== panel.pendingLeave.requestId)
+            throw failure(502, "The host did not confirm this access removal request.");
+          await clearLegacy(id);
+          await panel.network.clearStorageData?.();
+          await panel.network.closeAllConnections?.();
+          await persist(id);
+          panel.removed = true;
+          panel.network.setCertificateVerifyProc(null);
+          return changed();
+        } catch (cause) {
+          if (cause.remoteResponse && [400, 401, 403, 404, 405, 409].includes(cause.status)) {
+            // A complete host rejection proves this request did not leave.
+            // Receipts are checked before authentication on the host, so an
+            // expired bearer may safely return to the normal sign-in flow.
+            const proof = panel.pendingLeave;
+            panel.pendingLeave = undefined;
+            panel.nextRefresh = Date.now() + pollMs;
+            try { await persist(); } catch {
+              panel.pendingLeave = proof;
+            }
+          }
+          panel.error = cause.status === 404 || cause.status === 405
+            ? "This host must be updated before it can confirm panel access removal. Ask the owner to update MC Panel, then try Forget again. The saved connection is retained."
+            : !panel.pendingLeave
+            ? `The host could not confirm access removal. ${cause.message} Reconnect or sign in in Manage Connections, then try Forget again. The saved connection is retained.`
+            : `${pendingLeaveMessage} ${cause.message || "Check the host connection and try again."}`;
+          changed();
+          throw failure(cause.status ?? 503, panel.error);
+        } finally {
+          panel.allowPrompt = false;
+          panel.forgetting = null;
+        }
+      })();
+      return panel.forgetting;
     },
     async selectServer(panelId, serverId) {
       try {
@@ -642,6 +710,7 @@ export function createUnifiedPanelController({
     },
     async proxy(req, res, id, apiPath) {
       const panel = get(id);
+      if (panel.pendingLeave) throw failure(409, pendingLeaveMessage);
       const epoch = panel.epoch;
       const url = new URL(apiPath, panel.origin);
       const rawPath = apiPath.split("?")[0];
@@ -670,7 +739,7 @@ export function createUnifiedPanelController({
         );
       if (
         /^\/api\/(?:desktop|panel-users)(?:\/|$)/i.test(url.pathname) ||
-        /^\/api\/access\/(?:login|accept|logout)\/?$/i.test(url.pathname)
+        /^\/api\/access\/(?:login|accept|logout|leave)\/?$/i.test(url.pathname)
       )
         throw failure(
           403,
@@ -838,6 +907,7 @@ export function createUnifiedPanelController({
   async function authenticate(id, pathname, credentials) {
     await initialize();
     const panel = get(id);
+    if (panel.pendingLeave) throw failure(409, pendingLeaveMessage);
     if (
       !text(credentials.password, 4096) ||
       (pathname.endsWith("login")

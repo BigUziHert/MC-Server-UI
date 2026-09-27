@@ -335,6 +335,9 @@ export function createRemoteGateway({
     await access.logout(req);
     res.json({ ok: true });
   });
+  app.post("/api/access/leave", async (req, res) => {
+    res.json(await access.leave(req, req.body));
+  });
   app.post("/api/access/download", async (req, res) => {
     res.json(await access.issueDownload(req, req.body?.url));
   });

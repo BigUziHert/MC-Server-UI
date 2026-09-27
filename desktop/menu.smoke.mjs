@@ -55,6 +55,91 @@ try {
   await expect
     .poll(() => page.evaluate(() => Boolean(window.mcPanelConnections)))
     .toBe(true);
+  const accountMenu = page.getByRole("button", {
+    name: "Account menu for Local administrator",
+    exact: true,
+  });
+  await accountMenu.click();
+  await expect(
+    page.getByRole("menuitem", { name: "Accept an invitation", exact: true }),
+  ).toHaveCount(0);
+  await page.getByRole("menuitem", { name: "Add Panel", exact: true }).click();
+  const addPanel = page.getByRole("dialog", { name: "Add Panel", exact: true });
+  await expect(
+    addPanel.getByLabel("Invitation link", { exact: true }),
+  ).toBeVisible();
+  await expect(addPanel.getByRole("button", { name: /sign in/i })).toHaveCount(
+    0,
+  );
+  const screenshotDir = path.join(project, "release", "smoke-results");
+  await fs.mkdir(screenshotDir, { recursive: true });
+  await page.screenshot({
+    path: path.join(screenshotDir, "add-panel-invitation.png"),
+  });
+  await addPanel
+    .getByLabel("Invitation link", { exact: true })
+    .fill("https://uncontacted.example.test");
+  await addPanel
+    .getByRole("button", { name: "Continue with invitation", exact: true })
+    .click();
+  await expect(addPanel.getByRole("alert")).toContainText(
+    "complete invitation link",
+  );
+  assert.equal(
+    await page.evaluate(
+      async () =>
+        (await window.mcPanelConnections.list()).panels.filter(
+          (panel) => !panel.local,
+        ).length,
+    ),
+    0,
+    "An address alone must not contact or save a remote panel.",
+  );
+  await page.keyboard.press("Escape");
+  await expect(accountMenu).toBeFocused();
+  await accountMenu.click();
+  await page
+    .getByRole("menuitem", { name: "Manage Connections", exact: true })
+    .click();
+  const connectionManager = page.getByRole("dialog", {
+    name: "Manage Connections",
+    exact: true,
+  });
+  await expect(connectionManager).toContainText("No saved panel connections.");
+  await connectionManager
+    .getByRole("button", {
+      name: "Sign in to existing panel",
+      exact: true,
+    })
+    .click();
+  await expect(
+    connectionManager.getByLabel("Panel address", { exact: true }),
+  ).toBeVisible();
+  await page.screenshot({
+    path: path.join(screenshotDir, "manage-existing-panel.png"),
+  });
+  await connectionManager
+    .getByLabel("Panel address", { exact: true })
+    .fill("http://uncontacted.example.test");
+  await connectionManager
+    .getByRole("button", {
+      name: "Continue to sign in",
+      exact: true,
+    })
+    .click();
+  await expect(connectionManager.getByRole("alert")).toContainText("HTTPS");
+  assert.equal(
+    await page.evaluate(
+      async () =>
+        (await window.mcPanelConnections.list()).panels.filter(
+          (panel) => !panel.local,
+        ).length,
+    ),
+    0,
+  );
+  await page.keyboard.press("Escape");
+  await expect(connectionManager).toBeVisible();
+  await page.keyboard.press("Escape");
   const inspect = () =>
     application.evaluate(({ BrowserWindow, Menu }) => {
       const window = BrowserWindow.getAllWindows()[0];

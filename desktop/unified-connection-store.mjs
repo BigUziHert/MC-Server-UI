@@ -13,6 +13,8 @@ const validId = (value) =>
   typeof value === "string" && /^[a-f0-9-]{36}$/.test(value);
 const validToken = (value) =>
   typeof value === "string" && /^[A-Za-z0-9_-]{43}$/.test(value);
+const validRequestId = (value) =>
+  typeof value === "string" && /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i.test(value);
 const object = (value) =>
   value !== null && typeof value === "object" && !Array.isArray(value);
 const text = (value, limit) =>
@@ -187,6 +189,8 @@ export function createUnifiedConnectionStore({ dataDir, safeStorage }) {
           }
         }
         const signedIn = validToken(credential?.token) && session;
+        if (credential?.pendingLeave !== undefined &&
+            !validRequestId(credential.pendingLeave?.requestId)) damaged = true;
         if (entry.credential !== undefined && !signedIn) renewSignIn = true;
         if (
           !Array.isArray(entry.servers) ||
@@ -203,6 +207,8 @@ export function createUnifiedConnectionStore({ dataDir, safeStorage }) {
             : {}),
           servers: signedIn ? displayRoster(entry.servers) : [],
           ...(signedIn ? { token: credential.token, session } : {}),
+          ...(signedIn && validRequestId(credential?.pendingLeave?.requestId)
+            ? { pendingLeave: { requestId: credential.pendingLeave.requestId } } : {}),
         });
       }
       const result = boundedSnapshot(panels, saved.selectedServer);
@@ -243,6 +249,8 @@ export function createUnifiedConnectionStore({ dataDir, safeStorage }) {
             validToken(panel.token) &&
             session &&
             safeStorage.isEncryptionAvailable();
+          if (panel.pendingLeave && (!signedIn || !validRequestId(panel.pendingLeave.requestId)))
+            throw new Error("The access removal retry proof could not be encrypted and saved. Restore this computer's secure storage before trying Forget again.");
           return {
             id: panel.id,
             origin,
@@ -251,6 +259,7 @@ export function createUnifiedConnectionStore({ dataDir, safeStorage }) {
               : {}),
             servers: signedIn ? displayRoster(panel.servers) : [],
             ...(signedIn ? { token: panel.token, session } : {}),
+            ...(panel.pendingLeave ? { pendingLeave: { requestId: panel.pendingLeave.requestId } } : {}),
           };
         });
       } catch (cause) {
@@ -268,10 +277,10 @@ export function createUnifiedConnectionStore({ dataDir, safeStorage }) {
           const body = JSON.stringify({
             version: 1,
             selectedServer: snapshot.selectedServer,
-            panels: snapshot.panels.map(({ token, session, ...panel }) => {
+            panels: snapshot.panels.map(({ token, session, pendingLeave, ...panel }) => {
               if (!token) return panel;
               const encrypted = safeStorage.encryptString(
-                JSON.stringify({ token, session }),
+                JSON.stringify({ token, session, ...(pendingLeave ? { pendingLeave } : {}) }),
               );
               if (encrypted.length > maximumCredentialBytes)
                 throw new Error("The encrypted sign-in is too large to save.");

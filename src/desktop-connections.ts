@@ -31,6 +31,9 @@ export type PanelConnections = {
     // A saved sign-in may remain true while offline. Cached roster rows never
     // authorize requests; live session metadata and permissions are rechecked.
     signedIn?: boolean;
+    // A durable self-removal request must be confirmed before credentials or
+    // certificate trust can be removed. Only Forget retries are allowed.
+    pendingLeave?: boolean;
     session?: PanelSession | null;
     sessionEpoch?: string;
     error?: string;
@@ -77,7 +80,10 @@ declare global {
       ) => Promise<PanelConnections>;
       signOut?: (panelId: string) => Promise<PanelConnections>;
       retry?: (panelId: string) => Promise<PanelConnections>;
-      forget?: (panelId: string) => Promise<PanelConnections>;
+      forget?: (
+        panelId: string,
+        expectedAccountId?: string,
+      ) => Promise<PanelConnections>;
       selectServer?: (
         panelId: string,
         serverId: string | null,

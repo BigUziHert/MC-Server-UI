@@ -257,3 +257,24 @@ test("unchanged roster polls do not rewrite or re-encrypt the whole connection s
   await h.store.save(saved);
   assert.equal(encryptions, 1);
 });
+
+test("pending departure proof restores only from encrypted credentials and requires durable encryption", async (t) => {
+  const h = await fixture(t);
+  const requestId = randomUUID();
+  const savedPanel = panel({ pendingLeave: { requestId } });
+  await h.store.save({ panels: [savedPanel], selectedServer: null });
+  const bytes = await fs.readFile(h.file, "utf8");
+  assert.ok(!bytes.includes(requestId));
+  assert.ok(!bytes.includes(token));
+  assert.equal(JSON.parse(bytes).panels[0].pendingLeave, undefined);
+  const restored = await h.store.read();
+  assert.deepEqual(restored.panels[0].pendingLeave, { requestId });
+  assert.equal(restored.panels[0].token, token);
+  const unavailable = createUnifiedConnectionStore({
+    dataDir: h.root,
+    safeStorage: { ...safeStorage, isEncryptionAvailable: () => false },
+  });
+  await assert.rejects(unavailable.save({ panels: [savedPanel], selectedServer: null }), /retry proof could not be encrypted/);
+  assert.equal(await fs.readFile(h.file, "utf8"), bytes);
+  await unavailable.close();
+});

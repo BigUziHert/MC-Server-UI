@@ -13,6 +13,8 @@ import permissionCatalog from "../shared/subuser-permissions.json" with { type: 
 export const SUBUSER_COOKIE = "__Host-mc-subuser";
 const invitationLifetime = 24 * 60 * 60 * 1000;
 const sessionLifetime = 7 * 24 * 60 * 60 * 1000;
+const leaveReceiptLifetime = 7 * 24 * 60 * 60 * 1000;
+const maximumLeaveReceipts = 4096;
 const maxEmailMemberships = 32;
 const invalidLink =
   "This invitation link is invalid or expired. Ask the server owner for a new link.";
@@ -165,6 +167,7 @@ export async function createAccessService({
     creationRevocations: [],
     accounts: [],
     retiredLegacyEmails: [],
+    leaveReceipts: [],
   };
   let migrationNeeded = false;
   try {
@@ -199,7 +202,21 @@ export async function createAccessService({
       retiredLegacyEmails: Array.isArray(saved.retiredLegacyEmails)
         ? saved.retiredLegacyEmails
         : [],
+      leaveReceipts: saved.leaveReceipts ?? [],
     };
+    if (
+      !Array.isArray(state.leaveReceipts) ||
+      state.leaveReceipts.length > maximumLeaveReceipts ||
+      state.leaveReceipts.some(
+        (receipt) =>
+          !receipt ||
+          !/^[a-f0-9]{64}$/.test(receipt.requestHash) ||
+          !/^[a-f0-9]{64}$/.test(receipt.proofHash) ||
+          !Number.isSafeInteger(receipt.expiresAt) ||
+          receipt.expiresAt < 0,
+      )
+    )
+      throw new Error("Invalid panel leave receipt storage.");
     const accountIds = new Set(),
       accountEmails = new Set();
     for (const account of state.accounts) {
@@ -367,6 +384,9 @@ export async function createAccessService({
       (token) => token.expiresAt > now() && token.sent !== false,
     ),
     sessions: state.sessions.filter((session) => session.expiresAt > now()),
+    leaveReceipts: state.leaveReceipts.filter(
+      (receipt) => receipt.expiresAt > now(),
+    ),
   });
   const status = () => ({
     ...state.configuration,
@@ -805,6 +825,64 @@ export async function createAccessService({
     );
   };
 
+  const withoutIdentity = (next, email, id) => {
+    const accountIds = new Set(
+      next.accounts
+        .filter((account) => account.email === email || account.id === id)
+        .map((account) => account.id),
+    );
+    const scopes = [
+      ...next.memberships.filter((member) => member.email === email),
+      ...next.sessions
+        .filter((session) => session.email === email)
+        .flatMap(sessionScopes),
+      ...listLegacyUsers()
+        .filter(({ user }) => normalizedEmail(user?.email) === email)
+        .map(({ serverId, user }) => ({ serverId, userId: user.id })),
+      ...next.accounts
+        .filter((account) => accountIds.has(account.id))
+        .flatMap((account) =>
+          [
+            ...(account.legacyMembers ?? []),
+            ...new Set([
+              ...account.serverIds,
+              ...(account.creatorServerIds ?? []),
+              ...Object.keys(account.serverOverrides),
+            ]),
+          ].map((scope) =>
+            typeof scope === "string"
+              ? { serverId: scope, userId: account.id }
+              : scope,
+          ),
+        ),
+    ];
+    return {
+      ...next,
+      accounts: next.accounts.filter((account) => !accountIds.has(account.id)),
+      retiredLegacyEmails: [...new Set([...next.retiredLegacyEmails, email])],
+      memberships: next.memberships.filter((member) => member.email !== email),
+      tokens: next.tokens.filter(
+        (token) => token.email !== email && !accountIds.has(token.accountId),
+      ),
+      sessions: next.sessions.filter(
+        (session) =>
+          session.email !== email && !accountIds.has(session.accountId),
+      ),
+      creationRevocations: [
+        ...new Set([
+          ...next.creationRevocations,
+          ...scopes
+            .filter(
+              (scope) =>
+                typeof scope.serverId === "string" &&
+                typeof scope.userId === "string",
+            )
+            .map(scopeKey),
+        ]),
+      ],
+    };
+  };
+
   return {
     status,
     hostAuthority,
@@ -1017,24 +1095,7 @@ export async function createAccessService({
       serialize(async () => {
         const current = findAccount(id);
         if (!current) throw fail(404, "Panel account not found.");
-        const next = cleaned();
-        await persist({
-          ...next,
-          accounts: next.accounts.filter((account) => account.id !== id),
-          retiredLegacyEmails: [
-            ...new Set([...next.retiredLegacyEmails, current.email]),
-          ],
-          memberships: next.memberships.filter(
-            (member) => member.email !== current.email,
-          ),
-          tokens: next.tokens.filter(
-            (token) => token.email !== current.email && token.accountId !== id,
-          ),
-          sessions: next.sessions.filter(
-            (session) =>
-              session.email !== current.email && session.accountId !== id,
-          ),
-        });
+        await persist(withoutIdentity(cleaned(), current.email, id));
       }),
     inviteAccount: (id) =>
       serialize(async () => {
@@ -1560,6 +1621,118 @@ export async function createAccessService({
       }),
     async authenticate(req) {
       return closing ? null : authenticatedSession(req);
+    },
+    leave: (req, input) => {
+      if (
+        !input ||
+        typeof input !== "object" ||
+        Array.isArray(input) ||
+        input.confirmed !== true ||
+        typeof input.requestId !== "string" ||
+        !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(
+          input.requestId,
+        ) ||
+        Object.keys(input).some(
+          (key) => !["confirmed", "requestId"].includes(key),
+        )
+      )
+        return Promise.reject(
+          fail(
+            400,
+            "Confirm leaving this panel and provide a valid request identifier.",
+          ),
+        );
+      const token =
+        typeof req?.headers?.authorization === "string"
+          ? cookieSecret(req)
+          : null;
+      if (!token)
+        return Promise.reject(fail(401, "Sign in before leaving this panel."));
+      const requestId = input.requestId.toLowerCase();
+      const requestHash = digest(`panel-leave-request:${requestId}`);
+      const proofHash = digest(`panel-leave-proof:${token}:${requestId}`);
+      return serialize(async () => {
+        const next = cleaned();
+        const receipt = next.leaveReceipts.find(
+          (item) => item.requestHash === requestHash,
+        );
+        if (receipt) {
+          if (receipt.proofHash !== proofHash)
+            throw fail(403, "This leave request belongs to another sign-in.");
+          return { left: true, requestId };
+        }
+        // Recheck inside the same queue as account grants, resets and removals.
+        // A stale view or a caller-supplied identity can never select the victim.
+        const session = await authenticatedSession(req);
+        if (!session) throw fail(401, "Sign in before leaving this panel.");
+        if (!session.accountId) {
+          // Legacy credentials prove individual memberships, never ownership of
+          // an email address. Retiring the email is safe only when this session
+          // proves every legacy identity that the operation would revoke.
+          const proven = new Set(sessionScopes(session).map(scopeKey));
+          const provenServers = new Set(
+            sessionScopes(session).map((scope) => scope.serverId),
+          );
+          const linkedAccounts = next.accounts.filter(
+            (account) => account.email === session.email,
+          );
+          const legacyScopes = [
+            ...next.memberships.filter(
+              (member) => member.email === session.email,
+            ),
+            ...next.tokens.filter(
+              (invitation) =>
+                invitation.email === session.email && !invitation.accountId,
+            ),
+            ...next.sessions
+              .filter(
+                (other) => other.email === session.email && !other.accountId,
+              )
+              .flatMap(sessionScopes),
+            ...listLegacyUsers()
+              .filter(
+                ({ user }) => normalizedEmail(user?.email) === session.email,
+              )
+              .map(({ serverId, user }) => ({ serverId, userId: user.id })),
+            ...linkedAccounts.flatMap((account) => account.legacyMembers ?? []),
+          ];
+          if (
+            legacyScopes.some((scope) => !proven.has(scopeKey(scope))) ||
+            linkedAccounts.some(
+              (account) =>
+                account.legacyPending !== true ||
+                account.acceptedAt ||
+                account.password ||
+                [
+                  ...account.serverIds,
+                  ...(account.creatorServerIds ?? []),
+                  ...Object.keys(account.serverOverrides),
+                ].some((serverId) => !provenServers.has(serverId)),
+            )
+          )
+            throw fail(
+              409,
+              "This email has separate legacy identities. Ask the panel owner to consolidate the account before leaving this panel.",
+            );
+        }
+        if (next.leaveReceipts.length >= maximumLeaveReceipts)
+          throw fail(
+            503,
+            "The panel cannot retain another leave receipt yet. Try again later.",
+          );
+        await persist({
+          ...withoutIdentity(next, session.email, session.accountId),
+          leaveReceipts: [
+            ...next.leaveReceipts,
+            {
+              requestHash,
+              proofHash,
+              expiresAt: now() + leaveReceiptLifetime,
+            },
+          ],
+        });
+        return { left: true, requestId };
+      });
     },
     logout: (req) => {
       if (closing)

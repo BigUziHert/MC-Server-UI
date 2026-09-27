@@ -88,6 +88,9 @@ export function installUnifiedConnectionIpc(ipcMain, controller) {
         (typeof second !== "string" || second.length > 128)
       )
         throw new Error("Provide a valid server selection.");
+      if (action === "forget" &&
+          (typeof second !== "string" || !second || second.length > 128))
+        throw new Error("Confirm the signed-in account before forgetting this panel.");
       return controller[action](first, second);
     });
   }

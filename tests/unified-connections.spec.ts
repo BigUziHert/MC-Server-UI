@@ -1,8 +1,8 @@
 import { expect, test, type Page } from "@playwright/test";
 
-async function workspace(page: Page, offline = false) {
+async function workspace(page: Page, offline = false, noSavedPanels = false) {
   await page.addInitScript(
-    ({ offline }) => {
+    ({ offline, noSavedPanels }) => {
       const session = (id: string, email = `${id}@example.test`) => ({
         role: "subuser",
         accountId: id,
@@ -70,6 +70,8 @@ async function workspace(page: Page, offline = false) {
           },
         ],
       };
+      if (noSavedPanels)
+        state.panels = state.panels.filter((panel: any) => panel.local);
       const calls: any[] = [];
       const changed = () =>
         window.dispatchEvent(new Event("mc-panel-connections-changed"));
@@ -79,7 +81,10 @@ async function workspace(page: Page, offline = false) {
         if (!panel || panel.local) throw new Error("Choose a remote panel.");
         return panel;
       };
-      Object.assign(window, { unifiedFixture: { state, calls, changed } });
+      const controls = { failForget: offline };
+      Object.assign(window, {
+        unifiedFixture: { state, calls, changed, controls },
+      });
       window.mcPanelConnections = {
         unified: true,
         list: async () => snapshot(),
@@ -124,6 +129,10 @@ async function workspace(page: Page, offline = false) {
             id,
             tokenLength: input.token.length,
           });
+          if (input.token.startsWith("e"))
+            throw new Error(
+              "This invitation has expired. Ask the panel owner for a new invitation.",
+            );
           const panel = find(id);
           panel.signedIn = true;
           panel.session = { ...session(id), serverId: null, permissions: [] };
@@ -146,8 +155,26 @@ async function workspace(page: Page, offline = false) {
           calls.push({ action: "retry", id });
           throw new Error("The panel is offline. Try again later.");
         },
-        forget: async (id: string) => {
-          calls.push({ action: "forget", id });
+        forget: async (id: string, expectedAccountId: string) => {
+          calls.push({ action: "forget", id, expectedAccountId });
+          const panel = find(id);
+          if (
+            expectedAccountId !==
+            (panel.session?.accountId ?? panel.session?.userId)
+          )
+            throw new Error(
+              "The signed-in account changed. Confirm Forget again.",
+            );
+          if (!panel.signedIn && !panel.pendingLeave)
+            throw new Error("Sign in before forgetting this panel.");
+          panel.pendingLeave = true;
+          panel.connectionState = "unavailable";
+          if (state.selectedServer?.panelId === id) state.selectedServer = null;
+          changed();
+          if (controls.failForget)
+            throw new Error(
+              "The panel is offline. Account removal is unconfirmed. Retry Forget when it is reachable.",
+            );
           state.panels = state.panels.filter((panel: any) => panel.id !== id);
           changed();
           return snapshot();
@@ -161,7 +188,7 @@ async function workspace(page: Page, offline = false) {
         openUpdates: async () => {},
       } as unknown as NonNullable<Window["mcPanelConnections"]>;
     },
-    { offline },
+    { offline, noSavedPanels },
   );
   await page.route("**/api/access/session", (route) =>
     route.fulfill({ json: { role: "owner" } }),
@@ -245,6 +272,171 @@ async function manage(page: Page) {
   return page.getByRole("dialog", { name: "Manage Connections", exact: true });
 }
 
+test("a new computer can sign in to an existing panel entirely from Manage Connections", async ({
+  page,
+}) => {
+  await workspace(page, false, true);
+  const originalUrl = page.url();
+  const dialog = await manage(page);
+  await expect(dialog).toContainText("No saved panel connections");
+  await dialog
+    .getByRole("button", { name: "Sign in to existing panel", exact: true })
+    .click();
+  await dialog
+    .getByLabel("Panel address", { exact: true })
+    .fill("https://existing.example.test:3002");
+  await dialog
+    .getByRole("button", { name: "Continue to sign in", exact: true })
+    .click();
+  let form = dialog.getByRole("form", {
+    name: "Sign in on existing.example.test:3002",
+    exact: true,
+  });
+  await expect(form).toContainText("https://existing.example.test:3002");
+  await expect(form.getByLabel("Panel address", { exact: true })).toHaveCount(
+    0,
+  );
+  await form
+    .getByLabel("Email address", { exact: true })
+    .fill("existing@example.test");
+  await form
+    .getByLabel("Password", { exact: true })
+    .fill("Cancelled password!");
+  await dialog
+    .getByRole("button", { name: "Cancel sign-in", exact: true })
+    .click();
+  await expect(form).toHaveCount(0);
+  expect(
+    await page.evaluate(() => (window as any).unifiedFixture.calls),
+  ).toEqual([{ action: "open", origin: "https://existing.example.test:3002" }]);
+  await dialog
+    .getByRole("button", {
+      name: "Sign in to existing.example.test:3002",
+      exact: true,
+    })
+    .click();
+  form = dialog.getByRole("form", {
+    name: "Sign in on existing.example.test:3002",
+    exact: true,
+  });
+  await expect(form.getByLabel("Password", { exact: true })).toHaveValue("");
+  await form
+    .getByLabel("Email address", { exact: true })
+    .fill("existing@example.test");
+  await form.getByLabel("Password", { exact: true }).fill("Existing password!");
+  await form.getByRole("button", { name: "Sign in", exact: true }).click();
+  await expect(
+    dialog.getByRole("button", {
+      name: "Sign out of existing.example.test:3002",
+      exact: true,
+    }),
+  ).toBeVisible();
+  expect(page.url()).toBe(originalUrl);
+  expect(
+    await page.evaluate(() => (window as any).unifiedFixture.calls),
+  ).toEqual([
+    { action: "open", origin: "https://existing.example.test:3002" },
+    { action: "signIn", id: "new-panel", email: "existing@example.test" },
+  ]);
+});
+
+test("existing-panel address validation and cancellation do not start authentication", async ({
+  page,
+}) => {
+  await workspace(page, false, true);
+  const dialog = await manage(page);
+  await dialog
+    .getByRole("button", { name: "Sign in to existing panel", exact: true })
+    .click();
+  for (const address of [
+    "http://existing.example.test",
+    "https://existing.example.test/path",
+    "https://user:password@existing.example.test",
+  ]) {
+    await dialog.getByLabel("Panel address", { exact: true }).fill(address);
+    await dialog
+      .getByRole("button", { name: "Continue to sign in", exact: true })
+      .click();
+    await expect(dialog.getByRole("alert")).toBeVisible();
+  }
+  await dialog
+    .getByLabel("Panel address", { exact: true })
+    .fill(`https://existing.example.test/#invite=${"a".repeat(43)}`);
+  await dialog
+    .getByRole("button", { name: "Continue to sign in", exact: true })
+    .click();
+  await expect(dialog.getByRole("alert")).toContainText("Use Add Panel");
+  await expect(
+    dialog.getByRole("group", { name: "Connection method" }),
+  ).toHaveCount(0);
+  await page.keyboard.press("Escape");
+  await expect(dialog).toBeVisible();
+  await expect(dialog.getByLabel("Panel address", { exact: true })).toHaveCount(
+    0,
+  );
+  await expect(dialog).toContainText("No saved panel connections");
+  expect(
+    await page.evaluate(() => (window as any).unifiedFixture.calls),
+  ).toEqual([]);
+});
+
+test("an already signed-in address preserves its account and an unavailable address keeps Retry", async ({
+  page,
+}) => {
+  await workspace(page);
+  const dialog = await manage(page);
+  await dialog
+    .getByRole("button", { name: "Sign in to existing panel", exact: true })
+    .click();
+  await dialog
+    .getByLabel("Panel address", { exact: true })
+    .fill("https://a.example.test:3002/");
+  await dialog
+    .getByRole("button", { name: "Continue to sign in", exact: true })
+    .click();
+  await expect(dialog.getByRole("status")).toContainText(
+    "already signed in to https://a.example.test:3002",
+  );
+  await expect(
+    dialog.getByRole("form", {
+      name: "Sign in on a.example.test:3002",
+      exact: true,
+    }),
+  ).toHaveCount(0);
+  await page.evaluate(() => {
+    const fixture = (window as any).unifiedFixture;
+    const panel = fixture.state.panels.find(
+      (item: any) => item.id === "computer-c",
+    );
+    panel.connectionState = "unavailable";
+    fixture.changed();
+  });
+  await dialog
+    .getByRole("button", { name: "Sign in to existing panel", exact: true })
+    .click();
+  await dialog
+    .getByLabel("Panel address", { exact: true })
+    .fill("https://c.example.test:3002");
+  await dialog
+    .getByRole("button", { name: "Continue to sign in", exact: true })
+    .click();
+  await expect(dialog.getByRole("alert")).toContainText(
+    "Its address is saved; use Retry",
+  );
+  await expect(
+    dialog.getByRole("button", {
+      name: "Retry c.example.test:3002",
+      exact: true,
+    }),
+  ).toBeVisible();
+  expect(
+    await page.evaluate(() => (window as any).unifiedFixture.calls),
+  ).toEqual([
+    { action: "open", origin: "https://a.example.test:3002" },
+    { action: "open", origin: "https://c.example.test:3002" },
+  ]);
+});
+
 test("unified connection manager signs in and out independently without replacing the workspace", async ({
   page,
 }) => {
@@ -252,6 +444,13 @@ test("unified connection manager signs in and out independently without replacin
   const originalUrl = page.url();
   const dialog = await manage(page);
   await expect(dialog.getByRole("button", { name: /^Open / })).toHaveCount(0);
+  await expect(
+    dialog.getByRole("button", {
+      name: "Forget c.example.test:3002",
+      exact: true,
+    }),
+  ).toBeDisabled();
+  await expect(dialog).toContainText("Sign in before forgetting this panel");
   await dialog
     .getByRole("button", {
       name: "Sign in to c.example.test:3002",
@@ -283,6 +482,12 @@ test("unified connection manager signs in and out independently without replacin
       exact: true,
     }),
   ).toBeVisible();
+  await expect(
+    dialog.getByRole("button", {
+      name: "Forget c.example.test:3002",
+      exact: true,
+    }),
+  ).toBeEnabled();
   await dialog
     .getByRole("button", {
       name: "Sign out of a.example.test:3002",
@@ -320,7 +525,7 @@ test("unified connection manager signs in and out independently without replacin
   ]);
 });
 
-test("unified offline retry and forget preserve other panels and the current document", async ({
+test("unified Forget confirms whole-panel removal and retains an offline request for retry", async ({
   page,
 }) => {
   await workspace(page, true);
@@ -340,6 +545,14 @@ test("unified offline retry and forget preserve other panels and the current doc
       exact: true,
     }),
   ).toBeVisible();
+  await expect(dialog).toContainText(
+    "access to every shared server and all computer permissions",
+  );
+  await expect(dialog).toContainText("signed out on all devices");
+  await expect(dialog).toContainText("new invitation to connect again");
+  await expect(dialog).toContainText(
+    "Minecraft servers keep running and their files stay on the host",
+  );
   await page.keyboard.press("Escape");
   await expect(
     dialog.getByRole("button", {
@@ -352,6 +565,59 @@ test("unified offline retry and forget preserve other panels and the current doc
     .click();
   await dialog
     .getByRole("button", { name: "Forget connection", exact: true })
+    .click();
+  await expect(dialog.getByRole("alert")).toContainText(
+    "Account removal is unconfirmed",
+  );
+  await expect(
+    dialog.getByRole("button", { name: "Retry Forget", exact: true }),
+  ).toBeEnabled();
+  await expect(dialog).toContainText("Closing this dialog does not cancel it");
+  await dialog
+    .getByRole("button", { name: "Back to connections", exact: true })
+    .click();
+  await expect(
+    dialog.getByRole("button", {
+      name: "Retry Forget a.example.test:3002",
+      exact: true,
+    }),
+  ).toBeVisible();
+  await expect(
+    dialog.getByRole("button", {
+      name: "Sign in to a.example.test:3002",
+      exact: true,
+    }),
+  ).toHaveCount(0);
+  await expect(
+    dialog.getByRole("button", {
+      name: "Sign out of a.example.test:3002",
+      exact: true,
+    }),
+  ).toHaveCount(0);
+  await expect(
+    dialog.getByRole("button", {
+      name: "Retry a.example.test:3002",
+      exact: true,
+    }),
+  ).toHaveCount(0);
+  expect(
+    await page.evaluate(() =>
+      (window as any).unifiedFixture.state.panels.some(
+        (panel: any) => panel.id === "computer-a",
+      ),
+    ),
+  ).toBe(true);
+  await page.evaluate(() => {
+    (window as any).unifiedFixture.controls.failForget = false;
+  });
+  await dialog
+    .getByRole("button", {
+      name: "Retry Forget a.example.test:3002",
+      exact: true,
+    })
+    .click();
+  await dialog
+    .getByRole("button", { name: "Retry Forget", exact: true })
     .click();
   await expect(
     dialog.getByRole("button", {
@@ -370,8 +636,52 @@ test("unified offline retry and forget preserve other panels and the current doc
     await page.evaluate(() => (window as any).unifiedFixture.calls),
   ).toEqual([
     { action: "retry", id: "computer-a" },
-    { action: "forget", id: "computer-a" },
+    { action: "forget", id: "computer-a", expectedAccountId: "computer-a" },
+    { action: "forget", id: "computer-a", expectedAccountId: "computer-a" },
   ]);
+});
+
+test("Forget confirmation cannot retarget a changed panel account", async ({
+  page,
+}) => {
+  await workspace(page);
+  const dialog = await manage(page);
+  await dialog
+    .getByRole("button", { name: "Forget a.example.test:3002", exact: true })
+    .click();
+  await expect(dialog).toContainText("computer-a@example.test");
+  await page.evaluate(() => {
+    const fixture = (window as any).unifiedFixture;
+    const panel = fixture.state.panels.find(
+      (item: any) => item.id === "computer-a",
+    );
+    panel.session = {
+      ...panel.session,
+      accountId: "replacement-account",
+      userId: "replacement-account",
+      email: "replacement@example.test",
+    };
+    panel.sessionEpoch = "replacement-epoch";
+    fixture.changed();
+  });
+  await expect(dialog.getByRole("alert")).toContainText(
+    "signed-in account has changed",
+  );
+  await expect(
+    dialog.getByRole("button", { name: "Forget connection", exact: true }),
+  ).toBeDisabled();
+  await expect(dialog).toContainText("computer-a@example.test");
+  expect(
+    await page.evaluate(() => (window as any).unifiedFixture.calls),
+  ).toEqual([]);
+  await dialog.getByRole("button", { name: "Cancel", exact: true }).click();
+  await dialog
+    .getByRole("button", { name: "Forget a.example.test:3002", exact: true })
+    .click();
+  await expect(dialog).toContainText("replacement@example.test");
+  await expect(
+    dialog.getByRole("button", { name: "Forget connection", exact: true }),
+  ).toBeEnabled();
 });
 
 test("the connection manager stays open when signing out the selected remote account", async ({
@@ -428,7 +738,7 @@ test("the connection manager stays open when signing out the selected remote acc
   ).toHaveAttribute("aria-pressed", "true");
 });
 
-test("unified invitation setup captures the destination and accepts within the workspace", async ({
+test("Add Panel accepts invitations only and captures the destination within the workspace", async ({
   page,
 }) => {
   await workspace(page);
@@ -440,15 +750,34 @@ test("unified invitation setup captures the destination and accepts within the w
     })
     .click();
   await expect(page.getByRole("menuitem", { name: /^Switch / })).toHaveCount(0);
-  await page
-    .getByRole("menuitem", { name: "Accept an invitation", exact: true })
-    .click();
+  await expect(
+    page.getByRole("menuitem", { name: "Accept an invitation", exact: true }),
+  ).toHaveCount(0);
+  await page.getByRole("menuitem", { name: "Add Panel", exact: true }).click();
   const dialog = page.getByRole("dialog", {
-    name: "Accept an invitation",
+    name: "Add Panel",
     exact: true,
   });
+  await expect(
+    dialog.getByRole("group", { name: "Connection method" }),
+  ).toHaveCount(0);
+  await expect(
+    dialog.getByRole("button", { name: "Sign in", exact: true }),
+  ).toHaveCount(0);
   await dialog
-    .getByLabel("Panel address or invitation link")
+    .getByLabel("Invitation link", { exact: true })
+    .fill("https://new.example.test:3003");
+  await dialog
+    .getByRole("button", { name: "Continue with invitation", exact: true })
+    .click();
+  await expect(dialog.getByRole("alert")).toContainText(
+    "complete invitation link",
+  );
+  expect(
+    await page.evaluate(() => (window as any).unifiedFixture.calls),
+  ).toEqual([]);
+  await dialog
+    .getByLabel("Invitation link", { exact: true })
     .fill(`https://new.example.test:3003/#invite=${"a".repeat(43)}`);
   await dialog
     .getByRole("button", { name: "Continue with invitation", exact: true })
@@ -457,6 +786,15 @@ test("unified invitation setup captures the destination and accepts within the w
     name: "Accept invitation on new.example.test:3003",
   });
   await expect(form).toContainText("https://new.example.test:3003");
+  await expect(form.getByLabel("Email address", { exact: true })).toHaveCount(
+    0,
+  );
+  await expect(
+    dialog.getByRole("button", {
+      name: "Sign in with an existing account",
+      exact: true,
+    }),
+  ).toHaveCount(0);
   await form
     .getByLabel("New password", { exact: true })
     .fill("Fixture invite password!");
@@ -484,4 +822,54 @@ test("unified invitation setup captures the destination and accepts within the w
   expect(
     await page.evaluate(() => localStorage.getItem("mc-panel.session.v1")),
   ).toBeNull();
+});
+
+test("an expired invitation stays in Add Panel without an existing-account sign-in escape", async ({
+  page,
+}) => {
+  await workspace(page);
+  await page
+    .getByRole("button", {
+      name: "Account menu for Local administrator",
+      exact: true,
+    })
+    .click();
+  await page.getByRole("menuitem", { name: "Add Panel", exact: true }).click();
+  const dialog = page.getByRole("dialog", { name: "Add Panel", exact: true });
+  await dialog
+    .getByLabel("Invitation link", { exact: true })
+    .fill(`https://c.example.test:3002/#invite=${"e".repeat(43)}`);
+  await dialog
+    .getByRole("button", { name: "Continue with invitation", exact: true })
+    .click();
+  const form = dialog.getByRole("form", {
+    name: "Accept invitation on c.example.test:3002",
+  });
+  await form.getByLabel("New password", { exact: true }).fill("New password!");
+  await form
+    .getByLabel("Confirm password", { exact: true })
+    .fill("New password!");
+  await form
+    .getByRole("button", { name: "Set password and continue", exact: true })
+    .click();
+  await expect(form.getByRole("alert")).toContainText("invitation has expired");
+  await expect(dialog.getByLabel("Email address", { exact: true })).toHaveCount(
+    0,
+  );
+  await expect(dialog.getByRole("button", { name: /sign in/i })).toHaveCount(0);
+  await dialog
+    .getByRole("button", { name: "Back to invitation link", exact: true })
+    .click();
+  await expect(
+    dialog.getByLabel("Invitation link", { exact: true }),
+  ).toBeVisible();
+  await expect(
+    dialog.getByRole("group", { name: "Connection method" }),
+  ).toHaveCount(0);
+  expect(
+    await page.evaluate(() => (window as any).unifiedFixture.calls),
+  ).toEqual([
+    { action: "open", origin: "https://c.example.test:3002" },
+    { action: "acceptInvitation", id: "computer-c", tokenLength: 43 },
+  ]);
 });

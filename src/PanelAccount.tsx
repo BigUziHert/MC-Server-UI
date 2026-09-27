@@ -134,10 +134,10 @@ export default function PanelAccount({
     });
   actions.push({
     id: "signin",
-    label: unified ? "Add a panel" : "Sign in to another panel",
+    label: unified ? "Add Panel" : "Sign in to another panel",
     icon: <LogIn size={16} />,
     disabled: busy,
-    onSelect: () => onConnect("signin"),
+    onSelect: () => onConnect(unified ? "invitation" : "signin"),
   });
   if (window.mcPanelConnections)
     actions.push({
@@ -147,13 +147,6 @@ export default function PanelAccount({
       disabled: busy,
       onSelect: () =>
         unified && workspace ? workspace.manageConnections() : setManage(true),
-    });
-  if (unified)
-    actions.push({
-      id: "invitation",
-      label: "Accept an invitation",
-      icon: <LogIn size={16} />,
-      onSelect: () => onConnect("invitation"),
     });
   if (!unified && session)
     actions.push({

@@ -28,11 +28,14 @@ export default function ConnectPanel({
   onOpened: () => void;
 }) {
   const inDesktop = desktop || Boolean(window.mcPanelConnections);
+  const unified = window.mcPanelConnections?.unified === true;
   const dialog = useRef<HTMLDialogElement>(null);
   const addressInput = useRef<HTMLInputElement>(null);
   const active = useRef(true);
   const pending = useRef(false);
-  const [mode, setMode] = useState(initialMode);
+  const [mode, setMode] = useState<ConnectionMode>(
+    unified ? "invitation" : initialMode,
+  );
   const [address, setAddress] = useState("");
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
@@ -65,7 +68,7 @@ export default function ConnectPanel({
     let url: string;
     try {
       url = normalizePanelConnectionUrl(address);
-      if (mode === "invitation" && !new URL(url).hash)
+      if ((unified || mode === "invitation") && !new URL(url).hash)
         throw new Error(
           "Paste the complete invitation link from the panel owner.",
         );
@@ -88,6 +91,10 @@ export default function ConnectPanel({
             if (!panel)
               throw new Error(
                 "The saved connection is unavailable. Open Manage Connections and retry.",
+              );
+            if (panel.pendingLeave)
+              throw new Error(
+                "Finish Retry Forget in Manage Connections before adding this panel again.",
               );
             const token =
               new URL(url).hash.slice("#invite=".length) || undefined;
@@ -144,20 +151,24 @@ export default function ConnectPanel({
       </span>
       <p className="connect-panel-eyebrow">REMOTE PANEL</p>
       <h2 id="connect-panel-title">
-        {target
-          ? target.token
-            ? "Accept an invitation"
-            : `Sign in to ${target.panel.label}`
-          : mode === "invitation"
-            ? "Accept an invitation"
-            : "Connect to a panel"}
+        {unified
+          ? "Add Panel"
+          : target
+            ? target.token
+              ? "Accept an invitation"
+              : `Sign in to ${target.panel.label}`
+            : mode === "invitation"
+              ? "Accept an invitation"
+              : "Connect to a panel"}
       </h2>
       <p id="connect-panel-description">
         {target
-          ? "Your account belongs to this panel. This workspace and your other connections stay open."
-          : mode === "invitation"
-            ? "Use the owner's invitation to create your account and choose a password on their panel."
-            : "Enter a panel address, then sign in with the account its owner invited."}
+          ? "Accept this invitation and choose a password for your account on this panel. Your other connections stay open."
+          : unified
+            ? "Paste the complete invitation link from the panel owner to add their panel."
+            : mode === "invitation"
+              ? "Use the owner's invitation to create your account and choose a password on their panel."
+              : "Enter a panel address, then sign in with the account its owner invited."}
       </p>
       {target ? (
         <>
@@ -181,9 +192,9 @@ export default function ConnectPanel({
                 setError("");
               }}
             >
-              Back to panel address
+              {unified ? "Back to invitation link" : "Back to panel address"}
             </button>
-            {target.token && (
+            {target.token && !unified && (
               <button
                 className="btn"
                 type="button"
@@ -197,37 +208,39 @@ export default function ConnectPanel({
         </>
       ) : (
         <>
-          <div
-            className="connect-panel-modes"
-            role="group"
-            aria-label="Connection method"
-          >
-            <button
-              type="button"
-              aria-pressed={mode === "signin"}
-              disabled={busy}
-              onClick={() => {
-                setMode("signin");
-                setError("");
-              }}
+          {!unified && (
+            <div
+              className="connect-panel-modes"
+              role="group"
+              aria-label="Connection method"
             >
-              <Globe2 size={15} /> Sign in
-            </button>
-            <button
-              type="button"
-              aria-pressed={mode === "invitation"}
-              disabled={busy}
-              onClick={() => {
-                setMode("invitation");
-                setError("");
-              }}
-            >
-              <KeyRound size={15} /> Use invitation
-            </button>
-          </div>
+              <button
+                type="button"
+                aria-pressed={mode === "signin"}
+                disabled={busy}
+                onClick={() => {
+                  setMode("signin");
+                  setError("");
+                }}
+              >
+                <Globe2 size={15} /> Sign in
+              </button>
+              <button
+                type="button"
+                aria-pressed={mode === "invitation"}
+                disabled={busy}
+                onClick={() => {
+                  setMode("invitation");
+                  setError("");
+                }}
+              >
+                <KeyRound size={15} /> Use invitation
+              </button>
+            </div>
+          )}
           <form onSubmit={connect}>
             <label htmlFor="connect-panel-address">
-              Panel address or invitation link
+              {unified ? "Invitation link" : "Panel address or invitation link"}
             </label>
             <input
               ref={addressInput}
@@ -254,8 +267,9 @@ export default function ConnectPanel({
               }}
             />
             <p id="connect-panel-hint" className="connect-panel-hint">
-              Use the panel's HTTPS address. This is separate from the address
-              used to join Minecraft.
+              {unified
+                ? "Use the complete HTTPS invitation link, including #invite=. For a saved panel, sign in from Manage Connections."
+                : "Use the panel's HTTPS address. This is separate from the address used to join Minecraft."}
             </p>
             {error && (
               <p
@@ -270,7 +284,8 @@ export default function ConnectPanel({
               <p className="connect-panel-destination">
                 <ShieldCheck size={15} />
                 <span>
-                  You'll sign in at <strong>{destination}</strong>.
+                  {unified ? "This invitation is for" : "You'll sign in at"}{" "}
+                  <strong>{destination}</strong>.
                 </span>
               </p>
             )}

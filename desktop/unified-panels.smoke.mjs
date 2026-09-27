@@ -198,6 +198,13 @@ async function smoke() {
           return res.end(downloadBytes.subarray(65536));
         }
         if (url.pathname === "/api/access/logout") return reply({ ok: true });
+        if (url.pathname === "/api/access/leave") {
+          const chunks = [];
+          for await (const chunk of req) chunks.push(chunk);
+          const body = JSON.parse(Buffer.concat(chunks).toString());
+          assert.equal(body.confirmed, true);
+          return reply({ left: true, requestId: body.requestId });
+        }
         reply({ error: "Unknown fixture endpoint" }, 404);
       },
     );
@@ -400,12 +407,18 @@ async function smoke() {
       ).signedIn,
       true,
     );
+    await page.evaluate((id) => window.mcPanelConnections.forget(id, "c"), c.id);
+    assert.equal(
+      (await page.evaluate(() => window.mcPanelConnections.list())).panels.some((panel) => panel.id === c.id),
+      false,
+    );
+    assert.ok(requests.some((request) => request.host === "c" && request.path === "/api/access/leave"));
     assert.ok(
       !requests.some((request) => request.path.includes("power")),
       "Switching/signing out/restarting the client must not stop a remote server",
     );
     console.log(
-      "Passed native unified workspace: one local renderer; A/C bearer isolation with colliding IDs; streamed multipart upload and client download surviving selection changes; encrypted session restart, trust persistence, epoch rejection and isolated sign-out.",
+      "Passed native unified workspace: one local renderer; A/C bearer isolation with colliding IDs; streamed multipart upload and client download surviving selection changes; encrypted session restart, trust persistence, epoch rejection, isolated sign-out and confirmed access removal.",
     );
   } catch (cause) {
     if (stderr) console.error(stderr);

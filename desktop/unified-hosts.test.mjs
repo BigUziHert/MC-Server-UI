@@ -379,6 +379,49 @@ test("unified bridge preserves real host permissions and filesystem isolation ac
   assert.deepEqual(snapshot(a).servers, []);
   assert.equal(snapshot(c).signedIn, true);
   assert.equal((await through(c, "/server")).status, 200);
+  await assert.rejects(
+    controller.forget(a.panelId, "signed-out-account"),
+    /sign in/i,
+  );
+  await controller.signIn(a.panelId, {
+    email: "a@example.test",
+    password: "Correct-fixture-password!",
+  });
+  assert.equal(
+    (
+      await a.local(
+        "/subusers",
+        json("POST", {
+          email: "another@example.test",
+          permissions: ["server.view"],
+        }),
+      )
+    ).status,
+    201,
+  );
+  await controller.forget(
+    a.panelId,
+    snapshot(a).session.accountId ?? snapshot(a).session.userId,
+  );
+  assert.equal(snapshot(a), undefined);
+  const remainingAccounts = await (await a.local("/panel-users")).json();
+  assert.equal(
+    remainingAccounts.users.some((user) => user.email === "a@example.test"),
+    false,
+  );
+  assert.equal(
+    remainingAccounts.users.some(
+      (user) => user.email === "another@example.test",
+    ),
+    true,
+  );
+  assert.equal(snapshot(c).signedIn, true);
+  assert.equal((await through(c, "/server")).status, 200);
+  assert.equal(
+    a.fleet.runtimes.size,
+    2,
+    "Leaving never removes Minecraft servers",
+  );
   assert.equal(
     await fs.readFile(path.join(aFolder, "bridge.txt"), "utf8"),
     "Still Computer A after selection changed",

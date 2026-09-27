@@ -12,7 +12,7 @@ if (process.isMainFrame) {
       invoke("acceptInvitation", panelId, credentials),
     signOut: (panelId) => invoke("signOut", panelId),
     retry: (panelId) => invoke("retry", panelId),
-    forget: (panelId) => invoke("forget", panelId),
+    forget: (panelId, expectedAccountId) => invoke("forget", panelId, expectedAccountId),
     selectServer: (panelId, serverId) =>
       invoke("selectServer", panelId, serverId),
     openUpdates: () => invoke("openUpdates"),
