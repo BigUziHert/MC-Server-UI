@@ -510,6 +510,19 @@ test("panel accounts can be prepared before remote setup, searched, and removed 
   request,
 }) => {
   await openPage(page, "subusers", "Subusers");
+  await expect(
+    page.getByRole("button", { name: "Invite person", exact: true }),
+  ).toHaveCount(0);
+  await page
+    .getByRole("button", { name: "Panel Settings", exact: true })
+    .click();
+  const settings = page.getByRole("dialog", {
+    name: "Panel Settings",
+    exact: true,
+  });
+  await settings
+    .getByRole("tab", { name: "Remote Access", exact: true })
+    .click();
   await page
     .getByRole("button", { name: "Invite person", exact: true })
     .click();
@@ -528,7 +541,9 @@ test("panel accounts can be prepared before remote setup, searched, and removed 
     .getByRole("button", { name: "Create account", exact: true })
     .click();
   await expect(dialog).not.toBeVisible();
-  const row = page.getByRole("row").filter({ hasText: "operator@example.com" });
+  const row = settings
+    .getByRole("row")
+    .filter({ hasText: "operator@example.com" });
   await expect(row).toContainText("Not invited");
   expect((await (await request.get("/api/panel-users")).json()).users).toEqual(
     expect.arrayContaining([
@@ -540,22 +555,22 @@ test("panel accounts can be prepared before remote setup, searched, and removed 
       }),
     ]),
   );
-  await page
+  await settings
     .getByRole("textbox", { name: "Search access records" })
     .fill("no-such-person");
   await expect(
     page.getByRole("heading", { name: "No matching people" }),
   ).toBeVisible();
-  await page
+  await settings
     .getByRole("textbox", { name: "Search access records" })
     .fill("operator");
   await expect(row).toBeVisible();
   await row
     .getByRole("button", {
-      name: "Remove access record for operator@example.com",
+      name: "Remove panel account for operator@example.com",
     })
     .click();
-  dialog = page.getByRole("dialog", { name: "Remove access record?" });
+  dialog = page.getByRole("dialog", { name: "Remove panel account?" });
   await expect(dialog).toContainText(
     "sign-in, invitation links, and all server grants will be revoked",
   );
@@ -1128,6 +1143,16 @@ test("server workspaces isolate files, commands and backups while panel users re
     page.getByRole("button", { name: /Grant OP|Revoke OP|Remove OP/ }),
   ).toHaveCount(0);
   await page
+    .getByRole("button", { name: "Panel Settings", exact: true })
+    .click();
+  const panelSettings = page.getByRole("dialog", {
+    name: "Panel Settings",
+    exact: true,
+  });
+  await panelSettings
+    .getByRole("tab", { name: "Remote Access", exact: true })
+    .click();
+  await page
     .getByRole("button", { name: "Invite person", exact: true })
     .click();
   dialog = page.getByRole("dialog", { name: "Invite person", exact: true });
@@ -1136,7 +1161,9 @@ test("server workspaces isolate files, commands and backups while panel users re
     .getByRole("button", { name: "Create account", exact: true })
     .click();
   await expect(dialog).not.toBeVisible();
-  await page.getByRole("tab", { name: "This server", exact: true }).click();
+  await panelSettings
+    .getByRole("button", { name: "Close Panel Settings", exact: true })
+    .click();
   await page
     .getByRole("button", { name: "Grant server access", exact: true })
     .click();

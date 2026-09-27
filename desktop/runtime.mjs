@@ -79,6 +79,7 @@ export async function startDesktopRuntime({
   let url;
   let host;
   let closing;
+  let autoStart;
   const listener = http.createServer((req, res) => {
     res.setHeader("Cache-Control", "no-store");
     res.setHeader("X-Content-Type-Options", "nosniff");
@@ -262,40 +263,70 @@ export async function startDesktopRuntime({
     token,
     fleet,
     panelSettings,
-    async startConfiguredServer({ startupLaunch = false } = {}) {
-      if (!startupLaunch || closing) return;
-      const settings = await panelSettings.read();
-      if (!settings.startupSupported || settings.startupMode !== "server")
-        return;
-      try {
-        if (settings.missingStartupServer)
-          throw new Error(
-            "The startup server is no longer available. Choose another server in Panel Settings.",
+    startConfiguredServers({ skipAutoStart = false } = {}) {
+      // One attempt per fresh runtime, even if a caller asks again while its
+      // first attempt is pending. Tray activation never creates a new runtime.
+      autoStart ??= (async () => {
+        if (skipAutoStart || closing)
+          return { skipped: true, startedServerIds: [], failures: [] };
+        try {
+          const settings = await panelSettings.read();
+          const results = await Promise.all(
+            settings.autoStartServerIds.map(async (serverId) => {
+              const name =
+                fleet.runtimes.get(serverId)?.descriptor().name || serverId;
+              try {
+                if (closing) throw new Error("The desktop panel is closing.");
+                if (settings.missingAutoStartServerIds.includes(serverId))
+                  throw new Error(
+                    "This server is no longer available. Review its selection in Panel Settings.",
+                  );
+                // Use the normal power operation, retaining EULA, path,
+                // installation, process ownership, backup, and audit checks.
+                const response = await fetch(`${url}/api/server/power`, {
+                  method: "POST",
+                  headers: {
+                    Cookie: `${DESKTOP_COOKIE_NAME}=${token}`,
+                    "Content-Type": "application/json",
+                    "X-Server-Id": serverId,
+                  },
+                  body: JSON.stringify({ action: "start" }),
+                });
+                if (!response.ok) {
+                  const body = await response.json().catch(() => ({}));
+                  throw new Error(body.error || "The server could not start.");
+                }
+                return { serverId, started: true };
+              } catch (cause) {
+                return {
+                  serverId,
+                  message: `${name}: ${cause.message || "The server could not start."}`,
+                };
+              }
+            }),
           );
-        await selection.save(settings.startupServerId);
-        // Use the normal power operation, retaining EULA, path, installation,
-        // process ownership, backup, and audit checks.
-        const response = await fetch(`${url}/api/server/power`, {
-          method: "POST",
-          headers: {
-            Cookie: `${DESKTOP_COOKIE_NAME}=${token}`,
-            "Content-Type": "application/json",
-            "X-Server-Id": settings.startupServerId,
-          },
-          body: JSON.stringify({ action: "start" }),
-        });
-        if (!response.ok) {
-          const body = await response.json().catch(() => ({}));
-          throw new Error(
-            body.error || "The configured startup server could not start.",
+          const failures = results
+            .filter((result) => !result.started)
+            .map(({ serverId, message }) => ({ serverId, message }));
+          panelSettings.setStartupError(
+            failures.map((failure) => failure.message).join("\n"),
           );
+          return {
+            skipped: false,
+            startedServerIds: results
+              .filter((result) => result.started)
+              .map((result) => result.serverId),
+            failures,
+          };
+        } catch (cause) {
+          panelSettings.setStartupError(
+            cause.message ||
+              "Automatic server startup could not read its settings.",
+          );
+          throw cause;
         }
-      } catch (cause) {
-        panelSettings.setStartupError(
-          cause.message || "The configured startup server could not start.",
-        );
-        throw cause;
-      }
+      })();
+      return autoStart;
     },
     listLocalServers() {
       return [...fleet.runtimes.values()].map((server) => {

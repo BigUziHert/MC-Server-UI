@@ -84,7 +84,12 @@ function LocalUpdates({ standalone = false }: { standalone?: boolean }) {
   const dialog = useRef<HTMLDialogElement>(null);
   const close = () => {
     if (standalone) window.mcPanelUpdates?.close();
-    else setOpen(false);
+    else {
+      // Close before an error-only dialog unmounts, restoring keyboard focus
+      // to the Updates button that opened it from Panel Settings.
+      dialog.current?.close();
+      setOpen(false);
+    }
   };
   useEffect(() => {
     let active = true;
@@ -95,11 +100,11 @@ function LocalUpdates({ standalone = false }: { standalone?: boolean }) {
           if (next.desktop) {
             setState(next);
             setLoadError("");
-          } else if (standalone)
+          } else if (standalone || open)
             setLoadError("App updates are only available in MC Panel desktop.");
         })
         .catch((cause) => {
-          if (active && standalone)
+          if (active && (standalone || open))
             setLoadError(
               cause instanceof Error
                 ? cause.message
@@ -154,14 +159,14 @@ function LocalUpdates({ standalone = false }: { standalone?: boolean }) {
       setBusy(false);
     }
   }
-  if (!state && !standalone) return null;
+  if (!state && !standalone && !open) return null;
   const working =
     busy ||
     ["checking", "downloading", "installing"].includes(state?.status || "");
   const ready = ["available", "downloaded"].includes(state?.status || "");
   return (
     <>
-      {!standalone && (
+      {!standalone && state && (
         <button
           className={`help-button update-button ${ready ? "update-ready" : ""}`}
           onClick={() => setOpen(true)}

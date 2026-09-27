@@ -1,13 +1,32 @@
 import { expect, test, type Page } from "@playwright/test";
 
-async function settingsFixture(page: Page, desktop = true) {
+const startupServers = [
+  { id: "survival", name: "Survival world", unavailable: false },
+  { id: "creative", name: "Creative world", unavailable: false },
+];
+
+async function settingsFixture(
+  page: Page,
+  options: {
+    desktop?: boolean;
+    startAtLogin?: boolean;
+    autoStartServerIds?: string[];
+    startupSupported?: boolean;
+    startupReason?: string;
+    missingAutoStartServerIds?: string[];
+    servers?: typeof startupServers;
+  } = {},
+) {
   let settings = {
-    desktop: true,
-    startupMode: "off",
-    startupServerId: null as string | null,
+    desktop: options.desktop ?? true,
+    startAtLogin: options.startAtLogin ?? false,
+    autoStartServerIds: options.autoStartServerIds ?? [],
     keepInTray: true,
-    startupSupported: true,
+    startupSupported: options.startupSupported ?? true,
+    startupReason: options.startupReason,
+    missingAutoStartServerIds: options.missingAutoStartServerIds ?? [],
   };
+  const servers = options.servers ?? startupServers;
   let remote = {
     enabled: false,
     ready: false,
@@ -17,8 +36,40 @@ async function settingsFixture(page: Page, desktop = true) {
     listening: false,
   };
   const writes: unknown[] = [];
+  const remoteWrites: unknown[] = [];
+  await page.route("**/api/access/session", (route) =>
+    route.fulfill({ json: { role: "owner" } }),
+  );
+  await page.route("**/api/servers", (route) =>
+    route.fulfill({
+      json: { servers, defaultServerId: servers[0]?.id ?? null },
+    }),
+  );
+  await page.route("**/api/server", (route) =>
+    route.fulfill({
+      json: {
+        ...servers[0],
+        status: "offline",
+        software: "Paper",
+        minecraftVersion: "1.21.1",
+        players: [],
+        maxPlayers: 20,
+        cpu: 0,
+        memory: 0,
+        memoryLimit: 2048,
+        disk: 0,
+        diskLimit: 1024,
+      },
+    }),
+  );
+  await page.route("**/api/console", (route) =>
+    route.fulfill({ json: { lines: [] } }),
+  );
+  await page.route("**/api/panel-users", (route) =>
+    route.fulfill({ json: { users: [], servers } }),
+  );
   await page.route("**/api/desktop/settings", async (route) => {
-    if (!desktop)
+    if (!settings.desktop)
       return route.fulfill({ status: 404, json: { error: "Not available" } });
     if (route.request().method() === "PUT") {
       writes.push(route.request().postDataJSON());
@@ -28,77 +79,244 @@ async function settingsFixture(page: Page, desktop = true) {
   });
   await page.route("**/api/access/settings", async (route) => {
     if (route.request().method() === "PUT") {
+      remoteWrites.push(route.request().postDataJSON());
       remote = { ...remote, ...route.request().postDataJSON() };
       remote.ready = remote.enabled;
       remote.listening = remote.enabled;
     }
     return route.fulfill({ json: remote });
   });
-  return { writes };
+  return { writes, remoteWrites };
 }
 
-test("one startup choice saves panel-plus-server and tray behavior across reopening", async ({
-  page,
-  request,
-}) => {
-  const { writes } = await settingsFixture(page);
-  const fleet = await (await request.get("/api/servers")).json();
-  const serverId = fleet.defaultServerId;
-  await page.goto("/");
+async function openSettings(page: Page) {
   await page
     .getByRole("button", { name: "Panel Settings", exact: true })
     .click();
-  const dialog = page.getByRole("dialog", {
-    name: "Panel Settings",
+  return page.getByRole("dialog", { name: "Panel Settings", exact: true });
+}
+
+test("General settings save multiple automatic servers independently of sign-in and persist deselection", async ({
+  page,
+}) => {
+  await page.setViewportSize({ width: 1280, height: 1000 });
+  const { writes } = await settingsFixture(page);
+  await page.goto("/");
+  const dialog = await openSettings(page);
+  await expect(
+    dialog.getByRole("tab", { name: "General", exact: true }),
+  ).toHaveAttribute("aria-selected", "true");
+  const login = dialog.getByRole("switch", {
+    name: "Start MC Panel when I sign in",
     exact: true,
   });
-  await dialog.getByLabel("When this PC starts").selectOption("server");
-  await dialog.getByLabel("Server to start").selectOption(serverId);
-  await expect(dialog).toContainText("sign in to Windows");
-  await dialog
-    .getByRole("switch", {
-      name: "Keep MC Panel in the system tray when its window is closed",
-    })
-    .uncheck();
-  await dialog.getByRole("button", { name: "Save startup settings" }).click();
-  await expect(
-    dialog.getByRole("button", { name: "Save startup settings" }),
-  ).toBeDisabled();
+  const tray = dialog.getByRole("switch", {
+    name: "Keep MC Panel in the system tray",
+    exact: true,
+  });
+  const picker = dialog.getByRole("button", {
+    name: "Servers to start when the panel opens",
+    exact: true,
+  });
+  const save = dialog.getByRole("button", {
+    name: "Save settings",
+    exact: true,
+  });
+  await login.check();
+  await tray.uncheck();
+  await picker.click();
+  const survival = dialog.getByRole("checkbox", {
+    name: "Survival world",
+    exact: true,
+  });
+  const creative = dialog.getByRole("checkbox", {
+    name: "Creative world",
+    exact: true,
+  });
+  await dialog.getByText("Survival world", { exact: true }).click();
+  await expect(survival).toBeChecked();
+  await creative.check();
+  await page.keyboard.press("Escape");
+  await expect(picker).toHaveAttribute("aria-expanded", "false");
+  await expect(dialog).toBeVisible();
+  await save.click();
+  await expect(save).toBeDisabled();
   expect(writes).toEqual([
-    { startupMode: "server", startupServerId: serverId, keepInTray: false },
+    {
+      startAtLogin: true,
+      autoStartServerIds: ["survival", "creative"],
+      keepInTray: false,
+    },
   ]);
   await dialog.getByRole("button", { name: "Close Panel Settings" }).click();
   await page.reload();
-  await page
-    .getByRole("button", { name: "Panel Settings", exact: true })
+  await openSettings(page);
+  await expect(login).toBeChecked();
+  await expect(tray).not.toBeChecked();
+  await picker.click();
+  await expect(survival).toBeChecked();
+  await expect(creative).toBeChecked();
+  await creative.press("Tab");
+  await expect(picker).toHaveAttribute("aria-expanded", "false");
+  await expect(dialog).toBeVisible();
+  await picker.click();
+  await survival.uncheck();
+  await login.uncheck();
+  await save.click();
+  await expect(save).toBeDisabled();
+  expect(writes.at(-1)).toEqual({
+    startAtLogin: false,
+    autoStartServerIds: ["creative"],
+    keepInTray: false,
+  });
+  if (!(await creative.isVisible())) await picker.click();
+  await creative.uncheck();
+  await save.click();
+  await expect(save).toBeDisabled();
+  expect(writes.at(-1)).toEqual({
+    startAtLogin: false,
+    autoStartServerIds: [],
+    keepInTray: false,
+  });
+  await dialog.getByRole("button", { name: "Close Panel Settings" }).click();
+  await openSettings(page);
+  await picker.click();
+  await expect(survival).not.toBeChecked();
+  await expect(creative).not.toBeChecked();
+});
+
+test("unavailable automatic servers stay visible and can be removed from the selection", async ({
+  page,
+}) => {
+  const { writes } = await settingsFixture(page, {
+    autoStartServerIds: ["missing-world", "creative"],
+    missingAutoStartServerIds: ["missing-world"],
+    servers: [startupServers[0]!, { ...startupServers[1]!, unavailable: true }],
+  });
+  await page.goto("/");
+  const dialog = await openSettings(page);
+  await dialog
+    .getByRole("button", {
+      name: "Servers to start when the panel opens",
+      exact: true,
+    })
     .click();
-  await expect(dialog.getByLabel("When this PC starts")).toHaveValue("server");
-  await expect(dialog.getByLabel("Server to start")).toHaveValue(serverId);
-  await expect(dialog.getByRole("switch")).not.toBeChecked();
-  await dialog.getByLabel("When this PC starts").selectOption("panel");
-  await expect(dialog.getByLabel("Server to start")).toHaveCount(0);
-  await dialog.getByRole("button", { name: "Save startup settings" }).click();
+  const missing = dialog.getByRole("checkbox", { name: /missing-world/ });
+  const unavailable = dialog.getByRole("checkbox", { name: /Creative world/ });
+  await expect(missing).toBeChecked();
+  await expect(unavailable).toBeChecked();
+  // Removing a missing server also removes its checkbox from the choices.
+  await missing.click();
+  await expect(missing).toHaveCount(0);
+  await expect(unavailable).toBeVisible();
+  await unavailable.uncheck();
+  await dialog
+    .getByRole("button", { name: "Save settings", exact: true })
+    .click();
   await expect(
-    dialog.getByRole("button", { name: "Save startup settings" }),
+    dialog.getByRole("button", { name: "Save settings", exact: true }),
   ).toBeDisabled();
-  expect(writes).toHaveLength(2);
+  expect(writes).toEqual([
+    { startAtLogin: false, autoStartServerIds: [], keepInTray: true },
+  ]);
+});
+
+test("an unsupported sign-in registration still allows automatic servers on manual launch", async ({
+  page,
+}) => {
+  const { writes } = await settingsFixture(page, {
+    startupSupported: false,
+    startupReason:
+      "Install the Setup edition to start MC Panel when you sign in.",
+  });
+  await page.goto("/");
+  const dialog = await openSettings(page);
+  await expect(
+    dialog.getByRole("switch", {
+      name: "Start MC Panel when I sign in",
+      exact: true,
+    }),
+  ).toBeDisabled();
+  await expect(dialog).toContainText("Install the Setup edition");
+  await dialog
+    .getByRole("button", {
+      name: "Servers to start when the panel opens",
+      exact: true,
+    })
+    .click();
+  await dialog
+    .getByRole("checkbox", { name: "Survival world", exact: true })
+    .check();
+  await dialog
+    .getByRole("button", { name: "Save settings", exact: true })
+    .click();
+  await expect(
+    dialog.getByRole("button", { name: "Save settings", exact: true }),
+  ).toBeDisabled();
+  expect(writes).toEqual([
+    { startAtLogin: false, autoStartServerIds: ["survival"], keepInTray: true },
+  ]);
+});
+
+test("General settings can open the desktop updater", async ({ page }) => {
+  await settingsFixture(page);
+  await page.route("**/api/desktop/updates**", (route) =>
+    route.fulfill({
+      json: {
+        desktop: true,
+        supported: true,
+        version: "0.1.3-dev.0",
+        channel: "dev",
+        status: "idle",
+        availableVersion: null,
+        message: "",
+      },
+    }),
+  );
+  await page.goto("/");
+  const dialog = await openSettings(page);
+  await dialog
+    .getByRole("button", { name: "App updates", exact: true })
+    .click();
+  const updates = page.getByRole("dialog", {
+    name: "App updates",
+    exact: true,
+  });
+  await expect(updates).toBeVisible();
+  await expect(
+    updates.getByRole("button", { name: "Check for updates", exact: true }),
+  ).toBeVisible();
 });
 
 test("browser Panel Settings persists host Remote Access and fits a phone", async ({
   page,
 }, testInfo) => {
-  await settingsFixture(page, false);
+  const { remoteWrites } = await settingsFixture(page, { desktop: false });
   await page.setViewportSize({ width: 390, height: 844 });
   await page.goto("/");
-  await page
-    .getByRole("button", { name: "Panel Settings", exact: true })
-    .click();
-  const dialog = page.getByRole("dialog", {
-    name: "Panel Settings",
-    exact: true,
-  });
+  const dialog = await openSettings(page);
   await expect(dialog).toContainText("available in the MC Panel desktop app");
-  await expect(dialog.getByLabel("When this PC starts")).toHaveCount(0);
+  await expect(
+    dialog.getByRole("switch", {
+      name: "Start MC Panel when I sign in",
+      exact: true,
+    }),
+  ).toHaveCount(0);
+  await dialog.getByRole("tab", { name: "Remote Access", exact: true }).click();
+  await expect(
+    dialog.getByRole("tab", { name: "Remote Access", exact: true }),
+  ).toHaveAttribute("aria-selected", "true");
+  await expect(
+    dialog.getByRole("heading", { name: "Panel users", exact: true }),
+  ).toBeVisible();
+  await dialog
+    .getByLabel("Public panel address", { exact: true })
+    .fill("https://updated-panel.example.test:3002");
+  await dialog.getByRole("tab", { name: "General", exact: true }).click();
+  await dialog.getByRole("tab", { name: "Remote Access", exact: true }).click();
+  await expect(
+    dialog.getByLabel("Public panel address", { exact: true }),
+  ).toHaveValue("https://updated-panel.example.test:3002");
   await dialog
     .getByRole("checkbox", { name: "Enable remote access", exact: true })
     .check();
@@ -106,6 +324,12 @@ test("browser Panel Settings persists host Remote Access and fits a phone", asyn
   await expect(
     dialog.getByRole("heading", { name: "Remote access is configured" }),
   ).toBeVisible();
+  expect(remoteWrites).toEqual([
+    expect.objectContaining({
+      enabled: true,
+      publicUrl: "https://updated-panel.example.test:3002",
+    }),
+  ]);
   await page.screenshot({
     path: testInfo.outputPath("panel-settings-mobile.png"),
     fullPage: true,
@@ -122,9 +346,8 @@ test("browser Panel Settings persists host Remote Access and fits a phone", asyn
   ).toBe(false);
   await dialog.getByRole("button", { name: "Close Panel Settings" }).click();
   await page.reload();
-  await page
-    .getByRole("button", { name: "Panel Settings", exact: true })
-    .click();
+  await openSettings(page);
+  await dialog.getByRole("tab", { name: "Remote Access", exact: true }).click();
   await dialog.getByRole("button", { name: "Edit setup" }).click();
   await expect(
     dialog.getByRole("checkbox", { name: "Enable remote access", exact: true }),
@@ -136,6 +359,8 @@ test("browser Panel Settings persists host Remote Access and fits a phone", asyn
   await expect(
     dialog.getByRole("heading", { name: "Remote access", exact: true }),
   ).toBeVisible();
+  expect(remoteWrites).toHaveLength(2);
+  expect(remoteWrites[1]).toEqual(expect.objectContaining({ enabled: false }));
 });
 
 test("an invited account with no servers has no host settings or server controls", async ({

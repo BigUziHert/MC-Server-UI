@@ -4,8 +4,7 @@
   font-size: 12px;
   line-height: 1.6;
 }
-.subusers-heading-actions,
-.subusers-view-tabs {
+.subusers-heading-actions {
   display: flex;
   align-items: center;
   flex-wrap: wrap;
@@ -14,22 +13,15 @@
 .subusers-heading-actions {
   flex-shrink: 0;
 }
-.subusers-view-tabs {
-  margin-bottom: 18px;
-  border-bottom: 1px solid var(--border);
+.panel-users {
+  border-top: 1px solid var(--border);
+  padding-top: 24px;
+  min-width: 0;
 }
-.subusers-view-tabs button {
-  padding: 12px 14px;
-  background: transparent;
-  border: 0;
-  border-bottom: 2px solid transparent;
-  border-radius: 0;
-  color: var(--muted);
-  font-size: 12px;
-}
-.subusers-view-tabs button[aria-selected="true"] {
+.panel-users .page-heading h3 {
+  margin: 0;
   color: var(--text);
-  border-bottom-color: var(--accent);
+  font-size: 18px;
 }
 .subusers-basic-access {
   padding: 7px;

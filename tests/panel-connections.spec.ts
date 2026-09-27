@@ -1895,12 +1895,21 @@ for (const width of [1280, 375]) {
       });
     });
     await page.goto("/");
-    await page
-      .getByRole("button", { name: "Manage panel users", exact: true })
-      .click();
-    await expect(page).toHaveURL(/#subusers$/);
     await expect(
-      page.getByRole("heading", { name: /^(Panel users|Subusers)$/ }),
+      page.getByRole("button", { name: "Manage panel users", exact: true }),
+    ).toHaveCount(0);
+    await page
+      .getByRole("button", { name: "Panel Settings", exact: true })
+      .click();
+    const settings = page.getByRole("dialog", {
+      name: "Panel Settings",
+      exact: true,
+    });
+    await settings
+      .getByRole("tab", { name: "Remote Access", exact: true })
+      .click();
+    await expect(
+      settings.getByRole("heading", { name: "Panel users", exact: true }),
     ).toBeVisible();
     await expect
       .poll(
@@ -1921,16 +1930,19 @@ for (const width of [1280, 375]) {
       path: testInfo.outputPath(`empty-fleet-panel-users-${width}.png`),
       fullPage: true,
     });
-    await page
-      .getByRole("button", { name: "Back to servers", exact: true })
+    await settings
+      .getByRole("button", { name: "Close Panel Settings", exact: true })
       .click();
     await expect(
       page.getByRole("heading", { name: "Welcome to MC Panel" }),
     ).toBeVisible();
     await page.goto("/#subusers");
     await expect(
-      page.getByRole("heading", { name: /^(Panel users|Subusers)$/ }),
+      page.getByRole("heading", { name: "Welcome to MC Panel", exact: true }),
     ).toBeVisible();
+    await expect(
+      page.getByRole("heading", { name: "Panel users", exact: true }),
+    ).toHaveCount(0);
   });
 }
 

@@ -495,6 +495,7 @@ function InvitationDialog({
 }) {
   const dialog = useRef<HTMLDialogElement>(null);
   const link = useRef<HTMLTextAreaElement>(null);
+  const invitationId = useId();
   const [copyStatus, setCopyStatus] = useState("");
   useEffect(() => {
     dialog.current?.showModal();
@@ -517,15 +518,16 @@ function InvitationDialog({
     <dialog
       ref={dialog}
       className="subusers-dialog subusers-link-dialog"
-      aria-labelledby="subuser-link-title"
+      aria-labelledby={`${invitationId}-title`}
       onCancel={(event) => {
         event.preventDefault();
+        event.stopPropagation();
         onClose();
       }}
     >
       <div className="subusers-link-content">
         <header className="subusers-dialog-heading">
-          <h2 id="subuser-link-title">Share invitation link</h2>
+          <h2 id={`${invitationId}-title`}>Share invitation link</h2>
           <button
             className="btn icon"
             aria-label="Close invitation"
@@ -541,10 +543,10 @@ function InvitationDialog({
             {panelWide && " This invitation grants no server access."}
           </p>
           <div className="subusers-setup-field">
-            <label htmlFor="subuser-invitation-url">Invitation link</label>
+            <label htmlFor={`${invitationId}-url`}>Invitation link</label>
             <textarea
               ref={link}
-              id="subuser-invitation-url"
+              id={`${invitationId}-url`}
               rows={4}
               readOnly
               value={invitation.invitationUrl}
@@ -596,9 +598,41 @@ export default function Subusers({
   signedInEmail,
 }: PageProps & { permissions?: string[]; signedInEmail?: string }) {
   const serverId = useContext(ServerScope);
+  if (!serverId)
+    return (
+      <StatePanel
+        variant="empty"
+        title="Choose a server"
+        message="Select a server to manage its subusers and permissions."
+      />
+    );
+  return (
+    <AccessManagement
+      notify={notify}
+      permissions={permissions}
+      signedInEmail={signedInEmail}
+      scope="server"
+    />
+  );
+}
+
+export function PanelUsers({ notify }: PageProps) {
+  return <AccessManagement notify={notify} scope="accounts" />;
+}
+
+function AccessManagement({
+  notify,
+  permissions,
+  signedInEmail,
+  scope,
+}: PageProps & {
+  permissions?: string[];
+  signedInEmail?: string;
+  scope: "server" | "accounts";
+}) {
+  const editorId = useId();
   const remote = permissions !== undefined;
-  const [view, setView] = useState<"server" | "accounts">("server");
-  const accountsView = !remote && (!serverId || view === "accounts");
+  const accountsView = scope === "accounts";
   const can = (permission: string) =>
     permissions === undefined || permissions.includes(permission);
   const canRead = can("user.read");
@@ -676,13 +710,13 @@ export default function Subusers({
 
   useEffect(() => setPage(1), [debouncedSearch, pageSize]);
   useEffect(() => {
-    if (remote) return;
+    if (!accountsView) return;
     const update = (event: Event) =>
       setAccessSettings((event as CustomEvent<AccessSettings>).detail);
     window.addEventListener("mc-panel-access-settings-changed", update);
     return () =>
       window.removeEventListener("mc-panel-access-settings-changed", update);
-  }, [remote]);
+  }, [accountsView]);
   const refresh = useCallback(async () => {
     request.current?.abort();
     if (!canRead) {
@@ -701,7 +735,7 @@ export default function Subusers({
               signal: controller.signal,
             })
           : Promise.resolve(null),
-        !remote
+        accountsView
           ? panelApi<AccessSettings>("/access/settings", {
               signal: controller.signal,
             }).catch(() => null)
@@ -723,6 +757,13 @@ export default function Subusers({
       if (!controller.signal.aborted) setLoading(false);
     }
   }, [api, canRead, basePath, remote, accountsView]);
+  useEffect(() => {
+    if (accountsView || remote) return;
+    const update = () => void refresh();
+    window.addEventListener("mc-panel-accounts-changed", update);
+    return () =>
+      window.removeEventListener("mc-panel-accounts-changed", update);
+  }, [accountsView, remote, refresh]);
   useEffect(() => {
     loaded.current = false;
     setUsers([]);
@@ -783,6 +824,8 @@ export default function Subusers({
         previous.map((item) => (item.id === user.id ? result.user : item)),
       );
       setInvitation({ ...result, panelWide: panelAccount });
+      if (panelAccount)
+        window.dispatchEvent(new Event("mc-panel-accounts-changed"));
       return true;
     } catch (cause) {
       const message =
@@ -882,8 +925,8 @@ export default function Subusers({
         const user = "user" in result ? result.user : result;
         setEditor(null);
         // Show the saved identity even if the separate invitation request fails.
-        setView("accounts");
-        if (accountsView) await refresh();
+        await refresh();
+        window.dispatchEvent(new Event("mc-panel-accounts-changed"));
         if (inviteOnCreate) await createInvitation(user, true);
         else
           notify(
@@ -909,6 +952,8 @@ export default function Subusers({
       setEditor(null);
       setDeleting(null);
       await refresh();
+      if (accountsView)
+        window.dispatchEvent(new Event("mc-panel-accounts-changed"));
     } catch (cause) {
       setFormError(
         cause instanceof Error
@@ -939,10 +984,10 @@ export default function Subusers({
       />
     );
   return (
-    <div className="subusers-page">
+    <div className={`subusers-page${accountsView ? " panel-users" : ""}`}>
       <header className="page-heading">
         <div>
-          <h1>Subusers</h1>
+          {accountsView ? <h3>Panel users</h3> : <h1>Subusers</h1>}
           <p className="subusers-page-description">
             {accountsView
               ? "Invite people to create an account and sign in. Invitations grant no server access."
@@ -950,10 +995,10 @@ export default function Subusers({
           </p>
         </div>
         <div className="subusers-heading-actions">
-          {!remote && (
+          {accountsView && (
             <button
               className="btn"
-              disabled={busy || !!inviting}
+              disabled={busy || !!inviting || loading}
               onClick={() => openEditor(undefined, true)}
             >
               <Plus size={16} /> Invite person
@@ -971,29 +1016,7 @@ export default function Subusers({
           )}
         </div>
       </header>
-      {!remote && serverId && (
-        <div
-          className="subusers-view-tabs"
-          role="tablist"
-          aria-label="Access management"
-        >
-          <button
-            role="tab"
-            aria-selected={!accountsView}
-            onClick={() => setView("server")}
-          >
-            This server
-          </button>
-          <button
-            role="tab"
-            aria-selected={accountsView}
-            onClick={() => setView("accounts")}
-          >
-            Panel accounts
-          </button>
-        </div>
-      )}
-      {!remote && (
+      {accountsView && (
         <p className="subusers-editor-notice">
           {accessReady(accessSettings)
             ? "Remote Access is enabled. Invited people can sign in, and see only servers the host has shared with them."
@@ -1010,14 +1033,16 @@ export default function Subusers({
         <div className="subusers-toolbar">
           <div className="subusers-list-title">
             <Users size={17} />
-            <h2>{accountsView ? "Panel accounts" : "Users"}</h2>
+            <h2>{accountsView ? "Accounts" : "Users"}</h2>
             <span>{users.length}</span>
           </div>
           <div className="subusers-controls">
             <SearchField
               className="subusers-search"
               aria-label="Search access records"
-              placeholder="Search subusers…"
+              placeholder={
+                accountsView ? "Search panel users…" : "Search subusers…"
+              }
               value={search}
               onValueChange={setSearch}
             />
@@ -1202,7 +1227,7 @@ export default function Subusers({
                         </button>
                         <button
                           className="btn icon subuser-delete"
-                          aria-label={`Remove access record for ${user.email}`}
+                          aria-label={`${accountsView ? "Remove panel account" : "Remove access record"} for ${user.email}`}
                           title={
                             accountsView
                               ? "Remove panel account"
@@ -1243,17 +1268,20 @@ export default function Subusers({
       <dialog
         ref={dialog}
         className={`subusers-dialog ${deleting || resetting ? "subusers-delete-dialog" : ""}`}
-        aria-labelledby="subuser-dialog-title"
+        aria-labelledby={`${editorId}-dialog-title`}
         onCancel={(event) => {
           event.preventDefault();
+          event.stopPropagation();
           closeDialog();
         }}
       >
         <form onSubmit={submit}>
           <header className="subusers-dialog-heading">
-            <h2 id="subuser-dialog-title">
+            <h2 id={`${editorId}-dialog-title`}>
               {deleting
-                ? "Remove access record?"
+                ? accountsView
+                  ? "Remove panel account?"
+                  : "Remove access record?"
                 : resetting
                   ? "Reset subuser access?"
                   : invitingAccount
@@ -1315,9 +1343,9 @@ export default function Subusers({
                 </p>
                 {editor === "grant" && !remote ? (
                   <div className="subusers-email">
-                    <label htmlFor="subuser-account">Panel account</label>
+                    <label htmlFor={`${editorId}-account`}>Panel account</label>
                     <select
-                      id="subuser-account"
+                      id={`${editorId}-account`}
                       required
                       value={accountId}
                       disabled={busy}
@@ -1332,17 +1360,17 @@ export default function Subusers({
                     </select>
                     {!candidates.length && (
                       <small className="subusers-email-help">
-                        No accounts are waiting for access. Close this dialog
-                        and use Invite person to create one.
+                        No accounts are waiting for access. Create one in Panel
+                        Settings &gt; Remote Access &gt; Panel users.
                       </small>
                     )}
                   </div>
                 ) : (
                   <div className="subusers-email">
-                    <label htmlFor="subuser-email">Email address</label>
+                    <label htmlFor={`${editorId}-email`}>Email address</label>
                     <input
                       ref={emailInput}
-                      id="subuser-email"
+                      id={`${editorId}-email`}
                       type="email"
                       required
                       maxLength={254}
@@ -1498,11 +1526,13 @@ export default function Subusers({
                             <section
                               className="subusers-permission-group"
                               key={group.id}
-                              aria-labelledby={`permission-group-${group.id}`}
+                              aria-labelledby={`${editorId}-permission-group-${group.id}`}
                             >
                               <div className="subusers-group-heading">
                                 <div>
-                                  <h3 id={`permission-group-${group.id}`}>
+                                  <h3
+                                    id={`${editorId}-permission-group-${group.id}`}
+                                  >
                                     {group.label}
                                   </h3>
                                   <p>{group.description}</p>

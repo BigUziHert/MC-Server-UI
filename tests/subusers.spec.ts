@@ -60,6 +60,23 @@ async function openSubusers(page: Page, id: string) {
   ).toBeVisible();
 }
 
+async function openPanelUsers(page: Page) {
+  await page
+    .getByRole("button", { name: "Panel Settings", exact: true })
+    .click();
+  const settings = page.getByRole("dialog", {
+    name: "Panel Settings",
+    exact: true,
+  });
+  await settings
+    .getByRole("tab", { name: "Remote Access", exact: true })
+    .click();
+  await expect(
+    settings.getByRole("heading", { name: "Panel users", exact: true }),
+  ).toBeVisible();
+  return settings;
+}
+
 async function showPermissionDetails(dialog: Locator) {
   await expect(dialog).toBeVisible();
   const details = dialog.locator(".subusers-permission-details");
@@ -118,6 +135,13 @@ test("an account invite grants no server access, and grant/edit/revoke affect on
   server,
 }, testInfo) => {
   await openSubusers(page, server.id);
+  await expect(
+    page.getByRole("button", { name: "Invite person", exact: true }),
+  ).toHaveCount(0);
+  await expect(
+    page.getByRole("tab", { name: "Panel accounts", exact: true }),
+  ).toHaveCount(0);
+  const settings = await openPanelUsers(page);
   await page
     .getByRole("button", { name: "Invite person", exact: true })
     .click();
@@ -134,8 +158,8 @@ test("an account invite grants no server access, and grant/edit/revoke affect on
     .click();
   await expect(dialog).not.toBeVisible();
   await expect(
-    page.getByRole("tab", { name: "Panel accounts", exact: true }),
-  ).toHaveAttribute("aria-selected", "true");
+    settings.getByRole("heading", { name: "Panel users", exact: true }),
+  ).toBeVisible();
   const account = (await users(request)).find(
     (user) => user.email === "separate-account@example.test",
   )!;
@@ -147,7 +171,10 @@ test("an account invite grants no server access, and grant/edit/revoke affect on
     ),
   ).toBe(false);
 
-  await page.getByRole("tab", { name: "This server", exact: true }).click();
+  await settings
+    .getByRole("button", { name: "Close Panel Settings", exact: true })
+    .click();
+  await expect(settings).not.toBeVisible();
   await page
     .getByRole("button", { name: "Grant server access", exact: true })
     .click();
@@ -481,7 +508,7 @@ test("panel account changes preserve legacy server mappings and show saved acces
     return route.fulfill({ json: { users: [account] } });
   });
   await openSubusers(page, server.id);
-  await page.getByRole("tab", { name: "Panel accounts", exact: true }).click();
+  await openPanelUsers(page);
   const row = page.getByRole("row").filter({ hasText: account.email });
   await expect(row).toContainText(account.accessReview.message);
   await expect(row).toContainText(
@@ -569,6 +596,7 @@ test("a failed account invitation preserves zero grants and clipboard retries re
     });
   });
   await openSubusers(page, server.id);
+  await openPanelUsers(page);
   await page
     .getByRole("button", { name: "Invite person", exact: true })
     .click();
@@ -709,7 +737,7 @@ test("resetting activated access explains immediate sign-out and can be cancelle
     });
   });
   await openSubusers(page, server.id);
-  await page.getByRole("tab", { name: "Panel accounts", exact: true }).click();
+  const settings = await openPanelUsers(page);
   const reset = page.getByRole("button", {
     name: "Reset access for activated@example.test",
     exact: true,
@@ -726,7 +754,9 @@ test("resetting activated access explains immediate sign-out and can be cancelle
   await expect(
     dialog.getByRole("button", { name: "Cancel", exact: true }),
   ).toBeFocused();
-  await dialog.getByRole("button", { name: "Cancel", exact: true }).click();
+  await page.keyboard.press("Escape");
+  await expect(dialog).not.toBeVisible();
+  await expect(settings).toBeVisible();
   expect(resets).toBe(0);
   await reset.click();
   dialog = page.getByRole("dialog", {
@@ -797,9 +827,7 @@ test("direct remote setup detects the public IP on request, supports a proxy, an
     return route.fulfill({ json: { ...configured, ...body } });
   });
   await openSubusers(page, server.id);
-  await page
-    .getByRole("button", { name: "Panel Settings", exact: true })
-    .click();
+  await openPanelUsers(page);
   await page.getByRole("button", { name: "Edit setup", exact: true }).click();
   const setup = page.getByRole("region", {
     name: "Remote access setup",

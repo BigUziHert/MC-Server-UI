@@ -34,7 +34,11 @@ import {
 import updaterPackage from "electron-updater";
 import { applyDownloadedUpdate, createUpdateController } from "./updates.mjs";
 import { createUpdatesOverlay } from "./updates-overlay.mjs";
-import { keepWindowInTray } from "./panel-settings.mjs";
+import {
+  keepWindowInTray,
+  skipAutomaticServerStart,
+  updateRecoveryArguments,
+} from "./panel-settings.mjs";
 
 const { autoUpdater } = updaterPackage;
 
@@ -243,9 +247,7 @@ async function requestQuit(installUpdate = false) {
           "Your servers have been stopped safely, but the update installer could not start. MC Panel will reopen so you can retry. Your server files and settings are unchanged. Details are in desktop.log.",
         );
         app.relaunch({
-          args: process.argv
-            .slice(1)
-            .filter((argument) => argument !== "--startup"),
+          args: updateRecoveryArguments(process.argv.slice(1)),
         });
         app.exit(1);
       });
@@ -379,7 +381,7 @@ async function launch() {
     loginItem: {
       supported,
       reason:
-        "Automatic startup is available in the installed Windows desktop app. Portable and development copies do not register at sign-in.",
+        "Starting MC Panel at Windows sign-in is available in the installed Windows desktop app. Portable and development copies do not register at sign-in.",
       setEnabled: async (enabled) => {
         const options = { path: app.getPath("exe"), args: ["--startup"] };
         app.setLoginItemSettings({ ...options, openAtLogin: enabled, enabled });
@@ -510,10 +512,21 @@ async function launch() {
   window.on("session-end", endWindowsSession);
   createTray();
   await window.loadURL(runtime.url);
-  // The login entry uses this explicit flag. Opening the panel manually, an
-  // update relaunch, or a second instance must never start a server implicitly.
-  if (process.argv.includes("--startup"))
-    void runtime.startConfiguredServer({ startupLaunch: true }).catch(logError);
+  // A fresh manual or Windows sign-in launch starts the selected servers once.
+  // NSIS and failed-update recovery both pass --updated to keep servers stopped.
+  void runtime
+    .startConfiguredServers({
+      skipAutoStart: skipAutomaticServerStart(process.argv),
+    })
+    .then((result) => {
+      if (result.failures.length)
+        return logError(
+          new Error(
+            result.failures.map((failure) => failure.message).join("\n"),
+          ),
+        );
+    })
+    .catch(logError);
   // The owner UI and servers are ready before any saved remote host is tried.
   // Independent restore attempts never hold startup or the local view hostage.
   void remotePanels.restore().catch(logError);

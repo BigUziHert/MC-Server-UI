@@ -1,5 +1,50 @@
 import { test, expect } from "@playwright/test";
 
+test("Panel Settings opens update errors without losing the settings dialog", async ({
+  page,
+}) => {
+  await page.route("**/api/desktop/settings", (route) =>
+    route.fulfill({
+      json: {
+        desktop: true,
+        startAtLogin: false,
+        autoStartServerIds: [],
+        keepInTray: true,
+        startupSupported: true,
+      },
+    }),
+  );
+  await page.route("**/api/desktop/updates", (route) =>
+    route.fulfill({
+      status: 503,
+      json: { error: "Updater temporarily unavailable." },
+    }),
+  );
+  await page.goto("/");
+  await page
+    .getByRole("button", { name: "Panel Settings", exact: true })
+    .click();
+  const settings = page.getByRole("dialog", {
+    name: "Panel Settings",
+    exact: true,
+  });
+  await settings
+    .getByRole("button", { name: "App updates", exact: true })
+    .click();
+  const updates = page.getByRole("dialog", {
+    name: "App updates",
+    exact: true,
+  });
+  await expect(updates.getByRole("alert")).toHaveText(
+    "Updater temporarily unavailable.",
+  );
+  await updates.getByRole("button", { name: "Close app updates" }).click();
+  await expect(settings).toBeVisible();
+  await expect(
+    settings.getByRole("button", { name: "App updates", exact: true }),
+  ).toBeFocused();
+});
+
 test("restarting to update waits for the selected server to finish saving", async ({
   page,
 }) => {

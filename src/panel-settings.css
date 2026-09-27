@@ -1,6 +1,6 @@
 .panel-settings-dialog {
   margin: auto;
-  width: min(760px, calc(100vw - 32px));
+  width: min(900px, calc(100vw - 32px));
   max-height: calc(100dvh - 32px);
   overflow: auto;
   border: 1px solid var(--border);
@@ -30,14 +30,50 @@
   color: var(--muted);
   font-size: 13px;
 }
+.panel-settings-tabs {
+  display: flex;
+  gap: 6px;
+  padding: 5px;
+  margin-bottom: 22px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: #181922;
+}
+.panel-settings-tabs button {
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  gap: 9px;
+  flex: 1;
+  border: 0;
+  border-radius: 5px;
+  padding: 11px 14px;
+  font: inherit;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--muted);
+  background: transparent;
+  cursor: pointer;
+}
+.panel-settings-tabs button[aria-selected="true"] {
+  background: #ffd00013;
+  color: var(--accent, #ffd000);
+  box-shadow: inset 0 0 0 1px #ffd00040;
+}
+.panel-settings-tabs button:focus-visible,
+.panel-server-trigger:focus-visible {
+  outline: 2px solid var(--accent, #ffd000);
+  outline-offset: 2px;
+}
 .panel-startup-settings {
   padding: 20px;
   margin-bottom: 22px;
   border: 1px solid var(--border);
-  border-radius: 5px;
+  border-radius: 8px;
   background: var(--panel);
 }
-.panel-startup-settings h3 {
+.panel-startup-settings h3,
+.panel-updates-settings h3 {
   display: flex;
   gap: 10px;
   align-items: center;
@@ -46,6 +82,11 @@
 }
 .panel-startup-settings h3 svg {
   color: #a9b4e7;
+}
+.panel-setting-row + .panel-setting-row {
+  border-top: 1px solid var(--border);
+  margin-top: 20px;
+  padding-top: 20px;
 }
 .panel-startup-settings fieldset {
   padding: 0;
@@ -57,23 +98,133 @@
   margin-bottom: 20px;
 }
 .panel-startup-settings .form-field small,
-.panel-tray-setting p,
+.panel-setting-row p,
+.panel-updates-settings p,
 .panel-settings-unavailable {
   color: var(--muted);
   font-size: 12px;
   line-height: 1.7;
 }
-.panel-tray-setting .shared-switch {
+.panel-setting-row .shared-switch {
   align-items: flex-start;
   text-align: left;
   font-size: 13px;
 }
-.panel-tray-setting .shared-switch-track {
+.panel-setting-row .shared-switch-track {
   margin-top: 2px;
   flex-shrink: 0;
 }
-.panel-tray-setting p {
+.panel-setting-row p {
   margin: 9px 0 0;
+}
+.panel-server-checklist {
+  position: relative;
+}
+.panel-server-checklist > label {
+  display: block;
+  font-size: 13px;
+  font-weight: 600;
+  margin-bottom: 10px;
+}
+.panel-server-trigger {
+  display: flex;
+  width: 100%;
+  gap: 16px;
+  align-items: center;
+  justify-content: space-between;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 13px 14px;
+  font: inherit;
+  font-size: 13px;
+  color: var(--text);
+  background: #2b2d39;
+  text-align: left;
+  cursor: pointer;
+}
+.panel-server-trigger span {
+  overflow-wrap: anywhere;
+  min-width: 0;
+}
+.panel-server-trigger svg {
+  flex-shrink: 0;
+  color: var(--muted);
+}
+.panel-server-trigger[aria-expanded="true"] svg {
+  transform: rotate(180deg);
+}
+.panel-server-choices {
+  position: absolute;
+  top: 100%;
+  left: 0;
+  right: 0;
+  z-index: 3;
+  margin-top: 5px;
+  padding: 6px;
+  max-height: 225px;
+  overflow: auto;
+  background: #252733;
+  border: 1px solid #4c4e60;
+  border-radius: 6px;
+  box-shadow: 0 8px 24px #0006;
+}
+.panel-server-choices label {
+  display: flex;
+  gap: 11px;
+  align-items: center;
+  padding: 12px 10px;
+  border-radius: 4px;
+  font-size: 13px;
+  cursor: pointer;
+}
+.panel-server-choices label:hover,
+.panel-server-choices label:focus-within {
+  background: #ffffff08;
+}
+.panel-server-choices input {
+  width: 17px;
+  height: 17px;
+  flex-shrink: 0;
+  margin: 0;
+  accent-color: var(--accent, #ffd000);
+}
+.panel-server-choices span {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.panel-server-choices small {
+  display: block;
+  color: var(--muted);
+  margin-top: 4px;
+}
+.panel-server-choices > p {
+  padding: 8px 10px;
+}
+.panel-updates-settings {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 24px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 20px;
+  background: var(--panel);
+}
+.panel-updates-settings h3 {
+  margin-bottom: 8px;
+}
+.panel-updates-settings p {
+  margin: 0;
+}
+.panel-updates-settings .btn {
+  flex-shrink: 0;
+}
+.panel-remote-settings {
+  display: grid;
+  gap: 22px;
+}
+.panel-settings-dialog [role="tabpanel"][hidden] {
+  display: none;
 }
 .panel-settings-actions {
   display: flex;
@@ -86,6 +237,9 @@
   line-height: 1.7;
   color: #f2b9c6;
 }
+.panel-settings-warning {
+  white-space: pre-line;
+}
 .panel-settings-dialog .subusers-setup {
   margin-bottom: 0;
 }
@@ -94,6 +248,12 @@
     padding: 18px;
   }
   .panel-startup-settings {
+    padding: 16px;
+  }
+  .panel-updates-settings {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 14px;
     padding: 16px;
   }
   .panel-settings-dialog .subusers-setup-heading {

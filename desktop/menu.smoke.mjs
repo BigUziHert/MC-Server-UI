@@ -216,17 +216,28 @@ try {
     exact: true,
   });
   await expect(settingsDialog).toBeVisible();
+  await settingsDialog
+    .getByRole("button", { name: "App updates", exact: true })
+    .click();
   await expect(
-    settingsDialog.getByLabel("When this PC starts", { exact: true }),
+    reopened.getByRole("dialog", { name: "App updates", exact: true }),
+  ).toBeVisible();
+  await reopened.getByRole("button", { name: "Close app updates" }).click();
+  await expect(settingsDialog).toBeVisible();
+  await expect(
+    settingsDialog.getByRole("switch", {
+      name: "Start MC Panel when I sign in",
+      exact: true,
+    }),
   ).toBeDisabled();
   const keepInTray = settingsDialog.getByRole("switch", {
-    name: "Keep MC Panel in the system tray when its window is closed",
+    name: "Keep MC Panel in the system tray",
     exact: true,
   });
   await expect(keepInTray).toBeChecked();
   await keepInTray.click();
   await settingsDialog
-    .getByRole("button", { name: "Save startup settings", exact: true })
+    .getByRole("button", { name: "Save settings", exact: true })
     .click();
   await expect
     .poll(() =>
