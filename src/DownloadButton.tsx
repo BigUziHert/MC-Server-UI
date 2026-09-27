@@ -1,18 +1,20 @@
 import { useRef, useState, type ButtonHTMLAttributes } from "react";
-import { api } from "./api";
+import { api, isPanelProxyUrl } from "./api";
 import { sessionCredential, sessionRevision } from "./session-auth";
 
 export async function downloadToComputer(url: string) {
   const revision = sessionRevision();
-  const target = sessionCredential()
-    ? (
-        await api<{ url: string }>("/access/download", {
-          method: "POST",
-          body: JSON.stringify({ url }),
-        })
-      ).url
-    : url;
-  if (revision !== sessionRevision())
+  const proxied = isPanelProxyUrl(url);
+  const target =
+    sessionCredential() && !proxied
+      ? (
+          await api<{ url: string }>("/access/download", {
+            method: "POST",
+            body: JSON.stringify({ url }),
+          })
+        ).url
+      : url;
+  if (!proxied && revision !== sessionRevision())
     throw new Error("This sign-in ended before the download started.");
   const parsed = new URL(target, window.location.href);
   if (

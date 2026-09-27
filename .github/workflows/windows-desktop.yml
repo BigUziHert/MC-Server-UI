@@ -78,6 +78,9 @@ jobs:
       - name: Smoke-test consistent desktop and remote interfaces
         run: node desktop/remote-frontend.smoke.mjs
 
+      - name: Smoke-test unified workspace transport and saved accounts
+        run: node desktop/unified-panels.smoke.mjs
+
       - name: Smoke-test desktop navigation
         run: node desktop/menu.smoke.mjs
 

@@ -19,7 +19,7 @@ import {
   X,
 } from "lucide-react";
 import {
-  api as panelApi,
+  usePanelApi,
   useServerApi,
   relativeTime,
   ServerScope,
@@ -101,6 +101,7 @@ export function RemoteAccessSetup({
   onSettings: (settings: AccessSettings | null) => void;
   notify: PageProps["notify"];
 }) {
+  const { api: panelApi } = usePanelApi();
   const [settings, setSettings] = useState<AccessSettings | null>(null);
   const [draft, setDraft] = useState({
     enabled: false,
@@ -156,7 +157,7 @@ export function RemoteAccessSetup({
         if (!signal?.aborted) setLoading(false);
       }
     },
-    [applySettings, onSettings],
+    [panelApi, applySettings, onSettings],
   );
 
   useEffect(() => {
@@ -657,6 +658,7 @@ function AccessManagement({
     }))
     .filter((group) => group.permissions.length);
   const { api: serverApi } = useServerApi();
+  const { api: panelApi } = usePanelApi();
   const api = accountsView ? panelApi : serverApi;
   const basePath = accountsView ? "/panel-users" : "/subusers";
   const [users, setUsers] = useState<Subuser[]>([]);

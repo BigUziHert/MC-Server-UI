@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useContext, useEffect, useRef, useState } from "react";
 import { Globe2, LogIn, LogOut, Monitor } from "lucide-react";
 import AccountMenu, { type AccountMenuAction } from "./AccountMenu";
 import { post } from "./api";
@@ -6,6 +6,7 @@ import type { ConnectionMode } from "./ConnectPanel";
 import { useDesktopConnections } from "./desktop-connections";
 import PanelConnections from "./PanelConnections";
 import { useConfirmDiscardPropertyDrafts } from "./property-drafts";
+import { DesktopWorkspaceContext } from "./workspace-target";
 
 export type PanelSession = {
   role: "subuser";
@@ -20,28 +21,35 @@ export type PanelSession = {
 export function DesktopPanelReturn() {
   const [error, setError] = useState("");
   const [manage, setManage] = useState(false);
+  const workspace = useContext(DesktopWorkspaceContext);
   if (!window.mcPanelConnections) return null;
+  const unified = window.mcPanelConnections.unified === true;
   return (
     <div className="desktop-panel-return">
-      <button
-        className="btn"
-        type="button"
-        onClick={() => {
-          setError("");
-          void window
-            .mcPanelConnections!.activate("local")
-            .catch((cause) => setError(cause.message));
-        }}
-      >
-        <Monitor size={15} /> Back to this computer
-      </button>
+      {!unified && (
+        <button
+          className="btn"
+          type="button"
+          onClick={() => {
+            setError("");
+            void window
+              .mcPanelConnections!.activate("local")
+              .catch((cause) => setError(cause.message));
+          }}
+        >
+          <Monitor size={15} /> Back to this computer
+        </button>
+      )}
       {error && <p role="alert">{error}</p>}
       <button
         className="btn panel-connections-open"
         type="button"
-        onClick={() => setManage(true)}
+        onClick={() =>
+          unified && workspace ? workspace.manageConnections() : setManage(true)
+        }
       >
-        <Globe2 size={15} /> Manage panel connections
+        <Globe2 size={15} />{" "}
+        {unified ? "Manage Connections" : "Manage panel connections"}
       </button>
       {manage && <PanelConnections onClose={() => setManage(false)} />}
     </div>
@@ -52,12 +60,16 @@ export default function PanelAccount({
   session,
   onSignedOut,
   onConnect,
+  targetPanelId,
 }: {
   session?: PanelSession;
   onSignedOut?: () => void;
   onConnect: (mode: ConnectionMode) => void;
+  targetPanelId?: string;
 }) {
-  const connections = useDesktopConnections();
+  const workspace = useContext(DesktopWorkspaceContext);
+  const legacyConnections = useDesktopConnections(!workspace);
+  const connections = workspace?.connections ?? legacyConnections;
   const confirmDiscardDrafts = useConfirmDiscardPropertyDrafts();
   const mounted = useRef(true);
   useEffect(() => {
@@ -69,6 +81,15 @@ export default function PanelAccount({
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const [manage, setManage] = useState(false);
+  const unified = window.mcPanelConnections?.unified === true;
+  const targetPanel = connections?.panels.find(
+    (panel) =>
+      panel.id ===
+      (targetPanelId ??
+        workspace?.selected?.panelId ??
+        connections.selectedServer?.panelId ??
+        "local"),
+  );
   async function perform(action: () => Promise<unknown>) {
     if (busy) return;
     setBusy(true);
@@ -85,7 +106,9 @@ export default function PanelAccount({
       setBusy(false);
     }
   }
-  const actions: AccountMenuAction[] = (connections?.panels ?? [])
+  const actions: AccountMenuAction[] = (
+    unified ? [] : (connections?.panels ?? [])
+  )
     .filter(
       (panel) =>
         !panel.local &&
@@ -100,7 +123,7 @@ export default function PanelAccount({
       onSelect: () =>
         void perform(() => window.mcPanelConnections!.activate(panel.id)),
     }));
-  if (session && window.mcPanelConnections)
+  if (!unified && session && window.mcPanelConnections)
     actions.unshift({
       id: "local",
       label: "Switch to this computer",
@@ -111,7 +134,7 @@ export default function PanelAccount({
     });
   actions.push({
     id: "signin",
-    label: "Sign in to another panel",
+    label: unified ? "Add a panel" : "Sign in to another panel",
     icon: <LogIn size={16} />,
     disabled: busy,
     onSelect: () => onConnect("signin"),
@@ -119,12 +142,20 @@ export default function PanelAccount({
   if (window.mcPanelConnections)
     actions.push({
       id: "connections",
-      label: "Manage panel connections",
+      label: unified ? "Manage Connections" : "Manage panel connections",
       icon: <Globe2 size={16} />,
       disabled: busy,
-      onSelect: () => setManage(true),
+      onSelect: () =>
+        unified && workspace ? workspace.manageConnections() : setManage(true),
     });
-  if (session)
+  if (unified)
+    actions.push({
+      id: "invitation",
+      label: "Accept an invitation",
+      icon: <LogIn size={16} />,
+      onSelect: () => onConnect("invitation"),
+    });
+  if (!unified && session)
     actions.push({
       id: "signout",
       label: "Sign out",
@@ -151,18 +182,41 @@ export default function PanelAccount({
       )}
       <AccountMenu
         identity={
-          session
-            ? { name: session.email, detail: window.location.host }
-            : {
-                name: "Local administrator",
-                detail: "This computer",
-                initial: "L",
+          unified && targetPanel && !targetPanel.local
+            ? {
+                name:
+                  targetPanel.session?.email ??
+                  (targetPanel.signedIn ? "Saved panel account" : "Signed out"),
+                detail: targetPanel.label,
               }
+            : session
+              ? { name: session.email, detail: window.location.host }
+              : {
+                  name: "Local administrator",
+                  detail: "This computer",
+                  initial: "L",
+                }
         }
         status={
-          session
-            ? { label: "Signed in · Shared access", tone: "active" }
-            : { label: "Local access", tone: "neutral" }
+          unified && targetPanel && !targetPanel.local
+            ? {
+                label:
+                  targetPanel.connectionState === "unavailable"
+                    ? "Panel unavailable"
+                    : targetPanel.connectionState === "connecting"
+                      ? "Connecting…"
+                      : targetPanel.signedIn
+                        ? "Signed in · Shared access"
+                        : "Sign in to access servers",
+                tone:
+                  targetPanel.signedIn &&
+                  targetPanel.connectionState === "connected"
+                    ? "active"
+                    : "neutral",
+              }
+            : session
+              ? { label: "Signed in · Shared access", tone: "active" }
+              : { label: "Local access", tone: "neutral" }
         }
         actions={actions}
       />

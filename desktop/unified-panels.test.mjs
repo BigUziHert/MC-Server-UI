@@ -1,0 +1,613 @@
+import assert from "node:assert/strict";
+import test from "node:test";
+import fs from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
+import { createUnifiedPanelController } from "./unified-panels.mjs";
+import { createUnifiedConnectionStore } from "./unified-connection-store.mjs";
+import { startDesktopRuntime } from "./runtime.mjs";
+
+const account = {
+  role: "subuser",
+  email: "friend@example.test",
+  userId: "friend",
+  accountId: "account",
+  serverId: "same-id",
+  permissions: ["server.view"],
+  hostPermissions: [],
+};
+const token = "a".repeat(43);
+const response = (value, status = 200) =>
+  new Response(JSON.stringify(value), {
+    status,
+    headers: { "Content-Type": "application/json" },
+  });
+
+async function harness(
+  t,
+  { hostPermissions = [], behavior, storeRead, pollMs = 60000 } = {},
+) {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "mc-unified-test-"));
+  let controller;
+  const calls = [],
+    persisted = [];
+  const runtime = await startDesktopRuntime({
+    dataDir: root,
+    scheduler: false,
+    proxyRemotePanel: (...args) => controller.proxy(...args),
+  });
+  const contents = {
+    isDestroyed: () => false,
+    send() {},
+    getURL: () => runtime.url,
+  };
+  contents.mainFrame = { origin: runtime.url, url: `${runtime.url}/` };
+  const window = { webContents: contents };
+  controller = createUnifiedPanelController({
+    window,
+    localOrigin: runtime.url,
+    pollMs,
+    store: {
+      read: storeRead ?? (async () => ({ panels: [], selectedServer: null })),
+      save: async (value) => persisted.push(value),
+      close: async () => {},
+    },
+    session: {
+      fromPartition: () => ({
+        setCertificateVerifyProc() {},
+        clearStorageData: async () => {},
+        closeAllConnections: async () => {},
+        fetch: async (input, options) => {
+          const url = new URL(input),
+            headers = new Headers(options.headers);
+          calls.push({
+            url,
+            headers,
+            method: options.method,
+            body: options.body,
+          });
+          if (behavior) {
+            const result = await behavior(url, options);
+            if (result) return result;
+          }
+          if (url.pathname === "/api/access/login")
+            return response({ ...account, sessionToken: token });
+          if (url.pathname === "/api/access/session")
+            return response(
+              headers.has("Authorization")
+                ? { ...account, hostPermissions }
+                : { role: "guest" },
+            );
+          if (url.pathname === "/api/servers")
+            return response({
+              servers: [
+                {
+                  id: "same-id",
+                  name: url.host,
+                  status: "offline",
+                  accessPermissions: ["server.view"],
+                  serverDir: "C:/remote/private",
+                },
+              ],
+              hostPermissions,
+            });
+          if (url.pathname === "/api/access/logout")
+            return response({ ok: true });
+          if (url.pathname === "/api/server")
+            return response({
+              host: url.host,
+              serverId: headers.get("X-Server-Id"),
+            });
+          if (url.pathname === "/api/files/upload") {
+            const bytes = Buffer.from(
+              await new Response(options.body).arrayBuffer(),
+            );
+            return response({
+              size: bytes.length,
+              contentType: headers.get("Content-Type"),
+              text: bytes.toString("utf8"),
+            });
+          }
+          if (url.pathname === "/api/files/download")
+            return new Response("remote bytes", {
+              headers: {
+                "Content-Type": "application/octet-stream",
+                "Content-Disposition": 'attachment; filename="world.zip"',
+              },
+            });
+          return response({ error: "Not found" }, 404);
+        },
+      }),
+    },
+    dialog: { showMessageBox: async () => ({ response: 1 }) },
+    listLocalServers: () => [
+      { id: "same-id", name: "Local", status: "offline" },
+    ],
+  });
+  t.after(async () => {
+    await controller.close();
+    await runtime.close();
+    await fs.rm(root, { recursive: true, force: true });
+  });
+  const signIn = async (origin) => {
+    const opened = await controller.open(origin);
+    const id = opened.panels.find((panel) => panel.origin === origin).id;
+    await controller.signIn(id, {
+      email: account.email,
+      password: "fixture-password",
+    });
+    return controller.list().panels.find((panel) => panel.id === id);
+  };
+  const proxy = (panel, target, options = {}) =>
+    fetch(
+      `${runtime.url}/api/desktop/panels/${panel.id}/proxy/api${target}${target.includes("?") ? "&" : "?"}desktopEpoch=${panel.sessionEpoch}`,
+      {
+        ...options,
+        headers: {
+          Cookie: `mc-panel-desktop=${runtime.token}`,
+          ...options.headers,
+        },
+      },
+    );
+  return {
+    root,
+    runtime,
+    controller,
+    calls,
+    persisted,
+    signIn,
+    proxy,
+    contents,
+  };
+}
+
+test("unified proxy binds colliding server IDs to panel and epoch without moving the renderer", async (t) => {
+  const h = await harness(t);
+  const a = await h.signIn("https://a.example.test"),
+    c = await h.signIn("https://c.example.test");
+  await h.controller.selectServer(a.id, "same-id");
+  const result = await h.proxy(c, "/server?serverId=same-id", {
+    headers: { Authorization: "Bearer attacker", "X-Server-Id": "same-id" },
+  });
+  assert.deepEqual(await result.json(), {
+    host: "c.example.test",
+    serverId: "same-id",
+  });
+  assert.deepEqual(h.controller.list().selectedServer, {
+    panelId: a.id,
+    serverId: "same-id",
+  });
+  const call = h.calls.at(-1);
+  assert.equal(call.headers.get("Authorization"), `Bearer ${token}`);
+  assert.equal(call.headers.get("Cookie"), null);
+  assert.equal(call.headers.get("Origin"), c.origin);
+  assert.equal(call.url.searchParams.has("desktopEpoch"), false);
+  assert.equal(h.contents.getURL(), h.runtime.url);
+  assert.equal(
+    (
+      await h.proxy(c, "/server?serverId=same-id", {
+        headers: { "X-Server-Id": "different" },
+      })
+    ).status,
+    400,
+  );
+  assert.equal((await h.proxy(c, "/server?serverId=unknown")).status, 403);
+  assert.equal(
+    (await h.proxy(c, "/desktop/settings?serverId=same-id")).status,
+    403,
+  );
+  await h.controller.signOut(c.id);
+  assert.equal((await h.proxy(c, "/server?serverId=same-id")).status, 409);
+  assert.equal(
+    h.controller.list().panels.find((panel) => panel.id === a.id).signedIn,
+    true,
+  );
+});
+
+test("unified runtime streams multipart uploads and attachment bytes through local owner authentication", async (t) => {
+  const h = await harness(t);
+  const panel = await h.signIn("https://a.example.test");
+  const form = new FormData();
+  form.set("file", new Blob(["payload".repeat(20000)]), "remote.txt");
+  form.set("path", "world");
+  const upload = await h.proxy(panel, "/files/upload?serverId=same-id", {
+    method: "POST",
+    body: form,
+  });
+  const received = await upload.json();
+  assert.equal(upload.status, 200);
+  assert.ok(received.size > 140000);
+  assert.match(received.contentType, /^multipart\/form-data; boundary=/);
+  assert.match(received.text, /name="path"\r\n\r\nworld/);
+  const download = await h.proxy(
+    panel,
+    "/files/download?serverId=same-id&path=world",
+  );
+  assert.equal(await download.text(), "remote bytes");
+  assert.match(download.headers.get("Content-Disposition"), /world.zip/);
+  const anonymous = await fetch(
+    `${h.runtime.url}/api/desktop/panels/${panel.id}/proxy/api/server?desktopEpoch=${panel.sessionEpoch}&serverId=same-id`,
+  );
+  assert.equal(anonymous.status, 401);
+  assert.equal(
+    (
+      await h.proxy(panel, "/server-setup", {
+        method: "POST",
+        body: "{}",
+        headers: { "Content-Type": "application/json" },
+      })
+    ).status,
+    403,
+  );
+});
+
+test("unified offline state retains display-only identity and blocks requests until live retry", async (t) => {
+  let offline = false;
+  const h = await harness(t, {
+    behavior: async () => {
+      if (offline) throw new Error("offline");
+    },
+  });
+  const panel = await h.signIn("https://a.example.test");
+  offline = true;
+  await assert.rejects(h.controller.retry(panel.id), /unavailable/);
+  const saved = h.controller.list().panels.find((item) => item.id === panel.id);
+  assert.equal(saved.signedIn, true);
+  assert.equal(saved.connectionState, "unavailable");
+  assert.equal(saved.servers[0].accessPermissions, undefined);
+  assert.equal(saved.servers[0].serverDir, undefined);
+  assert.equal((await h.proxy(panel, "/server?serverId=same-id")).status, 503);
+  offline = false;
+  await h.controller.retry(panel.id);
+  assert.equal((await h.proxy(panel, "/server?serverId=same-id")).status, 200);
+});
+
+test("initial selection waits for saved connections and closing before initialization does not overwrite them", async (t) => {
+  let release;
+  const gate = new Promise((resolve) => {
+    release = resolve;
+  });
+  const remote = {
+    id: "00000000-0000-4000-8000-000000000001",
+    origin: "https://saved.example.test",
+    servers: [],
+  };
+  const h = await harness(t, { storeRead: () => gate });
+  assert.equal(h.controller.list().ready, false);
+  const selecting = h.controller.selectServer("local", "same-id");
+  assert.equal(h.persisted.length, 0);
+  release({
+    panels: [remote],
+    selectedServer: { panelId: remote.id, serverId: "old-id" },
+  });
+  await selecting;
+  assert.equal(h.controller.list().ready, true);
+  assert.equal(h.persisted.at(-1).panels[0].id, remote.id);
+  const unopened = await harness(t);
+  await unopened.controller.close();
+  assert.equal(unopened.persisted.length, 0);
+});
+
+test("failed invitations preserve the account lease and protected route spelling cannot expose credentials", async (t) => {
+  const h = await harness(t, {
+    behavior: async (url) =>
+      url.pathname === "/api/access/accept"
+        ? response({ error: "Invitation expired" }, 400)
+        : undefined,
+  });
+  const before = await h.signIn("https://a.example.test");
+  await assert.rejects(
+    h.controller.acceptInvitation(before.id, {
+      token: "b".repeat(43),
+      password: "fixture-password",
+    }),
+    /expired/,
+  );
+  const after = h.controller
+    .list()
+    .panels.find((panel) => panel.id === before.id);
+  assert.equal(after.sessionEpoch, before.sessionEpoch);
+  assert.equal(after.signedIn, true);
+  for (const target of [
+    "/access/login/",
+    "/access/LOGIN",
+    "/access/accept/",
+    "/desktop/settings/",
+    "/panel-users/",
+  ]) {
+    assert.equal(
+      (
+        await h.proxy(after, `${target}?serverId=same-id`, {
+          method: "POST",
+          body: "{}",
+          headers: { "Content-Type": "application/json" },
+        })
+      ).status,
+      403,
+    );
+  }
+});
+
+test("a delayed prior-session 401 body cannot sign out a replacement session", async (t) => {
+  let body, markStarted;
+  const started = new Promise((resolve) => {
+    markStarted = resolve;
+  });
+  const h = await harness(t, {
+    behavior: async (url) => {
+      if (url.pathname !== "/api/server") return;
+      return new Response(
+        new ReadableStream({
+          start(controller) {
+            body = controller;
+            markStarted();
+          },
+        }),
+        { status: 401, headers: { "Content-Type": "application/json" } },
+      );
+    },
+  });
+  const before = await h.signIn("https://a.example.test");
+  const pending = h.proxy(before, "/server?serverId=same-id");
+  await started;
+  await h.controller.signIn(before.id, {
+    email: account.email,
+    password: "replacement-password",
+  });
+  body.enqueue(
+    new TextEncoder().encode(JSON.stringify({ error: "Old account expired" })),
+  );
+  body.close();
+  assert.equal((await pending).status, 409);
+  const after = h.controller
+    .list()
+    .panels.find((panel) => panel.id === before.id);
+  assert.equal(after.signedIn, true);
+  assert.notEqual(after.sessionEpoch, before.sessionEpoch);
+});
+
+test("host creation waits for a post-registration roster rather than coalescing an older poll", async (t) => {
+  let hold = false,
+    created = false,
+    release,
+    markBlocked;
+  const blocked = new Promise((resolve) => {
+    markBlocked = resolve;
+  });
+  const h = await harness(t, {
+    hostPermissions: ["server.create"],
+    pollMs: 20,
+    behavior: async (url) => {
+      if (url.pathname === "/api/servers") {
+        const servers = [
+          {
+            id: "same-id",
+            name: "Existing",
+            status: "offline",
+            accessPermissions: ["server.view"],
+          },
+          ...(created
+            ? [
+                {
+                  id: "created",
+                  name: "Created",
+                  status: "offline",
+                  accessPermissions: ["server.view"],
+                },
+              ]
+            : []),
+        ];
+        if (hold) {
+          hold = false;
+          markBlocked();
+          await new Promise((resolve) => {
+            release = resolve;
+          });
+        }
+        return response({ servers, hostPermissions: ["server.create"] });
+      }
+      if (url.pathname === "/api/server-setup") {
+        created = true;
+        return response({ server: { id: "created" } }, 201);
+      }
+    },
+  });
+  const panel = await h.signIn("https://a.example.test");
+  hold = true;
+  await blocked;
+  const setup = h.proxy(panel, "/server-setup", {
+    method: "POST",
+    body: "{}",
+    headers: { "Content-Type": "application/json" },
+  });
+  while (!created) await new Promise((resolve) => setTimeout(resolve, 1));
+  release();
+  assert.equal((await setup).status, 201);
+  assert.equal(
+    h.controller
+      .list()
+      .panels.find((entry) => entry.id === panel.id)
+      .servers.some((server) => server.id === "created"),
+    true,
+  );
+  assert.equal((await h.proxy(panel, "/server?serverId=created")).status, 200);
+});
+
+test("sign-out hides cached rows before a stalled remote logout completes", async (t) => {
+  let release;
+  const gate = new Promise((resolve) => {
+    release = resolve;
+  });
+  const h = await harness(t, {
+    behavior: async (url) => {
+      if (url.pathname === "/api/access/logout") {
+        await gate;
+        return response({ ok: true });
+      }
+    },
+  });
+  const panel = await h.signIn("https://a.example.test");
+  await h.controller.signOut(panel.id);
+  const signedOut = h.controller
+    .list()
+    .panels.find((entry) => entry.id === panel.id);
+  assert.equal(signedOut.signedIn, false);
+  assert.deepEqual(signedOut.servers, []);
+  assert.equal(h.persisted.at(-1).panels[0].token, null);
+  release();
+});
+
+test("revocation clears persisted credentials and signed-out cached records never expose a roster", async (t) => {
+  let revoked = false;
+  const h = await harness(t, {
+    behavior: async (url) =>
+      revoked && url.pathname === "/api/servers"
+        ? response({ error: "Session revoked" }, 401)
+        : undefined,
+  });
+  const panel = await h.signIn("https://a.example.test");
+  revoked = true;
+  await assert.rejects(h.controller.retry(panel.id), /revoked/);
+  assert.equal(h.persisted.at(-1).panels[0].token, null);
+  assert.deepEqual(h.persisted.at(-1).panels[0].servers, []);
+  const cached = await harness(t, {
+    storeRead: async () => ({
+      selectedServer: null,
+      panels: [
+        {
+          id: "00000000-0000-4000-8000-000000000001",
+          origin: "https://cached.example.test",
+          servers: [{ id: "private", name: "Private", status: "offline" }],
+        },
+      ],
+    }),
+  });
+  await cached.controller.initialize();
+  const record = cached.controller.list().panels.find((item) => !item.local);
+  assert.equal(record.signedIn, false);
+  assert.deepEqual(record.servers, []);
+});
+
+test("a sign-in queued behind roster refresh cannot start after sign-out", async (t) => {
+  let hold = false,
+    release,
+    markBlocked;
+  const blocked = new Promise((resolve) => {
+    markBlocked = resolve;
+  });
+  const h = await harness(t, {
+    pollMs: 20,
+    behavior: async (url) => {
+      if (hold && url.pathname === "/api/access/session") {
+        hold = false;
+        markBlocked();
+        await new Promise((resolve) => {
+          release = resolve;
+        });
+      }
+    },
+  });
+  const panel = await h.signIn("https://a.example.test");
+  hold = true;
+  await blocked;
+  const accepting = h.controller.acceptInvitation(panel.id, {
+    token: "b".repeat(43),
+    password: "fixture-password",
+  });
+  const rejected = assert.rejects(accepting, /sign-in changed/);
+  await new Promise((resolve) => setImmediate(resolve));
+  await h.controller.signOut(panel.id);
+  release();
+  await rejected;
+  assert.equal(
+    h.calls.filter((call) => call.url.pathname === "/api/access/accept").length,
+    0,
+  );
+});
+
+test("sign-out resumes background refresh after an in-flight invitation is cancelled", async (t) => {
+  let release, entered, resumed;
+  const gate = new Promise((resolve) => { release = resolve; });
+  const authenticating = new Promise((resolve) => { entered = resolve; });
+  const refreshed = new Promise((resolve) => { resumed = resolve; });
+  let signedOut = false;
+  const h = await harness(t, {
+    pollMs: 20,
+    behavior: async (url, options) => {
+      if (url.pathname === "/api/access/accept") {
+        entered();
+        await gate;
+        return response({ ...account, sessionToken: token });
+      }
+      if (signedOut && url.pathname === "/api/access/session" &&
+          !new Headers(options.headers).has("Authorization")) resumed();
+    },
+  });
+  const panel = await h.signIn("https://a.example.test");
+  const accepting = h.controller.acceptInvitation(panel.id, {
+    token: "b".repeat(43), password: "fixture-password",
+  });
+  const rejected = assert.rejects(accepting, /changed|abort/i);
+  await authenticating;
+  await h.controller.signOut(panel.id);
+  signedOut = true;
+  let timeout;
+  try {
+    await Promise.race([
+      refreshed,
+      new Promise((_, reject) => {
+        timeout = setTimeout(() => reject(new Error("Background refresh stayed paused after sign-out.")), 2000);
+      }),
+    ]);
+  } finally {
+    clearTimeout(timeout);
+    release();
+    await rejected;
+  }
+  assert.equal(h.controller.list().panels.find((entry) => entry.id === panel.id).signedIn, false);
+});
+
+test("unified credentials are encrypted and offline roster persistence excludes paths and permissions", async (t) => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "mc-unified-store-"));
+  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  // Deterministic fake encryption verifies the store contract; native smoke
+  // exercises Electron safeStorage under an isolated Windows profile.
+  const safeStorage = {
+    isEncryptionAvailable: () => true,
+    encryptString: (value) => Buffer.from(value.split("").reverse().join("")),
+    decryptString: (value) => value.toString().split("").reverse().join(""),
+  };
+  const store = createUnifiedConnectionStore({ dataDir: root, safeStorage });
+  const id = "00000000-0000-4000-8000-000000000001";
+  await store.save({
+    selectedServer: { panelId: id, serverId: "same-id" },
+    panels: [
+      {
+        id,
+        origin: "https://a.example.test",
+        token,
+        session: account,
+        servers: [
+          {
+            id: "same-id",
+            name: "Private world",
+            status: "running",
+            serverDir: "C:/private",
+            accessPermissions: ["file.update"],
+          },
+        ],
+      },
+    ],
+  });
+  const bytes = await fs.readFile(
+    path.join(root, "desktop-workspace.json"),
+    "utf8",
+  );
+  assert.ok(!bytes.includes(token));
+  assert.ok(!bytes.includes("C:/private"));
+  assert.ok(!bytes.includes("file.update"));
+  const saved = await store.read();
+  assert.equal(saved.panels[0].token, token);
+  assert.equal(saved.panels[0].session.email, account.email);
+  assert.equal(saved.panels[0].servers[0].status, "unavailable");
+});

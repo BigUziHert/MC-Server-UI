@@ -1,5 +1,5 @@
 // Source-entry Electron smoke: no native menu (including Alt), live tray, and
-// native local selection flush ordering. Uses only a temporary app profile.
+// unified local selection persistence. Uses only a temporary app profile.
 import assert from "node:assert/strict";
 import fs from "node:fs/promises";
 import os from "node:os";
@@ -117,34 +117,34 @@ try {
     };
     const first = await create("First fixture world", 25565);
     const second = await create("Second fixture world", 25566);
-    const events = [];
-    window.addEventListener("mc-panel-local-server-selected", (event) =>
-      events.push(event.detail),
+    await window.mcPanelConnections.selectServer("local", first);
+    const result = await window.mcPanelConnections.selectServer(
+      "local",
+      second,
     );
-    // Simulate the owner's older pending save. Main must flush this before the
-    // requested native selection so the earlier choice cannot win the race.
-    window.__mcPanelFlushSelection = async () => {
-      const response = await fetch("/api/desktop/selection", {
-        method: "PUT",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ activeServerId: first }),
-      });
-      if (!response.ok) throw new Error("Fixture flush failed.");
-    };
-    const result = await window.mcPanelConnections.selectLocalServer(second);
-    const persisted = await (await fetch("/api/desktop/selection")).json();
+    const persisted = await window.mcPanelConnections.list();
     return {
       selected: second,
-      persisted: persisted.activeServerId,
+      persisted: persisted.selectedServer,
       activeId: result.activeId,
       localServers: result.localServers,
-      events,
     };
   });
-  assert.equal(selection.persisted, selection.selected);
+  assert.deepEqual(selection.persisted, {
+    panelId: "local",
+    serverId: selection.selected,
+  });
   assert.equal(selection.activeId, "local");
   assert.equal(selection.localServers.length, 2);
-  assert.deepEqual(selection.events, [{ serverId: selection.selected }]);
+  assert.deepEqual(
+    JSON.parse(
+      await fs.readFile(
+        path.join(root, "profile", "data", "desktop-workspace.json"),
+        "utf8",
+      ),
+    ).selectedServer,
+    selection.persisted,
+  );
   await expect(
     page.getByRole("button", { name: "App updates", exact: true }),
   ).toBeVisible();
@@ -189,6 +189,13 @@ try {
   const reopened = await application.firstWindow();
   await expect
     .poll(() =>
+      reopened.evaluate(
+        async () => (await window.mcPanelConnections.list()).selectedServer,
+      ),
+    )
+    .toEqual(selection.persisted);
+  await expect
+    .poll(() =>
       reopened.evaluate(() => localStorage.getItem("mc-panel.launchpad.rows")),
     )
     .toBe("75");
@@ -222,13 +229,30 @@ try {
   await settingsDialog
     .getByRole("button", { name: "App updates", exact: true })
     .click();
+  await expect
+    .poll(
+      () =>
+        application
+          .windows()
+          .filter((page) => page.url().includes("?app-updates=1")).length,
+    )
+    .toBe(1);
+  const settingsUpdater = application
+    .windows()
+    .find((page) => page.url().includes("?app-updates=1"));
+  assert.equal(
+    new URL(settingsUpdater.url()).origin,
+    new URL(reopened.url()).origin,
+  );
   await expect(
-    reopened.getByRole("dialog", {
+    settingsUpdater.getByRole("dialog", {
       name: "App updates on this computer",
       exact: true,
     }),
   ).toBeVisible();
-  await reopened.getByRole("button", { name: "Close app updates" }).click();
+  await settingsUpdater
+    .getByRole("button", { name: "Close app updates" })
+    .click();
   await expect(settingsDialog).toBeVisible();
   await expect(
     settingsDialog.getByRole("switch", {
@@ -274,7 +298,7 @@ try {
   await closed;
   application = undefined;
   console.log(
-    "Passed real Electron source smoke: native menu removed including Alt, tray lifecycle preserved, disabling close-to-tray persists and quits on window close, unsupported startup and updates disabled, immediate update dialog, local display preferences survive relaunch with a new private credential, and owner selection flush/persist/event ordering.",
+    "Passed real Electron source smoke: native menu removed including Alt, tray lifecycle preserved, disabling close-to-tray persists and quits on window close, unsupported startup and updates disabled, immediate update dialog, and display preferences and unified server selection survive relaunch with a new private owner credential.",
   );
 } finally {
   if (application) await application.close().catch(() => {});

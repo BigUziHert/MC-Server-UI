@@ -42,7 +42,13 @@ export function authenticatedFetch(input: string, options: RequestInit = {}) {
   )
     throw new Error("Panel credentials can only be sent to this panel's API.");
   const headers = new Headers(options.headers);
-  const token = memoryToken;
+  // The desktop proxy is authenticated as this computer, then injects the
+  // selected remote panel's token in main. Never send renderer credentials.
+  const proxy = /^\/api\/desktop\/panels\/[^/?#]+\/proxy\/api(?:\/|$)/.test(
+    target.pathname,
+  );
+  const token = proxy ? null : memoryToken;
+  if (proxy) headers.delete("Authorization");
   if (token) headers.set("Authorization", `Bearer ${token}`);
   return fetch(target.pathname + target.search, {
     ...options,

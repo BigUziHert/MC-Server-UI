@@ -16,6 +16,32 @@ const rowKeys = new Set([
   ].map((id) => `mc-panel.players.rows.${id}`),
 ]);
 const viewKey = /^mc-panel\.launchpad\.view\.(?:default|[a-zA-Z0-9_-]{1,128})$/;
+function remoteViewScope(key) {
+  const match =
+    /^mc-panel\.launchpad\.remote-view\.([A-Za-z0-9_-]{1,1024})$/.exec(key);
+  if (!match) return null;
+  try {
+    const value = JSON.parse(
+      Buffer.from(match[1], "base64url").toString("utf8"),
+    );
+    if (
+      !Array.isArray(value) ||
+      value.length !== 3 ||
+      value.some(
+        (part, index) =>
+          typeof part !== "string" ||
+          !part ||
+          part.length > (index === 1 ? 256 : 128) ||
+          /[\x00-\x1f\x7f]/.test(part),
+      ) ||
+      Buffer.from(JSON.stringify(value)).toString("base64url") !== match[1]
+    )
+      return null;
+    return value;
+  } catch {
+    return null;
+  }
+}
 const choices = {
   platform: [
     "modrinth",
@@ -78,7 +104,7 @@ export function validatePreference(key, value) {
       )
     )
       throw fail(400, "Provide valid navigation choices.");
-  } else if (viewKey.test(key)) {
+  } else if (viewKey.test(key) || remoteViewScope(key)) {
     if (
       Object.entries(parsed).some(([name, choice]) => {
         if (name === "installedOnly") return typeof choice !== "boolean";

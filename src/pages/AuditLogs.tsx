@@ -13,7 +13,7 @@ import {
   Users,
 } from "lucide-react";
 import {
-  api as panelApi,
+  usePanelApi,
   useServerApi,
   relativeTime,
   type PageProps,
@@ -51,6 +51,7 @@ export default function AuditLogs({
   serverOnly = false,
 }: PageProps & { scope?: "server" | "panel"; serverOnly?: boolean }) {
   const { api: serverApi } = useServerApi();
+  const { api: panelApi } = usePanelApi();
   const [activityScope, setActivityScope] = useState(scope);
   const api = activityScope === "panel" ? panelApi : serverApi;
   const [entries, setEntries] = useState<AuditEntry[]>([]);

@@ -28,6 +28,7 @@ import {
   formatBytes,
   messageOf,
   ServerScope,
+  PanelScope,
   useServerApi,
   type PageProps,
 } from "../api";
@@ -37,7 +38,11 @@ import RefreshButton from "../RefreshButton";
 import StatePanel from "../StatePanel";
 import Pagination from "../Pagination";
 import Switch from "../Switch";
-import { readPreference, writePreference } from "../preferences";
+import {
+  readPreference,
+  writePreference,
+  remoteLaunchpadViewKey,
+} from "../preferences";
 import { projectPageUrl } from "../../shared/launchpad-project.mjs";
 import "./management.css";
 import "./launchpad.css";
@@ -385,7 +390,15 @@ export default function Launchpad({
   const allowChanges = canChangeContent(permissions);
   const { api, post } = useServerApi();
   const serverId = useContext(ServerScope);
-  const viewKey = `mc-panel.launchpad.view.${serverId ?? "default"}`;
+  const panel = useContext(PanelScope);
+  const viewKey =
+    panel && panel.panelId !== "local"
+      ? remoteLaunchpadViewKey(
+          panel.panelId,
+          panel.accountId ?? panel.sessionEpoch,
+          serverId ?? "default",
+        )
+      : `mc-panel.launchpad.view.${serverId ?? "default"}`;
   const [viewReady, setViewReady] = useState<string | null>(null);
   const [config, setConfig] = useState<Config | null>(null);
   const [configError, setConfigError] = useState("");

@@ -43,6 +43,7 @@ export async function startDesktopRuntime({
   selectServerDirectory,
   updates,
   openRemotePanel,
+  proxyRemotePanel,
   loginItem,
 } = {}) {
   if (typeof dataDir !== "string" || !path.isAbsolute(dataDir))
@@ -102,6 +103,30 @@ export async function startDesktopRuntime({
     if (!authenticated(req.headers.cookie, expectedToken))
       return reject(401, "An authenticated desktop session is required.");
     const requestPath = new URL(req.url, url).pathname;
+    if (requestPath.startsWith("/api/desktop/panels/")) {
+      // Keep this ahead of fleet.app and every body parser. The authenticated
+      // owner connection streams uploads/downloads to one captured remote host.
+      const match = /^\/api\/desktop\/panels\/([^/]+)\/proxy(\/api\/.*)$/.exec(
+        req.url,
+      );
+      if (!match || !/^[a-f0-9-]{36}$/.test(match[1]))
+        return reject(400, "Choose a saved panel and relative API path.");
+      if (!proxyRemotePanel)
+        return reject(503, "Remote connections are unavailable.");
+      void Promise.resolve()
+        .then(() => proxyRemotePanel(req, res, match[1], match[2]))
+        .catch((cause) => {
+          if (res.headersSent) res.destroy(cause);
+          else
+            reject(
+              cause.status ?? 502,
+              cause.status
+                ? cause.message
+                : "The remote request was interrupted. Check the original operation before retrying.",
+            );
+        });
+      return;
+    }
     if (requestPath === "/api/desktop/settings") {
       if (!["GET", "PUT"].includes(req.method))
         return reject(405, "Use GET to read or PUT to save panel settings.");
@@ -342,6 +367,9 @@ export async function startDesktopRuntime({
           ...(iconDataUrl ? { iconDataUrl } : {}),
         };
       });
+    },
+    listLocalServerRecords() {
+      return [...fleet.runtimes.values()].map((server) => server.descriptor());
     },
     async selectLocalServer(id) {
       if (closing)

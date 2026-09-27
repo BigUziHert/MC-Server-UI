@@ -5,6 +5,20 @@ let writes: Promise<unknown> = Promise.resolve();
 const storageFor = (kind: PreferenceStorage) =>
   kind === "session" ? sessionStorage : localStorage;
 
+export function remoteLaunchpadViewKey(
+  panelId: string,
+  accountId: string,
+  serverId: string,
+) {
+  const bytes = new TextEncoder().encode(
+    JSON.stringify([panelId, accountId, serverId]),
+  );
+  return `mc-panel.launchpad.remote-view.${btoa(String.fromCharCode(...bytes))
+    .replace(/\+/g, "-")
+    .replace(/\//g, "_")
+    .replace(/=+$/, "")}`;
+}
+
 export function readPreference(
   key: string,
   storage: PreferenceStorage = "local",
@@ -74,7 +88,10 @@ export async function initializeDesktopPreferences() {
     for (const [key, value] of Object.entries(saved.preferences)) {
       if (typeof value === "string")
         storageFor(
-          key.startsWith("mc-panel.launchpad.view.") ? "session" : "local",
+          key.startsWith("mc-panel.launchpad.view.") ||
+            key.startsWith("mc-panel.launchpad.remote-view.")
+            ? "session"
+            : "local",
         ).setItem(key, value);
     }
     desktop = true;

@@ -44,11 +44,18 @@ const batches = new Map<string, RecoveryBatch>();
 const listeners = new Set<() => void>();
 const transports = new Map<string, Set<AbortController>>();
 const emit = () => listeners.forEach((listener) => listener());
-export function clearRecoveryBatches() {
-  batches.clear();
-  for (const controllers of transports.values())
-    for (const controller of controllers) controller.abort();
-  transports.clear();
+export function clearRecoveryBatches(sessionScope?: string) {
+  for (const [key, batch] of batches) {
+    if (sessionScope && !key.startsWith(`${sessionScope}:`)) continue;
+    batches.delete(key);
+    for (const controller of transports.get(batch.id) ?? []) controller.abort();
+    transports.delete(batch.id);
+  }
+  if (!sessionScope) {
+    for (const controllers of transports.values())
+      for (const controller of controllers) controller.abort();
+    transports.clear();
+  }
   emit();
 }
 const subscribe = (listener: () => void) => {

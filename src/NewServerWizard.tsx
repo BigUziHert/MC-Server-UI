@@ -17,7 +17,7 @@ import {
   Terminal,
   X,
 } from "lucide-react";
-import { api, formatBytes } from "./api";
+import { usePanelApi, formatBytes } from "./api";
 import type { ServerRecord } from "./ServerManager";
 import SearchField, { useDebouncedValue } from "./SearchField";
 import HostDirectoryPicker from "./HostDirectoryPicker";
@@ -219,6 +219,7 @@ export default function NewServerWizard({
   onLockChange,
   closeRequest,
 }: Props) {
+  const { api } = usePanelApi();
   const [step, setStep] = useState<Step>("source");
   const [kind, setKind] = useState<"software" | "modpack">("software");
   const [catalog, setCatalog] = useState<Catalog | null>(null);
@@ -365,7 +366,7 @@ export default function NewServerWizard({
         if (!cancel.signal.aborted) setCatalogError(message(cause));
       });
     return () => cancel.abort();
-  }, [refresh]);
+  }, [api, refresh]);
   useEffect(() => {
     if (step !== "configure" || !isPrepared) return;
     const cancel = new AbortController();
@@ -406,7 +407,7 @@ export default function NewServerWizard({
         if (!cancel.signal.aborted) setJavaLoading(false);
       });
     return () => cancel.abort();
-  }, [step, isPrepared, javaSelectionKey, javaRefresh]);
+  }, [api, step, isPrepared, javaSelectionKey, javaRefresh]);
   useEffect(() => {
     if (!provider || kind !== "software") return;
     const cancel = new AbortController();
@@ -434,7 +435,7 @@ export default function NewServerWizard({
         if (!cancel.signal.aborted) setLoading(false);
       });
     return () => cancel.abort();
-  }, [provider, kind, refresh]);
+  }, [api, provider, kind, refresh]);
   useEffect(() => {
     if (!provider || !gameVersion || kind !== "software") return;
     const cancel = new AbortController();
@@ -457,7 +458,7 @@ export default function NewServerWizard({
         if (!cancel.signal.aborted) setLoading(false);
       });
     return () => cancel.abort();
-  }, [provider, gameVersion, kind, refresh]);
+  }, [api, provider, gameVersion, kind, refresh]);
   useEffect(() => {
     if (!catalog || kind !== "modpack" || step !== "catalog" || project) return;
     if (!source?.available || (source.requiresKey && !source.keyConfigured)) {
@@ -491,6 +492,7 @@ export default function NewServerWizard({
       cancel.abort();
     };
   }, [
+    api,
     catalog,
     kind,
     step,
@@ -528,7 +530,7 @@ export default function NewServerWizard({
         if (!cancel.signal.aborted) setLoading(false);
       });
     return () => cancel.abort();
-  }, [project, filterVersion, filterLoader, refresh]);
+  }, [api, project, filterVersion, filterLoader, refresh]);
   useEffect(() => {
     if (!packVersion) return;
     setGameVersion(

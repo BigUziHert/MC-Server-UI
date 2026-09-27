@@ -70,3 +70,52 @@
 .desktop-panel-return .panel-connections-open {
   margin-top: 8px;
 }
+.panel-connections-signin {
+  flex-basis: 100%;
+  padding: 16px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+}
+.panel-signin-form {
+  display: grid;
+  gap: 10px;
+  text-align: left;
+}
+.panel-signin-form p,
+.panel-signin-form small {
+  color: var(--muted);
+  line-height: 1.6;
+  overflow-wrap: anywhere;
+}
+.panel-signin-form label {
+  font-weight: 600;
+  font-size: 12px;
+}
+.panel-signin-form input {
+  width: 100%;
+  min-height: 42px;
+}
+.panel-signin-password {
+  display: flex;
+  gap: 8px;
+}
+.panel-signin-password input {
+  min-width: 0;
+}
+.panel-signin-form .panel-connections-actions {
+  margin-top: 6px;
+}
+.panel-connections-signin > .btn {
+  margin-top: 10px;
+}
+@media (max-width: 500px) {
+  .panel-connections-dialog {
+    padding: 20px;
+  }
+  .panel-signin-form input {
+    font-size: 16px;
+  }
+  .panel-connections-row-actions {
+    flex-wrap: wrap;
+  }
+}

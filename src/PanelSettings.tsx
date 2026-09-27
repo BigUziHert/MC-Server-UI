@@ -7,7 +7,15 @@ import {
   Settings2,
   X,
 } from "lucide-react";
-import { api, messageOf, type PageProps } from "./api";
+import {
+  api,
+  messageOf,
+  PanelScope,
+  ServerScope,
+  SessionActiveContext,
+  SessionExpiredContext,
+  type PageProps,
+} from "./api";
 import { PanelUsers, RemoteAccessSetup } from "./pages/Subusers";
 import Switch from "./Switch";
 import StatePanel from "./StatePanel";
@@ -25,6 +33,7 @@ type DesktopSettings = {
 };
 type StartupServer = { id: string; name: string; unavailable?: boolean };
 const ignoreSettings = () => {};
+const localSessionActive = () => true;
 
 export default function PanelSettings({ notify }: PageProps) {
   const [open, setOpen] = useState(false);
@@ -40,7 +49,20 @@ export default function PanelSettings({ notify }: PageProps) {
         <span>Panel Settings</span>
       </button>
       {open && (
-        <SettingsDialog notify={notify} onClose={() => setOpen(false)} />
+        // Startup, panel accounts and Remote Access all belong to this local
+        // installation, including when opened above a remote server workspace.
+        <PanelScope.Provider value={null}>
+          <ServerScope.Provider value={null}>
+            <SessionActiveContext.Provider value={localSessionActive}>
+              <SessionExpiredContext.Provider value={null}>
+                <SettingsDialog
+                  notify={notify}
+                  onClose={() => setOpen(false)}
+                />
+              </SessionExpiredContext.Provider>
+            </SessionActiveContext.Provider>
+          </ServerScope.Provider>
+        </PanelScope.Provider>
       )}
     </>
   );
@@ -313,9 +335,20 @@ function SettingsDialog({
             <button
               className="btn"
               aria-label="App updates"
-              onClick={() =>
-                window.dispatchEvent(new Event("mc-panel-updates-open"))
-              }
+              onClick={() => {
+                const bridge = window.mcPanelConnections;
+                if (bridge?.unified) {
+                  if (!bridge.openUpdates) {
+                    setError("App updates are unavailable on this computer.");
+                    return;
+                  }
+                  void bridge
+                    .openUpdates()
+                    .catch((cause) =>
+                      setError(messageOf(cause, "Unable to open app updates.")),
+                    );
+                } else window.dispatchEvent(new Event("mc-panel-updates-open"));
+              }}
             >
               <ArrowDownToLine size={16} /> Updates
             </button>

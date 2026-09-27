@@ -1,4 +1,11 @@
-import { useCallback, useEffect, useId, useRef, useState } from "react";
+import {
+  useCallback,
+  useContext,
+  useEffect,
+  useId,
+  useRef,
+  useState,
+} from "react";
 import {
   Activity,
   ArrowDown,
@@ -40,6 +47,7 @@ import {
 } from "lucide-react";
 import {
   api as fleetApi,
+  PanelScope,
   formatBytes,
   saveDesktopSelection,
   ServerScope,
@@ -83,6 +91,7 @@ import ServerManager, {
   type ServerRecord,
 } from "./ServerManager";
 import "./welcome.css";
+import DesktopWorkspace from "./DesktopWorkspace";
 
 type Page =
   | "console"
@@ -296,7 +305,15 @@ function Sparkline({
   );
 }
 
-export default function App({
+export default function App(props: Parameters<typeof PanelApp>[0]) {
+  return window.mcPanelConnections?.unified ? (
+    <DesktopWorkspace />
+  ) : (
+    <PanelApp {...props} />
+  );
+}
+
+function PanelApp({
   session,
   onSignedOut,
   requestedRemoteServer,
@@ -821,7 +838,7 @@ export default function App({
   );
 }
 
-function EmptyFleet({
+export function EmptyFleet({
   onAdd,
   canAddServer,
   onConnect,
@@ -1038,7 +1055,7 @@ function WelcomeServerChoices({
   );
 }
 
-function ServerWorkspace({
+export function ServerWorkspace({
   servers,
   selected,
   onSelect,
@@ -1060,6 +1077,7 @@ function ServerWorkspace({
   permissions?: string[];
 }) {
   const { api } = useServerApi();
+  const panelTarget = useContext(PanelScope);
   const can = (permission: string) =>
     !permissions || permissions.includes(permission);
   const allowedNavigation = navigation.filter(
@@ -1300,7 +1318,11 @@ function ServerWorkspace({
                 <div id={`nav-links-${group.id}`} hidden={collapsed}>
                   {group.id === "servers" && (
                     <ServerSwitcher
-                      remoteHost={session ? window.location.host : undefined}
+                      remoteHost={
+                        session
+                          ? (panelTarget?.label ?? window.location.host)
+                          : undefined
+                      }
                       servers={servers}
                       selected={{
                         ...selected,
@@ -1365,6 +1387,14 @@ function ServerWorkspace({
               <Menu size={20} />
             </button>
             <Layers3 size={16} />
+            {window.mcPanelConnections?.unified && (
+              <span
+                className="workspace-target-label"
+                title={panelTarget?.origin ?? "This computer"}
+              >
+                {panelTarget?.label ?? "This computer"}
+              </span>
+            )}
             <button
               className="fleet-breadcrumb-name"
               title={selected.name}
@@ -1423,7 +1453,9 @@ function ServerWorkspace({
             )}
           </nav>
           <div className="topbar-right">
-            {!session && <PanelSettings notify={notify} />}
+            {(!session || window.mcPanelConnections?.unified) && (
+              <PanelSettings notify={notify} />
+            )}
             <DesktopUpdates remote={Boolean(session)} />
             <button
               className="help-button"

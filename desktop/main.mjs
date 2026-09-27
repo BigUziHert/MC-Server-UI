@@ -7,6 +7,7 @@ import {
   Menu,
   nativeImage,
   session,
+  safeStorage,
   shell,
   Tray,
 } from "electron";
@@ -17,15 +18,14 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { startDesktopRuntime } from "./runtime.mjs";
 import { flushRendererSelection } from "./selection.mjs";
-import { createRemotePanelController } from "./remote-panels.mjs";
+import { createUnifiedPanelController } from "./unified-panels.mjs";
+import { createUnifiedConnectionStore } from "./unified-connection-store.mjs";
 import {
-  createRemoteFrontend,
   configureRemoteCertificateVerification,
   PANEL_CONTENT_SECURITY_POLICY,
 } from "./remote-frontend.mjs";
 import { installPanelPermissionHandlers } from "./permissions.mjs";
-import { installConnectionIpc } from "./connections-ipc.mjs";
-import { createConnectionStore } from "./connection-store.mjs";
+import { installUnifiedConnectionIpc } from "./connections-ipc.mjs";
 import { flushSelectionForQuit, waitForShutdown } from "./shutdown.mjs";
 import {
   installExternalLinkHandlers,
@@ -398,6 +398,14 @@ async function launch() {
         });
       return remotePanels.open(url);
     },
+    proxyRemotePanel: (req, res, id, apiPath) => {
+      if (!remotePanels || quitting)
+        throw Object.assign(
+          new Error("MC Panel connections are unavailable."),
+          { status: 503 },
+        );
+      return remotePanels.proxy(req, res, id, apiPath);
+    },
   });
   const panelSession = session.fromPartition(`mc-panel-${randomUUID()}`);
   await panelSession.cookies.set({
@@ -442,7 +450,7 @@ async function launch() {
     show: false,
     webPreferences: {
       session: panelSession,
-      preload: path.join(desktopDir, "connections-preload.cjs"),
+      preload: path.join(desktopDir, "unified-connections-preload.cjs"),
       nodeIntegration: false,
       contextIsolation: true,
       sandbox: true,
@@ -460,32 +468,21 @@ async function launch() {
     session: panelSession,
     preload: path.join(desktopDir, "updates-preload.cjs"),
   });
-  remotePanels = createRemotePanelController({
+  remotePanels = createUnifiedPanelController({
     window,
     localOrigin: runtime.url,
-    WebContentsView,
     session,
     dialog,
-    downloadsDirectory: app.getPath("downloads"),
-    preload: path.join(desktopDir, "connections-preload.cjs"),
-    openWebsite,
     openUpdatesOverlay: (contents) => updatesOverlay.open(contents),
-    dismissUpdatesOverlay: () => updatesOverlay.dismiss(),
-    remoteFrontend: await createRemoteFrontend({
-      directory: path.join(desktopDir, "../dist"),
+    store: createUnifiedConnectionStore({
+      dataDir: path.join(userData, "data"),
+      safeStorage,
     }),
-    store: createConnectionStore({ dataDir: path.join(userData, "data") }),
     onError: (cause) => void logError(cause),
-    listLocalServers: () => runtime.listLocalServers(),
-    selectLocalServer: async (id) => {
-      await flushRendererSelection(window.webContents);
-      return runtime.selectLocalServer(id);
-    },
+    listLocalServers: () => runtime.listLocalServerRecords(),
   });
-  removeConnectionIpc = installConnectionIpc(ipcMain, remotePanels);
-  window.on("page-title-updated", (event) => {
-    if (remotePanels.list().activeId !== "local") event.preventDefault();
-  });
+  removeConnectionIpc = installUnifiedConnectionIpc(ipcMain, remotePanels);
+  void remotePanels.initialize().catch(logError);
   installPanelPermissionHandlers(
     panelSession,
     runtime.url,

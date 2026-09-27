@@ -70,6 +70,9 @@ files:
   - desktop/connections-ipc.mjs
   - desktop/connection-store.mjs
   - desktop/connections-preload.cjs
+  - desktop/unified-panels.mjs
+  - desktop/unified-connection-store.mjs
+  - desktop/unified-connections-preload.cjs
   - desktop/assets/**/*
   - package.json
 asar: true

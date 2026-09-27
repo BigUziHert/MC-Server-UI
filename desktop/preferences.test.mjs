@@ -71,6 +71,37 @@ test("preference writes serialize and survive restart without copying unrelated 
   await restored.close();
 });
 
+test("remote Launchpad views stay distinct for panel, account and identical server IDs", async (t) => {
+  const key = (panel, session, server = "same-server") =>
+    `mc-panel.launchpad.remote-view.${Buffer.from(JSON.stringify([panel, session, server])).toString("base64url")}`;
+  const first = key("panel-A", "account-one"),
+    second = key("panel-C", "account-one"),
+    otherAccount = key("panel-A", "account-two");
+  const dataDir = await fixture(t);
+  const store = createDesktopPreferences({ dataDir });
+  await store.save(first, '{"platform":"modrinth"}');
+  await store.save(second, '{"platform":"curseforge"}');
+  await store.save(otherAccount, '{"platform":"ftb"}');
+  await store.close();
+  const restored = createDesktopPreferences({ dataDir });
+  assert.deepEqual((await restored.read()).preferences, {
+    [first]: '{"platform":"modrinth"}',
+    [second]: '{"platform":"curseforge"}',
+    [otherAccount]: '{"platform":"ftb"}',
+  });
+  await restored.close();
+  for (const invalidKey of [
+    key("", "session"),
+    key("A", "x".repeat(257)),
+    first + "=",
+    "mc-panel.launchpad.remote-view.e30",
+  ])
+    assert.throws(() => validatePreference(invalidKey, "{}"), { status: 400 });
+  assert.throws(() => validatePreference(first, '{"password":"secret"}'), {
+    status: 400,
+  });
+});
+
 test("obsolete or malformed preference files recover safely and filesystem errors stay generic at the private endpoint", async (t) => {
   const dataDir = await fixture(t);
   const target = path.join(dataDir, "desktop-preferences.json");

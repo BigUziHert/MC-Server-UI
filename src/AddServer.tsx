@@ -12,7 +12,7 @@ import {
   Settings2,
   X,
 } from "lucide-react";
-import { api, post } from "./api";
+import { usePanelApi } from "./api";
 import type { ServerRecord } from "./ServerManager";
 import NewServerWizard from "./NewServerWizard";
 import HostDirectoryPicker from "./HostDirectoryPicker";
@@ -62,6 +62,7 @@ export default function AddServer({
   onClose: () => void;
   onSaved: (server: ServerRecord) => void;
 }) {
+  const { api, post } = usePanelApi();
   const [step, setStep] = useState<Step>(initialStep);
   const [wizardLocked, setWizardLocked] = useState(false);
   const wizardClose = useRef<(() => void) | null>(null);

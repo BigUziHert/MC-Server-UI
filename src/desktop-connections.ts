@@ -1,7 +1,12 @@
 import { useEffect, useState } from "react";
 import { authenticatedFetch } from "./session-auth";
+import type { PanelSession } from "./PanelAccount";
+import type { ServerRecord } from "./ServerManager";
 
-export type PanelServer = {
+export type PanelServer = Omit<
+  Partial<ServerRecord>,
+  "id" | "name" | "status" | "minecraftVersion"
+> & {
   id: string;
   name: string;
   status: string;
@@ -11,7 +16,11 @@ export type PanelServer = {
 };
 
 export type PanelConnections = {
-  activeId: string;
+  unified?: boolean;
+  ready?: boolean;
+  error?: string;
+  selectedServer?: { panelId: string; serverId: string } | null;
+  activeId?: string;
   // Only the trusted local renderer receives requests to open its setup UI.
   pendingLocalServerSetup?: { id: string; step: "create" | "import" } | null;
   panels: {
@@ -19,8 +28,12 @@ export type PanelConnections = {
     label: string;
     origin: string;
     local: boolean;
-    // Only true after this running connection confirms its current session.
+    // A saved sign-in may remain true while offline. Cached roster rows never
+    // authorize requests; live session metadata and permissions are rechecked.
     signedIn?: boolean;
+    session?: PanelSession | null;
+    sessionEpoch?: string;
+    error?: string;
     connectionState?: "connecting" | "unavailable" | "connected";
     servers?: PanelServer[];
   }[];
@@ -38,6 +51,7 @@ declare global {
   interface Window {
     mcPanelUpdates?: { close: () => void };
     mcPanelConnections?: {
+      unified?: boolean;
       list: () => Promise<PanelConnections>;
       open: (url: string) => Promise<PanelConnections>;
       activate: (id: string) => Promise<PanelConnections>;
@@ -53,6 +67,21 @@ declare global {
         serverId: string,
       ) => Promise<PanelConnections>;
       reportServers: (servers: PanelServer[] | null) => Promise<void>;
+      signIn?: (
+        panelId: string,
+        input: { email: string; password: string },
+      ) => Promise<PanelConnections>;
+      acceptInvitation?: (
+        panelId: string,
+        input: { token: string; password: string },
+      ) => Promise<PanelConnections>;
+      signOut?: (panelId: string) => Promise<PanelConnections>;
+      retry?: (panelId: string) => Promise<PanelConnections>;
+      forget?: (panelId: string) => Promise<PanelConnections>;
+      selectServer?: (
+        panelId: string,
+        serverId: string | null,
+      ) => Promise<PanelConnections>;
     };
   }
 }

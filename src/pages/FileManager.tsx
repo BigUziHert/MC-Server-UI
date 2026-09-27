@@ -34,6 +34,7 @@ import {
   formatBytes,
   relativeTime,
   messageOf,
+  PanelScope,
   ServerScope,
   type PageProps,
 } from "../api";
@@ -206,6 +207,16 @@ const unconfirmedMessage =
 const moveBatches = new Map<string, MoveBatch>();
 const moveTransports = new Map<string, Set<AbortController>>();
 const moveListeners = new Set<() => void>();
+export function clearFileMoves(sessionScope?: string) {
+  for (const [key, batch] of moveBatches) {
+    if (sessionScope && !key.startsWith(`${sessionScope}:`)) continue;
+    moveBatches.delete(key);
+    for (const controller of moveTransports.get(batch.id) ?? [])
+      controller.abort();
+    moveTransports.delete(batch.id);
+  }
+  moveListeners.forEach((listener) => listener());
+}
 const subscribeMoves = (listener: () => void) => {
   moveListeners.add(listener);
   return () => {
@@ -579,10 +590,11 @@ export default function FileManager({
   const canBin =
     canRead &&
     (permissions === undefined || permissions.includes("backup.read"));
-  const { api, post, downloadUrl } = useServerApi();
+  const { api, post, downloadUrl, scopeKey } = useServerApi();
   const serverId = useContext(ServerScope);
   const sessionScope = useContext(SessionScopeContext);
-  const transferKey = `${sessionScope}:${window.location.origin}:${serverId || "default"}`;
+  const panelOrigin = useContext(PanelScope)?.origin ?? window.location.origin;
+  const transferKey = `${sessionScope}:${scopeKey}`;
   const transfer = useFileTransfer(transferKey);
   const transferring = transfer?.status === "running";
   const uploading = transferring && transfer.kind === "upload";
@@ -613,7 +625,7 @@ export default function FileManager({
   const [readFailed, setReadFailed] = useState(false);
   const [dialogError, setDialogError] = useState("");
   const [selected, setSelected] = useState<Set<string>>(new Set());
-  const moveKey = downloadUrl("/files");
+  const moveKey = `${sessionScope}:${scopeKey}:moves`;
   const moveBatch = useSyncExternalStore(
     subscribeMoves,
     () => moveBatches.get(moveKey) || null,
@@ -960,7 +972,7 @@ export default function FileManager({
     const targets = entries.filter((entry) => selected.has(entry.path));
     if (!targets.length) return;
     copyFiles({
-      origin: window.location.origin,
+      origin: panelOrigin,
       sessionScope,
       sourceServerId: serverId,
       sourceName: serverName,
@@ -974,7 +986,7 @@ export default function FileManager({
     if (
       !canCreate ||
       !clipboard ||
-      clipboard.origin !== window.location.origin ||
+      clipboard.origin !== panelOrigin ||
       transferring ||
       movePending ||
       loading
@@ -1213,7 +1225,7 @@ export default function FileManager({
         />
       </div>
 
-      {clipboard && clipboard.origin === window.location.origin && (
+      {clipboard && clipboard.origin === panelOrigin && (
         <div
           className="file-clipboard-notice"
           role="status"
@@ -1228,7 +1240,7 @@ export default function FileManager({
           </span>
           <button
             className="btn icon"
-            onClick={clearFileClipboard}
+            onClick={() => clearFileClipboard(sessionScope)}
             aria-label="Clear copied files"
           >
             <X size={16} />
@@ -1321,7 +1333,7 @@ export default function FileManager({
               disabled={
                 !canCreate ||
                 !clipboard ||
-                clipboard.origin !== window.location.origin ||
+                clipboard.origin !== panelOrigin ||
                 transferring ||
                 movePending ||
                 loading
@@ -2020,9 +2032,9 @@ function RecycleBin({
     permissions === undefined ||
     (permissions.includes("file.delete") &&
       permissions.includes("backup.delete"));
-  const { api, downloadUrl } = useServerApi();
+  const { api, scopeKey } = useServerApi();
   const sessionScope = useContext(SessionScopeContext);
-  const recoveryKey = `${sessionScope}:${window.location.origin}:${downloadUrl("/files/recycle-bin")}`;
+  const recoveryKey = `${sessionScope}:${scopeKey}:recovery`;
   const batch = useRecoveryBatch(recoveryKey);
   const pending = recoveryPending(batch);
   const [checkingOperation, setCheckingOperation] = useState(true);

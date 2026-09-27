@@ -23,7 +23,8 @@ export function copyFiles(value: FileClipboard) {
   listeners.forEach((listener) => listener());
 }
 
-export function clearFileClipboard() {
+export function clearFileClipboard(sessionScope?: string) {
+  if (sessionScope && clipboard?.sessionScope !== sessionScope) return;
   clipboard = null;
   listeners.forEach((listener) => listener());
 }

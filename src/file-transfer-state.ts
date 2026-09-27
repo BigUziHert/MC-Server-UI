@@ -25,8 +25,11 @@ const subscribe = (listener: () => void) => {
 };
 const emit = () => listeners.forEach((listener) => listener());
 
-export function clearFileTransfers() {
-  transfers.clear();
+export function clearFileTransfers(sessionScope?: string) {
+  if (sessionScope) {
+    for (const key of transfers.keys())
+      if (key.startsWith(`${sessionScope}:`)) transfers.delete(key);
+  } else transfers.clear();
   emit();
 }
 

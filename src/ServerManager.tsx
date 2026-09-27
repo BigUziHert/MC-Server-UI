@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, type FormEvent } from "react";
+import { useContext, useEffect, useRef, useState, type FormEvent } from "react";
 import {
   AlertCircle,
   Box,
@@ -9,7 +9,7 @@ import {
   Trash2,
   X,
 } from "lucide-react";
-import { api, ServerScope, useServerApi } from "./api";
+import { PanelScope, ServerScope, useServerApi } from "./api";
 import AddServer from "./AddServer";
 import { CachedServerIconImage, ServerIconImage } from "./ServerIcon";
 import { useDesktopConnections } from "./desktop-connections";
@@ -22,6 +22,7 @@ import {
   type LaunchType,
 } from "./LaunchSettings";
 import "./servers.css";
+import { DesktopWorkspaceContext } from "./workspace-target";
 
 export type ServerRecord = {
   id: string;
@@ -53,7 +54,174 @@ export type ServerRecord = {
   sourceError?: string;
 };
 
-export function ServerSwitcher({
+export function ServerSwitcher(
+  props: Parameters<typeof PanelServerSwitcher>[0],
+) {
+  const workspace = useContext(DesktopWorkspaceContext);
+  return workspace ? (
+    <UnifiedServerSwitcher {...props} />
+  ) : (
+    <PanelServerSwitcher {...props} />
+  );
+}
+
+function UnifiedServerSwitcher({
+  onAdd,
+  onSettings,
+  selected,
+}: Parameters<typeof PanelServerSwitcher>[0]) {
+  const workspace = useContext(DesktopWorkspaceContext)!;
+  const { connections, localServers } = workspace;
+  const groups = [
+    {
+      id: "local",
+      label: "This computer",
+      local: true,
+      signedIn: true,
+      connectionState: "connected",
+      servers: localServers,
+    },
+    ...(connections?.panels.filter((panel) => !panel.local) ?? []),
+  ];
+  return (
+    <div className="fleet-switcher" aria-label="All computers">
+      {groups.map((panel) => {
+        const available = panel.local || panel.connectionState === "connected";
+        const entries =
+          panel.local || panel.signedIn === true ? (panel.servers ?? []) : [];
+        return (
+          <div
+            className="fleet-server-group"
+            key={panel.id}
+            data-panel-id={panel.id}
+          >
+            <h3 className="fleet-server-group-heading" title={panel.label}>
+              {panel.label}
+            </h3>
+            <ul
+              className="fleet-server-list"
+              aria-label={`Servers on ${panel.local ? "this computer" : panel.label}`}
+            >
+              {entries.map((entry) => {
+                const active =
+                  workspace.selected?.panelId === panel.id &&
+                  workspace.selected.serverId === entry.id;
+                const server =
+                  active && selected ? { ...entry, ...selected } : entry;
+                const remotePanel = connections?.panels.find(
+                  (item) => item.id === panel.id,
+                );
+                return (
+                  <li key={`${panel.id}:${server.id}`}>
+                    <button
+                      className="fleet-server-button"
+                      type="button"
+                      aria-label={`Select server ${server.name} on ${panel.label}`}
+                      aria-pressed={active}
+                      disabled={!available}
+                      data-panel-id={panel.id}
+                      data-server-id={server.id}
+                      onClick={() => workspace.select(panel.id, server.id)}
+                    >
+                      <span className="server-mini">
+                        {available ? (
+                          <PanelScope.Provider
+                            value={
+                              panel.local
+                                ? null
+                                : {
+                                    panelId: panel.id,
+                                    sessionEpoch:
+                                      remotePanel?.sessionEpoch ?? "",
+                                    label: panel.label,
+                                    origin: remotePanel?.origin ?? "",
+                                  }
+                            }
+                          >
+                            <ServerScope.Provider value={server.id}>
+                              <ServerIconImage
+                                name={server.name}
+                                version={
+                                  "iconVersion" in server
+                                    ? server.iconVersion
+                                    : undefined
+                                }
+                              />
+                            </ServerScope.Provider>
+                          </PanelScope.Provider>
+                        ) : (
+                          <CachedServerIconImage
+                            name={server.name}
+                            dataUrl={
+                              "iconDataUrl" in server
+                                ? server.iconDataUrl
+                                : undefined
+                            }
+                          />
+                        )}
+                      </span>
+                      <span className="fleet-selection">
+                        <strong title={server.name}>{server.name}</strong>
+                        <span>
+                          <i
+                            className={`status-dot ${available && server.status === "running" ? "" : "offline"}`}
+                          />
+                          {available ? server.status : "Unavailable"}
+                          <span className="fleet-mode">
+                            · {server.software || "Java"}{" "}
+                            {server.minecraftVersion}
+                          </span>
+                        </span>
+                      </span>
+                    </button>
+                  </li>
+                );
+              })}
+            </ul>
+            {!available && (
+              <p className="fleet-server-group-note">
+                {panel.connectionState === "connecting"
+                  ? "Reconnecting…"
+                  : "Computer unavailable. Reconnect in Manage Connections."}
+              </p>
+            )}
+            {available && !entries.length && (
+              <p className="fleet-server-group-note">
+                {panel.local
+                  ? "No servers on this computer."
+                  : panel.signedIn
+                    ? "No shared servers on this panel."
+                    : "Signed out. Sign in in Manage Connections."}
+              </p>
+            )}
+          </div>
+        );
+      })}
+      {(onAdd || onSettings) && (
+        <div className="fleet-actions">
+          {onAdd && (
+            <button className="nav-item" onClick={onAdd}>
+              <Plus size={19} />
+              Add server
+            </button>
+          )}
+          {onSettings && (
+            <button
+              className="nav-item"
+              aria-label="Server settings"
+              onClick={onSettings}
+            >
+              <Settings2 size={19} />
+              <span>Settings</span>
+            </button>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function PanelServerSwitcher({
   servers,
   selected,
   onSelect,
@@ -515,11 +683,16 @@ function ServerSettings({
   const dialog = useRef<HTMLDialogElement>(null);
   const removalCancel = useRef<HTMLButtonElement>(null);
   const errorMessage = useRef<HTMLDivElement>(null);
+  const mounted = useRef(false);
   const running = baseline.status !== "offline";
   useEffect(() => {
+    mounted.current = true;
     const element = dialog.current;
     element?.showModal();
-    return () => element?.close();
+    return () => {
+      mounted.current = false;
+      element?.close();
+    };
   }, []);
   useEffect(() => {
     if (confirmingRemoval) removalCancel.current?.focus();
@@ -574,12 +747,13 @@ function ServerSettings({
           }),
         },
       );
-      onSaved(result.server);
+      if (mounted.current) onSaved(result.server);
     } catch (cause) {
+      if (!mounted.current) return;
       setError((cause as Error).message);
       setConflict((cause as { status?: number }).status === 409);
     } finally {
-      setBusy(false);
+      if (mounted.current) setBusy(false);
     }
   }
 
@@ -591,6 +765,7 @@ function ServerSettings({
         server?: ServerRecord;
         servers?: ServerRecord[];
       }>(remote ? "/server/settings" : "/servers");
+      if (!mounted.current) return;
       const latest =
         result.server ??
         result.servers?.find((server) => server.id === editing.id);
@@ -605,9 +780,9 @@ function ServerSettings({
       setConflict(false);
       setError("");
     } catch (cause) {
-      setError((cause as Error).message);
+      if (mounted.current) setError((cause as Error).message);
     } finally {
-      setBusy(false);
+      if (mounted.current) setBusy(false);
     }
   }
 
@@ -616,18 +791,19 @@ function ServerSettings({
     setBusy(true);
     setError("");
     try {
-      await api(`/servers/${encodeURIComponent(editing.id)}`, {
+      await scopedApi(`/servers/${encodeURIComponent(editing.id)}`, {
         method: "DELETE",
       });
-      onRemoved(editing.id);
+      if (mounted.current) onRemoved(editing.id);
     } catch (cause) {
+      if (!mounted.current) return;
       setError(
         cause instanceof Error
           ? cause.message
           : "Unable to remove this server from the panel.",
       );
     } finally {
-      setBusy(false);
+      if (mounted.current) setBusy(false);
     }
   }
 

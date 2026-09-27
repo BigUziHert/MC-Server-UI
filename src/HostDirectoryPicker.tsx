@@ -7,7 +7,7 @@ import {
   LoaderCircle,
   X,
 } from "lucide-react";
-import { api, messageOf } from "./api";
+import { usePanelApi, messageOf } from "./api";
 import "./host-directory-picker.css";
 
 type Listing = {
@@ -31,6 +31,7 @@ export default function HostDirectoryPicker({
   onSelect: (directory: string) => void;
   onClose: () => void;
 }) {
+  const { api } = usePanelApi();
   const [target, setTarget] = useState<string | null>(
     initialDirectory.trim() || null,
   );
@@ -73,7 +74,7 @@ export default function HostDirectoryPicker({
         if (current()) setLoading(false);
       });
     return () => controller.abort();
-  }, [target, refresh]);
+  }, [api, target, refresh]);
   const navigate = (directory: string | null) => {
     // Invalidate the displayed folder in the same event as navigation. A
     // passive-effect reset leaves its name input usable briefly and can erase

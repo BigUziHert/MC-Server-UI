@@ -1306,11 +1306,12 @@ ${processFixture}`,
     "true",
   );
   await ui
-    .poll(
-      async () =>
-        (await browserApi(page, "/desktop/selection")).data.activeServerId,
+    .poll(() =>
+      page.evaluate(
+        async () => (await window.mcPanelConnections.list()).selectedServer,
+      ),
     )
-    .toBe(neoForge.id);
+    .toEqual({ panelId: "local", serverId: neoForge.id });
 
   step("Closing the hidden window keeps the tray runtime available.");
   const trayState = await application.evaluate(({ BrowserWindow, Menu }) => {

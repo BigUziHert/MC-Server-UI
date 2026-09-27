@@ -55,3 +55,44 @@ export function installConnectionIpc(ipcMain, controller) {
       ipcMain.removeHandler(channel);
   };
 }
+
+// Only the persistent local main frame receives this control plane. Request
+// bodies and file bytes use the authenticated streaming runtime route instead.
+export function installUnifiedConnectionIpc(ipcMain, controller) {
+  const actions = [
+    "list",
+    "open",
+    "signIn",
+    "acceptInvitation",
+    "signOut",
+    "retry",
+    "forget",
+    "selectServer",
+    "openUpdates",
+  ];
+  for (const action of actions) {
+    ipcMain.handle(`mc-panel-unified:${action}`, (event, first, second) => {
+      if (!controller.isManagedSender(event))
+        throw new Error(
+          "Only this computer's panel workspace can manage connections.",
+        );
+      if (["list", "openUpdates"].includes(action)) return controller[action]();
+      if (
+        typeof first !== "string" ||
+        first.length > (action === "open" ? 2048 : 128)
+      )
+        throw new Error("Provide a valid panel connection.");
+      if (
+        action === "selectServer" &&
+        second !== null &&
+        (typeof second !== "string" || second.length > 128)
+      )
+        throw new Error("Provide a valid server selection.");
+      return controller[action](first, second);
+    });
+  }
+  return () => {
+    for (const action of actions)
+      ipcMain.removeHandler(`mc-panel-unified:${action}`);
+  };
+}
