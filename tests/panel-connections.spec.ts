@@ -435,27 +435,46 @@ test("the remote sign-in screen can forget its saved connection without contacti
 });
 
 for (const width of [1434, 390]) {
-  test(`a signed-in account with no shared or local servers can return to this computer at ${width}px`, async ({
+  test(`a signed-in account with no shared or local servers sees the standard welcome and can return to this computer at ${width}px`, async ({
     page,
-  }) => {
+  }, testInfo) => {
     await page.setViewportSize({ width, height: 950 });
     await desktopBridge(page, { activeId: "pc-one", localServers: [] });
     const { writes } = await remoteAccount(page);
     await page.goto("/#console");
     await expect(
-      page.getByRole("heading", { name: "No shared servers" }),
+      page.getByRole("heading", { name: "Welcome to MC Panel", exact: true }),
     ).toBeVisible();
+    await expect(page.locator(".fleet-welcome-copy > p")).toHaveText(
+      "Start a new Minecraft server, or bring one you already have.",
+    );
     await expect(
       page.getByRole("button", { name: "Create a new server", exact: true }),
-    ).toBeVisible();
+    ).toHaveAccessibleDescription(
+      "Choose your software. We’ll guide the setup.",
+    );
     await expect(
       page.getByRole("button", {
         name: "Import an existing server",
         exact: true,
       }),
-    ).toBeVisible();
+    ).toHaveAccessibleDescription("Connect a server folder on your computer.");
+    await expect(
+      page.getByRole("heading", { name: "On this computer", exact: true }),
+    ).toHaveCount(0);
+    await expect(
+      page.getByRole("button", { name: "Back to this computer", exact: true }),
+    ).toHaveCount(0);
+    await expect(page.getByText("No servers on this computer.")).toBeVisible();
+    await page.screenshot({
+      path: testInfo.outputPath(`welcome-remote-${width}.png`),
+      fullPage: true,
+    });
     await page
-      .getByRole("button", { name: "Back to this computer", exact: true })
+      .getByRole("button", { name: "Account menu for friend@example.test" })
+      .click();
+    await page
+      .getByRole("menuitem", { name: "Switch to this computer", exact: true })
       .click();
     await expect
       .poll(() =>
@@ -508,7 +527,7 @@ for (const width of [1434, 390]) {
       ).toBeVisible();
       await expect(
         page.getByRole("heading", { name: "On this computer", exact: true }),
-      ).toBeVisible();
+      ).toHaveCount(0);
       await expect(
         page.getByRole("group", {
           name: "Servers on connected computer",
@@ -946,9 +965,14 @@ for (const empty of [false, true]) {
           updateRequests.push(request.url());
       });
       await page.goto("/#console");
+      const heading = empty
+        ? desktop
+          ? "Welcome to MC Panel"
+          : "No shared servers"
+        : localServer.name;
       await expect(
         page.getByRole("heading", {
-          name: empty ? "No shared servers" : localServer.name,
+          name: heading,
           exact: true,
         }),
       ).toBeVisible();
@@ -978,7 +1002,7 @@ for (const empty of [false, true]) {
         ).toBe("pc-one");
         await expect(
           page.getByRole("heading", {
-            name: empty ? "No shared servers" : localServer.name,
+            name: heading,
             exact: true,
           }),
         ).toBeVisible();

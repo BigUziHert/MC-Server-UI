@@ -257,6 +257,18 @@ test("welcome choices are centered at desktop, tablet, and mobile widths", async
   await expect(
     page.getByRole("heading", { name: "Welcome to MC Panel", exact: true }),
   ).toBeVisible();
+  await expect(page.locator(".fleet-welcome-copy > p")).toHaveText(
+    "Start a new Minecraft server, or bring one you already have.",
+  );
+  await expect(
+    page.getByRole("button", { name: "Create a new server", exact: true }),
+  ).toHaveAccessibleDescription("Choose your software. We’ll guide the setup.");
+  await expect(
+    page.getByRole("button", {
+      name: "Import an existing server",
+      exact: true,
+    }),
+  ).toHaveAccessibleDescription("Connect a server folder on your computer.");
   for (const viewport of [
     { width: 1440, height: 900 },
     { width: 800, height: 900 },

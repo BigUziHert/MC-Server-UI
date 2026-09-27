@@ -839,6 +839,14 @@ function EmptyFleet({
   const openLocalSetup = session
     ? window.mcPanelConnections?.openLocalServerSetup
     : undefined;
+  const connections = useDesktopConnections(
+    Boolean(openLocalSetup && !canAddServer),
+  );
+  const showWelcome =
+    !session ||
+    Boolean(
+      openLocalSetup && !canAddServer && connections?.localServers.length === 0,
+    );
   const [openingLocal, setOpeningLocal] = useState(false);
   const [localSetupError, setLocalSetupError] = useState("");
   async function addLocal(step: "create" | "import") {
@@ -889,18 +897,22 @@ function EmptyFleet({
         >
           <div className="fleet-welcome-copy">
             <h1 id="fleet-welcome-title">
-              {session ? "No shared servers" : "Welcome to MC Panel"}
+              {showWelcome ? "Welcome to MC Panel" : "No shared servers"}
             </h1>
             <p>
-              {session && (!canAddServer || openLocalSetup)
-                ? "No servers are currently shared with this account. Servers you gain access to will appear here automatically."
-                : session
-                  ? `Create or import a server on ${window.location.host}.`
-                  : "Start a new Minecraft server, or bring one you already have."}
+              {showWelcome
+                ? "Start a new Minecraft server, or bring one you already have."
+                : session && (!canAddServer || openLocalSetup)
+                  ? "No servers are currently shared with this account. Servers you gain access to will appear here automatically."
+                  : session
+                    ? `Create or import a server on ${window.location.host}.`
+                    : "Start a new Minecraft server, or bring one you already have."}
             </p>
             {openLocalSetup && (
               <>
-                <h2 className="fleet-setup-target">On this computer</h2>
+                {!showWelcome && (
+                  <h2 className="fleet-setup-target">On this computer</h2>
+                )}
                 <WelcomeServerChoices
                   onAdd={(step) => void addLocal(step)}
                   disabled={openingLocal}
@@ -927,7 +939,7 @@ function EmptyFleet({
               </>
             )}
             <div className="welcome-remote-account">
-              {session && <DesktopPanelReturn />}
+              {session && !showWelcome && <DesktopPanelReturn />}
               {window.mcPanelConnections && (
                 <div className="fleet-available-servers">
                   <ServerSwitcher
@@ -994,7 +1006,7 @@ function WelcomeServerChoices({
           <span id={`${id}-create-description`}>
             {remote
               ? "Choose software for the connected computer."
-              : "Choose your software. We’ll guide the setup on this computer."}
+              : "Choose your software. We’ll guide the setup."}
           </span>
         </span>
         <ArrowRight size={19} />
@@ -1017,7 +1029,7 @@ function WelcomeServerChoices({
           <strong>Import an existing server</strong>
           <span id={`${id}-import-description`}>
             Connect a server folder on{" "}
-            {remote ? "the connected computer" : "this computer"}.
+            {remote ? "the connected computer" : "your computer"}.
           </span>
         </span>
         <ArrowRight size={19} />

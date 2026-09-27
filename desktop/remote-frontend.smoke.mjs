@@ -902,7 +902,7 @@ async function smoke() {
       .toEqual([]);
     assert.equal((await remotePanel()).signedIn, true);
     await expect(
-      remote.getByRole("heading", { name: "No shared servers", exact: true }),
+      remote.getByRole("heading", { name: "Welcome to MC Panel", exact: true }),
     ).toBeVisible();
 
     // Both setup cards on an empty remote panel open the gaming PC's owner
@@ -983,7 +983,10 @@ async function smoke() {
       await switchToRemote.click();
       await expect.poll(activePanel).toBe(remoteId);
       await expect(
-        remote.getByRole("heading", { name: "No shared servers", exact: true }),
+        remote.getByRole("heading", {
+          name: "Welcome to MC Panel",
+          exact: true,
+        }),
       ).toBeVisible();
       await expect(
         remote.getByRole("button", { name: "Sign in", exact: true }),
@@ -1016,7 +1019,13 @@ async function smoke() {
       "The shortcuts must not prepare, create or import servers on the remote host",
     );
     await remote
-      .getByRole("button", { name: "Back to this computer", exact: true })
+      .getByRole("button", {
+        name: `Account menu for ${user.email}`,
+        exact: true,
+      })
+      .click();
+    await remote
+      .getByRole("menuitem", { name: "Switch to this computer", exact: true })
       .click();
     await expect.poll(activePanel).toBe("local");
     await localAccount.click();
