@@ -273,11 +273,20 @@ test("browser owner uses shared account menus and host settings capabilities", a
   await expect(
     page.getByRole("button", { name: "Create a new server", exact: true }),
   ).toBeVisible();
+  await expect(
+    page.getByRole("button", { name: "Accept invitation", exact: true }),
+  ).toHaveCount(0);
+  await expect(
+    page.getByRole("button", { name: "Sign in", exact: true }),
+  ).toHaveCount(0);
   await page
     .getByRole("button", { name: /^Account menu for Local administrator/ })
     .click();
   await expect(
     page.getByRole("menuitem", { name: "Accept invitation", exact: true }),
+  ).toBeVisible();
+  await expect(
+    page.getByRole("menuitem", { name: "Sign in", exact: true }),
   ).toBeVisible();
   await page
     .getByRole("menuitem", { name: "Manage Connections", exact: true })
@@ -314,6 +323,12 @@ test("browser member with zero servers retains their account without local owner
   await expect(
     page.getByRole("heading", { name: "No shared servers", exact: true }),
   ).toBeVisible();
+  await expect(
+    page.getByRole("button", { name: "Accept invitation", exact: true }),
+  ).toHaveCount(0);
+  await expect(
+    page.getByRole("button", { name: "Sign in", exact: true }),
+  ).toHaveCount(0);
   await expect(
     page.getByRole("button", {
       name: /^Account menu for 127.0.0.1@example.test/,

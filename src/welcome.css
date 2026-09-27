@@ -137,14 +137,6 @@
   padding: 20px 24px;
 }
 
-.welcome-signin-actions {
-  display: flex;
-  justify-content: center;
-  gap: 10px;
-  flex-wrap: wrap;
-  margin-top: 24px;
-}
-
 @media (max-width: 600px) {
   .fleet-welcome-shell .fleet-welcome-header {
     height: 76px;

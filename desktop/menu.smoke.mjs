@@ -59,6 +59,12 @@ try {
     name: "Account menu for Local administrator",
     exact: true,
   });
+  await expect(
+    page.getByRole("button", { name: "Accept invitation", exact: true }),
+  ).toHaveCount(0);
+  await expect(
+    page.getByRole("button", { name: "Sign in", exact: true }),
+  ).toHaveCount(0);
   await accountMenu.click();
   await expect(
     page.getByRole("menuitem", { name: "Sign in", exact: true }),
