@@ -597,7 +597,10 @@ test("a late response from a signed-out workspace cannot end the next session", 
   await openSignIn(page);
   await page.getByLabel("Email address").fill(sister.email);
   await page.getByLabel("Password", { exact: true }).fill(password);
-  await page.getByRole("button", { name: "Sign in", exact: true }).click();
+  await page
+    .getByRole("form", { name: /^Sign in/ })
+    .getByRole("button", { name: "Sign in", exact: true })
+    .click();
   await finishSignIn(page);
   await expect(page.getByRole("heading", { name: server.name })).toBeVisible();
   releaseResponse();
@@ -658,7 +661,10 @@ test("email and password sign-in opens the shared panel and logout returns to si
       () => document.documentElement.scrollWidth > window.innerWidth,
     ),
   ).toBe(false);
-  await page.getByRole("button", { name: "Sign in", exact: true }).click();
+  await page
+    .getByRole("form", { name: /^Sign in/ })
+    .getByRole("button", { name: "Sign in", exact: true })
+    .click();
   await finishSignIn(page);
   await expect(
     page.getByRole("heading", { name: "Family survival" }),
@@ -797,7 +803,10 @@ test("failed credentials stay on sign-in with the generic server error and allow
   await openSignIn(page);
   await page.getByLabel("Email address").fill("sister@example.com");
   await page.getByLabel("Password", { exact: true }).fill("incorrect password");
-  await page.getByRole("button", { name: "Sign in", exact: true }).click();
+  await page
+    .getByRole("form", { name: /^Sign in/ })
+    .getByRole("button", { name: "Sign in", exact: true })
+    .click();
   await expect(page.getByRole("alert")).toHaveText(
     "Email or password is incorrect.",
   );
@@ -805,7 +814,10 @@ test("failed credentials stay on sign-in with the generic server error and allow
     page.getByRole("heading", { name: "Family survival" }),
   ).toHaveCount(0);
   await page.getByLabel("Password", { exact: true }).fill(password);
-  await page.getByRole("button", { name: "Sign in", exact: true }).click();
+  await page
+    .getByRole("form", { name: /^Sign in/ })
+    .getByRole("button", { name: "Sign in", exact: true })
+    .click();
   await finishSignIn(page);
   await expect(
     page.getByRole("heading", { name: "Family survival" }),
@@ -879,10 +891,15 @@ test("an unavailable new panel remains unsaved and never opens owner controls", 
   await openSignIn(page);
   await page.getByLabel("Email address").fill(sister.email);
   await page.getByLabel("Password", { exact: true }).fill(password);
-  await page.getByRole("button", { name: "Sign in", exact: true }).click();
+  await page
+    .getByRole("form", { name: /^Sign in/ })
+    .getByRole("button", { name: "Sign in", exact: true })
+    .click();
   await expect(page.getByRole("alert")).toContainText("Panel is unavailable");
   await expect(
-    page.getByRole("button", { name: "Sign in", exact: true }),
+    page
+      .getByRole("form", { name: /^Sign in/ })
+      .getByRole("button", { name: "Sign in", exact: true }),
   ).toBeEnabled();
   await expect(
     page.getByRole("navigation", { name: "Main navigation" }),

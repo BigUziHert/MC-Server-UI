@@ -635,7 +635,14 @@ test("removing a saved panel during sign-in releases Manage Connections without 
     name: "Close panel connections",
     exact: true,
   });
-  await expect(close).toBeDisabled();
+  await expect(close).toBeEnabled();
+  await expect
+    .poll(() =>
+      page.evaluate(() =>
+        Boolean((window as any).unifiedFixture.releaseSignIn),
+      ),
+    )
+    .toBe(true);
   await page.evaluate(() => {
     const fixture = (window as any).unifiedFixture;
     fixture.state.panels = fixture.state.panels.filter(

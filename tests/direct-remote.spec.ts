@@ -225,7 +225,9 @@ test("a copied invitation works over direct HTTPS through password setup, sign-i
     await phone
       .getByLabel("Password", { exact: true })
       .fill("A memorable family password");
-    await phone.getByRole("button", { name: "Sign in", exact: true }).click();
+    await connections
+      .getByRole("button", { name: "Sign in", exact: true })
+      .click();
     await connections
       .getByRole("button", { name: "Close panel connections", exact: true })
       .click();
