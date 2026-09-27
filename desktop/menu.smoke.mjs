@@ -230,6 +230,20 @@ try {
     ).selectedServer,
     selection.persisted,
   );
+  // IPC selection persists before the renderer refreshes its server roster.
+  // Wait for the selected workspace so its mount cannot dismiss this dialog.
+  await expect(
+    page.getByRole("button", {
+      name: "Select server Second fixture world on This computer",
+      exact: true,
+    }),
+  ).toHaveAttribute("aria-pressed", "true", { timeout: 15000 });
+  await expect(
+    page.getByRole("group", {
+      name: "Power controls for Second fixture world",
+      exact: true,
+    }),
+  ).toBeVisible({ timeout: 15000 });
   await expect(
     page.getByRole("button", { name: "App updates", exact: true }),
   ).toBeVisible();
