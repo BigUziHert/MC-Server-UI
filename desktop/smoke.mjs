@@ -750,7 +750,7 @@ async function assertDesktopUpdates(page) {
       .getByRole("button", { name: "App updates", exact: true })
       .click();
     const dialog = page.getByRole("dialog", {
-      name: "App updates",
+      name: "App updates on this computer",
       exact: true,
     });
     await ui(dialog).toBeVisible();
