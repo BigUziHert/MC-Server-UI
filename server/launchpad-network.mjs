@@ -236,6 +236,11 @@ export async function downloadVerified(
           400,
           `This download exceeds the ${limitDescription} limit.`,
         );
+      if (file.size != null && size > file.size)
+        throw launchpadError(
+          502,
+          "Downloaded file exceeded its declared size. No server files were changed.",
+        );
       hash.update(chunk);
       await handle.writeFile(chunk);
     }

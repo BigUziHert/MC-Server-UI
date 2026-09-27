@@ -265,7 +265,7 @@ const recoveredVersion = (value) => ({
   files: [{ hashes: { sha512: value } }],
 });
 
-for (const status of [502, 403])
+for (const status of [200, 502, 403])
   test(`220 installed identities recover through verified GET requests after a bulk ${status}`, async () => {
     let posts = 0,
       reads = 0,
@@ -277,6 +277,7 @@ for (const status of [502, 403])
         if (options.method === "POST") {
           posts++;
           assert.equal(address.pathname, "/v2/version_files");
+          if (status === 200) return json({});
           return new Response("<html><h1>Request blocked at edge</h1></html>", {
             status,
             headers: { "Content-Type": "text/html" },
@@ -300,10 +301,12 @@ for (const status of [502, 403])
     assert.equal(Object.keys(overlapping.matches).length, 120);
     assert.deepEqual(result.warnings, []);
     assert.equal(reads, 220);
-    assert.ok(
-      posts >= 1 && posts <= 2,
-      `expected the failed POST circuit to stop queued batches, got ${posts}`,
-    );
+    if (status === 200) assert.equal(posts, 3);
+    else
+      assert.ok(
+        posts >= 1 && posts <= 2,
+        `expected the failed POST circuit to stop queued batches, got ${posts}`,
+      );
     assert.ok(peak <= 6, `shared GET recovery exceeded six readers: ${peak}`);
     await provider.identifyInstalled(rows(220).reverse());
     assert.equal(reads, 220, "verified recovered identities stay cached");
@@ -367,57 +370,67 @@ test("403 bulk identity recovery verifies GET checksums and IDs and keeps denied
   assert.equal(posts, 1, "the blocked POST observes its shared cooldown");
 });
 
-test("GET identity recovery isolates missing files, bad hashes and unsafe IDs while retaining verified successes", async (t) => {
-  let now = Date.now(),
-    recovered = false;
-  t.mock.method(Date, "now", () => now);
-  const calls = new Map();
-  const lookup = createInstalledIdentification(
-    async () => {
-      throw fallbackError();
-    },
-    {
-      loadOne: async (value) => {
-        calls.set(value, (calls.get(value) ?? 0) + 1);
-        if (value === hash(2))
-          throw Object.assign(new Error("not found"), { status: 404 });
-        if (!recovered && value === hash(3)) return recoveredVersion(hash(999));
-        if (!recovered && value === hash(4)) throw new Error("GET unavailable");
-        if (!recovered && value === hash(5))
-          return { ...recoveredVersion(value), project_id: "../unsafe" };
-        return recoveredVersion(value);
+for (const bulk of ["unavailable", "empty"])
+  test(`GET identity recovery after ${bulk} bulk results isolates missing files, bad hashes and unsafe IDs while retaining verified successes`, async (t) => {
+    let now = Date.now(),
+      recovered = false;
+    t.mock.method(Date, "now", () => now);
+    const calls = new Map();
+    const lookup = createInstalledIdentification(
+      async () => {
+        if (bulk === "empty") return {};
+        throw fallbackError();
       },
-    },
-  );
-  const requested = [1, 2, 3, 4, 5].map(hash);
-  const first = await lookup(requested);
-  assert.deepEqual(Object.keys(first.matches), [hash(1)]);
-  assert.equal(first.warnings.length, 2);
-  assert.ok(first.warnings.some((warning) => /unverified/.test(warning)));
-  assert.ok(first.warnings.some((warning) => /GET unavailable/.test(warning)));
-  now += 20_000;
-  await lookup(requested);
-  assert.ok([...calls.values()].every((count) => count === 1));
-  recovered = true;
-  now += 10_001;
-  const retried = await lookup(requested);
-  assert.equal(Object.keys(retried.matches).length, 4);
-  assert.deepEqual(retried.warnings, []);
-  assert.equal(calls.get(hash(1)), 1);
-  assert.equal(calls.get(hash(2)), 1, "verified 404 remains negatively cached");
-  assert.equal(
-    calls.get(hash(3)),
-    2,
-    "an invalid hash is retried as a failure",
-  );
-  now += 30_000;
-  await lookup(requested);
-  assert.equal(
-    calls.get(hash(2)),
-    2,
-    "verified missing identities expire after one minute",
-  );
-});
+      {
+        loadOne: async (value) => {
+          calls.set(value, (calls.get(value) ?? 0) + 1);
+          if (value === hash(2))
+            throw Object.assign(new Error("not found"), { status: 404 });
+          if (!recovered && value === hash(3))
+            return recoveredVersion(hash(999));
+          if (!recovered && value === hash(4))
+            throw new Error("GET unavailable");
+          if (!recovered && value === hash(5))
+            return { ...recoveredVersion(value), project_id: "../unsafe" };
+          return recoveredVersion(value);
+        },
+      },
+    );
+    const requested = [1, 2, 3, 4, 5].map(hash);
+    const first = await lookup(requested);
+    assert.deepEqual(Object.keys(first.matches), [hash(1)]);
+    assert.equal(first.warnings.length, 2);
+    assert.ok(first.warnings.some((warning) => /unverified/.test(warning)));
+    assert.ok(
+      first.warnings.some((warning) => /GET unavailable/.test(warning)),
+    );
+    now += 20_000;
+    await lookup(requested);
+    assert.ok([...calls.values()].every((count) => count === 1));
+    recovered = true;
+    now += 10_001;
+    const retried = await lookup(requested);
+    assert.equal(Object.keys(retried.matches).length, 4);
+    assert.deepEqual(retried.warnings, []);
+    assert.equal(calls.get(hash(1)), 1);
+    assert.equal(
+      calls.get(hash(2)),
+      1,
+      "verified 404 remains negatively cached",
+    );
+    assert.equal(
+      calls.get(hash(3)),
+      2,
+      "an invalid hash is retried as a failure",
+    );
+    now += 30_000;
+    await lookup(requested);
+    assert.equal(
+      calls.get(hash(2)),
+      2,
+      "verified missing identities expire after one minute",
+    );
+  });
 
 test("an unverified GET response is retried after the failure cache instead of entering the transport success cache", async (t) => {
   let now = Date.now(),
@@ -444,7 +457,7 @@ test("an unverified GET response is retried after the failure cache instead of e
   assert.equal(posts, 1, "bulk recovery still observes the shared circuit");
 });
 
-test("a Modrinth rate limit never starts identification GET recovery", async () => {
+test("a Modrinth rate limit never starts identification GET recovery, including forced refreshes", async () => {
   let posts = 0,
     reads = 0;
   const [provider] = createCoreProviders({
@@ -459,6 +472,168 @@ test("a Modrinth rate limit never starts identification GET recovery", async () 
   assert.ok(result.warnings.every((warning) => /request limit/.test(warning)));
   assert.ok(posts <= 2);
   assert.equal(reads, 0);
+  const attemptedPosts = posts;
+  assert.deepEqual(
+    await provider.identifyInstalled(rows(220), { refresh: true }),
+    result,
+  );
+  assert.equal(
+    posts,
+    attemptedPosts,
+    "refresh preserves the rate-limit cooldown",
+  );
+  assert.equal(reads, 0);
+});
+
+test("partial bulk results confirm only omissions and refresh retries unrecognized files without dropping successful identities", async () => {
+  const posts = [],
+    reads = [];
+  let available = false;
+  const [provider] = createCoreProviders({
+    fetch: async (url, options) => {
+      if (options.method === "POST") {
+        const { hashes } = JSON.parse(options.body);
+        posts.push(hashes);
+        return json(
+          hashes.includes(hash(1))
+            ? { [hash(1)]: recoveredVersion(hash(1)) }
+            : {},
+        );
+      }
+      const address = new URL(url);
+      assert.equal(address.searchParams.get("algorithm"), "sha512");
+      const value = address.pathname.split("/").at(-1);
+      reads.push(value);
+      if (!available && value === hash(3))
+        return new Response("not found", { status: 404 });
+      return json(recoveredVersion(value));
+    },
+  });
+  const requested = [1, 2, 3].map(hash);
+  const first = await provider.identifyInstalled(requested);
+  assert.deepEqual(Object.keys(first.matches), [hash(1), hash(2)]);
+  assert.deepEqual(first.warnings, []);
+  assert.deepEqual(reads, [hash(2), hash(3)]);
+  available = true;
+  assert.deepEqual(await provider.identifyInstalled(requested), first);
+  const [refreshed, overlapping] = await Promise.all([
+    provider.identifyInstalled(requested, { refresh: true }),
+    provider.identifyInstalled(requested, { refresh: true }),
+  ]);
+  assert.deepEqual(Object.keys(refreshed.matches), requested);
+  assert.deepEqual(refreshed.warnings, []);
+  assert.deepEqual(overlapping, refreshed);
+  assert.deepEqual(posts, [requested, [hash(3)]]);
+  assert.deepEqual(reads, [hash(2), hash(3), hash(3)]);
+});
+
+test("refresh retries a failed omission lookup while retaining the neighboring bulk identity", async () => {
+  let reads = 0;
+  const batches = [];
+  const lookup = createInstalledIdentification(
+    async (hashes) => {
+      batches.push(hashes);
+      return hashes.includes(hash(1))
+        ? { [hash(1)]: recoveredVersion(hash(1)) }
+        : {};
+    },
+    {
+      loadOne: async (value) => {
+        if (++reads === 1) throw new Error("GET unavailable");
+        return recoveredVersion(value);
+      },
+    },
+  );
+  const requested = [hash(1), hash(2)];
+  const first = await lookup(requested);
+  assert.deepEqual(Object.keys(first.matches), [hash(1)]);
+  assert.deepEqual(first.warnings, ["GET unavailable"]);
+  assert.deepEqual(await lookup(requested), first);
+  const retried = await lookup(requested, { refresh: true });
+  assert.deepEqual(Object.keys(retried.matches), requested);
+  assert.deepEqual(retried.warnings, []);
+  assert.deepEqual(batches, [requested, [hash(2)]]);
+  assert.equal(reads, 2);
+});
+
+test("refresh preserves an identification outage cooldown and retries after it expires", async (t) => {
+  let now = Date.now(),
+    calls = 0;
+  t.mock.method(Date, "now", () => now);
+  const [provider] = batchOnlyProvider({
+    fetch: async (_url, options) => {
+      calls++;
+      return calls === 1
+        ? new Response("offline", { status: 503 })
+        : json(identified(JSON.parse(options.body).hashes));
+    },
+  });
+  const requested = [hash(1)];
+  const first = await provider.identifyInstalled(requested);
+  now += 10_000;
+  assert.deepEqual(
+    await provider.identifyInstalled(requested, { refresh: true }),
+    first,
+  );
+  assert.equal(calls, 1);
+  now += 20_001;
+  const retried = await provider.identifyInstalled(requested, {
+    refresh: true,
+  });
+  assert.deepEqual(Object.keys(retried.matches), requested);
+  assert.deepEqual(retried.warnings, []);
+  assert.equal(calls, 2);
+});
+
+test("forced refresh respects a rate limit reached while confirming a bulk omission", async (t) => {
+  let now = Date.now(),
+    posts = 0,
+    reads = 0,
+    limited = true;
+  t.mock.method(Date, "now", () => now);
+  const [provider] = createCoreProviders({
+    fetch: async (url, options) => {
+      if (options.method === "POST") {
+        posts++;
+        const { hashes } = JSON.parse(options.body);
+        return json(
+          hashes.includes(hash(1))
+            ? { [hash(1)]: recoveredVersion(hash(1)) }
+            : {},
+        );
+      }
+      reads++;
+      if (limited)
+        return new Response("limited", {
+          status: 429,
+          headers: { "Retry-After": "120" },
+        });
+      return json(recoveredVersion(new URL(url).pathname.split("/").at(-1)));
+    },
+  });
+  const requested = [hash(1), hash(2)];
+  const first = await provider.identifyInstalled(requested);
+  assert.deepEqual(Object.keys(first.matches), [hash(1)]);
+  assert.match(first.warnings[0], /request limit/);
+  limited = false;
+  for (const elapsed of [10_000, 60_001]) {
+    now += elapsed;
+    const stillLimited = await provider.identifyInstalled(requested, {
+      refresh: true,
+    });
+    assert.deepEqual(Object.keys(stillLimited.matches), [hash(1)]);
+    assert.match(stillLimited.warnings[0], /request limit/);
+    assert.equal(posts, 1);
+    assert.equal(reads, 1);
+  }
+  now += 60_001;
+  const retried = await provider.identifyInstalled(requested, {
+    refresh: true,
+  });
+  assert.deepEqual(Object.keys(retried.matches), requested);
+  assert.deepEqual(retried.warnings, []);
+  assert.equal(posts, 2);
+  assert.equal(reads, 2);
 });
 
 test("cancelling one GET recovery reader leaves overlapping callers and cached results intact", async () => {
@@ -496,6 +671,106 @@ test("cancelling one GET recovery reader leaves overlapping callers and cached r
   assert.equal(Object.keys((await second).matches).length, 1);
   await lookup([hash(1)]);
   assert.equal(calls, 1);
+});
+
+test("identification publishes bulk and individual GET successes before stalled omissions finish for each shared reader", async () => {
+  const bulkSeen = Promise.withResolvers(),
+    secondSeen = Promise.withResolvers(),
+    second = Promise.withResolvers(),
+    third = Promise.withResolvers();
+  let batches = 0;
+  const reads = [],
+    firstProgress = [],
+    sharedProgress = [],
+    subsetProgress = [];
+  const lookup = createInstalledIdentification(
+    async () => {
+      batches++;
+      return { [hash(1)]: recoveredVersion(hash(1)) };
+    },
+    {
+      loadOne: async (value) => {
+        reads.push(value);
+        return value === hash(2) ? second.promise : third.promise;
+      },
+    },
+  );
+  const requested = [1, 2, 3].map(hash);
+  const caller = new AbortController();
+  const first = lookup(requested, {
+    signal: caller.signal,
+    onProgress: ({ matches }) => {
+      firstProgress.push(...Object.keys(matches));
+      if (matches[hash(1)]) bulkSeen.resolve();
+      if (matches[hash(2)]) secondSeen.resolve();
+    },
+  });
+  const cancelled = assert.rejects(first, /view closed/);
+  await bulkSeen.promise;
+  assert.deepEqual(firstProgress, [hash(1)]);
+  const shared = lookup(requested, {
+    onProgress: ({ matches }) => sharedProgress.push(...Object.keys(matches)),
+  });
+  const subset = lookup([hash(2)], {
+    onProgress: ({ matches }) => subsetProgress.push(...Object.keys(matches)),
+  });
+  assert.deepEqual(
+    sharedProgress,
+    [hash(1)],
+    "late readers receive prior successes immediately",
+  );
+  second.resolve(recoveredVersion(hash(2)));
+  await secondSeen.promise;
+  assert.deepEqual(firstProgress, [hash(1), hash(2)]);
+  assert.deepEqual(sharedProgress, [hash(1), hash(2)]);
+  assert.deepEqual(subsetProgress, [hash(2)]);
+  caller.abort(new Error("view closed"));
+  await cancelled;
+  third.resolve(recoveredVersion(hash(3)));
+  const [all, one] = await Promise.all([shared, subset]);
+  assert.deepEqual(Object.keys(all.matches), requested);
+  assert.deepEqual(Object.keys(one.matches), [hash(2)]);
+  assert.deepEqual(
+    firstProgress,
+    [hash(1), hash(2)],
+    "cancelled readers stop receiving progress",
+  );
+  assert.deepEqual(sharedProgress, requested);
+  assert.deepEqual(subsetProgress, [hash(2)]);
+  assert.equal(batches, 1);
+  assert.deepEqual(reads, [hash(2), hash(3)]);
+});
+
+test("progress callback failures cannot alter shared identities and completed observers are removed", async (t) => {
+  let now = Date.now(),
+    notifications = 0;
+  t.mock.method(Date, "now", () => now);
+  const lookup = createInstalledIdentification(async (hashes) =>
+    identified(hashes),
+  );
+  const first = await lookup([hash(1)], {
+    onProgress: ({ matches }) => {
+      notifications++;
+      matches[hash(1)].id = "changed-by-subscriber";
+      throw new Error("display failed");
+    },
+  });
+  assert.equal(first.matches[hash(1)].id, "v1");
+  await lookup([hash(1)], {
+    onProgress: async () => {
+      notifications++;
+      throw new Error("async display failed");
+    },
+  });
+  assert.equal(notifications, 2);
+  now += 600_001;
+  const later = await lookup([hash(1)]);
+  assert.equal(later.matches[hash(1)].id, "v1");
+  assert.equal(
+    notifications,
+    2,
+    "completed calls no longer observe refreshed cache entries",
+  );
 });
 
 test("GET recovery has a shared ninety-second lifetime including queued batches even when reads ignore cancellation", async (t) => {

@@ -27,14 +27,26 @@ function waitFor(operation, signal) {
 export function createInstalledIdentification(loadBatch, { loadOne } = {}) {
   const cache = new Map(),
     pending = new Map(),
+    observers = new Set(),
     lanes = [Promise.resolve(), Promise.resolve()];
   let nextLane = 0,
     failureUntil = 0,
     failureWarning = "";
+  const publish = (observer, hash, value) => {
+    if (!value || !observer.keys.has(hash) || observer.signal?.aborted) return;
+    try {
+      Promise.resolve(
+        observer.onProgress({ matches: { [hash]: structuredClone(value) } }),
+      ).catch(() => {});
+    } catch {
+      // A subscriber's display callback must not interrupt shared lookups.
+    }
+  };
   const remember = (hash, entry) => {
     cache.delete(hash);
     cache.set(hash, entry);
     while (cache.size > 5000) cache.delete(cache.keys().next().value);
+    for (const observer of observers) publish(observer, hash, entry.value);
     return entry;
   };
   const recover = async (batch, signal) =>
@@ -91,7 +103,7 @@ export function createInstalledIdentification(loadBatch, { loadOne } = {}) {
         }),
       ),
     );
-  return async (hashes, { signal } = {}) => {
+  return async (hashes, { signal, refresh = false, onProgress } = {}) => {
     signal?.throwIfAborted();
     if (
       !Array.isArray(hashes) ||
@@ -107,6 +119,10 @@ export function createInstalledIdentification(loadBatch, { loadOne } = {}) {
     const keys = [...new Set(hashes.map((hash) => hash.toLowerCase()))];
     for (const [hash, entry] of cache)
       if (entry.expiresAt <= Date.now()) cache.delete(hash);
+    // An explicit refresh retries unrecognized files immediately. Keep verified
+    // identities, shared in-flight work and provider outage cooldowns intact.
+    if (refresh)
+      for (const hash of keys) if (!cache.get(hash)?.value) cache.delete(hash);
     const missing = keys.filter(
       (hash) => !cache.has(hash) && !pending.has(hash),
     );
@@ -170,6 +186,17 @@ export function createInstalledIdentification(loadBatch, { loadOne } = {}) {
           };
           entries.set(hash, remember(hash, entry));
         }
+        // A successful bulk response can omit a known file. Confirm only those
+        // omissions through the exact-hash endpoint before calling them unknown.
+        if (loadOne && !warning) {
+          const omitted = batch.filter((hash) => !entries.get(hash).value);
+          if (omitted.length)
+            for (const [hash, entry] of await recover(
+              omitted,
+              recoveryDeadline,
+            ))
+              entries.set(hash, entry);
+        }
         return entries;
       });
       lanes[lane] = task.catch(() => {});
@@ -182,10 +209,25 @@ export function createInstalledIdentification(loadBatch, { loadOne } = {}) {
         );
       }
     }
-    const entries = await waitFor(
-      Promise.all(keys.map((hash) => pending.get(hash) ?? cache.get(hash))),
-      signal,
-    );
+    // Publish completed identities before slower omissions finish. Subscribers
+    // joining a shared batch also receive successes already found in that batch.
+    const observer =
+      typeof onProgress === "function"
+        ? { keys: new Set(keys), signal, onProgress }
+        : null;
+    if (observer) {
+      observers.add(observer);
+      for (const hash of keys) publish(observer, hash, cache.get(hash)?.value);
+    }
+    let entries;
+    try {
+      entries = await waitFor(
+        Promise.all(keys.map((hash) => pending.get(hash) ?? cache.get(hash))),
+        signal,
+      );
+    } finally {
+      if (observer) observers.delete(observer);
+    }
     return {
       matches: Object.fromEntries(
         keys.flatMap((hash, index) =>

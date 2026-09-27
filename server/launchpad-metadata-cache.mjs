@@ -29,8 +29,9 @@ function displayFields(value) {
   return result;
 }
 
-// This is disposable display data, separate from installation receipts. File
-// paths, trusted stat stamps, update results, and negative lookups never persist.
+// Disposable identities/display data, separate from installation receipts.
+// Content-equivalent aliases are tied to the actual local checksum. Paths,
+// trusted stat stamps, update results, and negative lookups never persist.
 export async function createLaunchpadMetadataCache({
   pathFor,
   platforms,
@@ -64,6 +65,14 @@ export async function createLaunchpadMetadataCache({
           platform: value.platform,
           projectId: value.projectId,
           versionId: value.versionId,
+          ...(value.platform === "modrinth" &&
+          ["jar-timestamps", "jar-contents"].includes(value.identityMethod) &&
+          checksum(value.canonicalSha512)
+            ? {
+                identityMethod: value.identityMethod,
+                canonicalSha512: value.canonicalSha512,
+              }
+            : {}),
           ...displayFields(value),
         },
       };

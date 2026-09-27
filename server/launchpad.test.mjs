@@ -4,7 +4,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import os from "node:os";
 import { createHash } from "node:crypto";
-import { crc32 } from "node:zlib";
+import { crc32, deflateRawSync } from "node:zlib";
 import {
   createLaunchpad,
   curseFingerprint,
@@ -33,33 +33,36 @@ const selection = {
   gameVersion: "1.21.1",
   loader: "neoforge",
 };
-function zip(entries) {
+function zip(entries, { compressed = false } = {}) {
   const chunks = [],
     central = [];
   let offset = 0;
   for (const [filename, value, mode = 0o100644] of entries) {
     const name = Buffer.from(filename),
-      data = Buffer.isBuffer(value) ? value : Buffer.from(value);
+      data = Buffer.isBuffer(value) ? value : Buffer.from(value),
+      stored = compressed ? deflateRawSync(data) : data;
     const local = Buffer.alloc(30);
     local.writeUInt32LE(0x04034b50);
     local.writeUInt16LE(20, 4);
+    local.writeUInt16LE(compressed ? 8 : 0, 8);
     local.writeUInt32LE(crc32(data), 14);
-    local.writeUInt32LE(data.length, 18);
+    local.writeUInt32LE(stored.length, 18);
     local.writeUInt32LE(data.length, 22);
     local.writeUInt16LE(name.length, 26);
     const row = Buffer.alloc(46);
     row.writeUInt32LE(0x02014b50);
     row.writeUInt16LE(0x314, 4);
     row.writeUInt16LE(20, 6);
+    row.writeUInt16LE(compressed ? 8 : 0, 10);
     row.writeUInt32LE(crc32(data), 16);
-    row.writeUInt32LE(data.length, 20);
+    row.writeUInt32LE(stored.length, 20);
     row.writeUInt32LE(data.length, 24);
     row.writeUInt16LE(name.length, 28);
     row.writeUInt32LE((mode << 16) >>> 0, 38);
     row.writeUInt32LE(offset, 42);
-    chunks.push(local, name, data);
+    chunks.push(local, name, stored);
     central.push(row, name);
-    offset += local.length + name.length + data.length;
+    offset += local.length + name.length + stored.length;
   }
   const directory = Buffer.concat(central),
     end = Buffer.alloc(22);
@@ -170,6 +173,8 @@ async function fixture(t, options = {}) {
       return Response.json([{ version: "1.21.1", version_type: "release" }]);
     if (address.pathname === "/v2/version_files")
       return Response.json({ [hashes(old).sha512]: versions.old });
+    if (address.pathname.startsWith("/v2/version_file/"))
+      return new Response(null, { status: 404 });
     if (address.pathname === "/v2/version_files/update")
       return Response.json(
         Object.fromEntries(
@@ -811,6 +816,268 @@ test("unknown unchanged JAR fingerprints survive negative identification cache e
     2,
   );
 });
+
+for (const initialStatus of [404, 403])
+  test(`manual Refresh retries a cached unidentified file after an identity GET ${initialStatus}`, async (t) => {
+    let unavailable = true;
+    const f = await fixture(t, {
+      request: async (url) => {
+        const pathname = new URL(url).pathname;
+        // A valid, incomplete batch response must be checked per file.
+        if (pathname === "/v2/version_files") return Response.json({});
+        if (pathname.startsWith("/v2/version_file/"))
+          return unavailable
+            ? new Response(null, { status: initialStatus })
+            : Response.json(f.versions.old);
+      },
+    });
+    const first = await f.service.installed(selection);
+    assert.equal(first.items[0].platform, null);
+    assert.equal(first.warnings.length, initialStatus === 404 ? 0 : 1);
+    const reads = () =>
+      f.requests.filter(({ url }) =>
+        new URL(url).pathname.startsWith("/v2/version_file/"),
+      ).length;
+    assert.equal(reads(), 1);
+    unavailable = false;
+    const cached = await f.service.installed(selection);
+    assert.equal(cached.items[0].platform, null);
+    assert.equal(reads(), 1, "routine polling respects the negative cache");
+    const refreshed = await f.service.installed({
+      ...selection,
+      refresh: "true",
+    });
+    assert.equal(reads(), 2, "Refresh immediately retries the unknown file");
+    assert.equal(refreshed.items[0].platform, "modrinth");
+    assert.equal(refreshed.items[0].projectId, "project");
+    assert.equal(refreshed.items[0].title, "Fixture Project");
+    assert.equal(refreshed.items[0].update.id, "new");
+    assert.deepEqual(
+      refreshed.warnings,
+      [],
+      "old failures do not survive recovery",
+    );
+    const local = await f.service.installed({ ...selection, local: true });
+    assert.equal(local.items[0].projectId, "project");
+    await f.service.installed({ ...selection, refresh: true });
+    assert.equal(reads(), 2, "Refresh preserves successful file identities");
+  });
+
+test("a stalled omission lookup cannot erase successful bulk identities when the inventory deadline expires", async (t) => {
+  const deadline = new AbortController();
+  const f = await fixture(t, {
+    request: async (url) => {
+      if (new URL(url).pathname.startsWith("/v2/version_file/")) {
+        deadline.abort(new DOMException("Inventory deadline", "TimeoutError"));
+        return new Promise(() => {});
+      }
+    },
+  });
+  await fs.writeFile(
+    path.join(f.serverDir, "mods", "unknown.jar"),
+    "unknown mod",
+  );
+  const timeout = AbortSignal.timeout.bind(AbortSignal);
+  let first = true;
+  t.mock.method(AbortSignal, "timeout", (duration) => {
+    if (duration === 90_000 && first) {
+      first = false;
+      return deadline.signal;
+    }
+    return timeout(duration);
+  });
+  const result = await f.service.installed(selection);
+  const known = result.items.find((item) => item.name === "old.jar");
+  assert.equal(known.platform, "modrinth");
+  assert.equal(known.projectId, "project");
+  assert.equal(known.versionId, "old");
+  assert.equal(known.updateCheck, "unavailable");
+  assert.equal(
+    result.items.find((item) => item.name === "unknown.jar").platform,
+    null,
+  );
+  assert.match(result.warnings.join(" "), /took too long/);
+  const local = await f.service.installed({ ...selection, local: true });
+  assert.equal(
+    local.items.find((item) => item.name === "old.jar").versionId,
+    "old",
+  );
+});
+
+for (const variant of [
+  "jar-timestamps",
+  "jar-contents",
+  "declared-jarjar-timestamps",
+])
+  test(`${variant} variants identify from verified downloads, retain local hashes, and check updates across restart`, async (t) => {
+    const identityMethod =
+      variant === "jar-timestamps" ? variant : "jar-contents";
+    const entries = (
+      timestamp,
+      epoch,
+      code = "original mod code",
+      nestedTimestamp = 0,
+    ) => {
+      const nested = zip([
+        [
+          "META-INF/MANIFEST.MF",
+          "Manifest-Version: 1.0\r\nImplementation-Version: 1.0\r\n\r\n",
+        ],
+        ["bundled.class", "original bundled library code"],
+      ]);
+      nested.writeUInt16LE(nestedTimestamp, 10);
+      const nestedCentral = nested.indexOf(
+        Buffer.from([0x50, 0x4b, 0x01, 0x02]),
+      );
+      nested.writeUInt16LE(nestedTimestamp, nestedCentral + 12);
+      return [
+        [
+          "META-INF/MANIFEST.MF",
+          `Manifest-Version: 1.0\r\nImplementation-Version: 1.0\r\nImplementation-Timestamp: ${timestamp}\r\nTimestamp: ${epoch}\r\nMixinConfigs: example.mixins.json\r\n\r\n`,
+        ],
+        [
+          "META-INF/neoforge.mods.toml",
+          'modLoader="javafml"\n[[mods]]\nmodId="example"\ndisplayName="Example"\nversion="1.0"',
+        ],
+        ["example.class", code],
+        ["example.mixins.json", '{"package":"example.mixins","mixins":[]}'],
+        ...(variant === "declared-jarjar-timestamps"
+          ? [
+              [
+                "META-INF/jarjar/metadata.json",
+                JSON.stringify({
+                  jars: [
+                    {
+                      identifier: { group: "example", artifact: "bundled" },
+                      version: { range: "[1.0,2.0)", artifactVersion: "1.0" },
+                      path: "META-INF/jarjar/bundled.jar",
+                    },
+                  ],
+                }),
+              ],
+              ["META-INF/jarjar/bundled.jar", nested],
+            ]
+          : []),
+      ];
+    };
+    const installedEntries = (code = "original mod code") =>
+      entries(
+        variant === "jar-contents"
+          ? "2026-06-20T17:56:17+0000"
+          : "2026-06-20T17:56:48+0000",
+        variant === "jar-contents" ? "1781978177238" : "1781978208610",
+        code,
+        variant === "declared-jarjar-timestamps" ? 1234 : 0,
+      );
+    const canonical = zip(
+      entries("2026-06-20T17:56:48+0000", "1781978208610"),
+      {
+        compressed: identityMethod === "jar-contents",
+      },
+    );
+    const installed =
+      identityMethod === "jar-contents"
+        ? zip(installedEntries().reverse())
+        : Buffer.from(canonical);
+    if (identityMethod === "jar-contents")
+      assert.notEqual(
+        installed.length,
+        canonical.length,
+        "archive compression changes the outer archive size",
+      );
+    installed.writeUInt16LE(1234, 10);
+    const central = installed.indexOf(Buffer.from([0x50, 0x4b, 0x01, 0x02]));
+    installed.writeUInt16LE(1234, central + 12);
+    const canonicalHash = hashes(canonical).sha512;
+    const installedHash = hashes(installed).sha512;
+    const f = await fixture(t, {
+      request: async (url) => {
+        if (new URL(url).pathname === "/v2/version_files")
+          return Response.json({});
+      },
+    });
+    f.versions.old.files[0] = {
+      ...f.versions.old.files[0],
+      hashes: hashes(canonical),
+      size: canonical.length,
+    };
+    f.downloads.set("https://cdn.modrinth.com/old.jar", canonical);
+    await fs.writeFile(path.join(f.serverDir, "mods/old.jar"), installed);
+    const result = await f.service.installed(selection);
+    assert.deepEqual(result.warnings, []);
+    const item = result.items[0];
+    assert.equal(item.platform, "modrinth");
+    assert.equal(item.versionId, "old");
+    assert.equal(item.sha512, installedHash);
+    assert.equal(item.canonicalSha512, canonicalHash);
+    assert.equal(item.identityMethod, identityMethod);
+    assert.equal(item.title, "Fixture Project");
+    assert.equal(item.update.id, "new");
+    assert.deepEqual(
+      await fs.readFile(path.join(f.serverDir, "mods/old.jar")),
+      installed,
+    );
+    const updateRequest = f.requests.find(
+      ({ url }) => new URL(url).pathname === "/v2/version_files/update",
+    );
+    assert.deepEqual(JSON.parse(updateRequest.body).hashes, [canonicalHash]);
+    assert.ok(
+      !(await fs.readdir(path.join(f.dataDir, "launchpad"))).some((name) =>
+        name.startsWith("identity-"),
+      ),
+    );
+    await f.service.close();
+    const count = f.requests.length;
+    const reopened = await f.boot();
+    const local = await reopened.installed({ ...selection, local: true });
+    assert.equal(local.items[0].sha512, installedHash);
+    assert.equal(local.items[0].canonicalSha512, canonicalHash);
+    assert.equal(local.items[0].identityMethod, identityMethod);
+    assert.equal(
+      f.requests.length,
+      count,
+      "persisted matches require no redownload",
+    );
+    const again = await reopened.installed(selection);
+    assert.equal(again.items[0].update.id, "new");
+    assert.deepEqual(again.warnings, []);
+    assert.equal(
+      f.requests.filter(({ url }) => url === "https://cdn.modrinth.com/old.jar")
+        .length,
+      1,
+      "online update checks also reuse the persisted verified match without redownloading",
+    );
+    const plan = await reopened.preview({
+      ...selection,
+      replacePath: "mods/old.jar",
+    });
+    assert.equal(
+      plan.files.find((file) => file.path === "mods/new.jar").previousPath,
+      "mods/old.jar",
+    );
+    const modified = zip(installedEntries("modified mod code"));
+    await fs.writeFile(path.join(f.serverDir, "mods/old.jar"), modified);
+    const stale = await finish(reopened, {
+      planId: plan.planId,
+      confirmed: true,
+    });
+    assert.equal(stale.status, "failed");
+    assert.deepEqual(
+      await fs.readFile(path.join(f.serverDir, "mods/old.jar")),
+      modified,
+    );
+    await assert.rejects(fs.access(path.join(f.serverDir, "mods/new.jar")), {
+      code: "ENOENT",
+    });
+    const changed = await reopened.installed({ ...selection, refresh: true });
+    assert.equal(
+      changed.items[0].platform,
+      null,
+      "real content changes must not inherit the verified identity",
+    );
+    assert.equal(changed.items[0].canonicalSha512, undefined);
+    assert.equal(changed.items[0].update, undefined);
+  });
 
 test("local inventory needs no provider, reuses unchanged hashes and notices same-size edits with restored mtime", async (t) => {
   const f = await fixture(t);

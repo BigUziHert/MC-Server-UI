@@ -1385,6 +1385,124 @@ export function createCoreProviders({
         };
       },
       identifyInstalled,
+      async installedCandidates({ name, title, gameVersion, loader, signal }) {
+        signal = lookupSignal(signal);
+        signal?.throwIfAborted();
+        // These are discovery hints, never identities. The caller must verify
+        // the downloaded artifact and compare every archive member before use.
+        try {
+          if (typeof name !== "string" || !/\.jar$/i.test(name)) return [];
+          fileName(name);
+        } catch {
+          return [];
+        }
+        const hint =
+          typeof title === "string" &&
+          title.trim() &&
+          title.length <= 256 &&
+          !/[\x00-\x1f\x7f]/.test(title) &&
+          !title.includes("${")
+            ? title.trim()
+            : name
+                .replace(/\.jar$/i, "")
+                .replace(/[-_ .]+v?\d.*$/i, "")
+                .replace(/[-_]+/g, " ")
+                .trim();
+        if (hint.length < 2 || hint.length > 256) return [];
+        const input = { type: "mod", gameVersion, loader };
+        const loaders = compatibleLoaders(input);
+        // Installed content can belong to an older or different runtime. Keep
+        // project discovery independent of the current server's compatibility.
+        const facets = [["all_project_types:mod"]];
+        const query = new URLSearchParams({
+          query: hint,
+          facets: JSON.stringify(facets),
+          limit: "5",
+          offset: "0",
+          index: "relevance",
+        });
+        const search = await recovery.read(`${mr}/search?${query}`, { signal });
+        signal?.throwIfAborted();
+        if (!Array.isArray(search?.hits)) return [];
+        const projects = new Set();
+        for (const hit of search.hits.slice(0, 5)) {
+          try {
+            if (hit?.project_type && hit.project_type !== "mod") continue;
+            projects.add(id(hit?.project_id));
+          } catch {
+            // Ignore malformed search hints instead of constructing a URL.
+          }
+        }
+        const candidates = new Map();
+        const tags = (value) =>
+          Array.isArray(value) && value.every((tag) => typeof tag === "string");
+        // Prefer the smaller compatible histories, then retry these same five
+        // projects without runtime filters if they contain no exact filename.
+        for (const filtered of gameVersion || loaders.length
+          ? [true, false]
+          : [false]) {
+          for (const projectId of projects) {
+            signal?.throwIfAborted();
+            const filters = new URLSearchParams();
+            if (filtered && gameVersion)
+              filters.set("game_versions", JSON.stringify([gameVersion]));
+            if (filtered && loaders.length)
+              filters.set("loaders", JSON.stringify(loaders));
+            const versions = await recovery.read(
+              `${mr}/project/${enc(projectId)}/version?${filters}`,
+              { signal },
+            );
+            signal?.throwIfAborted();
+            if (!Array.isArray(versions) || versions.length > 10000) continue;
+            for (const version of versions) {
+              if (
+                version?.project_id !== projectId ||
+                !tags(version.game_versions) ||
+                !tags(version.loaders) ||
+                (filtered &&
+                  gameVersion &&
+                  !version.game_versions.includes(gameVersion)) ||
+                (filtered &&
+                  loaders.length &&
+                  !loaders.some((value) => version.loaders.includes(value))) ||
+                !Array.isArray(version.files)
+              )
+                continue;
+              const files = version.files.filter(
+                (file) => file?.filename === name,
+              );
+              if (files.length !== 1) continue;
+              const file = files[0];
+              try {
+                id(version.id);
+                if (
+                  typeof file.hashes?.sha512 !== "string" ||
+                  !/^[a-f0-9]{128}$/i.test(file.hashes.sha512) ||
+                  !Number.isSafeInteger(file.size) ||
+                  file.size <= 0 ||
+                  file.size > 128 * 1024 ** 2
+                )
+                  continue;
+                checkedProviderUrl(file.url, ["cdn.modrinth.com"]);
+              } catch {
+                continue;
+              }
+              const candidate = { ...version, files };
+              const key = `${projectId}:${version.id}`;
+              const previous = candidates.get(key);
+              if (
+                previous &&
+                JSON.stringify(previous) !== JSON.stringify(candidate)
+              )
+                return [];
+              candidates.set(key, candidate);
+              if (candidates.size > 3) return [];
+            }
+          }
+          if (candidates.size) break;
+        }
+        return [...candidates.values()];
+      },
       async identify(hashes, { signal } = {}) {
         return json(`${mr}/version_files`, {
           method: "POST",

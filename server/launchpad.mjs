@@ -8,6 +8,7 @@ import { inspectBundledDependencies } from "./launchpad-bundled.mjs";
 import { installedDependencySatisfies } from "./launchpad-dependency-ranges.mjs";
 import { createModRemoval } from "./launchpad-removal.mjs";
 import { createLaunchpadMetadataCache } from "./launchpad-metadata-cache.mjs";
+import { recoverJarIdentity } from "./launchpad-jar-recovery.mjs";
 import { createVersionsService } from "./versions.mjs";
 import { cleanInstall, prepareCleanSettings } from "./clean-install.mjs";
 import { inferPackRuntime } from "./launchpad-pack-runtime.mjs";
@@ -329,6 +330,8 @@ export async function createLaunchpad(ctx) {
         "iconUrl",
         "author",
         "url",
+        "identityMethod",
+        "canonicalSha512",
       ]
         .filter((key) => item[key] !== undefined)
         .map((key) => [key, item[key]]),
@@ -342,6 +345,7 @@ export async function createLaunchpad(ctx) {
       item.projectId,
       item.versionId,
       item.sha512,
+      item.canonicalSha512,
     ]);
   let active = null,
     activeController = null,
@@ -921,6 +925,11 @@ export async function createLaunchpad(ctx) {
           found.updates &&
           input.type !== "modpack"
         ) {
+          const providerHash = (item) =>
+            found.id === "modrinth" &&
+            ["jar-timestamps", "jar-contents"].includes(item.identityMethod)
+              ? item.canonicalSha512
+              : item.sha512;
           const work = (async () => {
             const checked = new Map();
             const cacheGeneration = metadataCache?.generation;
@@ -938,10 +947,10 @@ export async function createLaunchpad(ctx) {
                 const key = updateKey(input, item);
                 if (
                   checked.has(key) ||
-                  !Object.hasOwn(result.updates, item.sha512)
+                  !Object.hasOwn(result.updates, providerHash(item))
                 )
                   continue;
-                const value = result.updates[item.sha512];
+                const value = result.updates[providerHash(item)];
                 const normalized = value ? publicVersion(value) : null;
                 remember(updateCache, key, {
                   value: normalized,
@@ -953,7 +962,13 @@ export async function createLaunchpad(ctx) {
             };
             try {
               const result = await abortable(
-                found.updates({ ...input, onProgress: accept }, missing),
+                found.updates(
+                  { ...input, onProgress: accept },
+                  missing.map((item) => ({
+                    ...item,
+                    sha512: providerHash(item),
+                  })),
+                ),
                 input.signal,
               );
               warnings.push(...(result.warnings ?? []));
@@ -975,7 +990,9 @@ export async function createLaunchpad(ctx) {
             const value = work.then((result) =>
               result.checked?.has(key)
                 ? { value: result.checked.get(key) }
-                : { issue: result.issues?.[item.sha512] ?? result.issue },
+                : {
+                    issue: result.issues?.[providerHash(item)] ?? result.issue,
+                  },
             );
             updateFlights.set(key, value);
             void value.then(
@@ -1325,7 +1342,12 @@ export async function createLaunchpad(ctx) {
           const previous = identities.get(item.sha512);
           // Polling an unchanged negative result must not renew its retry
           // deadline forever while a provider recovers in the background.
-          if (!item.platform && previous?.expiresAt > Date.now()) continue;
+          if (
+            !item.platform &&
+            previous?.expiresAt > Date.now() &&
+            !enabled(input.refresh)
+          )
+            continue;
           if (item.platform || (!previous?.value?.platform && !signal.aborted))
             remember(identities, item.sha512, {
               value: identityFields(item),
@@ -1411,30 +1433,22 @@ export async function createLaunchpad(ctx) {
       (item) =>
         item.sha512 &&
         !item.platform &&
-        !(identities.get(item.sha512)?.expiresAt > Date.now()),
+        (enabled(input.refresh) ||
+          !(identities.get(item.sha512)?.expiresAt > Date.now())),
     );
     for (const item of items) {
       const cached = identities.get(item.sha512);
-      if (cached?.expiresAt > Date.now() && cached.warnings)
+      if (
+        !enabled(input.refresh) &&
+        cached?.expiresAt > Date.now() &&
+        cached.warnings
+      )
         warnings.push(...cached.warnings);
     }
     const modrinth = providers.find((value) => value.id === "modrinth");
     if (unknown.length) {
-      try {
-        const result = await abortable(
-          (modrinth.identifyInstalled ?? modrinth.identify)(
-            [...new Set(unknown.map((item) => item.sha512))],
-            { signal: input.signal },
-          ),
-          input.signal,
-        );
-        const matches = modrinth.identifyInstalled ? result.matches : result;
-        if (modrinth.identifyInstalled)
-          warnings.push(
-            ...(result.warnings ?? []).map(
-              (warning) => `Modrinth identification: ${warning}`,
-            ),
-          );
+      const applyIdentities = (matches) => {
+        if (input.signal.aborted) return;
         for (const item of unknown) {
           const version = matches[item.sha512];
           if (version)
@@ -1446,6 +1460,29 @@ export async function createLaunchpad(ctx) {
               title: version.name,
             });
         }
+      };
+      try {
+        const result = await abortable(
+          (modrinth.identifyInstalled ?? modrinth.identify)(
+            [...new Set(unknown.map((item) => item.sha512))],
+            {
+              signal: input.signal,
+              refresh: enabled(input.refresh),
+              // Keep confirmed identities visible even when another file's
+              // fallback lookup outlasts this inventory's deadline.
+              onProgress: ({ matches }) => applyIdentities(matches),
+            },
+          ),
+          input.signal,
+        );
+        const matches = modrinth.identifyInstalled ? result.matches : result;
+        if (modrinth.identifyInstalled)
+          warnings.push(
+            ...(result.warnings ?? []).map(
+              (warning) => `Modrinth identification: ${warning}`,
+            ),
+          );
+        applyIdentities(matches);
       } catch (cause) {
         input.signal.throwIfAborted();
         warnings.push(`Modrinth identification: ${cause.message}`);
@@ -1537,18 +1574,95 @@ export async function createLaunchpad(ctx) {
     }
     input.signal.throwIfAborted();
     if (input.identityOnly) return;
-    // Names and icons belong to the project, even with All loaders/versions.
-    // Failed metadata requests must not suppress identification or updates.
-    await Promise.all([
-      enrichProjectMetadata(
-        items,
-        warnings,
-        input.signal,
-        "url",
-        cacheGeneration,
-      ),
-      checkUpdates(input, items, warnings),
-    ]);
+    const known = new Set(items.filter((item) => item.platform));
+    const details = (entries) =>
+      Promise.all([
+        enrichProjectMetadata(
+          entries,
+          warnings,
+          input.signal,
+          "url",
+          cacheGeneration,
+        ),
+        checkUpdates(input, entries, warnings),
+      ]);
+    const recoverMissing = async () => {
+      if (input.type === "mod" && modrinth.installedCandidates) {
+        let downloadBytes = 0;
+        await parallel(
+          unknown.filter(
+            (item) =>
+              !item.platform && item.size >= 22 && item.size <= 128 * 1024 ** 2,
+          ),
+          2,
+          async (item) => {
+            try {
+              const target = await safePath(serverDir, item.path);
+              const before = await fs.lstat(target);
+              if (
+                !before.isFile() ||
+                before.isSymbolicLink() ||
+                before.size > 128 * 1024 ** 2
+              )
+                return;
+              const handle = await fs.open(target, "r");
+              let source;
+              try {
+                if (fileStamp(await handle.stat()) !== fileStamp(before))
+                  return;
+                const chunks = [];
+                let size = 0;
+                input.signal.throwIfAborted();
+                for await (const chunk of handle.createReadStream({
+                  autoClose: false,
+                  signal: input.signal,
+                })) {
+                  if ((size += chunk.length) > 128 * 1024 ** 2) return;
+                  chunks.push(chunk);
+                }
+                source = Buffer.concat(chunks);
+                if (
+                  fileStamp(await handle.stat()) !== fileStamp(before) ||
+                  createHash("sha512").update(source).digest("hex") !==
+                    item.sha512
+                )
+                  return;
+              } finally {
+                await handle.close();
+              }
+              const identity = await recoverJarIdentity(source, {
+                ...input,
+                name: item.name,
+                provider: modrinth,
+                request,
+                temporaryDirectory: async () =>
+                  fs.mkdtemp(await privatePath("identity-")),
+                reserve: (bytes) => {
+                  if (downloadBytes + bytes > 256 * 1024 ** 2) return false;
+                  downloadBytes += bytes;
+                  return true;
+                },
+              });
+              input.signal.throwIfAborted();
+              if (
+                identity &&
+                fileStamp(await fs.lstat(target)) === fileStamp(before)
+              )
+                Object.assign(item, identity);
+            } catch (cause) {
+              input.signal.throwIfAborted();
+              warnings.push(
+                `Modrinth identification: ${item.name}: ${cause.message}`,
+              );
+            }
+          },
+          input.signal,
+        );
+      }
+      await details(items.filter((item) => item.platform && !known.has(item)));
+    };
+    // Slow discovery of unknown files must not block already-known projects.
+    await Promise.all([details([...known]), recoverMissing()]);
     input.signal.throwIfAborted();
   }
   async function config(input = {}) {
