@@ -7,6 +7,9 @@ export const CONNECTION_CHANNELS = {
   selectLocalServer: "mc-panel-connections:select-local-server",
   reportServers: "mc-panel-connections:report-servers",
   selectRemoteServer: "mc-panel-connections:select-remote-server",
+  openLocalServerSetup: "mc-panel-connections:open-local-server-setup",
+  acknowledgeLocalServerSetup:
+    "mc-panel-connections:acknowledge-local-server-setup",
 };
 
 export function installConnectionIpc(ipcMain, controller) {
@@ -17,6 +20,16 @@ export function installConnectionIpc(ipcMain, controller) {
       if (action === "openUpdates") return controller.openUpdates();
       if (action === "reportServers")
         return controller.reportServers(event, value);
+      if (action === "openLocalServerSetup") {
+        if (value !== "create" && value !== "import")
+          throw new Error("Choose create or import for local server setup.");
+        return controller.openLocalServerSetup(value);
+      }
+      if (action === "acknowledgeLocalServerSetup") {
+        if (typeof value !== "string" || !value || value.length > 128)
+          throw new Error("Provide a valid local setup request identifier.");
+        return controller.acknowledgeLocalServerSetup(event, value);
+      }
       if (action === "selectRemoteServer") {
         if (
           typeof value !== "string" ||
@@ -32,7 +45,9 @@ export function installConnectionIpc(ipcMain, controller) {
         (typeof value !== "string" || value.length > 4096)
       )
         throw new Error("Provide a valid panel address or connection.");
-      return action === "list" ? controller.list() : controller[action](value);
+      return action === "list"
+        ? controller.list(event)
+        : controller[action](value);
     });
   }
   return () => {

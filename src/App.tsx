@@ -67,7 +67,10 @@ import PanelAccount, {
   DesktopPanelReturn,
   type PanelSession,
 } from "./PanelAccount";
-import { reportDesktopServers } from "./desktop-connections";
+import {
+  reportDesktopServers,
+  useDesktopConnections,
+} from "./desktop-connections";
 import ConnectPanel, { type ConnectionMode } from "./ConnectPanel";
 import { version as appVersion } from "../package.json";
 import ServerManager, {
@@ -298,6 +301,9 @@ export default function App({
   requestedRemoteServer?: { serverId: string; sequence: number } | null;
 }) {
   const remote = Boolean(session);
+  const desktopConnections = useDesktopConnections(!remote);
+  const handledLocalSetup = useRef<string | null>(null);
+  const committedLocalSetup = useRef<string | null>(null);
   const sessionMounted = useRef(true);
   const isSessionActive = useCallback(() => sessionMounted.current, []);
   useEffect(() => {
@@ -326,6 +332,7 @@ export default function App({
     editing: ServerRecord | null;
     initialStep?: "choice" | "create" | "import";
     firstServer?: boolean;
+    desktopRequestId?: string;
   } | null>(null);
   const [notice, setNotice] = useState("");
   const notify = useCallback((message: string) => setNotice(message), []);
@@ -342,6 +349,52 @@ export default function App({
     onSignedOut?.();
   }, [onSignedOut]);
   const [selectionReady, setSelectionReady] = useState(false);
+  const localSetupRequest = desktopConnections?.pendingLocalServerSetup;
+  useEffect(() => {
+    if (
+      remote ||
+      loading ||
+      error ||
+      manager ||
+      !selectionReady ||
+      !localSetupRequest ||
+      !window.mcPanelConnections?.acknowledgeLocalServerSetup ||
+      handledLocalSetup.current === localSetupRequest.id ||
+      !["create", "import"].includes(localSetupRequest.step)
+    )
+      return;
+    handledLocalSetup.current = localSetupRequest.id;
+    setConnection(null);
+    setManager({
+      editing: null,
+      initialStep: localSetupRequest.step,
+      firstServer: servers.length === 0,
+      desktopRequestId: localSetupRequest.id,
+    });
+  }, [
+    remote,
+    loading,
+    error,
+    manager,
+    selectionReady,
+    localSetupRequest,
+    servers.length,
+  ]);
+  useEffect(() => {
+    if (remote) return;
+    if (manager?.desktopRequestId)
+      committedLocalSetup.current = manager.desktopRequestId;
+    if (
+      !localSetupRequest ||
+      committedLocalSetup.current !== localSetupRequest.id
+    )
+      return;
+    // Acknowledge only after the wizard has committed. Repeated snapshots retry
+    // a failed acknowledgement without reopening a cancelled setup dialog.
+    void window.mcPanelConnections
+      ?.acknowledgeLocalServerSetup?.(localSetupRequest.id)
+      .catch(() => {});
+  }, [remote, manager?.desktopRequestId, localSetupRequest]);
   const loadServers = useCallback(
     async (showLoading = false) => {
       if (!sessionMounted.current || (fleetInFlight.current && !showLoading))
@@ -761,6 +814,27 @@ function EmptyFleet({
   onSignedOut?: () => void;
   notify: (message: string, error?: boolean) => void;
 }) {
+  const openLocalSetup = session
+    ? window.mcPanelConnections?.openLocalServerSetup
+    : undefined;
+  const [openingLocal, setOpeningLocal] = useState(false);
+  const [localSetupError, setLocalSetupError] = useState("");
+  async function addLocal(step: "create" | "import") {
+    if (!openLocalSetup || openingLocal) return;
+    setOpeningLocal(true);
+    setLocalSetupError("");
+    try {
+      await openLocalSetup(step);
+    } catch (cause) {
+      setLocalSetupError(
+        cause instanceof Error
+          ? cause.message
+          : "Unable to open setup on this computer. Try again.",
+      );
+    } finally {
+      setOpeningLocal(false);
+    }
+  }
   return (
     <div className="fleet-welcome-shell">
       <header className="fleet-welcome-header">
@@ -796,50 +870,39 @@ function EmptyFleet({
               {session ? "No shared servers" : "Welcome to MC Panel"}
             </h1>
             <p>
-              {session && !canAddServer
+              {session && (!canAddServer || openLocalSetup)
                 ? "No servers are currently shared with this account. Servers you gain access to will appear here automatically."
                 : session
                   ? `Create or import a server on ${window.location.host}.`
                   : "Start a new Minecraft server, or bring one you already have."}
             </p>
+            {openLocalSetup && (
+              <>
+                <h2 className="fleet-setup-target">On this computer</h2>
+                <WelcomeServerChoices
+                  onAdd={(step) => void addLocal(step)}
+                  disabled={openingLocal}
+                />
+                {localSetupError && (
+                  <p className="fleet-setup-error" role="alert">
+                    {localSetupError}
+                  </p>
+                )}
+              </>
+            )}
             {canAddServer && (
-              <div className="fleet-welcome-choices">
-                <button
-                  className="fleet-welcome-choice"
-                  aria-label="Create a new server"
-                  aria-describedby="welcome-create-description"
-                  onClick={() => onAdd("create")}
-                >
-                  <span className="fleet-welcome-choice-icon">
-                    <Plus size={23} />
-                  </span>
-                  <span>
-                    <strong>Create a new server</strong>
-                    <span id="welcome-create-description">
-                      Choose your software. We’ll guide the setup.
-                    </span>
-                  </span>
-                  <ArrowRight size={19} />
-                </button>
-                <button
-                  className="fleet-welcome-choice"
-                  aria-label="Import an existing server"
-                  aria-describedby="welcome-import-description"
-                  onClick={() => onAdd("import")}
-                >
-                  <span className="fleet-welcome-choice-icon">
-                    <FolderOpen size={23} />
-                  </span>
-                  <span>
-                    <strong>Import an existing server</strong>
-                    <span id="welcome-import-description">
-                      Connect a server folder on{" "}
-                      {session ? "the connected computer" : "your computer"}.
-                    </span>
-                  </span>
-                  <ArrowRight size={19} />
-                </button>
-              </div>
+              <>
+                {openLocalSetup && (
+                  <h2 className="fleet-setup-target">
+                    On {window.location.host}
+                  </h2>
+                )}
+                <WelcomeServerChoices
+                  onAdd={onAdd}
+                  remote={Boolean(session)}
+                  explicitTarget={Boolean(openLocalSetup)}
+                />
+              </>
             )}
             <div className="welcome-remote-account">
               {session && <DesktopPanelReturn />}
@@ -866,6 +929,77 @@ function EmptyFleet({
           MC Panel <span className="footer-version">v{appVersion}</span>
         </span>
       </footer>
+    </div>
+  );
+}
+
+function WelcomeServerChoices({
+  onAdd,
+  remote = false,
+  explicitTarget = false,
+  disabled = false,
+}: {
+  onAdd: (step: "create" | "import") => void;
+  remote?: boolean;
+  explicitTarget?: boolean;
+  disabled?: boolean;
+}) {
+  const id = useId();
+  return (
+    <div
+      className="fleet-welcome-choices"
+      role="group"
+      aria-label={
+        remote ? "Servers on connected computer" : "Servers on this computer"
+      }
+    >
+      <button
+        className="fleet-welcome-choice"
+        disabled={disabled}
+        aria-label={
+          remote && explicitTarget
+            ? "Create a server on the connected computer"
+            : "Create a new server"
+        }
+        aria-describedby={`${id}-create-description`}
+        onClick={() => onAdd("create")}
+      >
+        <span className="fleet-welcome-choice-icon">
+          <Plus size={23} />
+        </span>
+        <span>
+          <strong>Create a new server</strong>
+          <span id={`${id}-create-description`}>
+            {remote
+              ? "Choose software for the connected computer."
+              : "Choose your software. We’ll guide the setup on this computer."}
+          </span>
+        </span>
+        <ArrowRight size={19} />
+      </button>
+      <button
+        className="fleet-welcome-choice"
+        disabled={disabled}
+        aria-label={
+          remote && explicitTarget
+            ? "Import a server on the connected computer"
+            : "Import an existing server"
+        }
+        aria-describedby={`${id}-import-description`}
+        onClick={() => onAdd("import")}
+      >
+        <span className="fleet-welcome-choice-icon">
+          <FolderOpen size={23} />
+        </span>
+        <span>
+          <strong>Import an existing server</strong>
+          <span id={`${id}-import-description`}>
+            Connect a server folder on{" "}
+            {remote ? "the connected computer" : "this computer"}.
+          </span>
+        </span>
+        <ArrowRight size={19} />
+      </button>
     </div>
   );
 }

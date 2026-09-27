@@ -11,6 +11,8 @@ export type PanelServer = {
 
 export type PanelConnections = {
   activeId: string;
+  // Only the trusted local renderer receives requests to open its setup UI.
+  pendingLocalServerSetup?: { id: string; step: "create" | "import" } | null;
   panels: {
     id: string;
     label: string;
@@ -38,6 +40,10 @@ declare global {
       open: (url: string) => Promise<PanelConnections>;
       activate: (id: string) => Promise<PanelConnections>;
       openUpdates?: () => Promise<void>;
+      openLocalServerSetup?: (
+        step: "create" | "import",
+      ) => Promise<PanelConnections>;
+      acknowledgeLocalServerSetup?: (id: string) => Promise<void>;
       disconnect: (id: string) => Promise<PanelConnections>;
       selectLocalServer: (id: string) => Promise<PanelConnections>;
       selectRemoteServer: (

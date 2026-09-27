@@ -890,15 +890,25 @@ async function smoke() {
     await expect(
       remote.getByRole("heading", { name: "No shared servers", exact: true }),
     ).toBeVisible();
-    await remote
-      .getByRole("button", { name: "Back to this computer", exact: true })
-      .click();
-    await expect.poll(activePanel).toBe("local");
 
-    // The empty remote panel and empty local PC need a visible route into
-    // local creation. Only stub the read-only catalog; native owner routing,
-    // the installed wizard, and the remote authentication remain real.
+    // Both setup cards on an empty remote panel open the gaming PC's owner
+    // wizard directly, keeping that remote account signed in. Only stub the
+    // read-only catalog; the installed UI and native routing remain real.
     const setupReads = [];
+    const localSetupMutations = [];
+    const recordLocalSetupMutation = (request) => {
+      const url = new URL(request.url());
+      if (
+        url.origin === new URL(local.url()).origin &&
+        url.pathname.startsWith("/api/") &&
+        !["GET", "HEAD"].includes(request.method())
+      )
+        localSetupMutations.push({
+          path: url.pathname,
+          method: request.method(),
+        });
+    };
+    local.on("request", recordLocalSetupMutation);
     await local.route("**/api/server-setup", async (route) => {
       const request = route.request();
       assert.equal(request.method(), "GET");
@@ -917,36 +927,61 @@ async function smoke() {
         }),
       });
     });
-    await local
-      .getByRole("button", { name: "Create a new server", exact: true })
-      .click();
-    const createWizard = local.getByRole("dialog", {
-      name: "What would you like to play?",
-      exact: true,
-    });
-    await expect(createWizard).toBeVisible();
-    await expect.poll(() => setupReads.length).toBe(1);
-    await expect(
-      createWizard.getByRole("button", {
-        name: "Server software",
+    let createOpens = 0;
+    for (const step of ["create", "import", "create", "import"]) {
+      await remote
+        .getByRole("button", {
+          name:
+            step === "create"
+              ? "Create a new server"
+              : "Import an existing server",
+          exact: true,
+        })
+        .click();
+      await expect.poll(activePanel).toBe("local");
+      const wizard = local.getByRole("dialog", {
+        name:
+          step === "create"
+            ? "What would you like to play?"
+            : "Import an existing server",
         exact: true,
-      }),
-    ).toBeVisible();
-    await expect(createWizard.locator(".setup-host-context")).toHaveCount(0);
-    await createWizard
-      .getByRole("button", { name: "Close add server", exact: true })
-      .click();
-    await expect(createWizard).toHaveCount(0);
+      });
+      await expect(wizard).toBeVisible();
+      if (step === "create") {
+        createOpens++;
+        await expect.poll(() => setupReads.length).toBe(createOpens);
+        await expect(
+          wizard.getByRole("button", { name: "Server software", exact: true }),
+        ).toBeVisible();
+      } else {
+        await expect(
+          wizard.getByLabel("Server folder", { exact: true }),
+        ).toHaveValue("");
+      }
+      await expect(wizard.locator(".setup-host-context")).toHaveCount(0);
+      await expect(remote.getByRole("dialog")).toHaveCount(0);
+      await wizard
+        .getByRole("button", { name: "Close add server", exact: true })
+        .click();
+      await expect(wizard).toHaveCount(0);
+      assert.equal((await remotePanel()).signedIn, true);
+      await localAccount.click();
+      await switchToRemote.click();
+      await expect.poll(activePanel).toBe(remoteId);
+      await expect(
+        remote.getByRole("heading", { name: "No shared servers", exact: true }),
+      ).toBeVisible();
+      await expect(
+        remote.getByRole("button", { name: "Sign in", exact: true }),
+      ).toHaveCount(0);
+    }
+    local.off("request", recordLocalSetupMutation);
+    assert.deepEqual(
+      localSetupMutations,
+      [],
+      "Opening and canceling either local wizard must not mutate local server data",
+    );
     await local.unroute("**/api/server-setup");
-    await localAccount.click();
-    await switchToRemote.click();
-    await expect.poll(activePanel).toBe(remoteId);
-    await expect(
-      remote.getByRole("heading", { name: "No shared servers", exact: true }),
-    ).toBeVisible();
-    await expect(
-      remote.getByRole("button", { name: "Sign in", exact: true }),
-    ).toHaveCount(0);
     state = await application.evaluate(() =>
       globalThis.__frontendSmoke.inspect(),
     );
@@ -956,13 +991,15 @@ async function smoke() {
       state.requests.filter((request) => request.path === "/api/access/logout")
         .length,
       1,
-      "Returning home and opening local creation must retain the remote session",
+      "The remote setup shortcuts must retain the signed-in account",
     );
     assert.ok(
       state.requests.every(
-        (request) => !request.path.startsWith("/api/server-setup"),
+        (request) =>
+          !request.path.startsWith("/api/server-setup") &&
+          !request.path.startsWith("/api/server-import"),
       ),
-      "Local creation must not load a catalog or create a server on the remote host",
+      "The shortcuts must not prepare, create or import servers on the remote host",
     );
     await remote
       .getByRole("button", { name: "Back to this computer", exact: true })
@@ -987,7 +1024,7 @@ async function smoke() {
       remote.getByRole("heading", { name: "Welcome to your server" }),
     ).toBeVisible();
     console.log(
-      "Passed native frontend consistency: stale remote shell replaced by installed UI; certificate consent, remote sign-in/cookies, console filter/clear/export, client file/folder/selection downloads, Updates, switching, local creation from an empty remote panel, reload, logout and background access revocation.",
+      "Passed native frontend consistency: stale remote shell replaced by installed UI; certificate consent, remote sign-in/cookies, console filter/clear/export, client file/folder/selection downloads, Updates, switching, direct local create/import from an empty remote panel, reload, logout and background access revocation.",
     );
   } catch (error) {
     if (stderr) console.error(stderr);

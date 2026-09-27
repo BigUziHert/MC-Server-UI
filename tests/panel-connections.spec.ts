@@ -51,6 +51,8 @@ async function desktopBridge(
     remoteServers?: Record<string, LocalServerDescriptor[]>;
     listFailure?: "reject" | "hang";
     updatesFailure?: boolean;
+    localSetupFailure?: boolean;
+    pendingLocalServerSetup?: { id: string; step: "create" | "import" };
     unavailablePanels?: string[];
     signedOutPanels?: string[];
   } = {},
@@ -63,6 +65,8 @@ async function desktopBridge(
       remoteServers,
       listFailure,
       updatesFailure,
+      localSetupFailure,
+      pendingLocalServerSetup,
       unavailablePanels,
       signedOutPanels,
     }) => {
@@ -115,7 +119,14 @@ async function desktopBridge(
         panelId: string;
         servers: LocalServerDescriptor[] | null;
       }[] = [];
-      const snapshot = () => structuredClone(state);
+      let setupSequence = 0;
+      const snapshot = () =>
+        structuredClone({
+          ...state,
+          ...(senderId === "local"
+            ? { pendingLocalServerSetup: pendingLocalServerSetup ?? null }
+            : {}),
+        });
       const changed = () =>
         window.dispatchEvent(new Event("mc-panel-connections-changed"));
       const report = (
@@ -132,7 +143,13 @@ async function desktopBridge(
       Object.assign(window, {
         connectionCalls: calls,
         connectionReports: reports,
-        connectionFixture: { report },
+        connectionFixture: {
+          report,
+          requestLocalServerSetup: (step: "create" | "import") => {
+            pendingLocalServerSetup = { id: `setup-${++setupSequence}`, step };
+            changed();
+          },
+        },
       });
       window.mcPanelConnections = {
         list: () =>
@@ -163,6 +180,25 @@ async function desktopBridge(
             );
           }
           calls.push({ action: "openUpdates", value: "local" });
+        },
+        openLocalServerSetup: async (step) => {
+          calls.push({ action: "openLocalServerSetup", value: step });
+          if (localSetupFailure) {
+            localSetupFailure = false;
+            throw new Error(
+              "The local panel is still loading. Try again in a moment.",
+            );
+          }
+          pendingLocalServerSetup = { id: `setup-${++setupSequence}`, step };
+          state.activeId = "local";
+          changed();
+          return snapshot();
+        },
+        acknowledgeLocalServerSetup: async (id) => {
+          calls.push({ action: "acknowledgeLocalServerSetup", value: id });
+          if (pendingLocalServerSetup?.id === id)
+            pendingLocalServerSetup = undefined;
+          changed();
         },
         disconnect: async (id) => {
           calls.push({ action: "disconnect", value: id });
@@ -204,6 +240,8 @@ async function desktopBridge(
       remoteServers: options.remoteServers ?? {},
       listFailure: options.listFailure,
       updatesFailure: options.updatesFailure,
+      localSetupFailure: options.localSetupFailure,
+      pendingLocalServerSetup: options.pendingLocalServerSetup,
       unavailablePanels: options.unavailablePanels ?? [],
       signedOutPanels: options.signedOutPanels ?? [],
     },
@@ -241,7 +279,11 @@ async function localPanel(page: Page, desktop = false) {
   return { localCredentials };
 }
 
-async function remoteAccount(page: Page, empty = true) {
+async function remoteAccount(
+  page: Page,
+  empty = true,
+  hostPermissions: string[] = [],
+) {
   await localPanel(page);
   const writes: string[] = [];
   page.on("request", (request) => {
@@ -258,7 +300,7 @@ async function remoteAccount(page: Page, empty = true) {
         userId: "friend",
         serverId: empty ? null : localServer.id,
         permissions: empty ? [] : ["server.view", "control.console"],
-        hostPermissions: [],
+        hostPermissions,
       },
     }),
   );
@@ -274,7 +316,7 @@ async function remoteAccount(page: Page, empty = true) {
               },
             ],
         defaultServerId: empty ? null : localServer.id,
-        hostPermissions: [],
+        hostPermissions,
       },
     }),
   );
@@ -294,13 +336,13 @@ for (const width of [1434, 390]) {
     ).toBeVisible();
     await expect(
       page.getByRole("button", { name: "Create a new server", exact: true }),
-    ).toHaveCount(0);
+    ).toBeVisible();
     await expect(
       page.getByRole("button", {
         name: "Import an existing server",
         exact: true,
       }),
-    ).toHaveCount(0);
+    ).toBeVisible();
     await page
       .getByRole("button", { name: "Back to this computer", exact: true })
       .click();
@@ -325,6 +367,355 @@ for (const width of [1434, 390]) {
     expect(writes).toEqual([]);
   });
 }
+
+for (const width of [1434, 390]) {
+  for (const step of ["create", "import"] as const) {
+    test(`an empty remote panel opens ${step} on this computer without changing the remote account at ${width}px`, async ({
+      page,
+    }) => {
+      await page.setViewportSize({ width, height: 950 });
+      await desktopBridge(page, { activeId: "pc-one", localServers: [] });
+      const { writes } = await remoteAccount(page);
+      const setupReads: string[] = [];
+      page.on("request", (request) => {
+        const path = new URL(request.url()).pathname;
+        if (/^\/api\/server-(?:setup|import)/.test(path)) setupReads.push(path);
+      });
+      await page.goto("/#console");
+      const local = page.getByRole("group", {
+        name: "Servers on this computer",
+        exact: true,
+      });
+      await expect(
+        local.getByRole("button", { name: "Create a new server", exact: true }),
+      ).toBeVisible();
+      await expect(
+        local.getByRole("button", {
+          name: "Import an existing server",
+          exact: true,
+        }),
+      ).toBeVisible();
+      await expect(
+        page.getByRole("heading", { name: "On this computer", exact: true }),
+      ).toBeVisible();
+      await expect(
+        page.getByRole("group", {
+          name: "Servers on connected computer",
+          exact: true,
+        }),
+      ).toHaveCount(0);
+      expect(
+        await page.evaluate(
+          () => document.documentElement.scrollWidth > innerWidth,
+        ),
+      ).toBe(false);
+      await local
+        .getByRole("button", {
+          name:
+            step === "create"
+              ? "Create a new server"
+              : "Import an existing server",
+          exact: true,
+        })
+        .click();
+      await expect
+        .poll(() =>
+          page.evaluate(
+            () =>
+              (window as unknown as { connectionCalls: unknown })
+                .connectionCalls,
+          ),
+        )
+        .toEqual([{ action: "openLocalServerSetup", value: step }]);
+      const snapshot = await page.evaluate(() =>
+        window.mcPanelConnections!.list(),
+      );
+      expect(snapshot.activeId).toBe("local");
+      expect(
+        snapshot.panels.find((panel) => panel.id === "pc-one")?.signedIn,
+      ).toBe(true);
+      await expect(page.getByRole("dialog")).toHaveCount(0);
+      expect(setupReads).toEqual([]);
+      expect(writes).toEqual([]);
+    });
+  }
+}
+
+test("local setup errors keep the remote account signed in and allow a deliberate retry", async ({
+  page,
+}) => {
+  await desktopBridge(page, {
+    activeId: "pc-one",
+    localServers: [],
+    localSetupFailure: true,
+  });
+  const { writes } = await remoteAccount(page);
+  await page.goto("/#console");
+  const create = page.getByRole("button", {
+    name: "Create a new server",
+    exact: true,
+  });
+  await create.click();
+  await expect(page.getByRole("alert")).toContainText(
+    "The local panel is still loading",
+  );
+  expect(
+    (await page.evaluate(() => window.mcPanelConnections!.list())).activeId,
+  ).toBe("pc-one");
+  await expect(create).toBeEnabled();
+  await create.click();
+  await expect(page.getByRole("alert")).toHaveCount(0);
+  await expect
+    .poll(() =>
+      page.evaluate(
+        () =>
+          (window as unknown as { connectionCalls: unknown }).connectionCalls,
+      ),
+    )
+    .toEqual([
+      { action: "openLocalServerSetup", value: "create" },
+      { action: "openLocalServerSetup", value: "create" },
+    ]);
+  expect(
+    (await page.evaluate(() => window.mcPanelConnections!.list())).panels.find(
+      (panel) => panel.id === "pc-one",
+    )?.signedIn,
+  ).toBe(true);
+  expect(writes).toEqual([]);
+});
+
+for (const grant of [false, true]) {
+  test(`a remote browser offers ${grant ? "only permitted host setup" : "no local or host setup without permission"}`, async ({
+    page,
+  }) => {
+    const { writes } = await remoteAccount(
+      page,
+      true,
+      grant ? ["server.create"] : [],
+    );
+    await page.goto("/#console");
+    await expect(
+      page.getByRole("heading", { name: "No shared servers", exact: true }),
+    ).toBeVisible();
+    await expect(
+      page.getByRole("group", {
+        name: "Servers on this computer",
+        exact: true,
+      }),
+    ).toHaveCount(0);
+    await expect(
+      page.getByRole("button", { name: "Back to this computer", exact: true }),
+    ).toHaveCount(0);
+    const create = page.getByRole("button", {
+      name: "Create a new server",
+      exact: true,
+    });
+    const importServer = page.getByRole("button", {
+      name: "Import an existing server",
+      exact: true,
+    });
+    if (grant) {
+      await expect(create).toBeVisible();
+      await expect(importServer).toBeVisible();
+      await importServer.click();
+      await expect(
+        page.getByRole("dialog").getByLabel("Server folder", { exact: true }),
+      ).toBeVisible();
+    } else {
+      await expect(create).toHaveCount(0);
+      await expect(importServer).toHaveCount(0);
+    }
+    expect(writes).toEqual([]);
+  });
+}
+
+test("local setup cards and permitted host setup remain separate on a remote desktop", async ({
+  page,
+}) => {
+  await desktopBridge(page, { activeId: "pc-one", localServers: [] });
+  const { writes } = await remoteAccount(page, true, ["server.create"]);
+  await page.goto("/#console");
+  const local = page.getByRole("group", {
+    name: "Servers on this computer",
+    exact: true,
+  });
+  const host = page.getByRole("group", {
+    name: "Servers on connected computer",
+    exact: true,
+  });
+  await expect(
+    local.getByRole("button", { name: "Create a new server", exact: true }),
+  ).toBeVisible();
+  await expect(
+    host.getByRole("button", {
+      name: "Create a server on the connected computer",
+      exact: true,
+    }),
+  ).toBeVisible();
+  await host
+    .getByRole("button", {
+      name: "Import a server on the connected computer",
+      exact: true,
+    })
+    .click();
+  await expect(
+    page.getByRole("dialog").getByLabel("Server folder", { exact: true }),
+  ).toBeVisible();
+  expect(
+    await page.evaluate(
+      () => (window as unknown as { connectionCalls: unknown }).connectionCalls,
+    ),
+  ).toEqual([]);
+  expect(
+    (await page.evaluate(() => window.mcPanelConnections!.list())).activeId,
+  ).toBe("pc-one");
+  expect(writes).toEqual([]);
+});
+
+for (const step of ["create", "import"] as const) {
+  for (const timing of ["before loading", "after loading"] as const) {
+    test(`the local owner consumes ${step} setup requested ${timing} exactly once`, async ({
+      page,
+    }) => {
+      await desktopBridge(page, {
+        localServers: [],
+        remoteServers: { "pc-one": [] },
+        pendingLocalServerSetup:
+          timing === "before loading" ? { id: "setup-1", step } : undefined,
+      });
+      await localPanel(page, true);
+      await page.route("**/api/servers", (route) =>
+        route.fulfill({ json: { servers: [], defaultServerId: null } }),
+      );
+      await page.route("**/api/server-setup", (route) =>
+        route.fulfill({ json: { providers: [], platforms: [] } }),
+      );
+      const writes: string[] = [];
+      page.on("request", (request) => {
+        const path = new URL(request.url()).pathname;
+        if (request.method() === "POST" && path.startsWith("/api/"))
+          writes.push(path);
+      });
+      await page.goto("/#console");
+      if (timing === "after loading") {
+        await expect(
+          page.getByRole("heading", {
+            name: "Welcome to MC Panel",
+            exact: true,
+          }),
+        ).toBeVisible();
+        await page.evaluate((requestedStep) => {
+          (window as ConnectionMock).connectionFixture.requestLocalServerSetup(
+            requestedStep,
+          );
+        }, step);
+      }
+      const dialog = page.getByRole("dialog");
+      if (step === "create") {
+        await expect(
+          dialog.getByRole("button", { name: "Server software", exact: true }),
+        ).toBeVisible();
+        await expect(
+          dialog.getByLabel("Server folder", { exact: true }),
+        ).toHaveCount(0);
+      } else {
+        await expect(
+          dialog.getByLabel("Server folder", { exact: true }),
+        ).toBeVisible();
+        await expect(
+          dialog.getByRole("button", { name: "Server software", exact: true }),
+        ).toHaveCount(0);
+      }
+      await expect
+        .poll(() =>
+          page.evaluate(
+            () =>
+              (window as unknown as { connectionCalls: unknown })
+                .connectionCalls,
+          ),
+        )
+        .toEqual([{ action: "acknowledgeLocalServerSetup", value: "setup-1" }]);
+      await page.keyboard.press("Escape");
+      await expect(dialog).toHaveCount(0);
+      await page.evaluate(() =>
+        window.dispatchEvent(new Event("mc-panel-connections-changed")),
+      );
+      await expect(dialog).toHaveCount(0);
+      const snapshot = await page.evaluate(() =>
+        window.mcPanelConnections!.list(),
+      );
+      expect(snapshot.pendingLocalServerSetup).toBeNull();
+      expect(
+        snapshot.panels.find((panel) => panel.id === "pc-one")?.signedIn,
+      ).toBe(true);
+      expect(writes).toEqual([]);
+    });
+  }
+}
+
+test("a queued local setup request waits for an already open wizard to close", async ({
+  page,
+}) => {
+  await desktopBridge(page, {
+    localServers: [],
+    remoteServers: { "pc-one": [] },
+  });
+  await localPanel(page, true);
+  await page.route("**/api/servers", (route) =>
+    route.fulfill({ json: { servers: [], defaultServerId: null } }),
+  );
+  await page.route("**/api/server-setup", (route) =>
+    route.fulfill({ json: { providers: [], platforms: [] } }),
+  );
+  await page.goto("/#console");
+  await page
+    .getByRole("button", { name: "Create a new server", exact: true })
+    .click();
+  const dialog = page.getByRole("dialog");
+  await expect(
+    dialog.getByRole("button", { name: "Server software", exact: true }),
+  ).toBeVisible();
+  await page.evaluate(() => {
+    (window as ConnectionMock).connectionFixture.requestLocalServerSetup(
+      "import",
+    );
+  });
+  await dialog.getByRole("button", { name: "Modpack", exact: true }).click();
+  await expect(
+    dialog.getByRole("heading", { name: "Find your modpack", exact: true }),
+  ).toBeVisible();
+  await expect(dialog.getByLabel("Server folder", { exact: true })).toHaveCount(
+    0,
+  );
+  expect(
+    await page.evaluate(
+      () => (window as unknown as { connectionCalls: unknown }).connectionCalls,
+    ),
+  ).toEqual([]);
+  expect(
+    (await page.evaluate(() => window.mcPanelConnections!.list()))
+      .pendingLocalServerSetup,
+  ).toEqual({ id: "setup-1", step: "import" });
+  await page.keyboard.press("Escape");
+  await expect(
+    dialog.getByLabel("Server folder", { exact: true }),
+  ).toBeVisible();
+  await expect(
+    dialog.getByRole("button", { name: "Server software", exact: true }),
+  ).toHaveCount(0);
+  await expect
+    .poll(() =>
+      page.evaluate(
+        () =>
+          (window as unknown as { connectionCalls: unknown }).connectionCalls,
+      ),
+    )
+    .toEqual([{ action: "acknowledgeLocalServerSetup", value: "setup-1" }]);
+  expect(
+    (await page.evaluate(() => window.mcPanelConnections!.list()))
+      .pendingLocalServerSetup,
+  ).toBeNull();
+});
 
 for (const listFailure of [undefined, "reject", "hang"] as const) {
   test(`a remote account can switch to this computer with a ${listFailure ?? "working"} connection list`, async ({
@@ -551,6 +942,7 @@ type ConnectionMock = Window & {
   }[];
   connectionFixture: {
     report: (panelId: string, servers: LocalServerDescriptor[] | null) => void;
+    requestLocalServerSetup: (step: "create" | "import") => void;
   };
 };
 
@@ -2085,15 +2477,24 @@ test("a panel account discovers grants automatically and survives individual or 
   hostPermissions = ["server.create"];
   await page.evaluate(() => window.dispatchEvent(new Event("focus")));
   await expect(
-    page.getByRole("button", { name: "Create a new server", exact: true }),
+    page.getByRole("button", {
+      name: "Create a server on the connected computer",
+      exact: true,
+    }),
   ).toBeVisible();
   hostPermissions = [];
   await page.evaluate(() =>
     document.dispatchEvent(new Event("visibilitychange")),
   );
   await expect(
-    page.getByRole("button", { name: "Create a new server", exact: true }),
+    page.getByRole("button", {
+      name: "Create a server on the connected computer",
+      exact: true,
+    }),
   ).toHaveCount(0);
+  await expect(
+    page.getByRole("button", { name: "Create a new server", exact: true }),
+  ).toBeVisible();
 
   servers = [first, second];
   await page.clock.runFor(5100);

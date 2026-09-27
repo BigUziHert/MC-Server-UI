@@ -13,6 +13,13 @@ if (process.isMainFrame) {
     openUpdates: () => ipcRenderer.invoke("mc-panel-connections:open-updates"),
     selectLocalServer: (id) =>
       ipcRenderer.invoke("mc-panel-connections:select-local-server", id),
+    openLocalServerSetup: (step) =>
+      ipcRenderer.invoke("mc-panel-connections:open-local-server-setup", step),
+    acknowledgeLocalServerSetup: (id) =>
+      ipcRenderer.invoke(
+        "mc-panel-connections:acknowledge-local-server-setup",
+        id,
+      ),
     reportServers: (servers) =>
       ipcRenderer.invoke("mc-panel-connections:report-servers", servers),
     selectRemoteServer: (panelId, serverId) =>

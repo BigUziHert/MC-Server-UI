@@ -835,6 +835,154 @@ test("pending local server selection preserves a newer panel activation", async 
   await h.controller.close();
 });
 
+test("remote setup cards open only local UI while preserving the remote session and keeping requests owner-only", async () => {
+  const h = harness();
+  const handlers = new Map();
+  installConnectionIpc(
+    { handle: (channel, callback) => handlers.set(channel, callback) },
+    h.controller,
+  );
+  const connected = await h.controller.open(origin);
+  const remote = h.views[0].webContents;
+  const local = h.owner.webContents;
+  const invoke = (action, sender, value) =>
+    handlers.get(CONNECTION_CHANNELS[action])(
+      { sender, senderFrame: sender.mainFrame },
+      value,
+    );
+  invoke("reportServers", remote, []);
+  for (const step of [
+    undefined,
+    null,
+    "",
+    "server",
+    "../import",
+    { step: "create", path: "C:/private" },
+  ])
+    assert.throws(
+      () => invoke("openLocalServerSetup", remote, step),
+      /Choose create or import/,
+    );
+  assert.equal(h.controller.list().activeId, connected.activeId);
+  const navigated = invoke("openLocalServerSetup", remote, "create");
+  assert.equal(navigated.activeId, "local");
+  assert.equal(Object.hasOwn(navigated, "pendingLocalServerSetup"), false);
+  assert.equal(
+    Object.hasOwn(invoke("list", remote), "pendingLocalServerSetup"),
+    false,
+  );
+  const request = invoke("list", local).pendingLocalServerSetup;
+  assert.equal(request.step, "create");
+  assert.match(request.id, /^[a-f0-9-]{36}$/);
+  const copy = invoke("list", local).pendingLocalServerSetup;
+  copy.step = "import";
+  assert.equal(invoke("list", local).pendingLocalServerSetup.step, "create");
+  assert.throws(
+    () => invoke("acknowledgeLocalServerSetup", remote, request.id),
+    /Only the local panel/,
+  );
+  for (const id of [undefined, null, {}, "", "a".repeat(129)])
+    assert.throws(
+      () => invoke("acknowledgeLocalServerSetup", local, id),
+      /valid local setup/,
+    );
+  invoke("acknowledgeLocalServerSetup", local, "old-request");
+  assert.equal(invoke("list", local).pendingLocalServerSetup.id, request.id);
+  invoke("acknowledgeLocalServerSetup", local, request.id);
+  assert.equal(invoke("list", local).pendingLocalServerSetup, null);
+  local.emit("did-finish-load");
+  assert.equal(
+    invoke("list", local).pendingLocalServerSetup,
+    null,
+    "A handled wizard must not reopen after cancellation or reload.",
+  );
+  h.controller.activate(connected.activeId);
+  assert.equal(
+    h.controller.list().panels.find((panel) => panel.id === connected.activeId)
+      .signedIn,
+    true,
+  );
+  assert.equal(remote.isDestroyed(), false);
+  assert.equal(h.views[0].loads.length, 1);
+  assert.equal(h.partitions[0].cleared, undefined);
+  assert.equal(h.partitions[0].disconnected, undefined);
+  await h.controller.close();
+});
+
+test("local setup delivery waits through initial load and reload until the current trusted owner document acknowledges", async () => {
+  const h = harness();
+  await h.controller.open(origin);
+  const local = h.owner.webContents;
+  const ownerEvent = () => ({ sender: local, senderFrame: local.mainFrame });
+  local.loading = true;
+  h.controller.openLocalServerSetup("import");
+  assert.equal(h.controller.list(ownerEvent()).pendingLocalServerSetup, null);
+  local.loading = false;
+  local.emit("did-finish-load");
+  const request = h.controller.list(ownerEvent()).pendingLocalServerSetup;
+  assert.equal(request.step, "import");
+  const previousDocument = ownerEvent();
+  local.loading = true;
+  h.controller.acknowledgeLocalServerSetup(previousDocument, request.id);
+  local.mainFrame = { ...local.mainFrame };
+  assert.throws(
+    () =>
+      h.controller.acknowledgeLocalServerSetup(previousDocument, request.id),
+    /Only the local panel/,
+  );
+  local.loading = false;
+  local.emit("did-finish-load");
+  assert.deepEqual(
+    h.controller.list(ownerEvent()).pendingLocalServerSetup,
+    request,
+  );
+  h.controller.acknowledgeLocalServerSetup(ownerEvent(), request.id);
+  assert.equal(h.controller.list(ownerEvent()).pendingLocalServerSetup, null);
+  await h.controller.close();
+  assert.equal(local.listenerCount("did-finish-load"), 0);
+  assert.throws(
+    () => h.controller.openLocalServerSetup("create"),
+    /shutting down/,
+  );
+});
+
+test("new local setup requests replace old ones while later server or panel selections cancel only older pending setup", async () => {
+  let finishSelection;
+  const h = harness({
+    localServers: [{ id: "local-one", name: "Local", status: "offline" }],
+    selectLocalServer: () =>
+      new Promise((resolve) => {
+        finishSelection = resolve;
+      }),
+  });
+  const connected = await h.controller.open(origin);
+  const local = h.owner.webContents;
+  const ownerEvent = { sender: local, senderFrame: local.mainFrame };
+  const pending = () => h.controller.list(ownerEvent).pendingLocalServerSetup;
+  h.controller.openLocalServerSetup("create");
+  const first = pending();
+  h.controller.openLocalServerSetup("import");
+  const second = pending();
+  assert.notEqual(second.id, first.id);
+  h.controller.acknowledgeLocalServerSetup(ownerEvent, first.id);
+  assert.deepEqual(pending(), second);
+  h.controller.activate(connected.activeId);
+  assert.equal(pending(), null);
+  h.controller.openLocalServerSetup("create");
+  const selected = h.controller.selectLocalServer("local-one");
+  assert.equal(pending(), null);
+  h.controller.openLocalServerSetup("import");
+  const latest = pending();
+  finishSelection();
+  await selected;
+  assert.deepEqual(
+    pending(),
+    latest,
+    "An older selection finishing cannot discard a newer wizard request.",
+  );
+  await h.controller.close();
+});
+
 test("remote rosters stay with their sending sessions across local switches and clear only on that session's signout", async () => {
   const h = harness();
   const handlers = new Map();
@@ -1445,7 +1593,12 @@ test("connection IPC validates managed sender, main frame, origin and bounded ar
   assert.equal(invoke("activate", remote, "local").activeId, "local");
   assert.equal(invoke("activate", local, remoteId).activeId, remoteId);
   const rejectsSender = (sender, senderFrame = sender.mainFrame) => {
-    for (const action of ["list", "openUpdates"])
+    for (const action of [
+      "list",
+      "openUpdates",
+      "openLocalServerSetup",
+      "acknowledgeLocalServerSetup",
+    ])
       assert.throws(
         () => invoke(action, sender, undefined, senderFrame),
         /cannot manage/,

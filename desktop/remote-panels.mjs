@@ -164,6 +164,7 @@ export function createRemotePanelController({
   let attached;
   let closed = false;
   let closing;
+  let pendingLocalServerSetup;
   const cleanups = new Set();
   // Saved connections outlive their views, including a quit while the initial
   // registry read or an offline host's background load is still pending.
@@ -239,10 +240,20 @@ export function createRemotePanelController({
       ];
     });
   };
-  const list = () => ({
+  const list = (event) => ({
     activeId,
     // Only the selector's display fields may cross into remote renderers.
     localServers: localServerEntries(),
+    // A setup request is navigation for the trusted owner document only. Keep
+    // it in memory until that document has mounted and acknowledged the wizard.
+    ...(event?.sender === local.contents && controller.isManagedSender(event)
+      ? {
+          pendingLocalServerSetup:
+            pendingLocalServerSetup && !local.contents.isLoadingMainFrame()
+              ? { ...pendingLocalServerSetup }
+              : null,
+        }
+      : {}),
     panels: [...panels.values()].map(
       ({ id, label, origin, local, servers, signedIn }) => ({
         id,
@@ -266,6 +277,15 @@ export function createRemotePanelController({
     }
     onChange(context);
     return context;
+  };
+  const localLoaded = () => {
+    if (pendingLocalServerSetup && !closed) changed();
+  };
+  local.contents.on("did-finish-load", localLoaded);
+  const cancelLocalSetup = () => {
+    if (!pendingLocalServerSetup) return;
+    pendingLocalServerSetup = undefined;
+    changed();
   };
   const suspendSession = (panel) => {
     const hadSession = panel.signedIn === true || panel.servers.length > 0;
@@ -309,12 +329,16 @@ export function createRemotePanelController({
     if (panel.servers.some((server) => server.id === id))
       contents.send("mc-panel-remote-server-selected", id);
   };
-  const activate = (id, { restored = false } = {}) => {
+  const activate = (
+    id,
+    { restored = false, preserveLocalSetup = false } = {},
+  ) => {
     ensureOpen();
     const panel = panels.get(id);
     if (!panel || panel.contents.isDestroyed())
       throw failure(404, "This panel connection is no longer available.");
     if (!restored) {
+      if (!preserveLocalSetup) cancelLocalSetup();
       preferredActiveId = id;
       activationVersion += 1;
     }
@@ -373,6 +397,42 @@ export function createRemotePanelController({
   const controller = {
     list,
     activate,
+    openLocalServerSetup(step) {
+      ensureOpen();
+      if (step !== "create" && step !== "import")
+        throw failure(400, "Choose create or import for local server setup.");
+      if (local.contents.isDestroyed())
+        throw failure(
+          503,
+          "The local panel is unavailable. Restart MC Panel and try again.",
+        );
+      // This bridge only opens existing local UI. Server creation, inspection,
+      // path selection, and writes still require the local wizard's own actions.
+      pendingLocalServerSetup = { id: randomUUID(), step };
+      return activate(local.id, { preserveLocalSetup: true });
+    },
+    acknowledgeLocalServerSetup(event, id) {
+      ensureOpen();
+      if (
+        event?.sender !== local.contents ||
+        !controller.isManagedSender(event)
+      )
+        throw failure(
+          403,
+          "Only the local panel can acknowledge its setup request.",
+        );
+      if (typeof id !== "string" || !id || id.length > 128)
+        throw failure(400, "Provide a valid local setup request identifier.");
+      // Do not let a departing document consume a request intended for the
+      // replacement renderer. Stale acknowledgements cannot clear a newer step.
+      if (
+        local.contents.isLoadingMainFrame() ||
+        pendingLocalServerSetup?.id !== id
+      )
+        return;
+      pendingLocalServerSetup = undefined;
+      changed();
+    },
     openUpdates() {
       ensureOpen();
       if (!openUpdatesOverlay)
@@ -441,6 +501,7 @@ export function createRemotePanelController({
         throw failure(400, "Select a server that is still in the panel.");
       if (!selectLocalServer)
         throw failure(409, "Local server selection is unavailable.");
+      cancelLocalSetup();
       const requestedAt = ++activationVersion;
       await selectLocalServer(id);
       ensureOpen();
@@ -809,6 +870,8 @@ export function createRemotePanelController({
       if (closing) return closing;
       closed = true;
       window.off("resize", resize);
+      local.contents.off("did-finish-load", localLoaded);
+      pendingLocalServerSetup = undefined;
       closing = (async () => {
         const remote = [...panels.values()].filter((panel) => !panel.local);
         if (store) {
