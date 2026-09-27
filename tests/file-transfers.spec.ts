@@ -119,22 +119,22 @@ test("shared panel readers download files, folders, and selections to their comp
       page.getByRole("button", { name: "New file", exact: true }),
     ).toBeDisabled();
 
-    const fileLink = page.getByRole("link", {
+    const fileLink = page.getByRole("button", {
       name: "Download download & café.txt",
       exact: true,
     });
-    const fileUrl = new URL((await fileLink.getAttribute("href"))!, page.url());
-    expect(fileUrl.searchParams.get("serverId")).toBe(server.id);
-    expect(fileUrl.searchParams.get("path")).toBe("download & café.txt");
     let downloadEvent = page.waitForEvent("download");
     await fileLink.click();
     let download = await downloadEvent;
+    const fileUrl = new URL(download.url());
+    expect(fileUrl.searchParams.get("serverId")).toBe(server.id);
+    expect(fileUrl.searchParams.get("path")).toBe("download & café.txt");
     expect(download.suggestedFilename()).toBe("download & café.txt");
     expect(await readFile((await download.path())!, "utf8")).toBe(
       "Saved from the server PC.\n",
     );
 
-    const folderLink = page.getByRole("link", {
+    const folderLink = page.getByRole("button", {
       name: "Download world copy",
       exact: true,
     });

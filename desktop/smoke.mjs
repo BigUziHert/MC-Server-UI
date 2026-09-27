@@ -534,7 +534,10 @@ async function assertSmokeBackup(page, serverId) {
   const backup = created.data;
   await page.goto(`${currentOrigin}/#backups`);
   await page
-    .getByRole("link", { name: `Download backup ${backup.name}`, exact: true })
+    .getByRole("button", {
+      name: `Download backup ${backup.name}`,
+      exact: true,
+    })
     .click();
   const bytes = await expectDownload(`${backup.name}.tar.gz`);
   assert.deepEqual([...bytes.subarray(0, 2)], [31, 139]);
@@ -1277,7 +1280,7 @@ ${processFixture}`,
   assert.equal(textFile.status, 200);
   assert.equal(textFile.data.content, textContents);
   await page
-    .getByRole("link", { name: "Download desktop-smoke.bin", exact: true })
+    .getByRole("button", { name: "Download desktop-smoke.bin", exact: true })
     .click();
   assert.deepEqual(await expectDownload("desktop-smoke.bin"), uploadBytes);
   await capturePackaged("packaged-file-manager.png");

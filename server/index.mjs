@@ -21,6 +21,7 @@ import { copyServerFiles, uploadServerFiles } from "./file-transfer.mjs";
 import { planFileDownload, streamFileArchive } from "./file-download.mjs";
 import { createBackupArchive } from "./backup-archive.mjs";
 import { restoreBackupArchive } from "./backup-restore.mjs";
+import { createOperationReceipts } from "./operation-receipts.mjs";
 import { createMinecraft } from "./minecraft.mjs";
 import { createServerSetup } from "./server-setup.mjs";
 import {
@@ -224,6 +225,27 @@ function validatePlayerName(name) {
     );
   return name;
 }
+
+const settingsRevision = (configuration) =>
+  createHash("sha256")
+    .update(
+      JSON.stringify([
+        configuration.name,
+        configuration.mode,
+        configuration.port,
+        configuration.memoryLimitMB,
+        configuration.jar,
+        configuration.launchType,
+        configuration.launchScript,
+        configuration.launchArgs,
+        configuration.launchExecutable,
+        configuration.javaPath,
+        configuration.motd,
+        configuration.connectionHost ??
+          legacyConnectionHost(configuration.address),
+      ]),
+    )
+    .digest("hex");
 
 export function validateServerConfiguration(
   input,
@@ -565,6 +587,10 @@ export async function createPanel(options = {}) {
     uploadDir,
   ])
     await fs.mkdir(dir, { recursive: true });
+  const restoreReceipts = await createOperationReceipts(
+    await safePath(dataDir, "restore-receipts"),
+    safePath,
+  );
   const relativeBackup = path.relative(
     await fs.realpath(serverDir),
     await fs.realpath(backupDir),
@@ -1018,6 +1044,7 @@ export async function createPanel(options = {}) {
     });
   const descriptor = () => ({
     ...configuration,
+    settingsRevision: settingsRevision(configuration),
     version: startupMetadata.version,
     software: startupMetadata.software,
     minecraftVersion: gameVersion(),
@@ -2059,6 +2086,7 @@ export async function createPanel(options = {}) {
     const current = descriptor();
     const fields = [
       "id",
+      "settingsRevision",
       "name",
       "status",
       "mode",
@@ -2090,6 +2118,7 @@ export async function createPanel(options = {}) {
     "/api/server/settings",
     trackOperation(async (req, res) => {
       const allowed = new Set([
+        "settingsRevision",
         "name",
         "connectionHost",
         "port",
@@ -3253,10 +3282,18 @@ export async function createPanel(options = {}) {
     }),
   );
 
+  const scheduleRevision = () =>
+    createHash("sha256")
+      .update(JSON.stringify(validateSchedule(state.schedule)))
+      .digest("hex");
+  const presentedSchedule = () => ({
+    ...state.schedule,
+    revision: scheduleRevision(),
+  });
   app.get("/api/backups", (_req, res) =>
     res.json({
       backups: state.backups,
-      schedule: state.schedule,
+      schedule: presentedSchedule(),
       timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
       job: latestBackupJob,
     }),
@@ -3316,19 +3353,44 @@ export async function createPanel(options = {}) {
       }
     }),
   );
+  let scheduleWrites = Promise.resolve();
   app.put(
     "/api/backups/schedule",
     trackOperation(async (req, res) => {
       const schedule = validateSchedule(req.body);
-      state.schedule = { ...schedule, nextRun: nextRunFor(schedule), timezone };
-      await audit(
-        "backup",
-        "Backup schedule updated",
-        schedule.enabled
-          ? `${schedule.type} schedule enabled; retain ${schedule.retention} scheduled backups. Timezone: ${Intl.DateTimeFormat().resolvedOptions().timeZone}.`
-          : "Automatic backups disabled.",
-      );
-      res.json({ schedule: state.schedule });
+      const pending = scheduleWrites
+        .catch(() => {})
+        .then(async () => {
+          if (
+            req.body?.revision != null &&
+            req.body.revision !== scheduleRevision()
+          )
+            throw error(
+              409,
+              "The backup schedule changed on another client. Refresh to review the current schedule before saving again.",
+            );
+          const previous = state.schedule;
+          state.schedule = {
+            ...schedule,
+            nextRun: nextRunFor(schedule),
+            timezone,
+          };
+          try {
+            await audit(
+              "backup",
+              "Backup schedule updated",
+              schedule.enabled
+                ? `${schedule.type} schedule enabled; retain ${schedule.retention} scheduled backups. Timezone: ${Intl.DateTimeFormat().resolvedOptions().timeZone}.`
+                : "Automatic backups disabled.",
+            );
+          } catch (cause) {
+            state.schedule = previous;
+            throw cause;
+          }
+          return presentedSchedule();
+        });
+      scheduleWrites = pending.catch(() => {});
+      res.json({ schedule: await pending });
     }),
   );
   const getItem = (collection, id) => {
@@ -3351,33 +3413,135 @@ export async function createPanel(options = {}) {
           400,
           "Confirm that this backup will replace the current server files.",
         );
-      if (status !== "offline")
-        throw error(409, "Stop the server before restoring a backup.");
-      const item = getItem(state.backups, req.params.id);
-      const result = await withMinecraftMutation(async () => {
-        const archive = await safePath(backupDir, `${item.id}.tar.gz`);
-        if (!(await exists(archive)))
-          throw error(404, "Backup archive not found.");
-        const restored = await restoreBackupArchive(serverDir, archive);
-        invalidateDiskUsage();
-        startupMetadataAt = 0;
-        iconReadAt = 0;
-        try {
-          await audit(
-            "backup",
-            "Backup restored",
-            `${item.name} · server files replaced with the saved backup. The server remains stopped.`,
-          );
-        } catch (cause) {
-          const warning = `Your server files were restored, but the activity log could not be saved. ${cause.message}`;
-          restored.warning = [restored.warning, warning]
-            .filter(Boolean)
-            .join(" ");
-          append(`[Panel] ${warning}`, "warn");
-        }
-        return restored;
-      });
-      res.json({ ok: true, backupId: item.id, ...result });
+      const principal = req[remotePrincipal];
+      const result = await restoreReceipts.run(
+        req.body?.requestId,
+        {
+          actor: principal
+            ? [principal.accountId ?? null, principal.userId, principal.email]
+            : "local-owner",
+          backupId: req.params.id,
+        },
+        () => {
+          if (status !== "offline")
+            throw error(409, "Stop the server before restoring a backup.");
+          return withMinecraftMutation(async () => {
+            const item = getItem(state.backups, req.params.id);
+            const archive = await safePath(backupDir, `${item.id}.tar.gz`);
+            if (!(await exists(archive)))
+              throw error(404, "Backup archive not found.");
+            const restored = await restoreBackupArchive(serverDir, archive, {
+              validate: async (staged) => {
+                try {
+                  const validateRetainedExecutable = async (value) => {
+                    let relative;
+                    if (path.isAbsolute(value)) {
+                      relative = path.relative(serverDir, value);
+                      // External Java installations and system executables
+                      // are not replaced by restoring this server directory.
+                      if (
+                        path.isAbsolute(relative) ||
+                        relative === ".." ||
+                        relative.startsWith(`..${path.sep}`)
+                      )
+                        return;
+                    } else {
+                      if (!/[\\/]/.test(value)) {
+                        // Windows searches cwd before PATH, including implicit
+                        // .com/.exe suffixes. Preserve a currently selected
+                        // bundled executable even when settings use a bare name.
+                        if (
+                          process.platform !== "win32" ||
+                          process.env.NoDefaultCurrentDirectoryInExePath !==
+                            undefined
+                        )
+                          return;
+                        const base = value.endsWith(".") ? value : `${value}.`;
+                        const candidates = [
+                          ...(value.includes(".") && !value.endsWith(".")
+                            ? [value]
+                            : []),
+                          `${base}com`,
+                          `${base}exe`,
+                        ];
+                        for (const candidate of candidates) {
+                          const present = await fs
+                            .stat(await safePath(serverDir, candidate))
+                            .catch((cause) => {
+                              if (
+                                cause.code === "ENOENT" ||
+                                cause.code === "ENOTDIR"
+                              )
+                                return null;
+                              throw cause;
+                            });
+                          if (present?.isFile()) {
+                            relative = candidate;
+                            break;
+                          }
+                        }
+                        if (!relative) return;
+                      } else relative = value;
+                    }
+                    const executable = await safePath(
+                      staged,
+                      relative.replace(/\\/g, "/").replace(/^\.\//, ""),
+                    );
+                    if (!(await fs.stat(executable)).isFile())
+                      throw new Error(
+                        "The selected startup executable is missing.",
+                      );
+                  };
+                  if (configuration.launchType === "jar") {
+                    const jar = await safePath(staged, configuration.jar);
+                    if (!(await fs.stat(jar)).isFile())
+                      throw new Error(
+                        "The selected server JAR is not a regular file.",
+                      );
+                  } else {
+                    await validateStartupFiles(staged, configuration);
+                  }
+                  if (configuration.launchType === "executable")
+                    await validateRetainedExecutable(
+                      configuration.launchExecutable,
+                    );
+                  else if (
+                    ["jar", "java-args"].includes(configuration.launchType)
+                  )
+                    await validateRetainedExecutable(configuration.javaPath);
+                } catch (cause) {
+                  const detail =
+                    cause.code === "ENOENT" || cause.code === "ENOTDIR"
+                      ? "The archive does not contain the selected startup files."
+                      : "The archive's startup files could not be validated.";
+                  throw error(
+                    409,
+                    `This backup is incompatible with the retained launch settings. No server files were replaced. Ask the owner to select startup settings matching this backup before restoring. ${detail}`,
+                  );
+                }
+              },
+            });
+            invalidateDiskUsage();
+            startupMetadataAt = 0;
+            iconReadAt = 0;
+            try {
+              await audit(
+                "backup",
+                "Backup restored",
+                `${item.name} · server files replaced with the saved backup. The server remains stopped.`,
+              );
+            } catch (cause) {
+              const warning = `Your server files were restored, but the activity log could not be saved. ${cause.message}`;
+              restored.warning = [restored.warning, warning]
+                .filter(Boolean)
+                .join(" ");
+              append(`[Panel] ${warning}`, "warn");
+            }
+            return { ok: true, backupId: item.id, ...restored };
+          });
+        },
+      );
+      res.json(result);
     }),
   );
   app.delete(
@@ -3548,11 +3712,15 @@ export async function createPanel(options = {}) {
         createdAt: new Date().toISOString(),
       };
       checkSubuserAccess(req, "user.create", null, item.permissions);
-      await saveSubusers(
-        [...state.users, item],
-        "Subuser added",
-        `${item.email} · ${item.permissions.length} permissions. Invitation not yet sent.`,
-      );
+      const create = () =>
+        saveSubusers(
+          [...state.users, item],
+          "Subuser added",
+          `${item.email} · ${item.permissions.length} permissions. Invitation not yet sent.`,
+        );
+      if (options.createLegacyUser)
+        await options.createLegacyUser(item.email, create);
+      else await create();
       res.status(201).json(item);
     }),
   );
@@ -4014,6 +4182,7 @@ export async function createFleet(options = {}) {
       unavailable: true,
       descriptor: () => ({
         ...onlyConfig(entry),
+        settingsRevision: settingsRevision(onlyConfig(entry)),
         id: entry.id,
         address: entry.address,
         version: entry.version,
@@ -4121,6 +4290,8 @@ export async function createFleet(options = {}) {
       accessUserForServer: (userId) => access?.userForServer(entry.id, userId),
       grantAccount: (accountId, input) =>
         access.grantServer(entry.id, accountId, input),
+      createLegacyUser: (email, create) =>
+        access.withLegacyIdentity(email, create),
       inviteAccount: (accountId) => access.inviteAccount(accountId),
       subusersForDisplay: (users) =>
         access
@@ -5228,8 +5399,19 @@ export async function createFleet(options = {}) {
             "You no longer have permission to change this server's settings.",
           );
       }
+      if (!input || typeof input !== "object" || Array.isArray(input))
+        throw error(400, "Provide server settings.");
+      const { settingsRevision: expectedRevision, ...changes } = input;
+      if (
+        expectedRevision !== undefined &&
+        expectedRevision !== descriptor(entry).settingsRevision
+      )
+        throw error(
+          409,
+          "Server settings changed on the host. Your edits have not been saved. Reload the saved settings and review your changes before trying again.",
+        );
       const config = validateServerConfiguration(
-        input,
+        changes,
         onlyConfig(entry),
         entry.storage === "external",
       );

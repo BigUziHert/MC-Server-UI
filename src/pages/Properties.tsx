@@ -1,28 +1,17 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useContext, useEffect, useRef, useState } from "react";
 import { FileCode2, Save, SlidersHorizontal } from "lucide-react";
-import { useServerApi, type PageProps } from "../api";
+import { ServerScope, useServerApi, type PageProps } from "../api";
+import {
+  PropertyDraftsContext,
+  type PropertyDraft,
+  type PropertyField as Field,
+  type PropertyConfig as Config,
+} from "../property-drafts";
 import SearchField, { useDebouncedValue } from "../SearchField";
 import RefreshButton from "../RefreshButton";
 import StatePanel from "../StatePanel";
 import Switch from "../Switch";
 import "./properties.css";
-
-type Field = {
-  key: string;
-  label: string;
-  type: "string" | "number" | "boolean";
-  value: string | number | boolean;
-  options?: string[];
-  min?: number;
-  max?: number;
-  secret?: boolean;
-};
-type Config = {
-  path: string;
-  revision: string;
-  fields: Field[];
-  status: string;
-};
 
 function numberError(field: Field, value: string | number | boolean) {
   if (field.type !== "number") return "";
@@ -45,6 +34,8 @@ export default function Properties({
   const canWrite =
     permissions === undefined || permissions.includes("file.update");
   const { api, post } = useServerApi();
+  const drafts = useContext(PropertyDraftsContext);
+  const draftKey = useContext(ServerScope) ?? "default";
   const [files, setFiles] = useState<{ path: string; name: string }[]>([]),
     [selected, setSelected] = useState("");
   const [config, setConfig] = useState<Config | null>(null),
@@ -55,10 +46,15 @@ export default function Properties({
     [saving, setSaving] = useState(false),
     [error, setError] = useState(""),
     [search, setSearch] = useState("");
+  const [errorKind, setErrorKind] = useState<"load" | "save" | "conflict">(
+    "load",
+  );
   const debouncedSearch = useDebouncedValue(search);
   const [catalogReload, setCatalogReload] = useState(0);
   const [pendingReload, setPendingReload] = useState(false);
   const [pending, setPending] = useState<string | null>(null);
+  const [missingDraft, setMissingDraft] = useState(false);
+  const [discardMissingDraft, setDiscardMissingDraft] = useState(false);
   const request = useRef(0),
     session = useRef(0),
     dialog = useRef<HTMLDialogElement>(null);
@@ -76,12 +72,46 @@ export default function Properties({
     .filter((field) => !invalid[field.key])
     .map((field) => ({ key: field.key, value: values[field.key] }));
   const dirty = edited.length > 0;
+  const currentDraft = useRef({ config, values });
+  currentDraft.current = { config, values };
+  useEffect(() => {
+    if (!config || loading) return;
+    if (!dirty) {
+      drafts.delete(draftKey);
+      return;
+    }
+    const draft: PropertyDraft = {
+      config,
+      values,
+      onSaved: (saved) => {
+        if (
+          currentDraft.current.config !== config ||
+          currentDraft.current.values !== values
+        )
+          return;
+        setConfig(saved);
+        setValues(
+          Object.fromEntries(
+            saved.fields.map((field) => [field.key, field.value]),
+          ),
+        );
+        setMissingDraft(false);
+        setError("");
+      },
+    };
+    drafts.set(draftKey, draft);
+    return () => {
+      // Retain data across navigation without retaining an unmounted page.
+      delete draft.onSaved;
+    };
+  }, [config, values, dirty, loading, drafts, draftKey]);
   const load = useCallback(
     async (file: string, preserve = false) => {
       if (!canRead) return false;
       const id = ++request.current;
       setLoading(true);
       setError("");
+      setErrorKind("load");
       if (!preserve) {
         setConfig(null);
         setValues({});
@@ -91,12 +121,25 @@ export default function Properties({
           `/minecraft/properties/file?path=${encodeURIComponent(file)}`,
         );
         if (id !== request.current) return false;
-        setConfig(data);
-        setValues(
-          Object.fromEntries(
-            data.fields.map((field) => [field.key, field.value]),
-          ),
-        );
+        setMissingDraft(false);
+        const draft = drafts.get(draftKey);
+        if (draft?.config.path === file) {
+          setConfig(draft.config);
+          setValues(draft.values);
+          if (draft.config.revision !== data.revision) {
+            setErrorKind("conflict");
+            setError(
+              "This file changed on the host while you were away. Your unsaved edits are kept. Copy any edits you want to keep, then refresh to review the latest file.",
+            );
+          }
+        } else {
+          setConfig(data);
+          setValues(
+            Object.fromEntries(
+              data.fields.map((field) => [field.key, field.value]),
+            ),
+          );
+        }
         return true;
       } catch (cause) {
         if (id === request.current) setError((cause as Error).message);
@@ -105,7 +148,7 @@ export default function Properties({
         if (id === request.current) setLoading(false);
       }
     },
-    [api, canRead],
+    [api, canRead, drafts, draftKey],
   );
   useEffect(() => {
     const id = ++session.current;
@@ -116,6 +159,8 @@ export default function Properties({
     setValues({});
     setSearch("");
     setPending(null);
+    setMissingDraft(false);
+    setDiscardMissingDraft(false);
     setLoading(true);
     setSaving(false);
     setError("");
@@ -129,9 +174,24 @@ export default function Properties({
       .then((data) => {
         if (id !== session.current) return;
         setFiles(data.files);
+        const draft = drafts.get(draftKey);
+        if (
+          draft &&
+          !data.files.some((file) => file.path === draft.config.path)
+        ) {
+          setSelected(draft.config.path);
+          setConfig(draft.config);
+          setValues(draft.values);
+          setMissingDraft(true);
+          setLoading(false);
+          return;
+        }
         if (data.files.length) {
-          setSelected(data.files[0].path);
-          void load(data.files[0].path);
+          const file =
+            data.files.find((file) => file.path === draft?.config.path)?.path ??
+            data.files[0].path;
+          setSelected(file);
+          void load(file);
         } else setLoading(false);
       })
       .catch((cause) => {
@@ -144,11 +204,11 @@ export default function Properties({
       session.current++;
       request.current++;
     };
-  }, [api, load, catalogReload, canRead]);
+  }, [api, load, catalogReload, canRead, drafts, draftKey]);
   useEffect(() => {
-    if (pending) dialog.current?.showModal();
+    if (pending || discardMissingDraft) dialog.current?.showModal();
     else dialog.current?.close();
-  }, [pending]);
+  }, [pending, discardMissingDraft]);
   useEffect(() => {
     if (!dirty) return;
     const warn = (event: BeforeUnloadEvent) => {
@@ -165,6 +225,7 @@ export default function Properties({
       return;
     }
     setSearch("");
+    setMissingDraft(false);
     setSelected(file);
     void load(file);
   };
@@ -178,15 +239,31 @@ export default function Properties({
     return load(selected, true);
   };
   async function save() {
-    if (!canWrite || !config || !dirty || invalidCount > 0 || saving) return;
+    if (
+      !canWrite ||
+      !config ||
+      !dirty ||
+      invalidCount > 0 ||
+      saving ||
+      missingDraft
+    )
+      return;
     const id = session.current;
     setSaving(true);
     setError("");
+    setErrorKind("save");
     try {
       const result = await post<Config & { message: string }>(
         "/minecraft/properties/save",
         { path: config.path, revision: config.revision, changes },
       );
+      // Navigation may unmount this page while the host saves successfully.
+      // Release only the submitted snapshot, never a newer page's edits.
+      const stored = drafts.get(draftKey);
+      if (stored?.config === config && stored.values === values) {
+        drafts.delete(draftKey);
+        stored.onSaved?.(result);
+      }
       if (id !== session.current) return;
       setConfig(result);
       setValues(
@@ -196,7 +273,12 @@ export default function Properties({
       );
       notify(result.message);
     } catch (cause) {
-      if (id === session.current) setError((cause as Error).message);
+      if (id === session.current) {
+        setError((cause as Error).message);
+        setErrorKind(
+          (cause as { status?: number }).status === 409 ? "conflict" : "save",
+        );
+      }
     } finally {
       if (id === session.current) setSaving(false);
     }
@@ -224,7 +306,12 @@ export default function Properties({
           className="btn primary"
           onClick={() => void save()}
           disabled={
-            !canWrite || !dirty || invalidCount > 0 || saving || loading
+            !canWrite ||
+            !dirty ||
+            invalidCount > 0 ||
+            saving ||
+            loading ||
+            missingDraft
           }
         >
           <Save size={15} />
@@ -261,19 +348,52 @@ export default function Properties({
         <span>{filtered.length} properties</span>
         <RefreshButton
           label="Refresh properties"
-          disabled={loading || saving || !selected}
+          disabled={loading || saving || !selected || missingDraft}
           onRefresh={reload}
           notify={notify}
           successMessage="Properties refreshed."
         />
       </div>
+      {missingDraft && config && (
+        <StatePanel
+          variant="error"
+          title="Draft file is missing on the host"
+          message={`Your unsaved edits for ${config.path} are kept below. Copy anything you need before discarding this draft, or restore the file on the host and check again.`}
+          action={
+            <div className="modal-actions">
+              <button
+                className="btn"
+                disabled={loading}
+                onClick={() => void load(selected, true)}
+              >
+                Check for file
+              </button>
+              <button
+                className="btn danger"
+                disabled={loading}
+                onClick={() => setDiscardMissingDraft(true)}
+              >
+                Discard missing-file draft
+              </button>
+            </div>
+          }
+        />
+      )}
       {error && (
         <StatePanel
           variant="error"
-          title="Unable to load properties"
+          title={
+            errorKind === "load"
+              ? "Unable to load properties"
+              : errorKind === "conflict"
+                ? "Properties changed on the host"
+                : "Unable to save properties"
+          }
           message={error}
           onRetry={() => {
-            if (selected) void reload();
+            if (missingDraft) void load(selected, true);
+            else if (errorKind === "save") void save();
+            else if (selected) void reload();
             else setCatalogReload((v) => v + 1);
           }}
         />
@@ -290,7 +410,7 @@ export default function Properties({
           variant="loading"
           title="Loading configuration…"
         />
-      ) : !files.length ? (
+      ) : !files.length && !config ? (
         <StatePanel
           className="panel"
           variant="empty"
@@ -310,7 +430,7 @@ export default function Properties({
                       aria-label={field.label}
                       label={values[field.key] === true ? "On" : "Off"}
                       checked={values[field.key] === true}
-                      disabled={!canWrite || saving || loading}
+                      disabled={!canWrite || saving || loading || missingDraft}
                       onCheckedChange={(checked) =>
                         setValues((current) => ({
                           ...current,
@@ -322,7 +442,7 @@ export default function Properties({
                     <select
                       aria-label={field.label}
                       value={String(values[field.key])}
-                      disabled={!canWrite || saving || loading}
+                      disabled={!canWrite || saving || loading || missingDraft}
                       onChange={(event) =>
                         setValues((current) => ({
                           ...current,
@@ -356,6 +476,7 @@ export default function Properties({
                       autoComplete="off"
                       spellCheck={false}
                       disabled={!canWrite || saving || loading}
+                      readOnly={missingDraft}
                       value={String(values[field.key])}
                       onChange={(event) =>
                         setValues((current) => ({
@@ -395,6 +516,8 @@ export default function Properties({
               {canWrite ? (
                 <span>
                   Changes apply after a server restart.
+                  {dirty &&
+                    " Unsaved edits are kept while you navigate this panel."}
                   {(permissions === undefined ||
                     permissions.includes("file.read")) && (
                     <>
@@ -415,28 +538,53 @@ export default function Properties({
         ref={dialog}
         className="modal properties-discard"
         aria-labelledby="discard-properties-title"
-        onCancel={() => setPending(null)}
+        onCancel={() => {
+          setPending(null);
+          setDiscardMissingDraft(false);
+        }}
       >
         <h2 id="discard-properties-title">
-          {pendingReload
-            ? `Reload and discard ${edited.length} unsaved changes?`
-            : "Discard unsaved changes?"}
+          {discardMissingDraft
+            ? `Discard unsaved changes for ${selected}?`
+            : pendingReload
+              ? `Reload and discard ${edited.length} unsaved changes?`
+              : "Discard unsaved changes?"}
         </h2>
         <p>
-          {pendingReload
+          {!discardMissingDraft && pendingReload
             ? "Reloading replaces your edits with the saved file."
             : `Your ${edited.length} unsaved changes will be discarded.`}
         </p>
         <div className="modal-actions">
-          <button className="btn" onClick={() => setPending(null)}>
+          <button
+            className="btn"
+            onClick={() => {
+              setPending(null);
+              setDiscardMissingDraft(false);
+            }}
+          >
             Keep editing
           </button>
           <button
             className="btn danger"
             onClick={() => {
+              if (discardMissingDraft) {
+                setDiscardMissingDraft(false);
+                drafts.delete(draftKey);
+                setMissingDraft(false);
+                setConfig(null);
+                setValues({});
+                setError("");
+                const first = files[0]?.path ?? "";
+                setSelected(first);
+                if (first) void load(first);
+                return;
+              }
               const target = pending;
               setPending(null);
               if (target) {
+                drafts.delete(draftKey);
+                setMissingDraft(false);
                 if (!pendingReload) setSearch("");
                 setSelected(target);
                 void load(target, pendingReload).then((ok) => {
@@ -445,7 +593,9 @@ export default function Properties({
               }
             }}
           >
-            {pendingReload ? "Reload properties" : "Discard changes"}
+            {!discardMissingDraft && pendingReload
+              ? "Reload properties"
+              : "Discard changes"}
           </button>
         </div>
       </dialog>

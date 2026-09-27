@@ -1,7 +1,9 @@
-import { useSyncExternalStore } from "react";
+import { useContext, useSyncExternalStore } from "react";
+import { SessionScopeContext } from "./session-scope";
 
 export type FileClipboard = {
   origin: string;
+  sessionScope: string;
   sourceServerId: string;
   sourceName: string;
   paths: string[];
@@ -29,5 +31,8 @@ export function clearFileClipboard() {
 // This clipboard is intentionally in memory and confined to this panel's origin.
 // The destination API rechecks source and destination permissions on every paste.
 export function useFileClipboard() {
-  return useSyncExternalStore(subscribe, () => clipboard);
+  const scope = useContext(SessionScopeContext);
+  return useSyncExternalStore(subscribe, () =>
+    clipboard?.sessionScope === scope ? clipboard : null,
+  );
 }

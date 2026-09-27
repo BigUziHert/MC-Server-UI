@@ -51,7 +51,9 @@ async function fixture(t) {
                 resolve({
                   status: res.statusCode,
                   body: JSON.parse(body),
-                  cookie: res.headers["set-cookie"]?.[0],
+                  cookie: JSON.parse(body).sessionToken
+                    ? `Bearer ${JSON.parse(body).sessionToken}`
+                    : undefined,
                 });
               } catch (cause) {
                 reject(cause);
@@ -115,14 +117,14 @@ async function fixture(t) {
     );
     const signed = await guest("/api/access/accept", {
       ...json("POST", { token, password }),
-      ...(existingCookie ? { headers: { Cookie: existingCookie } } : {}),
+      ...(existingCookie ? { headers: { Authorization: existingCookie } } : {}),
     });
     assert.equal(signed.status, 200, JSON.stringify(signed.body));
     const cookie = signed.cookie.split(";")[0];
     const asUser = request(remote, {
       Host: "panel.example.test",
       Origin: origin,
-      Cookie: cookie,
+      Authorization: cookie,
     });
     return { user, cookie, token, asUser, session: signed.body };
   };
@@ -377,7 +379,7 @@ test("remote copy checks proven source read access and destination create access
   const asBoth = (route, options = {}) =>
     source.asUser(route, {
       ...options,
-      headers: { ...options.headers, Cookie: cookie },
+      headers: { ...options.headers, Authorization: cookie },
     });
   const copied = await asBoth("/api/files/copy", request());
   assert.equal(copied.status, 201, JSON.stringify(copied.body));
@@ -609,7 +611,7 @@ test("invited phone sessions are server-scoped, honor changed permissions, and r
   for (const command of ["stop", "/stop", " Stop "])
     assert.equal(
       (await asUser("/api/console/command", json("POST", { command }))).status,
-      403,
+      409, // Authorized unrestricted Console, but the fixture server is stopped.
     );
   for (const route of [
     "/api/files",
@@ -1500,7 +1502,10 @@ test("failed subuser revocation stays retryable and never restores revoked crede
         ? persisted.users.find((entry) => entry.id === userId)
         : null,
   });
-  assert.equal(await reloaded.authenticate({ headers: { cookie } }), null);
+  assert.equal(
+    await reloaded.authenticate({ headers: { authorization: cookie } }),
+    null,
+  );
   await assert.rejects(
     reloaded.login({ email: user.email, password: "Correct-test-password!" }),
     { status: 401 },

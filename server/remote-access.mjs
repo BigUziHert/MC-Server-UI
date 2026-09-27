@@ -4,7 +4,7 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import http from "node:http";
 import https from "node:https";
 import { createHash } from "node:crypto";
-import { createAccessRateLimiter } from "./access.mjs";
+import { createAccessRateLimiter, SUBUSER_COOKIE } from "./access.mjs";
 import {
   createRemoteTls,
   addressHost,
@@ -132,13 +132,10 @@ export function requiredPermissions(req) {
       return [`control.${action === "force-stop" ? "stop" : action}`];
     }
     if (route === "/api/console/command") {
-      const command =
-        typeof req.body?.command === "string"
-          ? req.body.command.trim().replace(/^\//, "")
-          : "";
-      return /^stop(?:\s|$)/i.test(command)
-        ? ["control.console", "control.stop"]
-        : ["control.console"];
+      // Minecraft/plugin commands can wrap or alias power actions. Console is
+      // explicitly trusted unrestricted command access; power grants govern
+      // the panel's dedicated buttons, not a misleading command denylist.
+      return ["control.console"];
     }
     if (["/api/files", "/api/files/upload"].includes(route))
       return ["file.create"];
@@ -231,6 +228,10 @@ export function createRemoteGateway({
   const app = express();
   app.disable("x-powered-by");
   app.use((req, res, next) => {
+    // Browser cookies are shared across ports. Never authenticate them or emit
+    // a reusable cookie from this public gateway. Old clients must sign in
+    // again using origin-scoped bearer credentials.
+    delete req.headers.cookie;
     res.set({
       "Cache-Control": "no-store",
       "Referrer-Policy": "no-referrer",
@@ -304,6 +305,12 @@ export function createRemoteGateway({
     limit: () => (access.status().transport === "proxy" ? 240 : 30),
   });
   app.get("/api/access/session", async (req, res) => {
+    // Retire credentials issued by older versions. They cannot authenticate
+    // this gateway, including if another port captured their former value.
+    res.setHeader(
+      "Set-Cookie",
+      `${SUBUSER_COOKIE}=; Path=/; HttpOnly; SameSite=Strict; Secure; Max-Age=0`,
+    );
     res.json((await access.authenticate(req)) ?? { role: "guest" });
   });
   app.post(
@@ -312,8 +319,7 @@ export function createRemoteGateway({
     accountLoginLimit,
     async (req, res) => {
       const result = await access.login(req.body ?? {});
-      res.setHeader("Set-Cookie", result.cookie);
-      res.json(result.session);
+      res.json({ ...result.session, sessionToken: result.token });
     },
   );
   app.post("/api/access/accept", acceptLimit, async (req, res) => {
@@ -323,15 +329,18 @@ export function createRemoteGateway({
       req,
     );
     await accepted?.(result.session);
-    res.setHeader("Set-Cookie", result.cookie);
-    res.json(result.session);
+    res.json({ ...result.session, sessionToken: result.token });
   });
   app.post("/api/access/logout", async (req, res) => {
-    res.setHeader("Set-Cookie", await access.logout(req));
+    await access.logout(req);
     res.json({ ok: true });
+  });
+  app.post("/api/access/download", async (req, res) => {
+    res.json(await access.issueDownload(req, req.body?.url));
   });
   app.use(async (req, res, next) => {
     if (!/^\/api(?:\/|$)/i.test(req.path)) return next();
+    if (req.query.downloadTicket !== undefined) access.consumeDownload(req);
     const session = await access.authenticate(req);
     if (!session)
       throw failure(401, "Sign in with your email address and password.");

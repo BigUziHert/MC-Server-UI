@@ -31,6 +31,7 @@ const validPassword = (value) =>
 const membershipKey = (serverId, userId) => JSON.stringify([serverId, userId]);
 const scopeKey = (record) => membershipKey(record.serverId, record.userId);
 const clearCookie = `${SUBUSER_COOKIE}=; Path=/; HttpOnly; SameSite=Strict; Secure; Max-Age=0`;
+const downloadSessionHash = Symbol("downloadSessionHash");
 const derivePassword = promisify(scrypt);
 const passwordOptions = { N: 16384, r: 8, p: 1, maxmem: 64 * 1024 * 1024 };
 const dummyPassword = {
@@ -61,6 +62,14 @@ async function matchesPassword(password, stored) {
 }
 
 function cookieSecret(req) {
+  if (req?.headers?.authorization !== undefined) {
+    const authorization = req.headers.authorization;
+    const token =
+      typeof authorization === "string" && authorization.startsWith("Bearer ")
+        ? authorization.slice(7)
+        : null;
+    return validSecret(token) ? token : null;
+  }
   const value = req?.headers?.cookie;
   if (typeof value !== "string" || value.length > 16_384) return null;
   const matches = value
@@ -309,6 +318,7 @@ export async function createAccessService({
       );
   }
   let queue = Promise.resolve();
+  const downloadTickets = new Map();
   let closing = false;
   let pendingAuthentications = 0;
   const serialize = (operation) => {
@@ -541,7 +551,18 @@ export async function createAccessService({
   const publicAccount = (account) => {
     if (!account) return null;
     const { password, authRevision, ...visible } = account;
-    return structuredClone({ ...visible, ...accountInvitation(account) });
+    return structuredClone({
+      ...visible,
+      ...accountInvitation(account),
+      effectiveHostPermissions: [
+        ...new Set([
+          ...account.hostPermissions,
+          ...Object.keys(account.serverOverrides)
+            .filter((id) => permitsServer(account, id))
+            .flatMap((id) => account.serverOverrides[id].hostPermissions ?? []),
+        ]),
+      ],
+    });
   };
   const findAccount = (id) =>
     accountById(id) ?? legacyAccounts().find((account) => account.id === id);
@@ -594,6 +615,16 @@ export async function createAccessService({
         input.hostPermissions,
         hostPermissionIds,
       );
+    if (Object.hasOwn(input, "hostPermissions"))
+      account.serverOverrides = Object.fromEntries(
+        Object.entries(account.serverOverrides).map(([id, override]) => [
+          id,
+          {
+            ...override,
+            hostPermissions: [],
+          },
+        ]),
+      );
     return account;
   };
   const replaceAccount = (next, account, previous) => ({
@@ -641,6 +672,7 @@ export async function createAccessService({
     const value = secret();
     const { serverId, userId, email } = records[0];
     const session = {
+      transport: "bearer",
       serverId,
       userId,
       email,
@@ -652,6 +684,7 @@ export async function createAccessService({
       expiresAt: now() + sessionLifetime,
     };
     return {
+      token: value,
       session,
       cookie: `${SUBUSER_COOKIE}=${value}; Path=/; HttpOnly; SameSite=Strict; Secure; Max-Age=${sessionLifetime / 1000}`,
     };
@@ -682,7 +715,9 @@ export async function createAccessService({
   const createAccountSession = (account) => {
     const value = secret();
     return {
+      token: value,
       session: {
+        transport: "bearer",
         accountId: account.id,
         authRevision: account.authRevision,
         email: account.email,
@@ -695,9 +730,14 @@ export async function createAccessService({
   const authenticatedSession = async (req) => {
     if (!status().ready) return null;
     const token = cookieSecret(req);
-    if (!token) return null;
+    const hash = req?.[downloadSessionHash] ?? (token ? digest(token) : null);
+    if (!hash) return null;
     const record = state.sessions.find(
-      (item) => item.hash === digest(token) && item.expiresAt > now(),
+      (item) =>
+        item.hash === hash &&
+        item.expiresAt > now() &&
+        (!(req?.headers?.authorization || req?.[downloadSessionHash]) ||
+          item.transport === "bearer"),
     );
     if (!record) return null;
     if (record.accountId) {
@@ -768,6 +808,120 @@ export async function createAccessService({
   return {
     status,
     hostAuthority,
+    // Serialize identity reservation with account creation/promotion so a raw
+    // server identity cannot become invisible between validation and commit.
+    withLegacyIdentity: (email, create) =>
+      serialize(async () => {
+        const normalized = normalizedEmail(email);
+        if (
+          state.accounts.some((account) => account.email === normalized) ||
+          state.retiredLegacyEmails.includes(normalized)
+        )
+          throw fail(
+            409,
+            "This identity is managed by the panel owner. Ask them to grant access from this server's Subusers page.",
+          );
+        return create();
+      }),
+    async issueDownload(req, target) {
+      const session = await authenticatedSession(req);
+      if (!session) throw fail(401, "Sign in before downloading files.");
+      const token = cookieSecret(req);
+      if (!validSecret(token))
+        throw fail(401, "Sign in before downloading files.");
+      let url;
+      try {
+        url = new URL(target, "https://download.invalid");
+      } catch {
+        /* validated below */
+      }
+      if (
+        typeof target !== "string" ||
+        !target.startsWith("/api/") ||
+        !url ||
+        url.origin !== "https://download.invalid" ||
+        url.hash ||
+        url.searchParams.has("downloadTicket") ||
+        !(
+          url.pathname === "/api/files/download" ||
+          /^\/api\/backups\/[^/]+\/download$/.test(url.pathname)
+        )
+      )
+        throw fail(400, "Choose a file or backup download on this panel.");
+      const selectors = url.searchParams.getAll("serverId");
+      if (selectors.length > 1)
+        throw fail(400, "Choose one server for this download.");
+      const serverId = selectors[0] ?? session.serverId;
+      const scope = session.memberships.find(
+        (membership) => membership.serverId === serverId,
+      );
+      const user = scope
+        ? await liveUser({ ...scope, email: session.email })
+        : null;
+      const permission =
+        url.pathname === "/api/files/download"
+          ? "file.read-content"
+          : "backup.download";
+      if (
+        !user?.permissions?.includes("server.view") ||
+        !user.permissions.includes(permission)
+      )
+        throw fail(403, "You do not have permission to download this item.");
+      // A later grant change may select a different primary server. The
+      // ticket must continue to address the server authorized at issuance.
+      url.searchParams.set("serverId", serverId);
+      for (const [key, ticket] of downloadTickets)
+        if (ticket.expiresAt <= now()) downloadTickets.delete(key);
+      // Tokens rotate across sign-ins. Keep the budget tied to the panel
+      // identity so one account cannot occupy the global ticket pool.
+      const principal = session.accountId
+        ? `account:${session.accountId}`
+        : `legacy:${session.email}`;
+      if (
+        [...downloadTickets.values()].filter(
+          (ticket) => ticket.principal === principal,
+        ).length >= 32
+      )
+        throw fail(
+          429,
+          "Too many pending downloads for this account. Try again shortly.",
+        );
+      if (downloadTickets.size >= 1024)
+        throw fail(429, "Too many pending downloads. Try again shortly.");
+      const value = secret();
+      url.search = url.searchParams.toString();
+      downloadTickets.set(digest(value), {
+        hash: digest(token),
+        principal,
+        target: url.pathname + url.search,
+        expiresAt: now() + 60_000,
+      });
+      url.searchParams.set("downloadTicket", value);
+      return { url: url.pathname + url.search };
+    },
+    consumeDownload(req) {
+      const value = req.query?.downloadTicket;
+      if (!validSecret(value) || req.method !== "GET")
+        throw fail(
+          401,
+          "This download link is invalid or expired. Start the download again.",
+        );
+      const key = digest(value),
+        ticket = downloadTickets.get(key);
+      const url = new URL(req.originalUrl, "https://download.invalid");
+      url.searchParams.delete("downloadTicket");
+      if (
+        !ticket ||
+        ticket.expiresAt <= now() ||
+        ticket.target !== url.pathname + url.search
+      )
+        throw fail(
+          401,
+          "This download link is invalid or expired. Start the download again.",
+        );
+      downloadTickets.delete(key);
+      req[downloadSessionHash] = ticket.hash;
+    },
     account: (id) => publicAccount(findAccount(id)),
     listAccounts: () =>
       [...state.accounts, ...legacyAccounts()].map(publicAccount),
@@ -1299,6 +1453,7 @@ export async function createAccessService({
             ],
           });
           return {
+            token: issued.token,
             cookie: issued.cookie,
             session: accountSessionView(updated),
           };
@@ -1339,6 +1494,7 @@ export async function createAccessService({
           ],
         });
         return {
+          token: issued.token,
           cookie: issued.cookie,
           session: sessionView(
             issued.session,
@@ -1366,6 +1522,7 @@ export async function createAccessService({
             sessions: [...next.sessions, issued.session],
           });
           return {
+            token: issued.token,
             cookie: issued.cookie,
             session: accountSessionView(account),
           };
@@ -1392,6 +1549,7 @@ export async function createAccessService({
           sessions: [...next.sessions, issued.session],
         });
         return {
+          token: issued.token,
           cookie: issued.cookie,
           session: sessionView(
             issued.session,

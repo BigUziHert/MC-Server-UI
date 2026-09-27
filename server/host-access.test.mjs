@@ -78,7 +78,9 @@ async function fixture(t) {
                   resolve({
                     status: response.statusCode,
                     body: JSON.parse(body),
-                    cookie: response.headers["set-cookie"]?.[0]?.split(";")[0],
+                    cookie: JSON.parse(body).sessionToken
+                      ? `Bearer ${JSON.parse(body).sessionToken}`
+                      : undefined,
                   });
                 } catch (cause) {
                   reject(
@@ -99,7 +101,7 @@ async function fixture(t) {
       request(remote, {
         Host: "host-permission.example.test",
         Origin: origin,
-        ...(cookie ? { Cookie: cookie } : {}),
+        ...(cookie ? { Authorization: cookie } : {}),
       });
     let closed = false;
     const close = async () => {

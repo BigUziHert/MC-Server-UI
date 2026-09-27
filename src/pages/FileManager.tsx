@@ -7,6 +7,7 @@ import {
   useSyncExternalStore,
   type FormEvent,
 } from "react";
+import { SessionScopeContext } from "../session-scope";
 import {
   ChevronRight,
   Copy,
@@ -42,6 +43,7 @@ import SearchField, { useDebouncedValue } from "../SearchField";
 import RefreshButton from "../RefreshButton";
 import StatePanel from "../StatePanel";
 import Pagination from "../Pagination";
+import DownloadButton, { downloadToComputer } from "../DownloadButton";
 import "./file-selection.css";
 import "./recycle-bin.css";
 import {
@@ -579,7 +581,8 @@ export default function FileManager({
     (permissions === undefined || permissions.includes("backup.read"));
   const { api, post, downloadUrl } = useServerApi();
   const serverId = useContext(ServerScope);
-  const transferKey = `${window.location.origin}:${serverId || "default"}`;
+  const sessionScope = useContext(SessionScopeContext);
+  const transferKey = `${sessionScope}:${window.location.origin}:${serverId || "default"}`;
   const transfer = useFileTransfer(transferKey);
   const transferring = transfer?.status === "running";
   const uploading = transferring && transfer.kind === "upload";
@@ -861,12 +864,9 @@ export default function FileManager({
     }
     // Keep downloads in the browser/native save flow so large archives are
     // streamed to this computer without buffering them in the renderer.
-    const link = document.createElement("a");
-    link.href = url;
-    link.download = "";
-    document.body.append(link);
-    link.click();
-    link.remove();
+    void downloadToComputer(url).catch((cause) =>
+      notify(messageOf(cause, "The download could not start."), true),
+    );
   }
   function openCreate(kind: "file" | "directory") {
     if (!canCreate) return;
@@ -961,6 +961,7 @@ export default function FileManager({
     if (!targets.length) return;
     copyFiles({
       origin: window.location.origin,
+      sessionScope,
       sourceServerId: serverId,
       sourceName: serverName,
       paths: targets.map((entry) => entry.path),
@@ -1223,7 +1224,7 @@ export default function FileManager({
             {clipboard.paths.length}{" "}
             {clipboard.paths.length === 1 ? "item" : "items"} copied from{" "}
             <strong>{clipboard.sourceName}</strong>. Open a folder or another
-            server on this PC, then Paste.
+            server on this panel, then Paste.
           </span>
           <button
             className="btn icon"
@@ -1580,8 +1581,9 @@ export default function FileManager({
                             </button>
                           )}
                         {canContent && (
-                          <a
+                          <DownloadButton
                             className="btn icon"
+                            onError={(message) => notify(message, true)}
                             aria-label={`Download ${entry.name}`}
                             title={
                               entry.type === "directory"
@@ -1591,10 +1593,9 @@ export default function FileManager({
                             href={downloadUrl(
                               `/files/download?path=${encodeURIComponent(entry.path)}`,
                             )}
-                            download
                           >
                             <Download size={15} />
-                          </a>
+                          </DownloadButton>
                         )}
                         <button
                           className="btn icon delete-action"
@@ -2020,7 +2021,8 @@ function RecycleBin({
     (permissions.includes("file.delete") &&
       permissions.includes("backup.delete"));
   const { api, downloadUrl } = useServerApi();
-  const recoveryKey = `${window.location.origin}:${downloadUrl("/files/recycle-bin")}`;
+  const sessionScope = useContext(SessionScopeContext);
+  const recoveryKey = `${sessionScope}:${window.location.origin}:${downloadUrl("/files/recycle-bin")}`;
   const batch = useRecoveryBatch(recoveryKey);
   const pending = recoveryPending(batch);
   const [checkingOperation, setCheckingOperation] = useState(true);

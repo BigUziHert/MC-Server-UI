@@ -1,0 +1,72 @@
+.panel-connections-dialog {
+  position: fixed;
+  inset: 0;
+  margin: auto;
+  width: min(620px, calc(100vw - 32px));
+  max-height: calc(100dvh - 48px);
+  overflow: auto;
+  color: var(--text);
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  padding: 24px;
+}
+.panel-connections-dialog::backdrop {
+  background: rgb(0 0 0 / 65%);
+  backdrop-filter: blur(3px);
+}
+.panel-connections-heading,
+.panel-connections-list li,
+.panel-connections-identity,
+.panel-connections-row-actions,
+.panel-connections-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.panel-connections-heading {
+  justify-content: space-between;
+  margin-bottom: 14px;
+}
+.panel-connections-heading h2 {
+  margin: 0;
+  font-size: 20px;
+}
+.panel-connections-dialog > p {
+  color: var(--muted);
+  line-height: 1.6;
+}
+.panel-connections-list {
+  list-style: none;
+  padding: 0;
+  margin: 20px 0 0;
+}
+.panel-connections-list li {
+  justify-content: space-between;
+  padding: 14px 0;
+  border-top: 1px solid var(--border);
+  flex-wrap: wrap;
+}
+.panel-connections-identity {
+  min-width: 0;
+}
+.panel-connections-identity > div {
+  min-width: 0;
+}
+.panel-connections-identity strong {
+  display: block;
+  overflow-wrap: anywhere;
+}
+.panel-connections-identity small {
+  display: block;
+  color: var(--muted);
+  margin-top: 4px;
+}
+.panel-connections-actions {
+  justify-content: flex-end;
+  margin-top: 20px;
+  flex-wrap: wrap;
+}
+.desktop-panel-return .panel-connections-open {
+  margin-top: 8px;
+}

@@ -2,7 +2,7 @@
 // The loopback fixtures live in the parent Node process so every Electron
 // restart is a real quit/relaunch against the same disposable profile.
 import assert from "node:assert/strict";
-import { X509Certificate } from "node:crypto";
+import { randomBytes, X509Certificate } from "node:crypto";
 import fs from "node:fs/promises";
 import http from "node:http";
 import https from "node:https";
@@ -14,6 +14,7 @@ const scriptPath = fileURLToPath(import.meta.url);
 const projectDirectory = path.dirname(path.dirname(scriptPath));
 const cookieName = "remote-persistence-session";
 const ownerCookieName = "mc-panel-desktop";
+const credentialKey = "mc-panel.session.v1";
 
 async function electronFixture() {
   const { app, BrowserWindow, WebContentsView, ipcMain, session } =
@@ -152,7 +153,7 @@ async function electronFixture() {
       assert.ok(["/session", "/login", "/logout"].includes(route));
       assert.ok(["GET", "POST"].includes(method));
       return remoteContents(origin).executeJavaScript(
-        `(async()=>{const response=await fetch(${JSON.stringify(route)},{method:${JSON.stringify(method)}});return {status:response.status,body:await response.json()}})()`,
+        `(async()=>{const key=${JSON.stringify(credentialKey)};const token=localStorage.getItem(key);const response=await fetch(${JSON.stringify(route)},{method:${JSON.stringify(method)},headers:token?{Authorization:'Bearer '+token}:{}});const body=await response.json();if(response.ok&&body.sessionToken)localStorage.setItem(key,body.sessionToken);if(response.ok&&${JSON.stringify(route)}==='/logout')localStorage.removeItem(key);return {status:response.status,body}})()`,
       );
     },
     async remoteState(origin, marker) {
@@ -172,6 +173,9 @@ async function electronFixture() {
           'localStorage.getItem("fixture-marker")',
         ),
         documentCookie: await contents.executeJavaScript("document.cookie"),
+        sessionToken: await contents.executeJavaScript(
+          `localStorage.getItem(${JSON.stringify(credentialKey)})`,
+        ),
       };
     },
     async inspect() {
@@ -231,6 +235,8 @@ async function smoke() {
   );
   const requests = [];
   const liveTokens = [null, null];
+  const liveCredentials = [null, null];
+  const issuedCredentials = [new Set(), new Set()];
   const loginCounts = [0, 0];
   const page =
     "<!doctype html><title>Persistence fixture</title><h1>Remote persistence fixture</h1>";
@@ -245,22 +251,36 @@ async function smoke() {
       { key: certificates[0].private, cert: certificates[0].cert },
       (req, res) => {
         const cookie = req.headers.cookie || "";
-        requests.push({ server: index, path: req.url, cookie });
+        requests.push({
+          server: index,
+          path: req.url,
+          cookie,
+          authorization: req.headers.authorization,
+        });
         res.setHeader("Cache-Control", "no-store");
         res.setHeader("Content-Type", "application/json");
         const authenticated = Boolean(
-          liveTokens[index] &&
-          cookie.split(/;\s*/).includes(`${cookieName}=${liveTokens[index]}`),
+          liveCredentials[index] &&
+          req.headers.authorization === `Bearer ${liveCredentials[index]}`,
         );
         if (req.url === "/login" && req.method === "POST") {
           liveTokens[index] = `fixture-token-${index}-${++loginCounts[index]}`;
+          liveCredentials[index] = randomBytes(32).toString("base64url");
+          issuedCredentials[index].add(liveCredentials[index]);
           res.setHeader(
             "Set-Cookie",
             `${cookieName}=${liveTokens[index]}; Secure; HttpOnly; SameSite=Strict; Path=/; Max-Age=3600`,
           );
-          res.end(JSON.stringify({ authenticated: true, server: index }));
+          res.end(
+            JSON.stringify({
+              authenticated: true,
+              server: index,
+              sessionToken: liveCredentials[index],
+            }),
+          );
         } else if (req.url === "/logout" && req.method === "POST") {
           liveTokens[index] = null;
+          liveCredentials[index] = null;
           res.setHeader(
             "Set-Cookie",
             `${cookieName}=; Secure; HttpOnly; SameSite=Strict; Path=/; Max-Age=0`,
@@ -381,11 +401,19 @@ async function smoke() {
     );
     assert.ok(requests.every((item) => !item.cookie.includes(ownerCookieName)));
     assert.ok(ownerRequests.every((cookie) => !cookie.includes(cookieName)));
-    for (const entry of requests)
+    for (const entry of requests) {
       assert.ok(
         !entry.cookie.includes(`fixture-token-${1 - entry.server}-`),
         "Remote connections must not receive each other's credentials even on the same host.",
       );
+      if (entry.authorization)
+        assert.ok(
+          issuedCredentials[entry.server].has(
+            entry.authorization.replace(/^Bearer /, ""),
+          ),
+          "Bearer credentials must stay in their originating panel even with identical hostnames",
+        );
+    }
   };
   try {
     await Promise.all([ownerServer, ...remoteServers].map(listen));
@@ -417,6 +445,8 @@ async function smoke() {
     const firstToken = firstState.cookies.find(
       (cookie) => cookie.name === cookieName,
     ).value;
+    const firstCredential = firstState.sessionToken;
+    assert.match(firstCredential, /^[A-Za-z0-9_-]{43}$/);
     await report(remoteOrigins[0], [
       { id: "same-world-id", name: "First world", status: "offline" },
     ]);
@@ -424,6 +454,7 @@ async function smoke() {
     assert.notEqual(first, second);
     assert.equal((await request(remoteOrigins[1], "/session")).status, 401);
     assert.equal((await remoteState(remoteOrigins[1])).marker, null);
+    assert.equal((await remoteState(remoteOrigins[1])).sessionToken, null);
     await request(remoteOrigins[1], "/login", "POST");
     await remoteState(remoteOrigins[1], "second-only");
     await report(remoteOrigins[1], [
@@ -464,9 +495,14 @@ async function smoke() {
       firstToken,
     );
     assert.equal((await inspect()).prompts.length, 0);
+    assert.equal(
+      (await remoteState(remoteOrigins[0])).sessionToken,
+      firstCredential,
+    );
     await request(remoteOrigins[0], "/logout", "POST");
     await report(remoteOrigins[0], null);
     assert.equal((await request(remoteOrigins[0], "/session")).status, 401);
+    assert.equal((await remoteState(remoteOrigins[0])).sessionToken, null);
     assert.ok(
       (await remoteState(remoteOrigins[0])).cookies.every(
         (cookie) => cookie.name !== cookieName,
@@ -572,13 +608,14 @@ async function smoke() {
     assert.notEqual(reconnected, first);
     assert.equal((await request(remoteOrigins[0], "/session")).status, 401);
     assert.equal((await remoteState(remoteOrigins[0])).marker, null);
+    assert.equal((await remoteState(remoteOrigins[0])).sessionToken, null);
     state = await inspect();
     assert.equal(state.prompts.length, 1);
     assert.equal(state.prompts[0].fingerprint, fingerprints[1]);
     assertIsolated(state);
     await close();
     console.log(
-      "Passed real Electron persistence smoke: five distinct processes with the bundled frontend, saved hosts and certificate trust restored, HttpOnly sessions survive normal quit, local/remote storage stays isolated, signout survives restart, changed certificates block credentials, and disconnect forgets and clears the old session.",
+      "Passed real Electron persistence smoke: five distinct processes with the bundled frontend, saved hosts and certificate trust restored, origin-scoped bearer credentials and legacy cookies survive normal quit, local/remote storage stays isolated, signout survives restart, changed certificates block credentials, and disconnect forgets and clears the old session.",
     );
   } catch (cause) {
     if (stderr) console.error(stderr);

@@ -10,6 +10,7 @@ import { restoreBackupArchive } from "./backup-restore.mjs";
 import { createBackupArchive } from "./backup-archive.mjs";
 import { createPanel } from "./index.mjs";
 import { requiredPermissions } from "./remote-access.mjs";
+import { randomUUID } from "node:crypto";
 
 async function fixture(t) {
   const directory = await fs.realpath(
@@ -26,6 +27,8 @@ async function fixture(t) {
     await fs.rm(directory, { recursive: true, force: true });
   });
   const boot = async () => {
+    // Backups restored through the API must match retained startup settings.
+    await fs.writeFile(path.join(serverDir, "server.jar"), "fixture runtime");
     const panel = await createPanel({
       dataDir: path.join(directory, "panel-data"),
       serverDir,
@@ -536,6 +539,206 @@ test("restore reports success with a warning when the activity log cannot be per
       .status,
     201,
   );
+});
+
+test("restore confirmation receipts survive restart and never replace later edits on replay", async (t) => {
+  const { serverDir, boot } = await fixture(t);
+  const panel = await boot();
+  const backup = (
+    await panel.request("/api/backups", { name: "Receipt fixture" })
+  ).body;
+  const route = `/api/backups/${backup.id}/restore`;
+  const input = { confirm: true, requestId: randomUUID() };
+  const first = await panel.request(route, input);
+  assert.equal(first.status, 200, JSON.stringify(first.body));
+  await fs.writeFile(path.join(serverDir, "later.txt"), "preserve later edits");
+  assert.deepEqual(await panel.request(route, input), first);
+  await panel.close();
+  const restarted = await boot();
+  assert.deepEqual(await restarted.request(route, input), first);
+  assert.equal(
+    await fs.readFile(path.join(serverDir, "later.txt"), "utf8"),
+    "preserve later edits",
+  );
+  assert.equal(
+    (await restarted.request(`/api/backups/${randomUUID()}/restore`, input))
+      .status,
+    409,
+  );
+  assert.equal(
+    (await restarted.request(route, { ...input, requestId: randomUUID() }))
+      .status,
+    200,
+  );
+  await assert.rejects(fs.stat(path.join(serverDir, "later.txt")), {
+    code: "ENOENT",
+  });
+});
+
+test("an incompatible backup never replaces files or the retained JAR and loader launch settings", async (t) => {
+  const { serverDir, boot } = await fixture(t);
+  const panel = await boot();
+  const backup = (
+    await panel.request("/api/backups", { name: "Before runtime change" })
+  ).body;
+  await fs.writeFile(
+    path.join(serverDir, "replacement.jar"),
+    "keep current runtime",
+  );
+  await fs.writeFile(path.join(serverDir, "later.txt"), "keep later world");
+  await panel.updateConfiguration({
+    ...panel.descriptor(),
+    jar: "replacement.jar",
+  });
+  let result = await panel.request(`/api/backups/${backup.id}/restore`, {
+    confirm: true,
+    requestId: randomUUID(),
+  });
+  assert.equal(result.status, 409, JSON.stringify(result.body));
+  assert.match(result.body.error, /incompatible.*retained launch settings/);
+  assert.equal(
+    await fs.readFile(path.join(serverDir, "replacement.jar"), "utf8"),
+    "keep current runtime",
+  );
+  assert.equal(panel.descriptor().jar, "replacement.jar");
+  await fs.writeFile(
+    path.join(serverDir, "new_args.txt"),
+    "-jar replacement.jar\n",
+  );
+  await panel.updateConfiguration({
+    ...panel.descriptor(),
+    launchType: "java-args",
+    launchArgs: ["@new_args.txt"],
+  });
+  result = await panel.request(`/api/backups/${backup.id}/restore`, {
+    confirm: true,
+    requestId: randomUUID(),
+  });
+  assert.equal(result.status, 409, JSON.stringify(result.body));
+  assert.equal(
+    await fs.readFile(path.join(serverDir, "later.txt"), "utf8"),
+    "keep later world",
+  );
+  assert.deepEqual(panel.descriptor().launchArgs, ["@new_args.txt"]);
+});
+
+test("restore validates retained absolute and relative bundled binaries without requiring external executables in the archive", async (t) => {
+  const { serverDir, boot } = await fixture(t);
+  const panel = await boot();
+  const original = panel.descriptor();
+  const backup = (
+    await panel.request("/api/backups", { name: "Before bundled runtime" })
+  ).body;
+  const binary = path.join(serverDir, "runtime", "bin", "runner.exe");
+  await fs.mkdir(path.dirname(binary), { recursive: true });
+  await fs.writeFile(binary, "bundled binary; never executed");
+  await fs.writeFile(
+    path.join(serverDir, "bundled.exe"),
+    "local executable; never executed",
+  );
+  await fs.writeFile(
+    path.join(serverDir, "java.exe"),
+    "local Java; never executed",
+  );
+  await fs.writeFile(path.join(serverDir, "later.txt"), "preserve later edits");
+  const route = `/api/backups/${backup.id}/restore`;
+  for (const config of [
+    { launchType: "executable", launchExecutable: binary },
+    { launchType: "executable", launchExecutable: "./runtime/bin/runner.exe" },
+    { launchType: "jar", jar: "server.jar", javaPath: binary },
+    {
+      launchType: "java-args",
+      launchArgs: ["-jar", "server.jar"],
+      javaPath: "./runtime/bin/runner.exe",
+    },
+    ...(process.platform === "win32" &&
+    process.env.NoDefaultCurrentDirectoryInExePath === undefined
+      ? [
+          { launchType: "executable", launchExecutable: "bundled.exe" },
+          { launchType: "executable", launchExecutable: "bundled" },
+          { launchType: "jar", jar: "server.jar", javaPath: "java" },
+        ]
+      : []),
+  ]) {
+    await panel.updateConfiguration({ ...original, ...config });
+    const result = await panel.request(route, {
+      confirm: true,
+      requestId: randomUUID(),
+    });
+    assert.equal(result.status, 409, JSON.stringify({ config, result }));
+    assert.match(result.body.error, /incompatible.*retained launch settings/);
+    assert.equal(
+      await fs.readFile(binary, "utf8"),
+      "bundled binary; never executed",
+    );
+    assert.equal(
+      await fs.readFile(path.join(serverDir, "later.txt"), "utf8"),
+      "preserve later edits",
+    );
+  }
+  const compatible = (
+    await panel.request("/api/backups", { name: "With bundled runtime" })
+  ).body;
+  await panel.updateConfiguration({
+    ...original,
+    launchType: "executable",
+    launchExecutable: binary,
+  });
+  const restored = await panel.request(
+    `/api/backups/${compatible.id}/restore`,
+    { confirm: true, requestId: randomUUID() },
+  );
+  assert.equal(restored.status, 200, JSON.stringify(restored));
+  assert.equal(panel.descriptor().launchExecutable, binary);
+  assert.equal(
+    await fs.readFile(binary, "utf8"),
+    "bundled binary; never executed",
+  );
+
+  // Absolute paths outside this server tree stay host settings. They need not
+  // be bundled into a server backup (and are never executed by this test).
+  for (const config of [
+    { launchType: "executable", launchExecutable: process.execPath },
+    { launchType: "jar", jar: "server.jar", javaPath: process.execPath },
+  ]) {
+    await panel.updateConfiguration({ ...original, ...config });
+    const result = await panel.request(route, {
+      confirm: true,
+      requestId: randomUUID(),
+    });
+    assert.equal(result.status, 200, JSON.stringify(result));
+  }
+});
+
+test("schedule revisions reject a concurrent stale save without disabling the newer schedule", async (t) => {
+  const { boot } = await fixture(t);
+  const panel = await boot();
+  const baseline = (await panel.request("/api/backups")).body.schedule;
+  assert.match(baseline.revision, /^[a-f0-9]{64}$/);
+  const [first, second] = await Promise.all([
+    panel.request(
+      "/api/backups/schedule",
+      { ...baseline, enabled: true, intervalHours: 12 },
+      "PUT",
+    ),
+    panel.request(
+      "/api/backups/schedule",
+      { ...baseline, retention: 19 },
+      "PUT",
+    ),
+  ]);
+  assert.deepEqual([first.status, second.status].sort(), [200, 409]);
+  const current = (await panel.request("/api/backups")).body.schedule;
+  assert.equal(current.enabled, first.status === 200 ? true : baseline.enabled);
+  assert.equal(
+    current.intervalHours,
+    first.status === 200 ? 12 : baseline.intervalHours,
+  );
+  assert.equal(
+    current.retention,
+    first.status === 200 ? baseline.retention : 19,
+  );
+  assert.notEqual(current.revision, baseline.revision);
 });
 
 test("remote restore requires its explicit destructive-action permission", () => {

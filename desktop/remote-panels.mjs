@@ -255,7 +255,7 @@ export function createRemotePanelController({
         }
       : {}),
     panels: [...panels.values()].map(
-      ({ id, label, origin, local, servers, signedIn }) => ({
+      ({ id, label, origin, local, servers, signedIn, failed, loading }) => ({
         id,
         label,
         origin,
@@ -263,6 +263,11 @@ export function createRemotePanelController({
         ...(!local
           ? {
               servers: servers.map((server) => ({ ...server })),
+              connectionState: loading
+                ? "connecting"
+                : failed
+                  ? "unavailable"
+                  : "connected",
               ...(typeof signedIn === "boolean" ? { signedIn } : {}),
             }
           : {}),
@@ -369,6 +374,7 @@ export function createRemotePanelController({
   const dispose = (panel) => {
     if (panel.disposing) return panel.disposing;
     panel.removed = true;
+    panel.cancelPendingTrust?.();
     if (activeId === panel.id) {
       if (!closed && !window.isDestroyed()) activate(local.id);
       else activeId = local.id;
@@ -593,7 +599,7 @@ export function createRemotePanelController({
       )
         throw failure(
           409,
-          "Disconnect a panel before adding another connection.",
+          "Forget a saved panel in Manage panel connections before adding another connection.",
         );
       const id = savedEntry?.id ?? randomUUID();
       const remoteSession = session.fromPartition(
@@ -634,6 +640,7 @@ export function createRemotePanelController({
       installPanelPermissionHandlers(remoteSession, origin, () => contents);
       let pendingTrust;
       let canceled = false;
+      panel.cancelPendingTrust = () => pendingTrust?.abort.abort();
       const navigation = (event, destination) => {
         if (!sameOrigin(event.url ?? destination, origin))
           event.preventDefault();
@@ -704,20 +711,39 @@ export function createRemotePanelController({
         if (pendingTrust && pendingTrust.fingerprint !== fingerprint)
           return done(false);
         if (!pendingTrust) {
-          const verification = dialog
-            .showMessageBox(window, {
-              type: "warning",
-              title: "Verify remote panel certificate",
-              message: `Verify the certificate for ${host}`,
-              detail: `${panel.trustedFingerprint ? "This panel's certificate has changed.\n\n" : ""}Compare this SHA-256 fingerprint with the fingerprint the server owner shares through a trusted channel:\n\n${fingerprint}\n\nContinue only if every character matches. Trust applies only to this connection and this exact certificate.`,
-              buttons: ["Cancel connection", "Fingerprint matches — connect"],
-              defaultId: 0,
-              cancelId: 0,
-              noLink: true,
-            })
+          const abort = new AbortController();
+          const prompt = { fingerprint, abort };
+          pendingTrust = prompt;
+          // Comparing the fingerprint is a user decision, not network time.
+          // A connection deadline resumes only after the prompt has settled.
+          panel.pauseLoadTimeout?.();
+          const verification = Promise.race([
+            Promise.resolve().then(() =>
+              dialog.showMessageBox(window, {
+                type: "warning",
+                title: "Verify remote panel certificate",
+                message: `Verify the certificate for ${host}`,
+                detail: `${panel.trustedFingerprint ? "This panel's certificate has changed.\n\n" : ""}Compare this SHA-256 fingerprint with the fingerprint the server owner shares through a trusted channel:\n\n${fingerprint}\n\nContinue only if every character matches. Trust applies only to this connection and this exact certificate.`,
+                buttons: ["Cancel connection", "Fingerprint matches — connect"],
+                defaultId: 0,
+                cancelId: 0,
+                noLink: true,
+                signal: abort.signal,
+              }),
+            ),
+            new Promise((resolve) => {
+              abort.signal.addEventListener(
+                "abort",
+                () => resolve({ response: 0 }),
+                { once: true },
+              );
+            }),
+          ])
             .then(({ response }) => {
               const accepted =
                 response === 1 &&
+                !abort.signal.aborted &&
+                !closed &&
                 !panel.removed &&
                 !contents.isDestroyed() &&
                 panels.has(panel.id);
@@ -734,9 +760,10 @@ export function createRemotePanelController({
               canceled = true;
               return false;
             });
-          pendingTrust = { fingerprint, verification };
+          prompt.verification = verification;
           void verification.finally(() => {
-            pendingTrust = undefined;
+            if (pendingTrust === prompt) pendingTrust = undefined;
+            panel.resumeLoadTimeout?.();
           });
         }
         void pendingTrust.verification.then((accepted) => done(accepted));
@@ -793,20 +820,29 @@ export function createRemotePanelController({
         panel.allowCertificatePrompt = !quiet;
         suspendSession(panel);
         let timeout;
+        let loadSettled = false;
+        let rejectTimeout;
+        const pauseTimeout = () => clearTimeout(timeout);
+        const resumeTimeout = () => {
+          clearTimeout(timeout);
+          if (loadSettled || pendingTrust) return;
+          timeout = setTimeout(
+            () => {
+              contents.stop();
+              rejectTimeout(failure(502, "The remote panel did not respond."));
+            },
+            quiet ? restoreTimeoutMs : 30000,
+          );
+        };
+        panel.pauseLoadTimeout = pauseTimeout;
+        panel.resumeLoadTimeout = resumeTimeout;
+        const deadline = new Promise((_, reject) => {
+          rejectTimeout = reject;
+          resumeTimeout();
+        });
         panel.loading = (async () => {
           try {
-            await Promise.race([
-              contents.loadURL(target),
-              new Promise((_, reject) => {
-                timeout = setTimeout(
-                  () => {
-                    contents.stop();
-                    reject(failure(502, "The remote panel did not respond."));
-                  },
-                  quiet ? restoreTimeoutMs : 30000,
-                );
-              }),
-            ]);
+            await Promise.race([contents.loadURL(target), deadline]);
             ensureOpen();
             if (
               panel.removed ||
@@ -822,6 +858,7 @@ export function createRemotePanelController({
             if (store) remember(panel);
             await persist();
           } catch {
+            panel.cancelPendingTrust();
             panel.failed = true;
             suspendSession(panel);
             if (!panel.saved) await dispose(panel);
@@ -833,7 +870,12 @@ export function createRemotePanelController({
                 : "Could not open the remote panel. Check its HTTPS address, certificate, and whether the host is online.",
             );
           } finally {
+            loadSettled = true;
             clearTimeout(timeout);
+            if (panel.pauseLoadTimeout === pauseTimeout) {
+              panel.pauseLoadTimeout = undefined;
+              panel.resumeLoadTimeout = undefined;
+            }
             panel.loading = undefined;
           }
         })();
@@ -854,6 +896,7 @@ export function createRemotePanelController({
       if (activeId === id) activate(local.id);
       if (preferredActiveId === id) preferredActiveId = "local";
       panel.removed = true;
+      panel.cancelPendingTrust?.();
       panel.saved = false;
       registry.delete(id);
       try {
@@ -878,6 +921,7 @@ export function createRemotePanelController({
           const results = await Promise.allSettled([
             persist(),
             ...remote.map(async (panel) => {
+              panel.cancelPendingTrust?.();
               if (!panel.contents.isDestroyed()) {
                 panel.contents.stop();
                 panel.contents.close();

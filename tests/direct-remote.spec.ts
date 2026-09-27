@@ -100,6 +100,12 @@ test("a copied invitation works over direct HTTPS through password setup, sign-i
       viewport: { width: 390, height: 844 },
     });
     const phone = await context.newPage();
+    const remoteGet = async (url: string) =>
+      context!.request.get(url, {
+        headers: {
+          Authorization: `Bearer ${await phone.evaluate(() => localStorage.getItem("mc-panel.session.v1"))}`,
+        },
+      });
     await phone.goto(invitationUrl);
     await expect(
       phone.getByRole("heading", { name: "Set up your server access" }),
@@ -116,18 +122,14 @@ test("a copied invitation works over direct HTTPS through password setup, sign-i
     await expect(
       phone.getByRole("heading", { name: "No shared servers" }),
     ).toBeVisible();
-    expect(
-      (await context.request.get(`${publicUrl}/api/servers`)).status(),
-    ).toBe(200);
+    expect((await remoteGet(`${publicUrl}/api/servers`)).status()).toBe(200);
     const noServers = await (
-      await context.request.get(`${publicUrl}/api/servers`)
+      await remoteGet(`${publicUrl}/api/servers`)
     ).json();
     expect(noServers.servers).toEqual([]);
     expect(
       (
-        await context.request.get(
-          `${publicUrl}/api/server?serverId=${serverId}`,
-        )
+        await remoteGet(`${publicUrl}/api/server?serverId=${serverId}`)
       ).status(),
     ).toBe(403);
     const granted = await ownerApi(
@@ -158,15 +160,18 @@ test("a copied invitation works over direct HTTPS through password setup, sign-i
       phone.getByRole("heading", { name: "Console", exact: true }),
     ).toBeVisible();
     await expect(phone.locator(".metric-card")).toHaveCount(4);
-    const cookie = (await context.cookies(publicUrl)).find(
-      (entry) => entry.name === "__Host-mc-subuser",
-    );
-    expect(cookie).toMatchObject({
-      secure: true,
-      httpOnly: true,
-      sameSite: "Strict",
-      path: "/",
-    });
+    expect(
+      (await context.cookies(publicUrl)).some(
+        (entry) => entry.name === "__Host-mc-subuser",
+      ),
+    ).toBe(false);
+    expect(
+      await phone.evaluate(() =>
+        /^[A-Za-z0-9_-]{43}$/.test(
+          localStorage.getItem("mc-panel.session.v1") ?? "",
+        ),
+      ),
+    ).toBe(true);
     expect(await phone.evaluate(() => document.cookie)).not.toContain(
       "__Host-mc-subuser",
     );
@@ -215,14 +220,12 @@ test("a copied invitation works over direct HTTPS through password setup, sign-i
       phone.getByRole("heading", { name: "No shared servers" }),
     ).toBeVisible();
     const stillSignedIn = await (
-      await context.request.get(`${publicUrl}/api/access/session`)
+      await remoteGet(`${publicUrl}/api/access/session`)
     ).json();
     expect(stillSignedIn.accountId).toBe(user.id);
     expect(
       (
-        await context.request.get(
-          `${publicUrl}/api/server?serverId=${serverId}`,
-        )
+        await remoteGet(`${publicUrl}/api/server?serverId=${serverId}`)
       ).status(),
     ).toBe(403);
     await expect(

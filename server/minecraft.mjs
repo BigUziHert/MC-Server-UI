@@ -1,4 +1,6 @@
 import { terminalJobs } from "./terminal-jobs.mjs";
+import { createOperationReceipts } from "./operation-receipts.mjs";
+import { remotePrincipal } from "./remote-access.mjs";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { randomUUID, createHash } from "node:crypto";
@@ -494,6 +496,10 @@ export async function createMinecraft(ctx) {
     return ctx.safePath(root, id);
   };
   const terminal = await terminalJobs(await privatePath("last-job.json"));
+  const installReceipts = await createOperationReceipts(
+    await privatePath("receipts"),
+    ctx.safePath,
+  );
   if (terminal.get()) {
     const job = terminal.get();
     jobs.set(job.id, job);
@@ -507,7 +513,7 @@ export async function createMinecraft(ctx) {
             job.status ?? (job.state === "complete" ? "completed" : job.state),
         }
       : null;
-  function install(input) {
+  function install(input, requestId = null) {
     if (closing) throw fail(503, "Minecraft management is shutting down.");
     if (input?.confirmed !== true)
       throw fail(400, "Review and confirm the selected server build first.");
@@ -528,6 +534,7 @@ export async function createMinecraft(ctx) {
     };
     const job = {
       id: randomUUID(),
+      ...(requestId ? { requestId } : {}),
       state: "queued",
       status: "queued",
       message: "Preparing installation…",
@@ -635,6 +642,7 @@ export async function createMinecraft(ctx) {
             .audit("server", "Installation failed", job.error)
             .catch(() => {});
         await terminal.save(publicJob(job)).catch(() => {});
+        await installReceipts.update(requestId, publicJob(job)).catch(() => {});
         operations.delete(active);
       });
     while (jobs.size > 30) {
@@ -682,7 +690,49 @@ export async function createMinecraft(ctx) {
     app.post(
       "/api/versions/install",
       endpoint(async (req, res) => {
-        const job = publicJob(install(req.body));
+        const principal = req[remotePrincipal];
+        const input = req.body ?? {};
+        let job = await installReceipts.run(
+          input.requestId,
+          {
+            actor: principal
+              ? [principal.accountId ?? null, principal.userId, principal.email]
+              : "local-owner",
+            provider: input.provider,
+            version: input.version,
+            build: input.build,
+            confirmed: input.confirmed,
+            cleanInstall: input.cleanInstall === true,
+            updateRuntime: input.updateRuntime === true,
+          },
+          (id) => {
+            try {
+              return publicJob(install(input, id));
+            } catch (cause) {
+              // install throws only before accepting a job; asynchronous
+              // failures are returned through that accepted job instead.
+              cause.operationNotStarted = true;
+              throw cause;
+            }
+          },
+        );
+        if (!jobs.has(job.id)) {
+          // An accepted asynchronous job cannot resume after host interruption.
+          // Return its identity and an explicit uncertain outcome, never rerun it.
+          if (["queued", "running"].includes(job.status)) {
+            job = {
+              ...job,
+              state: "failed",
+              status: "failed",
+              error:
+                "The host restarted before this installation's outcome was saved. Check the server files before reviewing a new installation. The original request was not repeated.",
+              finishedAt: new Date().toISOString(),
+            };
+            await installReceipts.update(input.requestId, job);
+          }
+          jobs.set(job.id, job);
+        }
+        job = publicJob(jobs.get(job.id));
         res.status(202).json({ ...job, job });
       }),
     );

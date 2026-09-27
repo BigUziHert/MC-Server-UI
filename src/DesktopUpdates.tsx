@@ -186,7 +186,7 @@ function LocalUpdates({ standalone = false }: { standalone?: boolean }) {
         }}
       >
         <div className="updates-heading">
-          <h2 id="updates-title">App updates</h2>
+          <h2 id="updates-title">App updates on this computer</h2>
           <button
             className="btn icon"
             aria-label="Close app updates"
@@ -195,7 +195,11 @@ function LocalUpdates({ standalone = false }: { standalone?: boolean }) {
             <X size={18} />
           </button>
         </div>
-        <p>Get the latest tested build from the dev branch.</p>
+        <p>
+          Update the MC Panel installation on this computer with the latest
+          tested build from the dev branch. Connected remote panels are updated
+          on their own computers.
+        </p>
         {state && (
           <dl className="updates-versions">
             <div>
@@ -234,8 +238,10 @@ function LocalUpdates({ standalone = false }: { standalone?: boolean }) {
         )}
         {state?.status === "downloaded" && (
           <p>
-            Installing restarts MC Panel. Running servers will be stopped after
-            active backups finish. Start them again after the update.
+            Installing restarts MC Panel on this computer. Servers hosted on
+            this computer will be stopped after active backups finish. Start
+            them again after the update. Servers on connected remote panels keep
+            running; unfinished transfers to this computer may be interrupted.
           </p>
         )}
         {(error || loadError) && (

@@ -1,7 +1,7 @@
 // Run after pnpm build: node desktop/remote-frontend.smoke.mjs
 // Real Electron, a stale loopback HTTPS host, and isolated disposable app data.
 import assert from "node:assert/strict";
-import { X509Certificate } from "node:crypto";
+import { randomBytes, X509Certificate } from "node:crypto";
 import fs from "node:fs/promises";
 import https from "node:https";
 import os from "node:os";
@@ -43,6 +43,7 @@ const user = {
   serverId: server.id,
   permissions: server.accessPermissions,
 };
+const sessionToken = "s".repeat(43);
 
 async function fixture() {
   const { app, BrowserWindow, WebContentsView, ipcMain, session } =
@@ -94,6 +95,7 @@ async function fixture() {
   const folderBytes = await archive(false);
   const selectionBytes = await archive(true);
   const requests = [];
+  const downloadTickets = new Map();
   let sessionRevoked = false;
   let serverShared = true;
   let lines = [
@@ -111,6 +113,7 @@ async function fixture() {
         path: req.url,
         method: req.method,
         cookie: req.headers.cookie || "",
+        authorization: req.headers.authorization,
         origin: req.headers.origin,
         serverId: req.headers["x-server-id"],
         body,
@@ -124,27 +127,40 @@ async function fixture() {
           email: user.email,
           password: "fixture-password",
         });
-        res.setHeader(
-          "Set-Cookie",
-          "frontend-fixture=authenticated; Secure; HttpOnly; SameSite=Strict; Path=/",
-        );
         sessionRevoked = false;
-        return json(user);
+        return json({ ...user, sessionToken });
       }
+      const requestUrl = new URL(req.url, "https://fixture.example");
+      const ticket = requestUrl.searchParams.get("downloadTicket");
+      requestUrl.searchParams.delete("downloadTicket");
+      const ticketTarget = `${requestUrl.pathname}${requestUrl.search}`;
+      const ticketAuthenticated = Boolean(
+        !sessionRevoked &&
+        ticket &&
+        downloadTickets.get(ticket) === ticketTarget,
+      );
+      if (ticket) downloadTickets.delete(ticket);
       const authenticated =
         !sessionRevoked &&
-        req.headers.cookie?.includes("frontend-fixture=authenticated");
+        req.headers.authorization === `Bearer ${sessionToken}`;
       if (req.url === "/api/access/session")
         return json(authenticated ? user : { role: "guest" });
       if (req.url.startsWith("/api/")) {
-        if (!authenticated) return json({ error: "Sign in first." }, 401);
+        if (!authenticated && !ticketAuthenticated)
+          return json({ error: "Sign in first." }, 401);
+        if (req.url === "/api/access/download") {
+          assert.equal(req.method, "POST");
+          assert.equal(authenticated, true);
+          const target = JSON.parse(body).url;
+          assert.ok(target.startsWith("/api/files/download?"));
+          const ticket = randomBytes(32).toString("base64url");
+          downloadTickets.set(ticket, target);
+          return json({ url: `${target}&downloadTicket=${ticket}` });
+        }
         if (req.url === "/api/access/logout") {
           assert.equal(req.method, "POST");
           sessionRevoked = true;
-          res.setHeader(
-            "Set-Cookie",
-            "frontend-fixture=; Secure; HttpOnly; SameSite=Strict; Path=/; Max-Age=0",
-          );
+          downloadTickets.clear();
           return json({ ok: true });
         }
         if (req.url === "/api/servers")
@@ -159,7 +175,6 @@ async function fixture() {
           );
         if (req.url === "/api/server") return json(server);
         if (req.url === "/api/console") return json({ lines });
-        const requestUrl = new URL(req.url, "https://fixture.example");
         if (requestUrl.pathname === "/api/files") {
           assert.equal(req.headers["x-server-id"], server.id);
           return json({
@@ -179,6 +194,7 @@ async function fixture() {
           });
         }
         if (requestUrl.pathname === "/api/files/download") {
+          assert.equal(ticketAuthenticated, true);
           assert.equal(requestUrl.searchParams.get("serverId"), server.id);
           const paths = requestUrl.searchParams.getAll("path");
           const selected = paths.length === 2;
@@ -680,9 +696,7 @@ async function smoke() {
     ).toBeVisible();
     const filesUrl = remote.url();
     for (const name of ["remote.properties", "world"]) {
-      await remote
-        .getByRole("link", { name: `Download ${name}`, exact: true })
-        .click();
+      await remote.getByLabel(`Download ${name}`, { exact: true }).click();
     }
     await remote
       .getByRole("checkbox", { name: "Select remote.properties", exact: true })
@@ -758,7 +772,7 @@ async function smoke() {
     assert.equal(downloadRequests.length, 3);
     assert.ok(
       downloadRequests.every((request) =>
-        request.cookie.includes("frontend-fixture=authenticated"),
+        new URL(request.path, origin).searchParams.has("downloadTicket"),
       ),
     );
     assert.ok(
@@ -773,7 +787,7 @@ async function smoke() {
         .every(
           (request) =>
             request.serverId === server.id &&
-            request.cookie.includes("frontend-fixture=authenticated"),
+            request.authorization === `Bearer ${sessionToken}`,
         ),
     );
     assert.equal(
@@ -1024,7 +1038,7 @@ async function smoke() {
       remote.getByRole("heading", { name: "Welcome to your server" }),
     ).toBeVisible();
     console.log(
-      "Passed native frontend consistency: stale remote shell replaced by installed UI; certificate consent, remote sign-in/cookies, console filter/clear/export, client file/folder/selection downloads, Updates, switching, direct local create/import from an empty remote panel, reload, logout and background access revocation.",
+      "Passed native frontend consistency: stale remote shell replaced by installed UI; certificate consent, origin-scoped bearer sign-in and reload, console filter/clear/export, one-use-ticket client file/folder/selection downloads, Updates, switching, direct local create/import from an empty remote panel, logout and background access revocation.",
     );
   } catch (error) {
     if (stderr) console.error(stderr);

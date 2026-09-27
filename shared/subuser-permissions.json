@@ -33,7 +33,7 @@
         {
           "id": "control.console",
           "label": "Console",
-          "description": "View server output and send console commands."
+          "description": "View output and run unrestricted Minecraft commands, including stopping the server and changing operators. Grant only to trusted server administrators. Power permissions separately control the panel buttons."
         },
         {
           "id": "control.start",

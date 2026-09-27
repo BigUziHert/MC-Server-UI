@@ -1579,9 +1579,13 @@ test("a recovery queue cannot send remaining deletions with a newly signed-in ac
       name: "Recovery operation progress",
       exact: true,
     });
-    await expect(progress).toContainText("remaining items were not sent");
-    await expect(progress).toContainText("1 of 2 items finished");
+    // The old account's private operation history is discarded at sign-out.
+    await expect(progress).toHaveCount(0);
     heldStatus();
+    await page
+      .getByRole("button", { name: "Refresh Recycle Bin", exact: true })
+      .click();
+    await expect(progress).toHaveCount(0);
     await expect(
       page.getByRole("button", {
         name: "Account menu for second@example.test",

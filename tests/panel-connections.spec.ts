@@ -90,6 +90,9 @@ async function desktopBridge(
                 ? location.origin
                 : "https://pc-one.example:3002",
             local: false,
+            connectionState: unavailablePanels.includes("pc-one")
+              ? "unavailable"
+              : "connected",
             signedIn: signedOutPanels.includes("pc-one")
               ? false
               : remoteServers["pc-one"]
@@ -105,6 +108,9 @@ async function desktopBridge(
                 ? location.origin
                 : "https://pc-two.example:3002",
             local: false,
+            connectionState: unavailablePanels.includes("pc-two")
+              ? "unavailable"
+              : "connected",
             signedIn: signedOutPanels.includes("pc-two")
               ? false
               : remoteServers["pc-two"]
@@ -322,6 +328,111 @@ async function remoteAccount(
   );
   return { writes };
 }
+
+test("saved connections expose unavailable and signed-out panels and forget only the confirmed destination", async ({
+  page,
+}) => {
+  await desktopBridge(page, {
+    unavailablePanels: ["pc-one"],
+    signedOutPanels: ["pc-two"],
+  });
+  await localPanel(page, true);
+  await page.goto("/#console");
+  const account = page.getByRole("button", {
+    name: "Account menu for Local administrator",
+  });
+  await account.click();
+  await page
+    .getByRole("menuitem", { name: "Manage panel connections" })
+    .click();
+  const dialog = page.getByRole("dialog", { name: "Panel connections" });
+  await expect(
+    dialog.getByText("Unavailable — retry to connect"),
+  ).toBeVisible();
+  await expect(dialog.getByText("Signed out", { exact: true })).toBeVisible();
+  await dialog
+    .getByRole("button", { name: "Retry pc-one.example:3002" })
+    .click();
+  await expect(dialog.getByRole("alert")).toHaveText(
+    "This saved panel is offline.",
+  );
+  await dialog
+    .getByRole("button", { name: "Forget pc-one.example:3002" })
+    .click();
+  await expect(
+    dialog.getByRole("heading", { name: "Forget pc-one.example:3002?" }),
+  ).toBeVisible();
+  await expect(dialog).toContainText(
+    "Minecraft servers on that panel stay on their host and keep running",
+  );
+  await dialog.getByRole("button", { name: "Cancel", exact: true }).click();
+  await expect(
+    dialog.getByRole("button", { name: "Retry pc-one.example:3002" }),
+  ).toBeVisible();
+  await dialog
+    .getByRole("button", { name: "Forget pc-one.example:3002" })
+    .click();
+  await dialog
+    .getByRole("button", { name: "Forget connection", exact: true })
+    .click();
+  await expect(
+    dialog.getByRole("button", { name: "Retry pc-one.example:3002" }),
+  ).toHaveCount(0);
+  await expect(
+    dialog.getByRole("button", { name: "Open pc-two.example:3002" }),
+  ).toBeVisible();
+  const calls = await page.evaluate(
+    () => (window as unknown as { connectionCalls: unknown }).connectionCalls,
+  );
+  expect(calls).toEqual([
+    { action: "activate", value: "pc-one" },
+    { action: "disconnect", value: "pc-one" },
+  ]);
+  await page.keyboard.press("Escape");
+  await expect(dialog).toHaveCount(0);
+  await expect(account).toBeFocused();
+});
+
+test("the remote sign-in screen can forget its saved connection without contacting the host", async ({
+  page,
+}) => {
+  await desktopBridge(page, {
+    activeId: "pc-one",
+    signedOutPanels: ["pc-one"],
+    remoteServers: { "pc-two": [] },
+  });
+  await localPanel(page);
+  await page.route("**/api/access/session", (route) =>
+    route.fulfill({ json: { role: "guest" } }),
+  );
+  const mutations: string[] = [];
+  page.on("request", (request) => {
+    if (
+      request.method() !== "GET" &&
+      new URL(request.url()).pathname.startsWith("/api/")
+    )
+      mutations.push(request.url());
+  });
+  await page.goto("/");
+  await page.getByRole("button", { name: "Manage panel connections" }).click();
+  const dialog = page.getByRole("dialog", { name: "Panel connections" });
+  await dialog
+    .getByRole("button", { name: "Forget pc-one.example:3002" })
+    .click();
+  await dialog
+    .getByRole("button", { name: "Forget connection", exact: true })
+    .click();
+  await expect(
+    dialog.getByRole("button", { name: "Forget pc-one.example:3002" }),
+  ).toHaveCount(0);
+  await expect(
+    dialog.getByRole("button", { name: "Open pc-two.example:3002" }),
+  ).toBeVisible();
+  expect(
+    await page.evaluate(() => window.mcPanelConnections!.list()),
+  ).toMatchObject({ activeId: "local" });
+  expect(mutations).toEqual([]);
+});
 
 for (const width of [1434, 390]) {
   test(`a signed-in account with no shared or local servers can return to this computer at ${width}px`, async ({

@@ -20,6 +20,7 @@ import App from "./App";
 import { DesktopPanelReturn, type PanelSession } from "./PanelAccount";
 import { api, messageOf } from "./api";
 import { reportDesktopServers } from "./desktop-connections";
+import { saveSessionCredential } from "./session-auth";
 import "./remote-access.css";
 
 type SubuserSession = PanelSession;
@@ -41,11 +42,21 @@ export default function RemoteAccess() {
     sequence: number;
   } | null>(null);
   const signedOut = useCallback(() => {
+    saveSessionCredential(null);
     // Clear the native account menu as part of the session transition, even
     // when this view is hidden before React renders the sign-in screen.
     void reportDesktopServers(null).catch(() => {});
     setRequestedRemoteServer(null);
     setSession({ role: "guest" });
+  }, []);
+  useEffect(() => {
+    const changed = () => {
+      setSession(null);
+      setAttempt((value) => value + 1);
+    };
+    window.addEventListener("mc-panel-session-changed", changed);
+    return () =>
+      window.removeEventListener("mc-panel-session-changed", changed);
   }, []);
   useEffect(() => {
     if (!window.mcPanelConnections || session?.role === "owner") return;

@@ -15,6 +15,7 @@ files:
   - server/installed-minecraft.mjs
   - server/minecraft-version.mjs
   - server/terminal-jobs.mjs
+  - server/operation-receipts.mjs
   - server/import.mjs
   - server/server-setup.mjs
   - server/installation-directory.mjs

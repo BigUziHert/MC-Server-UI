@@ -778,12 +778,15 @@ test("remote authentication restores an imported runtime after its folder return
     listener.closeAllConnections();
     await new Promise((resolve) => listener.close(resolve));
   });
-  const remote = (route, cookie) =>
+  const remote = (route, token) =>
     new Promise((resolve, reject) => {
       const req = http.request(
         `http://127.0.0.1:${listener.address().port}${route}`,
         {
-          headers: { Host: "panel.example.test", Cookie: cookie.split(";")[0] },
+          headers: {
+            Host: "panel.example.test",
+            Authorization: `Bearer ${token}`,
+          },
         },
         (response) => {
           let body = "";
@@ -800,14 +803,14 @@ test("remote authentication restores an imported runtime after its folder return
       req.end();
     });
   assert.equal(
-    (await remote("/api/access/session", signed.cookie)).body.role,
+    (await remote("/api/access/session", signed.token)).body.role,
     "guest",
   );
   await fs.rename(parked, directory);
   // No owner request may be needed to wake the restored runtime.
   const requests = await Promise.all([
-    remote("/api/access/session", signed.cookie),
-    remote("/api/servers", signed.cookie),
+    remote("/api/access/session", signed.token),
+    remote("/api/servers", signed.token),
   ]);
   assert.equal(requests[0].body.role, "subuser");
   assert.equal(requests[1].status, 200);

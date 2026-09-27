@@ -32,7 +32,7 @@ test("Panel Settings opens update errors without losing the settings dialog", as
     .getByRole("button", { name: "App updates", exact: true })
     .click();
   const updates = page.getByRole("dialog", {
-    name: "App updates",
+    name: "App updates on this computer",
     exact: true,
   });
   await expect(updates.getByRole("alert")).toHaveText(
@@ -138,7 +138,10 @@ test("desktop updates show version, manual download, and restart without submitt
   expect(actions).toEqual(["check"]);
   await dialog.getByRole("button", { name: "Download update" }).click();
   await expect(dialog).toContainText(
-    "Running servers will be stopped after active backups finish",
+    "Servers hosted on this computer will be stopped after active backups finish",
+  );
+  await expect(dialog).toContainText(
+    "Servers on connected remote panels keep running",
   );
   expect(actions).toEqual(["check", "download"]);
   await dialog.getByRole("button", { name: "Restart to update" }).click();

@@ -151,7 +151,7 @@ function harness({
     dialog: {
       async showMessageBox(window, options) {
         prompts.push({ window, options });
-        return { response: responses.shift() ?? 0 };
+        return { response: await (responses.shift() ?? 0) };
       },
     },
     downloadsDirectory: path.join(os.tmpdir(), "remote-downloads"),
@@ -294,6 +294,7 @@ test("remote views share one window, isolate sessions, reject external navigatio
       origin,
       local: false,
       servers: [],
+      connectionState: "connected",
     },
   ]);
   const secondContext = await h.controller.open("https://other.example:3002/");
@@ -717,6 +718,91 @@ test("canceled trust fails opening and destroys only the isolated view", async (
   assert.equal(h.controller.list().activeId, "local");
   assert.equal(h.controller.list().panels.length, 1);
 });
+
+test("fingerprint consent pauses the network deadline and a late confirmation can connect", async (t) => {
+  const cert = await certificate();
+  let confirm;
+  const answer = new Promise((resolve) => {
+    confirm = resolve;
+  });
+  const h = harness({
+    responses: [answer],
+    load: async (view) => {
+      if (!(await verify(view, cert))) throw new Error("Certificate rejected");
+    },
+  });
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const opening = h.controller.open(origin);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(h.prompts.length, 1);
+  t.mock.timers.tick(45000);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(h.views[0].webContents.isDestroyed(), false);
+  assert.equal(h.views[0].webContents.stopped, undefined);
+  confirm(1);
+  const connected = await opening;
+  assert.notEqual(connected.activeId, "local");
+  assert.equal(h.prompts[0].options.signal.aborted, false);
+  await h.controller.close();
+});
+
+test("a network deadline resumes after fingerprint consent", async (t) => {
+  const cert = await certificate();
+  let confirm;
+  const answer = new Promise((resolve) => {
+    confirm = resolve;
+  });
+  const h = harness({
+    responses: [answer],
+    load: async (view) => {
+      if (!(await verify(view, cert))) throw new Error("Certificate rejected");
+      await new Promise(() => {});
+    },
+  });
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const failed = assert.rejects(h.controller.open(origin), { status: 502 });
+  await new Promise((resolve) => setImmediate(resolve));
+  t.mock.timers.tick(45000);
+  confirm(1);
+  await new Promise((resolve) => setImmediate(resolve));
+  t.mock.timers.tick(29999);
+  assert.equal(h.views[0].webContents.stopped, undefined);
+  t.mock.timers.tick(1);
+  await failed;
+  assert.equal(h.views[0].webContents.isDestroyed(), true);
+  await h.controller.close();
+});
+
+for (const action of ["disconnect", "close"]) {
+  test(`${action} dismisses pending certificate consent and ignores a late answer`, async () => {
+    const cert = await certificate();
+    let confirm;
+    const answer = new Promise((resolve) => {
+      confirm = resolve;
+    });
+    const store = memoryStore();
+    const h = harness({
+      store,
+      responses: [answer],
+      load: async (view) => {
+        if (!(await verify(view, cert)))
+          throw new Error("Certificate rejected");
+      },
+    });
+    const failed = assert.rejects(h.controller.open(origin));
+    await new Promise((resolve) => setImmediate(resolve));
+    const id = h.controller.list().panels.find((panel) => !panel.local).id;
+    if (action === "disconnect") await h.controller.disconnect(id);
+    else await h.controller.close();
+    assert.equal(h.prompts[0].options.signal.aborted, true);
+    await failed;
+    confirm(1);
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(store.snapshot.panels.length, 0);
+    assert.equal(h.views[0].webContents.isDestroyed(), true);
+    await h.controller.close();
+  });
+}
 
 test("local server selection exposes only display fields and notifies only the owner after saving", async () => {
   let finishSave;
@@ -1736,6 +1822,41 @@ test("offline restores keep retryable entries, suppress certificate dialogs, and
   assert.equal(h.views.length, 2);
   await h.controller.close();
   assert.equal(store.snapshot.panels.length, 2);
+});
+
+test("forgetting a signed-out saved panel frees its registry slot and only clears that partition", async () => {
+  const store = memoryStore({
+    activeId: "local",
+    panels: Array.from({ length: 50 }, (_, index) => ({
+      id: randomUUID(),
+      origin: `https://saved-${index}.example`,
+      signedIn: false,
+    })),
+  });
+  const h = harness({ store });
+  await h.controller.restore();
+  const panels = h.controller.list().panels.filter((panel) => !panel.local);
+  assert.equal(panels.length, 50);
+  assert.ok(panels.every((panel) => panel.signedIn === false));
+  await assert.rejects(
+    h.controller.open("https://new.example"),
+    /Manage panel connections/,
+  );
+  await h.controller.disconnect(panels[0].id);
+  assert.equal(h.partitions[0].cleared, true);
+  assert.equal(h.partitions[0].cacheCleared, true);
+  assert.ok(h.partitions.slice(1).every((partition) => !partition.cleared));
+  assert.equal(store.snapshot.panels.length, 49);
+  const opened = await h.controller.open("https://new.example");
+  assert.ok(
+    opened.panels.some((panel) => panel.origin === "https://new.example"),
+  );
+  assert.equal(store.snapshot.panels.length, 50);
+  assert.equal(
+    store.snapshot.panels.some((panel) => panel.id === panels[0].id),
+    false,
+  );
+  await h.controller.close();
 });
 
 test("signout survives offline restore but a remembered login needs fresh verification", async () => {

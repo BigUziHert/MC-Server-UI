@@ -82,7 +82,10 @@ async function fixture(t, { createDefaultServer = true } = {}) {
                   resolve({
                     status: response.statusCode,
                     body: raw ? JSON.parse(raw) : undefined,
-                    cookie: response.headers["set-cookie"]?.[0]?.split(";")[0],
+                    cookie:
+                      raw && JSON.parse(raw).sessionToken
+                        ? `Bearer ${JSON.parse(raw).sessionToken}`
+                        : undefined,
                   });
                 } catch (cause) {
                   reject(
@@ -100,7 +103,7 @@ async function fixture(t, { createDefaultServer = true } = {}) {
       request(remote, {
         Host: "panel-accounts.example.test",
         Origin: origin,
-        ...(cookie ? { Cookie: cookie } : {}),
+        ...(cookie ? { Authorization: cookie } : {}),
       });
     const configured = await local(
       "/api/access/settings",

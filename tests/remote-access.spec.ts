@@ -253,6 +253,7 @@ for (const width of [1280, 390]) {
       ...server,
       mode: "live",
       launchType: "jar",
+      settingsRevision: "initial-settings-revision",
       connectionHost: "play.example.com",
       port: 25565,
       memoryLimitMB: 2048,
@@ -324,10 +325,8 @@ for (const width of [1280, 390]) {
     expect(patches).toEqual([
       {
         name: "Family renamed",
-        connectionHost: "play.example.com",
-        port: 25565,
         memoryLimitMB: 3072,
-        motd: "Family server",
+        settingsRevision: "initial-settings-revision",
       },
     ]);
     await expect(page.getByRole("status")).toContainText(

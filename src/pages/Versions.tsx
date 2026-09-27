@@ -77,6 +77,7 @@ function newerStableBuild(candidate: Build, installed: string) {
 
 type Job = {
   id: string;
+  requestId?: string;
   status: "queued" | "running" | "completed" | "failed";
   state?: "queued" | "running" | "complete" | "failed";
   message?: string;
@@ -167,6 +168,8 @@ export default function Versions({
   const [checkingUpdate, setCheckingUpdate] = useState(false);
   const [job, setJob] = useState<Job | null>(null);
   const [dialogError, setDialogError] = useState("");
+  const installRequest = useRef<{ id: string; signature: string } | null>(null);
+  const uncertainInstall = useRef<string | null>(null);
   const generation = useRef(0);
   const dialog = useRef<HTMLDialogElement>(null);
   const jobBusy = job?.status === "queued" || job?.status === "running";
@@ -262,6 +265,8 @@ export default function Versions({
     setVersion("");
     setJob(null);
     setConfirming(null);
+    installRequest.current = null;
+    uncertainInstall.current = null;
     setCheckingUpdate(false);
     setSearch("");
     void refresh();
@@ -281,6 +286,16 @@ export default function Versions({
               status: server.status,
             });
             setRuntimeUpdate(catalog.runtimeUpdate ?? null);
+            const acceptedJob = catalog.job ? normalizeJob(catalog.job) : null;
+            if (
+              uncertainInstall.current &&
+              acceptedJob?.requestId === uncertainInstall.current
+            ) {
+              uncertainInstall.current = null;
+              setJob(acceptedJob);
+              setConfirming(null);
+              setDialogError("");
+            }
           }
         })
         .catch(() => {});
@@ -459,6 +474,8 @@ export default function Versions({
       setReleaseSearch("");
       setLoading(false);
       setLoadingBuilds(false);
+      installRequest.current = null;
+      uncertainInstall.current = null;
       setConfirming(latest);
       setInstallMode("update");
       setAccepted(false);
@@ -490,27 +507,39 @@ export default function Versions({
     setLoading(false);
     setSubmitting(true);
     setDialogError("");
+    const input = {
+      provider: selected.id,
+      version,
+      build: confirming.id,
+      confirmed: true,
+      ...(updating ? { updateRuntime: true } : { cleanInstall: true }),
+    };
+    const signature = JSON.stringify(input);
+    if (installRequest.current?.signature !== signature)
+      installRequest.current = { id: crypto.randomUUID(), signature };
     try {
       const result = normalizeJob(
         await post<Job | { job: Job }>("/versions/install", {
-          provider: selected.id,
-          version,
-          build: confirming.id,
-          confirmed: true,
-          ...(updating ? { updateRuntime: true } : { cleanInstall: true }),
+          ...input,
+          requestId: installRequest.current.id,
         }),
       );
       if (token === generation.current) {
+        uncertainInstall.current = null;
         setJob(result);
         setConfirming(null);
       }
     } catch (cause) {
-      if (token === generation.current)
+      if (token === generation.current) {
+        const status = (cause as { status?: number }).status;
+        if (!status || status >= 500)
+          uncertainInstall.current = installRequest.current.id;
         setDialogError(
           cause instanceof Error
-            ? cause.message
+            ? `${cause.message}${uncertainInstall.current ? " Checking whether the original installation was accepted. Retrying this confirmation will not start it twice." : ""}`
             : "Unable to start the installation.",
         );
+      }
     } finally {
       if (token === generation.current) setSubmitting(false);
     }
@@ -914,6 +943,8 @@ export default function Versions({
                           current?.status !== "offline"
                         }
                         onClick={() => {
+                          installRequest.current = null;
+                          uncertainInstall.current = null;
                           setConfirming(build);
                           setInstallMode(canUpdate ? "update" : "clean");
                           setAccepted(false);

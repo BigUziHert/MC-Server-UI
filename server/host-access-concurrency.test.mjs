@@ -69,7 +69,7 @@ test("concurrent login skips unavailable memberships while creation owns the fle
             ...(remoteRequest
               ? { Host: "concurrency.example.test", Origin: origin }
               : {}),
-            ...(cookie ? { Cookie: cookie } : {}),
+            ...(cookie ? { Authorization: cookie } : {}),
             ...(serverId ? { "X-Server-Id": serverId } : {}),
           },
         },
@@ -84,7 +84,9 @@ test("concurrent login skips unavailable memberships while creation owns the fle
               resolve({
                 status: res.statusCode,
                 body: JSON.parse(text),
-                cookie: res.headers["set-cookie"]?.[0]?.split(";")[0],
+                cookie: JSON.parse(text).sessionToken
+                  ? `Bearer ${JSON.parse(text).sessionToken}`
+                  : undefined,
               });
             } catch (cause) {
               reject(cause);

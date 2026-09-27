@@ -39,6 +39,7 @@ type Subuser = {
   role?: string;
   permissions?: string[];
   hostPermissions?: string[];
+  effectiveHostPermissions?: string[];
   accessMode?: "all" | "selected";
   serverIds?: string[];
   excludedServerIds?: string[];
@@ -805,7 +806,9 @@ function AccessManagement({
     setAccountId("");
     setSelected(user ? permissionsFor(user) : []);
     setAllowServerCreation(
-      user?.hostPermissions?.includes("server.create") ?? false,
+      (user?.effectiveHostPermissions ?? user?.hostPermissions)?.includes(
+        "server.create",
+      ) ?? false,
     );
     setFormError("");
     setInviteOnCreate(invite && invitationReady);
@@ -1146,7 +1149,10 @@ function AccessManagement({
                             </span>
                           )}
                           {accountsView &&
-                            user.hostPermissions?.includes("server.create") && (
+                            (
+                              user.effectiveHostPermissions ??
+                              user.hostPermissions
+                            )?.includes("server.create") && (
                               <span>
                                 Can create and import servers on this computer
                               </span>

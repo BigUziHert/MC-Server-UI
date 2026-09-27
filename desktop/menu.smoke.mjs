@@ -152,7 +152,10 @@ try {
     BrowserWindow.getAllWindows()[0].webContents.send("mc-panel-updates-open");
   });
   await expect(
-    page.getByRole("dialog", { name: "App updates", exact: true }),
+    page.getByRole("dialog", {
+      name: "App updates on this computer",
+      exact: true,
+    }),
   ).toBeVisible();
   await page.getByRole("button", { name: "Close app updates" }).click();
   await application.evaluate(({ BrowserWindow }) =>
@@ -220,7 +223,10 @@ try {
     .getByRole("button", { name: "App updates", exact: true })
     .click();
   await expect(
-    reopened.getByRole("dialog", { name: "App updates", exact: true }),
+    reopened.getByRole("dialog", {
+      name: "App updates on this computer",
+      exact: true,
+    }),
   ).toBeVisible();
   await reopened.getByRole("button", { name: "Close app updates" }).click();
   await expect(settingsDialog).toBeVisible();

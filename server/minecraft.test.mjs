@@ -8,6 +8,7 @@ import { promoteVersion } from "./minecraft.mjs";
 import { createRecycleBin } from "./recycle-bin.mjs";
 import { containedSourcePath } from "./import.mjs";
 import { processStartup } from "../tests/fixtures/process-options.mjs";
+import { randomUUID } from "node:crypto";
 
 const json = (method, body) => ({ method, body: JSON.stringify(body) });
 const selection = {
@@ -187,6 +188,52 @@ async function install(f, id) {
       : null;
   });
 }
+
+test("an accepted version confirmation replays its durable job without repeating a clean install", async (t) => {
+  let staged = 0;
+  const f = await fixture(t, {
+    fleet: true,
+    stage: async (_input, ctx) => {
+      staged++;
+      return makeStage(ctx);
+    },
+  });
+  const input = { ...selection, requestId: randomUUID() };
+  const accepted = await f.request(
+    "/api/versions/install",
+    json("POST", input),
+  );
+  assert.equal(accepted.status, 202, JSON.stringify(accepted.body));
+  await eventually(
+    async () =>
+      (await f.request(`/api/versions/jobs/${accepted.body.id}`)).body
+        .status === "completed",
+  );
+  await fs.writeFile(
+    path.join(f.serverDir, "later.txt"),
+    "another client's changes",
+  );
+  for (const restart of [false, true]) {
+    if (restart) await f.restart();
+    const replay = await f.request(
+      "/api/versions/install",
+      json("POST", input),
+    );
+    assert.equal(replay.status, 202, JSON.stringify(replay.body));
+    assert.equal(replay.body.id, accepted.body.id);
+    assert.equal(replay.body.status, "completed");
+    assert.equal(
+      await fs.readFile(path.join(f.serverDir, "later.txt"), "utf8"),
+      "another client's changes",
+    );
+  }
+  assert.equal(staged, 1);
+  const mismatch = await f.request(
+    "/api/versions/install",
+    json("POST", { ...input, build: "other" }),
+  );
+  assert.equal(mismatch.status, 409);
+});
 
 test("version jobs clean the entire selected server folder, retain recovery files, and persist fleet metadata", async (t) => {
   const f = await fixture(t, { fleet: true });

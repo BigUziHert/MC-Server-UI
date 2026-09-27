@@ -286,10 +286,10 @@ test("file listing access does not fetch file contents or enable file changes", 
     page.getByRole("button", { name: "Delete notes.txt", exact: true }),
   ).toBeDisabled();
   await expect(
-    page.getByRole("link", { name: "Download notes.txt" }),
+    page.getByRole("button", { name: "Download notes.txt" }),
   ).toHaveCount(0);
   await expect(
-    page.getByRole("link", { name: "Download world", exact: true }),
+    page.getByRole("button", { name: "Download world", exact: true }),
   ).toHaveCount(0);
   await expect(
     page.getByRole("button", {
@@ -415,7 +415,7 @@ test("backup readers can inspect archives and schedules without changing or down
     page.getByRole("button", { name: "Save schedule", exact: true }),
   ).toBeDisabled();
   await expect(
-    page.getByRole("link", { name: "Download backup Before changes" }),
+    page.getByRole("button", { name: "Download backup Before changes" }),
   ).toHaveCount(0);
   expect(calls.filter((call) => call.method !== "GET")).toEqual([]);
 });

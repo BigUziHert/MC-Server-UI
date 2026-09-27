@@ -62,6 +62,11 @@ import DesktopUpdates from "./DesktopUpdates";
 import PanelSettings from "./PanelSettings";
 import ServerIcon, { ServerIconImage } from "./ServerIcon";
 import { copyText } from "./clipboard";
+import { clearFileClipboard } from "./file-clipboard";
+import { clearFileTransfers } from "./file-transfer-state";
+import { clearRecoveryBatches } from "./recycle-action-state";
+import { SessionScopeContext } from "./session-scope";
+import { PropertyDraftsContext, type PropertyDraft } from "./property-drafts";
 import { readPreference, writePreference } from "./preferences";
 import PanelAccount, {
   DesktopPanelReturn,
@@ -301,6 +306,8 @@ export default function App({
   requestedRemoteServer?: { serverId: string; sequence: number } | null;
 }) {
   const remote = Boolean(session);
+  const [sessionScope] = useState(() => crypto.randomUUID());
+  const propertyDrafts = useRef(new Map<string, PropertyDraft>());
   const desktopConnections = useDesktopConnections(!remote);
   const handledLocalSetup = useRef<string | null>(null);
   const committedLocalSetup = useRef<string | null>(null);
@@ -310,7 +317,18 @@ export default function App({
     sessionMounted.current = true;
     return () => {
       sessionMounted.current = false;
+      clearFileClipboard();
+      clearFileTransfers();
+      clearRecoveryBatches();
+      propertyDrafts.current.clear();
     };
+  }, []);
+  useEffect(() => {
+    const warn = (event: BeforeUnloadEvent) => {
+      if (propertyDrafts.current.size) event.preventDefault();
+    };
+    window.addEventListener("beforeunload", warn);
+    return () => window.removeEventListener("beforeunload", warn);
   }, []);
   const selectionKey = session
     ? `mc-panel.active-server.${session.email}`
@@ -794,7 +812,11 @@ export default function App({
   );
   return (
     <SessionActiveContext.Provider value={isSessionActive}>
-      {workspace}
+      <SessionScopeContext.Provider value={sessionScope}>
+        <PropertyDraftsContext.Provider value={propertyDrafts.current}>
+          {workspace}
+        </PropertyDraftsContext.Provider>
+      </SessionScopeContext.Provider>
     </SessionActiveContext.Provider>
   );
 }
@@ -1114,9 +1136,14 @@ function ServerWorkspace({
     (message: string, error?: boolean) => setToast({ message, error }),
     [],
   );
+  const statusRequest = useRef(0);
+  const latestStatusResponse = useRef(0);
   const refresh = useCallback(async () => {
+    const request = ++statusRequest.current;
     try {
       const s = await api<Server>("/server");
+      if (request < latestStatusResponse.current) return;
+      latestStatusResponse.current = request;
       setServer(s);
       setConnectionError("");
       setHistory((h) => ({
@@ -1125,6 +1152,8 @@ function ServerWorkspace({
           s.memory === null ? h.memory : [...h.memory.slice(-39), s.memory],
       }));
     } catch (error) {
+      if (request < latestStatusResponse.current) return;
+      latestStatusResponse.current = request;
       setConnectionError((error as Error).message);
     }
   }, [api]);
@@ -1132,7 +1161,10 @@ function ServerWorkspace({
   useEffect(() => {
     void refresh();
     const timer = window.setInterval(refresh, 3000);
-    return () => clearInterval(timer);
+    return () => {
+      clearInterval(timer);
+      latestStatusResponse.current = ++statusRequest.current;
+    };
   }, [refresh]);
   useEffect(() => {
     setServer((current) =>
@@ -1498,7 +1530,6 @@ function ServerWorkspace({
               <button
                 className="btn icon"
                 aria-label="Close help"
-                autoFocus
                 onClick={() => setHelp(false)}
               >
                 <X size={18} />
@@ -1706,11 +1737,7 @@ function PowerConfirmation({
                 : "Connected players will be disconnected. The server will receive a graceful stop command to save its world."}
             </p>
             <div className="modal-actions">
-              <button
-                className="btn"
-                autoFocus
-                onClick={() => setConfirmPower(null)}
-              >
+              <button className="btn" onClick={() => setConfirmPower(null)}>
                 Cancel
               </button>
               <button
@@ -1781,16 +1808,23 @@ function ConsolePage({
     message: [],
   });
   const historyIndex = useRef(-1);
+  const logRequest = useRef(0);
+  const latestLogResponse = useRef(0);
   const loadLogs = useCallback(async () => {
     if (!canConsole) return;
+    const request = ++logRequest.current;
     try {
       const result = await api<{ lines: LogLine[] }>("/console");
+      if (request < latestLogResponse.current) return;
+      latestLogResponse.current = request;
       const latest = Number(result.lines.at(-1)?.id ?? 0);
       if (latest && latest < lastLogId.current) setHiddenUntil(null);
       if (latest) lastLogId.current = latest;
       setLines(result.lines);
       setLogError(false);
     } catch {
+      if (request < latestLogResponse.current) return;
+      latestLogResponse.current = request;
       setLogError(true);
     }
   }, [api, canConsole]);
@@ -1798,7 +1832,10 @@ function ConsolePage({
     if (!canConsole) return;
     void loadLogs();
     const timer = setInterval(loadLogs, 1500);
-    return () => clearInterval(timer);
+    return () => {
+      clearInterval(timer);
+      latestLogResponse.current = ++logRequest.current;
+    };
   }, [loadLogs, canConsole]);
   useEffect(() => {
     if (autoScroll && logContainer.current)
@@ -1806,6 +1843,13 @@ function ConsolePage({
   }, [lines, autoScroll, levelFilter, query, showSearch]);
   useEffect(() => {
     const listener = (e: KeyboardEvent) => {
+      if (
+        e.defaultPrevented ||
+        document.querySelector(
+          'dialog[open], [role="dialog"][aria-modal="true"]',
+        )
+      )
+        return;
       if ((e.ctrlKey || e.metaKey) && e.key === "k") {
         e.preventDefault();
         commandInput.current?.focus();
@@ -1842,8 +1886,9 @@ function ConsolePage({
     }
   }
   async function copyAddress() {
+    if (!server?.address) return;
     try {
-      await copyText(server?.address || "localhost:25565");
+      await copyText(server.address);
       notify("Server address copied.");
     } catch {
       notify("Could not access the clipboard.", true);
@@ -1938,10 +1983,11 @@ function ConsolePage({
             <button
               className="address-button"
               onClick={copyAddress}
+              disabled={!server?.address}
               aria-label="Copy server address"
               title={server?.addressNote}
             >
-              <span>{server?.address || "localhost:25565"}</span>
+              <span>{server?.address || "Loading address…"}</span>
               <Copy size={12} />
             </button>
           </div>

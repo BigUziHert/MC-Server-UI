@@ -1,4 +1,9 @@
 import { createContext, useContext, useMemo } from "react";
+import {
+  authenticatedFetch,
+  saveSessionCredential,
+  sessionRevision,
+} from "./session-auth";
 
 export const ServerScope = createContext<string | null>(null);
 export const SessionExpiredContext = createContext<(() => void) | null>(null);
@@ -15,12 +20,30 @@ export async function api<T = any>(
   path: string,
   options: RequestInit = {},
 ): Promise<T> {
+  const revision = sessionRevision();
   const headers = new Headers(options.headers);
   if (options.body && !(options.body instanceof FormData))
     headers.set("Content-Type", "application/json");
-  const response = await fetch(`/api${path}`, { ...options, headers });
+  const response = await authenticatedFetch(`/api${path}`, {
+    ...options,
+    headers,
+  });
+  if (revision !== sessionRevision())
+    throw Object.assign(
+      new Error(
+        "The signed-in account changed while this request was running.",
+      ),
+      { status: 409 },
+    );
   if (!response.ok) {
     const body = await response.json().catch(() => ({}));
+    if (revision !== sessionRevision())
+      throw Object.assign(
+        new Error(
+          "The signed-in account changed while this request was running.",
+        ),
+        { status: 409 },
+      );
     throw Object.assign(
       new Error(body.error || `Request failed (${response.status})`),
       {
@@ -43,7 +66,20 @@ export async function api<T = any>(
     );
   }
   if (response.status === 204) return undefined as T;
-  return response.json();
+  const body = await response.json();
+  if (revision !== sessionRevision())
+    throw Object.assign(
+      new Error(
+        "The signed-in account changed while this request was running.",
+      ),
+      { status: 409 },
+    );
+  if (["/access/login", "/access/accept"].includes(path) && body.sessionToken) {
+    saveSessionCredential(body.sessionToken);
+    delete body.sessionToken;
+  }
+  if (path === "/access/logout") saveSessionCredential(null);
+  return body;
 }
 export const post = <T = any>(path: string, body: unknown = {}) =>
   api<T>(path, { method: "POST", body: JSON.stringify(body) });
@@ -111,7 +147,7 @@ export function useServerApi() {
       const headers = new Headers(options.headers);
       if (serverId) headers.set("X-Server-Id", serverId);
       return api<T>(path, { ...options, headers }).catch((cause) => {
-        if (cause?.status === 401) onSessionExpired?.();
+        if (cause?.status === 401 && isSessionActive()) onSessionExpired?.();
         throw cause;
       });
     };

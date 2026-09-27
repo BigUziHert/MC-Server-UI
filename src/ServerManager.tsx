@@ -25,6 +25,7 @@ import "./servers.css";
 
 export type ServerRecord = {
   id: string;
+  settingsRevision?: string;
   accessPermissions?: string[];
   name: string;
   status: "running" | "offline" | "starting" | "stopping";
@@ -496,6 +497,7 @@ function ServerSettings({
 }) {
   const remote = Boolean(remoteHost);
   const { api: scopedApi } = useServerApi();
+  const [baseline, setBaseline] = useState(editing);
   const [name, setName] = useState(editing.name);
   const [connectionHost, setConnectionHost] = useState(
     editing.connectionHost ?? "",
@@ -508,11 +510,12 @@ function ServerSettings({
   );
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
+  const [conflict, setConflict] = useState(false);
   const [confirmingRemoval, setConfirmingRemoval] = useState(false);
   const dialog = useRef<HTMLDialogElement>(null);
   const removalCancel = useRef<HTMLButtonElement>(null);
   const errorMessage = useRef<HTMLDivElement>(null);
-  const running = editing.status !== "offline";
+  const running = baseline.status !== "offline";
   useEffect(() => {
     const element = dialog.current;
     element?.showModal();
@@ -541,6 +544,23 @@ function ServerSettings({
       ...(!remote ? startupPayload(startup) : {}),
       motd,
     };
+    const original = {
+      name: baseline.name,
+      connectionHost: baseline.connectionHost ?? "",
+      mode: baseline.mode,
+      port: baseline.port,
+      memoryLimitMB: baseline.memoryLimitMB,
+      ...startupPayload(startupDraft(baseline)),
+      motd: baseline.motd ?? "Welcome to our Minecraft server",
+    };
+    const changes = Object.fromEntries(
+      Object.entries(settings).filter(
+        ([key, value]) =>
+          (!running || key === "name" || key === "connectionHost") &&
+          JSON.stringify(value) !==
+            JSON.stringify(original[key as keyof typeof original]),
+      ),
+    );
     try {
       const result = await scopedApi<{ server: ServerRecord }>(
         remote
@@ -548,14 +568,42 @@ function ServerSettings({
           : `/servers/${encodeURIComponent(editing.id)}`,
         {
           method: "PATCH",
-          body: JSON.stringify(
-            running
-              ? { name: name.trim(), connectionHost: connectionHost.trim() }
-              : settings,
-          ),
+          body: JSON.stringify({
+            ...changes,
+            settingsRevision: baseline.settingsRevision,
+          }),
         },
       );
       onSaved(result.server);
+    } catch (cause) {
+      setError((cause as Error).message);
+      setConflict((cause as { status?: number }).status === 409);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function reloadSettings() {
+    if (busy) return;
+    setBusy(true);
+    try {
+      const result = await scopedApi<{
+        server?: ServerRecord;
+        servers?: ServerRecord[];
+      }>(remote ? "/server/settings" : "/servers");
+      const latest =
+        result.server ??
+        result.servers?.find((server) => server.id === editing.id);
+      if (!latest) throw new Error("This server is no longer available.");
+      setBaseline(latest);
+      setName(latest.name);
+      setConnectionHost(latest.connectionHost ?? "");
+      setPort(String(latest.port));
+      setMemory(String(latest.memoryLimitMB));
+      setStartup(startupDraft(latest));
+      setMotd(latest.motd ?? "Welcome to our Minecraft server");
+      setConflict(false);
+      setError("");
     } catch (cause) {
       setError((cause as Error).message);
     } finally {
@@ -742,6 +790,16 @@ function ServerSettings({
           <div ref={errorMessage} className="server-form-error" role="alert">
             <AlertCircle size={16} />
             {error}
+            {conflict && (
+              <button
+                type="button"
+                className="btn"
+                disabled={busy}
+                onClick={() => void reloadSettings()}
+              >
+                Reload and discard my edits
+              </button>
+            )}
           </div>
         )}
         <div className="server-dialog-actions">

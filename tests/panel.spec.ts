@@ -360,7 +360,7 @@ test("file manager creates and edits nested files and preserves upload/download 
   ).toBeVisible();
   const downloadEvent = page.waitForEvent("download");
   await page
-    .getByRole("link", { name: "Download uploaded.bin", exact: true })
+    .getByRole("button", { name: "Download uploaded.bin", exact: true })
     .click();
   const download = await downloadEvent;
   expect(download.suggestedFilename()).toBe("uploaded.bin");
@@ -414,7 +414,7 @@ test("manual backups download a real archive and automatic schedules persist", a
   ).toBeVisible();
   const downloadEvent = page.waitForEvent("download");
   await page
-    .getByRole("link", { name: "Download backup Before browser test" })
+    .getByRole("button", { name: "Download backup Before browser test" })
     .click();
   const download = await downloadEvent;
   const archivePath = testInfo.outputPath("backup.tar.gz");
@@ -1008,7 +1008,7 @@ test("server workspaces isolate files, commands and backups while panel users re
   ).toBe("Original world contents\n");
   let downloadEvent = page.waitForEvent("download");
   await page
-    .getByRole("link", { name: "Download e2e-shared-name.txt", exact: true })
+    .getByRole("button", { name: "Download e2e-shared-name.txt", exact: true })
     .click();
   let download = await downloadEvent;
   const filePath = testInfo.outputPath("secondary-server-file.txt");
@@ -1091,7 +1091,7 @@ test("server workspaces isolate files, commands and backups while panel users re
   );
   downloadEvent = page.waitForEvent("download");
   await page
-    .getByRole("link", {
+    .getByRole("button", {
       name: "Download backup E2E secondary world snapshot",
       exact: true,
     })
@@ -2212,7 +2212,7 @@ test("imports an existing external server in place without changing its files or
     ).toBeVisible();
     const downloadEvent = page.waitForEvent("download");
     await page
-      .getByRole("link", { name: "Download level.dat", exact: true })
+      .getByRole("button", { name: "Download level.dat", exact: true })
       .click();
     const download = await downloadEvent;
     const downloadPath = testInfo.outputPath("imported-level.dat");

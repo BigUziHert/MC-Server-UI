@@ -1310,6 +1310,9 @@ test("confirmed software creation retries installation on the same stopped serve
     },
   });
   expect(installs).toHaveLength(2);
+  expect(installs[0].body.requestId).toEqual(expect.any(String));
+  expect(installs[1].body.requestId).toEqual(expect.any(String));
+  expect(installs[1].body.requestId).not.toBe(installs[0].body.requestId);
   for (const install of installs) {
     expect(install.serverId).toBe(setup.created[0].id);
     expect(install.body).toMatchObject({
@@ -1740,6 +1743,7 @@ test("an accepted installation with a lost response recovers its completed job a
   });
   await page.route("**/api/versions/install", async (route) => {
     installationCalls++;
+    expect(route.request().postDataJSON().requestId).toMatch(/^[0-9a-f-]{36}$/);
     expect(route.request().headers()["x-server-id"]).toBe(setup.created[0]?.id);
     accepted = true;
     await route.fulfill({

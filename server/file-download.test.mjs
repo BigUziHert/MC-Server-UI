@@ -109,17 +109,17 @@ async function fixture(t) {
     );
     const signed = await guest("/api/access/accept", {
       ...json("POST", { token, password: "Correct-test-password!" }),
-      ...(existingCookie ? { headers: { Cookie: existingCookie } } : {}),
+      ...(existingCookie ? { headers: { Authorization: existingCookie } } : {}),
     });
     assert.equal(signed.status, 200, JSON.stringify(signed.body));
-    const cookie = signed.headers["set-cookie"][0].split(";")[0];
+    const cookie = `Bearer ${signed.body.sessionToken}`;
     return {
       user: created.body,
       cookie,
       asUser: request(remote, {
         Host: "panel.example.test",
         Origin: origin,
-        Cookie: cookie,
+        Authorization: cookie,
       }),
     };
   };

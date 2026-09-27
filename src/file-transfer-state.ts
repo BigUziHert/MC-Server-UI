@@ -25,6 +25,11 @@ const subscribe = (listener: () => void) => {
 };
 const emit = () => listeners.forEach((listener) => listener());
 
+export function clearFileTransfers() {
+  transfers.clear();
+  emit();
+}
+
 export function useFileTransfer(key: string) {
   return useSyncExternalStore(subscribe, () => transfers.get(key) ?? null);
 }
@@ -60,10 +65,12 @@ export function startFileTransfer(
   emit();
   void work(report, id)
     .then((message) => {
+      if (transfers.get(key)?.id !== id) return;
       report({ status: "completed", message });
       notify(`${initial.serverName}: ${message}`);
     })
     .catch((cause) => {
+      if (transfers.get(key)?.id !== id) return;
       const message = messageOf(cause);
       report({
         status: cause instanceof UnconfirmedTransfer ? "unconfirmed" : "failed",

@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { authenticatedFetch } from "./session-auth";
 
 export type PanelServer = {
   id: string;
@@ -20,6 +21,7 @@ export type PanelConnections = {
     local: boolean;
     // Only true after this running connection confirms its current session.
     signedIn?: boolean;
+    connectionState?: "connecting" | "unavailable" | "connected";
     servers?: PanelServer[];
   }[];
   localServers: {
@@ -74,7 +76,7 @@ async function fetchDesktopIcon(
   signal: AbortSignal,
 ) {
   const query = new URLSearchParams({ serverId, v: version });
-  const response = await fetch(`/api/server/icon?${query}`, {
+  const response = await authenticatedFetch(`/api/server/icon?${query}`, {
     credentials: "same-origin",
     signal: AbortSignal.any([signal, AbortSignal.timeout(5000)]),
   });

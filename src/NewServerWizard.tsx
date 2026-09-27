@@ -288,6 +288,7 @@ export default function NewServerWizard({
   const controller = useRef(new AbortController());
   const heading = useRef<HTMLHeadingElement>(null);
   const requestId = useRef(crypto.randomUUID());
+  const runtimeRequestId = useRef(crypto.randomUUID());
   const createdRef = useRef<ServerRecord | null>(null);
   const runtimeDone = useRef(false);
   const packDone = useRef(false);
@@ -807,12 +808,14 @@ export default function NewServerWizard({
       current = "job" in response ? response.job : response;
     }
     activeJob.current = null;
-    if ((current.state || current.status) === "failed")
+    if ((current.state || current.status) === "failed") {
+      if (type === "versions") runtimeRequestId.current = crypto.randomUUID();
       throw new Error(
         current.error ||
           current.message ||
           "Installation failed. You can retry using the same server.",
       );
+    }
     if (type === "versions") runtimeDone.current = true;
     else packDone.current = true;
   }
@@ -825,7 +828,12 @@ export default function NewServerWizard({
     try {
       const response = await request<Job | { job: Job }>(
         `/${type}/install`,
-        body,
+        type === "versions"
+          ? {
+              ...(body as Record<string, unknown>),
+              requestId: runtimeRequestId.current,
+            }
+          : body,
         serverId,
       );
       return "job" in response ? response.job : response;

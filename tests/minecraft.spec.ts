@@ -674,6 +674,12 @@ async function mockQuickUpdate(page: Page, serverId: string) {
       { id: "21.1.251", label: "21.1.251", stable: true },
     ],
     installations: [] as unknown[],
+    job: null as {
+      id: string;
+      requestId: string;
+      status: string;
+      message: string;
+    } | null,
     refreshed: [] as string[],
   };
   await page.route("**/api/server", async (route) => {
@@ -725,7 +731,7 @@ async function mockQuickUpdate(page: Page, serverId: string) {
             gameVersion: "1.21.1",
             build: state.installedBuild,
           },
-          job: null,
+          job: state.job,
         },
       });
     if (url.pathname === `/api/versions/${state.provider}/1.21.1`) {
@@ -746,6 +752,86 @@ async function mockQuickUpdate(page: Page, serverId: string) {
   });
   return state;
 }
+
+test("Versions reuses an uncertain confirmation ID and assigns a fresh ID after a new review", async ({
+  page,
+  serverId,
+}) => {
+  await mockQuickUpdate(page, serverId);
+  const ids: string[] = [];
+  await page.route("**/api/versions/install", (route) => {
+    const body = route.request().postDataJSON();
+    ids.push(body.requestId);
+    if (ids.length === 1) return route.abort("failed");
+    return route.fulfill({
+      status: 202,
+      json: {
+        id: `accepted-${ids.length}`,
+        requestId: body.requestId,
+        status: "completed",
+      },
+    });
+  });
+  await page.goto("/#versions");
+  await page.getByRole("button", { name: "Quick update", exact: true }).click();
+  const dialog = page.getByRole("dialog", {
+    name: "Update NeoForge",
+    exact: true,
+  });
+  const confirm = dialog.getByRole("button", {
+    name: "Update runtime",
+    exact: true,
+  });
+  await confirm.click();
+  await expect(dialog.getByRole("alert")).toContainText(
+    "Checking whether the original installation was accepted",
+  );
+  await confirm.click();
+  await expect(dialog).not.toBeVisible();
+  expect(ids).toHaveLength(2);
+  expect(ids[0]).toMatch(/^[0-9a-f-]{36}$/);
+  expect(ids[1]).toBe(ids[0]);
+  await page.getByRole("button", { name: "Quick update", exact: true }).click();
+  await confirm.click();
+  await expect(dialog).not.toBeVisible();
+  expect(ids).toHaveLength(3);
+  expect(ids[2]).not.toBe(ids[0]);
+});
+
+test("Versions reconnects to its accepted job from catalog polling after losing the install response", async ({
+  page,
+  serverId,
+}) => {
+  const state = await mockQuickUpdate(page, serverId);
+  let posts = 0;
+  await page.route("**/api/versions/install", (route) => {
+    posts++;
+    state.job = {
+      id: "accepted-after-disconnect",
+      requestId: route.request().postDataJSON().requestId,
+      status: "running",
+      message: "Original accepted installation",
+    };
+    return route.abort("failed");
+  });
+  await page.route("**/api/versions/jobs/accepted-after-disconnect", (route) =>
+    route.fulfill({ json: { job: state.job } }),
+  );
+  await page.goto("/#versions");
+  await page.getByRole("button", { name: "Quick update", exact: true }).click();
+  const dialog = page.getByRole("dialog", {
+    name: "Update NeoForge",
+    exact: true,
+  });
+  await dialog
+    .getByRole("button", { name: "Update runtime", exact: true })
+    .click();
+  await expect(dialog).not.toBeVisible();
+  await expect(page.locator(".versions-job")).toContainText(
+    "Original accepted installation",
+  );
+  expect(posts).toBe(1);
+});
 
 test("Versions quick update reviews the latest stable build for the current server even while browsing another software", async ({
   page,
@@ -800,6 +886,7 @@ test("Versions quick update reviews the latest stable build for the current serv
       build: "21.1.251",
       confirmed: true,
       updateRuntime: true,
+      requestId: expect.any(String),
     },
   ]);
   await expect(dialog).not.toBeVisible();
@@ -1071,6 +1158,7 @@ test("Versions updates an imported NeoForge runtime without a clean install and 
       build: "21.1.251",
       confirmed: true,
       updateRuntime: true,
+      requestId: expect.any(String),
     },
   ]);
   await expect(dialog).not.toBeVisible();
@@ -1212,6 +1300,7 @@ test("Versions shows official builds and requires a reviewed choice before insta
       build: "21.1.250",
       confirmed: true,
       cleanInstall: true,
+      requestId: expect.any(String),
     },
   ]);
 });

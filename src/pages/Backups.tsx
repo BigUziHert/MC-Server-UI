@@ -32,6 +32,7 @@ import "./storage-dialog.css";
 import RefreshButton from "../RefreshButton";
 import StatePanel from "../StatePanel";
 import Switch from "../Switch";
+import DownloadButton from "../DownloadButton";
 
 type Backup = {
   id: string;
@@ -45,6 +46,7 @@ type Backup = {
   originalSize?: number;
 };
 type Schedule = {
+  revision?: string;
   enabled: boolean;
   type: "interval" | "daily" | "weekly";
   intervalHours: number;
@@ -203,6 +205,16 @@ const defaults: Schedule = {
   retention: 7,
   nextRun: null,
 };
+const scheduleFields = [
+  "enabled",
+  "type",
+  "intervalHours",
+  "time",
+  "dayOfWeek",
+  "retention",
+] as const;
+const sameSchedule = (left: Schedule, right: Schedule) =>
+  scheduleFields.every((key) => left[key] === right[key]);
 const fullDate = (date: string) =>
   new Date(date).toLocaleString(undefined, {
     month: "short",
@@ -231,6 +243,10 @@ export default function Backups({
   const [backups, setBackups] = useState<Backup[]>([]);
   const [schedule, setSchedule] = useState<Schedule>(defaults);
   const [savedSchedule, setSavedSchedule] = useState<Schedule>(defaults);
+  const scheduleDraft = useRef(schedule);
+  const scheduleBaseline = useRef<Schedule>(defaults);
+  scheduleDraft.current = schedule;
+  const [scheduleConflict, setScheduleConflict] = useState(false);
   const [timezone, setTimezone] = useState("server time");
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
@@ -256,11 +272,13 @@ export default function Backups({
   const headingRef = useRef<HTMLHeadingElement>(null);
   const busyRef = useRef(false);
   const generation = useRef(0);
+  const loadSequence = useRef(0);
   const jobRef = useRef<BackupJob | null>(null);
   const startingRef = useRef(false);
   const jobRevision = useRef(0);
   const dialogVersion = useRef(0);
   const createDialogVersion = useRef<number | null>(null);
+  const restoreRequestId = useRef<string | null>(null);
   const currentDialog = useRef(dialog);
   currentDialog.current = dialog;
   const reloadRef = useRef<() => Promise<boolean>>(async () => false);
@@ -309,6 +327,7 @@ export default function Backups({
         return false;
       }
       const token = generation.current;
+      const sequence = ++loadSequence.current;
       const revision = jobRevision.current;
       if (initial) setLoading(true);
       setError("");
@@ -316,7 +335,8 @@ export default function Backups({
         const result = await api<BackupResult>("/backups", {
           signal: AbortSignal.timeout(10_000),
         });
-        if (token !== generation.current) return false;
+        if (token !== generation.current || sequence !== loadSequence.current)
+          return false;
         setBackups(result.backups);
         if (revision === jobRevision.current && !startingRef.current)
           acceptJob(result.job || null);
@@ -326,13 +346,27 @@ export default function Backups({
         );
         setSavedSchedule(result.schedule);
         setTimezone(result.timezone || "server time");
-        if (initial) setSchedule(result.schedule);
+        if (
+          initial ||
+          sameSchedule(scheduleDraft.current, scheduleBaseline.current)
+        ) {
+          if (!sameSchedule(scheduleDraft.current, result.schedule))
+            setSaved(false);
+          scheduleBaseline.current = result.schedule;
+          scheduleDraft.current = result.schedule;
+          setSchedule(result.schedule);
+          setScheduleConflict(false);
+        } else if (!sameSchedule(result.schedule, scheduleBaseline.current)) {
+          setScheduleConflict(true);
+        }
         return true;
       } catch (failure) {
-        if (token === generation.current) setError(messageOf(failure));
+        if (token === generation.current && sequence === loadSequence.current)
+          setError(messageOf(failure));
         return false;
       } finally {
-        if (token === generation.current) setLoading(false);
+        if (token === generation.current && sequence === loadSequence.current)
+          setLoading(false);
       }
     },
     [api, canRead, acceptJob],
@@ -357,6 +391,9 @@ export default function Backups({
     setJobError("");
     dialogVersion.current++;
     setSchedule(defaults);
+    scheduleDraft.current = defaults;
+    scheduleBaseline.current = defaults;
+    setScheduleConflict(false);
     setSavedSchedule(defaults);
     void load(true);
     return () => {
@@ -463,8 +500,9 @@ export default function Backups({
   }
   async function saveSchedule(event: FormEvent) {
     event.preventDefault();
-    if (!canSchedule) return;
+    if (!canSchedule || saving || scheduleConflict) return;
     const token = generation.current;
+    loadSequence.current++;
     setSaving(true);
     setSaved(false);
     try {
@@ -475,11 +513,17 @@ export default function Backups({
       if (token !== generation.current) return;
       const updated = "schedule" in result ? result.schedule : result;
       setSchedule(updated);
+      scheduleDraft.current = updated;
+      scheduleBaseline.current = updated;
       setSavedSchedule(updated);
+      setScheduleConflict(false);
       setSaved(true);
       notify("Backup schedule saved.");
     } catch (failure) {
-      if (token === generation.current) notify(messageOf(failure), true);
+      if (token === generation.current) {
+        notify(messageOf(failure), true);
+        if ((failure as { status?: number }).status === 409) await load();
+      }
     } finally {
       if (token === generation.current) setSaving(false);
     }
@@ -547,7 +591,13 @@ export default function Backups({
         if (!restoreConfirmed || restoreServerStatus !== "offline") return;
         const result = await api<{ warning?: string | null }>(
           `/backups/${encodeURIComponent(dialog.restore.id)}/restore`,
-          { method: "POST", body: JSON.stringify({ confirm: true }) },
+          {
+            method: "POST",
+            body: JSON.stringify({
+              confirm: true,
+              requestId: restoreRequestId.current,
+            }),
+          },
         );
         if (token !== generation.current) return;
         notify(
@@ -625,6 +675,7 @@ export default function Backups({
     if (!canRestore || busyRef.current) return;
     const token = generation.current;
     const version = ++dialogVersion.current;
+    restoreRequestId.current = crypto.randomUUID();
     setDialogError("");
     setDeleteErrors([]);
     setRestoreConfirmed(false);
@@ -926,17 +977,17 @@ export default function Backups({
                             </button>
                           )}
                           {canDownload && (
-                            <a
+                            <DownloadButton
                               className="btn icon"
+                              onError={(message) => notify(message, true)}
                               href={downloadUrl(
                                 `/backups/${encodeURIComponent(backup.id)}/download`,
                               )}
-                              download
                               aria-label={`Download backup ${backup.name}`}
                               title="Download backup"
                             >
                               <Download size={16} />
-                            </a>
+                            </DownloadButton>
                           )}
                           <button
                             className="btn icon delete-action"
@@ -973,6 +1024,63 @@ export default function Backups({
                   </div>
                 </div>
                 <form onSubmit={saveSchedule}>
+                  {scheduleConflict && (
+                    <div className="storage-form-error" role="alert">
+                      <p>
+                        This schedule changed on another client. Your unsaved
+                        edits are still here.
+                      </p>
+                      <p>
+                        Currently saved:{" "}
+                        {savedSchedule.enabled ? "enabled" : "disabled"},{" "}
+                        {savedSchedule.type === "interval"
+                          ? `every ${savedSchedule.intervalHours} hours`
+                          : `${savedSchedule.type}${savedSchedule.type === "weekly" ? ` on ${["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"][savedSchedule.dayOfWeek]}` : ""} at ${savedSchedule.time} (${timezone})`}
+                        , retain {savedSchedule.retention} backups.
+                      </p>
+                      <div className="backup-job-actions">
+                        <button
+                          type="button"
+                          className="btn small"
+                          onClick={() => {
+                            scheduleBaseline.current = savedSchedule;
+                            scheduleDraft.current = savedSchedule;
+                            setSchedule(savedSchedule);
+                            setScheduleConflict(false);
+                            setSaved(false);
+                          }}
+                        >
+                          Load current schedule
+                        </button>
+                        <button
+                          type="button"
+                          className="btn small"
+                          onClick={() => {
+                            const edits = Object.fromEntries(
+                              scheduleFields
+                                .filter(
+                                  (key) =>
+                                    scheduleDraft.current[key] !==
+                                    scheduleBaseline.current[key],
+                                )
+                                .map((key) => [
+                                  key,
+                                  scheduleDraft.current[key],
+                                ]),
+                            );
+                            const merged = { ...savedSchedule, ...edits };
+                            scheduleBaseline.current = savedSchedule;
+                            scheduleDraft.current = merged;
+                            setSchedule(merged);
+                            setScheduleConflict(false);
+                            setSaved(false);
+                          }}
+                        >
+                          Keep my edits for review
+                        </button>
+                      </div>
+                    </div>
+                  )}
                   <div className="schedule-toggle-row">
                     <div>
                       <strong>Enable schedule</strong>
@@ -1101,7 +1209,7 @@ export default function Backups({
                     <button
                       className="btn primary schedule-save"
                       type="submit"
-                      disabled={!canSchedule || saving}
+                      disabled={!canSchedule || saving || scheduleConflict}
                     >
                       {saving ? (
                         <LoaderCircle size={15} className="spin" />

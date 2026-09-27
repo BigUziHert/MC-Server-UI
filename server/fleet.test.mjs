@@ -99,6 +99,56 @@ async function fixture(t, settings = {}) {
   return { dataDir, boot };
 }
 
+test("server settings revisions reject stale and concurrent writes without losing unrelated edits", async (t) => {
+  const { boot } = await fixture(t);
+  const fleet = await boot();
+  const { defaultServerId: id } = (await fleet.request("/api/servers")).body;
+  const before = (await fleet.request("/api/server/settings", {}, id)).body
+    .server;
+  assert.match(before.settingsRevision, /^[a-f0-9]{64}$/);
+  const writes = await Promise.all([
+    fleet.request(
+      `/api/servers/${id}`,
+      json("PATCH", {
+        name: "Computer B",
+        settingsRevision: before.settingsRevision,
+      }),
+    ),
+    fleet.request(
+      "/api/server/settings",
+      json("PATCH", {
+        motd: "Computer C",
+        settingsRevision: before.settingsRevision,
+      }),
+      id,
+    ),
+  ]);
+  assert.deepEqual(writes.map((write) => write.status).sort(), [200, 409]);
+  const current = (await fleet.request("/api/server/settings", {}, id)).body
+    .server;
+  assert.notEqual(current.settingsRevision, before.settingsRevision);
+  assert.equal(
+    writes[0].status === 200 ? current.motd : current.name,
+    writes[0].status === 200 ? before.motd : before.name,
+  );
+  const renamed = await fleet.request(
+    `/api/servers/${id}`,
+    json("PATCH", {
+      name: "Reviewed name",
+      settingsRevision: current.settingsRevision,
+    }),
+  );
+  assert.equal(renamed.status, 200, JSON.stringify(renamed.body));
+  assert.equal(renamed.body.server.motd, current.motd);
+  await fleet.close();
+  const restarted = await boot();
+  const restored = (await restarted.request("/api/server/settings", {}, id))
+    .body.server;
+  assert.equal(restored.name, "Reviewed name");
+  assert.equal(restored.motd, current.motd);
+  assert.equal(restored.settingsRevision, renamed.body.server.settingsRevision);
+});
+
 test("browser desktop-selection capability is independent of an empty fleet and an unavailable server", async (t) => {
   const { boot } = await fixture(t, { createDefaultServer: false });
   const fleet = await boot();

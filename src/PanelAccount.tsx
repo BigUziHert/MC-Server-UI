@@ -4,6 +4,8 @@ import AccountMenu, { type AccountMenuAction } from "./AccountMenu";
 import { post } from "./api";
 import type { ConnectionMode } from "./ConnectPanel";
 import { useDesktopConnections } from "./desktop-connections";
+import PanelConnections from "./PanelConnections";
+import { useConfirmDiscardPropertyDrafts } from "./property-drafts";
 
 export type PanelSession = {
   role: "subuser";
@@ -17,6 +19,7 @@ export type PanelSession = {
 
 export function DesktopPanelReturn() {
   const [error, setError] = useState("");
+  const [manage, setManage] = useState(false);
   if (!window.mcPanelConnections) return null;
   return (
     <div className="desktop-panel-return">
@@ -33,6 +36,14 @@ export function DesktopPanelReturn() {
         <Monitor size={15} /> Back to this computer
       </button>
       {error && <p role="alert">{error}</p>}
+      <button
+        className="btn panel-connections-open"
+        type="button"
+        onClick={() => setManage(true)}
+      >
+        <Globe2 size={15} /> Manage panel connections
+      </button>
+      {manage && <PanelConnections onClose={() => setManage(false)} />}
     </div>
   );
 }
@@ -47,6 +58,7 @@ export default function PanelAccount({
   onConnect: (mode: ConnectionMode) => void;
 }) {
   const connections = useDesktopConnections();
+  const confirmDiscardDrafts = useConfirmDiscardPropertyDrafts();
   const mounted = useRef(true);
   useEffect(() => {
     mounted.current = true;
@@ -56,6 +68,7 @@ export default function PanelAccount({
   }, []);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
+  const [manage, setManage] = useState(false);
   async function perform(action: () => Promise<unknown>) {
     if (busy) return;
     setBusy(true);
@@ -103,13 +116,22 @@ export default function PanelAccount({
     disabled: busy,
     onSelect: () => onConnect("signin"),
   });
+  if (window.mcPanelConnections)
+    actions.push({
+      id: "connections",
+      label: "Manage panel connections",
+      icon: <Globe2 size={16} />,
+      disabled: busy,
+      onSelect: () => setManage(true),
+    });
   if (session)
     actions.push({
       id: "signout",
       label: "Sign out",
       icon: <LogOut size={16} />,
       busy,
-      onSelect: () =>
+      onSelect: () => {
+        if (!confirmDiscardDrafts()) return;
         void perform(async () => {
           try {
             await post("/access/logout");
@@ -117,7 +139,8 @@ export default function PanelAccount({
             if ((cause as { status?: number }).status !== 401) throw cause;
           }
           if (mounted.current) onSignedOut?.();
-        }),
+        });
+      },
     });
   return (
     <>
@@ -143,6 +166,7 @@ export default function PanelAccount({
         }
         actions={actions}
       />
+      {manage && <PanelConnections onClose={() => setManage(false)} />}
     </>
   );
 }

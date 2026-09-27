@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState, type ChangeEvent } from "react";
 import { Camera, Upload, X } from "lucide-react";
 import { useServerApi } from "./api";
+import { authenticatedFetch, sessionCredential } from "./session-auth";
 import "./server-icon.css";
 
 function DefaultIcon() {
@@ -16,6 +17,31 @@ function DefaultIcon() {
 function IconImage({ src, alt }: { src: string; alt: string }) {
   const [failed, setFailed] = useState(false);
   const [retried, setRetried] = useState(false);
+  const [authenticatedSrc, setAuthenticatedSrc] = useState<string | null>(null);
+  const needsAuth = src.startsWith("/api/") && !!sessionCredential();
+  useEffect(() => {
+    if (!needsAuth) return;
+    const controller = new AbortController();
+    let objectUrl: string | undefined;
+    setAuthenticatedSrc(null);
+    void authenticatedFetch(src, { signal: controller.signal })
+      .then(async (response) => {
+        if (!response.ok) throw new Error("Server icon unavailable.");
+        const blob = await response.blob();
+        if (blob.size > 262144 || !blob.type.startsWith("image/png"))
+          throw new Error("Server icon unavailable.");
+        if (controller.signal.aborted) return;
+        objectUrl = URL.createObjectURL(blob);
+        setAuthenticatedSrc(objectUrl);
+      })
+      .catch(() => {
+        if (!controller.signal.aborted) setFailed(true);
+      });
+    return () => {
+      controller.abort();
+      if (objectUrl) URL.revokeObjectURL(objectUrl);
+    };
+  }, [src, retried, needsAuth]);
   useEffect(() => {
     if (!failed || retried) return;
     const timer = setTimeout(() => {
@@ -24,13 +50,15 @@ function IconImage({ src, alt }: { src: string; alt: string }) {
     }, 750);
     return () => clearTimeout(timer);
   }, [failed, retried]);
-  return !failed ? (
+  return !failed && (!needsAuth || authenticatedSrc) ? (
     <img
       className="server-icon-image"
       src={
-        retried && !src.startsWith("data:")
-          ? `${src}${src.includes("?") ? "&" : "?"}retry=1`
-          : src
+        needsAuth
+          ? authenticatedSrc!
+          : retried && !src.startsWith("data:")
+            ? `${src}${src.includes("?") ? "&" : "?"}retry=1`
+            : src
       }
       alt={alt}
       onError={() => setFailed(true)}

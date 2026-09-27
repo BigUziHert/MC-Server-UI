@@ -127,7 +127,11 @@ function archiveManifest() {
   };
 }
 
-export async function restoreBackupArchive(serverDir, archive) {
+export async function restoreBackupArchive(
+  serverDir,
+  archive,
+  { validate } = {},
+) {
   const root = path.resolve(serverDir);
   const parent = path.dirname(root);
   const rootStat = await fs.lstat(root);
@@ -194,6 +198,9 @@ export async function restoreBackupArchive(serverDir, archive) {
     });
     if (extractionError) throw extractionError;
     extraction.check();
+    // Check the restored startup files before touching the live tree. Panel
+    // launch settings are intentionally retained rather than silently restored.
+    await validate?.(staged);
     const current = await fs.lstat(root);
     if (
       current.isSymbolicLink() ||

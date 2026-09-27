@@ -77,6 +77,129 @@ async function backupNames(request: APIRequestContext, fixture: BackupFixture) {
     .sort();
 }
 
+test("refresh adopts a pristine schedule and resolves concurrent dirty edits explicitly", async ({
+  page,
+  request,
+  backups,
+}) => {
+  const headers = { "X-Server-Id": backups.id };
+  await openBackups(page, backups);
+  const interval = page.getByLabel("Back up every");
+  const baseline = (
+    await (await request.get("/api/backups", { headers })).json()
+  ).schedule;
+  await expect(interval).toHaveValue(String(baseline.intervalHours));
+  const changed = await request.put("/api/backups/schedule", {
+    headers,
+    data: { ...baseline, enabled: true, intervalHours: 12, retention: 9 },
+  });
+  expect(changed.status()).toBe(200);
+  await page
+    .getByRole("button", { name: "Refresh backups", exact: true })
+    .click();
+  await expect(interval).toHaveValue("12");
+  await expect(
+    page.getByRole("switch", { name: "Enable automatic backups" }),
+  ).toBeChecked();
+  await interval.fill("18");
+  const current = (await changed.json()).schedule;
+  expect(
+    (
+      await request.put("/api/backups/schedule", {
+        headers,
+        data: { ...current, intervalHours: 24, retention: 15 },
+      })
+    ).status(),
+  ).toBe(200);
+  await page
+    .getByRole("button", { name: "Refresh backups", exact: true })
+    .click();
+  await expect(interval).toHaveValue("18");
+  await expect(
+    page.getByRole("button", { name: "Save schedule", exact: true }),
+  ).toBeDisabled();
+  await page
+    .getByRole("button", { name: "Keep my edits for review", exact: true })
+    .click();
+  await page
+    .getByRole("button", { name: "Save schedule", exact: true })
+    .click();
+  await expect(
+    page.getByRole("button", { name: "Schedule saved", exact: true }),
+  ).toBeVisible();
+  const saved = (await (await request.get("/api/backups", { headers })).json())
+    .schedule;
+  expect(saved.intervalHours).toBe(18);
+  expect(saved.retention).toBe(15);
+  expect(saved.enabled).toBe(true);
+});
+
+test("restore retries retain the confirmation ID after a lost response and a new review gets a new ID", async ({
+  page,
+  request,
+  backups,
+}) => {
+  await stopTestServer(request, backups.id);
+  const backup = backups.backups.find((item) => item.name === "Alpha backup")!;
+  const ids: string[] = [];
+  await page.route(`**/api/backups/${backup.id}/restore`, async (route) => {
+    ids.push(route.request().postDataJSON().requestId);
+    if (ids.length === 1) {
+      // Commit through the real isolated API but discard its response.
+      const response = await route.fetch();
+      expect(response.status()).toBe(200);
+      await request.post("/api/files", {
+        headers: { "X-Server-Id": backups.id },
+        data: {
+          type: "file",
+          name: "after-first-restore.txt",
+          content: "keep this",
+        },
+      });
+      return route.abort("failed");
+    }
+    return route.continue();
+  });
+  await openBackups(page, backups);
+  const open = page.getByRole("button", {
+    name: "Restore backup Alpha backup",
+    exact: true,
+  });
+  await open.click();
+  const dialog = page.getByRole("dialog", { name: "Restore this backup?" });
+  await dialog.getByRole("checkbox").check();
+  await dialog
+    .getByRole("button", { name: "Restore backup", exact: true })
+    .click();
+  await expect(dialog.getByRole("alert")).toBeVisible();
+  await dialog
+    .getByRole("button", { name: "Restore backup", exact: true })
+    .click();
+  await expect(dialog).not.toBeVisible();
+  expect(ids).toHaveLength(2);
+  expect(ids[1]).toBe(ids[0]);
+  const later = await request.get(
+    "/api/files/content?path=after-first-restore.txt",
+    { headers: { "X-Server-Id": backups.id } },
+  );
+  expect(later.status()).toBe(200);
+  expect((await later.json()).content).toBe("keep this");
+  await open.click();
+  await dialog.getByRole("checkbox").check();
+  await dialog
+    .getByRole("button", { name: "Restore backup", exact: true })
+    .click();
+  await expect(dialog).not.toBeVisible();
+  expect(ids[2]).not.toBe(ids[0]);
+  expect(
+    (
+      await request.get("/api/files/content?path=after-first-restore.txt", {
+        headers: { "X-Server-Id": backups.id },
+      })
+    ).status(),
+  ).toBe(404);
+});
+
 test("restoring a backup requires a stopped server and explicit confirmation", async ({
   page,
   request,
@@ -176,7 +299,7 @@ test("backup history shows compressed sizes and savings without requiring legacy
     await expect(row).toContainText("1.0 KB compressed");
     await expect(row).not.toContainText("saved");
     await expect(
-      row.getByRole("link", { name: `Download backup ${name}`, exact: true }),
+      row.getByRole("button", { name: `Download backup ${name}`, exact: true }),
     ).toBeVisible();
   }
 });
@@ -572,7 +695,7 @@ test("specific backups confirm exact targets and preserve unselected archives", 
   expect(attempted.every((item) => item.serverId === backups.id)).toBe(true);
   await expect(deletion).toBeDisabled();
   await expect(
-    page.getByRole("link", {
+    page.getByRole("button", {
       name: "Download backup Beta backup",
       exact: true,
     }),
@@ -870,7 +993,7 @@ test("Recycle Bin restores archive bytes and backup history without changing ser
   await page.getByRole("link", { name: "Backups", exact: true }).click();
   for (const backup of backups.backups)
     await expect(
-      page.getByRole("link", {
+      page.getByRole("button", {
         name: `Download backup ${backup.name}`,
         exact: true,
       }),
