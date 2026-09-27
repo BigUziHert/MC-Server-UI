@@ -264,7 +264,8 @@ export function createBrowserConnectionController({
   pollMs = 5000,
 }) {
   const home = new URL(origin).origin,
-    panels = new Map();
+    panels = new Map(),
+    drafts = new Map();
   let snapshot = {
       version: 1,
       revision: 0,
@@ -284,7 +285,7 @@ export function createBrowserConnectionController({
     !closed &&
     !panel.removed &&
     !panel.removing &&
-    panels.get(panel.id) === panel &&
+    (panels.get(panel.id) === panel || drafts.get(panel.id) === panel) &&
     panel.epoch === epoch;
   const requireCurrent = (panel, epoch) => {
     if (!current(panel, epoch))
@@ -298,6 +299,12 @@ export function createBrowserConnectionController({
     panel.requests.clear();
   };
   const apply = (next, raw) => {
+    for (const draft of drafts.values())
+      if (next.panels.some((panel) => panel.origin === draft.origin)) {
+        draft.removed = true;
+        invalidate(draft);
+        drafts.delete(draft.id);
+      }
     const keep = new Set(next.panels.map((item) => item.id));
     for (const panel of panels.values())
       if (!keep.has(panel.id)) {
@@ -381,7 +388,7 @@ export function createBrowserConnectionController({
   };
   const get = (id) => {
     sync();
-    const panel = panels.get(id);
+    const panel = panels.get(id) ?? drafts.get(id);
     if (!panel || panel.removed || panel.removing || closed)
       throw fail(404, "This saved panel is no longer available.");
     return panel;
@@ -391,6 +398,20 @@ export function createBrowserConnectionController({
     if (!entry) throw fail(404, "This saved panel is no longer available.");
     return entry;
   };
+  const describe = (panel) => ({
+    id: panel.id,
+    origin: panel.origin,
+    label: new URL(panel.origin).host,
+    local: false,
+    signedIn: Boolean(panel.token && panel.account),
+    session: panel.account,
+    sessionEpoch: panel.epoch,
+    pendingLeave: Boolean(panel.pendingLeave),
+    connectionState: panel.state,
+    servers: panel.servers,
+    ...(panel.temporary ? { temporary: true } : {}),
+    ...(panel.error ? { error: panel.error } : {}),
+  });
   const list = () => ({
     runtime: "browser",
     unified: true,
@@ -416,19 +437,7 @@ export function createBrowserConnectionController({
             },
           ]
         : []),
-      ...[...panels.values()].map((panel) => ({
-        id: panel.id,
-        origin: panel.origin,
-        label: new URL(panel.origin).host,
-        local: false,
-        signedIn: Boolean(panel.token && panel.account),
-        session: panel.account,
-        sessionEpoch: panel.epoch,
-        pendingLeave: Boolean(panel.pendingLeave),
-        connectionState: panel.state,
-        servers: panel.servers,
-        ...(panel.error ? { error: panel.error } : {}),
-      })),
+      ...[...panels.values()].map(describe),
     ],
   });
   async function remove(panel, epoch) {
@@ -477,7 +486,11 @@ export function createBrowserConnectionController({
     requireCurrent(panel, epoch);
     // This only consolidates the browser's representation of its own host.
     // An outstanding host leave operation must retain its durable retry proof.
-    if (!panel.pendingLeave) {
+    if (panel.temporary) {
+      panel.removed = true;
+      invalidate(panel);
+      drafts.delete(panel.id);
+    } else if (!panel.pendingLeave) {
       await commit(
         (next) => {
           const entry = updateRecord(next, panel.id);
@@ -634,6 +647,8 @@ export function createBrowserConnectionController({
           panel.nextRefresh = Date.now() + pollMs;
           return;
         }
+        if (panel.temporary)
+          throw fail(502, "Sign in to verify your account on this panel.");
         const session = browserSession(account),
           fleet = await json(panel, "/api/servers");
         requireCurrent(panel, epoch);
@@ -664,7 +679,7 @@ export function createBrowserConnectionController({
         if (panel.origin === home) homeCredential(panel.token);
       } catch (cause) {
         if (!current(panel, epoch)) return;
-        if (cause.status === 401 && !panel.pendingLeave) {
+        if (cause.status === 401 && !panel.pendingLeave && !panel.temporary) {
           if (cause.accessRevoked === true && panel.token) {
             await remove(panel, epoch);
             return;
@@ -877,7 +892,21 @@ export function createBrowserConnectionController({
       const session = browserSession(result);
       await commit(
         (next) => {
-          const entry = updateRecord(next, id);
+          let entry;
+          if (panel.temporary) {
+            if (next.panels.some((item) => item.origin === panel.origin))
+              throw fail(
+                409,
+                "This panel was saved in another tab. Use its saved connection to sign in.",
+              );
+            if (next.panels.length >= 50)
+              throw fail(
+                409,
+                "Remove a saved panel before adding another connection.",
+              );
+            entry = { id, origin: panel.origin };
+            next.panels.push(entry);
+          } else entry = updateRecord(next, id);
           entry.token = result.sessionToken;
           entry.session = identity(session);
           entry.epoch = newId();
@@ -903,28 +932,57 @@ export function createBrowserConnectionController({
     async open(input) {
       await initialize();
       if (!ready) throw fail(503, error);
+      sync();
       const target = originOf(input, home);
       let panel = [...panels.values()].find((item) => item.origin === target);
       if (!panel) {
-        await commit((next) => {
-          if (next.panels.some((item) => item.origin === target)) return;
-          if (next.panels.length >= 50)
-            throw fail(
-              409,
-              "Remove a saved panel before adding another connection.",
-            );
-          next.panels.push({
-            id: newId(),
-            origin: target,
-            epoch: newId(),
-            token: null,
-            servers: [],
-          });
-        });
-        panel = [...panels.values()].find((item) => item.origin === target);
+        if (panels.size >= 50 || drafts.size >= 50)
+          throw fail(
+            409,
+            "Close an unfinished sign-in or remove a saved panel before adding another connection.",
+          );
+        panel = {
+          id: newId(),
+          origin: target,
+          epoch: newId(),
+          token: null,
+          servers: [],
+          requests: new Set(),
+          state: "unavailable",
+          nextRefresh: 0,
+          controls: 0,
+          temporary: true,
+        };
+        drafts.set(panel.id, panel);
       }
-      await refresh(panel);
+      try {
+        await refresh(panel);
+      } catch (cause) {
+        if (panel.temporary) await bridge.cancelSignIn(panel.id);
+        throw cause;
+      }
+      if (panel.temporary) {
+        if (panel.removed || !drafts.has(panel.id)) return list();
+        if (panel.state !== "connected") {
+          await bridge.cancelSignIn(panel.id);
+          throw fail(
+            502,
+            panel.error ||
+              "The panel is unavailable. Check its address and try again.",
+          );
+        }
+        const result = list();
+        return { ...result, panels: [...result.panels, describe(panel)] };
+      }
       return list();
+    },
+    async cancelSignIn(id) {
+      const panel = drafts.get(id);
+      if (!panel) return;
+      panel.removed = true;
+      panel.controls++;
+      invalidate(panel);
+      drafts.delete(id);
     },
     signIn: (id, credentials) =>
       authenticate(id, "/api/access/login", {
@@ -1112,6 +1170,8 @@ export function createBrowserConnectionController({
     if (epochs.length !== 1 || epochs[0] !== panel.epoch)
       throw fail(409, "This panel sign-in changed. Reopen the operation.");
     if (panel.pendingLeave) throw fail(409, pendingMessage);
+    if (panel.temporary)
+      throw fail(401, "Finish signing in before using this panel.");
     if (!panel.token || !panel.account)
       throw fail(401, "Sign in to this panel before continuing.");
     if (panel.state !== "connected")
@@ -1240,7 +1300,9 @@ export function createBrowserConnectionController({
     async close() {
       closed = true;
       clearInterval(timer);
-      for (const panel of panels.values()) invalidate(panel);
+      for (const panel of [...panels.values(), ...drafts.values()])
+        invalidate(panel);
+      drafts.clear();
       await writing.catch(() => {});
     },
   };

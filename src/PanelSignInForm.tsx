@@ -1,4 +1,4 @@
-import { useId, useRef, useState, type FormEvent } from "react";
+import { useEffect, useId, useRef, useState, type FormEvent } from "react";
 import { Eye, EyeOff, LoaderCircle } from "lucide-react";
 import type { PanelConnections } from "./desktop-connections";
 
@@ -15,6 +15,16 @@ export default function PanelSignInForm({
 }) {
   const id = useId();
   const pending = useRef(false);
+  const mounted = useRef(true);
+  const busyChanged = useRef(onBusyChange);
+  busyChanged.current = onBusyChange;
+  useEffect(() => {
+    mounted.current = true;
+    return () => {
+      mounted.current = false;
+      if (pending.current) busyChanged.current?.(false);
+    };
+  }, []);
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [confirmation, setConfirmation] = useState("");
@@ -43,18 +53,22 @@ export default function PanelSignInForm({
         throw new Error("Update MC Panel to sign in from this workspace.");
       if (token) await bridge.acceptInvitation(panel.id, { token, password });
       else await bridge.signIn(panel.id, { email: email.trim(), password });
+      if (!mounted.current) return;
       setPassword("");
       setConfirmation("");
       window.dispatchEvent(new Event("mc-panel-connections-changed"));
       onComplete();
     } catch (cause) {
+      if (!mounted.current) return;
       setError(
         cause instanceof Error ? cause.message : "Sign-in failed. Try again.",
       );
     } finally {
       pending.current = false;
-      setBusy(false);
-      onBusyChange?.(false);
+      if (mounted.current) {
+        setBusy(false);
+        onBusyChange?.(false);
+      }
     }
   }
   return (

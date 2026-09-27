@@ -274,7 +274,105 @@ test("pending departure proof restores only from encrypted credentials and requi
     dataDir: h.root,
     safeStorage: { ...safeStorage, isEncryptionAvailable: () => false },
   });
-  await assert.rejects(unavailable.save({ panels: [savedPanel], selectedServer: null }), /retry proof could not be encrypted/);
+  await assert.rejects(
+    unavailable.save({ panels: [savedPanel], selectedServer: null }),
+    /retry proof could not be encrypted/,
+  );
   assert.equal(await fs.readFile(h.file, "utf8"), bytes);
   await unavailable.close();
+});
+
+test("promoting a new connection requires encryption and preserves the original file when secure storage is unavailable", async (t) => {
+  let available = true;
+  const h = await fixture(t, {
+    ...safeStorage,
+    isEncryptionAvailable: () => available,
+  });
+  const existing = panel({ token: undefined, session: undefined }),
+    draft = panel({ origin: "https://new.example.test" });
+  const prior = { panels: [existing], selectedServer: null };
+  await h.store.save(prior);
+  const original = await fs.readFile(h.file, "utf8"),
+    entries = await fs.readdir(h.root);
+  available = false;
+  await assert.rejects(
+    h.store.save({
+      panels: [existing, draft],
+      selectedServer: null,
+      requireCredentialFor: draft.id,
+    }),
+    /sign-in could not be encrypted and saved/,
+  );
+  assert.equal(await fs.readFile(h.file, "utf8"), original);
+  assert.deepEqual(await fs.readdir(h.root), entries);
+  assert.equal(original.includes(draft.origin), false);
+  // Existing unsigned entries retain their old save behavior.
+  await h.store.save(prior);
+  assert.equal(await fs.readFile(h.file, "utf8"), original);
+  available = true;
+  await h.store.save({
+    panels: [existing, draft],
+    selectedServer: null,
+    requireCredentialFor: draft.id,
+  });
+  const restored = await h.store.read();
+  assert.equal(
+    restored.panels.find((entry) => entry.id === draft.id).token,
+    token,
+  );
+});
+
+test("required promotion rejects missing or malformed credentials before writing an unsigned record", async (t) => {
+  const h = await fixture(t),
+    existing = panel(),
+    draft = panel({ origin: "https://new.example.test" });
+  await h.store.save({ panels: [existing], selectedServer: null });
+  const original = await fs.readFile(h.file, "utf8");
+  for (const changed of [
+    { ...draft, token: "invalid" },
+    { ...draft, session: null },
+    { ...draft, session: { ...account, email: "" } },
+  ]) {
+    await assert.rejects(
+      h.store.save({
+        panels: [existing, changed],
+        selectedServer: null,
+        requireCredentialFor: draft.id,
+      }),
+      /sign-in could not be encrypted and saved/,
+    );
+    assert.equal(await fs.readFile(h.file, "utf8"), original);
+  }
+  await assert.rejects(
+    h.store.save({
+      panels: [existing],
+      selectedServer: null,
+      requireCredentialFor: draft.id,
+    }),
+    /no longer available/,
+  );
+  assert.equal(await fs.readFile(h.file, "utf8"), original);
+});
+
+test("promotion rechecks secure storage when its queued save begins", async (t) => {
+  let available = true;
+  const h = await fixture(t, {
+    ...safeStorage,
+    isEncryptionAvailable: () => available,
+  });
+  const existing = panel(),
+    draft = panel({ origin: "https://new.example.test" }),
+    prior = { panels: [existing], selectedServer: null };
+  await h.store.save(prior);
+  const original = await fs.readFile(h.file, "utf8");
+  const queued = h.store.save({
+    panels: [existing, draft],
+    selectedServer: null,
+    requireCredentialFor: draft.id,
+  });
+  available = false;
+  await assert.rejects(queued, /sign-in could not be encrypted and saved/);
+  assert.equal(await fs.readFile(h.file, "utf8"), original);
+  available = true;
+  await h.store.save(prior);
 });

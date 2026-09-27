@@ -517,6 +517,9 @@ async function smoke() {
       [],
       "The gaming PC has no local servers",
     );
+    const browserConnectionsBeforeUpdates = await local.evaluate(() =>
+      localStorage.getItem("mc-panel.browser-connections.v1"),
+    );
     await remote
       .getByRole("button", { name: "App updates", exact: true })
       .click();
@@ -540,6 +543,13 @@ async function smoke() {
     assert.equal(
       await updater.evaluate(() => window.mcPanelConnections),
       undefined,
+    );
+    assert.equal(
+      await updater.evaluate(() =>
+        localStorage.getItem("mc-panel.browser-connections.v1"),
+      ),
+      browserConnectionsBeforeUpdates,
+      "Opening native updates must not create or change browser connections",
     );
     assert.deepEqual(
       await updater.evaluate(() => Object.keys(window.mcPanelUpdates)),

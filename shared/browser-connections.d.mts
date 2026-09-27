@@ -18,6 +18,7 @@ export type BrowserPanel = {
   sessionEpoch: string;
   session?: BrowserIdentity;
   pendingLeave?: boolean;
+  temporary?: boolean;
   servers: any[];
   error?: string;
 };
@@ -36,6 +37,7 @@ export type BrowserBridge = {
   unified: true;
   list(): Promise<BrowserSnapshot>;
   open(url: string): Promise<BrowserSnapshot>;
+  cancelSignIn(id: string): Promise<void>;
   signIn(
     id: string,
     input: { email: string; password: string },

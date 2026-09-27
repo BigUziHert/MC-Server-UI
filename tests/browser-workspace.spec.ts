@@ -110,6 +110,8 @@ async function fixture(
       );
     }
     if (["/api/access/login", "/api/access/accept"].includes(url.pathname)) {
+      if (request.postDataJSON()?.password === "wrong password")
+        return reply({ error: "Email or password is incorrect." }, 401);
       host.active = true;
       return reply({ ...session(url.origin), sessionToken: host.token });
     }
@@ -400,6 +402,148 @@ test("browser invitation opens shared Add Panel with its complete link", async (
   expect(
     calls.find((call) => call.path === "/api/access/accept")?.body,
   ).toEqual({ token: "i".repeat(43), password: "browser-password-123" });
+});
+
+test("browser verifies a new address without saving failed or cancelled sign-ins", async ({
+  page,
+}) => {
+  await fixture(page, "owner");
+  await page.goto("/");
+  let dialog = await manage(page);
+  const start = async () => {
+    await dialog
+      .getByRole("button", { name: "Sign in to existing panel", exact: true })
+      .click();
+    await dialog.getByLabel("Panel address", { exact: true }).fill(origins[0]);
+    await dialog
+      .getByRole("button", { name: "Continue to sign in", exact: true })
+      .click();
+    return dialog.getByRole("form", {
+      name: "Sign in on a.example.test",
+      exact: true,
+    });
+  };
+  const saved = () =>
+    page.evaluate(async () =>
+      (await window.mcPanelConnections!.list()).panels
+        .filter((panel) => !panel.local)
+        .map((panel) => panel.origin),
+    );
+  let form = await start();
+  await expect(form).toBeVisible();
+  await expect(dialog).toContainText("No saved panel connections");
+  await expect(dialog.locator(".panel-connections-list > li")).toHaveCount(0);
+  expect(await saved()).toEqual([]);
+  await form
+    .getByLabel("Email address", { exact: true })
+    .fill("member@example.test");
+  await form.getByLabel("Password", { exact: true }).fill("wrong password");
+  await form.getByRole("button", { name: "Sign in", exact: true }).click();
+  await expect(form.getByRole("alert")).toContainText("incorrect");
+  expect(await saved()).toEqual([]);
+  await dialog
+    .getByRole("button", { name: "Cancel sign-in", exact: true })
+    .click();
+  await expect(form).toHaveCount(0);
+  await dialog
+    .getByRole("button", { name: "Close panel connections", exact: true })
+    .click();
+  await page.reload();
+  expect(await saved()).toEqual([]);
+  dialog = await manage(page);
+  form = await start();
+  await expect(form.getByLabel("Password", { exact: true })).toHaveValue("");
+  await form
+    .getByLabel("Email address", { exact: true })
+    .fill("member@example.test");
+  await form.getByLabel("Password", { exact: true }).fill("wrong password");
+  await form.getByRole("button", { name: "Sign in", exact: true }).click();
+  await expect(form.getByRole("alert")).toContainText("incorrect");
+  await form
+    .getByLabel("Password", { exact: true })
+    .fill("browser-password-123");
+  await form.getByRole("button", { name: "Sign in", exact: true }).click();
+  await expect(
+    dialog.getByRole("button", {
+      name: "Sign out of a.example.test",
+      exact: true,
+    }),
+  ).toBeVisible();
+  expect(await saved()).toEqual([origins[0]]);
+  await expect(dialog.locator(".panel-connections-list > li")).toHaveCount(1);
+});
+
+test("an incoming browser invitation closes Manage Connections and discards its staged sign-in", async ({
+  page,
+}) => {
+  const ownerOrigin = "https://owner.example.test";
+  await page.route(`${ownerOrigin}/**`, async (route) => {
+    const url = new URL(route.request().url());
+    if (url.pathname.startsWith("/api/")) return route.fallback();
+    const response = await route.fetch({
+      url: `${home}${url.pathname}${url.search}`,
+    });
+    return route.fulfill({ response });
+  });
+  const { calls } = await fixture(page, "owner", ownerOrigin);
+  await page.goto(ownerOrigin);
+  const dialog = await manage(page);
+  await page.evaluate(() => {
+    const bridge = window.mcPanelConnections!;
+    const open = bridge.open;
+    bridge.open = async (url) => {
+      const result = await open(url);
+      (window as any).stagedPanelId = result.panels.find(
+        (panel) => panel.temporary,
+      )?.id;
+      return result;
+    };
+  });
+  await dialog
+    .getByRole("button", { name: "Sign in to existing panel", exact: true })
+    .click();
+  await dialog.getByLabel("Panel address", { exact: true }).fill(origins[0]);
+  await dialog
+    .getByRole("button", { name: "Continue to sign in", exact: true })
+    .click();
+  await dialog
+    .getByLabel("Password", { exact: true })
+    .fill("discard-this-password");
+  await page.evaluate(() => {
+    location.hash = `invite=${"i".repeat(43)}`;
+  });
+  const invitation = page.getByRole("dialog", {
+    name: "Add Panel",
+    exact: true,
+  });
+  await expect(invitation).toBeVisible();
+  await expect(dialog).toHaveCount(0);
+  await expect(page.locator("dialog[open]")).toHaveCount(1);
+  await expect(
+    invitation.getByLabel("Invitation link", { exact: true }),
+  ).toHaveValue(`${ownerOrigin}/#invite=${"i".repeat(43)}`);
+  const cancelled = await page.evaluate(async () => {
+    const id = (window as any).stagedPanelId;
+    if (!id) throw new Error("The sign-in did not stage a panel.");
+    try {
+      await window.mcPanelConnections!.signIn!(id, {
+        email: "test@example.test",
+        password: "wrong password",
+      });
+      return "accepted";
+    } catch (cause) {
+      return (cause as Error).message;
+    }
+  });
+  expect(cancelled).toContain("no longer available");
+  expect(calls.some((call) => call.path === "/api/access/login")).toBe(false);
+  await invitation
+    .getByRole("button", { name: "Close connection dialog", exact: true })
+    .click();
+  const reopened = await manage(page);
+  await expect(reopened).toContainText("No saved panel connections");
+  await expect(reopened.getByLabel("Password", { exact: true })).toHaveCount(0);
+  await expect(page.locator("dialog[open]")).toHaveCount(1);
 });
 
 test("browser combines colliding servers from two HTTPS panels and signs out only one", async ({

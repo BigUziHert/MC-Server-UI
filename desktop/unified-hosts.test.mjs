@@ -429,10 +429,11 @@ test("unified bridge preserves real host permissions and filesystem isolation ac
 
   // A host-side account revocation reaches the real gateway and removes only
   // that desktop connection, even when an API request discovers it first.
-  const savedAddress = (await controller.open(a.origin)).panels.find(
+  const unsignedAddress = (await controller.open(a.origin)).panels.find(
     (panel) => panel.origin === a.origin,
   );
-  assert.equal(savedAddress.signedIn, false);
+  assert.equal(unsignedAddress.signedIn, false);
+  assert.equal(unsignedAddress.temporary, true);
   await controller.selectServer(c.panelId, serverId);
   const cAccounts = await (await c.local("/panel-users")).json();
   const accountId = cAccounts.users.find(
@@ -453,7 +454,7 @@ test("unified bridge preserves real host permissions and filesystem isolation ac
   assert.equal(controller.list().selectedServer, null);
   assert.deepEqual(
     controller.list().panels.map((panel) => panel.id),
-    ["local", savedAddress.id],
+    ["local"],
   );
   assert.equal(
     c.fleet.runtimes.size,

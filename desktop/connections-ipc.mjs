@@ -62,6 +62,7 @@ export function installUnifiedConnectionIpc(ipcMain, controller) {
   const actions = [
     "list",
     "open",
+    "cancelSignIn",
     "signIn",
     "acceptInvitation",
     "signOut",
@@ -89,12 +90,20 @@ export function installUnifiedConnectionIpc(ipcMain, controller) {
         (typeof second !== "string" || second.length > 128)
       )
         throw new Error("Provide a valid server selection.");
-      if (action === "forget" &&
-          (typeof second !== "string" || !second || second.length > 128))
-        throw new Error("Confirm the signed-in account before forgetting this panel.");
-      if (action === "removeSavedConnection" &&
-          (typeof second !== "string" || !second || second.length > 128))
-        throw new Error("Confirm the current signed-out connection before removing it.");
+      if (
+        action === "forget" &&
+        (typeof second !== "string" || !second || second.length > 128)
+      )
+        throw new Error(
+          "Confirm the signed-in account before forgetting this panel.",
+        );
+      if (
+        action === "removeSavedConnection" &&
+        (typeof second !== "string" || !second || second.length > 128)
+      )
+        throw new Error(
+          "Confirm the current signed-out connection before removing it.",
+        );
       return controller[action](first, second);
     });
   }

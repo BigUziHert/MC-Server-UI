@@ -28,6 +28,8 @@ export type PanelConnections = {
     label: string;
     origin: string;
     local: boolean;
+    // An address verified for a sign-in form, not yet a saved connection.
+    temporary?: boolean;
     // A saved sign-in may remain true while offline. Cached roster rows never
     // authorize requests; live session metadata and permissions are rechecked.
     signedIn?: boolean;
@@ -79,6 +81,7 @@ declare global {
         panelId: string,
         input: { token: string; password: string },
       ) => Promise<PanelConnections>;
+      cancelSignIn?: (panelId: string) => Promise<void | PanelConnections>;
       signOut?: (panelId: string) => Promise<PanelConnections>;
       retry?: (panelId: string) => Promise<PanelConnections>;
       forget?: (

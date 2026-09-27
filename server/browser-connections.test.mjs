@@ -616,14 +616,15 @@ test("a foreign host claiming owner cannot create or replace the local owner pan
       ? response({ role: "owner" })
       : undefined,
   );
-  const snapshot = await f.controller.bridge.open(remote);
+  await assert.rejects(f.controller.bridge.open(remote), { status: 502 });
+  const snapshot = await f.controller.bridge.list();
   assert.equal(
     snapshot.panels.some((row) => row.local),
     false,
   );
   assert.equal(
-    snapshot.panels.find((row) => row.origin === remote).connectionState,
-    "unavailable",
+    snapshot.panels.some((row) => row.origin === remote),
+    false,
   );
   assert.equal(f.requests.at(-1).init.credentials, "omit");
   await assert.rejects(f.controller.bridge.selectServer("local", "server"), {
@@ -964,4 +965,221 @@ test("network completion latency does not double the configured refresh interval
   t.mock.timers.tick(1000);
   await flush();
   assert.equal(polls.length, 4);
+});
+
+test("new connections remain unsaved drafts until validated sign-in promotes the same ID", async (t) => {
+  const f = await fixture(t),
+    before = f.values.get(browserConnectionsKey),
+    opened = await f.controller.bridge.open(remote),
+    draft = opened.panels.find((row) => row.origin === remote);
+  assert.equal(draft.temporary, true);
+  assert.equal(draft.signedIn, false);
+  assert.equal(f.values.get(browserConnectionsKey), before);
+  assert.equal(
+    (await f.controller.bridge.list()).panels.some(
+      (row) => row.id === draft.id,
+    ),
+    false,
+  );
+  assert.equal(
+    (await (await f.boot()).bridge.list()).panels.some(
+      (row) => row.origin === remote,
+    ),
+    false,
+  );
+  await assert.rejects(f.controller.fetch(virtual(draft)), { status: 401 });
+  await assert.rejects(
+    f.controller.download(virtual(draft, "/files/download?path=world.zip")),
+    { status: 401 },
+  );
+  await assert.rejects(
+    f.controller.bridge.signIn(draft.id, {
+      email: "member@example.test",
+      password: "wrong",
+    }),
+    { status: 401 },
+  );
+  assert.equal(f.values.get(browserConnectionsKey), before);
+  const signedIn = await f.controller.bridge.signIn(draft.id, {
+    email: "member@example.test",
+    password: "correct password",
+  });
+  const saved = signedIn.panels.find((row) => row.id === draft.id);
+  assert.equal(saved.signedIn, true);
+  assert.equal(saved.temporary, undefined);
+  const persisted = f.values.get(browserConnectionsKey);
+  assert.equal(JSON.parse(persisted).panels[0].id, draft.id);
+  assert.equal(persisted.includes("correct password"), false);
+  await f.controller.bridge.cancelSignIn(draft.id);
+  assert.equal(
+    (await f.controller.bridge.list()).panels.some(
+      (row) => row.id === draft.id,
+    ),
+    true,
+  );
+});
+
+test("canceling a draft aborts pending authentication and cannot promote a late response", async (t) => {
+  const f = await fixture(t),
+    draft = (await f.controller.bridge.open(remote)).panels.find(
+      (row) => row.origin === remote,
+    );
+  let release, signal, notify;
+  const started = new Promise((resolve) => {
+    notify = resolve;
+  });
+  f.handler((url, init) => {
+    if (url.pathname !== "/api/access/accept") return;
+    signal = init.signal;
+    notify();
+    return new Promise((resolve) => {
+      release = () =>
+        resolve(response({ ...account(), sessionToken: "a".repeat(43) }));
+    });
+  });
+  const pending = f.controller.bridge.acceptInvitation(draft.id, {
+    token: "i".repeat(43),
+    password: "correct password",
+  });
+  const rejected = assert.rejects(pending, { status: 409 });
+  await started;
+  await f.controller.bridge.cancelSignIn(draft.id);
+  assert.equal(signal.aborted, true);
+  release();
+  await rejected;
+  assert.equal(
+    (await f.controller.bridge.list()).panels.some(
+      (row) => row.origin === remote,
+    ),
+    false,
+  );
+  assert.deepEqual(JSON.parse(f.values.get(browserConnectionsKey)).panels, []);
+  assert.equal(
+    f.requests.some((call) =>
+      /\/access\/(?:leave|logout)$/.test(call.url.pathname),
+    ),
+    false,
+  );
+});
+
+test("an unreachable new address and a failed draft credential save leave no saved connection", async (t) => {
+  const f = await fixture(t),
+    before = f.values.get(browserConnectionsKey);
+  f.handler((url) => {
+    if (url.origin === remote) throw new TypeError("offline");
+  });
+  await assert.rejects(f.controller.bridge.open(remote), /offline/);
+  assert.equal(f.values.get(browserConnectionsKey), before);
+  assert.equal(
+    (await f.controller.bridge.list()).panels.some(
+      (row) => row.origin === remote,
+    ),
+    false,
+  );
+  f.handler(undefined);
+  const draft = (await f.controller.bridge.open(remote)).panels.find(
+    (row) => row.origin === remote,
+  );
+  f.failStorage(true);
+  await assert.rejects(
+    f.controller.bridge.signIn(draft.id, {
+      email: "member@example.test",
+      password: "correct password",
+    }),
+    /could not be saved/,
+  );
+  assert.equal(f.values.get(browserConnectionsKey), before);
+  assert.equal(
+    (await f.controller.bridge.list()).panels.some(
+      (row) => row.origin === remote,
+    ),
+    false,
+  );
+  await assert.rejects(f.controller.fetch(virtual(draft)), { status: 401 });
+  await f.controller.bridge.cancelSignIn(draft.id);
+  await assert.rejects(
+    f.controller.bridge.signIn(draft.id, {
+      email: "member@example.test",
+      password: "correct password",
+    }),
+    { status: 404 },
+  );
+});
+
+test("canceling sign-in preserves an existing saved signed-out connection", async (t) => {
+  const f = await fixture(t),
+    saved = await f.connect();
+  await f.controller.bridge.signOut(saved.id);
+  const opened = await f.controller.bridge.open(remote),
+    signedOut = opened.panels.find((row) => row.id === saved.id);
+  assert.equal(signedOut.temporary, undefined);
+  await f.controller.bridge.cancelSignIn(signedOut.id);
+  assert.equal(
+    (await f.controller.bridge.list()).panels.some(
+      (row) => row.id === saved.id,
+    ),
+    true,
+  );
+  assert.equal(
+    JSON.parse(f.values.get(browserConnectionsKey)).panels[0].id,
+    saved.id,
+  );
+});
+
+test("a draft cannot replace another tab's newly authenticated saved account", async (t) => {
+  const f = await fixture(t),
+    other = await f.boot(),
+    draft = (await f.controller.bridge.open(remote)).panels.find(
+      (row) => row.origin === remote,
+    );
+  const saved = await f.connect(remote, other);
+  f.controller.storageChanged();
+  await assert.rejects(
+    f.controller.bridge.signIn(draft.id, {
+      email: "replacement@example.test",
+      password: "correct password",
+    }),
+    { status: 404 },
+  );
+  assert.deepEqual(
+    (await f.controller.bridge.list()).panels
+      .filter((row) => row.origin === remote)
+      .map((row) => row.id),
+    [saved.id],
+  );
+  assert.equal(
+    JSON.parse(f.values.get(browserConnectionsKey)).panels[0].session.email,
+    "member@example.test",
+  );
+});
+
+test("successful invitation acceptance saves the draft once without its password or invitation token", async (t) => {
+  const f = await fixture(t),
+    invitation = "i".repeat(43),
+    draft = (
+      await f.controller.bridge.open(`${remote}/#invite=${invitation}`)
+    ).panels.find((row) => row.origin === remote);
+  assert.equal(draft.temporary, true);
+  assert.deepEqual(JSON.parse(f.values.get(browserConnectionsKey)).panels, []);
+  const accepted = await f.controller.bridge.acceptInvitation(draft.id, {
+    token: invitation,
+    password: "correct password",
+  });
+  assert.equal(
+    accepted.panels.find((row) => row.id === draft.id).signedIn,
+    true,
+  );
+  const raw = f.values.get(browserConnectionsKey),
+    saved = JSON.parse(raw);
+  assert.equal(saved.panels.length, 1);
+  assert.equal(saved.panels[0].id, draft.id);
+  assert.equal(raw.includes(invitation), false);
+  assert.equal(raw.includes("correct password"), false);
+  await f.controller.bridge.cancelSignIn(draft.id);
+  assert.equal(
+    (await (await f.boot()).bridge.list()).panels.find(
+      (row) => row.id === draft.id,
+    ).signedIn,
+    true,
+  );
 });

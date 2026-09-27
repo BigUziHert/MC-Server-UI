@@ -10,7 +10,10 @@ import {
 } from "lucide-react";
 import { createPortal } from "react-dom";
 import { normalizePanelConnectionUrl } from "../shared/panel-connection.mjs";
-import { useDesktopConnections } from "./desktop-connections";
+import {
+  useDesktopConnections,
+  type PanelConnections as ConnectionsSnapshot,
+} from "./desktop-connections";
 import PanelSignInForm from "./PanelSignInForm";
 import { DesktopWorkspaceContext } from "./workspace-target";
 import "./panel-connections.css";
@@ -29,6 +32,20 @@ export default function PanelConnections({ onClose }: { onClose: () => void }) {
   const [addingExisting, setAddingExisting] = useState(false);
   const [address, setAddress] = useState("");
   const [signingIn, setSigningIn] = useState<string | null>(null);
+  const [temporaryPanel, setTemporaryPanel] = useState<
+    ConnectionsSnapshot["panels"][number] | null
+  >(null);
+  const temporaryId = useRef<string | null>(null);
+  function discardTemporary() {
+    const id = temporaryId.current;
+    temporaryId.current = null;
+    if (id) void window.mcPanelConnections?.cancelSignIn?.(id).catch(() => {});
+  }
+  function cancelSignIn() {
+    discardTemporary();
+    setTemporaryPanel(null);
+    setSigningIn(null);
+  }
   const [signingOut, setSigningOut] = useState<{
     id: string;
     label: string;
@@ -42,7 +59,9 @@ export default function PanelConnections({ onClose }: { onClose: () => void }) {
     accountId?: string;
     email?: string;
   } | null>(null);
-  const panels = connections?.panels.filter((panel) => !panel.local) ?? [];
+  const panels =
+    connections?.panels.filter((panel) => !panel.local && !panel.temporary) ??
+    [];
   const forgettingPanel = panels.find((panel) => panel.id === forget?.id);
   const removingSaved = unified && forget?.mode === "saved";
   const pendingLeave =
@@ -88,6 +107,7 @@ export default function PanelConnections({ onClose }: { onClose: () => void }) {
     element?.showModal();
     return () => {
       mounted.current = false;
+      discardTemporary();
       element?.close();
       if (previous?.isConnected) previous.focus();
     };
@@ -154,12 +174,20 @@ export default function PanelConnections({ onClose }: { onClose: () => void }) {
     setBusy("existing-panel-address");
     try {
       const result = await window.mcPanelConnections!.open(url);
-      if (!mounted.current) return;
-      window.dispatchEvent(new Event("mc-panel-connections-changed"));
       const panel = result.panels.find(
         (item) => !item.local && item.origin === new URL(url).origin,
       );
-      if (!panel) throw new Error("The saved panel is unavailable. Try again.");
+      if (!mounted.current) {
+        if (panel?.temporary)
+          void window.mcPanelConnections
+            ?.cancelSignIn?.(panel.id)
+            .catch(() => {});
+        return;
+      }
+      if (panel?.temporary) temporaryId.current = panel.id;
+      window.dispatchEvent(new Event("mc-panel-connections-changed"));
+      if (!panel)
+        throw new Error("The panel could not be verified. Try again.");
       if (panel.pendingLeave)
         throw new Error(
           "Finish Retry Forget for this panel before signing in again.",
@@ -167,7 +195,7 @@ export default function PanelConnections({ onClose }: { onClose: () => void }) {
       if (panel.connectionState !== "connected")
         throw new Error(
           panel.error ||
-            "The panel is unavailable. Its address is saved; use Retry when the host is reachable.",
+            "The panel is unavailable. Check its address and try again when the host is reachable.",
         );
       setAddingExisting(false);
       setAddress("");
@@ -176,8 +204,12 @@ export default function PanelConnections({ onClose }: { onClose: () => void }) {
         setNotice(
           `You are already signed in to ${panel.origin}. Use its saved connection below.`,
         );
-      } else setSigningIn(panel.id);
+      } else {
+        setTemporaryPanel(panel.temporary ? panel : null);
+        setSigningIn(panel.id);
+      }
     } catch (cause) {
+      discardTemporary();
       if (mounted.current)
         setError(
           cause instanceof Error
@@ -204,7 +236,7 @@ export default function PanelConnections({ onClose }: { onClose: () => void }) {
           setAddingExisting(false);
           setAddress("");
           setError("");
-        } else if (signingIn) setSigningIn(null);
+        } else if (signingIn) cancelSignIn();
         else onClose();
       }}
     >
@@ -367,6 +399,7 @@ export default function PanelConnections({ onClose }: { onClose: () => void }) {
               : "Open a saved panel or forget its sign-in on this computer. Unavailable and signed-out panels remain here for retry."}
           </p>
           {unified &&
+            !temporaryPanel &&
             (addingExisting ? (
               <div className="panel-connections-signin">
                 <form
@@ -400,8 +433,8 @@ export default function PanelConnections({ onClose }: { onClose: () => void }) {
                   />
                   <small>
                     Use the panel address, which is separate from the address
-                    used to join Minecraft. Continuing saves this connection on
-                    this computer.
+                    used to join Minecraft. The connection is saved after you
+                    sign in successfully.
                   </small>
                   <div className="panel-connections-actions">
                     <button
@@ -433,7 +466,7 @@ export default function PanelConnections({ onClose }: { onClose: () => void }) {
                 disabled={Boolean(busy)}
                 onClick={() => {
                   setAddingExisting(true);
-                  setSigningIn(null);
+                  cancelSignIn();
                   setAddress("");
                   setError("");
                   setNotice("");
@@ -443,6 +476,32 @@ export default function PanelConnections({ onClose }: { onClose: () => void }) {
                 Sign in to existing panel
               </button>
             ))}
+          {temporaryPanel && signingIn === temporaryPanel.id && (
+            <div className="panel-connections-signin">
+              <h3>Sign in to {temporaryPanel.label}</h3>
+              <p>Sign in to save this panel connection.</p>
+              <PanelSignInForm
+                key={temporaryPanel.id}
+                panel={temporaryPanel}
+                onComplete={() => {
+                  temporaryId.current = null;
+                  setTemporaryPanel(null);
+                  setSigningIn(null);
+                }}
+                onBusyChange={(value) => {
+                  pending.current = value;
+                  setBusy(value ? temporaryPanel.id : null);
+                }}
+              />
+              <button
+                className="btn"
+                disabled={Boolean(busy)}
+                onClick={cancelSignIn}
+              >
+                Cancel sign-in
+              </button>
+            </div>
+          )}
           {notice && <p role="status">{notice}</p>}
           {!connections ? (
             <p role="status">Loading connections…</p>
@@ -528,6 +587,7 @@ export default function PanelConnections({ onClose }: { onClose: () => void }) {
                             disabled={Boolean(busy)}
                             aria-label={`Sign in to ${panel.label}`}
                             onClick={() => {
+                              cancelSignIn();
                               setSigningIn(panel.id);
                               setAddingExisting(false);
                               setAddress("");
@@ -547,6 +607,7 @@ export default function PanelConnections({ onClose }: { onClose: () => void }) {
                             disabled={Boolean(busy)}
                             aria-label={`Sign out of ${panel.label}`}
                             onClick={() => {
+                              cancelSignIn();
                               setSigningOut({
                                 id: panel.id,
                                 label: panel.label,
@@ -563,6 +624,7 @@ export default function PanelConnections({ onClose }: { onClose: () => void }) {
                         disabled={Boolean(busy)}
                         aria-label={`${removeSaved ? "Remove saved connection to" : unified && panel.pendingLeave ? "Retry Forget" : "Forget"} ${panel.label}`}
                         onClick={() => {
+                          cancelSignIn();
                           setForget({
                             id: panel.id,
                             label: panel.label,
@@ -599,7 +661,7 @@ export default function PanelConnections({ onClose }: { onClose: () => void }) {
                           <button
                             className="btn"
                             disabled={Boolean(busy)}
-                            onClick={() => setSigningIn(null)}
+                            onClick={cancelSignIn}
                           >
                             Cancel sign-in
                           </button>

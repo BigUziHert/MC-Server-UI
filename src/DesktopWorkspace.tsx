@@ -103,6 +103,7 @@ export default function DesktopWorkspace() {
     const openInvitation = () => {
       if (!new URLSearchParams(window.location.hash.slice(1)).has("invite"))
         return;
+      setManagingConnections(false);
       setInvitationUrl(window.location.href);
       setConnection("invitation");
     };

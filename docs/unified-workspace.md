@@ -21,6 +21,8 @@ Uploads use the selected host's direct API. Icons are authenticated, bounded PNG
 
 Browser connections and desktop connections have independent session stores. Update both the workspace assets and destination hosts to use cross-panel browser connections. Native startup, tray, and update controls depend on the actual host's capabilities; the common server and account interface does not depend on the runtime.
 
+New addresses are temporary sign-in attempts. `open` returns a temporary target to the requesting form while normal connection snapshots, selectors, and persistent storage exclude it. Verified authentication promotes that same target into the saved workspace. Cancellation invalidates pending authentication and drops temporary transport state; native certificate trust remains in memory until successful credential persistence. Existing saved signed-out connections keep their normal retry and removal behavior. The standalone native update window does not initialize browser connections.
+
 ## Workspace state
 
 Server selection persists as the panel/server tuple. Remote Properties drafts and transfer/recovery state belong to a panel session; identical server IDs on other computers cannot reuse them. Signing out clears only that session's state. Remote Launchpad preferences include stable panel, account, and server identity. App settings, desktop updates, and startup remain local.

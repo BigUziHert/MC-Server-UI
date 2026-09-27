@@ -35,6 +35,12 @@ export default function ConnectPanel({
   const addressInput = useRef<HTMLInputElement>(null);
   const active = useRef(true);
   const pending = useRef(false);
+  const temporaryId = useRef<string | null>(null);
+  function discardTemporary() {
+    const id = temporaryId.current;
+    temporaryId.current = null;
+    if (id) void window.mcPanelConnections?.cancelSignIn?.(id).catch(() => {});
+  }
   const [mode, setMode] = useState<ConnectionMode>(
     unified ? "invitation" : initialMode,
   );
@@ -53,6 +59,7 @@ export default function ConnectPanel({
     addressInput.current?.focus();
     return () => {
       active.current = false;
+      discardTemporary();
       element?.close();
       if (previous?.isConnected) previous.focus();
     };
@@ -85,15 +92,24 @@ export default function ConnectPanel({
     try {
       if (window.mcPanelConnections) {
         const result = await window.mcPanelConnections.open(url);
+        const openedPanel = result.panels.find(
+          (item) => !item.local && item.origin === new URL(url).origin,
+        );
+        if (!active.current) {
+          if (openedPanel?.temporary)
+            void window.mcPanelConnections
+              .cancelSignIn?.(openedPanel.id)
+              .catch(() => {});
+          return;
+        }
         if (active.current) {
           if (window.mcPanelConnections.unified) {
-            const panel = result.panels.find(
-              (item) => !item.local && item.origin === new URL(url).origin,
-            );
+            const panel = openedPanel;
             if (!panel)
               throw new Error(
-                "The saved connection is unavailable. Open Manage Connections and retry.",
+                "The panel could not be verified. Check its address and try again.",
               );
+            temporaryId.current = panel.temporary ? panel.id : null;
             if (panel.pendingLeave)
               throw new Error(
                 "Finish Retry Forget in Manage Connections before adding this panel again.",
@@ -190,6 +206,7 @@ export default function ConnectPanel({
               type="button"
               disabled={busy}
               onClick={() => {
+                discardTemporary();
                 setTarget(null);
                 setError("");
               }}

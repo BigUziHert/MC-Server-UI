@@ -259,23 +259,54 @@ async function smoke() {
       await page.evaluate(() => window.mcPanelConnections.unified),
       true,
     );
+    const draft = (
+      await page.evaluate(
+        (origin) => window.mcPanelConnections.open(origin),
+        servers[0].origin,
+      )
+    ).panels.find((panel) => panel.origin === servers[0].origin);
+    assert.equal(draft.temporary, true);
+    assert.equal(
+      (await page.evaluate(() => window.mcPanelConnections.list())).panels.some(
+        (panel) => panel.id === draft.id,
+      ),
+      false,
+    );
+    const beforeSignIn = await fs
+      .readFile(path.join(root, "data", "desktop-workspace.json"), "utf8")
+      .then(JSON.parse)
+      .catch((cause) => {
+        if (cause.code === "ENOENT") return { panels: [] };
+        throw cause;
+      });
+    assert.equal(
+      beforeSignIn.panels.some((panel) => panel.origin === servers[0].origin),
+      false,
+    );
+    await page.evaluate(
+      (id) => window.mcPanelConnections.cancelSignIn(id),
+      draft.id,
+    );
+    assert.equal(
+      (await application.evaluate(() => globalThis.__unifiedSmoke.inspect()))
+        .prompts,
+      1,
+    );
     for (let index = 0; index < servers.length; index++) {
       const origin = servers[index].origin;
-      await page.evaluate(
+      const opened = await page.evaluate(
         (origin) => window.mcPanelConnections.open(origin),
         origin,
       );
+      const temporary = opened.panels.find((panel) => panel.origin === origin);
       await page.evaluate(
-        async ({ origin, email }) => {
-          const panel = (await window.mcPanelConnections.list()).panels.find(
-            (panel) => panel.origin === origin,
-          );
-          await window.mcPanelConnections.signIn(panel.id, {
+        async ({ id, email }) => {
+          await window.mcPanelConnections.signIn(id, {
             email,
             password: "fixture-password",
           });
         },
-        { origin, email: `${index ? "c" : "a"}@example.test` },
+        { id: temporary.id, email: `${index ? "c" : "a"}@example.test` },
       );
     }
     const snapshot = await page.evaluate(() =>
@@ -354,7 +385,7 @@ async function smoke() {
     assert.equal(state.windows, 1);
     assert.equal(state.childViews, 0);
     assert.equal(new URL(page.url()).origin, state.localOrigin);
-    assert.equal(state.prompts, 2);
+    assert.equal(state.prompts, 3);
     assert.ok(
       state.encryption,
       "Native safeStorage must encrypt persisted credentials",
@@ -405,7 +436,10 @@ async function smoke() {
       const panel = (await window.mcPanelConnections.list()).panels.find(
         (entry) => entry.id === id,
       );
-      await window.mcPanelConnections.removeSavedConnection(id, panel.sessionEpoch);
+      await window.mcPanelConnections.removeSavedConnection(
+        id,
+        panel.sessionEpoch,
+      );
     }, a.id);
     assert.equal(
       (await page.evaluate(() => window.mcPanelConnections.list())).panels.some(
@@ -414,7 +448,10 @@ async function smoke() {
       false,
     );
     assert.ok(
-      !requests.some((request) => request.host === "a" && request.path === "/api/access/leave"),
+      !requests.some(
+        (request) =>
+          request.host === "a" && request.path === "/api/access/leave",
+      ),
       "Removing a signed-out address never deletes a host account",
     );
     assert.equal(
@@ -423,12 +460,22 @@ async function smoke() {
       ).signedIn,
       true,
     );
-    await page.evaluate((id) => window.mcPanelConnections.forget(id, "c"), c.id);
+    await page.evaluate(
+      (id) => window.mcPanelConnections.forget(id, "c"),
+      c.id,
+    );
     assert.equal(
-      (await page.evaluate(() => window.mcPanelConnections.list())).panels.some((panel) => panel.id === c.id),
+      (await page.evaluate(() => window.mcPanelConnections.list())).panels.some(
+        (panel) => panel.id === c.id,
+      ),
       false,
     );
-    assert.ok(requests.some((request) => request.host === "c" && request.path === "/api/access/leave"));
+    assert.ok(
+      requests.some(
+        (request) =>
+          request.host === "c" && request.path === "/api/access/leave",
+      ),
+    );
     assert.ok(
       !requests.some((request) => request.path.includes("power")),
       "Switching/signing out/restarting the client must not stop a remote server",

@@ -7,12 +7,14 @@ if (process.isMainFrame) {
     unified: true,
     list: () => invoke("list"),
     open: (url) => invoke("open", url),
+    cancelSignIn: (panelId) => invoke("cancelSignIn", panelId),
     signIn: (panelId, credentials) => invoke("signIn", panelId, credentials),
     acceptInvitation: (panelId, credentials) =>
       invoke("acceptInvitation", panelId, credentials),
     signOut: (panelId) => invoke("signOut", panelId),
     retry: (panelId) => invoke("retry", panelId),
-    forget: (panelId, expectedAccountId) => invoke("forget", panelId, expectedAccountId),
+    forget: (panelId, expectedAccountId) =>
+      invoke("forget", panelId, expectedAccountId),
     removeSavedConnection: (panelId, expectedEpoch) =>
       invoke("removeSavedConnection", panelId, expectedEpoch),
     selectServer: (panelId, serverId) =>
