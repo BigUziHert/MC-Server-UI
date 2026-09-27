@@ -179,6 +179,21 @@ async function workspace(page: Page, offline = false, noSavedPanels = false) {
           changed();
           return snapshot();
         },
+        removeSavedConnection: async (id: string, expectedEpoch: string) => {
+          calls.push({ action: "removeSavedConnection", id, expectedEpoch });
+          const panel = find(id);
+          if (
+            !expectedEpoch ||
+            panel.sessionEpoch !== expectedEpoch ||
+            panel.signedIn ||
+            panel.pendingLeave
+          )
+            throw new Error("This connection changed. Confirm removal again.");
+          state.panels = state.panels.filter((item: any) => item.id !== id);
+          if (state.selectedServer?.panelId === id) state.selectedServer = null;
+          changed();
+          return snapshot();
+        },
         selectServer: async (panelId: string, serverId: string) => {
           calls.push({ action: "selectServer", panelId, serverId });
           state.selectedServer = { panelId, serverId };
@@ -446,11 +461,13 @@ test("unified connection manager signs in and out independently without replacin
   await expect(dialog.getByRole("button", { name: /^Open / })).toHaveCount(0);
   await expect(
     dialog.getByRole("button", {
-      name: "Forget c.example.test:3002",
+      name: "Remove saved connection to c.example.test:3002",
       exact: true,
     }),
-  ).toBeDisabled();
-  await expect(dialog).toContainText("Sign in before forgetting this panel");
+  ).toBeEnabled();
+  await expect(dialog).not.toContainText(
+    "Sign in before forgetting this panel",
+  );
   await dialog
     .getByRole("button", {
       name: "Sign in to c.example.test:3002",
@@ -525,6 +542,240 @@ test("unified connection manager signs in and out independently without replacin
   ]);
 });
 
+test("automatic access revocation removes its saved panel and sidebar group while Manage Connections stays open", async ({
+  page,
+}) => {
+  await workspace(page);
+  const dialog = await manage(page);
+  await expect(
+    dialog.getByRole("button", {
+      name: "Forget a.example.test:3002",
+      exact: true,
+    }),
+  ).toBeVisible();
+  await expect(
+    page.getByRole("list", {
+      name: "Servers on a.example.test:3002",
+      exact: true,
+      includeHidden: true,
+    }),
+  ).toHaveCount(1);
+  await page.evaluate(() => {
+    const fixture = (window as any).unifiedFixture;
+    fixture.state.panels = fixture.state.panels.filter(
+      (panel: any) => panel.id !== "computer-a",
+    );
+    fixture.changed();
+  });
+  await expect(dialog).toBeVisible();
+  await expect(
+    dialog.getByRole("button", {
+      name: "Forget a.example.test:3002",
+      exact: true,
+    }),
+  ).toHaveCount(0);
+  await expect(
+    page.getByRole("list", {
+      name: "Servers on a.example.test:3002",
+      exact: true,
+      includeHidden: true,
+    }),
+  ).toHaveCount(0);
+  await expect(
+    dialog.getByRole("button", {
+      name: "Sign in to c.example.test:3002",
+      exact: true,
+    }),
+  ).toBeVisible();
+  await expect(
+    page.getByRole("list", {
+      name: "Servers on this computer",
+      exact: true,
+      includeHidden: true,
+    }),
+  ).toHaveCount(1);
+  expect(
+    await page.evaluate(() => (window as any).unifiedFixture.calls),
+  ).toEqual([]);
+});
+
+for (const connection of ["connected", "unavailable", "unverified"]) {
+  test(`a ${connection} signed-out panel can be removed locally without signing in or leaving its host account`, async ({
+    page,
+  }) => {
+    await workspace(page);
+    const originalUrl = page.url();
+    const unchanged = await page.evaluate((connection) => {
+      const fixture = (window as any).unifiedFixture;
+      const panel = fixture.state.panels.find(
+        (item: any) => item.id === "computer-c",
+      );
+      panel.connectionState =
+        connection === "unavailable" ? "unavailable" : "connected";
+      if (connection === "unverified") panel.signedIn = undefined;
+      fixture.changed();
+      return fixture.state.panels.filter((item: any) => item.id !== panel.id);
+    }, connection);
+    const dialog = await manage(page);
+    const removeRow = dialog.getByRole("button", {
+      name: "Remove saved connection to c.example.test:3002",
+      exact: true,
+    });
+    await removeRow.click();
+    await expect(
+      dialog.getByRole("heading", {
+        name: "Remove saved connection to c.example.test:3002?",
+        exact: true,
+      }),
+    ).toBeVisible();
+    await expect(dialog).toContainText(
+      "this computer's saved connection and certificate trust",
+    );
+    await expect(dialog).toContainText(
+      "Accounts, permissions, and Minecraft servers on the host stay unchanged",
+    );
+    await expect(dialog).not.toContainText("signed out on all devices");
+    await expect(
+      dialog.getByRole("button", { name: "Cancel", exact: true }),
+    ).toBeFocused();
+    await page.keyboard.press("Escape");
+    await expect(removeRow).toBeVisible();
+    expect(
+      await page.evaluate(() => (window as any).unifiedFixture.calls),
+    ).toEqual([]);
+    await removeRow.click();
+    await dialog
+      .getByRole("button", {
+        name: "Remove saved connection",
+        exact: true,
+      })
+      .click();
+    await expect(dialog).toBeVisible();
+    await expect(removeRow).toHaveCount(0);
+    await expect(
+      dialog.getByRole("button", {
+        name: "Forget a.example.test:3002",
+        exact: true,
+      }),
+    ).toBeVisible();
+    expect(
+      await page.evaluate(() => (window as any).unifiedFixture.calls),
+    ).toEqual([
+      {
+        action: "removeSavedConnection",
+        id: "computer-c",
+        expectedEpoch: "c-1",
+      },
+    ]);
+    expect(
+      await page.evaluate(() => (window as any).unifiedFixture.state.panels),
+    ).toEqual(unchanged);
+    expect(
+      await page.evaluate(
+        () => (window as any).unifiedFixture.state.selectedServer,
+      ),
+    ).toEqual({
+      panelId: "local",
+      serverId: "local-id",
+    });
+    expect(page.url()).toBe(originalUrl);
+  });
+}
+
+for (const change of ["sign-in", "session-epoch", "pending-leave"]) {
+  test(`saved-connection removal cannot follow a ${change} change while confirmation is open`, async ({
+    page,
+  }) => {
+    await workspace(page);
+    const dialog = await manage(page);
+    await dialog
+      .getByRole("button", {
+        name: "Remove saved connection to c.example.test:3002",
+        exact: true,
+      })
+      .click();
+    await page.evaluate((change) => {
+      const fixture = (window as any).unifiedFixture;
+      const panel = fixture.state.panels.find(
+        (item: any) => item.id === "computer-c",
+      );
+      if (change === "sign-in") {
+        panel.signedIn = true;
+        panel.session = {
+          role: "subuser",
+          accountId: "replacement",
+          userId: "replacement",
+          email: "replacement@example.test",
+          serverId: null,
+          permissions: [],
+          hostPermissions: [],
+        };
+      } else if (change === "session-epoch")
+        panel.sessionEpoch = "c-replacement";
+      else panel.pendingLeave = true;
+      fixture.changed();
+    }, change);
+    await expect(dialog.getByRole("alert")).toContainText(
+      change === "pending-leave"
+        ? "Account removal is pending"
+        : "This connection changed",
+    );
+    await expect(
+      dialog.getByRole("button", {
+        name: "Remove saved connection",
+        exact: true,
+      }),
+    ).toBeDisabled();
+    await expect(
+      dialog.getByRole("button", { name: "Forget connection", exact: true }),
+    ).toHaveCount(0);
+    expect(
+      await page.evaluate(() => (window as any).unifiedFixture.calls),
+    ).toEqual([]);
+    await dialog.getByRole("button", { name: "Cancel", exact: true }).click();
+    if (change === "pending-leave") {
+      await expect(
+        dialog.getByRole("button", {
+          name: "Remove saved connection to c.example.test:3002",
+          exact: true,
+        }),
+      ).toHaveCount(0);
+      await expect(
+        dialog.getByRole("button", {
+          name: "Retry Forget c.example.test:3002",
+          exact: true,
+        }),
+      ).toBeVisible();
+    } else if (change === "session-epoch") {
+      await dialog
+        .getByRole("button", {
+          name: "Remove saved connection to c.example.test:3002",
+          exact: true,
+        })
+        .click();
+      await dialog
+        .getByRole("button", { name: "Remove saved connection", exact: true })
+        .click();
+      expect(
+        await page.evaluate(() => (window as any).unifiedFixture.calls),
+      ).toEqual([
+        {
+          action: "removeSavedConnection",
+          id: "computer-c",
+          expectedEpoch: "c-replacement",
+        },
+      ]);
+    } else {
+      await expect(
+        dialog.getByRole("button", {
+          name: "Forget c.example.test:3002",
+          exact: true,
+        }),
+      ).toBeVisible();
+    }
+  });
+}
+
 test("unified Forget confirms whole-panel removal and retains an offline request for retry", async ({
   page,
 }) => {
@@ -597,6 +848,12 @@ test("unified Forget confirms whole-panel removal and retains an offline request
   await expect(
     dialog.getByRole("button", {
       name: "Retry a.example.test:3002",
+      exact: true,
+    }),
+  ).toHaveCount(0);
+  await expect(
+    dialog.getByRole("button", {
+      name: "Remove saved connection to a.example.test:3002",
       exact: true,
     }),
   ).toHaveCount(0);

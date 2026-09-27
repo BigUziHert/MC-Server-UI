@@ -37,12 +37,16 @@ export default function PanelConnections({ onClose }: { onClose: () => void }) {
   const [forget, setForget] = useState<{
     id: string;
     label: string;
+    mode: "account" | "saved";
+    sessionEpoch?: string;
     accountId?: string;
     email?: string;
   } | null>(null);
   const panels = connections?.panels.filter((panel) => !panel.local) ?? [];
   const forgettingPanel = panels.find((panel) => panel.id === forget?.id);
-  const pendingLeave = unified && forgettingPanel?.pendingLeave === true;
+  const removingSaved = unified && forget?.mode === "saved";
+  const pendingLeave =
+    unified && !removingSaved && forgettingPanel?.pendingLeave === true;
   const sameAccount =
     !unified ||
     Boolean(
@@ -51,9 +55,16 @@ export default function PanelConnections({ onClose }: { onClose: () => void }) {
       forget?.accountId ===
         (forgettingPanel.session?.accountId ?? forgettingPanel.session?.userId),
     );
-  const canForget =
-    sameAccount &&
-    (!unified || forgettingPanel?.signedIn === true || pendingLeave);
+  const canForget = removingSaved
+    ? Boolean(
+        forgettingPanel &&
+        !forgettingPanel.signedIn &&
+        !forgettingPanel.pendingLeave &&
+        forget?.sessionEpoch &&
+        forget.sessionEpoch === forgettingPanel.sessionEpoch,
+      )
+    : sameAccount &&
+      (!unified || forgettingPanel?.signedIn === true || pendingLeave);
   useEffect(() => {
     if (!unified) return;
     if (
@@ -90,8 +101,11 @@ export default function PanelConnections({ onClose }: { onClose: () => void }) {
     try {
       const bridge = window.mcPanelConnections!;
       if (unified) {
-        if (action === "forget") await bridge.forget!(id, forget?.accountId);
-        else if (action === "signOut") await bridge.signOut!(id);
+        if (action === "forget") {
+          if (removingSaved)
+            await bridge.removeSavedConnection!(id, forget!.sessionEpoch!);
+          else await bridge.forget!(id, forget?.accountId);
+        } else if (action === "signOut") await bridge.signOut!(id);
         else await bridge.retry!(id);
       } else if (action === "forget") await bridge.disconnect(id);
       else await bridge.activate(id);
@@ -241,8 +255,31 @@ export default function PanelConnections({ onClose }: { onClose: () => void }) {
         </>
       ) : forget ? (
         <>
-          <h3>Forget {forget.label}?</h3>
-          {unified ? (
+          <h3>
+            {removingSaved ? "Remove saved connection to" : "Forget"}{" "}
+            {forget.label}?
+          </h3>
+          {removingSaved ? (
+            <>
+              <p>
+                This removes this computer's saved connection and certificate
+                trust for <strong>{forget.label}</strong>. Accounts,
+                permissions, and Minecraft servers on the host stay unchanged.
+                Other saved panels remain connected.
+              </p>
+              <p>
+                To connect again, enter the panel address and sign in, or accept
+                a new invitation if your access was revoked.
+              </p>
+              {!canForget && (
+                <p role="alert">
+                  {forgettingPanel?.pendingLeave
+                    ? "Account removal is pending. Return to Manage Connections and use Retry Forget."
+                    : "This connection changed. Return to Manage Connections and confirm removal again."}
+                </p>
+              )}
+            </>
+          ) : unified ? (
             <>
               <p>
                 This permanently removes your account
@@ -314,7 +351,11 @@ export default function PanelConnections({ onClose }: { onClose: () => void }) {
               ) : (
                 <Trash2 size={16} />
               )}{" "}
-              {pendingLeave ? "Retry Forget" : "Forget connection"}
+              {removingSaved
+                ? "Remove saved connection"
+                : pendingLeave
+                  ? "Retry Forget"
+                  : "Forget connection"}
             </button>
           </div>
         </>
@@ -411,6 +452,8 @@ export default function PanelConnections({ onClose }: { onClose: () => void }) {
             <ul className="panel-connections-list">
               {panels.map((panel) => {
                 const unavailable = panel.connectionState === "unavailable";
+                const removeSaved =
+                  unified && !panel.signedIn && !panel.pendingLeave;
                 const status =
                   unified && panel.pendingLeave
                     ? "Forget incomplete — Retry Forget"
@@ -439,12 +482,6 @@ export default function PanelConnections({ onClose }: { onClose: () => void }) {
                         </small>
                         {unified && panel.session?.email && (
                           <small>{panel.session.email}</small>
-                        )}
-                        {unified && !panel.signedIn && !panel.pendingLeave && (
-                          <small>
-                            Sign in before forgetting this panel and removing
-                            your account access.
-                          </small>
                         )}
                         {unified && panel.error && (
                           <small className="form-error" role="alert">
@@ -523,20 +560,14 @@ export default function PanelConnections({ onClose }: { onClose: () => void }) {
                         )}
                       <button
                         className="btn"
-                        disabled={
-                          Boolean(busy) ||
-                          (unified && !panel.signedIn && !panel.pendingLeave)
-                        }
-                        title={
-                          unified && !panel.signedIn && !panel.pendingLeave
-                            ? "Sign in before forgetting this panel"
-                            : undefined
-                        }
-                        aria-label={`${unified && panel.pendingLeave ? "Retry Forget" : "Forget"} ${panel.label}`}
+                        disabled={Boolean(busy)}
+                        aria-label={`${removeSaved ? "Remove saved connection to" : unified && panel.pendingLeave ? "Retry Forget" : "Forget"} ${panel.label}`}
                         onClick={() => {
                           setForget({
                             id: panel.id,
                             label: panel.label,
+                            mode: removeSaved ? "saved" : "account",
+                            sessionEpoch: panel.sessionEpoch,
                             accountId:
                               panel.session?.accountId ?? panel.session?.userId,
                             email: panel.session?.email,
@@ -545,9 +576,11 @@ export default function PanelConnections({ onClose }: { onClose: () => void }) {
                         }}
                       >
                         <Trash2 size={15} />{" "}
-                        {unified && panel.pendingLeave
-                          ? "Retry Forget"
-                          : "Forget"}
+                        {removeSaved
+                          ? "Remove saved connection"
+                          : unified && panel.pendingLeave
+                            ? "Retry Forget"
+                            : "Forget"}
                       </button>
                     </div>
                     {unified &&

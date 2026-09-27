@@ -19,6 +19,8 @@ export const requestActor = new AsyncLocalStorage();
 const failure = (status, message) =>
   Object.assign(new Error(message), { status });
 const read = (req) => ["GET", "HEAD"].includes(req.method);
+const revokedAccessMessage =
+  "Your access to this panel was revoked. Contact the panel owner.";
 
 export function isHostCreationRoute(req) {
   if (read(req))
@@ -311,7 +313,14 @@ export function createRemoteGateway({
       "Set-Cookie",
       `${SUBUSER_COOKIE}=; Path=/; HttpOnly; SameSite=Strict; Secure; Max-Age=0`,
     );
-    res.json((await access.authenticate(req)) ?? { role: "guest" });
+    res.json(
+      (await access.authenticate(req)) ?? {
+        role: "guest",
+        ...(access.isAccessRevoked?.(req) === true
+          ? { accessRevoked: true }
+          : {}),
+      },
+    );
   });
   app.post(
     "/api/access/login",
@@ -467,15 +476,19 @@ export function createRemoteGateway({
   app.get("/{*path}", (_req, res) =>
     res.sendFile(path.join(distDir, "index.html")),
   );
-  app.use((cause, _req, res, _next) => {
+  app.use((cause, req, res, _next) => {
     if (res.headersSent) return;
     const status = cause.status ?? 500;
+    const accessRevoked =
+      status === 401 && access.isAccessRevoked?.(req) === true;
     res.status(status).json({
-      error:
-        status >= 500 && status !== 503
+      error: accessRevoked
+        ? revokedAccessMessage
+        : status >= 500 && status !== 503
           ? "Remote access could not complete the request. Try again or contact the panel owner."
           : cause.message,
       ...(cause.setupNotCreated === true ? { setupNotCreated: true } : {}),
+      ...(accessRevoked ? { accessRevoked: true } : {}),
     });
   });
   return app;

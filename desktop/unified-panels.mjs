@@ -161,7 +161,7 @@ export function createUnifiedPanelController({
   const get = (id) => {
     ensure();
     const panel = panels.get(id);
-    if (!panel || panel.removed)
+    if (!panel || panel.removed || panel.removing)
       throw failure(404, "This panel connection is no longer available.");
     return panel;
   };
@@ -184,6 +184,41 @@ export function createUnifiedPanelController({
     panel.account = undefined;
     panel.servers = [];
     if (selectedServer?.panelId === panel.id) selectedServer = null;
+  }
+  async function removeSavedPanel(panel, expectedEpoch) {
+    if (panel.pendingLeave) throw failure(409, pendingLeaveMessage);
+    if (panel.epoch !== expectedEpoch || panel.removed || panel.removing || closed)
+      throw failure(409, "This panel sign-in changed. Review the saved connection again.");
+    // Block new controls and invalidate every older response before awaiting IO.
+    // Keep the record until its removal is durable, so a failed write is retryable.
+    panel.removing = true;
+    panel.controls++;
+    panel.authenticating = false;
+    panel.pendingTrust?.abort.abort();
+    panel.allowPrompt = false;
+    invalidate(panel);
+    if (selectedServer?.panelId === panel.id) selectedServer = null;
+    try {
+      await persist(panel.id);
+    } catch (cause) {
+      panel.removing = false;
+      panel.state = "unavailable";
+      panel.servers = displayRoster(panel.servers);
+      panel.error = `The saved connection could not be removed. ${cause.message || "Check this computer's storage and retry."}`;
+      panel.nextRefresh = Date.now() + 30000;
+      changed();
+      throw Object.assign(failure(503, panel.error), { localRemovalFailed: true });
+    }
+    panel.removed = true;
+    panel.network.setCertificateVerifyProc(null);
+    const cleanup = await Promise.allSettled([
+      clearLegacy(panel.id),
+      panel.network.clearStorageData?.(),
+      panel.network.closeAllConnections?.(),
+    ]);
+    for (const result of cleanup)
+      if (result.status === "rejected") onError(result.reason);
+    return changed();
   }
   function make(entry) {
     const panel = {
@@ -320,10 +355,10 @@ export function createUnifiedPanelController({
     if (!response.ok)
       throw Object.assign(failure(
         response.status,
-        typeof body.error === "string"
+        typeof body?.error === "string"
           ? body.error
           : "The remote request failed.",
-      ), { remoteResponse: true });
+      ), { remoteResponse: true, accessRevoked: body?.accessRevoked === true });
     return body;
   }
   async function request(
@@ -339,7 +374,7 @@ export function createUnifiedPanelController({
     } = {},
   ) {
     ensure();
-    if (panel.removed || panels.get(panel.id) !== panel)
+    if (panel.removed || panel.removing || panels.get(panel.id) !== panel)
       throw failure(404, "This panel connection is no longer available.");
     const control = new AbortController();
     const epoch = panel.epoch;
@@ -404,7 +439,7 @@ export function createUnifiedPanelController({
     }
   }
   async function refresh(panel, explicit = false) {
-    if (panel.pendingLeave) return;
+    if (panel.pendingLeave || panel.removing || panel.removed) return;
     if (panel.refreshing) {
       if (!explicit || panel.refreshExplicit) return panel.refreshing;
       await panel.refreshing.catch(() => {});
@@ -424,6 +459,10 @@ export function createUnifiedPanelController({
       try {
         const account = await json(panel, "/api/access/session");
         if (panel.epoch !== epoch || panel.removed || closed) return;
+        if (account.role === "guest" && account.accessRevoked === true && panel.token) {
+          await removeSavedPanel(panel, epoch);
+          return;
+        }
         if (account.role !== "subuser") {
           forgetSession(panel);
           panel.state = "connected";
@@ -452,8 +491,16 @@ export function createUnifiedPanelController({
         panel.nextRefresh = Date.now() + pollMs;
         await persist();
       } catch (cause) {
+        if (cause.localRemovalFailed) {
+          if (explicit) throw cause;
+          return;
+        }
         if (panel.epoch !== epoch || panel.removed || closed) return;
         if (cause.status === 401) {
+          if (cause.accessRevoked === true && panel.token) {
+            await removeSavedPanel(panel, epoch);
+            return;
+          }
           forgetSession(panel);
           await persist();
         }
@@ -500,7 +547,7 @@ export function createUnifiedPanelController({
   const timer = setInterval(() => {
     if (closed || !ready) return;
     for (const panel of panels.values())
-      if (!panel.authenticating && !panel.pendingLeave && Date.now() >= panel.nextRefresh)
+      if (!panel.authenticating && !panel.pendingLeave && !panel.removing && Date.now() >= panel.nextRefresh)
         void refresh(panel).catch(onError);
   }, pollMs);
   timer.unref?.();
@@ -669,6 +716,15 @@ export function createUnifiedPanelController({
       })();
       return panel.forgetting;
     },
+    async removeSavedConnection(id, expectedEpoch) {
+      await initialize();
+      const panel = get(id);
+      if (panel.pendingLeave) throw failure(409, pendingLeaveMessage);
+      if (!text(expectedEpoch, 128) || !expectedEpoch || panel.epoch !== expectedEpoch ||
+          panel.token || panel.account || panel.authenticating)
+        throw failure(409, "This panel sign-in changed. Only a signed-out saved connection can be removed from this computer.");
+      return removeSavedPanel(panel, expectedEpoch);
+    },
     async selectServer(panelId, serverId) {
       try {
         await initialize();
@@ -807,10 +863,14 @@ export function createUnifiedPanelController({
         const response = pending.response;
         if (response.status === 401) {
           let reason = "Sign in to this panel before continuing.";
+          let accessRevoked = false;
           try {
             await readJson(response);
           } catch (cause) {
-            if (cause.status === 401) reason = cause.message;
+            if (cause.status === 401) {
+              reason = cause.message;
+              accessRevoked = cause.accessRevoked === true;
+            }
           }
           pending.done();
           pending = null;
@@ -819,8 +879,11 @@ export function createUnifiedPanelController({
               409,
               "This panel sign-in changed while the request was running.",
             );
-          forgetSession(panel);
-          await persist();
+          if (accessRevoked) await removeSavedPanel(panel, epoch);
+          else {
+            forgetSession(panel);
+            await persist();
+          }
           changed();
           throw failure(401, reason);
         }
@@ -918,12 +981,12 @@ export function createUnifiedPanelController({
     const version = ++panel.controls;
     // Failed credentials must not end the still-valid account lease/drafts.
     // Pause only roster discovery; successful replacement rotates the lease.
-    await panel.refreshing?.catch(() => {});
-    if (closed || panel.removed || version !== panel.controls)
-      throw failure(409, "This panel sign-in changed.");
     panel.authenticating = version;
-    panel.allowPrompt = true;
     try {
+      await panel.refreshing?.catch(() => {});
+      if (closed || panel.removed || panel.removing || version !== panel.controls)
+        throw failure(409, "This panel sign-in changed.");
+      panel.allowPrompt = true;
       const result = await json(panel, pathname, {
         method: "POST",
         headers: { "Content-Type": "application/json" },

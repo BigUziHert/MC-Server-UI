@@ -13,6 +13,8 @@ if (process.isMainFrame) {
     signOut: (panelId) => invoke("signOut", panelId),
     retry: (panelId) => invoke("retry", panelId),
     forget: (panelId, expectedAccountId) => invoke("forget", panelId, expectedAccountId),
+    removeSavedConnection: (panelId, expectedEpoch) =>
+      invoke("removeSavedConnection", panelId, expectedEpoch),
     selectServer: (panelId, serverId) =>
       invoke("selectServer", panelId, serverId),
     openUpdates: () => invoke("openUpdates"),

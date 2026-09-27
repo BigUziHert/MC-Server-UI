@@ -84,6 +84,10 @@ declare global {
         panelId: string,
         expectedAccountId?: string,
       ) => Promise<PanelConnections>;
+      removeSavedConnection?: (
+        panelId: string,
+        expectedEpoch: string,
+      ) => Promise<PanelConnections>;
       selectServer?: (
         panelId: string,
         serverId: string | null,

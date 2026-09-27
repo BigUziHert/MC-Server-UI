@@ -15,6 +15,7 @@ const invitationLifetime = 24 * 60 * 60 * 1000;
 const sessionLifetime = 7 * 24 * 60 * 60 * 1000;
 const leaveReceiptLifetime = 7 * 24 * 60 * 60 * 1000;
 const maximumLeaveReceipts = 4096;
+const maximumAccessRevocations = 4096;
 const maxEmailMemberships = 32;
 const invalidLink =
   "This invitation link is invalid or expired. Ask the server owner for a new link.";
@@ -168,6 +169,7 @@ export async function createAccessService({
     accounts: [],
     retiredLegacyEmails: [],
     leaveReceipts: [],
+    accessRevocations: [],
   };
   let migrationNeeded = false;
   try {
@@ -203,6 +205,8 @@ export async function createAccessService({
         ? saved.retiredLegacyEmails
         : [],
       leaveReceipts: saved.leaveReceipts ?? [],
+      accessRevocations:
+        saved.accessRevocations === undefined ? [] : saved.accessRevocations,
     };
     if (
       !Array.isArray(state.leaveReceipts) ||
@@ -217,6 +221,35 @@ export async function createAccessService({
       )
     )
       throw new Error("Invalid panel leave receipt storage.");
+    const revocationHashes = new Set();
+    if (
+      !Array.isArray(state.accessRevocations) ||
+      state.accessRevocations.length > maximumAccessRevocations ||
+      state.accessRevocations.some((receipt) => {
+        if (
+          !receipt ||
+          typeof receipt !== "object" ||
+          Array.isArray(receipt) ||
+          Object.keys(receipt).length !== 2 ||
+          typeof receipt.hash !== "string" ||
+          !/^[a-f0-9]{64}$/.test(receipt.hash) ||
+          !Number.isSafeInteger(receipt.expiresAt) ||
+          receipt.expiresAt < 0 ||
+          revocationHashes.has(receipt.hash)
+        )
+          return true;
+        revocationHashes.add(receipt.hash);
+        return false;
+      })
+    )
+      throw new Error("Invalid access revocation receipt storage.");
+    const activeRevocations = state.accessRevocations.filter(
+      (receipt) => receipt.expiresAt > now(),
+    );
+    if (activeRevocations.length !== state.accessRevocations.length) {
+      state.accessRevocations = activeRevocations;
+      migrationNeeded = true;
+    }
     const accountIds = new Set(),
       accountEmails = new Set();
     for (const account of state.accounts) {
@@ -387,7 +420,50 @@ export async function createAccessService({
     leaveReceipts: state.leaveReceipts.filter(
       (receipt) => receipt.expiresAt > now(),
     ),
+    accessRevocations: state.accessRevocations.filter(
+      (receipt) => receipt.expiresAt > now(),
+    ),
   });
+  // Keep only an expiring, bearer-token proof of a deliberate loss of access.
+  // This never records an identity, plaintext credential or ordinary sign-out.
+  // Evict the earliest-expiring receipts at capacity so removing access cannot
+  // fail just because the optional reconnect notice has reached its bound.
+  const withAccessRevocations = (next, removedSessions) => {
+    const time = now();
+    const receipts = new Map(
+      next.accessRevocations
+        .filter((receipt) => receipt.expiresAt > time)
+        .map((receipt) => [receipt.hash, receipt]),
+    );
+    for (const session of removedSessions) {
+      if (
+        session.transport !== "bearer" ||
+        typeof session.hash !== "string" ||
+        !/^[a-f0-9]{64}$/.test(session.hash) ||
+        !Number.isSafeInteger(session.expiresAt) ||
+        session.expiresAt <= time
+      )
+        continue;
+      receipts.set(session.hash, {
+        hash: session.hash,
+        expiresAt: Math.min(session.expiresAt, time + sessionLifetime),
+      });
+    }
+    return [...receipts.values()]
+      .sort((a, b) => a.expiresAt - b.expiresAt)
+      .slice(-maximumAccessRevocations);
+  };
+  const isAccessRevoked = (req) => {
+    // Legacy browser cookies are not origin-scoped proof, even when their value
+    // happens to match a newer bearer credential removed from this panel.
+    if (typeof req?.headers?.authorization !== "string") return false;
+    const token = cookieSecret(req);
+    if (!token) return false;
+    const hash = digest(token);
+    return state.accessRevocations.some(
+      (receipt) => receipt.hash === hash && receipt.expiresAt > now(),
+    );
+  };
   const status = () => ({
     ...state.configuration,
     ready: Boolean(
@@ -868,6 +944,13 @@ export async function createAccessService({
         (session) =>
           session.email !== email && !accountIds.has(session.accountId),
       ),
+      accessRevocations: withAccessRevocations(
+        next,
+        next.sessions.filter(
+          (session) =>
+            session.email === email || accountIds.has(session.accountId),
+        ),
+      ),
       creationRevocations: [
         ...new Set([
           ...next.creationRevocations,
@@ -886,6 +969,7 @@ export async function createAccessService({
   return {
     status,
     hostAuthority,
+    isAccessRevoked,
     // Serialize identity reservation with account creation/promotion so a raw
     // server identity cannot become invisible between validation and commit.
     withLegacyIdentity: (email, create) =>
@@ -1809,6 +1893,17 @@ export async function createAccessService({
             (item) => scopeKey(item) !== key,
           ),
           tokens: next.tokens.filter((item) => scopeKey(item) !== key),
+          accessRevocations: withAccessRevocations(
+            next,
+            next.sessions.filter(
+              (session) =>
+                !session.accountId &&
+                sessionIncludes(session, key) &&
+                sessionScopes(session).every(
+                  (scope) => scopeKey(scope) === key,
+                ),
+            ),
+          ),
           sessions: next.sessions.flatMap((session) => {
             if (session.accountId || !sessionIncludes(session, key))
               return [session];

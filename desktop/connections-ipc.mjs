@@ -67,6 +67,7 @@ export function installUnifiedConnectionIpc(ipcMain, controller) {
     "signOut",
     "retry",
     "forget",
+    "removeSavedConnection",
     "selectServer",
     "openUpdates",
   ];
@@ -91,6 +92,9 @@ export function installUnifiedConnectionIpc(ipcMain, controller) {
       if (action === "forget" &&
           (typeof second !== "string" || !second || second.length > 128))
         throw new Error("Confirm the signed-in account before forgetting this panel.");
+      if (action === "removeSavedConnection" &&
+          (typeof second !== "string" || !second || second.length > 128))
+        throw new Error("Confirm the current signed-out connection before removing it.");
       return controller[action](first, second);
     });
   }

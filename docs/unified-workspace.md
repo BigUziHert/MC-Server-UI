@@ -9,12 +9,15 @@ The desktop renderer always remains at its local runtime origin. `DesktopWorkspa
 - The broker resolves the saved destination, rejects stale epochs and unavailable/signed-out panels, requires current server membership or the separate host-creation grant, and lets the host enforce each operation's permission. It strips renderer credentials and injects the destination panel's bearer credential. Redirects and active document responses are rejected.
 - Multipart uploads and downloads stream through the bridge. Downloads are saved on the client computer. Changing selection cannot redirect a pending request or its follow-up operation to the new server.
 - Sign-out, expired sessions, and Forget invalidate only that connection's epoch and client transports. Cached rosters contain bounded display fields, never permissions, launch settings, or filesystem paths. They cannot enable operations before successful session and roster revalidation.
+- A host-proved `accessRevoked` response removes the saved connection and certificate trust only for the session that received it. Hosts retain bounded, expiring hashes of revoked bearer credentials so clients can distinguish account removal from expiration or a temporary outage. A normal guest response or empty server roster never proves revocation. Pending Forget requests retain their original proof until their receipt is confirmed.
 
 ## Workspace state
 
 Server selection persists as the panel/server tuple. Remote Properties drafts and transfer/recovery state belong to a panel session; identical server IDs on other computers cannot reuse them. Signing out clears only that session's state. Remote Launchpad preferences include stable panel, account, and server identity. App settings, desktop updates, and startup remain local.
 
 The connection manager stays open when its selected server's account is signed out. Adding a panel or accepting an invitation uses a dialog in the same document. Setup asks for a destination when more than one computer is eligible; local creation requires no remote grant.
+
+Signed-out saved addresses can be removed locally without signing back in. This action checks the captured session epoch and rejects a changed sign-in or pending Forget request; it never claims to remove the host account. This also lets users clear addresses left behind by older hosts or desktops before revocation notifications were supported.
 
 ## Verification
 

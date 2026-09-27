@@ -401,6 +401,22 @@ async function smoke() {
       { host: "a", serverId: "same-id" },
     );
     await page.evaluate((id) => window.mcPanelConnections.signOut(id), a.id);
+    await page.evaluate(async (id) => {
+      const panel = (await window.mcPanelConnections.list()).panels.find(
+        (entry) => entry.id === id,
+      );
+      await window.mcPanelConnections.removeSavedConnection(id, panel.sessionEpoch);
+    }, a.id);
+    assert.equal(
+      (await page.evaluate(() => window.mcPanelConnections.list())).panels.some(
+        (panel) => panel.id === a.id,
+      ),
+      false,
+    );
+    assert.ok(
+      !requests.some((request) => request.host === "a" && request.path === "/api/access/leave"),
+      "Removing a signed-out address never deletes a host account",
+    );
     assert.equal(
       (await page.evaluate(() => window.mcPanelConnections.list())).panels.find(
         (panel) => panel.id === c.id,
