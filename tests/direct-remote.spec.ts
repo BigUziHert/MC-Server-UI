@@ -228,6 +228,11 @@ test("a copied invitation works over direct HTTPS through password setup, sign-i
     await connections
       .getByRole("button", { name: "Sign in", exact: true })
       .click();
+    // Close is deliberately available while authentication is pending. Wait
+    // for success here so this path verifies sign-in rather than cancelling it.
+    await expect(
+      connections.getByRole("form", { name: /^Sign in/ }),
+    ).toHaveCount(0);
     await connections
       .getByRole("button", { name: "Close panel connections", exact: true })
       .click();

@@ -296,9 +296,13 @@ async function localPanel(page: Page, desktop = false) {
   }
   const localCredentials: string[] = [];
   page.on("request", (request) => {
-    const path = new URL(request.url()).pathname;
-    if (path === "/api/access/login" || path === "/api/access/accept")
-      localCredentials.push(path);
+    const url = new URL(request.url());
+    if (
+      url.origin === new URL(page.url()).origin &&
+      (url.pathname === "/api/access/login" ||
+        url.pathname === "/api/access/accept")
+    )
+      localCredentials.push(url.pathname);
   });
   // The account connection flow does not need a running Minecraft process or
   // any fixture writes to the panel's real server registry.

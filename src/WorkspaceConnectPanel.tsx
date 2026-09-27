@@ -46,6 +46,9 @@ export default function WorkspaceConnectPanel({
     const previous = document.activeElement as HTMLElement | null;
     const element = dialog.current;
     element?.showModal();
+    // Native modal opening chooses its own focus target after React's
+    // autoFocus. Put keyboard users in the form once the dialog is open.
+    element?.querySelector<HTMLInputElement>("input")?.focus();
     return () => {
       alive.current = false;
       discard();

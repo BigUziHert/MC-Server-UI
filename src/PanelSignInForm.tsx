@@ -223,8 +223,9 @@ export default function PanelSignInForm({
       {token ? (
         <>
           <small>
-            Use 12–128 characters. Cancelling keeps your invitation and existing
-            server permissions so you can finish later.
+            Use 12–128 characters. Your invitation stays pending until the
+            password is saved. Cancelling keeps your existing server
+            permissions.
           </small>
           <label htmlFor={`${id}-confirmation`}>Confirm password</label>
           <input
