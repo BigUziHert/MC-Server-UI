@@ -894,7 +894,9 @@ export function EmptyFleet({
           </span>
         </div>
         <div className="welcome-header-actions">
-          {!session && <PanelSettings notify={notify} />}
+          {(!session || window.mcPanelConnections?.unified) && (
+            <PanelSettings notify={notify} />
+          )}
           <DesktopUpdates remote={Boolean(session)} />
           <a
             className="help-button"
@@ -917,13 +919,15 @@ export function EmptyFleet({
               {showWelcome ? "Welcome to MC Panel" : "No shared servers"}
             </h1>
             <p>
-              {showWelcome
-                ? "Start a new Minecraft server, or bring one you already have."
-                : session && (!canAddServer || openLocalSetup)
-                  ? "No servers are currently shared with this account. Servers you gain access to will appear here automatically."
-                  : session
-                    ? `Create or import a server on ${window.location.host}.`
-                    : "Start a new Minecraft server, or bring one you already have."}
+              {window.mcPanelConnections?.unified && !canAddServer
+                ? "Add a panel or sign in to a saved connection. Servers shared with your accounts appear here automatically."
+                : showWelcome
+                  ? "Start a new Minecraft server, or bring one you already have."
+                  : session && (!canAddServer || openLocalSetup)
+                    ? "No servers are currently shared with this account. Servers you gain access to will appear here automatically."
+                    : session
+                      ? `Create or import a server on ${window.location.host}.`
+                      : "Start a new Minecraft server, or bring one you already have."}
             </p>
             {openLocalSetup && (
               <>

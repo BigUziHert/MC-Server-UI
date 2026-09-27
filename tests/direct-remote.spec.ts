@@ -108,8 +108,14 @@ test("a copied invitation works over direct HTTPS through password setup, sign-i
       });
     await phone.goto(invitationUrl);
     await expect(
-      phone.getByRole("heading", { name: "Set up your server access" }),
+      phone.getByRole("heading", { name: "Add Panel", exact: true }),
     ).toBeVisible();
+    await expect(
+      phone.getByLabel("Invitation link", { exact: true }),
+    ).toHaveValue(invitationUrl);
+    await phone
+      .getByRole("button", { name: "Continue with invitation", exact: true })
+      .click();
     await phone
       .getByLabel("New password", { exact: true })
       .fill("A memorable family password");
@@ -151,7 +157,7 @@ test("a copied invitation works over direct HTTPS through password setup, sign-i
     await expect(
       phone.getByRole("heading", { name: serverName, exact: true }),
     ).toBeVisible();
-    await expect(phone).toHaveURL(`${publicUrl}/`);
+    await expect(phone).toHaveURL(`${publicUrl}/#console`);
     await expect(
       phone.getByRole("button", { name: "Start", exact: true }),
     ).toBeEnabled();
@@ -187,7 +193,28 @@ test("a copied invitation works over direct HTTPS through password setup, sign-i
     await phone
       .getByRole("button", { name: "Account menu for sister@example.test" })
       .click();
-    await phone.getByRole("menuitem", { name: "Sign out" }).click();
+    await phone
+      .getByRole("menuitem", { name: "Manage Connections", exact: true })
+      .click();
+    const connections = phone.getByRole("dialog", {
+      name: "Manage Connections",
+      exact: true,
+    });
+    await connections
+      .getByRole("button", {
+        name: `Sign out of 127.0.0.1:${port}`,
+        exact: true,
+      })
+      .click();
+    await connections
+      .getByRole("button", { name: "Sign out of this panel", exact: true })
+      .click();
+    await connections
+      .getByRole("button", {
+        name: `Sign in to 127.0.0.1:${port}`,
+        exact: true,
+      })
+      .click();
     await expect(phone.getByLabel("Email address")).toBeVisible();
     expect(
       (await context.cookies(publicUrl)).some(
@@ -199,6 +226,9 @@ test("a copied invitation works over direct HTTPS through password setup, sign-i
       .getByLabel("Password", { exact: true })
       .fill("A memorable family password");
     await phone.getByRole("button", { name: "Sign in", exact: true }).click();
+    await connections
+      .getByRole("button", { name: "Close panel connections", exact: true })
+      .click();
     await expect(
       phone.getByRole("heading", { name: serverName, exact: true }),
     ).toBeVisible();

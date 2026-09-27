@@ -33,6 +33,9 @@ async function copyFixture(
   permissions: string[],
   options: { holdCopy?: Promise<void> } = {},
 ) {
+  await page.addInitScript(() =>
+    localStorage.setItem("mc-panel.session.v1", "f".repeat(43)),
+  );
   let copied = false;
   const mutations: { path: string; body: any }[] = [];
   let statusReads = 0;

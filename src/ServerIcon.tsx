@@ -1,7 +1,8 @@
 import { useEffect, useRef, useState, type ChangeEvent } from "react";
 import { Camera, Upload, X } from "lucide-react";
-import { useServerApi } from "./api";
+import { isPanelProxyUrl, useServerApi } from "./api";
 import { authenticatedFetch, sessionCredential } from "./session-auth";
+import { getBrowserPanelTransport } from "./panel-transport";
 import "./server-icon.css";
 
 function DefaultIcon() {
@@ -18,7 +19,10 @@ function IconImage({ src, alt }: { src: string; alt: string }) {
   const [failed, setFailed] = useState(false);
   const [retried, setRetried] = useState(false);
   const [authenticatedSrc, setAuthenticatedSrc] = useState<string | null>(null);
-  const needsAuth = src.startsWith("/api/") && !!sessionCredential();
+  const needsAuth =
+    src.startsWith("/api/") &&
+    (!!sessionCredential() ||
+      (isPanelProxyUrl(src) && !!getBrowserPanelTransport()));
   useEffect(() => {
     if (!needsAuth) return;
     const controller = new AbortController();
@@ -27,9 +31,25 @@ function IconImage({ src, alt }: { src: string; alt: string }) {
     void authenticatedFetch(src, { signal: controller.signal })
       .then(async (response) => {
         if (!response.ok) throw new Error("Server icon unavailable.");
-        const blob = await response.blob();
-        if (blob.size > 262144 || !blob.type.startsWith("image/png"))
+        if (!response.headers.get("content-type")?.startsWith("image/png"))
           throw new Error("Server icon unavailable.");
+        const reader = response.body?.getReader();
+        if (!reader) throw new Error("Server icon unavailable.");
+        const chunks: Uint8Array<ArrayBuffer>[] = [];
+        let size = 0;
+        try {
+          for (;;) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            size += value.byteLength;
+            if (size > 262144) throw new Error("Server icon unavailable.");
+            chunks.push(new Uint8Array(value));
+          }
+        } finally {
+          await reader.cancel().catch(() => {});
+          reader.releaseLock();
+        }
+        const blob = new Blob(chunks, { type: "image/png" });
         if (controller.signal.aborted) return;
         objectUrl = URL.createObjectURL(blob);
         setAuthenticatedSrc(objectUrl);

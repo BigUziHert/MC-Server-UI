@@ -14,6 +14,73 @@ const sister = {
   ],
 };
 const password = "family server password";
+const browserToken = "s".repeat(43);
+const invitationOrigin = "https://invited.example.test";
+async function signedOutSession(page: Page) {
+  await page.addInitScript(() =>
+    localStorage.removeItem("mc-panel.session.v1"),
+  );
+  await page.route("**/api/access/session", (route) =>
+    route.fulfill({
+      json:
+        route.request().headers().authorization === `Bearer ${browserToken}`
+          ? sister
+          : { role: "guest" },
+    }),
+  );
+}
+async function invitation(page: Page, token: string) {
+  await page.route(`${invitationOrigin}/**`, async (route) => {
+    const url = new URL(route.request().url());
+    if (url.pathname.startsWith("/api/")) return route.fallback();
+    return route.fulfill({
+      response: await route.fetch({
+        url: `http://127.0.0.1:3111${url.pathname}${url.search}`,
+      }),
+    });
+  });
+  await page.goto(`${invitationOrigin}/#invite=${token}`);
+  await page
+    .getByRole("button", { name: "Continue with invitation", exact: true })
+    .click();
+}
+async function openConnections(page: Page) {
+  const account = page.getByRole("button", { name: /^Account menu for/ });
+  if (!(await account.isVisible()))
+    await page
+      .getByRole("button", { name: "Open navigation", exact: true })
+      .click();
+  await account.click();
+  await page
+    .getByRole("menuitem", { name: "Manage Connections", exact: true })
+    .click();
+  return page.getByRole("dialog", { name: "Manage Connections", exact: true });
+}
+async function openSignIn(page: Page) {
+  const dialog = page.getByRole("dialog", {
+    name: "Manage Connections",
+    exact: true,
+  });
+  if (!(await dialog.isVisible())) await openConnections(page);
+  await dialog
+    .getByRole("button", {
+      name: `Sign in to ${new URL(page.url()).host}`,
+      exact: true,
+    })
+    .click();
+}
+async function signOut(page: Page) {
+  const dialog = await openConnections(page);
+  await dialog
+    .getByRole("button", {
+      name: `Sign out of ${new URL(page.url()).host}`,
+      exact: true,
+    })
+    .click();
+  await dialog
+    .getByRole("button", { name: "Sign out of this panel", exact: true })
+    .click();
+}
 const server = {
   id: "family",
   name: "Family survival",
@@ -32,13 +99,19 @@ const server = {
   address: "play.example.com",
 };
 async function sharedEndpoints(page: Page, permissions = sister.permissions) {
+  await page.addInitScript(
+    (token) => localStorage.setItem("mc-panel.session.v1", token),
+    browserToken,
+  );
   await page.route("**/api/servers", (route) =>
     route.fulfill({
       json: { servers: [{ ...server, accessPermissions: permissions }] },
     }),
   );
-  await page.route("**/api/server", (route) => route.fulfill({ json: server }));
-  await page.route("**/api/console", (route) =>
+  await page.route(/\/api\/server(?:\?|$)/, (route) =>
+    route.fulfill({ json: server }),
+  );
+  await page.route(/\/api\/console(?:\?|$)/, (route) =>
     route.fulfill({
       json: {
         lines: [
@@ -59,15 +132,13 @@ test("an invitation opens controls only after a password is chosen and explicitl
 }, testInfo) => {
   await page.setViewportSize({ width: 320, height: 844 });
   await sharedEndpoints(page);
-  await page.route("**/api/access/session", (route) =>
-    route.fulfill({ json: { role: "guest" } }),
-  );
+  await signedOutSession(page);
   const accepted: unknown[] = [];
   await page.route("**/api/access/accept", async (route) => {
     accepted.push(route.request().postDataJSON());
-    await route.fulfill({ json: sister });
+    await route.fulfill({ json: { ...sister, sessionToken: browserToken } });
   });
-  await page.goto("/#invite=one-time-test-token");
+  await invitation(page, "i".repeat(43));
   await expect(
     page.getByRole("button", { name: "Set password and continue" }),
   ).toBeVisible();
@@ -89,13 +160,10 @@ test("an invitation opens controls only after a password is chosen and explicitl
     .getByRole("button", { name: "Show password", exact: true })
     .click();
   await expect(newPassword).toHaveAttribute("type", "text");
-  await expect(confirmation).toHaveAttribute("type", "password");
-  await page.getByRole("button", { name: "Show confirm password" }).click();
   await expect(confirmation).toHaveAttribute("type", "text");
   await page
     .getByRole("button", { name: "Hide password", exact: true })
     .click();
-  await page.getByRole("button", { name: "Hide confirm password" }).click();
   await expect(newPassword).toHaveAttribute("type", "password");
   await expect(confirmation).toHaveAttribute("type", "password");
   await expect(newPassword).toHaveValue(password);
@@ -110,7 +178,7 @@ test("an invitation opens controls only after a password is chosen and explicitl
   await expect(
     page.getByRole("heading", { name: "Family survival" }),
   ).toBeVisible();
-  expect(accepted).toEqual([{ token: "one-time-test-token", password }]);
+  expect(accepted).toEqual([{ token: "i".repeat(43), password }]);
   await expect(page).not.toHaveURL(/invite=/);
   await expect(
     page.getByRole("button", { name: "Start", exact: true }),
@@ -150,7 +218,7 @@ test("a phone only offers granted controls and scopes every action to the shared
       forbiddenRequests.push(pathname);
   });
   const actions: unknown[] = [];
-  await page.route("**/api/server/power", async (route) => {
+  await page.route(/\/api\/server\/power(?:\?|$)/, async (route) => {
     actions.push({
       body: route.request().postDataJSON(),
       server: route.request().headers()["x-server-id"],
@@ -215,7 +283,7 @@ test("switching shared servers drops the previous console and uses the next memb
       },
     }),
   );
-  await page.route("**/api/server", (route) =>
+  await page.route(/\/api\/server(?:\?|$)/, (route) =>
     route.fulfill({
       json:
         route.request().headers()["x-server-id"] === "creative"
@@ -261,7 +329,7 @@ for (const width of [1280, 390]) {
       accessPermissions: permissions,
     };
     const patches: unknown[] = [];
-    await page.route("**/api/server/settings", async (route) => {
+    await page.route(/\/api\/server\/settings(?:\?|$)/, async (route) => {
       expect(route.request().headers()["x-server-id"]).toBe(server.id);
       if (route.request().method() === "PATCH") {
         const update = route.request().postDataJSON();
@@ -281,7 +349,7 @@ for (const width of [1280, 390]) {
     await openNavigation();
     await page
       .getByRole("button", {
-        name: "Select server Family survival",
+        name: "Select server Family survival on 127.0.0.1:3111",
         exact: true,
       })
       .click();
@@ -329,9 +397,7 @@ for (const width of [1280, 390]) {
         settingsRevision: "initial-settings-revision",
       },
     ]);
-    await expect(page.getByRole("status")).toContainText(
-      "Server settings saved.",
-    );
+    await expect(page.getByRole("status")).toContainText("Server saved.");
     await openNavigation();
     const account = page.getByRole("button", {
       name: `Account menu for ${sister.email}`,
@@ -445,7 +511,7 @@ test("an expired shared session leaves the workspace when an action returns 401"
   await page.route("**/api/access/session", (route) =>
     route.fulfill({ json: sister }),
   );
-  await page.route("**/api/server/power", (route) =>
+  await page.route(/\/api\/server\/power(?:\?|$)/, (route) =>
     route.fulfill({ status: 401, json: { error: "Sign in again." } }),
   );
   await page.goto("/");
@@ -454,7 +520,7 @@ test("an expired shared session leaves the workspace when an action returns 401"
     .getByRole("button", { name: "Start", exact: true })
     .click();
   await expect(
-    page.getByRole("heading", { name: "Welcome to your server" }),
+    page.getByRole("heading", { name: "Welcome to MC Panel" }),
   ).toBeVisible();
   await expect(page.locator(".app-shell")).toHaveCount(0);
 });
@@ -464,13 +530,17 @@ test("a late response from a signed-out workspace cannot end the next session", 
 }) => {
   await sharedEndpoints(page, ["control.start"]);
   await page.route("**/api/access/session", (route) =>
-    route.fulfill({ json: sister }),
+    route.fulfill({
+      json: route.request().headers().authorization
+        ? sister
+        : { role: "guest" },
+    }),
   );
   await page.route("**/api/access/logout", (route) =>
     route.fulfill({ json: { ok: true } }),
   );
   await page.route("**/api/access/login", (route) =>
-    route.fulfill({ json: sister }),
+    route.fulfill({ json: { ...sister, sessionToken: browserToken } }),
   );
   let releaseResponse!: () => void;
   const pendingResponse = new Promise<void>((resolve) => {
@@ -480,36 +550,34 @@ test("a late response from a signed-out workspace cannot end the next session", 
   const routeDone = new Promise<void>((resolve) => {
     finishRoute = resolve;
   });
-  await page.route("**/api/server/power", async (route) => {
+  await page.route(/\/api\/server\/power(?:\?|$)/, async (route) => {
     await pendingResponse;
-    await route.fulfill({
-      status: 401,
-      json: { error: "Old session expired." },
-    });
+    await route
+      .fulfill({
+        status: 401,
+        json: { error: "Old session expired." },
+      })
+      .catch(() => {});
     finishRoute();
   });
   await page.goto("/");
-  const requestReceived = page.waitForRequest("**/api/server/power");
+  const requestReceived = page.waitForRequest(/\/api\/server\/power(?:\?|$)/);
   await page
     .getByRole("main")
     .getByRole("button", { name: "Start", exact: true })
     .click();
   await requestReceived;
-  await page
-    .getByRole("button", { name: `Account menu for ${sister.email}` })
-    .click();
-  await page.getByRole("menuitem", { name: "Sign out" }).click();
+  await signOut(page);
+  await openSignIn(page);
   await page.getByLabel("Email address").fill(sister.email);
   await page.getByLabel("Password", { exact: true }).fill(password);
   await page.getByRole("button", { name: "Sign in", exact: true }).click();
+  await page
+    .getByRole("button", { name: "Close panel connections", exact: true })
+    .click();
   await expect(page.getByRole("heading", { name: server.name })).toBeVisible();
-  const responseFinished = page.waitForEvent("requestfinished", {
-    predicate: (request) =>
-      new URL(request.url()).pathname === "/api/server/power",
-  });
   releaseResponse();
   await routeDone;
-  await responseFinished;
   await page.evaluate(
     () =>
       new Promise<void>((resolve) => requestAnimationFrame(() => resolve())),
@@ -518,7 +586,7 @@ test("a late response from a signed-out workspace cannot end the next session", 
     page.getByRole("main").getByRole("button", { name: "Start", exact: true }),
   ).toBeEnabled();
   await expect(
-    page.getByRole("heading", { name: "Welcome to your server" }),
+    page.getByRole("heading", { name: "Welcome to MC Panel" }),
   ).toHaveCount(0);
 });
 
@@ -527,15 +595,14 @@ test("email and password sign-in opens the shared panel and logout returns to si
 }, testInfo) => {
   await page.setViewportSize({ width: 320, height: 844 });
   await sharedEndpoints(page);
-  await page.route("**/api/access/session", (route) =>
-    route.fulfill({ json: { role: "guest" } }),
-  );
+  await signedOutSession(page);
   let requestedCredentials: unknown;
   await page.route("**/api/access/login", async (route) => {
     requestedCredentials = route.request().postDataJSON();
-    await route.fulfill({ json: sister });
+    await route.fulfill({ json: { ...sister, sessionToken: browserToken } });
   });
   await page.goto("/");
+  await openSignIn(page);
   await expect(page.getByLabel("Password", { exact: true })).toHaveAttribute(
     "autocomplete",
     "current-password",
@@ -568,6 +635,9 @@ test("email and password sign-in opens the shared panel and logout returns to si
     ),
   ).toBe(false);
   await page.getByRole("button", { name: "Sign in", exact: true }).click();
+  await page
+    .getByRole("button", { name: "Close panel connections", exact: true })
+    .click();
   await expect(
     page.getByRole("heading", { name: "Family survival" }),
   ).toBeVisible();
@@ -578,11 +648,8 @@ test("email and password sign-in opens the shared panel and logout returns to si
   await page.route("**/api/access/logout", (route) =>
     route.fulfill({ json: { ok: true } }),
   );
-  await page.getByRole("button", { name: "Open navigation" }).click();
-  await page
-    .getByRole("button", { name: "Account menu for sister@example.com" })
-    .click();
-  await page.getByRole("menuitem", { name: "Sign out" }).click();
+  await signOut(page);
+  await openSignIn(page);
   await expect(page.getByLabel("Email address")).toBeVisible();
   await expect(passwordInput).toHaveAttribute("type", "password");
   await expect(passwordInput).toHaveValue("");
@@ -594,20 +661,23 @@ test("email and password sign-in opens the shared panel and logout returns to si
 test("a new invitation and returning to sign-in hide and clear passwords", async ({
   page,
 }) => {
-  await page.route("**/api/access/session", (route) =>
-    route.fulfill({ json: { role: "guest" } }),
-  );
-  await page.goto("/#invite=first-token");
+  await signedOutSession(page);
+  await invitation(page, "a".repeat(43));
   for (const field of ["New password", "Confirm password"]) {
     await page.getByLabel(field, { exact: true }).fill(password);
   }
   await page
     .getByRole("button", { name: "Show password", exact: true })
     .click();
-  await page.getByRole("button", { name: "Show confirm password" }).click();
   await page.evaluate(() => {
-    window.location.hash = "invite=second-token";
+    window.location.hash = `invite=${"b".repeat(43)}`;
   });
+  await expect(page.getByLabel("Invitation link", { exact: true })).toHaveValue(
+    `${invitationOrigin}/#invite=${"b".repeat(43)}`,
+  );
+  await page
+    .getByRole("button", { name: "Continue with invitation", exact: true })
+    .click();
   for (const field of ["New password", "Confirm password"]) {
     await expect(page.getByLabel(field, { exact: true })).toHaveAttribute(
       "type",
@@ -618,7 +688,10 @@ test("a new invitation and returning to sign-in hide and clear passwords", async
   await page
     .getByRole("button", { name: "Show password", exact: true })
     .click();
-  await page.getByRole("button", { name: "Back to sign in" }).click();
+  await page
+    .getByRole("button", { name: "Close connection dialog", exact: true })
+    .click();
+  await openSignIn(page);
   await expect(page.getByLabel("Password", { exact: true })).toHaveAttribute(
     "type",
     "password",
@@ -629,15 +702,13 @@ test("a new invitation and returning to sign-in hide and clear passwords", async
 test("an invitation validates password length and confirmation before sending credentials", async ({
   page,
 }) => {
-  await page.route("**/api/access/session", (route) =>
-    route.fulfill({ json: { role: "guest" } }),
-  );
+  await signedOutSession(page);
   let acceptRequests = 0;
   await page.route("**/api/access/accept", (route) => {
     acceptRequests++;
     return route.fulfill({ json: sister });
   });
-  await page.goto("/#invite=password-validation-token");
+  await invitation(page, "v".repeat(43));
   const newPassword = page.getByLabel("New password", { exact: true });
   const confirmation = page.getByLabel("Confirm password", { exact: true });
   await expect(newPassword).toHaveAttribute("autocomplete", "new-password");
@@ -650,52 +721,46 @@ test("an invitation validates password length and confirmation before sending cr
   await page.getByRole("button", { name: "Set password and continue" }).click();
   await expect(page.getByRole("alert")).toContainText("passwords do not match");
   expect(acceptRequests).toBe(0);
-  await expect(page).toHaveURL(/invite=password-validation-token/);
+  await expect(page).toHaveURL(`${invitationOrigin}/#invite=${"v".repeat(43)}`);
 });
 
 test("an expired invitation keeps its URL and offers a clear way back to sign-in", async ({
   page,
 }) => {
-  await page.route("**/api/access/session", (route) =>
-    route.fulfill({ json: { role: "guest" } }),
-  );
+  await signedOutSession(page);
   await page.route("**/api/access/accept", (route) =>
     route.fulfill({
       status: 401,
       json: { error: "This invitation link is invalid or expired." },
     }),
   );
-  await page.goto("/#invite=expired-token");
+  await invitation(page, "e".repeat(43));
   await page.getByLabel("New password", { exact: true }).fill(password);
   await page.getByLabel("Confirm password", { exact: true }).fill(password);
   await page.getByRole("button", { name: "Set password and continue" }).click();
-  await expect(
-    page.getByRole("heading", { name: "This invitation is unavailable" }),
-  ).toBeVisible();
-  await expect(
-    page.getByText("Ask the server owner for a new invitation link.", {
-      exact: false,
-    }),
-  ).toBeVisible();
   await expect(page.getByRole("alert")).toContainText("invalid or expired");
-  await expect(page).toHaveURL(/invite=expired-token/);
+  await expect(page).toHaveURL(`${invitationOrigin}/#invite=${"e".repeat(43)}`);
   await expect(page.getByLabel("Email address")).toHaveCount(0);
-  await page.getByRole("button", { name: "Back to sign in" }).click();
-  await expect(
-    page.getByRole("heading", { name: "Welcome to your server" }),
-  ).toBeVisible();
+  await page
+    .getByRole("button", { name: "Back to invitation link", exact: true })
+    .click();
+  await expect(page.getByLabel("Invitation link", { exact: true })).toHaveValue(
+    `${invitationOrigin}/#invite=${"e".repeat(43)}`,
+  );
+  await page
+    .getByRole("button", { name: "Close connection dialog", exact: true })
+    .click();
+  await openSignIn(page);
   await expect(page.getByLabel("Email address")).toBeVisible();
   await expect(page.getByRole("alert")).toHaveCount(0);
-  await expect(page).toHaveURL(/invite=expired-token/);
+  await expect(page).not.toHaveURL(/invite=/);
 });
 
 test("failed credentials stay on sign-in with the generic server error and allow a retry", async ({
   page,
 }) => {
   await sharedEndpoints(page);
-  await page.route("**/api/access/session", (route) =>
-    route.fulfill({ json: { role: "guest" } }),
-  );
+  await signedOutSession(page);
   let attempts = 0;
   await page.route("**/api/access/login", (route) => {
     attempts++;
@@ -704,9 +769,10 @@ test("failed credentials stay on sign-in with the generic server error and allow
           status: 401,
           json: { error: "Email or password is incorrect." },
         })
-      : route.fulfill({ json: sister });
+      : route.fulfill({ json: { ...sister, sessionToken: browserToken } });
   });
   await page.goto("/");
+  await openSignIn(page);
   await page.getByLabel("Email address").fill("sister@example.com");
   await page.getByLabel("Password", { exact: true }).fill("incorrect password");
   await page.getByRole("button", { name: "Sign in", exact: true }).click();
@@ -718,17 +784,18 @@ test("failed credentials stay on sign-in with the generic server error and allow
   ).toHaveCount(0);
   await page.getByLabel("Password", { exact: true }).fill(password);
   await page.getByRole("button", { name: "Sign in", exact: true }).click();
+  await page
+    .getByRole("button", { name: "Close panel connections", exact: true })
+    .click();
   await expect(
     page.getByRole("heading", { name: "Family survival" }),
   ).toBeVisible();
 });
 
-test("leaving an invitation cancels a pending acceptance and ignores its late result", async ({
+test("leaving the page during invitation acceptance ignores its late result", async ({
   page,
 }) => {
-  await page.route("**/api/access/session", (route) =>
-    route.fulfill({ json: { role: "guest" } }),
-  );
+  await signedOutSession(page);
   let finishAcceptance: (() => void) | undefined;
   let received: (() => void) | undefined;
   const requestReceived = new Promise<void>((resolve) => {
@@ -741,11 +808,13 @@ test("leaving an invitation cancels a pending acceptance and ignores its late re
     void page.route("**/api/access/accept", async (route) => {
       received?.();
       await responseReady;
-      await route.fulfill({ json: sister }).catch(() => {});
+      await route
+        .fulfill({ json: { ...sister, sessionToken: browserToken } })
+        .catch(() => {});
       resolve();
     });
   });
-  await page.goto("/#invite=pending-token");
+  await invitation(page, "p".repeat(43));
   await page.getByLabel("New password", { exact: true }).fill(password);
   await page.getByLabel("Confirm password", { exact: true }).fill(password);
   await page.getByRole("button", { name: "Set password and continue" }).click();
@@ -754,19 +823,22 @@ test("leaving an invitation cancels a pending acceptance and ignores its late re
     page.getByRole("button", { name: "Show password", exact: true }),
   ).toBeDisabled();
   await expect(
-    page.getByRole("button", { name: "Show confirm password" }),
+    page.getByRole("button", { name: "Close connection dialog" }),
   ).toBeDisabled();
-  await page.getByRole("button", { name: "Back to sign in" }).click();
-  await expect(page.getByLabel("Email address")).toBeVisible();
+  await page.goto(`${invitationOrigin}/`);
   finishAcceptance?.();
   await routeDone;
   await expect(
-    page.getByRole("heading", { name: "Welcome to your server" }),
+    page.getByRole("heading", { name: "Welcome to MC Panel" }),
   ).toBeVisible();
   await expect(
     page.getByRole("heading", { name: "Family survival" }),
   ).toHaveCount(0);
-  await expect(page).toHaveURL(/invite=pending-token/);
+  await openSignIn(page);
+  await expect(page.getByLabel("Email address")).toBeVisible();
+  expect(
+    await page.evaluate(() => localStorage.getItem("mc-panel.session.v1")),
+  ).toBeNull();
 });
 
 test("an unavailable session endpoint never opens owner controls", async ({
@@ -777,21 +849,38 @@ test("an unavailable session endpoint never opens owner controls", async ({
   );
   await page.goto("/");
   await expect(
-    page.getByRole("heading", { name: "Unable to connect" }),
+    page.getByRole("heading", { name: "Welcome to MC Panel" }),
   ).toBeVisible();
-  await expect(page.getByRole("button", { name: "Try again" })).toBeVisible();
+  await expect(
+    page.getByRole("button", { name: "Create a new server", exact: true }),
+  ).toHaveCount(0);
+  const connections = await openConnections(page);
+  await expect(
+    connections.getByRole("button", {
+      name: "Retry 127.0.0.1:3111",
+      exact: true,
+    }),
+  ).toBeVisible();
+  await expect(connections.getByRole("alert")).toContainText(
+    "Panel is unavailable",
+  );
   await expect(
     page.getByRole("navigation", { name: "Main navigation" }),
   ).toHaveCount(0);
 });
 
-test("the mobile account menu stays onscreen and a failed sign-out can be retried", async ({
+test("the mobile account menu stays onscreen and local sign-out completes when the host is unavailable", async ({
   page,
 }, testInfo) => {
   await page.setViewportSize({ width: 320, height: 720 });
   await sharedEndpoints(page);
   await page.route("**/api/access/session", (route) =>
-    route.fulfill({ json: sister }),
+    route.fulfill({
+      json:
+        route.request().headers().authorization === `Bearer ${browserToken}`
+          ? sister
+          : { role: "guest" },
+    }),
   );
   let attempts = 0;
   await page.route("**/api/access/logout", (route) => {
@@ -821,16 +910,20 @@ test("the mobile account menu stays onscreen and a failed sign-out can be retrie
   await page.screenshot({
     path: testInfo.outputPath("mobile-account-menu.png"),
   });
-  await page.getByRole("menuitem", { name: "Sign out" }).click();
-  await expect(page.getByRole("alert")).toContainText(
-    "Sign-out could not complete. Try again.",
-  );
-  await expect(
-    page.getByRole("heading", { name: "Family survival" }),
-  ).toBeVisible();
-  await account.click();
-  await page.getByRole("menuitem", { name: "Sign out" }).click();
+  await page
+    .getByRole("menuitem", { name: "Manage Connections", exact: true })
+    .click();
+  await page
+    .getByRole("button", { name: "Sign out of 127.0.0.1:3111", exact: true })
+    .click();
+  await page
+    .getByRole("button", { name: "Sign out of this panel", exact: true })
+    .click();
+  await openSignIn(page);
   await expect(page.getByLabel("Email address")).toBeVisible();
   await expect(account).toHaveCount(0);
-  expect(attempts).toBe(2);
+  await expect.poll(() => attempts).toBe(1);
+  expect(
+    await page.evaluate(() => localStorage.getItem("mc-panel.session.v1")),
+  ).toBeNull();
 });

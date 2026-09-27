@@ -255,6 +255,45 @@ async function desktopBridge(
 }
 
 async function localPanel(page: Page, desktop = false) {
+  if (desktop) {
+    // Explicitly retain coverage of older desktop builds that expose the HTTP
+    // open endpoint. Ordinary browsers now install their real unified adapter.
+    await page.addInitScript(() => {
+      if (window.mcPanelConnections) return;
+      const snapshot = () => ({
+        activeId: "local",
+        localServers: [],
+        panels: [
+          {
+            id: "local",
+            label: "This computer",
+            origin: location.origin,
+            local: true,
+          },
+        ],
+      });
+      const unchanged = async () => snapshot();
+      window.mcPanelConnections = {
+        runtime: "desktop",
+        list: unchanged,
+        open: async (url) => {
+          const response = await fetch("/api/desktop/connections/open", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ url }),
+          });
+          const body = await response.json();
+          if (!response.ok) throw new Error(body.error);
+          return snapshot();
+        },
+        activate: unchanged,
+        disconnect: unchanged,
+        selectLocalServer: unchanged,
+        selectRemoteServer: unchanged,
+        reportServers: async () => {},
+      };
+    });
+  }
   const localCredentials: string[] = [];
   page.on("request", (request) => {
     const path = new URL(request.url()).pathname;
@@ -290,6 +329,9 @@ async function remoteAccount(
   empty = true,
   hostPermissions: string[] = [],
 ) {
+  await page.addInitScript(() =>
+    localStorage.setItem("mc-panel.session.v1", "r".repeat(43)),
+  );
   await localPanel(page);
   const writes: string[] = [];
   page.on("request", (request) => {
@@ -937,6 +979,10 @@ for (const empty of [false, true]) {
     }) => {
       if (desktop)
         await desktopBridge(page, { activeId: "pc-one", localServers: [] });
+      else
+        await page.addInitScript(() =>
+          localStorage.setItem("mc-panel.session.v1", "r".repeat(43)),
+        );
       await localPanel(page);
       await page.route("**/api/access/session", (route) =>
         route.fulfill({
@@ -1161,7 +1207,7 @@ test("the account menu and connection dialog support Escape and restore keyboard
   await account.press("Enter");
   await expect(
     page.getByRole("menuitem", {
-      name: "Sign in to another panel",
+      name: "Add Panel",
       exact: true,
     }),
   ).toBeVisible();
@@ -1174,15 +1220,15 @@ test("the account menu and connection dialog support Escape and restore keyboard
 
   await account.press("Enter");
   const signIn = page.getByRole("menuitem", {
-    name: "Sign in to another panel",
+    name: "Add Panel",
     exact: true,
   });
   await signIn.focus();
   await signIn.press("Enter");
-  const dialog = page.getByRole("dialog", { name: "Connect to a panel" });
+  const dialog = page.getByRole("dialog", { name: "Add Panel", exact: true });
   await expect(dialog).toBeVisible();
   await expect(
-    dialog.getByRole("textbox", { name: "Panel address or invitation link" }),
+    dialog.getByRole("textbox", { name: "Invitation link", exact: true }),
   ).toBeFocused();
   await expect(dialog.getByLabel("Password", { exact: true })).toHaveCount(0);
   await page.keyboard.press("Escape");
@@ -2308,7 +2354,7 @@ test("desktop invitations use the scoped connection bridge and keep credentials 
   await page.goto("/#console");
   const dialog = await openConnection(page, true);
   await expect(dialog).toContainText(
-    "Use the server list to open servers on this computer or a connected panel.",
+    "Use the server list to open servers across your connected panels.",
   );
   await dialog
     .getByLabel("Panel address or invitation link")
@@ -2345,7 +2391,7 @@ test("a remote desktop sign-in screen can return to this computer before authent
 });
 
 for (const invitation of [false, true]) {
-  test(`a browser opens the remote ${invitation ? "invitation" : "sign-in address"} directly`, async ({
+  test(`a browser opens the remote ${invitation ? "invitation" : "sign-in address"} inside the shared workspace`, async ({
     page,
   }) => {
     const { localCredentials } = await localPanel(page);
@@ -2362,10 +2408,50 @@ for (const invitation of [false, true]) {
         body: "<!doctype html><html><body><h1>Remote panel destination</h1></body></html>",
       });
     });
+    const remoteRequests: { path: string; authorization?: string }[] = [];
+    await page.route(`${panelOrigin}/api/**`, (route) => {
+      const request = route.request();
+      const headers = {
+        "Access-Control-Allow-Origin":
+          request.headers().origin || "http://127.0.0.1:3111",
+        "Access-Control-Allow-Headers":
+          "authorization,content-type,x-mc-panel-client,x-server-id",
+        "Access-Control-Allow-Methods": "GET,POST,OPTIONS",
+      };
+      if (request.method() === "OPTIONS")
+        return route.fulfill({ status: 204, headers });
+      remoteRequests.push({
+        path: new URL(request.url()).pathname,
+        authorization: request.headers().authorization,
+      });
+      return route.fulfill({ headers, json: { role: "guest" } });
+    });
     await page.goto("/");
-    const dialog = await openConnection(page, invitation);
+    await page
+      .getByRole("button", {
+        name: "Account menu for Local administrator",
+        exact: true,
+      })
+      .click();
+    await page
+      .getByRole("menuitem", {
+        name: invitation ? "Add Panel" : "Manage Connections",
+        exact: true,
+      })
+      .click();
+    const dialog = page.getByRole("dialog", {
+      name: invitation ? "Add Panel" : "Manage Connections",
+      exact: true,
+    });
+    if (!invitation)
+      await dialog
+        .getByRole("button", { name: "Sign in to existing panel", exact: true })
+        .click();
     await dialog
-      .getByRole("textbox", { name: "Panel address or invitation link" })
+      .getByRole("textbox", {
+        name: invitation ? "Invitation link" : "Panel address",
+        exact: true,
+      })
       .fill(
         invitation
           ? `https://PANEL.example.test:443/#invite=${invitationToken}`
@@ -2378,14 +2464,21 @@ for (const invitation of [false, true]) {
       })
       .click();
     await expect(
-      page.getByRole("heading", { name: "Remote panel destination" }),
+      dialog.getByLabel(invitation ? "New password" : "Password", {
+        exact: true,
+      }),
     ).toBeVisible();
-    await expect(page).toHaveURL(
-      invitation ? invitationUrl : `${panelOrigin}/`,
-    );
-    // Fragments are retained for the remote app but are never sent as part of
-    // its HTTP navigation request.
-    expect(navigations).toEqual([`${panelOrigin}/`]);
+    await expect(dialog).toContainText("panel.example.test");
+    expect(new URL(page.url()).origin).toBe("http://127.0.0.1:3111");
+    // Discovery carries no invitation fragment, password or existing token.
+    expect(navigations).toEqual([]);
+    expect(remoteRequests.length).toBeGreaterThan(0);
+    expect(
+      remoteRequests.every(
+        (request) =>
+          request.path === "/api/access/session" && !request.authorization,
+      ),
+    ).toBe(true);
     expect(desktopOpens).toEqual([]);
     expect(localCredentials).toEqual([]);
   });

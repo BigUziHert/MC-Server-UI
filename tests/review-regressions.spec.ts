@@ -41,19 +41,31 @@ test("a delayed authorization error cannot sign out a replacement account", asyn
       if (
         !delayed &&
         response.status === 401 &&
-        response.url.endsWith("/api/server")
+        new URL(response.url).pathname === "/api/server"
       ) {
         delayed = true;
-        const json = response.json.bind(response);
-        response.json = async () => {
-          (window as any).reviewErrorBodyPending = true;
-          await new Promise<void>((resolve) => {
-            (window as any).releaseReviewErrorBody = resolve;
-          });
-          const result = await json();
-          (window as any).reviewErrorBodyConsumed = true;
-          return result;
-        };
+        // Delay the actual stream: the browser transport bounds and reads
+        // response bodies itself instead of calling the original json method.
+        return new Response(
+          new ReadableStream({
+            async start(controller) {
+              (window as any).reviewErrorBodyPending = true;
+              await new Promise<void>((resolve) => {
+                (window as any).releaseReviewErrorBody = resolve;
+              });
+              try {
+                const bytes = new Uint8Array(await response.arrayBuffer());
+                controller.enqueue(bytes);
+                controller.close();
+              } catch {
+                /* The ended session may have cancelled its stream. */
+              } finally {
+                (window as any).reviewErrorBodyFinished = true;
+              }
+            },
+          }),
+          { status: response.status, headers: response.headers },
+        );
       }
       return response;
     };
@@ -90,18 +102,34 @@ test("a delayed authorization error cannot sign out a replacement account", asyn
       .poll(() => page.evaluate(() => (window as any).reviewErrorBodyPending))
       .toBe(true);
     await other.goto("/review-account-switch");
-    await other.evaluate(
-      (token) => localStorage.setItem("mc-panel.session.v1", token),
-      secondToken,
-    );
+    await other.evaluate((token) => {
+      const key = "mc-panel.browser-connections.v1";
+      const saved = JSON.parse(localStorage.getItem(key)!);
+      const panel = saved.panels.find(
+        (item: { origin: string }) => item.origin === location.origin,
+      );
+      panel.token = token;
+      panel.epoch = crypto.randomUUID();
+      panel.session = {
+        ...panel.session,
+        accountId: "second",
+        userId: "second",
+        email: "second@example.test",
+      };
+      saved.revision++;
+      localStorage.setItem(key, JSON.stringify(saved));
+    }, secondToken);
     const account = page.getByRole("button", {
       name: "Account menu for second@example.test",
       exact: true,
     });
     await expect(account).toBeVisible();
+    await expect(
+      page.getByRole("heading", { name: "Console", exact: true }),
+    ).toBeVisible();
     await page.evaluate(() => (window as any).releaseReviewErrorBody());
     await expect
-      .poll(() => page.evaluate(() => (window as any).reviewErrorBodyConsumed))
+      .poll(() => page.evaluate(() => (window as any).reviewErrorBodyFinished))
       .toBe(true);
     await page.evaluate(
       () =>
@@ -111,7 +139,14 @@ test("a delayed authorization error cannot sign out a replacement account", asyn
     );
     await expect(account).toBeVisible();
     expect(
-      await page.evaluate(() => localStorage.getItem("mc-panel.session.v1")),
+      await page.evaluate(() => {
+        const saved = JSON.parse(
+          localStorage.getItem("mc-panel.browser-connections.v1")!,
+        );
+        return saved.panels.find(
+          (panel: { origin: string }) => panel.origin === location.origin,
+        ).token;
+      }),
     ).toBe(secondToken);
     await expect(page.getByLabel("Email address", { exact: true })).toHaveCount(
       0,
@@ -628,15 +663,16 @@ test("Ctrl and Cmd K respect modal focus and resume after closing", async ({
 test("remote address stays unavailable until verified host details arrive", async ({
   page,
 }) => {
-  await page.addInitScript(() =>
+  await page.addInitScript(() => {
+    localStorage.setItem("mc-panel.session.v1", "a".repeat(43));
     Object.defineProperty(navigator, "clipboard", {
       value: {
         writeText: async (text: string) => {
           (window as any).copied = text;
         },
       },
-    }),
-  );
+    });
+  });
   const member = {
     role: "subuser",
     accountId: "loading-address",
@@ -668,7 +704,7 @@ test("remote address stays unavailable until verified host details arrive", asyn
   const gate = new Promise<void>((resolve) => {
     release = resolve;
   });
-  await page.route(/\/api\/server$/, async (route) => {
+  await page.route(/\/api\/server(?:\?|$)/, async (route) => {
     await gate;
     await route.fulfill({
       json: {
@@ -703,6 +739,9 @@ test("remote address stays unavailable until verified host details arrive", asyn
 test("signing out clears private clipboard metadata before another account opens files", async ({
   page,
 }) => {
+  await page.addInitScript(() =>
+    localStorage.setItem("mc-panel.session.v1", "a".repeat(43)),
+  );
   const permissions = [
     "server.view",
     "file.read",
@@ -710,6 +749,7 @@ test("signing out clears private clipboard metadata before another account opens
     "file.create",
   ];
   let account = "first";
+  let signedIn = true;
   const server = () => ({
     id: account === "first" ? "private-server" : "public-server",
     name:
@@ -735,11 +775,16 @@ test("signing out clears private clipboard metadata before another account opens
   await page.route("**/api/**", (route) => {
     const pathname = new URL(route.request().url()).pathname;
     const reply = (json: unknown) => route.fulfill({ json });
-    if (pathname === "/api/access/session") return reply(session());
-    if (pathname === "/api/access/logout") return reply({ ok: true });
+    if (pathname === "/api/access/session")
+      return reply(signedIn ? session() : { role: "guest" });
+    if (pathname === "/api/access/logout") {
+      signedIn = false;
+      return reply({ ok: true });
+    }
     if (pathname === "/api/access/login") {
       account = "second";
-      return reply(session());
+      signedIn = true;
+      return reply({ ...session(), sessionToken: "b".repeat(43) });
     }
     if (pathname === "/api/servers")
       return reply({
@@ -781,10 +826,34 @@ test("signing out clears private clipboard metadata before another account opens
       exact: true,
     })
     .click();
-  await page.getByRole("menuitem", { name: "Sign out", exact: true }).click();
-  await page.getByLabel("Email address").fill("second@example.test");
-  await page.getByLabel("Password", { exact: true }).fill("a fixture password");
-  await page.getByRole("button", { name: "Sign in", exact: true }).click();
+  await page
+    .getByRole("menuitem", { name: "Manage Connections", exact: true })
+    .click();
+  const manager = page.getByRole("dialog", {
+    name: "Manage Connections",
+    exact: true,
+  });
+  const host = new URL(page.url()).host;
+  await manager
+    .getByRole("button", { name: `Sign out of ${host}`, exact: true })
+    .click();
+  await manager
+    .getByRole("button", { name: "Sign out of this panel", exact: true })
+    .click();
+  await manager
+    .getByRole("button", { name: `Sign in to ${host}`, exact: true })
+    .click();
+  await manager.getByLabel("Email address").fill("second@example.test");
+  await manager
+    .getByLabel("Password", { exact: true })
+    .fill("a fixture password");
+  await manager.getByRole("button", { name: "Sign in", exact: true }).click();
+  await expect(
+    manager.getByRole("button", { name: `Sign out of ${host}`, exact: true }),
+  ).toBeVisible();
+  await manager
+    .getByRole("button", { name: "Close panel connections", exact: true })
+    .click();
   await page.getByRole("link", { name: "File Manager", exact: true }).click();
   await expect(page.getByRole("status", { name: "Copied files" })).toHaveCount(
     0,

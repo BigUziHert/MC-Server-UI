@@ -907,7 +907,7 @@ test("editable server names and the selected workspace persist across reloads", 
     page.getByRole("heading", { name: "E2E Creative Lab", exact: true }),
   ).toBeVisible();
   await expect(serverButton(page, created.id)).toHaveAccessibleName(
-    "Select server E2E Creative Lab",
+    "Select server E2E Creative Lab on This computer",
   );
   await page.reload();
   await expect(serverButton(page, created!.id)).toHaveAttribute(

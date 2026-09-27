@@ -35,6 +35,8 @@ export default defineConfig({
     "remote-server-creation.spec.ts",
     "panel-connections.spec.ts",
     "unified-workspace.spec.ts",
+    "browser-workspace.spec.ts",
+    "browser-transport.spec.ts",
     "unified-connections.spec.ts",
     "unified-transport.spec.ts",
     "direct-remote.spec.ts",

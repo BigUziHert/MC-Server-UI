@@ -19,11 +19,13 @@ export type ConnectionMode = "signin" | "invitation";
 export default function ConnectPanel({
   desktop,
   initialMode = "signin",
+  initialUrl = "",
   onClose,
   onOpened,
 }: {
   desktop: boolean;
   initialMode?: ConnectionMode;
+  initialUrl?: string;
   onClose: () => void;
   onOpened: () => void;
 }) {
@@ -36,7 +38,7 @@ export default function ConnectPanel({
   const [mode, setMode] = useState<ConnectionMode>(
     unified ? "invitation" : initialMode,
   );
-  const [address, setAddress] = useState("");
+  const [address, setAddress] = useState(initialUrl);
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
   const [target, setTarget] = useState<{
@@ -313,8 +315,8 @@ export default function ConnectPanel({
         </>
       )}
       <p className="connect-panel-note">
-        {inDesktop
-          ? "Use the server list to open servers on this computer or a connected panel."
+        {inDesktop || unified
+          ? "Use the server list to open servers across your connected panels."
           : "The panel opens in this tab."}{" "}
         Your local servers keep running.
       </p>

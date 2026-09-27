@@ -33,6 +33,14 @@ function invitationToken() {
 }
 
 export default function RemoteAccess() {
+  return window.mcPanelConnections?.runtime === "browser" ? (
+    <App />
+  ) : (
+    <OriginAccess />
+  );
+}
+
+function OriginAccess() {
   const [session, setSession] = useState<Session | null>(null);
   const [error, setError] = useState("");
   const [attempt, setAttempt] = useState(0);

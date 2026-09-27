@@ -101,7 +101,7 @@ for (const { width, remote } of [
       line(6, "ERROR", "World save failed"),
       line(7, "fatal", "Plugin failed to load"),
     ];
-    await page.route("**/api/console", (route) =>
+    await page.route(/\/api\/console(?:\?|$)/, (route) =>
       route.fulfill({ json: { lines } }),
     );
     await page.addInitScript(
@@ -109,6 +109,9 @@ for (const { width, remote } of [
       serverId,
     );
     if (remote) {
+      await page.addInitScript(() =>
+        localStorage.setItem("mc-panel.session.v1", "c".repeat(43)),
+      );
       await page.route("**/api/access/session", (route) =>
         route.fulfill({
           json: {
@@ -125,9 +128,12 @@ for (const { width, remote } of [
         const fleet = await response.json();
         await route.fulfill({
           json: {
-            servers: fleet.servers.filter(
-              (server: { id: string }) => server.id === serverId,
-            ),
+            servers: fleet.servers
+              .filter((server: { id: string }) => server.id === serverId)
+              .map((server: Record<string, unknown>) => ({
+                ...server,
+                accessPermissions: ["control.console"],
+              })),
             defaultServerId: serverId,
           },
         });

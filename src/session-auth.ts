@@ -1,3 +1,5 @@
+import { getBrowserPanelTransport } from "./panel-transport";
+
 // Web Storage is origin-scoped (scheme + hostname + port); cookies are not.
 // Credentials never enter resource URLs or requests to another origin.
 const key = "mc-panel.session.v1";
@@ -47,6 +49,9 @@ export function authenticatedFetch(input: string, options: RequestInit = {}) {
   const proxy = /^\/api\/desktop\/panels\/[^/?#]+\/proxy\/api(?:\/|$)/.test(
     target.pathname,
   );
+  const browserTransport = getBrowserPanelTransport();
+  if (proxy && browserTransport)
+    return browserTransport.fetch(target.pathname + target.search, options);
   const token = proxy ? null : memoryToken;
   if (proxy) headers.delete("Authorization");
   if (token) headers.set("Authorization", `Bearer ${token}`);

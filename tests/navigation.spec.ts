@@ -4,7 +4,33 @@ import {
   serverButton,
   removeTestServer,
 } from "./server-fixtures";
-import { test as base, expect } from "@playwright/test";
+import { test as base, expect, type Page } from "@playwright/test";
+
+async function nativeSelectionFixture(page: Page) {
+  // These cases exercise the legacy native selection persistence API. The
+  // browser workspace persists its panel/server tuple in its own registry.
+  await page.addInitScript(() => {
+    Object.assign(window, {
+      mcPanelConnections: {
+        runtime: "desktop",
+        list: async () => ({
+          activeId: "local",
+          localServers: [],
+          panels: [
+            {
+              id: "local",
+              label: "This computer",
+              origin: location.origin,
+              local: true,
+              signedIn: true,
+              servers: [],
+            },
+          ],
+        }),
+      },
+    });
+  });
+}
 
 const test = base.extend<{ serverId: string }>({
   serverId: async ({ request }, use) => {
@@ -31,6 +57,21 @@ test.beforeEach(async ({ page, serverId }) => {
   await page.addInitScript((id) => {
     if (!localStorage.getItem("mc-panel.active-server"))
       localStorage.setItem("mc-panel.active-server", id);
+    // Browser navigation cases start from the current persisted format.
+    // Legacy-key migration has separate controller coverage and an extra
+    // validation request must not consume these cases' UI retry fixtures.
+    const key = "mc-panel.browser-connections.v1";
+    if (!localStorage.getItem(key))
+      localStorage.setItem(
+        key,
+        JSON.stringify({
+          version: 1,
+          revision: 0,
+          homeBootstrapped: true,
+          panels: [],
+          selectedServer: { panelId: "local", serverId: id },
+        }),
+      );
   }, serverId);
 });
 
@@ -74,6 +115,7 @@ test("desktop selection is restored before scoped requests and persists subseque
   request,
   serverId,
 }) => {
+  await nativeSelectionFixture(page);
   const fleet = await (await request.get("/api/servers")).json();
   const other = fleet.servers.find(
     (server: { id: string }) => server.id !== serverId,
@@ -151,9 +193,13 @@ test("browser server selection survives reload and all new workspace requests ke
   await selectServer(page, other.id);
   await expect
     .poll(() =>
-      page.evaluate(() => localStorage.getItem("mc-panel.active-server")),
+      page.evaluate(
+        () =>
+          JSON.parse(localStorage.getItem("mc-panel.browser-connections.v1")!)
+            .selectedServer,
+      ),
     )
-    .toBe(other.id);
+    .toEqual({ panelId: "local", serverId: other.id });
   const scopedIds: string[] = [];
   page.on("request", (request) => {
     if (/\/api\/(?:server|console)(?:\?|$|\/)/.test(request.url()))
@@ -172,6 +218,7 @@ test("a failed desktop selection read waits for retry without opening the defaul
   page,
   serverId,
 }) => {
+  await nativeSelectionFixture(page);
   let available = false;
   await page.route("**/api/desktop/selection", (route) =>
     route.fulfill(
@@ -257,6 +304,7 @@ test("native selection flush retries once after failure and drains choices queue
   request,
   serverId,
 }) => {
+  await nativeSelectionFixture(page);
   const fleet = await (await request.get("/api/servers")).json();
   const other = fleet.servers.find(
     (server: { id: string }) => server.id !== serverId,

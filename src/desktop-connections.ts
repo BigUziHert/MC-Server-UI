@@ -54,6 +54,7 @@ declare global {
   interface Window {
     mcPanelUpdates?: { close: () => void };
     mcPanelConnections?: {
+      runtime?: "desktop" | "browser";
       unified?: boolean;
       list: () => Promise<PanelConnections>;
       open: (url: string) => Promise<PanelConnections>;

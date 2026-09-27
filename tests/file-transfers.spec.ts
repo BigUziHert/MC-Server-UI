@@ -89,6 +89,9 @@ test("shared panel readers download files, folders, and selections to their comp
     await create("world copy/nested", "level.txt", "file", "World contents\n");
     await create("", "unselected.txt", "file", "Leave this on the server.\n");
     const permissions = ["file.read", "file.read-content"];
+    await page.addInitScript(() =>
+      localStorage.setItem("mc-panel.session.v1", "d".repeat(43)),
+    );
     const serverInfo = await (
       await request.get("/api/server", { headers })
     ).json();
@@ -111,6 +114,17 @@ test("shared panel readers download files, folders, and selections to their comp
         },
       }),
     );
+    // This test serves real file bytes from the isolated owner runtime while
+    // mocking the shared account's authorization. Model the gateway's resource
+    // ticket response without changing the download handlers being exercised.
+    await page.route("**/api/access/download", (route) => {
+      const target = new URL(
+        route.request().postDataJSON().url,
+        route.request().url(),
+      );
+      target.searchParams.set("downloadTicket", "t".repeat(43));
+      return route.fulfill({ json: { url: target.pathname + target.search } });
+    });
     await page.goto("/#files");
     await expect(
       page.getByRole("heading", { name: "File Manager", exact: true }),

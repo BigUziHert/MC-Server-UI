@@ -95,6 +95,9 @@ test("browser origins isolate sign-ins, replay protection, icons and streamed do
     async function accept(page: Page, invitation: string) {
       await page.goto(invitation);
       await page
+        .getByRole("button", { name: "Continue with invitation", exact: true })
+        .click();
+      await page
         .getByLabel("New password", { exact: true })
         .fill("Origin isolated password!");
       await page
@@ -110,7 +113,7 @@ test("browser origins isolate sign-ins, replay protection, icons and streamed do
     await accept(pageA, A.invitation);
     await pageC.goto(`${C.origin}/`);
     await expect(
-      pageC.getByRole("heading", { name: "Welcome to your server" }),
+      pageC.getByRole("heading", { name: "Welcome to MC Panel" }),
     ).toBeVisible();
     // These assertions inspect C's own incoming headers, never A's credential.
     expect(
@@ -158,8 +161,28 @@ test("browser origins isolate sign-ins, replay protection, icons and streamed do
     await pageC
       .getByRole("button", { name: `Account menu for ${C.email}` })
       .click();
-    await pageC.getByRole("menuitem", { name: "Sign out" }).click();
-    await expect(pageC.getByLabel("Email address")).toBeVisible();
+    await pageC
+      .getByRole("menuitem", { name: "Manage Connections", exact: true })
+      .click();
+    const connections = pageC.getByRole("dialog", {
+      name: "Manage Connections",
+      exact: true,
+    });
+    await connections
+      .getByRole("button", {
+        name: `Sign out of ${new URL(C.origin).host}`,
+        exact: true,
+      })
+      .click();
+    await connections
+      .getByRole("button", { name: "Sign out of this panel", exact: true })
+      .click();
+    await expect(
+      connections.getByRole("button", {
+        name: `Sign in to ${new URL(C.origin).host}`,
+        exact: true,
+      }),
+    ).toBeVisible();
     await pageA.reload();
     await expect(
       pageA.getByRole("button", {
@@ -186,7 +209,21 @@ test("browser origins isolate sign-ins, replay protection, icons and streamed do
       restarted.getByRole("heading", { name: "A private server", exact: true }),
     ).toBeVisible();
     await restarted.goto(C.origin);
-    await expect(restarted.getByLabel("Email address")).toBeVisible();
+    await expect(
+      restarted.getByRole("heading", { name: "Welcome to MC Panel" }),
+    ).toBeVisible();
+    await restarted
+      .getByRole("button", { name: "Account menu for Signed out", exact: true })
+      .click();
+    await restarted
+      .getByRole("menuitem", { name: "Manage Connections", exact: true })
+      .click();
+    await expect(
+      restarted.getByRole("button", {
+        name: `Sign in to ${new URL(C.origin).host}`,
+        exact: true,
+      }),
+    ).toBeVisible();
   } finally {
     await context?.close();
     for (const { server, fleet } of resources) {

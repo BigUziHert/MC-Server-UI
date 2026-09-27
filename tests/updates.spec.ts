@@ -48,6 +48,29 @@ test("Panel Settings opens update errors without losing the settings dialog", as
 test("restarting to update waits for the selected server to finish saving", async ({
   page,
 }) => {
+  // Exercise the native renderer's persisted-selection barrier. The browser
+  // workspace saves selection through its own connection controller instead.
+  await page.addInitScript(() => {
+    Object.assign(window, {
+      mcPanelConnections: {
+        runtime: "desktop",
+        list: async () => ({
+          activeId: "local",
+          localServers: [],
+          panels: [
+            {
+              id: "local",
+              label: "This computer",
+              origin: location.origin,
+              local: true,
+              signedIn: true,
+              servers: [],
+            },
+          ],
+        }),
+      },
+    });
+  });
   let releaseSave: (() => void) | undefined;
   const saveGate = new Promise<void>((resolve) => {
     releaseSave = resolve;

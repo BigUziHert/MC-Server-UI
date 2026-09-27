@@ -82,14 +82,22 @@ export default function PanelAccount({
   const [error, setError] = useState("");
   const [manage, setManage] = useState(false);
   const unified = window.mcPanelConnections?.unified === true;
-  const targetPanel = connections?.panels.find(
-    (panel) =>
-      panel.id ===
-      (targetPanelId ??
-        workspace?.selected?.panelId ??
-        connections.selectedServer?.panelId ??
-        "local"),
-  );
+  const targetPanel =
+    connections?.panels.find(
+      (panel) =>
+        panel.id ===
+        (targetPanelId ??
+          workspace?.selected?.panelId ??
+          connections.selectedServer?.panelId ??
+          "local"),
+    ) ??
+    (unified
+      ? (connections?.panels.find((panel) => panel.local) ??
+        connections?.panels.find((panel) => panel.signedIn) ??
+        connections?.panels[0])
+      : undefined);
+  const hasLocalOwner =
+    !unified || connections?.panels.some((panel) => panel.local);
   async function perform(action: () => Promise<unknown>) {
     if (busy) return;
     setBusy(true);
@@ -184,11 +192,13 @@ export default function PanelAccount({
               }
             : session
               ? { name: session.email, detail: window.location.host }
-              : {
-                  name: "Local administrator",
-                  detail: "This computer",
-                  initial: "L",
-                }
+              : hasLocalOwner
+                ? {
+                    name: "Local administrator",
+                    detail: "This computer",
+                    initial: "L",
+                  }
+                : { name: "Not signed in", detail: "Your panels" }
         }
         status={
           unified && targetPanel && !targetPanel.local
@@ -209,7 +219,12 @@ export default function PanelAccount({
               }
             : session
               ? { label: "Signed in · Shared access", tone: "active" }
-              : { label: "Local access", tone: "neutral" }
+              : {
+                  label: hasLocalOwner
+                    ? "Local access"
+                    : "Add a panel or sign in",
+                  tone: "neutral",
+                }
         }
         actions={actions}
       />

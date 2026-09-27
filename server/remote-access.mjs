@@ -21,6 +21,44 @@ const failure = (status, message) =>
 const read = (req) => ["GET", "HEAD"].includes(req.method);
 const revokedAccessMessage =
   "Your access to this panel was revoked. Contact the panel owner.";
+const browserMethods = new Set([
+  "GET",
+  "HEAD",
+  "POST",
+  "PUT",
+  "PATCH",
+  "DELETE",
+]);
+const browserHeaders = new Set([
+  "authorization",
+  "content-type",
+  "x-server-id",
+  "x-mc-panel-client",
+]);
+function browserWorkspaceOrigin(value) {
+  if (typeof value !== "string" || value.length > 2048) return false;
+  try {
+    const url = new URL(value);
+    return (
+      url.origin === value &&
+      (url.protocol === "https:" ||
+        (url.protocol === "http:" &&
+          (url.hostname === "localhost" ||
+            url.hostname === "[::1]" ||
+            /^127(?:\.\d{1,3}){3}$/.test(url.hostname))))
+    );
+  } catch {
+    return false;
+  }
+}
+function browserResponseHeaders(res, origin) {
+  res.vary("Origin");
+  res.set({
+    "Access-Control-Allow-Origin": origin,
+    "Access-Control-Expose-Headers":
+      "Content-Disposition, Content-Length, Content-Range, Accept-Ranges, ETag, Last-Modified, Retry-After",
+  });
+}
 
 export function isHostCreationRoute(req) {
   if (read(req))
@@ -271,10 +309,75 @@ export function createRemoteGateway({
       return next(
         failure(403, "This address is not configured for remote access."),
       );
+    const requestOrigin = req.headers.origin;
+    const expectedOrigin =
+      settings.transport === "direct" ? `https://${host}` : origin;
+    const foreignOrigin =
+      requestOrigin !== undefined && requestOrigin !== expectedOrigin;
+    const apiRequest = /^\/api(?:\/|$)/i.test(req.path);
+    let browserWorkspace = false;
+    if (foreignOrigin && apiRequest) {
+      if (!browserWorkspaceOrigin(requestOrigin))
+        return next(failure(403, "Use a secure browser workspace origin."));
+      if (req.method === "OPTIONS") {
+        const method = req.headers["access-control-request-method"];
+        const requested = req.headers["access-control-request-headers"];
+        const headers =
+          typeof requested === "string" && requested.length <= 1024
+            ? requested
+                .toLowerCase()
+                .split(",")
+                .map((header) => header.trim())
+            : [];
+        const privateNetwork =
+          req.headers["access-control-request-private-network"];
+        if (
+          !browserMethods.has(method) ||
+          !headers.includes("x-mc-panel-client") ||
+          headers.some((header) => !browserHeaders.has(header)) ||
+          (privateNetwork !== undefined && privateNetwork !== "true")
+        )
+          return next(
+            failure(403, "This browser API preflight is not supported."),
+          );
+        browserResponseHeaders(res, requestOrigin);
+        res.vary("Access-Control-Request-Method");
+        res.vary("Access-Control-Request-Headers");
+        res.vary("Access-Control-Request-Private-Network");
+        res.set({
+          "Access-Control-Allow-Methods": [...browserMethods].join(", "),
+          "Access-Control-Allow-Headers": [...browserHeaders].join(", "),
+          "Access-Control-Max-Age": "600",
+        });
+        // This answers browser private-network preflights only on the remote
+        // bearer gateway. Local owner APIs never receive this permission.
+        if (privateNetwork === "true")
+          res.set("Access-Control-Allow-Private-Network", "true");
+        return res.status(204).end();
+      }
+      browserWorkspace =
+        req.headers["x-mc-panel-client"] === "browser" &&
+        browserMethods.has(req.method);
+      if (browserWorkspace) {
+        browserResponseHeaders(res, requestOrigin);
+        // A custom header opts into this transport; it is never authentication.
+        // Login and invitations may omit a bearer, but still require JSON.
+        if (
+          req.method === "POST" &&
+          /^\/api\/access\/(?:login|accept)\/?$/i.test(req.path) &&
+          !/^application\/json(?:\s*;|$)/i.test(
+            req.headers["content-type"] ?? "",
+          )
+        )
+          return next(
+            failure(415, "Browser sign-in and invitations require JSON."),
+          );
+      }
+    }
     if (
       !read(req) &&
-      (req.headers.origin !==
-        (settings.transport === "direct" ? `https://${host}` : origin) ||
+      !browserWorkspace &&
+      (req.headers.origin !== expectedOrigin ||
         req.headers["sec-fetch-site"] === "cross-site")
     )
       return next(

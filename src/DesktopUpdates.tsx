@@ -1,6 +1,7 @@
-import { useEffect, useRef, useState } from "react";
+import { useContext, useEffect, useRef, useState } from "react";
 import { ArrowDownToLine, RefreshCw, X } from "lucide-react";
 import { api, flushDesktopSelection, post } from "./api";
+import { DesktopWorkspaceContext } from "./workspace-target";
 import "./updates.css";
 
 type UpdateState = {
@@ -19,6 +20,11 @@ export default function DesktopUpdates({
 }: {
   remote?: boolean;
 }) {
+  const workspace = useContext(DesktopWorkspaceContext);
+  if (window.mcPanelConnections?.runtime === "browser")
+    return workspace?.connections?.panels.some((panel) => panel.local) ? (
+      <LocalUpdates />
+    ) : null;
   return remote ? <RemoteUpdates /> : <LocalUpdates />;
 }
 

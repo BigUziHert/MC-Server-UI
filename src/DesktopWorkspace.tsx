@@ -45,7 +45,8 @@ function managerAllowedFor(
   connections: PanelConnections | null,
   requireConnection = true,
 ) {
-  if (value.panelId === "local") return true;
+  if (value.panelId === "local")
+    return connections?.panels.some((panel) => panel.local) === true;
   const host = connections?.panels.find((item) => item.id === value.panelId);
   if (
     !host?.signedIn ||
@@ -63,10 +64,16 @@ function managerAllowedFor(
 
 export default function DesktopWorkspace() {
   const connections = useDesktopConnections();
+  const hasLocalOwner =
+    connections?.panels.some((panel) => panel.local) === true;
   const currentConnections = useRef(connections);
   currentConnections.current = connections;
   const [localServers, setLocalServers] = useState<ServerRecord[]>([]);
   const [localLoading, setLocalLoading] = useState(true);
+  const [localRosterLoaded, setLocalRosterLoaded] = useState(false);
+  const [localRosterSelection, setLocalRosterSelection] = useState<
+    string | null
+  >(null);
   const [localError, setLocalError] = useState("");
   const [selected, setSelected] = useState<WorkspaceSelection | null>(null);
   const [manager, setManager] = useState<Manager | null>(null);
@@ -82,7 +89,26 @@ export default function DesktopWorkspace() {
   const currentSelection = useRef(selected);
   currentSelection.current = selected;
   const [chooseHost, setChooseHost] = useState<Manager["step"] | null>(null);
-  const [connection, setConnection] = useState<ConnectionMode | null>(null);
+  const [invitationUrl, setInvitationUrl] = useState(() =>
+    window.mcPanelConnections?.runtime === "browser" &&
+    new URLSearchParams(window.location.hash.slice(1)).has("invite")
+      ? window.location.href
+      : "",
+  );
+  const [connection, setConnection] = useState<ConnectionMode | null>(
+    invitationUrl ? "invitation" : null,
+  );
+  useEffect(() => {
+    if (window.mcPanelConnections?.runtime !== "browser") return;
+    const openInvitation = () => {
+      if (!new URLSearchParams(window.location.hash.slice(1)).has("invite"))
+        return;
+      setInvitationUrl(window.location.href);
+      setConnection("invitation");
+    };
+    window.addEventListener("hashchange", openInvitation);
+    return () => window.removeEventListener("hashchange", openInvitation);
+  }, []);
   const [managingConnections, setManagingConnections] = useState(false);
   const manageConnections = useCallback(() => setManagingConnections(true), []);
   const [notice, setNotice] = useState("");
@@ -117,18 +143,34 @@ export default function DesktopWorkspace() {
     return () => window.removeEventListener("beforeunload", warn);
   }, []);
   useEffect(() => {
+    if (!hasLocalOwner) {
+      setLocalServers([]);
+      setLocalRosterLoaded(false);
+      setLocalRosterSelection(null);
+      setLocalError("");
+      setLocalLoading(false);
+      return;
+    }
+    setLocalLoading(true);
     let active = true;
     let running = false;
     const controller = new AbortController();
     const load = async () => {
       if (running) return;
       running = true;
+      const requestedSelection = currentConnections.current?.selectedServer;
+      const requestedLocalId =
+        requestedSelection?.panelId === "local"
+          ? requestedSelection.serverId
+          : null;
       try {
         const result = await api<{ servers: ServerRecord[] }>("/servers", {
           signal: controller.signal,
         });
         if (active) {
           setLocalServers(result.servers);
+          setLocalRosterLoaded(true);
+          setLocalRosterSelection(requestedLocalId);
           setLocalError("");
         }
       } catch (cause) {
@@ -152,7 +194,7 @@ export default function DesktopWorkspace() {
       clearInterval(timer);
       window.removeEventListener("focus", load);
     };
-  }, [refreshRevision]);
+  }, [refreshRevision, hasLocalOwner]);
   useEffect(() => {
     if (connections) setSelected(connections.selectedServer ?? null);
   }, [
@@ -160,7 +202,7 @@ export default function DesktopWorkspace() {
     connections?.selectedServer?.serverId,
   ]);
   const select = useCallback(
-    (panelId: string, serverId: string | null) => {
+    (panelId: string, serverId: string | null, preservePage = false) => {
       const request = ++selectionRequest.current;
       const previousManager = currentManager.current;
       setSelecting(true);
@@ -169,7 +211,8 @@ export default function DesktopWorkspace() {
           if (!alive.current || selectionRequest.current !== request) return;
           setSelected(serverId ? { panelId, serverId } : null);
           if (currentManager.current === previousManager) changeManager(null);
-          window.location.hash = "console";
+          if (!preservePage || !window.location.hash)
+            window.location.hash = "console";
           refresh();
         })
         .catch((cause) => {
@@ -188,14 +231,26 @@ export default function DesktopWorkspace() {
       !connections ||
       connections.ready === false ||
       localLoading ||
-      selected ||
-      selecting ||
-      connections.selectedServer
+      selecting
     )
       return;
+    if (
+      selected?.panelId === "local" &&
+      connections.selectedServer?.panelId === "local" &&
+      connections.selectedServer.serverId === selected.serverId &&
+      hasLocalOwner &&
+      localRosterLoaded &&
+      localRosterSelection === selected.serverId &&
+      !localError &&
+      !localServers.some((item) => item.id === selected.serverId)
+    ) {
+      select("local", localServers[0]?.id ?? null, true);
+      return;
+    }
+    if (selected || connections.selectedServer) return;
     const local = localServers[0];
     if (local) {
-      select("local", local.id);
+      select("local", local.id, true);
       return;
     }
     const remote = connections.panels.find(
@@ -206,8 +261,19 @@ export default function DesktopWorkspace() {
         panel.session &&
         panel.servers?.length,
     );
-    if (remote?.servers?.[0]) select(remote.id, remote.servers[0].id);
-  }, [connections, localLoading, localServers, selected, selecting, select]);
+    if (remote?.servers?.[0]) select(remote.id, remote.servers[0].id, true);
+  }, [
+    connections,
+    hasLocalOwner,
+    localRosterLoaded,
+    localRosterSelection,
+    localError,
+    localLoading,
+    localServers,
+    selected,
+    selecting,
+    select,
+  ]);
   useEffect(() => {
     if (!notice) return;
     const timer = setTimeout(() => setNotice(""), 7000);
@@ -238,7 +304,11 @@ export default function DesktopWorkspace() {
     if (!leases.current.has(key))
       leases.current.set(key, () => {
         if (!alive.current) return false;
-        if (panelId === "local") return true;
+        if (panelId === "local")
+          return (
+            currentConnections.current?.panels.some((item) => item.local) ===
+            true
+          );
         const current = currentConnections.current?.panels.find(
           (item) => item.id === panelId,
         );
@@ -301,19 +371,19 @@ export default function DesktopWorkspace() {
       editing,
     });
   };
+  const creationHosts = panels.filter(
+    (item) =>
+      item.local ||
+      (item.signedIn &&
+        item.connectionState === "connected" &&
+        item.session?.hostPermissions?.includes("server.create")),
+  );
+  const canAddServer = creationHosts.length > 0;
   const add = (step: Manager["step"] = "choice") => {
-    if (
-      panels.some(
-        (item) =>
-          !item.local &&
-          item.signedIn &&
-          item.connectionState === "connected" &&
-          item.session?.hostPermissions?.includes("server.create"),
-      )
-    ) {
+    if (creationHosts.length > 1) {
       managerRevision.current++;
       setChooseHost(step);
-    } else openManager("local", step);
+    } else if (creationHosts[0]) openManager(creationHosts[0].id, step);
   };
   const managerPanel =
     manager?.panelId !== "local"
@@ -364,7 +434,7 @@ export default function DesktopWorkspace() {
                       servers={roster}
                       selected={server}
                       onSelect={(id) => select(selected!.panelId, id)}
-                      onAdd={() => add()}
+                      onAdd={canAddServer ? () => add() : undefined}
                       onSettings={
                         !remote || permissions?.includes("server.update")
                           ? (status) =>
@@ -398,7 +468,7 @@ export default function DesktopWorkspace() {
                         <ServerSwitcher
                           servers={localServers}
                           onSelect={(id) => select("local", id)}
-                          onAdd={() => add()}
+                          onAdd={canAddServer ? () => add() : undefined}
                         />
                       </nav>
                       <div className="sidebar-bottom">
@@ -440,13 +510,43 @@ export default function DesktopWorkspace() {
                             Reconnect
                           </button>
                         )}
-                        {localError && <p role="alert">{localError}</p>}
+                        {localError && (
+                          <div role="alert">
+                            <p>{localError}</p>
+                            <button className="btn primary" onClick={refresh}>
+                              Retry connection
+                            </button>
+                          </div>
+                        )}
                       </main>
+                    </div>
+                  </div>
+                ) : localError ? (
+                  <div className="server-workspace-loading">
+                    <div role="alert">
+                      <h1>Unable to load your servers</h1>
+                      <p>{localError}</p>
+                      <button className="btn primary" onClick={refresh}>
+                        Retry connection
+                      </button>
+                    </div>
+                    <div className="workspace-account-state">
+                      <ServerSwitcher
+                        servers={localServers}
+                        onSelect={(id) => select("local", id)}
+                      />
+                      <PanelAccount onConnect={setConnection} />
                     </div>
                   </div>
                 ) : (
                   <EmptyFleet
-                    canAddServer
+                    canAddServer={canAddServer}
+                    session={
+                      hasLocalOwner
+                        ? undefined
+                        : (panels.find((item) => item.signedIn && item.session)
+                            ?.session ?? undefined)
+                    }
                     onAdd={add}
                     onConnect={setConnection}
                     notify={setNotice}
@@ -464,11 +564,29 @@ export default function DesktopWorkspace() {
       )}
       {connection && (
         <ConnectPanel
-          desktop
+          key={invitationUrl}
+          desktop={window.mcPanelConnections?.runtime !== "browser"}
           initialMode={connection}
-          onClose={() => setConnection(null)}
+          initialUrl={invitationUrl}
+          onClose={() => {
+            setConnection(null);
+            setInvitationUrl("");
+            if (invitationUrl)
+              window.history.replaceState(
+                null,
+                "",
+                window.location.pathname + window.location.search,
+              );
+          }}
           onOpened={() => {
             setConnection(null);
+            setInvitationUrl("");
+            if (invitationUrl)
+              window.history.replaceState(
+                null,
+                "",
+                window.location.pathname + window.location.search,
+              );
             refresh();
           }}
         />
@@ -640,10 +758,12 @@ function ChooseHost({
         installations stay on that computer.
       </p>
       <div className="workspace-host-choices">
-        <button className="btn" onClick={() => onSelect("local")}>
-          <Plus size={18} />
-          This computer
-        </button>
+        {panels.some((panel) => panel.local) && (
+          <button className="btn" onClick={() => onSelect("local")}>
+            <Plus size={18} />
+            This computer
+          </button>
+        )}
         {panels
           .filter(
             (panel) =>

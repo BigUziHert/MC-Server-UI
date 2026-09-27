@@ -52,7 +52,7 @@ export function writePreference(
 
 export async function initializeDesktopPreferences() {
   const connections = window.mcPanelConnections;
-  if (!connections) return;
+  if (!connections || connections.runtime === "browser") return;
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 4000);
   try {

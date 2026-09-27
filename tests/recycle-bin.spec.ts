@@ -1440,6 +1440,9 @@ test("recovery permission loss stops observation and remaining deletions until t
 test("a recovery queue cannot send remaining deletions with a newly signed-in account", async ({
   page,
 }) => {
+  await page.addInitScript(() =>
+    localStorage.setItem("mc-panel.session.v1", "a".repeat(43)),
+  );
   const permissions = [
     "file.read",
     "backup.read",
@@ -1495,14 +1498,17 @@ test("a recovery queue cannot send remaining deletions with a newly signed-in ac
     const url = new URL(request.url());
     const path = url.pathname;
     const reply = (json: unknown) => route.fulfill({ json });
-    if (path === "/api/access/session") return reply(session(currentUser));
+    if (path === "/api/access/session")
+      return reply(
+        currentUser === "guest" ? { role: "guest" } : session(currentUser),
+      );
     if (path === "/api/access/logout") {
       currentUser = "guest";
       return reply({ ok: true });
     }
     if (path === "/api/access/login") {
       currentUser = "second";
-      return reply(session(currentUser));
+      return reply({ ...session(currentUser), sessionToken: "b".repeat(43) });
     }
     if (path === "/api/servers")
       return reply({
@@ -1562,17 +1568,48 @@ test("a recovery queue cannot send remaining deletions with a newly signed-in ac
         exact: true,
       })
       .click();
-    await page.getByRole("menuitem", { name: "Sign out", exact: true }).click();
-    await page.getByLabel("Email address").fill("second@example.test");
     await page
+      .getByRole("menuitem", { name: "Manage Connections", exact: true })
+      .click();
+    const connections = page.getByRole("dialog", {
+      name: "Manage Connections",
+      exact: true,
+    });
+    await connections
+      .getByRole("button", {
+        name: `Sign out of ${new URL(page.url()).host}`,
+        exact: true,
+      })
+      .click();
+    await connections
+      .getByRole("button", { name: "Sign out of this panel", exact: true })
+      .click();
+    await connections
+      .getByRole("button", {
+        name: `Sign in to ${new URL(page.url()).host}`,
+        exact: true,
+      })
+      .click();
+    await connections.getByLabel("Email address").fill("second@example.test");
+    await connections
       .getByLabel("Password", { exact: true })
       .fill("A valid password 123!");
-    await page.getByRole("button", { name: "Sign in", exact: true }).click();
+    await connections
+      .getByRole("button", { name: "Sign in", exact: true })
+      .click();
+    await connections
+      .getByRole("button", { name: "Close panel connections", exact: true })
+      .click();
     await expect(
       page.getByRole("button", {
         name: "Account menu for second@example.test",
         exact: true,
       }),
+    ).toBeVisible();
+    // The shared workspace preserves the current page while its new account
+    // is selected automatically, so the Recycle Bin is already open.
+    await expect(
+      page.getByRole("heading", { name: "Recycle Bin", exact: true }),
     ).toBeVisible();
     release();
     const progress = page.getByRole("status", {

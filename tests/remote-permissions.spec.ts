@@ -22,6 +22,9 @@ const server = {
 };
 
 async function sharedPanel(page: Page, permissions: string[]) {
+  await page.addInitScript(() =>
+    localStorage.setItem("mc-panel.session.v1", "p".repeat(43)),
+  );
   permissions = [...new Set(["server.view", ...permissions])];
   const calls: { path: string; method: string; body: unknown }[] = [];
   const users = [
@@ -424,7 +427,7 @@ test("catalog readers can browse Versions and Launchpad while content changes an
   page,
 }) => {
   const calls = await sharedPanel(page, ["file.read"]);
-  await page.route("**/api/server", (route) =>
+  await page.route(/\/api\/server(?:\?|$)/, (route) =>
     route.fulfill({ json: { ...server, status: "offline" } }),
   );
   await page.goto("/#versions");
@@ -634,12 +637,12 @@ test("remote managers cannot reset their own access but can reset another user's
     id: "helper",
     email: "helper@example.test",
   };
-  await page.route("**/api/subusers", (route) =>
+  await page.route(/\/api\/subusers(?:\?|$)/, (route) =>
     route.fulfill({ json: { users: [ownUser, otherUser] } }),
   );
   const invitations: string[] = [];
   const warning = "Invitation created, but its audit entry could not be saved.";
-  await page.route("**/api/subusers/*/invite", (route) => {
+  await page.route(/\/api\/subusers\/[^/?]+\/invite(?:\?|$)/, (route) => {
     invitations.push(new URL(route.request().url()).pathname);
     return route.fulfill({
       json: {

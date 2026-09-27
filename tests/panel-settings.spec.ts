@@ -295,7 +295,12 @@ test("browser Panel Settings persists host Remote Access and fits a phone", asyn
   await page.setViewportSize({ width: 390, height: 844 });
   await page.goto("/");
   const dialog = await openSettings(page);
-  await expect(dialog).toContainText("available in the MC Panel desktop app");
+  await expect(dialog).toContainText(
+    "Startup and system tray settings are managed in the desktop app.",
+  );
+  await expect(dialog).toContainText(
+    "Use Manage Connections to manage this browser's panel sign-ins.",
+  );
   await expect(
     dialog.getByRole("switch", {
       name: "Start MC Panel when I sign in",
@@ -366,6 +371,9 @@ test("browser Panel Settings persists host Remote Access and fits a phone", asyn
 test("an invited account with no servers has no host settings or server controls", async ({
   page,
 }) => {
+  await page.addInitScript(() =>
+    localStorage.setItem("mc-panel.session.v1", "s".repeat(43)),
+  );
   const calls: string[] = [];
   await page.route("**/api/**", (route) => {
     const path = new URL(route.request().url()).pathname;
@@ -392,9 +400,17 @@ test("an invited account with no servers has no host settings or server controls
   await expect(
     page.getByRole("heading", { name: "No shared servers" }),
   ).toBeVisible();
+  await page
+    .getByRole("button", { name: "Panel Settings", exact: true })
+    .click();
+  const settings = page.getByRole("dialog", {
+    name: "Panel Settings",
+    exact: true,
+  });
   await expect(
-    page.getByRole("button", { name: "Panel Settings", exact: true }),
+    settings.getByRole("tab", { name: "Remote Access", exact: true }),
   ).toHaveCount(0);
+  await expect(settings).toContainText("Use Manage Connections");
   await expect(
     page.getByRole("button", { name: "Start", exact: true }),
   ).toHaveCount(0);

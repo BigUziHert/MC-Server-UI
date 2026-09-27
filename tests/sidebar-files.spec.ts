@@ -65,7 +65,9 @@ for (const width of [1434, 390]) {
         nav.getByRole("button", { name: "SERVER", exact: true }),
       ).toBeVisible();
       await expect(
-        nav.getByRole("list", { name: "Your servers" }).getByRole("button"),
+        nav
+          .getByRole("list", { name: "Servers on this computer", exact: true })
+          .getByRole("button"),
       ).toHaveCount(fleet.servers.length + 1);
       await expect(serverButton(page, server.id)).toHaveAttribute(
         "aria-pressed",

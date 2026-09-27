@@ -35,6 +35,9 @@ type Record = typeof existing & { source?: string };
 type Call = { path: string; method: string; body: any; serverId?: string };
 
 async function remotePanel(page: Page, granted = true) {
+  await page.addInitScript(() =>
+    localStorage.setItem("mc-panel.session.v1", "c".repeat(43)),
+  );
   const state = {
     hostPermissions: granted ? ["server.create"] : [],
     // A stale session grant must never override the roster's current decision.

@@ -1,4 +1,11 @@
-import { useEffect, useId, useRef, useState, type FormEvent } from "react";
+import {
+  useContext,
+  useEffect,
+  useId,
+  useRef,
+  useState,
+  type FormEvent,
+} from "react";
 import {
   ArrowDownToLine,
   ChevronDown,
@@ -19,6 +26,7 @@ import {
 import { PanelUsers, RemoteAccessSetup } from "./pages/Subusers";
 import Switch from "./Switch";
 import StatePanel from "./StatePanel";
+import { DesktopWorkspaceContext } from "./workspace-target";
 import "./panel-settings.css";
 
 type DesktopSettings = {
@@ -37,6 +45,11 @@ const localSessionActive = () => true;
 
 export default function PanelSettings({ notify }: PageProps) {
   const [open, setOpen] = useState(false);
+  const workspace = useContext(DesktopWorkspaceContext);
+  const owner = workspace
+    ? workspace.connections?.panels.some((panel) => panel.local) === true
+    : true;
+  const native = window.mcPanelConnections?.runtime !== "browser";
   return (
     <>
       <button
@@ -56,7 +69,10 @@ export default function PanelSettings({ notify }: PageProps) {
             <SessionActiveContext.Provider value={localSessionActive}>
               <SessionExpiredContext.Provider value={null}>
                 <SettingsDialog
+                  key={`${owner}:${native}`}
                   notify={notify}
+                  owner={owner}
+                  native={native}
                   onClose={() => setOpen(false)}
                 />
               </SessionExpiredContext.Provider>
@@ -71,7 +87,9 @@ export default function PanelSettings({ notify }: PageProps) {
 function SettingsDialog({
   notify,
   onClose,
-}: PageProps & { onClose: () => void }) {
+  owner,
+  native,
+}: PageProps & { onClose: () => void; owner: boolean; native: boolean }) {
   const dialog = useRef<HTMLDialogElement>(null);
   const [tab, setTab] = useState("general");
   const [remoteOpened, setRemoteOpened] = useState(false);
@@ -92,6 +110,11 @@ function SettingsDialog({
     return () => element?.close();
   }, []);
   useEffect(() => {
+    if (!owner) {
+      setSettings({ desktop: false } as DesktopSettings);
+      setLoading(false);
+      return;
+    }
     const controller = new AbortController();
     setLoading(true);
     setError("");
@@ -114,7 +137,7 @@ function SettingsDialog({
       setLoading(false);
     });
     return () => controller.abort();
-  }, [attempt]);
+  }, [attempt, native, owner]);
 
   async function save(event: FormEvent) {
     event.preventDefault();
@@ -160,7 +183,7 @@ function SettingsDialog({
       <div className="panel-settings-heading">
         <div>
           <h2 id="panel-settings-title">Panel Settings</h2>
-          <p>Make MC Panel work the way you want on this computer.</p>
+          <p>Manage your MC Panel workspace and available host settings.</p>
         </div>
         <button
           className="btn icon"
@@ -178,7 +201,9 @@ function SettingsDialog({
       >
         {[
           { id: "general", label: "General", Icon: Monitor },
-          { id: "remote", label: "Remote Access", Icon: Globe },
+          ...(owner
+            ? [{ id: "remote", label: "Remote Access", Icon: Globe }]
+            : []),
         ].map(({ id, label, Icon }) => (
           <button
             key={id}
@@ -190,6 +215,7 @@ function SettingsDialog({
             tabIndex={tab === id ? 0 : -1}
             onClick={() => selectTab(id)}
             onKeyDown={(event) => {
+              if (!owner) return;
               if (
                 !["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)
               )
@@ -299,8 +325,9 @@ function SettingsDialog({
           ) : (
             settings && (
               <p className="panel-settings-unavailable">
-                Startup and system tray settings are available in the MC Panel
-                desktop app on this host.
+                {native
+                  ? "Startup and system tray settings are available in the MC Panel desktop app on this host."
+                  : "Startup and system tray settings are managed in the desktop app. Use Manage Connections to manage this browser's panel sign-ins."}
               </p>
             )
           )}
@@ -337,7 +364,7 @@ function SettingsDialog({
               aria-label="App updates"
               onClick={() => {
                 const bridge = window.mcPanelConnections;
-                if (bridge?.unified) {
+                if (bridge?.unified && bridge.runtime !== "browser") {
                   if (!bridge.openUpdates) {
                     setError("App updates are unavailable on this computer.");
                     return;
@@ -347,7 +374,11 @@ function SettingsDialog({
                     .catch((cause) =>
                       setError(messageOf(cause, "Unable to open app updates.")),
                     );
-                } else window.dispatchEvent(new Event("mc-panel-updates-open"));
+                } else {
+                  // The proved browser owner uses the updater for this origin;
+                  // native workspaces open their trusted local updater via IPC.
+                  window.dispatchEvent(new Event("mc-panel-updates-open"));
+                }
               }}
             >
               <ArrowDownToLine size={16} /> Updates
@@ -355,7 +386,7 @@ function SettingsDialog({
           </section>
         )}
       </div>
-      {remoteOpened && (
+      {owner && remoteOpened && (
         <div
           id="panel-settings-remote"
           role="tabpanel"

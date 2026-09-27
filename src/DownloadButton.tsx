@@ -1,12 +1,15 @@
 import { useRef, useState, type ButtonHTMLAttributes } from "react";
 import { api, isPanelProxyUrl } from "./api";
 import { sessionCredential, sessionRevision } from "./session-auth";
+import { getBrowserPanelTransport } from "./panel-transport";
 
 export async function downloadToComputer(url: string) {
   const revision = sessionRevision();
   const proxied = isPanelProxyUrl(url);
-  const target =
-    sessionCredential() && !proxied
+  const browserTransport = proxied ? getBrowserPanelTransport() : undefined;
+  const target = browserTransport
+    ? await browserTransport.download(url)
+    : sessionCredential() && !proxied
       ? (
           await api<{ url: string }>("/access/download", {
             method: "POST",
@@ -18,14 +21,23 @@ export async function downloadToComputer(url: string) {
     throw new Error("This sign-in ended before the download started.");
   const parsed = new URL(target, window.location.href);
   if (
-    parsed.origin !== window.location.origin ||
+    (!browserTransport && parsed.origin !== window.location.origin) ||
+    (browserTransport &&
+      parsed.protocol !== "https:" &&
+      parsed.origin !== window.location.origin) ||
+    parsed.username ||
+    parsed.password ||
+    parsed.hash ||
     !parsed.pathname.startsWith("/api/")
   )
     throw new Error("The download destination does not belong to this panel.");
   // A one-use, one-minute resource ticket retains native streaming; large
   // archives never need to be buffered into a renderer Blob.
   const link = document.createElement("a");
-  link.href = parsed.pathname + parsed.search;
+  // Browser transport validates this one-use ticket against the captured
+  // connection's exact origin and resource before returning it.
+  link.href = browserTransport ? parsed.href : parsed.pathname + parsed.search;
+  link.rel = "noreferrer";
   link.download = "";
   document.body.append(link);
   link.click();
