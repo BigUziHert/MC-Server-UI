@@ -410,6 +410,8 @@ async function smoke() {
         "disconnect",
         "openUpdates",
         "selectLocalServer",
+        "openLocalServerSetup",
+        "acknowledgeLocalServerSetup",
         "reportServers",
         "selectRemoteServer",
       ],
