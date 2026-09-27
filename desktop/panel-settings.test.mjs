@@ -187,7 +187,11 @@ test("legacy startup modes migrate atomically without OS writes, including an un
 
 test("invalid legacy settings and failed migration keep their original file for repair", async (t) => {
   const { dataDir } = await fixture(t);
-  const filename = path.join(dataDir, "panel-settings.json");
+  // safePath resolves the data directory before constructing rename targets.
+  // Windows Temp can be a short-path alias on CI, so match its canonical root.
+  const filename = path.join(await fs.realpath(dataDir), "panel-settings.json");
+  const settingsDataDir =
+    process.platform === "win32" ? dataDir.toUpperCase() : dataDir;
   const invalid = JSON.stringify({
     startupMode: "server",
     startupServerId: null,
@@ -195,7 +199,10 @@ test("invalid legacy settings and failed migration keep their original file for 
   });
   await fs.writeFile(filename, invalid);
   await assert.rejects(
-    createPanelSettings({ dataDir, hasServer: () => true }).read(),
+    createPanelSettings({
+      dataDir: settingsDataDir,
+      hasServer: () => true,
+    }).read(),
     { status: 400 },
   );
   assert.equal(await fs.readFile(filename, "utf8"), invalid);
@@ -207,26 +214,41 @@ test("invalid legacy settings and failed migration keep their original file for 
   await fs.writeFile(filename, original);
   const rename = fs.rename;
   let errorCode = "EIO";
+  const injectedFailures = [];
   const fault = t.mock.method(fs, "rename", async (source, target) => {
-    if (target === filename)
+    if (target === filename) {
+      injectedFailures.push(errorCode);
       throw Object.assign(new Error("Disk write failed"), { code: errorCode });
+    }
     return rename(source, target);
   });
   await assert.rejects(
-    createPanelSettings({ dataDir, hasServer: () => true }).read(),
+    createPanelSettings({
+      dataDir: settingsDataDir,
+      hasServer: () => true,
+    }).read(),
     /Disk write failed/,
   );
+  assert.deepEqual(injectedFailures, ["EIO"]);
   assert.equal(await fs.readFile(filename, "utf8"), original);
   errorCode = "ENOENT";
   await assert.rejects(
-    createPanelSettings({ dataDir, hasServer: () => true }).read(),
+    createPanelSettings({
+      dataDir: settingsDataDir,
+      hasServer: () => true,
+    }).read(),
     /Disk write failed/,
   );
+  assert.deepEqual(injectedFailures, ["EIO", "ENOENT"]);
   assert.equal(await fs.readFile(filename, "utf8"), original);
   fault.mock.restore();
   assert.deepEqual(
-    (await createPanelSettings({ dataDir, hasServer: () => false }).read())
-      .autoStartServerIds,
+    (
+      await createPanelSettings({
+        dataDir: settingsDataDir,
+        hasServer: () => false,
+      }).read()
+    ).autoStartServerIds,
     ["previous"],
   );
 });
