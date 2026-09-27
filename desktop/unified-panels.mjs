@@ -86,17 +86,30 @@ export function createUnifiedPanelController({
     loaded,
     ready = false,
     initializationError = "",
+    attemptEpoch = 0,
     saving = Promise.resolve();
   const changed = () => {
     if (!closed && !window.webContents.isDestroyed())
       window.webContents.send("mc-panel-connections:changed");
     return list();
   };
-  const persist = (removeId, promote) => {
+  const persist = (removeId, promote, authentication) => {
     const write = saving
       .catch(() => {})
       .then(async () => {
         if (!ready) await initialize();
+        const authenticationCurrent = () =>
+          authentication &&
+          !authentication.panel.removed &&
+          !authentication.panel.removing &&
+          panels.get(authentication.panel.id) === authentication.panel &&
+          authentication.panel.controls === authentication.version &&
+          authentication.panel.epoch === authentication.epoch;
+        if (authentication) {
+          if (closed || !authenticationCurrent())
+            throw failure(409, "This panel sign-in changed.");
+          authentication.panel.authenticationWriting = true;
+        }
         if (promote) {
           if (closed || promote.removed || panels.get(promote.id) !== promote)
             throw failure(409, "This panel sign-in changed.");
@@ -122,13 +135,31 @@ export function createUnifiedPanelController({
                   panel.id !== removeId &&
                   (!panel.temporary || panel === promote),
               )
-              .map(({ temporary, ...panel }) => ({
-                ...panel,
-                session: panel.account,
-              })),
+              .map((entry) => {
+                const { temporary, ...panel } = entry;
+                return authentication?.panel === entry
+                  ? {
+                      ...panel,
+                      token: authentication.token,
+                      session: authentication.account,
+                      servers: [],
+                    }
+                  : { ...panel, session: panel.account };
+              }),
             selectedServer,
-            ...(promote ? { requireCredentialFor: promote.id } : {}),
+            ...(promote || authentication
+              ? { requireCredentialFor: promote?.id ?? authentication.panel.id }
+              : {}),
           });
+          if (authentication) {
+            if (!authenticationCurrent())
+              throw failure(409, "This panel sign-in changed.");
+            const panel = authentication.panel;
+            panel.token = authentication.token;
+            panel.account = authentication.account;
+            panel.servers = [];
+            invalidate(panel);
+          }
           if (promote) promote.temporary = false;
           // Remove in-memory state only after the corresponding disk write succeeds.
           // Do it inside the write queue so a later snapshot cannot resurrect it.
@@ -145,6 +176,8 @@ export function createUnifiedPanelController({
           return result;
         } finally {
           if (promote) promote.promotionWriting = false;
+          if (authentication)
+            authentication.panel.authenticationWriting = false;
         }
       });
     saving = write;
@@ -166,7 +199,7 @@ export function createUnifiedPanelController({
     label: new URL(panel.origin).host,
     local: false,
     signedIn: !panel.temporary && Boolean(panel.token && panel.account),
-    connectionState: panel.state,
+    connectionState: panel.temporary ? "connecting" : panel.state,
     session: panel.temporary ? undefined : panel.account,
     sessionEpoch: panel.epoch,
     pendingLeave: Boolean(panel.pendingLeave),
@@ -205,7 +238,23 @@ export function createUnifiedPanelController({
   }
   async function cancelSignIn(id) {
     const panel = panels.get(id);
-    if (!panel?.temporary) return;
+    if (!panel) return;
+    if (!panel.temporary) {
+      // A disk transaction that has already started must finish atomically.
+      // Queued transactions are still cancelled by their account-control guard.
+      if (panel.authenticationWriting) await panel.authSaving.catch(() => {});
+      // Closing an account form cancels that attempt, not the existing account.
+      // Keep its token, server grants, selection and request epoch intact.
+      if (panel.authenticating || panel.previewing) {
+        panel.controls++;
+        panel.authAbort?.abort();
+        panel.pendingTrust?.abort.abort();
+        panel.allowPrompt = false;
+        panel.authenticating = false;
+        panel.previewing = false;
+      }
+      return;
+    }
     // An atomic disk write already in progress must finish. A promotion still
     // queued behind another write is cancelled before it can reach the store.
     if (panel.promotionWriting) await panel.promoting.catch(() => {});
@@ -619,6 +668,7 @@ export function createUnifiedPanelController({
       if (
         !panel.temporary &&
         !panel.authenticating &&
+        !panel.previewing &&
         !panel.pendingLeave &&
         !panel.removing &&
         Date.now() >= panel.nextRefresh
@@ -626,6 +676,19 @@ export function createUnifiedPanelController({
         void refresh(panel).catch(onError);
   }, pollMs);
   timer.unref?.();
+  const cancelWorkspaceAttempts = () => {
+    attemptEpoch++;
+    for (const panel of panels.values())
+      if (panel.temporary || panel.authenticating || panel.previewing)
+        void cancelSignIn(panel.id).catch(onError);
+  };
+  const workspaceNavigation = (_event, _url, isInPlace, isMainFrame) => {
+    if (isMainFrame && !isInPlace) cancelWorkspaceAttempts();
+  };
+  // Renderer unload handlers and IPC cannot be relied upon after reload/crash.
+  // Observe only the workspace renderer, leaving the updater window isolated.
+  window.webContents.on?.("did-start-navigation", workspaceNavigation);
+  window.webContents.on?.("render-process-gone", cancelWorkspaceAttempts);
   const controller = {
     list,
     initialize,
@@ -652,7 +715,10 @@ export function createUnifiedPanelController({
       return changed();
     },
     async open(input) {
+      const openingEpoch = attemptEpoch;
       await initialize();
+      if (openingEpoch !== attemptEpoch)
+        throw failure(409, "This panel sign-in changed.");
       ensure();
       const origin = new URL(normalizePanelConnectionUrl(input)).origin;
       let panel = [...panels.values()].find(
@@ -679,6 +745,57 @@ export function createUnifiedPanelController({
       }
     },
     cancelSignIn,
+    async invitation(id, credentials) {
+      const openingEpoch = attemptEpoch;
+      await initialize();
+      if (openingEpoch !== attemptEpoch)
+        throw failure(409, "This panel sign-in changed.");
+      const panel = get(id);
+      if (panel.pendingLeave) throw failure(409, pendingLeaveMessage);
+      if (!validToken(credentials?.token))
+        throw failure(400, "Provide a valid invitation.");
+      if (panel.authenticating || panel.previewing)
+        throw failure(
+          409,
+          "A sign-in attempt is already running for this panel.",
+        );
+      const version = ++panel.controls,
+        abort = new AbortController();
+      panel.authAbort = abort;
+      panel.previewing = version;
+      try {
+        await panel.refreshing?.catch(() => {});
+        if (version !== panel.controls || panel.removed || closed)
+          throw failure(409, "This panel sign-in changed.");
+        panel.allowPrompt = true;
+        const result = await json(panel, "/api/access/invitation", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ token: credentials.token }),
+          tokenOverride: "",
+          signal: abort.signal,
+        });
+        if (version !== panel.controls || panel.removed || closed)
+          throw failure(409, "This panel sign-in changed.");
+        if (
+          !text(result.email) ||
+          !result.email ||
+          !Number.isFinite(Date.parse(result.inviteExpiresAt))
+        )
+          throw failure(502, "The host returned an invalid invitation.");
+        return {
+          email: result.email,
+          panelAddress: panel.origin,
+          inviteExpiresAt: result.inviteExpiresAt,
+        };
+      } finally {
+        if (panel.previewing === version) {
+          panel.previewing = false;
+          panel.allowPrompt = false;
+          panel.authAbort = undefined;
+        }
+      }
+    },
     async signIn(id, credentials) {
       return authenticate(id, "/api/access/login", {
         email: credentials?.email,
@@ -917,7 +1034,9 @@ export function createUnifiedPanelController({
         );
       if (
         /^\/api\/(?:desktop|panel-users)(?:\/|$)/i.test(url.pathname) ||
-        /^\/api\/access\/(?:login|accept|logout|leave)\/?$/i.test(url.pathname)
+        /^\/api\/access\/(?:login|invitation|accept|logout|leave)\/?$/i.test(
+          url.pathname,
+        )
       )
         throw failure(
           403,
@@ -1073,6 +1192,8 @@ export function createUnifiedPanelController({
       if (closed) return saving;
       closed = true;
       clearInterval(timer);
+      window.webContents.off?.("did-start-navigation", workspaceNavigation);
+      window.webContents.off?.("render-process-gone", cancelWorkspaceAttempts);
       for (const panel of panels.values()) {
         panel.pendingTrust?.abort.abort();
         for (const request of panel.requests) request.abort();
@@ -1090,9 +1211,17 @@ export function createUnifiedPanelController({
     },
   };
   async function authenticate(id, pathname, credentials) {
+    const openingEpoch = attemptEpoch;
     await initialize();
+    if (openingEpoch !== attemptEpoch)
+      throw failure(409, "This panel sign-in changed.");
     const panel = get(id);
     if (panel.pendingLeave) throw failure(409, pendingLeaveMessage);
+    if (panel.authenticating || panel.previewing)
+      throw failure(
+        409,
+        "A sign-in attempt is already running for this panel.",
+      );
     if (
       !text(credentials.password, 4096) ||
       (pathname.endsWith("login")
@@ -1100,10 +1229,12 @@ export function createUnifiedPanelController({
         : !validToken(credentials.token))
     )
       throw failure(400, "Provide valid sign-in details.");
-    const version = ++panel.controls;
+    const version = ++panel.controls,
+      abort = new AbortController();
     // Failed credentials must not end the still-valid account lease/drafts.
     // Pause only roster discovery; successful replacement rotates the lease.
     panel.authenticating = version;
+    panel.authAbort = abort;
     try {
       await panel.refreshing?.catch(() => {});
       if (
@@ -1119,6 +1250,8 @@ export function createUnifiedPanelController({
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(credentials),
         timeout: 30000,
+        tokenOverride: "",
+        signal: abort.signal,
       });
       if (version !== panel.controls || panel.removed || closed)
         throw failure(409, "This panel sign-in changed.");
@@ -1128,11 +1261,11 @@ export function createUnifiedPanelController({
           "Update the remote host to use secure desktop sign-in.",
         );
       const account = sessionRecord(result);
-      panel.token = result.sessionToken;
-      panel.account = account;
-      panel.servers = [];
-      invalidate(panel);
       if (panel.temporary) {
+        panel.token = result.sessionToken;
+        panel.account = account;
+        panel.servers = [];
+        invalidate(panel);
         panel.promoting = persist(undefined, panel);
         try {
           await panel.promoting;
@@ -1142,11 +1275,25 @@ export function createUnifiedPanelController({
         } finally {
           panel.promoting = null;
         }
-      } else await persist();
+      } else {
+        panel.authSaving = persist(undefined, undefined, {
+          panel,
+          version,
+          epoch: panel.epoch,
+          token: result.sessionToken,
+          account,
+        });
+        try {
+          await panel.authSaving;
+        } finally {
+          panel.authSaving = null;
+        }
+      }
     } finally {
       if (panel.authenticating === version) {
         panel.allowPrompt = false;
         panel.authenticating = false;
+        panel.authAbort = undefined;
       }
     }
     try {

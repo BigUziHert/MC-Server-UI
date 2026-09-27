@@ -142,11 +142,19 @@ export default function PanelAccount({
     });
   actions.push({
     id: "signin",
-    label: unified ? "Add Panel" : "Sign in to another panel",
+    label: unified ? "Sign in" : "Sign in to another panel",
     icon: <LogIn size={16} />,
     disabled: busy,
-    onSelect: () => onConnect(unified ? "invitation" : "signin"),
+    onSelect: () => onConnect("signin"),
   });
+  if (unified)
+    actions.push({
+      id: "invitation",
+      label: "Accept invitation",
+      icon: <LogIn size={16} />,
+      disabled: busy,
+      onSelect: () => onConnect("invitation"),
+    });
   if (window.mcPanelConnections)
     actions.push({
       id: "connections",

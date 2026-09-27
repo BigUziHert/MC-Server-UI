@@ -32,6 +32,10 @@ type Host = {
   servers: (typeof server)[];
   create: boolean;
   revoked?: boolean;
+  password?: string | null;
+  invitation?: string;
+  loseAcceptResponse?: boolean;
+  unavailable?: boolean;
 };
 
 async function fixture(
@@ -100,6 +104,22 @@ async function fixture(
       route.fulfill({ status, headers: cors, json: body });
     const authorized =
       host.active && headers.authorization === `Bearer ${host.token}`;
+    if (host.unavailable) return route.abort("connectionfailed");
+    if (url.pathname === "/api/access/invitation") {
+      if (host.invitation && request.postDataJSON()?.token !== host.invitation)
+        return reply(
+          {
+            error:
+              "This invitation has expired. Ask the panel owner to reissue it for your existing account.",
+          },
+          410,
+        );
+      return reply({
+        email: "invited@example.test",
+        panelAddress: url.origin,
+        inviteExpiresAt: new Date(Date.now() + 86400000).toISOString(),
+      });
+    }
     if (url.pathname === "/api/access/session") {
       if (url.origin === homeOrigin && role === "owner")
         return reply({ role: "owner" });
@@ -110,7 +130,33 @@ async function fixture(
       );
     }
     if (["/api/access/login", "/api/access/accept"].includes(url.pathname)) {
-      if (request.postDataJSON()?.password === "wrong password")
+      const input = request.postDataJSON();
+      if (url.pathname === "/api/access/accept") {
+        if (host.invitation && input.token !== host.invitation)
+          return reply(
+            {
+              error:
+                "This invitation is no longer valid. If you already saved your password, sign in.",
+            },
+            410,
+          );
+        host.password = input.password;
+        host.invitation = "consumed";
+        if (host.loseAcceptResponse) {
+          host.loseAcceptResponse = false;
+          return route.abort("connectionfailed");
+        }
+      }
+      if (
+        url.pathname === "/api/access/login" &&
+        (host.password === null ||
+          (host.password && input.password !== host.password))
+      )
+        return reply(
+          { error: "Finish setting your password using your invitation." },
+          401,
+        );
+      if (input?.password === "wrong password")
         return reply({ error: "Email or password is incorrect." }, 401);
       host.active = true;
       return reply({ ...session(url.origin), sessionToken: host.token });
@@ -189,15 +235,15 @@ async function manage(page: Page) {
   return page.getByRole("dialog", { name: "Manage Connections", exact: true });
 }
 
+async function openSignIn(page: Page) {
+  await page.getByRole("button", { name: /^Account menu for/ }).click();
+  await page.getByRole("menuitem", { name: "Sign in", exact: true }).click();
+  return page.getByRole("dialog", { name: "Sign in", exact: true });
+}
+
 async function signIn(page: Page, origin: string) {
-  const dialog = await manage(page);
-  await dialog
-    .getByRole("button", { name: "Sign in to existing panel", exact: true })
-    .click();
+  const dialog = await openSignIn(page);
   await dialog.getByLabel("Panel address", { exact: true }).fill(origin);
-  await dialog
-    .getByRole("button", { name: "Continue to sign in", exact: true })
-    .click();
   await dialog
     .getByLabel("Email address", { exact: true })
     .fill("member@example.test");
@@ -205,15 +251,12 @@ async function signIn(page: Page, origin: string) {
     .getByLabel("Password", { exact: true })
     .fill("browser-password-123");
   await dialog.getByRole("button", { name: "Sign in", exact: true }).click();
-  await expect(
-    dialog.getByRole("button", {
-      name: `Sign out of ${new URL(origin).host}`,
-      exact: true,
-    }),
-  ).toBeVisible();
-  await dialog
-    .getByRole("button", { name: "Close panel connections", exact: true })
-    .click();
+  await expect(dialog).toHaveCount(0);
+  expect(
+    (await page.evaluate(() => window.mcPanelConnections!.list())).panels.find(
+      (panel) => panel.origin === origin,
+    )?.signedIn,
+  ).toBe(true);
 }
 
 test("browser owner uses shared account menus and host settings capabilities", async ({
@@ -234,7 +277,7 @@ test("browser owner uses shared account menus and host settings capabilities", a
     .getByRole("button", { name: /^Account menu for Local administrator/ })
     .click();
   await expect(
-    page.getByRole("menuitem", { name: "Add Panel", exact: true }),
+    page.getByRole("menuitem", { name: "Accept invitation", exact: true }),
   ).toBeVisible();
   await page
     .getByRole("menuitem", { name: "Manage Connections", exact: true })
@@ -363,7 +406,7 @@ test("browser restores the requested page and recovers a removed local selection
   await expect(page).toHaveURL(`${home}/#players`);
 });
 
-test("browser invitation opens shared Add Panel with its complete link", async ({
+test("browser invitation opens Accept invitation with its complete link", async ({
   page,
 }) => {
   const invitationOrigin = "https://invited.example.test";
@@ -378,7 +421,10 @@ test("browser invitation opens shared Add Panel with its complete link", async (
   const { calls } = await fixture(page, "guest", invitationOrigin);
   const invitation = `${invitationOrigin}/#invite=${"i".repeat(43)}`;
   await page.goto(invitation);
-  const dialog = page.getByRole("dialog", { name: "Add Panel", exact: true });
+  const dialog = page.getByRole("dialog", {
+    name: "Accept invitation",
+    exact: true,
+  });
   await expect(
     dialog.getByLabel("Invitation link", { exact: true }),
   ).toHaveValue(invitation);
@@ -404,108 +450,81 @@ test("browser invitation opens shared Add Panel with its complete link", async (
   ).toEqual({ token: "i".repeat(43), password: "browser-password-123" });
 });
 
-test("browser verifies a new address without saving failed or cancelled sign-ins", async ({
+test("browser sign-in validates only on submission and never saves failed or cancelled attempts", async ({
   page,
 }) => {
-  await fixture(page, "owner");
+  const { calls, hosts } = await fixture(page, "owner");
   await page.goto("/");
-  let dialog = await manage(page);
-  const start = async () => {
-    await dialog
-      .getByRole("button", { name: "Sign in to existing panel", exact: true })
-      .click();
-    await dialog.getByLabel("Panel address", { exact: true }).fill(origins[0]);
-    await dialog
-      .getByRole("button", { name: "Continue to sign in", exact: true })
-      .click();
-    return dialog.getByRole("form", {
-      name: "Sign in on a.example.test",
-      exact: true,
-    });
-  };
   const saved = () =>
     page.evaluate(async () =>
       (await window.mcPanelConnections!.list()).panels
         .filter((panel) => !panel.local)
         .map((panel) => panel.origin),
     );
-  let form = await start();
-  await expect(form).toBeVisible();
-  await expect(dialog).toContainText("No saved panel connections");
-  await expect(dialog.locator(".panel-connections-list > li")).toHaveCount(0);
-  expect(await saved()).toEqual([]);
-  await form
+  let dialog = await openSignIn(page);
+  await dialog.getByLabel("Panel address", { exact: true }).fill(origins[0]);
+  await dialog
     .getByLabel("Email address", { exact: true })
     .fill("member@example.test");
-  await form.getByLabel("Password", { exact: true }).fill("wrong password");
-  await form.getByRole("button", { name: "Sign in", exact: true }).click();
-  await expect(form.getByRole("alert")).toContainText("incorrect");
+  await dialog.getByLabel("Password", { exact: true }).fill("wrong password");
+  expect(calls.filter((call) => call.origin === origins[0])).toEqual([]);
+  hosts.get(origins[0])!.unavailable = true;
+  await dialog.getByRole("button", { name: "Sign in", exact: true }).click();
+  await expect(dialog.getByRole("alert")).toBeVisible();
+  expect(calls.filter((call) => call.path === "/api/access/login")).toEqual([]);
   expect(await saved()).toEqual([]);
-  await dialog
-    .getByRole("button", { name: "Cancel sign-in", exact: true })
-    .click();
-  await expect(form).toHaveCount(0);
-  await dialog
-    .getByRole("button", { name: "Close panel connections", exact: true })
-    .click();
+  hosts.get(origins[0])!.unavailable = false;
+  await dialog.getByRole("button", { name: "Sign in", exact: true }).click();
+  await expect(dialog.getByRole("alert")).toContainText("incorrect");
+  expect(await saved()).toEqual([]);
+  await page.keyboard.press("Escape");
+  await expect(dialog).toHaveCount(0);
   await page.reload();
   expect(await saved()).toEqual([]);
-  dialog = await manage(page);
-  form = await start();
-  await expect(form.getByLabel("Password", { exact: true })).toHaveValue("");
-  await form
+  dialog = await openSignIn(page);
+  await expect(dialog.getByLabel("Password", { exact: true })).toHaveValue("");
+  await dialog.getByLabel("Panel address", { exact: true }).fill(origins[0]);
+  await dialog
     .getByLabel("Email address", { exact: true })
     .fill("member@example.test");
-  await form.getByLabel("Password", { exact: true }).fill("wrong password");
-  await form.getByRole("button", { name: "Sign in", exact: true }).click();
-  await expect(form.getByRole("alert")).toContainText("incorrect");
-  await form
+  await dialog
     .getByLabel("Password", { exact: true })
     .fill("browser-password-123");
-  await form.getByRole("button", { name: "Sign in", exact: true }).click();
+  await dialog.getByRole("button", { name: "Sign in", exact: true }).click();
+  await expect(dialog).toHaveCount(0);
+  expect(await saved()).toEqual([origins[0]]);
+  const manager = await manage(page);
   await expect(
-    dialog.getByRole("button", {
-      name: "Sign out of a.example.test",
+    manager.getByLabel("Panel address", { exact: true }),
+  ).toHaveCount(0);
+  await expect(
+    manager.getByRole("button", {
+      name: "Sign in to existing panel",
       exact: true,
     }),
-  ).toBeVisible();
-  expect(await saved()).toEqual([origins[0]]);
-  await expect(dialog.locator(".panel-connections-list > li")).toHaveCount(1);
+  ).toHaveCount(0);
 });
 
-test("an incoming browser invitation closes Manage Connections and discards its staged sign-in", async ({
+test("an incoming browser invitation replaces an unfinished sign-in and clears its credentials", async ({
   page,
 }) => {
   const ownerOrigin = "https://owner.example.test";
   await page.route(`${ownerOrigin}/**`, async (route) => {
     const url = new URL(route.request().url());
     if (url.pathname.startsWith("/api/")) return route.fallback();
-    const response = await route.fetch({
-      url: `${home}${url.pathname}${url.search}`,
+    return route.fulfill({
+      response: await route.fetch({
+        url: `${home}${url.pathname}${url.search}`,
+      }),
     });
-    return route.fulfill({ response });
   });
   const { calls } = await fixture(page, "owner", ownerOrigin);
   await page.goto(ownerOrigin);
-  const dialog = await manage(page);
-  await page.evaluate(() => {
-    const bridge = window.mcPanelConnections!;
-    const open = bridge.open;
-    bridge.open = async (url) => {
-      const result = await open(url);
-      (window as any).stagedPanelId = result.panels.find(
-        (panel) => panel.temporary,
-      )?.id;
-      return result;
-    };
-  });
-  await dialog
-    .getByRole("button", { name: "Sign in to existing panel", exact: true })
-    .click();
+  const dialog = await openSignIn(page);
   await dialog.getByLabel("Panel address", { exact: true }).fill(origins[0]);
   await dialog
-    .getByRole("button", { name: "Continue to sign in", exact: true })
-    .click();
+    .getByLabel("Email address", { exact: true })
+    .fill("discard@example.test");
   await dialog
     .getByLabel("Password", { exact: true })
     .fill("discard-this-password");
@@ -513,7 +532,7 @@ test("an incoming browser invitation closes Manage Connections and discards its 
     location.hash = `invite=${"i".repeat(43)}`;
   });
   const invitation = page.getByRole("dialog", {
-    name: "Add Panel",
+    name: "Accept invitation",
     exact: true,
   });
   await expect(invitation).toBeVisible();
@@ -522,28 +541,217 @@ test("an incoming browser invitation closes Manage Connections and discards its 
   await expect(
     invitation.getByLabel("Invitation link", { exact: true }),
   ).toHaveValue(`${ownerOrigin}/#invite=${"i".repeat(43)}`);
-  const cancelled = await page.evaluate(async () => {
-    const id = (window as any).stagedPanelId;
-    if (!id) throw new Error("The sign-in did not stage a panel.");
-    try {
-      await window.mcPanelConnections!.signIn!(id, {
-        email: "test@example.test",
-        password: "wrong password",
-      });
-      return "accepted";
-    } catch (cause) {
-      return (cause as Error).message;
-    }
-  });
-  expect(cancelled).toContain("no longer available");
   expect(calls.some((call) => call.path === "/api/access/login")).toBe(false);
-  await invitation
-    .getByRole("button", { name: "Close connection dialog", exact: true })
-    .click();
-  const reopened = await manage(page);
-  await expect(reopened).toContainText("No saved panel connections");
-  await expect(reopened.getByLabel("Password", { exact: true })).toHaveCount(0);
+  await page.keyboard.press("Escape");
+  const reopened = await openSignIn(page);
+  await expect(reopened.getByLabel("Password", { exact: true })).toHaveValue(
+    "",
+  );
+  await expect(
+    reopened.getByLabel("Email address", { exact: true }),
+  ).toHaveValue("");
   await expect(page.locator("dialog[open]")).toHaveCount(1);
+});
+
+async function openInvitation(page: Page, origin: string, token: string) {
+  await page.getByRole("button", { name: /^Account menu for/ }).click();
+  await page
+    .getByRole("menuitem", { name: "Accept invitation", exact: true })
+    .click();
+  const dialog = page.getByRole("dialog", {
+    name: "Accept invitation",
+    exact: true,
+  });
+  await dialog
+    .getByLabel("Invitation link", { exact: true })
+    .fill(`${origin}/#invite=${token}`);
+  await dialog
+    .getByRole("button", { name: "Continue with invitation", exact: true })
+    .click();
+  await expect(
+    dialog.getByLabel("New password", { exact: true }),
+  ).toBeVisible();
+  await expect(dialog).toContainText("invited@example.test");
+  return dialog;
+}
+
+for (const width of [1434, 390]) {
+  test(`shared sign-in and invitation forms fit a ${width}px workspace`, async ({
+    page,
+  }, testInfo) => {
+    await page.setViewportSize({ width, height: 900 });
+    await fixture(page, "owner");
+    await page.goto("/");
+    const signIn = await openSignIn(page);
+    await expect(
+      signIn.getByLabel("Panel address", { exact: true }),
+    ).toBeVisible();
+    await expect(
+      signIn.getByLabel("Email address", { exact: true }),
+    ).toBeVisible();
+    await expect(signIn.getByLabel("Password", { exact: true })).toBeVisible();
+    await expect(
+      signIn.getByRole("button", { name: "Sign in", exact: true }),
+    ).toBeInViewport();
+    await page.screenshot({
+      path: testInfo.outputPath(`sign-in-${width}.png`),
+      fullPage: true,
+    });
+    await page.keyboard.press("Escape");
+    const invitation = await openInvitation(page, origins[0], "i".repeat(43));
+    await expect(
+      invitation.getByLabel("New password", { exact: true }),
+    ).toBeVisible();
+    await expect(
+      invitation.getByLabel("Panel address", { exact: true }),
+    ).toHaveCount(0);
+    await expect(
+      invitation.getByRole("button", {
+        name: "Set password and continue",
+        exact: true,
+      }),
+    ).toBeInViewport();
+    await page.screenshot({
+      path: testInfo.outputPath(`invitation-${width}.png`),
+      fullPage: true,
+    });
+    expect(
+      await page.evaluate(
+        () => document.documentElement.scrollWidth <= window.innerWidth,
+      ),
+    ).toBe(true);
+  });
+}
+
+for (const interruption of [
+  "Escape",
+  "Back",
+  "reload",
+  "tab closure",
+] as const) {
+  test(`browser preserves an invited account with existing grants after ${interruption} before password creation`, async ({
+    page,
+    context,
+  }) => {
+    const { hosts, calls } = await fixture(page, "owner");
+    const host = hosts.get(origins[0])!;
+    host.password = null;
+    host.invitation = "i".repeat(43);
+    await page.goto("/");
+    let dialog = await openInvitation(page, origins[0], host.invitation);
+    await dialog
+      .getByLabel("New password", { exact: true })
+      .fill("unfinished-password");
+    if (interruption === "Back") {
+      await dialog
+        .getByRole("button", { name: "Back to invitation link", exact: true })
+        .click();
+      await expect(
+        dialog.getByLabel("Invitation link", { exact: true }),
+      ).toBeVisible();
+      await page.keyboard.press("Escape");
+    } else if (interruption === "reload") await page.reload();
+    else if (interruption === "tab closure") {
+      // Keep the fixture's host state while replacing the tab and real adapter.
+      const next = await context.newPage();
+      await page.close();
+      page = next;
+      const replacement = await fixture(page, "owner");
+      replacement.hosts.set(origins[0], host);
+      await page.goto("/");
+    } else await page.keyboard.press("Escape");
+    expect(host.password).toBeNull();
+    expect(host.invitation).toBe("i".repeat(43));
+    expect(host.servers.map((item) => item.id)).toEqual(["same-id"]);
+    expect(calls.some((call) => call.path === "/api/access/accept")).toBe(
+      false,
+    );
+    expect(
+      (
+        await page.evaluate(() => window.mcPanelConnections!.list())
+      ).panels.some((panel) => panel.origin === origins[0]),
+    ).toBe(false);
+    dialog = await openInvitation(page, origins[0], host.invitation);
+    await expect(
+      dialog.getByLabel("New password", { exact: true }),
+    ).toHaveValue("");
+    await dialog
+      .getByLabel("New password", { exact: true })
+      .fill("completed-password");
+    await dialog
+      .getByLabel("Confirm password", { exact: true })
+      .fill("completed-password");
+    await dialog
+      .getByRole("button", { name: "Set password and continue", exact: true })
+      .click();
+    await expect(dialog).toHaveCount(0);
+    await expect(
+      page.getByRole("button", {
+        name: "Select server Shared world on a.example.test",
+        exact: true,
+      }),
+    ).toBeVisible();
+    expect(host.password).toBe("completed-password");
+    expect(host.servers.map((item) => item.id)).toEqual(["same-id"]);
+  });
+}
+
+test("browser recovers a lost password-creation response through normal sign-in", async ({
+  page,
+}) => {
+  const { hosts, calls } = await fixture(page, "owner");
+  const host = hosts.get(origins[0])!;
+  host.password = null;
+  host.invitation = "i".repeat(43);
+  host.loseAcceptResponse = true;
+  await page.goto("/");
+  const dialog = await openInvitation(page, origins[0], host.invitation);
+  await dialog
+    .getByLabel("New password", { exact: true })
+    .fill("saved-before-network-failed");
+  await dialog
+    .getByLabel("Confirm password", { exact: true })
+    .fill("saved-before-network-failed");
+  await dialog
+    .getByRole("button", { name: "Set password and continue", exact: true })
+    .click();
+  await expect(dialog.getByRole("alert")).toBeVisible();
+  expect(host.password).toBe("saved-before-network-failed");
+  expect(
+    (await page.evaluate(() => window.mcPanelConnections!.list())).panels.some(
+      (panel) => panel.origin === origins[0],
+    ),
+  ).toBe(false);
+  await dialog
+    .getByRole("button", {
+      name: "Sign in with an existing account",
+      exact: true,
+    })
+    .click();
+  const recovery = page.getByRole("dialog", { name: "Sign in", exact: true });
+  await expect(
+    recovery.getByLabel("Panel address", { exact: true }),
+  ).toHaveValue(origins[0]);
+  await expect(
+    recovery.getByLabel("Email address", { exact: true }),
+  ).toHaveValue("invited@example.test");
+  await recovery
+    .getByLabel("Password", { exact: true })
+    .fill("saved-before-network-failed");
+  await recovery.getByRole("button", { name: "Sign in", exact: true }).click();
+  await expect(recovery).toHaveCount(0);
+  expect(
+    calls.filter((call) => call.path === "/api/access/accept"),
+  ).toHaveLength(1);
+  expect(
+    calls.filter((call) => call.path === "/api/access/login"),
+  ).toHaveLength(1);
+  await expect(
+    page.getByRole("button", {
+      name: "Select server Shared world on a.example.test",
+      exact: true,
+    }),
+  ).toBeVisible();
 });
 
 test("browser combines colliding servers from two HTTPS panels and signs out only one", async ({
@@ -674,7 +882,7 @@ test("browser removes verified revoked panel while connections is open and retai
       name: "Sign in to 127.0.0.1:3111",
       exact: true,
     }),
-  ).toBeVisible();
+  ).toHaveCount(0);
   await dialog
     .getByRole("button", { name: "Close panel connections", exact: true })
     .click();

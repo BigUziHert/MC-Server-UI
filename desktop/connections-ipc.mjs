@@ -63,6 +63,7 @@ export function installUnifiedConnectionIpc(ipcMain, controller) {
     "list",
     "open",
     "cancelSignIn",
+    "invitation",
     "signIn",
     "acceptInvitation",
     "signOut",

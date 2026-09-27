@@ -108,7 +108,7 @@ test("a copied invitation works over direct HTTPS through password setup, sign-i
       });
     await phone.goto(invitationUrl);
     await expect(
-      phone.getByRole("heading", { name: "Add Panel", exact: true }),
+      phone.getByRole("heading", { name: "Accept invitation", exact: true }),
     ).toBeVisible();
     await expect(
       phone.getByLabel("Invitation link", { exact: true }),

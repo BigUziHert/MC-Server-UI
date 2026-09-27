@@ -98,17 +98,38 @@ export default function DesktopWorkspace() {
   const [connection, setConnection] = useState<ConnectionMode | null>(
     invitationUrl ? "invitation" : null,
   );
+  const currentInvitationUrl = useRef(invitationUrl);
+  currentInvitationUrl.current = invitationUrl;
   useEffect(() => {
     if (window.mcPanelConnections?.runtime !== "browser") return;
     const openInvitation = () => {
-      if (!new URLSearchParams(window.location.hash.slice(1)).has("invite"))
+      if (!new URLSearchParams(window.location.hash.slice(1)).has("invite")) {
+        if (currentInvitationUrl.current) {
+          setInvitationUrl("");
+          setConnection(null);
+        }
         return;
+      }
       setManagingConnections(false);
       setInvitationUrl(window.location.href);
       setConnection("invitation");
     };
+    const leaveWorkspace = () => {
+      setConnection(null);
+      setInvitationUrl("");
+      setManagingConnections(false);
+    };
+    const restoreWorkspace = (event: PageTransitionEvent) => {
+      if (event.persisted) openInvitation();
+    };
     window.addEventListener("hashchange", openInvitation);
-    return () => window.removeEventListener("hashchange", openInvitation);
+    window.addEventListener("pagehide", leaveWorkspace);
+    window.addEventListener("pageshow", restoreWorkspace);
+    return () => {
+      window.removeEventListener("hashchange", openInvitation);
+      window.removeEventListener("pagehide", leaveWorkspace);
+      window.removeEventListener("pageshow", restoreWorkspace);
+    };
   }, []);
   const [managingConnections, setManagingConnections] = useState(false);
   const manageConnections = useCallback(() => setManagingConnections(true), []);

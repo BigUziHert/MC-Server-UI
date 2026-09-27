@@ -81,6 +81,14 @@ declare global {
         panelId: string,
         input: { token: string; password: string },
       ) => Promise<PanelConnections>;
+      invitation?: (
+        panelId: string,
+        input: { token: string },
+      ) => Promise<{
+        email: string;
+        panelAddress: string;
+        inviteExpiresAt: string;
+      }>;
       cancelSignIn?: (panelId: string) => Promise<void | PanelConnections>;
       signOut?: (panelId: string) => Promise<PanelConnections>;
       retry?: (panelId: string) => Promise<PanelConnections>;

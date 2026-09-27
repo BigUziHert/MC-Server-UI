@@ -251,10 +251,10 @@ test("a non-owner home is an ordinary remote account and adopts its existing bea
   assert.equal(f.homes.at(-1), null);
 });
 
-test("guests retain saved addresses, and denied sign-ins preserve an existing account epoch", async (t) => {
+test("anonymous home visits stay unsaved, and denied sign-ins preserve an existing account epoch", async (t) => {
   const f = await fixture(t, { owner: false });
-  const guest = (await f.controller.bridge.list()).panels[0];
-  assert.equal(guest.signedIn, false);
+  assert.deepEqual((await f.controller.bridge.list()).panels, []);
+  assert.deepEqual(JSON.parse(f.values.get(browserConnectionsKey)).panels, []);
   const panel = await f.connect();
   await assert.rejects(
     f.controller.bridge.signIn(panel.id, {
@@ -551,14 +551,14 @@ test("an offline saved host does not delay initialization or authorize its cache
 
 test("retry recovers a proven home owner after the initial session outage without host account actions", async (t) => {
   const f = await fixture(t, { homeUnavailable: true });
-  const guest = (await f.controller.bridge.list()).panels[0];
-  await f.controller.bridge.retry(guest.id);
+  assert.deepEqual((await f.controller.bridge.list()).panels, []);
+  await assert.rejects(f.controller.bridge.open(home), /offline/i);
   assert.equal(
     (await f.controller.bridge.list()).panels.some((row) => row.local),
     false,
   );
   f.homeUnavailable(false);
-  const recovered = await f.controller.bridge.retry(guest.id);
+  const recovered = await f.controller.bridge.open(home);
   assert.deepEqual(
     recovered.panels.map((row) => row.id),
     ["local"],
@@ -974,6 +974,7 @@ test("new connections remain unsaved drafts until validated sign-in promotes the
     draft = opened.panels.find((row) => row.origin === remote);
   assert.equal(draft.temporary, true);
   assert.equal(draft.signedIn, false);
+  assert.equal(draft.connectionState, "connecting");
   assert.equal(f.values.get(browserConnectionsKey), before);
   assert.equal(
     (await f.controller.bridge.list()).panels.some(
@@ -1182,4 +1183,243 @@ test("successful invitation acceptance saves the draft once without its password
     ).signedIn,
     true,
   );
+});
+
+test("browser invitation preview preserves an incomplete account through cancel, reload and reopening", async (t) => {
+  const f = await fixture(t),
+    invitation = "i".repeat(43),
+    expires = new Date(Date.now() + 60000).toISOString();
+  f.handler((url) =>
+    url.pathname === "/api/access/invitation"
+      ? response({
+          email: "member@example.test",
+          panelAddress: remote,
+          inviteExpiresAt: expires,
+        })
+      : undefined,
+  );
+  const other = await f.connect("https://two.example.test");
+  await f.controller.bridge.selectServer(other.id, "server");
+  let draft = (await f.controller.bridge.open(remote)).panels.find(
+    (panel) => panel.temporary,
+  );
+  assert.deepEqual(
+    await f.controller.bridge.invitation(draft.id, { token: invitation }),
+    {
+      email: "member@example.test",
+      panelAddress: remote,
+      inviteExpiresAt: expires,
+    },
+  );
+  const preview = f.requests.at(-1);
+  assert.equal(preview.token, undefined);
+  assert.equal(preview.init.credentials, "omit");
+  assert.deepEqual(JSON.parse(preview.init.body), { token: invitation });
+  await f.controller.bridge.cancelSignIn(draft.id);
+  assert.equal(
+    f.requests.some((call) =>
+      /\/access\/(accept|leave|logout)$/.test(call.url.pathname),
+    ),
+    false,
+  );
+  const restored = await f.boot();
+  assert.equal(
+    (await restored.bridge.list()).panels.some(
+      (panel) => panel.origin === remote,
+    ),
+    false,
+  );
+  draft = (await restored.bridge.open(remote)).panels.find(
+    (panel) => panel.temporary,
+  );
+  await restored.bridge.invitation(draft.id, { token: invitation });
+  const accepted = await restored.bridge.acceptInvitation(draft.id, {
+    token: invitation,
+    password: "correct password",
+  });
+  assert.equal(
+    accepted.panels.filter((panel) => !panel.local && panel.signedIn).length,
+    2,
+  );
+  assert.deepEqual(accepted.selectedServer, {
+    panelId: other.id,
+    serverId: "server",
+  });
+  assert.equal(
+    accepted.panels.find((panel) => panel.id === draft.id).servers[0].id,
+    "server",
+  );
+});
+
+test("canceling a saved browser attempt rejects late success while preserving its selected account", async (t) => {
+  const f = await fixture(t),
+    first = await f.connect(),
+    other = await f.connect("https://two.example.test");
+  await f.controller.bridge.selectServer(first.id, "server");
+  let release, entered, signal;
+  const started = new Promise((resolve) => {
+    entered = resolve;
+  });
+  f.handler(async (url, init) => {
+    if (url.pathname !== "/api/access/accept") return;
+    signal = init.signal;
+    entered();
+    await new Promise((resolve) => {
+      release = resolve;
+    });
+    return response({
+      ...account("replacement"),
+      sessionToken: "b".repeat(43),
+    });
+  });
+  const pending = f.controller.bridge.acceptInvitation(first.id, {
+    token: "i".repeat(43),
+    password: "correct password",
+  });
+  const rejected = assert.rejects(pending, { status: 409 });
+  await started;
+  await assert.rejects(
+    f.controller.bridge.acceptInvitation(first.id, {
+      token: "i".repeat(43),
+      password: "correct password",
+    }),
+    /already running/,
+  );
+  await f.controller.bridge.cancelSignIn(first.id);
+  assert.equal(signal.aborted, true);
+  release();
+  await rejected;
+  const snapshot = await f.controller.bridge.list(),
+    retained = snapshot.panels.find((panel) => panel.id === first.id);
+  assert.equal(retained.sessionEpoch, first.sessionEpoch);
+  assert.equal(retained.session.accountId, first.session.accountId);
+  assert.equal(
+    snapshot.panels.find((panel) => panel.id === other.id).signedIn,
+    true,
+  );
+  assert.deepEqual(snapshot.selectedServer, {
+    panelId: first.id,
+    serverId: "server",
+  });
+  assert.equal((await f.controller.fetch(virtual(first))).status, 200);
+  assert.equal(
+    f.requests.filter((call) => call.url.pathname === "/api/access/accept")
+      .length,
+    1,
+  );
+});
+
+test("canceling a browser attempt also invalidates authentication queued for storage", async (t) => {
+  let block = false,
+    entered,
+    release;
+  const writing = new Promise((resolve) => {
+    entered = resolve;
+  });
+  const f = await fixture(t, {
+    lock: async (operation) => {
+      if (block) {
+        entered();
+        await new Promise((resolve) => {
+          release = resolve;
+        });
+      }
+      return operation();
+    },
+  });
+  const saved = await f.connect();
+  block = true;
+  const pending = f.controller.bridge.signIn(saved.id, {
+    email: "replacement@example.test",
+    password: "correct password",
+  });
+  const rejected = assert.rejects(pending, { status: 409 });
+  await writing;
+  await f.controller.bridge.cancelSignIn(saved.id);
+  block = false;
+  release();
+  await rejected;
+  assert.equal(
+    JSON.parse(f.values.get(browserConnectionsKey)).panels[0].session.email,
+    "member@example.test",
+  );
+  assert.equal(
+    (await f.controller.bridge.list()).panels.find(
+      (panel) => panel.id === saved.id,
+    ).sessionEpoch,
+    saved.sessionEpoch,
+  );
+});
+
+test("lost browser password setup responses recover through normal sign-in without saving a draft", async (t) => {
+  const f = await fixture(t);
+  f.handler((url) => {
+    if (url.pathname === "/api/access/accept")
+      throw new TypeError("Response lost");
+  });
+  let draft = (await f.controller.bridge.open(remote)).panels.find(
+    (panel) => panel.temporary,
+  );
+  await assert.rejects(
+    f.controller.bridge.acceptInvitation(draft.id, {
+      token: "i".repeat(43),
+      password: "correct password",
+    }),
+    /Response lost/,
+  );
+  assert.deepEqual(JSON.parse(f.values.get(browserConnectionsKey)).panels, []);
+  await f.controller.close();
+  const reopened = await f.boot();
+  draft = (await reopened.bridge.open(remote)).panels.find(
+    (panel) => panel.temporary,
+  );
+  const saved = await reopened.bridge.signIn(draft.id, {
+    email: "member@example.test",
+    password: "correct password",
+  });
+  assert.equal(
+    saved.panels.find((panel) => panel.id === draft.id).signedIn,
+    true,
+  );
+});
+
+test("browser page suspension cancels pending drafts and permits sign-in again after restoration", async (t) => {
+  const f = await fixture(t),
+    other = await f.connect("https://two.example.test");
+  await f.controller.bridge.selectServer(other.id, "server");
+  const draft = (await f.controller.bridge.open(remote)).panels.find(
+    (panel) => panel.temporary,
+  );
+  let entered, release;
+  const started = new Promise((resolve) => {
+    entered = resolve;
+  });
+  f.handler(async (url) => {
+    if (url.pathname !== "/api/access/accept") return;
+    entered();
+    await new Promise((resolve) => {
+      release = resolve;
+    });
+    return response({ ...account(), sessionToken: "a".repeat(43) });
+  });
+  const pending = f.controller.bridge.acceptInvitation(draft.id, {
+    token: "i".repeat(43),
+    password: "correct password",
+  });
+  const rejected = assert.rejects(pending, { status: 409 });
+  await started;
+  f.controller.cancelAttempts();
+  release();
+  await rejected;
+  f.handler(undefined);
+  await f.connect();
+  const restored = await f.controller.bridge.list();
+  assert.equal(
+    restored.panels.filter((panel) => !panel.local && panel.signedIn).length,
+    2,
+  );
+  assert.deepEqual(restored.selectedServer, {
+    panelId: other.id,
+    serverId: "server",
+  });
 });

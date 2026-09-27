@@ -8,6 +8,8 @@ if (process.isMainFrame) {
     list: () => invoke("list"),
     open: (url) => invoke("open", url),
     cancelSignIn: (panelId) => invoke("cancelSignIn", panelId),
+    invitation: (panelId, credentials) =>
+      invoke("invitation", panelId, credentials),
     signIn: (panelId, credentials) => invoke("signIn", panelId, credentials),
     acceptInvitation: (panelId, credentials) =>
       invoke("acceptInvitation", panelId, credentials),

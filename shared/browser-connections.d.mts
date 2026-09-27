@@ -38,6 +38,10 @@ export type BrowserBridge = {
   list(): Promise<BrowserSnapshot>;
   open(url: string): Promise<BrowserSnapshot>;
   cancelSignIn(id: string): Promise<void>;
+  invitation(
+    id: string,
+    input: { token: string },
+  ): Promise<{ email: string; panelAddress: string; inviteExpiresAt: string }>;
   signIn(
     id: string,
     input: { email: string; password: string },
@@ -77,5 +81,6 @@ export function createBrowserConnectionController(options: {
   fetch(input: string, options?: RequestInit): Promise<Response>;
   download(input: string): Promise<string>;
   storageChanged(): void;
+  cancelAttempts(): void;
   close(): Promise<void>;
 };

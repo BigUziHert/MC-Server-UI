@@ -61,10 +61,15 @@ try {
   });
   await accountMenu.click();
   await expect(
-    page.getByRole("menuitem", { name: "Accept an invitation", exact: true }),
-  ).toHaveCount(0);
-  await page.getByRole("menuitem", { name: "Add Panel", exact: true }).click();
-  const addPanel = page.getByRole("dialog", { name: "Add Panel", exact: true });
+    page.getByRole("menuitem", { name: "Sign in", exact: true }),
+  ).toBeVisible();
+  await page
+    .getByRole("menuitem", { name: "Accept invitation", exact: true })
+    .click();
+  const addPanel = page.getByRole("dialog", {
+    name: "Accept invitation",
+    exact: true,
+  });
   await expect(
     addPanel.getByLabel("Invitation link", { exact: true }),
   ).toBeVisible();
@@ -106,28 +111,40 @@ try {
     exact: true,
   });
   await expect(connectionManager).toContainText("No saved panel connections.");
-  await connectionManager
-    .getByRole("button", {
-      name: "Sign in to existing panel",
-      exact: true,
-    })
-    .click();
   await expect(
     connectionManager.getByLabel("Panel address", { exact: true }),
+  ).toHaveCount(0);
+  await expect(
+    connectionManager.getByRole("button", {
+      name: "Sign in to existing panel",
+      exact: true,
+    }),
+  ).toHaveCount(0);
+  await page.keyboard.press("Escape");
+  await expect(connectionManager).not.toBeVisible();
+  await accountMenu.click();
+  await page.getByRole("menuitem", { name: "Sign in", exact: true }).click();
+  const signIn = page.getByRole("dialog", { name: "Sign in", exact: true });
+  await expect(
+    signIn.getByLabel("Panel address", { exact: true }),
   ).toBeVisible();
+  await expect(
+    signIn.getByLabel("Email address", { exact: true }),
+  ).toBeVisible();
+  await expect(signIn.getByLabel("Password", { exact: true })).toBeVisible();
   await page.screenshot({
     path: path.join(screenshotDir, "manage-existing-panel.png"),
   });
-  await connectionManager
+  await signIn
     .getByLabel("Panel address", { exact: true })
     .fill("http://uncontacted.example.test");
-  await connectionManager
+  await signIn
     .getByRole("button", {
-      name: "Continue to sign in",
+      name: "Sign in",
       exact: true,
     })
     .click();
-  await expect(connectionManager.getByRole("alert")).toContainText("HTTPS");
+  await expect(signIn.getByRole("alert")).toContainText("HTTPS");
   assert.equal(
     await page.evaluate(
       async () =>
@@ -138,8 +155,8 @@ try {
     0,
   );
   await page.keyboard.press("Escape");
-  await expect(connectionManager).toBeVisible();
-  await page.keyboard.press("Escape");
+  await expect(signIn).not.toBeVisible();
+  await expect(accountMenu).toBeFocused();
   const inspect = () =>
     application.evaluate(({ BrowserWindow, Menu }) => {
       const window = BrowserWindow.getAllWindows()[0];

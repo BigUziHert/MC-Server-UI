@@ -30,6 +30,15 @@ async function signedOutSession(page: Page) {
   );
 }
 async function invitation(page: Page, token: string) {
+  await page.route("**/api/access/invitation", (route) =>
+    route.fulfill({
+      json: {
+        email: sister.email,
+        panelAddress: invitationOrigin,
+        inviteExpiresAt: new Date(Date.now() + 86400000).toISOString(),
+      },
+    }),
+  );
   await page.route(`${invitationOrigin}/**`, async (route) => {
     const url = new URL(route.request().url());
     if (url.pathname.startsWith("/api/")) return route.fallback();
@@ -62,12 +71,29 @@ async function openSignIn(page: Page) {
     exact: true,
   });
   if (!(await dialog.isVisible())) await openConnections(page);
-  await dialog
-    .getByRole("button", {
-      name: `Sign in to ${new URL(page.url()).host}`,
-      exact: true,
-    })
-    .click();
+  const saved = dialog.getByRole("button", {
+    name: `Sign in to ${new URL(page.url()).host}`,
+    exact: true,
+  });
+  if (await saved.isVisible()) await saved.click();
+  else {
+    await dialog
+      .getByRole("button", { name: "Close panel connections", exact: true })
+      .click();
+    await page.getByRole("button", { name: /^Account menu for/ }).click();
+    await page.getByRole("menuitem", { name: "Sign in", exact: true }).click();
+  }
+  await expect(page.getByLabel("Panel address", { exact: true })).toHaveValue(
+    new URL(page.url()).origin,
+  );
+}
+async function finishSignIn(page: Page) {
+  await expect(page.getByLabel("Password", { exact: true })).toHaveCount(0);
+  const close = page.getByRole("button", {
+    name: "Close panel connections",
+    exact: true,
+  });
+  if (await close.isVisible()) await close.click();
 }
 async function signOut(page: Page) {
   const dialog = await openConnections(page);
@@ -572,9 +598,7 @@ test("a late response from a signed-out workspace cannot end the next session", 
   await page.getByLabel("Email address").fill(sister.email);
   await page.getByLabel("Password", { exact: true }).fill(password);
   await page.getByRole("button", { name: "Sign in", exact: true }).click();
-  await page
-    .getByRole("button", { name: "Close panel connections", exact: true })
-    .click();
+  await finishSignIn(page);
   await expect(page.getByRole("heading", { name: server.name })).toBeVisible();
   releaseResponse();
   await routeDone;
@@ -635,9 +659,7 @@ test("email and password sign-in opens the shared panel and logout returns to si
     ),
   ).toBe(false);
   await page.getByRole("button", { name: "Sign in", exact: true }).click();
-  await page
-    .getByRole("button", { name: "Close panel connections", exact: true })
-    .click();
+  await finishSignIn(page);
   await expect(
     page.getByRole("heading", { name: "Family survival" }),
   ).toBeVisible();
@@ -784,9 +806,7 @@ test("failed credentials stay on sign-in with the generic server error and allow
   ).toHaveCount(0);
   await page.getByLabel("Password", { exact: true }).fill(password);
   await page.getByRole("button", { name: "Sign in", exact: true }).click();
-  await page
-    .getByRole("button", { name: "Close panel connections", exact: true })
-    .click();
+  await finishSignIn(page);
   await expect(
     page.getByRole("heading", { name: "Family survival" }),
   ).toBeVisible();
@@ -824,7 +844,7 @@ test("leaving the page during invitation acceptance ignores its late result", as
   ).toBeDisabled();
   await expect(
     page.getByRole("button", { name: "Close connection dialog" }),
-  ).toBeDisabled();
+  ).toBeEnabled();
   await page.goto(`${invitationOrigin}/`);
   finishAcceptance?.();
   await routeDone;
@@ -841,7 +861,7 @@ test("leaving the page during invitation acceptance ignores its late result", as
   ).toBeNull();
 });
 
-test("an unavailable session endpoint never opens owner controls", async ({
+test("an unavailable new panel remains unsaved and never opens owner controls", async ({
   page,
 }) => {
   await page.route("**/api/access/session", (route) =>
@@ -855,15 +875,15 @@ test("an unavailable session endpoint never opens owner controls", async ({
     page.getByRole("button", { name: "Create a new server", exact: true }),
   ).toHaveCount(0);
   const connections = await openConnections(page);
+  await expect(connections).toContainText("No saved panel connections.");
+  await openSignIn(page);
+  await page.getByLabel("Email address").fill(sister.email);
+  await page.getByLabel("Password", { exact: true }).fill(password);
+  await page.getByRole("button", { name: "Sign in", exact: true }).click();
+  await expect(page.getByRole("alert")).toContainText("Panel is unavailable");
   await expect(
-    connections.getByRole("button", {
-      name: "Retry 127.0.0.1:3111",
-      exact: true,
-    }),
-  ).toBeVisible();
-  await expect(connections.getByRole("alert")).toContainText(
-    "Panel is unavailable",
-  );
+    page.getByRole("button", { name: "Sign in", exact: true }),
+  ).toBeEnabled();
   await expect(
     page.getByRole("navigation", { name: "Main navigation" }),
   ).toHaveCount(0);

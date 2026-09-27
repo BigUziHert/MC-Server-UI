@@ -132,13 +132,13 @@ test("browser workspace connects to independent HTTPS panels with isolated files
     async function accountMenu(current: Page) {
       await current.getByRole("button", { name: /^Account menu for/ }).click();
     }
-    async function addPanel(invitation: string) {
+    async function addPanel(invitation: string, cancel = false) {
       await accountMenu(page);
       await page
-        .getByRole("menuitem", { name: "Add Panel", exact: true })
+        .getByRole("menuitem", { name: "Accept invitation", exact: true })
         .click();
       const dialog = page.getByRole("dialog", {
-        name: "Add Panel",
+        name: "Accept invitation",
         exact: true,
       });
       await dialog
@@ -148,6 +148,11 @@ test("browser workspace connects to independent HTTPS panels with isolated files
         .getByRole("button", { name: "Continue with invitation", exact: true })
         .click();
       await dialog.getByLabel("New password", { exact: true }).fill(password);
+      if (cancel) {
+        await page.keyboard.press("Escape");
+        await expect(dialog).not.toBeVisible();
+        return;
+      }
       await dialog
         .getByLabel("Confirm password", { exact: true })
         .fill(password);
@@ -156,6 +161,27 @@ test("browser workspace connects to independent HTTPS panels with isolated files
         .click();
       await expect(dialog).not.toBeVisible();
     }
+    const pendingGrants = a.fleet.access.account(a.account.id).serverOverrides;
+    await addPanel(a.invitation, true);
+    expect(a.fleet.access.account(a.account.id).inviteStatus).toBe("pending");
+    expect(a.fleet.access.account(a.account.id).acceptedAt).toBeNull();
+    expect(a.fleet.access.account(a.account.id).serverOverrides).toEqual(
+      pendingGrants,
+    );
+    expect(
+      a.received.some((request) => request.path === "/api/access/accept"),
+    ).toBe(false);
+    await expect
+      .poll(() =>
+        page.evaluate(
+          async () =>
+            (await window.mcPanelConnections!.list()).panels.filter(
+              (panel) => !panel.local,
+            ).length,
+        ),
+      )
+      .toBe(0);
+    await page.reload();
     await addPanel(a.invitation);
     await addPanel(c.invitation);
     const select = async (label: string) => {

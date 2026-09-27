@@ -83,7 +83,7 @@ async function workspace(page: Page, offline = false, noSavedPanels = false) {
         if (!panel || panel.local) throw new Error("Choose a remote panel.");
         return panel;
       };
-      const controls = { failForget: offline };
+      const controls: any = { failForget: offline };
       Object.assign(window, {
         unifiedFixture: { state, calls, changed, controls, drafts },
       });
@@ -93,6 +93,12 @@ async function workspace(page: Page, offline = false, noSavedPanels = false) {
         open: async (url: string) => {
           const origin = new URL(url).origin;
           calls.push({ action: "open", origin });
+          if (controls.pauseValidation)
+            await new Promise<void>((resolve) => {
+              controls.releaseValidation = resolve;
+            });
+          if (controls.rejectCertificate)
+            throw new Error("Certificate confirmation was cancelled.");
           if (!state.panels.some((panel: any) => panel.origin === origin)) {
             const panel = {
               id: "new-panel",
@@ -117,6 +123,22 @@ async function workspace(page: Page, offline = false, noSavedPanels = false) {
           if (!drafts.has(id)) return;
           calls.push({ action: "cancelSignIn", id });
           drafts.delete(id);
+        },
+        invitation: async (id: string, input: { token: string }) => {
+          calls.push({
+            action: "invitation",
+            id,
+            tokenLength: input.token.length,
+          });
+          if (input.token.startsWith("e"))
+            throw new Error(
+              "This invitation has expired. Ask the panel owner to reissue it for your existing account.",
+            );
+          return {
+            email: "invited@example.test",
+            panelAddress: find(id).origin,
+            inviteExpiresAt: new Date(Date.now() + 86400000).toISOString(),
+          };
         },
         signIn: async (
           id: string,
@@ -310,127 +332,46 @@ async function manage(page: Page) {
   return page.getByRole("dialog", { name: "Manage Connections", exact: true });
 }
 
-test("a new computer can sign in to an existing panel entirely from Manage Connections", async ({
+async function openSignIn(page: Page) {
+  await page
+    .getByRole("button", {
+      name: "Account menu for Local administrator",
+      exact: true,
+    })
+    .click();
+  await page.getByRole("menuitem", { name: "Sign in", exact: true }).click();
+  return page.getByRole("dialog", { name: "Sign in", exact: true });
+}
+
+async function fillSignIn(
+  dialog: ReturnType<Page["getByRole"]>,
+  address = "https://existing.example.test:3002",
+  password = "Existing password!",
+) {
+  await dialog.getByLabel("Panel address", { exact: true }).fill(address);
+  await dialog
+    .getByLabel("Email address", { exact: true })
+    .fill("existing@example.test");
+  await dialog.getByLabel("Password", { exact: true }).fill(password);
+}
+
+test("a new panel uses one sign-in form and saves only after authentication", async ({
   page,
 }) => {
   await workspace(page, false, true);
   const originalUrl = page.url();
-  const dialog = await manage(page);
-  await expect(dialog).toContainText("No saved panel connections");
-  await dialog
-    .getByRole("button", { name: "Sign in to existing panel", exact: true })
-    .click();
-  await dialog
-    .getByLabel("Panel address", { exact: true })
-    .fill("https://existing.example.test:3002");
-  await dialog
-    .getByRole("button", { name: "Continue to sign in", exact: true })
-    .click();
-  let form = dialog.getByRole("form", {
-    name: "Sign in on existing.example.test:3002",
-    exact: true,
-  });
-  await expect(form).toContainText("https://existing.example.test:3002");
-  await expect(dialog.locator(".panel-connections-list > li")).toHaveCount(0);
-  await expect(dialog).toContainText("No saved panel connections");
-  await expect(
-    page.getByRole("list", {
-      name: "Servers on existing.example.test:3002",
-      exact: true,
-      includeHidden: true,
-    }),
-  ).toHaveCount(0);
-  await expect(form.getByLabel("Panel address", { exact: true })).toHaveCount(
-    0,
-  );
-  await form
-    .getByLabel("Email address", { exact: true })
-    .fill("existing@example.test");
-  await form
-    .getByLabel("Password", { exact: true })
-    .fill("Cancelled password!");
-  await dialog
-    .getByRole("button", { name: "Cancel sign-in", exact: true })
-    .click();
-  await expect(form).toHaveCount(0);
+  let dialog = await openSignIn(page);
+  await fillSignIn(dialog);
   expect(
     await page.evaluate(() => (window as any).unifiedFixture.calls),
-  ).toEqual([
-    { action: "open", origin: "https://existing.example.test:3002" },
-    { action: "cancelSignIn", id: "new-panel" },
-  ]);
-  await dialog
-    .getByRole("button", {
-      name: "Sign in to existing panel",
-      exact: true,
-    })
-    .click();
-  await dialog
-    .getByLabel("Panel address", { exact: true })
-    .fill("https://existing.example.test:3002");
-  await dialog
-    .getByRole("button", { name: "Continue to sign in", exact: true })
-    .click();
-  form = dialog.getByRole("form", {
-    name: "Sign in on existing.example.test:3002",
-    exact: true,
-  });
-  await expect(form.getByLabel("Password", { exact: true })).toHaveValue("");
-  await form
-    .getByLabel("Email address", { exact: true })
-    .fill("existing@example.test");
-  await form.getByLabel("Password", { exact: true }).fill("wrong password");
-  await form.getByRole("button", { name: "Sign in", exact: true }).click();
-  await expect(form.getByRole("alert")).toContainText("incorrect");
-  await expect(dialog.locator(".panel-connections-list > li")).toHaveCount(0);
-  await form.getByLabel("Password", { exact: true }).fill("Existing password!");
-  await form.getByRole("button", { name: "Sign in", exact: true }).click();
-  await expect(
-    dialog.getByRole("button", {
-      name: "Sign out of existing.example.test:3002",
-      exact: true,
-    }),
-  ).toBeVisible();
-  expect(page.url()).toBe(originalUrl);
-  expect(
-    await page.evaluate(() => (window as any).unifiedFixture.calls),
-  ).toEqual([
-    { action: "open", origin: "https://existing.example.test:3002" },
-    { action: "cancelSignIn", id: "new-panel" },
-    { action: "open", origin: "https://existing.example.test:3002" },
-    { action: "signIn", id: "new-panel", email: "existing@example.test" },
-    { action: "signIn", id: "new-panel", email: "existing@example.test" },
-  ]);
-});
-
-test("closing Manage Connections discards a verified address without saving it", async ({
-  page,
-}) => {
-  await workspace(page, false, true);
-  const dialog = await manage(page);
-  await dialog
-    .getByRole("button", { name: "Sign in to existing panel", exact: true })
-    .click();
-  await dialog
-    .getByLabel("Panel address", { exact: true })
-    .fill("https://unsaved.example.test");
-  await dialog
-    .getByRole("button", { name: "Continue to sign in", exact: true })
-    .click();
-  await expect(
-    dialog.getByRole("form", {
-      name: "Sign in on unsaved.example.test",
-      exact: true,
-    }),
-  ).toBeVisible();
-  await dialog
-    .getByRole("button", { name: "Close panel connections", exact: true })
-    .click();
-  expect(
-    await page.evaluate(() => (window as any).unifiedFixture.drafts.size),
-  ).toBe(0);
-  const reopened = await manage(page);
-  await expect(reopened).toContainText("No saved panel connections");
+  ).toEqual([]);
+  await page.keyboard.press("Escape");
+  await expect(dialog).toHaveCount(0);
+  dialog = await openSignIn(page);
+  await expect(dialog.getByLabel("Password", { exact: true })).toHaveValue("");
+  await fillSignIn(dialog, undefined, "wrong password");
+  await dialog.getByRole("button", { name: "Sign in", exact: true }).click();
+  await expect(dialog.getByRole("alert")).toContainText("incorrect");
   expect(
     await page.evaluate(() =>
       (window as any).unifiedFixture.state.panels.filter(
@@ -438,103 +379,135 @@ test("closing Manage Connections discards a verified address without saving it",
       ),
     ),
   ).toEqual([]);
+  await dialog
+    .getByLabel("Password", { exact: true })
+    .fill("Existing password!");
+  await dialog.getByRole("button", { name: "Sign in", exact: true }).click();
+  await expect(dialog).toHaveCount(0);
+  expect(page.url()).toBe(originalUrl);
+  const manager = await manage(page);
+  await expect(
+    manager.getByRole("button", {
+      name: "Sign out of existing.example.test:3002",
+      exact: true,
+    }),
+  ).toBeVisible();
+  await expect(
+    manager.getByRole("button", {
+      name: "Sign in to existing panel",
+      exact: true,
+    }),
+  ).toHaveCount(0);
+  await expect(
+    manager.getByLabel("Panel address", { exact: true }),
+  ).toHaveCount(0);
 });
 
-test("existing-panel address validation and cancellation do not start authentication", async ({
+for (const cancel of ["Escape", "Close"] as const) {
+  test(`${cancel} during certificate validation discards the temporary panel and never transmits credentials`, async ({
+    page,
+  }) => {
+    await workspace(page, false, true);
+    await page.evaluate(() => {
+      (window as any).unifiedFixture.controls.pauseValidation = true;
+    });
+    const dialog = await openSignIn(page);
+    await fillSignIn(dialog);
+    await dialog.getByRole("button", { name: "Sign in", exact: true }).click();
+    await expect
+      .poll(() =>
+        page.evaluate(() =>
+          Boolean((window as any).unifiedFixture.controls.releaseValidation),
+        ),
+      )
+      .toBe(true);
+    expect(
+      await page.evaluate(() => (window as any).unifiedFixture.calls),
+    ).toEqual([
+      { action: "open", origin: "https://existing.example.test:3002" },
+    ]);
+    if (cancel === "Escape") await page.keyboard.press("Escape");
+    else
+      await dialog
+        .getByRole("button", { name: "Close connection dialog", exact: true })
+        .click();
+    await expect(dialog).toHaveCount(0);
+    await page.evaluate(() => {
+      (window as any).unifiedFixture.controls.releaseValidation();
+    });
+    await expect
+      .poll(() =>
+        page.evaluate(() => (window as any).unifiedFixture.drafts.size),
+      )
+      .toBe(0);
+    expect(
+      await page.evaluate(() => (window as any).unifiedFixture.calls),
+    ).toEqual([
+      { action: "open", origin: "https://existing.example.test:3002" },
+      { action: "cancelSignIn", id: "new-panel" },
+    ]);
+    const manager = await manage(page);
+    await expect(manager).toContainText("No saved panel connections");
+  });
+}
+
+test("certificate rejection and invalid addresses never start authentication", async ({
   page,
 }) => {
   await workspace(page, false, true);
-  const dialog = await manage(page);
-  await dialog
-    .getByRole("button", { name: "Sign in to existing panel", exact: true })
-    .click();
+  const dialog = await openSignIn(page);
+  await fillSignIn(dialog);
   for (const address of [
     "http://existing.example.test",
     "https://existing.example.test/path",
     "https://user:password@existing.example.test",
+    `https://existing.example.test/#invite=${"a".repeat(43)}`,
   ]) {
     await dialog.getByLabel("Panel address", { exact: true }).fill(address);
-    await dialog
-      .getByRole("button", { name: "Continue to sign in", exact: true })
-      .click();
+    await dialog.getByRole("button", { name: "Sign in", exact: true }).click();
     await expect(dialog.getByRole("alert")).toBeVisible();
   }
-  await dialog
-    .getByLabel("Panel address", { exact: true })
-    .fill(`https://existing.example.test/#invite=${"a".repeat(43)}`);
-  await dialog
-    .getByRole("button", { name: "Continue to sign in", exact: true })
-    .click();
-  await expect(dialog.getByRole("alert")).toContainText("Use Add Panel");
-  await expect(
-    dialog.getByRole("group", { name: "Connection method" }),
-  ).toHaveCount(0);
-  await page.keyboard.press("Escape");
-  await expect(dialog).toBeVisible();
-  await expect(dialog.getByLabel("Panel address", { exact: true })).toHaveCount(
-    0,
-  );
-  await expect(dialog).toContainText("No saved panel connections");
   expect(
     await page.evaluate(() => (window as any).unifiedFixture.calls),
   ).toEqual([]);
+  await page.evaluate(() => {
+    (window as any).unifiedFixture.controls.rejectCertificate = true;
+  });
+  await fillSignIn(dialog);
+  await dialog.getByRole("button", { name: "Sign in", exact: true }).click();
+  await expect(dialog.getByRole("alert")).toContainText(
+    "Certificate confirmation was cancelled",
+  );
+  expect(
+    await page.evaluate(() => (window as any).unifiedFixture.calls),
+  ).toEqual([{ action: "open", origin: "https://existing.example.test:3002" }]);
+  expect(
+    await page.evaluate(() => (window as any).unifiedFixture.drafts.size),
+  ).toBe(0);
 });
 
-test("an already signed-in address preserves its account and an unavailable address keeps Retry", async ({
+test("signing in an already connected address preserves its current account", async ({
   page,
 }) => {
   await workspace(page);
-  const dialog = await manage(page);
+  const dialog = await openSignIn(page);
+  await fillSignIn(dialog, "https://a.example.test:3002/");
   await dialog
-    .getByRole("button", { name: "Sign in to existing panel", exact: true })
-    .click();
-  await dialog
-    .getByLabel("Panel address", { exact: true })
-    .fill("https://a.example.test:3002/");
-  await dialog
-    .getByRole("button", { name: "Continue to sign in", exact: true })
-    .click();
-  await expect(dialog.getByRole("status")).toContainText(
-    "already signed in to https://a.example.test:3002",
-  );
-  await expect(
-    dialog.getByRole("form", {
-      name: "Sign in on a.example.test:3002",
-      exact: true,
-    }),
-  ).toHaveCount(0);
-  await page.evaluate(() => {
-    const fixture = (window as any).unifiedFixture;
-    const panel = fixture.state.panels.find(
-      (item: any) => item.id === "computer-c",
-    );
-    panel.connectionState = "unavailable";
-    fixture.changed();
-  });
-  await dialog
-    .getByRole("button", { name: "Sign in to existing panel", exact: true })
-    .click();
-  await dialog
-    .getByLabel("Panel address", { exact: true })
-    .fill("https://c.example.test:3002");
-  await dialog
-    .getByRole("button", { name: "Continue to sign in", exact: true })
-    .click();
-  await expect(dialog.getByRole("alert")).toContainText(
-    "Check its address and try again when the host is reachable",
-  );
-  await expect(
-    dialog.getByRole("button", {
-      name: "Retry c.example.test:3002",
-      exact: true,
-    }),
-  ).toBeVisible();
+    .getByLabel("Email address", { exact: true })
+    .fill("computer-a@example.test");
+  await dialog.getByRole("button", { name: "Sign in", exact: true }).click();
+  await expect(dialog).toHaveCount(0);
   expect(
     await page.evaluate(() => (window as any).unifiedFixture.calls),
-  ).toEqual([
-    { action: "open", origin: "https://a.example.test:3002" },
-    { action: "open", origin: "https://c.example.test:3002" },
-  ]);
+  ).toEqual([{ action: "open", origin: "https://a.example.test:3002" }]);
+  expect(
+    await page.evaluate(
+      () =>
+        (window as any).unifiedFixture.state.panels.find(
+          (panel: any) => panel.id === "computer-a",
+        ).session.email,
+    ),
+  ).toBe("computer-a@example.test");
 });
 
 test("unified connection manager signs in and out independently without replacing the workspace", async ({
@@ -562,8 +535,8 @@ test("unified connection manager signs in and out independently without replacin
   const form = dialog.getByRole("form", {
     name: "Sign in on c.example.test:3002",
   });
-  await expect(form.getByLabel("Panel address or invitation link")).toHaveCount(
-    0,
+  await expect(form.getByLabel("Panel address", { exact: true })).toHaveValue(
+    "https://c.example.test:3002",
   );
   await form
     .getByLabel("Email address", { exact: true })
@@ -621,7 +594,9 @@ test("unified connection manager signs in and out independently without replacin
   expect(
     await page.evaluate(() => (window as any).unifiedFixture.calls),
   ).toEqual([
+    { action: "open", origin: "https://c.example.test:3002" },
     { action: "signIn", id: "computer-c", email: "member-c@example.test" },
+    { action: "open", origin: "https://c.example.test:3002" },
     { action: "signIn", id: "computer-c", email: "member-c@example.test" },
     { action: "signOut", id: "computer-a" },
   ]);
@@ -1135,7 +1110,7 @@ test("the connection manager stays open when signing out the selected remote acc
   ).toHaveAttribute("aria-pressed", "true");
 });
 
-test("Add Panel accepts invitations only and captures the destination within the workspace", async ({
+test("Accept invitation accepts invitations only and captures the destination within the workspace", async ({
   page,
 }) => {
   await workspace(page);
@@ -1148,11 +1123,13 @@ test("Add Panel accepts invitations only and captures the destination within the
     .click();
   await expect(page.getByRole("menuitem", { name: /^Switch / })).toHaveCount(0);
   await expect(
-    page.getByRole("menuitem", { name: "Accept an invitation", exact: true }),
+    page.getByRole("menuitem", { name: "Add Panel", exact: true }),
   ).toHaveCount(0);
-  await page.getByRole("menuitem", { name: "Add Panel", exact: true }).click();
+  await page
+    .getByRole("menuitem", { name: "Accept invitation", exact: true })
+    .click();
   const dialog = page.getByRole("dialog", {
-    name: "Add Panel",
+    name: "Accept invitation",
     exact: true,
   });
   await expect(
@@ -1198,7 +1175,7 @@ test("Add Panel accepts invitations only and captures the destination within the
       name: "Sign in with an existing account",
       exact: true,
     }),
-  ).toHaveCount(0);
+  ).toBeVisible();
   await form
     .getByLabel("New password", { exact: true })
     .fill("Fixture invite password!");
@@ -1228,6 +1205,7 @@ test("Add Panel accepts invitations only and captures the destination within the
     await page.evaluate(() => (window as any).unifiedFixture.calls),
   ).toEqual([
     { action: "open", origin: "https://new.example.test:3003" },
+    { action: "invitation", id: "new-panel", tokenLength: 43 },
     { action: "acceptInvitation", id: "new-panel", tokenLength: 43 },
   ]);
   expect(
@@ -1236,7 +1214,7 @@ test("Add Panel accepts invitations only and captures the destination within the
 });
 
 for (const saved of [true, false]) {
-  test(`an expired invitation for a ${saved ? "saved" : "new"} panel stays in Add Panel without saving or an existing-account sign-in escape`, async ({
+  test(`an expired invitation for a ${saved ? "saved" : "new"} panel offers reissue guidance and normal sign-in recovery`, async ({
     page,
   }) => {
     await workspace(page);
@@ -1249,30 +1227,26 @@ for (const saved of [true, false]) {
       })
       .click();
     await page
-      .getByRole("menuitem", { name: "Add Panel", exact: true })
+      .getByRole("menuitem", { name: "Accept invitation", exact: true })
       .click();
-    const dialog = page.getByRole("dialog", { name: "Add Panel", exact: true });
+    const dialog = page.getByRole("dialog", {
+      name: "Accept invitation",
+      exact: true,
+    });
     await dialog
       .getByLabel("Invitation link", { exact: true })
       .fill(`https://${host}/#invite=${"e".repeat(43)}`);
     await dialog
       .getByRole("button", { name: "Continue with invitation", exact: true })
       .click();
-    const form = dialog.getByRole("form", {
-      name: `Accept invitation on ${host}`,
-    });
-    await form
-      .getByLabel("New password", { exact: true })
-      .fill("New password!");
-    await form
-      .getByLabel("Confirm password", { exact: true })
-      .fill("New password!");
-    await form
-      .getByRole("button", { name: "Set password and continue", exact: true })
-      .click();
-    await expect(form.getByRole("alert")).toContainText(
+    await expect(dialog.getByRole("alert")).toContainText(
       "invitation has expired",
     );
+    await expect(dialog).toContainText("existing account");
+    await expect(dialog).toContainText("server permissions are preserved");
+    await expect(
+      dialog.getByLabel("New password", { exact: true }),
+    ).toHaveCount(0);
     expect(
       await page.evaluate(
         async (origin) =>
@@ -1282,21 +1256,19 @@ for (const saved of [true, false]) {
         `https://${host}`,
       ),
     ).toBe(saved);
-    await expect(
-      dialog.getByLabel("Email address", { exact: true }),
-    ).toHaveCount(0);
-    await expect(dialog.getByRole("button", { name: /sign in/i })).toHaveCount(
-      0,
-    );
     await dialog
-      .getByRole("button", { name: "Back to invitation link", exact: true })
+      .getByRole("button", {
+        name: "Sign in with an existing account",
+        exact: true,
+      })
       .click();
+    const recovery = page.getByRole("dialog", { name: "Sign in", exact: true });
     await expect(
-      dialog.getByLabel("Invitation link", { exact: true }),
-    ).toBeVisible();
-    await expect(
-      dialog.getByRole("group", { name: "Connection method" }),
-    ).toHaveCount(0);
+      recovery.getByLabel("Panel address", { exact: true }),
+    ).toHaveValue(`https://${host}`);
+    await expect(recovery.getByLabel("Password", { exact: true })).toHaveValue(
+      "",
+    );
     expect(
       await page.evaluate(() => (window as any).unifiedFixture.drafts.size),
     ).toBe(0);
@@ -1304,7 +1276,7 @@ for (const saved of [true, false]) {
       await page.evaluate(() => (window as any).unifiedFixture.calls),
     ).toEqual([
       { action: "open", origin: `https://${host}` },
-      { action: "acceptInvitation", id: panelId, tokenLength: 43 },
+      { action: "invitation", id: panelId, tokenLength: 43 },
       ...(!saved ? [{ action: "cancelSignIn", id: panelId }] : []),
     ]);
   });

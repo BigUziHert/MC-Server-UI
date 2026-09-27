@@ -11,12 +11,27 @@ import { normalizePanelConnectionUrl } from "../shared/panel-connection.mjs";
 import { api } from "./api";
 import type { PanelConnections } from "./desktop-connections";
 import PanelSignInForm from "./PanelSignInForm";
+import WorkspaceConnectPanel from "./WorkspaceConnectPanel";
 import "./panel-connections.css";
 import "./connect-panel.css";
 
 export type ConnectionMode = "signin" | "invitation";
 
-export default function ConnectPanel({
+export default function ConnectPanel(props: {
+  desktop: boolean;
+  initialMode?: ConnectionMode;
+  initialUrl?: string;
+  onClose: () => void;
+  onOpened: () => void;
+}) {
+  return window.mcPanelConnections?.unified ? (
+    <WorkspaceConnectPanel {...props} />
+  ) : (
+    <LegacyConnectPanel {...props} />
+  );
+}
+
+function LegacyConnectPanel({
   desktop,
   initialMode = "signin",
   initialUrl = "",

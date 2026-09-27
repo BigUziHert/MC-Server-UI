@@ -269,7 +269,7 @@ test("expired invitations and sessions reject authentication; password login sti
   );
   await assert.rejects(f.access.accept(expired, password), {
     status: 401,
-    message: /Ask the server owner/,
+    message: /ask the server owner/,
   });
   const signedIn = await f.enroll();
   f.advance(7 * 24 * 60 * 60 * 1000);
@@ -600,7 +600,7 @@ test("duplicate cookies fail closed and session views cannot mutate persisted au
   );
 });
 
-test("legacy settings strip email secrets on save while preserving primary-scoped sessions and confirmed links", async (t) => {
+test("legacy settings strip email secrets and retain pending links without authorizing passwordless sessions", async (t) => {
   const f = await fixture(t);
   const memberB = f.addB();
   const now = Date.UTC(2026, 8, 19);
@@ -651,10 +651,18 @@ test("legacy settings strip email secrets on save while preserving primary-scope
   assert.equal(migrated.status().transport, "proxy");
   assert.equal(JSON.stringify(migrated.status()).includes("old"), false);
   const legacySession = await migrated.authenticate(request(cookie));
-  assert.deepEqual(
-    legacySession.memberships,
-    [scopeA],
-    "same email must not grant the legacy session access to server B",
+  assert.equal(
+    legacySession,
+    null,
+    "old passwordless sessions cannot authorize access",
+  );
+  assert.equal(
+    migrated.membershipAllowed(scopeA.serverId, scopeA.userId),
+    false,
+  );
+  assert.equal(
+    migrated.invitationState(scopeA.serverId, scopeA.userId).inviteStatus,
+    "expired",
   );
   await assert.rejects(
     migrated.login({ email: "sister@example.com", password }),
@@ -670,9 +678,7 @@ test("legacy settings strip email secrets on save while preserving primary-scope
     (await migrated.accept(token, password)).session.memberships,
     [scopeB],
   );
-  assert.deepEqual((await migrated.authenticate(request(cookie))).memberships, [
-    scopeA,
-  ]);
+  assert.equal(await migrated.authenticate(request(cookie)), null);
 });
 
 test("unconfirmed legacy email tokens cannot be accepted", async (t) => {

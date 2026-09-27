@@ -3,6 +3,7 @@ import test from "node:test";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { EventEmitter } from "node:events";
 import { createUnifiedPanelController } from "./unified-panels.mjs";
 import { createUnifiedConnectionStore } from "./unified-connection-store.mjs";
 import { startDesktopRuntime } from "./runtime.mjs";
@@ -38,11 +39,11 @@ async function harness(
     scheduler: false,
     proxyRemotePanel: (...args) => controller.proxy(...args),
   });
-  const contents = {
+  const contents = Object.assign(new EventEmitter(), {
     isDestroyed: () => false,
     send() {},
     getURL: () => runtime.url,
-  };
+  });
   contents.mainFrame = { origin: runtime.url, url: `${runtime.url}/` };
   const window = { webContents: contents };
   controller = createUnifiedPanelController({
@@ -1394,6 +1395,7 @@ test("new panel addresses stay temporary through failed sign-in and are discarde
   );
   assert.equal(draft.temporary, true);
   assert.equal(draft.signedIn, false);
+  assert.equal(draft.connectionState, "connecting");
   assert.equal(h.controller.list().panels.length, 1);
   assert.equal(h.persisted.length, 0);
   const count = h.calls.length;
@@ -1431,6 +1433,187 @@ test("new panel addresses stay temporary through failed sign-in and are discarde
     );
   await h.controller.close();
   assert.equal(h.persisted.at(-1).panels.length, 0);
+});
+
+test("invitation preview can be cancelled and reopened without accepting or changing existing server grants", async (t) => {
+  const invitation = "i".repeat(43),
+    expires = new Date(Date.now() + 60000).toISOString();
+  const h = await harness(t, {
+    behavior: async (url) =>
+      url.pathname === "/api/access/invitation"
+        ? response({
+            email: account.email,
+            panelAddress: url.origin,
+            inviteExpiresAt: expires,
+          })
+        : url.pathname === "/api/access/accept"
+          ? response({ ...account, sessionToken: token })
+          : undefined,
+  });
+  const other = await h.signIn("https://c.example.test");
+  await h.controller.selectServer(other.id, "same-id");
+  let draft = (await h.controller.open("https://a.example.test")).panels.find(
+    (panel) => panel.temporary,
+  );
+  assert.deepEqual(
+    await h.controller.invitation(draft.id, { token: invitation }),
+    {
+      email: account.email,
+      panelAddress: draft.origin,
+      inviteExpiresAt: expires,
+    },
+  );
+  const preview = h.calls.at(-1);
+  assert.equal(preview.headers.has("Authorization"), false);
+  assert.deepEqual(JSON.parse(preview.body), { token: invitation });
+  await h.controller.cancelSignIn(draft.id);
+  assert.equal(
+    h.calls.some((call) =>
+      /\/access\/(accept|leave|logout)$/.test(call.url.pathname),
+    ),
+    false,
+  );
+  assert.deepEqual(h.controller.list().selectedServer, {
+    panelId: other.id,
+    serverId: "same-id",
+  });
+  assert.equal(
+    h.controller.list().panels.filter((panel) => !panel.local).length,
+    1,
+  );
+  draft = (await h.controller.open("https://a.example.test")).panels.find(
+    (panel) => panel.temporary,
+  );
+  await h.controller.invitation(draft.id, { token: invitation });
+  await h.controller.acceptInvitation(draft.id, {
+    token: invitation,
+    password: "new password",
+  });
+  const snapshot = h.controller.list();
+  assert.equal(
+    snapshot.panels.filter((panel) => !panel.local && panel.signedIn).length,
+    2,
+  );
+  assert.deepEqual(snapshot.selectedServer, {
+    panelId: other.id,
+    serverId: "same-id",
+  });
+  assert.deepEqual(
+    await (
+      await h.proxy(
+        snapshot.panels.find((panel) => panel.id === draft.id),
+        "/server?serverId=same-id",
+      )
+    ).json(),
+    {
+      host: "a.example.test",
+      serverId: "same-id",
+    },
+  );
+});
+
+test("canceling a saved panel attempt rejects late success and preserves both connected panels", async (t) => {
+  let hold = false,
+    release,
+    entered,
+    requestSignal;
+  const started = new Promise((resolve) => {
+    entered = resolve;
+  });
+  const h = await harness(t, {
+    behavior: async (url, options) => {
+      if (hold && url.pathname === "/api/access/accept") {
+        requestSignal = options.signal;
+        entered();
+        await new Promise((resolve) => {
+          release = resolve;
+        });
+        return response({
+          ...account,
+          accountId: "replacement",
+          sessionToken: "b".repeat(43),
+        });
+      }
+    },
+  });
+  const first = await h.signIn("https://a.example.test"),
+    other = await h.signIn("https://c.example.test");
+  await h.controller.selectServer(first.id, "same-id");
+  hold = true;
+  const pending = h.controller.acceptInvitation(first.id, {
+    token: "i".repeat(43),
+    password: "new password",
+  });
+  const rejected = assert.rejects(pending, /changed|abort/i);
+  await started;
+  await assert.rejects(
+    h.controller.acceptInvitation(first.id, {
+      token: "i".repeat(43),
+      password: "new password",
+    }),
+    /already running/,
+  );
+  await h.controller.cancelSignIn(first.id);
+  assert.equal(requestSignal.aborted, true);
+  release();
+  await rejected;
+  const snapshot = h.controller.list();
+  const retained = snapshot.panels.find((panel) => panel.id === first.id);
+  assert.equal(retained.sessionEpoch, first.sessionEpoch);
+  assert.equal(retained.session.accountId, first.session.accountId);
+  assert.deepEqual(snapshot.selectedServer, {
+    panelId: first.id,
+    serverId: "same-id",
+  });
+  assert.equal(
+    snapshot.panels.find((panel) => panel.id === other.id).signedIn,
+    true,
+  );
+  assert.equal((await h.proxy(first, "/server?serverId=same-id")).status, 200);
+  assert.equal(
+    h.calls.filter((call) => call.url.pathname === "/api/access/accept").length,
+    1,
+  );
+});
+
+test("lost password setup response leaves a draft recoverable by ordinary sign-in", async (t) => {
+  let passwordSaved = false;
+  const h = await harness(t, {
+    behavior: async (url) => {
+      if (url.pathname === "/api/access/accept") {
+        passwordSaved = true;
+        throw new Error("Response lost");
+      }
+      if (url.pathname === "/api/access/login" && !passwordSaved)
+        return response(
+          { error: "Finish password setup with the invitation" },
+          401,
+        );
+    },
+  });
+  let draft = (await h.controller.open("https://a.example.test")).panels.find(
+    (panel) => panel.temporary,
+  );
+  await assert.rejects(
+    h.controller.acceptInvitation(draft.id, {
+      token: "i".repeat(43),
+      password: "new password",
+    }),
+    /Response lost/,
+  );
+  assert.equal(h.persisted.length, 0);
+  await h.controller.cancelSignIn(draft.id);
+  draft = (await h.controller.open("https://a.example.test")).panels.find(
+    (panel) => panel.temporary,
+  );
+  await h.controller.signIn(draft.id, {
+    email: account.email,
+    password: "new password",
+  });
+  assert.equal(
+    h.controller.list().panels.find((panel) => panel.id === draft.id).signedIn,
+    true,
+  );
 });
 
 test("successful sign-in saves a draft once and later cancellation cannot remove the saved panel", async (t) => {
@@ -1690,4 +1873,191 @@ test("a draft cannot overwrite another form's newly saved account", async (t) =>
   );
   await h.controller.cancelSignIn(second.id);
   assert.equal(h.persisted.at(-1).panels.length, 1);
+});
+
+test("workspace reload cancels temporary and saved authentication without touching other panels", async (t) => {
+  let release,
+    entered,
+    hold = false;
+  const started = new Promise((resolve) => {
+    entered = resolve;
+  });
+  const h = await harness(t, {
+    behavior: async (url) => {
+      if (hold && url.pathname === "/api/access/login") {
+        entered();
+        await new Promise((resolve) => {
+          release = resolve;
+        });
+      }
+    },
+  });
+  const other = await h.signIn("https://c.example.test");
+  const draft = (await h.controller.open("https://a.example.test")).panels.find(
+    (panel) => panel.temporary,
+  );
+  hold = true;
+  const pending = h.controller.signIn(draft.id, {
+    email: account.email,
+    password: "password",
+  });
+  const rejected = assert.rejects(pending, /changed|abort/i);
+  await started;
+  h.contents.emit("did-start-navigation", {}, h.runtime.url, false, false);
+  assert.equal(
+    h.calls.filter((call) => call.url.pathname === "/api/access/login").length,
+    2,
+  );
+  h.contents.emit("did-start-navigation", {}, h.runtime.url, false, true);
+  release();
+  await rejected;
+  assert.equal(
+    h.controller.list().panels.filter((panel) => !panel.local).length,
+    1,
+  );
+  assert.equal(
+    h.controller.list().panels.find((panel) => panel.id === other.id).signedIn,
+    true,
+  );
+  assert.equal(
+    h.persisted.at(-1).panels.some((panel) => panel.id === draft.id),
+    false,
+  );
+  await assert.rejects(
+    h.controller.signIn(draft.id, {
+      email: account.email,
+      password: "password",
+    }),
+    /no longer available/,
+  );
+});
+
+test("invitation preview IPC is restricted to the workspace and cannot be called by updater frames", () => {
+  const handlers = new Map(),
+    calls = [];
+  const uninstall = installUnifiedConnectionIpc(
+    {
+      handle: (channel, handler) => handlers.set(channel, handler),
+      removeHandler: (channel) => handlers.delete(channel),
+    },
+    {
+      isManagedSender: (event) => event.workspace === true,
+      invitation: (id, input) => calls.push({ id, input }),
+    },
+  );
+  const preview = handlers.get("mc-panel-unified:invitation");
+  assert.throws(
+    () => preview({ workspace: false }, "panel", { token: "i".repeat(43) }),
+    /Only this computer/,
+  );
+  preview({ workspace: true }, "panel", { token: "i".repeat(43) });
+  assert.deepEqual(calls, [{ id: "panel", input: { token: "i".repeat(43) } }]);
+  uninstall();
+});
+
+test("canceling saved authentication queued behind persistence preserves the prior account and epoch", async (t) => {
+  let block = false,
+    entered,
+    release,
+    authenticated;
+  const writing = new Promise((resolve) => {
+    entered = resolve;
+  });
+  const responseReady = new Promise((resolve) => {
+    authenticated = resolve;
+  });
+  const h = await harness(t, {
+    storeSave: async () => {
+      if (block) {
+        entered();
+        await new Promise((resolve) => {
+          release = resolve;
+        });
+      }
+    },
+    behavior: async (url) => {
+      if (block && url.pathname === "/api/access/login") {
+        authenticated();
+        return response({
+          ...account,
+          accountId: "replacement",
+          sessionToken: "b".repeat(43),
+        });
+      }
+    },
+  });
+  const first = await h.signIn("https://a.example.test"),
+    other = await h.signIn("https://c.example.test");
+  block = true;
+  const selection = h.controller.selectServer(first.id, "same-id");
+  await writing;
+  const pending = h.controller.signIn(first.id, {
+    email: account.email,
+    password: "password",
+  });
+  const rejected = assert.rejects(pending, /changed|abort/i);
+  await responseReady;
+  await new Promise((resolve) => setImmediate(resolve));
+  const waiting = h.controller
+    .list()
+    .panels.find((panel) => panel.id === first.id);
+  assert.equal(waiting.sessionEpoch, first.sessionEpoch);
+  assert.equal(waiting.session.accountId, first.session.accountId);
+  assert.equal(waiting.servers.length, 1);
+  await h.controller.cancelSignIn(first.id);
+  block = false;
+  release();
+  await selection;
+  await rejected;
+  const snapshot = h.controller.list();
+  assert.equal(
+    snapshot.panels.find((panel) => panel.id === first.id).sessionEpoch,
+    first.sessionEpoch,
+  );
+  assert.equal(
+    snapshot.panels.find((panel) => panel.id === other.id).signedIn,
+    true,
+  );
+  assert.deepEqual(snapshot.selectedServer, {
+    panelId: first.id,
+    serverId: "same-id",
+  });
+  assert.equal(
+    h.persisted.at(-1).panels.find((panel) => panel.id === first.id).token,
+    token,
+  );
+});
+
+test("failed saved authentication storage retains the previous usable account", async (t) => {
+  let failSave = false;
+  const h = await harness(t, {
+    storeSave: async () => {
+      if (failSave) throw new Error("Disk unavailable");
+    },
+    behavior: async (url) =>
+      failSave && url.pathname === "/api/access/login"
+        ? response({
+            ...account,
+            accountId: "replacement",
+            sessionToken: "b".repeat(43),
+          })
+        : undefined,
+  });
+  const first = await h.signIn("https://a.example.test");
+  failSave = true;
+  await assert.rejects(
+    h.controller.signIn(first.id, {
+      email: account.email,
+      password: "password",
+    }),
+    /Disk unavailable/,
+  );
+  failSave = false;
+  const retained = h.controller
+    .list()
+    .panels.find((panel) => panel.id === first.id);
+  assert.equal(retained.sessionEpoch, first.sessionEpoch);
+  assert.equal(retained.session.accountId, first.session.accountId);
+  assert.equal(retained.servers.length, 1);
+  assert.equal((await h.proxy(first, "/server?serverId=same-id")).status, 200);
 });

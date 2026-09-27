@@ -280,6 +280,7 @@ export function createBrowserConnectionController({
     writing = Promise.resolve(),
     initializing,
     timer;
+  let attemptEpoch = 0;
   let appliedRaw = null;
   const current = (panel, epoch) =>
     !closed &&
@@ -362,6 +363,11 @@ export function createBrowserConnectionController({
           if (closed) throw fail(503, "Browser connections are closed.");
           sync();
           if (expected) requireCurrent(expected.panel, expected.epoch);
+          if (
+            expected?.operation !== undefined &&
+            expected.panel.controls !== expected.operation
+          )
+            throw fail(409, "This panel sign-in changed.");
           const next = structuredClone(snapshot);
           update(next);
           next.revision++;
@@ -407,7 +413,7 @@ export function createBrowserConnectionController({
     session: panel.account,
     sessionEpoch: panel.epoch,
     pendingLeave: Boolean(panel.pendingLeave),
-    connectionState: panel.state,
+    connectionState: panel.temporary ? "connecting" : panel.state,
     servers: panel.servers,
     ...(panel.temporary ? { temporary: true } : {}),
     ...(panel.error ? { error: panel.error } : {}),
@@ -817,6 +823,15 @@ export function createBrowserConnectionController({
               return;
             next.homeBootstrapped = true;
             if (next.panels.length >= 50) return;
+            // Merely visiting a panel or opening its invitation must not save
+            // an anonymous connection. Retain recovery for a previously known
+            // owner selection or legacy credential only.
+            if (
+              !session &&
+              !validToken(token) &&
+              next.selectedServer?.panelId !== "local"
+            )
+              return;
             next.panels.push({
               id: newId(),
               origin: home,
@@ -865,15 +880,24 @@ export function createBrowserConnectionController({
     return initializing;
   }
   async function authenticate(id, pathname, input) {
+    const openingEpoch = attemptEpoch;
     await initialize();
+    if (openingEpoch !== attemptEpoch)
+      throw fail(409, "This panel sign-in changed.");
     const panel = get(id),
       epoch = panel.epoch;
     if (panel.pendingLeave) throw fail(409, pendingMessage);
+    if (panel.authenticating || panel.previewing)
+      throw fail(409, "A sign-in attempt is already running for this panel.");
     const operation = ++panel.controls;
-    panel.authenticating = true;
+    const abort = new AbortController();
+    panel.authenticating = operation;
+    panel.authAbort = abort;
     try {
       await panel.refreshing;
       requireCurrent(panel, epoch);
+      if (operation !== panel.controls)
+        throw fail(409, "This panel sign-in changed.");
       const result = await json(
         panel,
         pathname,
@@ -881,6 +905,8 @@ export function createBrowserConnectionController({
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify(input),
+          tokenOverride: "",
+          signal: abort.signal,
         },
         30000,
       );
@@ -912,11 +938,14 @@ export function createBrowserConnectionController({
           entry.epoch = newId();
           entry.servers = [];
         },
-        { panel, epoch },
+        { panel, epoch, operation },
       );
       if (panel.origin === home) homeCredential(result.sessionToken);
     } finally {
-      if (panel.controls === operation) panel.authenticating = false;
+      if (panel.controls === operation) {
+        panel.authenticating = false;
+        panel.authAbort = undefined;
+      }
     }
     await refresh(get(id));
     return list();
@@ -930,7 +959,10 @@ export function createBrowserConnectionController({
       return list();
     },
     async open(input) {
+      const openingEpoch = attemptEpoch;
       await initialize();
+      if (openingEpoch !== attemptEpoch)
+        throw fail(409, "This panel sign-in changed.");
       if (!ready) throw fail(503, error);
       sync();
       const target = originOf(input, home);
@@ -977,12 +1009,65 @@ export function createBrowserConnectionController({
       return list();
     },
     async cancelSignIn(id) {
-      const panel = drafts.get(id);
+      const panel = drafts.get(id) ?? panels.get(id);
       if (!panel) return;
+      if (!panel.temporary) {
+        if (panel.authenticating || panel.previewing) {
+          panel.controls++;
+          panel.authAbort?.abort();
+          panel.authenticating = false;
+          panel.previewing = false;
+        }
+        return;
+      }
       panel.removed = true;
       panel.controls++;
       invalidate(panel);
       drafts.delete(id);
+    },
+    async invitation(id, credentials) {
+      const openingEpoch = attemptEpoch;
+      await initialize();
+      if (openingEpoch !== attemptEpoch)
+        throw fail(409, "This panel sign-in changed.");
+      const panel = get(id),
+        epoch = panel.epoch;
+      if (panel.pendingLeave) throw fail(409, pendingMessage);
+      if (!validToken(credentials?.token))
+        throw fail(400, "Provide a valid invitation.");
+      if (panel.authenticating || panel.previewing)
+        throw fail(409, "A sign-in attempt is already running for this panel.");
+      const operation = ++panel.controls,
+        abort = new AbortController();
+      panel.previewing = operation;
+      panel.authAbort = abort;
+      try {
+        const result = await json(panel, "/api/access/invitation", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ token: credentials.token }),
+          tokenOverride: "",
+          signal: abort.signal,
+        });
+        requireCurrent(panel, epoch);
+        if (operation !== panel.controls)
+          throw fail(409, "This panel sign-in changed.");
+        if (
+          !text(result.email) ||
+          !Number.isFinite(Date.parse(result.inviteExpiresAt))
+        )
+          throw fail(502, "The host returned an invalid invitation.");
+        return {
+          email: result.email,
+          panelAddress: panel.origin,
+          inviteExpiresAt: result.inviteExpiresAt,
+        };
+      } finally {
+        if (panel.previewing === operation) {
+          panel.previewing = false;
+          panel.authAbort = undefined;
+        }
+      }
     },
     signIn: (id, credentials) =>
       authenticate(id, "/api/access/login", {
@@ -1180,7 +1265,9 @@ export function createBrowserConnectionController({
     const target = relativeApi(match[2] + url.search, panel.origin);
     if (
       /^\/api\/(?:desktop|panel-users)(?:\/|$)/i.test(target.pathname) ||
-      /^\/api\/access\/(?:login|accept|logout|leave)\/?$/i.test(target.pathname)
+      /^\/api\/access\/(?:login|invitation|accept|logout|leave)\/?$/i.test(
+        target.pathname,
+      )
     )
       throw fail(403, "Use the dedicated panel controls for this action.");
     return { panel, target, epoch: panel.epoch };
@@ -1296,6 +1383,12 @@ export function createBrowserConnectionController({
         error = cause.message;
         changed();
       }
+    },
+    cancelAttempts() {
+      attemptEpoch++;
+      for (const panel of [...panels.values(), ...drafts.values()])
+        if (panel.temporary || panel.authenticating || panel.previewing)
+          void bridge.cancelSignIn(panel.id).catch(() => {});
     },
     async close() {
       closed = true;

@@ -46,6 +46,10 @@ export function initializeBrowserConnections(): Promise<void> {
     if (event.key === browserConnectionsKey || event.key === null)
       controller?.storageChanged();
   });
+  // pagehide also runs when the document enters the back/forward cache. Cancel
+  // incomplete account attempts while retaining authenticated connections for
+  // a later pageshow; closing the controller would break that restored page.
+  window.addEventListener("pagehide", () => controller?.cancelAttempts());
   initialization = controller.initialize().then(() => undefined);
   return initialization;
 }

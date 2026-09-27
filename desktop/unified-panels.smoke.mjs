@@ -65,6 +65,7 @@ async function fixture() {
     },
   });
   let prompts = 0;
+  const certificateControl = { pause: false, release: null };
   controller = createUnifiedPanelController({
     window,
     localOrigin: runtime.url,
@@ -72,6 +73,10 @@ async function fixture() {
     dialog: {
       showMessageBox: async () => {
         prompts++;
+        if (certificateControl.pause)
+          await new Promise((resolve) => {
+            certificateControl.release = resolve;
+          });
         return { response: 1 };
       },
     },
@@ -86,6 +91,7 @@ async function fixture() {
   await controller.restore();
   globalThis.__unifiedSmoke = {
     ready: true,
+    certificateControl,
     inspect: () => ({
       snapshot: controller.list(),
       prompts,
@@ -120,6 +126,11 @@ async function smoke() {
   );
   const requests = [],
     servers = [];
+  const invitedAccount = {
+    password: null,
+    invitation: "i".repeat(43),
+    grants: ["same-id"],
+  };
   let releaseDownload;
   const downloadGate = new Promise((resolve) => {
     releaseDownload = resolve;
@@ -150,8 +161,38 @@ async function smoke() {
           permissions: ["server.view", "file.read-content", "file.create"],
           hostPermissions: [],
         };
-        if (url.pathname === "/api/access/login") {
-          for await (const _ of req) {
+        if (
+          [
+            "/api/access/login",
+            "/api/access/invitation",
+            "/api/access/accept",
+          ].includes(url.pathname)
+        ) {
+          const chunks = [];
+          for await (const chunk of req) chunks.push(chunk);
+          const input = JSON.parse(Buffer.concat(chunks).toString());
+          if (url.pathname === "/api/access/invitation") {
+            assert.equal(input.token, invitedAccount.invitation);
+            return reply({
+              email: "a@example.test",
+              panelAddress: url.origin,
+              inviteExpiresAt: new Date(Date.now() + 86400000).toISOString(),
+            });
+          }
+          if (url.pathname === "/api/access/accept") {
+            assert.equal(input.token, invitedAccount.invitation);
+            assert.ok(input.password.length >= 12);
+            invitedAccount.password = input.password;
+            invitedAccount.invitation = null;
+          } else if (
+            host === "a" &&
+            (!invitedAccount.password ||
+              input.password !== invitedAccount.password)
+          ) {
+            return reply(
+              { error: "Finish setting your password using the invitation." },
+              401,
+            );
           }
           return reply({ ...session, sessionToken: token(host) });
         }
@@ -176,7 +217,30 @@ async function smoke() {
             hostPermissions: [],
           });
         if (url.pathname === "/api/server")
-          return reply({ host, serverId: req.headers["x-server-id"] });
+          return reply({
+            host,
+            serverId: req.headers["x-server-id"],
+            id: "same-id",
+            name: `Computer ${host.toUpperCase()}`,
+            status: "running",
+            mode: "live",
+            software: "Paper",
+            version: "1.21.1",
+            address: "play.example.test",
+            players: [],
+            maxPlayers: 20,
+            uptime: 0,
+            cpu: 0,
+            memory: 0,
+            memoryLimit: 2048,
+            disk: 0,
+            diskLimit: 1024 ** 3,
+            port: 25565,
+            memoryLimitMB: 2048,
+            jar: "server.jar",
+            javaPath: "java",
+          });
+        if (url.pathname === "/api/console") return reply({ lines: [] });
         if (url.pathname === "/api/files/upload") {
           const chunks = [];
           for await (const chunk of req) chunks.push(chunk);
@@ -266,6 +330,7 @@ async function smoke() {
       )
     ).panels.find((panel) => panel.origin === servers[0].origin);
     assert.equal(draft.temporary, true);
+    assert.equal(draft.connectionState, "connecting");
     assert.equal(
       (await page.evaluate(() => window.mcPanelConnections.list())).panels.some(
         (panel) => panel.id === draft.id,
@@ -292,23 +357,103 @@ async function smoke() {
         .prompts,
       1,
     );
-    for (let index = 0; index < servers.length; index++) {
-      const origin = servers[index].origin;
-      const opened = await page.evaluate(
-        (origin) => window.mcPanelConnections.open(origin),
-        origin,
-      );
-      const temporary = opened.panels.find((panel) => panel.origin === origin);
-      await page.evaluate(
-        async ({ id, email }) => {
-          await window.mcPanelConnections.signIn(id, {
-            email,
-            password: "fixture-password",
-          });
-        },
-        { id: temporary.id, email: `${index ? "c" : "a"}@example.test` },
-      );
-    }
+    const invite = `${servers[0].origin}/#invite=${invitedAccount.invitation}`;
+    const openInvitation = async () => {
+      await page.getByRole("button", { name: /^Account menu for/ }).click();
+      await page
+        .getByRole("menuitem", { name: "Accept invitation", exact: true })
+        .click();
+      const dialog = page.getByRole("dialog", {
+        name: "Accept invitation",
+        exact: true,
+      });
+      await dialog.getByLabel("Invitation link", { exact: true }).fill(invite);
+      await dialog
+        .getByRole("button", { name: "Continue with invitation", exact: true })
+        .click();
+      await expect(
+        dialog.getByLabel("New password", { exact: true }),
+      ).toBeVisible();
+      await expect(dialog).toContainText("a@example.test");
+      return dialog;
+    };
+    let invitation = await openInvitation();
+    await invitation
+      .getByLabel("New password", { exact: true })
+      .fill("never-submitted-password");
+    await page.keyboard.press("Escape");
+    await expect(invitation).toHaveCount(0);
+    assert.equal(invitedAccount.password, null);
+    assert.equal(invitedAccount.invitation, "i".repeat(43));
+    assert.deepEqual(invitedAccount.grants, ["same-id"]);
+    assert.equal(
+      requests.some((request) =>
+        ["/api/access/login", "/api/access/accept"].includes(request.path),
+      ),
+      false,
+    );
+    assert.equal(
+      (await page.evaluate(() => window.mcPanelConnections.list())).panels.some(
+        (panel) => !panel.local,
+      ),
+      false,
+    );
+    invitation = await openInvitation();
+    await expect(
+      invitation.getByLabel("New password", { exact: true }),
+    ).toHaveValue("");
+    await invitation
+      .getByLabel("New password", { exact: true })
+      .fill("fixture-password");
+    await invitation
+      .getByLabel("Confirm password", { exact: true })
+      .fill("fixture-password");
+    await invitation
+      .getByRole("button", { name: "Set password and continue", exact: true })
+      .click();
+    await expect(invitation).toHaveCount(0);
+    assert.equal(invitedAccount.password, "fixture-password");
+    assert.equal(invitedAccount.invitation, null);
+    assert.deepEqual(invitedAccount.grants, ["same-id"]);
+
+    await application.evaluate(() => {
+      globalThis.__unifiedSmoke.certificateControl.pause = true;
+    });
+    await page.getByRole("button", { name: /^Account menu for/ }).click();
+    await page.getByRole("menuitem", { name: "Sign in", exact: true }).click();
+    const signIn = page.getByRole("dialog", { name: "Sign in", exact: true });
+    await signIn
+      .getByLabel("Panel address", { exact: true })
+      .fill(servers[1].origin);
+    await signIn
+      .getByLabel("Email address", { exact: true })
+      .fill("c@example.test");
+    await signIn
+      .getByLabel("Password", { exact: true })
+      .fill("fixture-password");
+    assert.equal(
+      requests.some((request) => request.host === "c"),
+      false,
+    );
+    await signIn.getByRole("button", { name: "Sign in", exact: true }).click();
+    await expect
+      .poll(() =>
+        application.evaluate(() =>
+          Boolean(globalThis.__unifiedSmoke.certificateControl.release),
+        ),
+      )
+      .toBe(true);
+    assert.equal(
+      requests.some(
+        (request) =>
+          request.host === "c" && request.path === "/api/access/login",
+      ),
+      false,
+    );
+    await application.evaluate(() => {
+      globalThis.__unifiedSmoke.certificateControl.release();
+    });
+    await expect(signIn).toHaveCount(0);
     const snapshot = await page.evaluate(() =>
       window.mcPanelConnections.list(),
     );
@@ -326,7 +471,10 @@ async function smoke() {
     );
     assert.deepEqual(
       await page.evaluate(
-        async (url) => (await fetch(url)).json(),
+        async (url) => {
+          const { host, serverId } = await (await fetch(url)).json();
+          return { host, serverId };
+        },
         proxy(a, "/server"),
       ),
       { host: "a", serverId: "same-id" },
@@ -385,7 +533,7 @@ async function smoke() {
     assert.equal(state.windows, 1);
     assert.equal(state.childViews, 0);
     assert.equal(new URL(page.url()).origin, state.localOrigin);
-    assert.equal(state.prompts, 3);
+    assert.equal(state.prompts, 4);
     assert.ok(
       state.encryption,
       "Native safeStorage must encrypt persisted credentials",
@@ -426,7 +574,10 @@ async function smoke() {
     );
     assert.deepEqual(
       await page.evaluate(
-        async (url) => (await fetch(url)).json(),
+        async (url) => {
+          const { host, serverId } = await (await fetch(url)).json();
+          return { host, serverId };
+        },
         proxy(restoredA, "/server"),
       ),
       { host: "a", serverId: "same-id" },
@@ -481,7 +632,7 @@ async function smoke() {
       "Switching/signing out/restarting the client must not stop a remote server",
     );
     console.log(
-      "Passed native unified workspace: one local renderer; A/C bearer isolation with colliding IDs; streamed multipart upload and client download surviving selection changes; encrypted session restart, trust persistence, epoch rejection, isolated sign-out and confirmed access removal.",
+      "Passed native unified workspace: invitation cancellation/reopening preserves pending password setup and grants; one-form sign-in waits for certificate confirmation; A/C bearer isolation with colliding IDs; streamed multipart upload and client download surviving selection changes; encrypted session restart, trust persistence, epoch rejection, isolated sign-out and confirmed access removal.",
     );
   } catch (cause) {
     if (stderr) console.error(stderr);

@@ -1207,25 +1207,28 @@ test("the account menu and connection dialog support Escape and restore keyboard
   await account.press("Enter");
   await expect(
     page.getByRole("menuitem", {
-      name: "Add Panel",
+      name: "Accept invitation",
       exact: true,
     }),
   ).toBeVisible();
   await expect(
-    page.getByRole("menuitem", { name: "Accept an invitation", exact: true }),
-  ).toHaveCount(0);
+    page.getByRole("menuitem", { name: "Sign in", exact: true }),
+  ).toBeVisible();
   await page.keyboard.press("Escape");
   await expect(page.getByRole("menuitem")).toHaveCount(0);
   await expect(account).toBeFocused();
 
   await account.press("Enter");
   const signIn = page.getByRole("menuitem", {
-    name: "Add Panel",
+    name: "Accept invitation",
     exact: true,
   });
   await signIn.focus();
   await signIn.press("Enter");
-  const dialog = page.getByRole("dialog", { name: "Add Panel", exact: true });
+  const dialog = page.getByRole("dialog", {
+    name: "Accept invitation",
+    exact: true,
+  });
   await expect(dialog).toBeVisible();
   await expect(
     dialog.getByRole("textbox", { name: "Invitation link", exact: true }),
@@ -2408,7 +2411,11 @@ for (const invitation of [false, true]) {
         body: "<!doctype html><html><body><h1>Remote panel destination</h1></body></html>",
       });
     });
-    const remoteRequests: { path: string; authorization?: string }[] = [];
+    const remoteRequests: {
+      path: string;
+      authorization?: string;
+      body: unknown;
+    }[] = [];
     await page.route(`${panelOrigin}/api/**`, (route) => {
       const request = route.request();
       const headers = {
@@ -2423,7 +2430,23 @@ for (const invitation of [false, true]) {
       remoteRequests.push({
         path: new URL(request.url()).pathname,
         authorization: request.headers().authorization,
+        body: request.postDataJSON(),
       });
+      if (new URL(request.url()).pathname === "/api/access/invitation")
+        return route.fulfill({
+          headers,
+          json: {
+            email: "invited@example.test",
+            panelAddress: panelOrigin,
+            inviteExpiresAt: new Date(Date.now() + 86400000).toISOString(),
+          },
+        });
+      if (new URL(request.url()).pathname === "/api/access/login")
+        return route.fulfill({
+          headers,
+          status: 401,
+          json: { error: "The email or password is incorrect." },
+        });
       return route.fulfill({ headers, json: { role: "guest" } });
     });
     await page.goto("/");
@@ -2435,18 +2458,14 @@ for (const invitation of [false, true]) {
       .click();
     await page
       .getByRole("menuitem", {
-        name: invitation ? "Add Panel" : "Manage Connections",
+        name: invitation ? "Accept invitation" : "Sign in",
         exact: true,
       })
       .click();
     const dialog = page.getByRole("dialog", {
-      name: invitation ? "Add Panel" : "Manage Connections",
+      name: invitation ? "Accept invitation" : "Sign in",
       exact: true,
     });
-    if (!invitation)
-      await dialog
-        .getByRole("button", { name: "Sign in to existing panel", exact: true })
-        .click();
     await dialog
       .getByRole("textbox", {
         name: invitation ? "Invitation link" : "Panel address",
@@ -2457,9 +2476,21 @@ for (const invitation of [false, true]) {
           ? `https://PANEL.example.test:443/#invite=${invitationToken}`
           : "https://PANEL.example.test:443",
       );
+    if (!invitation) {
+      await expect(
+        dialog.getByLabel("Password", { exact: true }),
+      ).toBeVisible();
+      await dialog
+        .getByLabel("Email address", { exact: true })
+        .fill("invited@example.test");
+      await dialog
+        .getByLabel("Password", { exact: true })
+        .fill("Fixture-only-account-password");
+      expect(remoteRequests).toEqual([]);
+    }
     await dialog
       .getByRole("button", {
-        name: invitation ? "Continue with invitation" : "Continue to sign in",
+        name: invitation ? "Continue with invitation" : "Sign in",
         exact: true,
       })
       .click();
@@ -2468,17 +2499,45 @@ for (const invitation of [false, true]) {
         exact: true,
       }),
     ).toBeVisible();
-    await expect(dialog).toContainText("panel.example.test");
+    if (invitation) await expect(dialog).toContainText("invited@example.test");
+    else {
+      await expect(dialog.getByRole("alert")).toHaveText(
+        "The email or password is incorrect.",
+      );
+      await expect(
+        dialog.getByLabel("Panel address", { exact: true }),
+      ).toHaveValue("https://PANEL.example.test:443");
+    }
     expect(new URL(page.url()).origin).toBe("http://127.0.0.1:3111");
-    // Discovery carries no invitation fragment, password or existing token.
+    // Only validation runs before the destination-specific preview or sign-in.
     expect(navigations).toEqual([]);
     expect(remoteRequests.length).toBeGreaterThan(0);
     expect(
       remoteRequests.every(
         (request) =>
-          request.path === "/api/access/session" && !request.authorization,
+          [
+            "/api/access/session",
+            invitation ? "/api/access/invitation" : "/api/access/login",
+          ].includes(request.path) && !request.authorization,
       ),
     ).toBe(true);
+    expect(remoteRequests[0]).toEqual({
+      path: "/api/access/session",
+      authorization: undefined,
+      body: null,
+    });
+    expect(
+      remoteRequests.find((request) =>
+        request.path.endsWith(invitation ? "/invitation" : "/login"),
+      )?.body,
+    ).toEqual(
+      invitation
+        ? { token: invitationToken }
+        : {
+            email: "invited@example.test",
+            password: "Fixture-only-account-password",
+          },
+    );
     expect(desktopOpens).toEqual([]);
     expect(localCredentials).toEqual([]);
   });

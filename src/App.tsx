@@ -920,7 +920,9 @@ export function EmptyFleet({
             </h1>
             <p>
               {window.mcPanelConnections?.unified && !canAddServer
-                ? "Add a panel or sign in to a saved connection. Servers shared with your accounts appear here automatically."
+                ? session
+                  ? "No servers are currently shared with this account. Servers the owner shares with you will appear here automatically."
+                  : "Accept an invitation or sign in to a panel. Servers shared with your accounts appear here automatically."
                 : showWelcome
                   ? "Start a new Minecraft server, or bring one you already have."
                   : session && (!canAddServer || openLocalSetup)
@@ -958,6 +960,19 @@ export function EmptyFleet({
                   explicitTarget={Boolean(openLocalSetup)}
                 />
               </>
+            )}
+            {window.mcPanelConnections?.unified && (
+              <div className="welcome-signin-actions">
+                <button
+                  className="btn primary"
+                  onClick={() => onConnect("invitation")}
+                >
+                  Accept invitation
+                </button>
+                <button className="btn" onClick={() => onConnect("signin")}>
+                  Sign in
+                </button>
+              </div>
             )}
             <div className="welcome-remote-account">
               {session && !showWelcome && <DesktopPanelReturn />}

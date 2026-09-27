@@ -18,7 +18,7 @@ const maximumLeaveReceipts = 4096;
 const maximumAccessRevocations = 4096;
 const maxEmailMemberships = 32;
 const invalidLink =
-  "This invitation link is invalid or expired. Ask the server owner for a new link.";
+  "This invitation link is invalid, expired, or already used. If you saved your password, choose Sign in. Otherwise, ask the server owner to reissue the invitation for your existing account.";
 const invalidLogin = "The email or password is incorrect.";
 const fail = (status, message) => Object.assign(new Error(message), { status });
 const digest = (value) => createHash("sha256").update(value).digest("hex");
@@ -31,6 +31,16 @@ const validEmail = (value) =>
   value.length <= 254 && /^[^\s@<>]+@[^\s@<>]+\.[^\s@<>]+$/.test(value);
 const validPassword = (value) =>
   typeof value === "string" && value.length >= 12 && value.length <= 128;
+const hasPassword = (record) =>
+  record?.password?.algorithm === "scrypt" &&
+  /^[a-f0-9]{64}$/.test(record.password.salt) &&
+  /^[a-f0-9]{128}$/.test(record.password.hash);
+const activated = (record) =>
+  Boolean(
+    Number.isSafeInteger(record?.acceptedAt) &&
+    record.acceptedAt > 0 &&
+    hasPassword(record),
+  );
 const membershipKey = (serverId, userId) => JSON.stringify([serverId, userId]);
 const scopeKey = (record) => membershipKey(record.serverId, record.userId);
 const clearCookie = `${SUBUSER_COOKIE}=; Path=/; HttpOnly; SameSite=Strict; Secure; Max-Age=0`;
@@ -634,12 +644,12 @@ export async function createAccessService({
     return {
       invitedAt: new Date(account.invitedAt).toISOString(),
       inviteExpiresAt: token ? new Date(token.expiresAt).toISOString() : null,
-      acceptedAt: account.acceptedAt
+      acceptedAt: activated(account)
         ? new Date(account.acceptedAt).toISOString()
         : null,
       inviteStatus: token
         ? "pending"
-        : account.acceptedAt
+        : activated(account)
           ? "accepted"
           : "expired",
     };
@@ -747,6 +757,23 @@ export async function createAccessService({
       (item) =>
         scopeKey(item) === scopeKey(record) && item.email === record.email,
     );
+  const pendingInvitation = async (token) => {
+    if (!status().ready || !validSecret(token)) throw fail(401, invalidLink);
+    const hash = digest(token);
+    const record = state.tokens.find(
+      (item) =>
+        item.hash === hash && item.sent !== false && item.expiresAt > now(),
+    );
+    if (!record) throw fail(401, invalidLink);
+    if (record.accountId) {
+      const account = accountById(record.accountId);
+      if (!account || account.email !== record.email)
+        throw fail(401, invalidLink);
+    } else if (!enrolled(record) || !(await liveUser(record))) {
+      throw fail(401, invalidLink);
+    }
+    return record;
+  };
   const sessionScopes = (record) =>
     Array.isArray(record.memberships)
       ? record.memberships
@@ -838,8 +865,7 @@ export async function createAccessService({
     if (!record) return null;
     if (record.accountId) {
       const account = accountById(record.accountId);
-      return account?.acceptedAt &&
-        account.password &&
+      return activated(account) &&
         account.email === record.email &&
         account.authRevision === record.authRevision
         ? accountSessionView(account)
@@ -848,7 +874,15 @@ export async function createAccessService({
     const memberships = [];
     for (const scope of sessionScopes(record).slice(0, maxEmailMemberships)) {
       const membership = { ...scope, email: record.email };
-      if (enrolled(membership) && (await liveUser(membership)))
+      if (
+        state.memberships.some(
+          (item) =>
+            scopeKey(item) === scopeKey(membership) &&
+            item.email === membership.email &&
+            activated(item),
+        ) &&
+        (await liveUser(membership))
+      )
         memberships.push(scope);
     }
     if (!memberships.length) return null;
@@ -1446,12 +1480,12 @@ export async function createAccessService({
       return {
         invitedAt: new Date(invited.invitedAt).toISOString(),
         inviteExpiresAt: token ? new Date(token.expiresAt).toISOString() : null,
-        acceptedAt: invited.acceptedAt
+        acceptedAt: activated(invited)
           ? new Date(invited.acceptedAt).toISOString()
           : null,
         inviteStatus: token
           ? "pending"
-          : invited.acceptedAt
+          : activated(invited)
             ? "accepted"
             : "expired",
       };
@@ -1461,8 +1495,7 @@ export async function createAccessService({
       const account = accountById(userId);
       if (account)
         return Boolean(
-          account.acceptedAt &&
-          account.password &&
+          activated(account) &&
           permitsServer(account, serverId) &&
           (email === undefined || account.email === normalizedEmail(email)),
         );
@@ -1470,6 +1503,7 @@ export async function createAccessService({
         (item) =>
           item.serverId === serverId &&
           item.userId === userId &&
+          activated(item) &&
           (email === undefined || item.email === normalizedEmail(email)) &&
           !state.retiredLegacyEmails.includes(item.email) &&
           !state.accounts.some(
@@ -1550,15 +1584,21 @@ export async function createAccessService({
           inviteExpiresAt: new Date(expiresAt).toISOString(),
         };
       }),
+    previewInvitation: (token) =>
+      serialize(async () => {
+        const record = await pendingInvitation(token);
+        // Looking at an invitation proves only which account the link names.
+        // Keep both the invitation and every server grant unchanged until the
+        // password and activation can be committed together by accept().
+        return {
+          email: record.email,
+          panelAddress: state.configuration.publicUrl,
+          inviteExpiresAt: new Date(record.expiresAt).toISOString(),
+        };
+      }),
     accept: (token, password, req) =>
       serializeAuthentication(async () => {
-        if (!status().ready || !validSecret(token))
-          throw fail(401, invalidLink);
-        const hash = digest(token);
-        const record = state.tokens.find(
-          (item) =>
-            item.hash === hash && item.sent !== false && item.expiresAt > now(),
-        );
+        const record = await pendingInvitation(token);
         if (record?.accountId) {
           const account = accountById(record.accountId);
           if (!account || account.email !== record.email)
@@ -1655,7 +1695,7 @@ export async function createAccessService({
         if (!status().ready || !validEmail(email) || !validPassword(password))
           throw fail(401, invalidLogin);
         const account = state.accounts.find(
-          (item) => item.email === email && item.password && item.acceptedAt,
+          (item) => item.email === email && activated(item),
         );
         if (account) {
           if (!(await matchesPassword(password, account.password)))
@@ -1673,7 +1713,7 @@ export async function createAccessService({
           };
         }
         const candidates = state.memberships
-          .filter((item) => item.email === email && item.password)
+          .filter((item) => item.email === email && activated(item))
           .slice(0, maxEmailMemberships);
         const matched = [];
         let primaryUser;

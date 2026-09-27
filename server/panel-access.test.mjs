@@ -16,8 +16,10 @@ async function fixture(t) {
   );
   const servers = ["server-a", "server-b"];
   const legacy = [];
+  let currentTime = Date.now();
   const options = {
     dataDir: root,
+    now: () => currentTime,
     listServerIds: () => [...servers],
     listLegacyUsers: () => legacy,
     getUser: (serverId, userId) =>
@@ -66,8 +68,188 @@ async function fixture(t) {
     const invitation = await access.invite({ serverId, user });
     return access.accept(token(invitation), secret);
   };
-  return { root, access, servers, legacy, boot, enroll, legacyEnroll };
+  return {
+    root,
+    access,
+    servers,
+    legacy,
+    boot,
+    enroll,
+    legacyEnroll,
+    advance: (milliseconds) => {
+      currentTime += milliseconds;
+    },
+  };
 }
+
+test("previewing and cancelling an invitation preserves a passwordless account and its existing grants across restart", async (t) => {
+  const f = await fixture(t);
+  const account = await f.access.createAccount({
+    email: "pending@example.test",
+  });
+  await f.access.grantServer("server-a", account.id, {
+    permissions: ["server.view", "file.read"],
+  });
+  const invitation = await f.access.inviteAccount(account.id);
+  const storage = path.join(f.root, "remote-access.json");
+  const before = await fs.readFile(storage, "utf8");
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    assert.deepEqual(await f.access.previewInvitation(token(invitation)), {
+      email: account.email,
+      panelAddress: "https://panel.example.test",
+      inviteExpiresAt: invitation.inviteExpiresAt,
+    });
+  }
+  await assert.rejects(f.access.accept(token(invitation), "short"), {
+    status: 400,
+  });
+  await assert.rejects(f.access.login({ email: account.email, password }), {
+    status: 401,
+  });
+  assert.equal(f.access.membershipAllowed("server-a", account.id), false);
+  assert.equal(await fs.readFile(storage, "utf8"), before);
+  await f.access.close();
+  const restarted = await f.boot();
+  assert.equal(restarted.account(account.id).inviteStatus, "pending");
+  assert.equal(restarted.account(account.id).acceptedAt, null);
+  assert.deepEqual(
+    restarted.userForServer("server-a", account.id).permissions,
+    ["server.view", "file.read"],
+  );
+  assert.equal(
+    (await restarted.previewInvitation(token(invitation))).email,
+    account.email,
+  );
+  const accepted = await restarted.accept(token(invitation), password);
+  assert.deepEqual(accepted.session.memberships, [
+    { serverId: "server-a", userId: account.id },
+  ]);
+  assert.equal(restarted.listAccounts().length, 1);
+  assert.equal(restarted.userForServer("server-b", account.id), null);
+});
+
+test("failed password persistence leaves invitation and grants usable; a lost success response recovers through sign-in", async (t) => {
+  const f = await fixture(t);
+  const account = await f.access.createAccount({ email: "retry@example.test" });
+  await f.access.grantServer("server-a", account.id, {
+    permissions: ["server.view", "control.start"],
+  });
+  const invitation = await f.access.inviteAccount(account.id);
+  const storage = path.join(f.root, "remote-access.json");
+  const before = await fs.readFile(storage, "utf8");
+  const rename = fs.rename;
+  const injected = t.mock.method(fs, "rename", async (source, destination) => {
+    if (destination === storage)
+      throw new Error("Fixture password persistence failure");
+    return rename(source, destination);
+  });
+  await assert.rejects(f.access.accept(token(invitation), password), {
+    status: 500,
+  });
+  assert.equal(await fs.readFile(storage, "utf8"), before);
+  assert.equal(f.access.account(account.id).inviteStatus, "pending");
+  assert.equal(f.access.account(account.id).acceptedAt, null);
+  assert.equal(
+    (await f.access.previewInvitation(token(invitation))).email,
+    account.email,
+  );
+  injected.mock.restore();
+  const attempts = await Promise.allSettled([
+    f.access.accept(token(invitation), password),
+    f.access.accept(token(invitation), secondPassword),
+  ]);
+  assert.equal(attempts[0].status, "fulfilled");
+  assert.equal(attempts[1].status, "rejected");
+  assert.equal(attempts[1].reason.status, 401);
+  await f.access.close();
+  const restarted = await f.boot();
+  await assert.rejects(restarted.previewInvitation(token(invitation)), {
+    status: 401,
+    message: /If you saved your password, choose Sign in/,
+  });
+  const signed = await restarted.login({ email: account.email, password });
+  assert.deepEqual(signed.session.permissions, [
+    "server.view",
+    "control.start",
+  ]);
+  await assert.rejects(
+    restarted.login({ email: account.email, password: secondPassword }),
+    { status: 401 },
+  );
+  assert.equal(restarted.account(account.id).inviteStatus, "accepted");
+  assert.equal(restarted.listAccounts().length, 1);
+});
+
+test("owners can reissue expired invitations on the existing account without changing server grants", async (t) => {
+  const f = await fixture(t);
+  const account = await f.access.createAccount({
+    email: "expired@example.test",
+  });
+  await f.access.grantServer("server-a", account.id, {
+    permissions: ["server.view", "file.read"],
+  });
+  await f.access.grantServer("server-b", account.id, {
+    permissions: ["server.view", "control.start"],
+  });
+  const expired = await f.access.inviteAccount(account.id);
+  f.advance(24 * 60 * 60 * 1000);
+  for (const operation of [
+    () => f.access.previewInvitation(token(expired)),
+    () => f.access.accept(token(expired), password),
+  ])
+    await assert.rejects(operation(), {
+      status: 401,
+      message: /reissue the invitation for your existing account/,
+    });
+  assert.equal(f.access.account(account.id).inviteStatus, "expired");
+  const grants = f.access.account(account.id).serverOverrides;
+  await assert.rejects(f.access.createAccount({ email: account.email }), {
+    status: 409,
+  });
+  const reissued = await f.access.inviteAccount(account.id);
+  assert.equal(reissued.account.id, account.id);
+  assert.deepEqual(reissued.account.serverOverrides, grants);
+  assert.equal(f.access.listAccounts().length, 1);
+  await assert.rejects(f.access.accept(token(expired), password), {
+    status: 401,
+  });
+  const accepted = await f.access.accept(token(reissued), password);
+  assert.deepEqual(
+    accepted.session.memberships.map((member) => member.serverId),
+    ["server-a", "server-b"],
+  );
+});
+
+test("inconsistent activation without a stored password fails closed and retains owner recovery", async (t) => {
+  const f = await fixture(t);
+  const member = await f.enroll();
+  await f.access.grantServer("server-a", member.account.id, {
+    permissions: ["server.view"],
+  });
+  const storage = path.join(f.root, "remote-access.json");
+  const saved = JSON.parse(await fs.readFile(storage, "utf8"));
+  delete saved.accounts[0].password;
+  await f.access.close();
+  await fs.writeFile(storage, JSON.stringify(saved));
+  const restarted = await f.boot();
+  assert.equal(await restarted.authenticate(req(member.cookie)), null);
+  assert.equal(
+    restarted.membershipAllowed("server-a", member.account.id),
+    false,
+  );
+  assert.equal(restarted.account(member.account.id).inviteStatus, "expired");
+  assert.equal(restarted.account(member.account.id).acceptedAt, null);
+  await assert.rejects(
+    restarted.login({ email: member.account.email, password }),
+    { status: 401 },
+  );
+  const invitation = await restarted.inviteAccount(member.account.id);
+  const signed = await restarted.accept(token(invitation), password);
+  assert.deepEqual(signed.session.memberships, [
+    { serverId: "server-a", userId: member.account.id },
+  ]);
+  assert.equal(restarted.listAccounts().length, 1);
+});
 
 test("panel invitations start with no grants and retain one durable credential across future servers", async (t) => {
   const f = await fixture(t);

@@ -364,7 +364,7 @@ export function createRemoteGateway({
         // Login and invitations may omit a bearer, but still require JSON.
         if (
           req.method === "POST" &&
-          /^\/api\/access\/(?:login|accept)\/?$/i.test(req.path) &&
+          /^\/api\/access\/(?:login|invitation|accept)\/?$/i.test(req.path) &&
           !/^application\/json(?:\s*;|$)/i.test(
             req.headers["content-type"] ?? "",
           )
@@ -442,6 +442,10 @@ export function createRemoteGateway({
     );
     await accepted?.(result.session);
     res.json({ ...result.session, sessionToken: result.token });
+  });
+  app.post("/api/access/invitation", acceptLimit, async (req, res) => {
+    res.set("Cache-Control", "no-store");
+    res.json(await access.previewInvitation(req.body?.token));
   });
   app.post("/api/access/logout", async (req, res) => {
     await access.logout(req);

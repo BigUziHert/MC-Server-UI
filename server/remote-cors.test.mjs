@@ -106,6 +106,77 @@ function assertCors(result, expectedOrigin = workspace) {
   assert.match(result.headers.vary, /(?:^|,\s*)Origin(?:,|$)/);
 }
 
+test("invitation preview identifies the pending account without issuing access or consuming its link", async (t) => {
+  const f = await fixture(t);
+  const account = await f.fleet.access.createAccount({
+    email: "pending@example.test",
+  });
+  await f.fleet.access.grantServer(f.serverId, account.id, {
+    permissions: ["server.view", "file.read"],
+  });
+  const invitation = await f.fleet.access.inviteAccount(account.id);
+  const token = new URL(invitation.invitationUrl).hash.slice("#invite=".length);
+  const options = (value = { token }) => ({
+    method: "POST",
+    headers: { ...browserHeaders, "Content-Type": "application/json" },
+    body: JSON.stringify(value),
+  });
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    const result = await f.request("/api/access/invitation", options());
+    assert.equal(result.status, 200, JSON.stringify(result.body));
+    assertCors(result);
+    assert.equal(result.headers["cache-control"], "no-store");
+    assert.equal(result.headers["set-cookie"], undefined);
+    assert.deepEqual(result.body, {
+      email: account.email,
+      panelAddress: origin,
+      inviteExpiresAt: invitation.inviteExpiresAt,
+    });
+  }
+  assert.deepEqual(
+    (await f.request("/api/access/session", { headers: browserHeaders })).body,
+    { role: "guest" },
+  );
+  assert.equal(f.fleet.access.account(account.id).inviteStatus, "pending");
+  assert.equal(f.fleet.access.account(account.id).acceptedAt, null);
+  assert.deepEqual(
+    f.fleet.access.userForServer(f.serverId, account.id).permissions,
+    ["server.view", "file.read"],
+  );
+  assert.equal(
+    (
+      await f.request("/api/access/invitation", {
+        ...options(),
+        headers: { ...browserHeaders, "Content-Type": "text/plain" },
+      })
+    ).status,
+    415,
+  );
+  const invalid = await f.request(
+    "/api/access/invitation",
+    options({ token: "x".repeat(43) }),
+  );
+  assert.equal(invalid.status, 401);
+  assert.equal(JSON.stringify(invalid.body).includes(account.email), false);
+  const accepted = await f.request(
+    "/api/access/accept",
+    options({ token, password }),
+  );
+  assert.equal(accepted.status, 200, JSON.stringify(accepted.body));
+  assert.deepEqual(accepted.body.memberships, [
+    { serverId: f.serverId, userId: account.id },
+  ]);
+  const consumed = await f.request("/api/access/invitation", options());
+  assert.equal(consumed.status, 401);
+  assert.match(consumed.body.error, /choose Sign in/);
+  const recovered = await f.request(
+    "/api/access/login",
+    options({ email: account.email, password }),
+  );
+  assert.equal(recovered.status, 200);
+  assert.equal(recovered.body.accountId, account.id);
+});
+
 test("browser preflight allows concrete API methods and headers from secure or canonical loopback origins", async (t) => {
   const f = await fixture(t);
   for (const value of [
