@@ -85,16 +85,20 @@ export default function PanelAccount({
   const targetPanel =
     connections?.panels.find(
       (panel) =>
+        (!unified ||
+          panel.local ||
+          (panel.signedIn === true && !panel.pendingLeave)) &&
         panel.id ===
-        (targetPanelId ??
-          workspace?.selected?.panelId ??
-          connections.selectedServer?.panelId ??
-          "local"),
+          (targetPanelId ??
+            workspace?.selected?.panelId ??
+            connections.selectedServer?.panelId ??
+            "local"),
     ) ??
     (unified
       ? (connections?.panels.find((panel) => panel.local) ??
-        connections?.panels.find((panel) => panel.signedIn) ??
-        connections?.panels[0])
+        connections?.panels.find(
+          (panel) => panel.signedIn && !panel.pendingLeave,
+        ))
       : undefined);
   const hasLocalOwner =
     !unified || connections?.panels.some((panel) => panel.local);
@@ -140,13 +144,14 @@ export default function PanelAccount({
       onSelect: () =>
         void perform(() => window.mcPanelConnections!.activate("local")),
     });
-  actions.push({
-    id: "signin",
-    label: unified ? "Sign in" : "Sign in to another panel",
-    icon: <LogIn size={16} />,
-    disabled: busy,
-    onSelect: () => onConnect("signin"),
-  });
+  if (!unified)
+    actions.push({
+      id: "signin",
+      label: "Sign in to another panel",
+      icon: <LogIn size={16} />,
+      disabled: busy,
+      onSelect: () => onConnect("signin"),
+    });
   if (unified)
     actions.push({
       id: "invitation",
@@ -198,7 +203,7 @@ export default function PanelAccount({
                   (targetPanel.signedIn ? "Saved panel account" : "Signed out"),
                 detail: targetPanel.label,
               }
-            : session
+            : session && !unified
               ? { name: session.email, detail: window.location.host }
               : hasLocalOwner
                 ? {
@@ -225,7 +230,7 @@ export default function PanelAccount({
                     ? "active"
                     : "neutral",
               }
-            : session
+            : session && !unified
               ? { label: "Signed in · Shared access", tone: "active" }
               : {
                   label: hasLocalOwner

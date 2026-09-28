@@ -36,7 +36,7 @@ export type BrowserBridge = {
   runtime: "browser";
   unified: true;
   list(): Promise<BrowserSnapshot>;
-  open(url: string): Promise<BrowserSnapshot>;
+  open(url: string): Promise<BrowserSnapshot & { openedPanelId: string }>;
   cancelSignIn(id: string): Promise<void>;
   invitation(
     id: string,

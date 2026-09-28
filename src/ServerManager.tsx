@@ -72,9 +72,15 @@ function UnifiedServerSwitcher({
 }: Parameters<typeof PanelServerSwitcher>[0]) {
   const workspace = useContext(DesktopWorkspaceContext)!;
   const { connections, localServers } = workspace;
-  const groups = (connections?.panels ?? []).map((panel) =>
-    panel.local ? { ...panel, servers: localServers } : panel,
-  );
+  const groups = (connections?.panels ?? [])
+    .filter(
+      (panel) =>
+        !panel.temporary &&
+        (panel.local || (panel.signedIn === true && !panel.pendingLeave)),
+    )
+    .map((panel) =>
+      panel.local ? { ...panel, servers: localServers } : panel,
+    );
   return (
     <div className="fleet-switcher" aria-label="All computers">
       {groups.map((panel) => {

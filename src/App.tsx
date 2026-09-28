@@ -922,7 +922,7 @@ export function EmptyFleet({
               {window.mcPanelConnections?.unified && !canAddServer
                 ? session
                   ? "No servers are currently shared with this account. Servers the owner shares with you will appear here automatically."
-                  : "Use the account menu to accept an invitation or sign in to a panel. Servers shared with your accounts appear here automatically."
+                  : "Use the account menu to accept an invitation, or open Manage Connections to sign in. Servers shared with your accounts appear here automatically."
                 : showWelcome
                   ? "Start a new Minecraft server, or bring one you already have."
                   : session && (!canAddServer || openLocalSetup)

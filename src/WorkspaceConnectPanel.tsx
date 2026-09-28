@@ -28,9 +28,8 @@ export default function WorkspaceConnectPanel({
   const revision = useRef(0);
   const pending = useRef(false);
   const temporary = useRef<string | null>(null);
-  const [mode, setMode] = useState(initialMode);
+  const mode = initialMode;
   const [address, setAddress] = useState(initialUrl);
-  const [email, setEmail] = useState("");
   const [target, setTarget] = useState<Target | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
@@ -83,7 +82,11 @@ export default function WorkspaceConnectPanel({
       const bridge = window.mcPanelConnections!;
       const result = await bridge.open(url.href);
       const panel = result.panels.find(
-        (item) => !item.local && item.origin === url.origin,
+        (item) =>
+          !item.local &&
+          (result.openedPanelId
+            ? item.id === result.openedPanelId
+            : item.origin === url.origin),
       );
       if (!active()) {
         if (panel?.temporary) await bridge.cancelSignIn?.(panel.id);
@@ -140,21 +143,6 @@ export default function WorkspaceConnectPanel({
     setError("");
     setBusy(false);
   }
-  function signInInstead() {
-    const origin =
-      target?.panel.origin ??
-      (() => {
-        try {
-          return new URL(address).origin;
-        } catch {
-          return "";
-        }
-      })();
-    setEmail(target?.email ?? "");
-    back();
-    setAddress(origin);
-    setMode("signin");
-  }
   return (
     <dialog
       ref={dialog}
@@ -195,7 +183,6 @@ export default function WorkspaceConnectPanel({
                 ? window.location.origin
                 : "")
             }
-            initialEmail={email}
             onComplete={onOpened}
             onBusyChange={setBusy}
           />
@@ -215,7 +202,8 @@ export default function WorkspaceConnectPanel({
               <p>
                 Ask the owner to create a new invitation link for your existing
                 account if this link expired. Your existing server permissions
-                are preserved. If you already saved a password, sign in with it.
+                are preserved. If you already saved a password, close this
+                invitation and choose Sign in in Manage Connections.
               </p>
             </>
           ) : (
@@ -234,9 +222,6 @@ export default function WorkspaceConnectPanel({
           <div className="connect-panel-actions">
             <button className="btn" onClick={back}>
               Back to invitation link
-            </button>
-            <button className="btn" onClick={signInInstead}>
-              Sign in with an existing account
             </button>
             <button className="btn" onClick={onClose}>
               Cancel

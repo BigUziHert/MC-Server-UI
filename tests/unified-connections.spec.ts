@@ -339,7 +339,16 @@ async function openSignIn(page: Page) {
       exact: true,
     })
     .click();
-  await page.getByRole("menuitem", { name: "Sign in", exact: true }).click();
+  await expect(
+    page.getByRole("menuitem", { name: "Sign in", exact: true }),
+  ).toHaveCount(0);
+  await page
+    .getByRole("menuitem", { name: "Manage Connections", exact: true })
+    .click();
+  await page
+    .getByRole("dialog", { name: "Manage Connections", exact: true })
+    .getByRole("button", { name: "Sign in", exact: true })
+    .click();
   return page.getByRole("dialog", { name: "Sign in", exact: true });
 }
 
@@ -421,6 +430,14 @@ for (const cancel of ["Escape", "Close"] as const) {
         ),
       )
       .toBe(true);
+    await dialog.getByRole("form").evaluate((form) => {
+      form.dispatchEvent(
+        new Event("submit", { bubbles: true, cancelable: true }),
+      );
+      form.dispatchEvent(
+        new Event("submit", { bubbles: true, cancelable: true }),
+      );
+    });
     expect(
       await page.evaluate(() => (window as any).unifiedFixture.calls),
     ).toEqual([
@@ -1182,7 +1199,7 @@ test("Accept invitation accepts invitations only and captures the destination wi
       name: "Sign in with an existing account",
       exact: true,
     }),
-  ).toBeVisible();
+  ).toHaveCount(0);
   await form
     .getByLabel("New password", { exact: true })
     .fill("Fixture invite password!");
@@ -1263,16 +1280,18 @@ for (const saved of [true, false]) {
         `https://${host}`,
       ),
     ).toBe(saved);
-    await dialog
-      .getByRole("button", {
+    await expect(dialog).toContainText("Sign in in Manage Connections");
+    await expect(
+      dialog.getByRole("button", {
         name: "Sign in with an existing account",
         exact: true,
-      })
-      .click();
-    const recovery = page.getByRole("dialog", { name: "Sign in", exact: true });
-    await expect(
-      recovery.getByLabel("Panel address", { exact: true }),
-    ).toHaveValue(`https://${host}`);
+      }),
+    ).toHaveCount(0);
+    await dialog.getByRole("button", { name: "Cancel", exact: true }).click();
+    const recovery = await openSignIn(page);
+    await recovery
+      .getByLabel("Panel address", { exact: true })
+      .fill(`https://${host}`);
     await expect(recovery.getByLabel("Password", { exact: true })).toHaveValue(
       "",
     );

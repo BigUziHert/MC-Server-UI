@@ -10,6 +10,7 @@ import { fileURLToPath } from "node:url";
 const script = fileURLToPath(import.meta.url);
 const project = path.dirname(path.dirname(script));
 const token = (host) => host.repeat(43);
+const revocationToken = (host) => host.toUpperCase().repeat(43);
 
 async function fixture() {
   const { app, BrowserWindow, ipcMain, session, dialog, safeStorage } =
@@ -126,6 +127,7 @@ async function smoke() {
   );
   const requests = [],
     servers = [];
+  const revokedAccounts = new Set();
   const invitedAccount = {
     password: null,
     invitation: "i".repeat(43),
@@ -194,7 +196,23 @@ async function smoke() {
               401,
             );
           }
-          return reply({ ...session, sessionToken: token(host) });
+          return reply({
+            ...session,
+            sessionToken: token(host),
+            revocationToken: revocationToken(host),
+          });
+        }
+        if (url.pathname === "/api/access/status") {
+          const chunks = [];
+          for await (const chunk of req) chunks.push(chunk);
+          const input = JSON.parse(Buffer.concat(chunks).toString());
+          assert.equal(
+            req.headers.authorization,
+            undefined,
+            "Status checks cannot retain a signed-out authentication bearer",
+          );
+          assert.equal(input.token, revocationToken(host));
+          return reply({ accessRevoked: revokedAccounts.has(host) });
         }
         if (url.pathname === "/api/access/session")
           return reply(
@@ -261,7 +279,8 @@ async function smoke() {
           await downloadGate;
           return res.end(downloadBytes.subarray(65536));
         }
-        if (url.pathname === "/api/access/logout") return reply({ ok: true });
+        if (url.pathname === "/api/access/logout")
+          return reply({ ok: true, revocationToken: revocationToken(host) });
         if (url.pathname === "/api/access/leave") {
           const chunks = [];
           for await (const chunk of req) chunks.push(chunk);
@@ -420,7 +439,13 @@ async function smoke() {
       globalThis.__unifiedSmoke.certificateControl.pause = true;
     });
     await page.getByRole("button", { name: /^Account menu for/ }).click();
-    await page.getByRole("menuitem", { name: "Sign in", exact: true }).click();
+    await page
+      .getByRole("menuitem", { name: "Manage Connections", exact: true })
+      .click();
+    await page
+      .getByRole("dialog", { name: "Manage Connections", exact: true })
+      .getByRole("button", { name: "Sign in", exact: true })
+      .click();
     const signIn = page.getByRole("dialog", { name: "Sign in", exact: true });
     await signIn
       .getByLabel("Panel address", { exact: true })
@@ -539,6 +564,7 @@ async function smoke() {
       "Native safeStorage must encrypt persisted credentials",
     );
     assert.ok(!JSON.stringify(state.snapshot).includes(token("a")));
+    assert.ok(!JSON.stringify(state.snapshot).includes(revocationToken("a")));
     assert.ok(
       requests.every(
         (request) => !request.cookie?.includes("mc-panel-desktop"),
@@ -611,6 +637,123 @@ async function smoke() {
       ).signedIn,
       true,
     );
+    // Reconnect the account that still exists on A, then exercise deletion
+    // discovered while signed out. Only a non-authenticating status proof is
+    // retained, and the separate C connection stays fully usable throughout.
+    await page.getByRole("button", { name: /^Account menu for/ }).click();
+    await page
+      .getByRole("menuitem", { name: "Manage Connections", exact: true })
+      .click();
+    let manager = page.getByRole("dialog", {
+      name: "Manage Connections",
+      exact: true,
+    });
+    await manager.getByRole("button", { name: "Sign in", exact: true }).click();
+    const reconnect = page.getByRole("dialog", {
+      name: "Sign in",
+      exact: true,
+    });
+    await reconnect
+      .getByLabel("Panel address", { exact: true })
+      .fill(servers[0].origin);
+    await reconnect
+      .getByLabel("Email address", { exact: true })
+      .fill("a@example.test");
+    await reconnect
+      .getByLabel("Password", { exact: true })
+      .fill("fixture-password");
+    await reconnect
+      .getByRole("button", { name: "Sign in", exact: true })
+      .click();
+    await expect(reconnect).toHaveCount(0);
+    const reconnectedA = (
+      await page.evaluate(() => window.mcPanelConnections.list())
+    ).panels.find((panel) => panel.origin === servers[0].origin);
+    await page.getByRole("button", { name: /^Account menu for/ }).click();
+    await page
+      .getByRole("menuitem", { name: "Manage Connections", exact: true })
+      .click();
+    manager = page.getByRole("dialog", {
+      name: "Manage Connections",
+      exact: true,
+    });
+    const labelA = new URL(servers[0].origin).host;
+    await manager
+      .getByRole("button", { name: `Sign out of ${labelA}`, exact: true })
+      .click();
+    await manager
+      .getByRole("button", { name: "Sign out of this panel", exact: true })
+      .click();
+    await expect(
+      manager.getByRole("button", {
+        name: `Sign in to ${labelA}`,
+        exact: true,
+      }),
+    ).toBeVisible();
+    await page.evaluate(
+      (id) => window.mcPanelConnections.retry(id),
+      reconnectedA.id,
+    );
+    assert.equal(
+      (await page.evaluate(() => window.mcPanelConnections.list())).panels.find(
+        (panel) => panel.id === reconnectedA.id,
+      ).signedIn,
+      false,
+    );
+    await manager
+      .getByRole("button", { name: "Close panel connections", exact: true })
+      .click();
+    await expect(
+      page.getByRole("list", { name: `Servers on ${labelA}`, exact: true }),
+    ).toHaveCount(0);
+    await expect(page.getByText(labelA, { exact: true })).toHaveCount(0);
+    assert.ok(
+      requests.some(
+        (request) =>
+          request.host === "a" && request.path === "/api/access/status",
+      ),
+    );
+    await page.getByRole("button", { name: /^Account menu for/ }).click();
+    await page
+      .getByRole("menuitem", { name: "Manage Connections", exact: true })
+      .click();
+    await expect(
+      manager.getByRole("button", {
+        name: `Sign in to ${labelA}`,
+        exact: true,
+      }),
+    ).toBeVisible();
+    revokedAccounts.add("a");
+    await expect
+      .poll(
+        async () =>
+          (
+            await page.evaluate(() => window.mcPanelConnections.list())
+          ).panels.some((panel) => panel.id === reconnectedA.id),
+        { timeout: 15000 },
+      )
+      .toBe(false);
+    await expect(
+      manager.getByRole("button", {
+        name: `Sign in to ${labelA}`,
+        exact: true,
+      }),
+    ).toHaveCount(0);
+    await expect(
+      manager.getByRole("button", {
+        name: `Sign out of ${new URL(servers[1].origin).host}`,
+        exact: true,
+      }),
+    ).toBeVisible();
+    assert.equal(
+      (await page.evaluate(() => window.mcPanelConnections.list())).panels.find(
+        (panel) => panel.id === c.id,
+      ).signedIn,
+      true,
+    );
+    await manager
+      .getByRole("button", { name: "Close panel connections", exact: true })
+      .click();
     await page.evaluate(
       (id) => window.mcPanelConnections.forget(id, "c"),
       c.id,
@@ -632,7 +775,7 @@ async function smoke() {
       "Switching/signing out/restarting the client must not stop a remote server",
     );
     console.log(
-      "Passed native unified workspace: invitation cancellation/reopening preserves pending password setup and grants; one-form sign-in waits for certificate confirmation; A/C bearer isolation with colliding IDs; streamed multipart upload and client download surviving selection changes; encrypted session restart, trust persistence, epoch rejection, isolated sign-out and confirmed access removal.",
+      "Passed native unified workspace: invitation cancellation/reopening preserves pending password setup and grants; one-form sign-in waits for certificate confirmation; A/C bearer isolation with colliding IDs; streamed multipart upload and client download surviving selection changes; encrypted session restart, trust persistence, epoch rejection; signed-out panels stay only in Manage Connections and non-authenticating status proof removes confirmed revoked accounts without affecting other panels.",
     );
   } catch (cause) {
     if (stderr) console.error(stderr);

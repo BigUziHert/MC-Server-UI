@@ -41,6 +41,11 @@
   padding: 0;
   margin: 20px 0 0;
 }
+.panel-connections-entry {
+  display: flex;
+  justify-content: flex-end;
+  margin-top: 16px;
+}
 .panel-connections-list li {
   justify-content: space-between;
   padding: 14px 0;

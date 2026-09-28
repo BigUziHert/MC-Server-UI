@@ -30,10 +30,15 @@ async function settingsFixture(
   let remote = {
     enabled: false,
     ready: false,
-    publicUrl: "https://panel.example.test:3002",
+    publicUrl: "https://panel.example.test",
     port: 3002,
-    transport: "direct",
+    transport: "managed",
     listening: false,
+    managedHttps: {
+      state: "disabled",
+      ready: false,
+      message: "Remote access is disabled.",
+    },
   };
   const writes: unknown[] = [];
   const remoteWrites: unknown[] = [];
@@ -83,6 +88,13 @@ async function settingsFixture(
       remote = { ...remote, ...route.request().postDataJSON() };
       remote.ready = remote.enabled;
       remote.listening = remote.enabled;
+      remote.managedHttps = {
+        state: remote.enabled ? "ready" : "disabled",
+        ready: remote.enabled,
+        message: remote.enabled
+          ? "Trusted certificate is ready."
+          : "Remote access is disabled.",
+      };
     }
     return route.fulfill({ json: remote });
   });
@@ -316,12 +328,12 @@ test("browser Panel Settings persists host Remote Access and fits a phone", asyn
   ).toBeVisible();
   await dialog
     .getByLabel("Public panel address", { exact: true })
-    .fill("https://updated-panel.example.test:3002");
+    .fill("https://updated-panel.example.test");
   await dialog.getByRole("tab", { name: "General", exact: true }).click();
   await dialog.getByRole("tab", { name: "Remote Access", exact: true }).click();
   await expect(
     dialog.getByLabel("Public panel address", { exact: true }),
-  ).toHaveValue("https://updated-panel.example.test:3002");
+  ).toHaveValue("https://updated-panel.example.test");
   await dialog
     .getByRole("checkbox", { name: "Enable remote access", exact: true })
     .check();
@@ -332,7 +344,8 @@ test("browser Panel Settings persists host Remote Access and fits a phone", asyn
   expect(remoteWrites).toEqual([
     expect.objectContaining({
       enabled: true,
-      publicUrl: "https://updated-panel.example.test:3002",
+      publicUrl: "https://updated-panel.example.test",
+      transport: "managed",
     }),
   ]);
   await page.screenshot({
@@ -512,7 +525,7 @@ async function managedSettingsFixture(
   return fixture;
 }
 
-test("new remote setup recommends trusted HTTPS on 443 and waits for the certificate without replacing edits", async ({
+test("remote setup offers only trusted HTTPS on 443 and waits for the certificate without replacing edits", async ({
   page,
 }, testInfo) => {
   const fixture = await managedSettingsFixture(page);
@@ -521,9 +534,10 @@ test("new remote setup recommends trusted HTTPS on 443 and waits for the certifi
   const dialog = await openSettings(page);
   await dialog.getByRole("tab", { name: "Remote Access", exact: true }).click();
   const setup = dialog.getByRole("region", { name: "Remote access setup" });
-  await expect(setup.getByLabel("HTTPS setup", { exact: true })).toHaveValue(
-    "managed",
-  );
+  await expect(setup.getByRole("combobox")).toHaveCount(0);
+  await expect(setup).toContainText("Trusted HTTPS");
+  await expect(setup).not.toContainText("Self-signed HTTPS");
+  await expect(setup).not.toContainText("HTTPS handled by a proxy");
   await expect(
     setup.getByLabel("Remote access port", { exact: true }),
   ).toHaveCount(0);
@@ -600,32 +614,32 @@ test("new remote setup recommends trusted HTTPS on 443 and waits for the certifi
 });
 
 for (const transport of ["direct", "proxy"]) {
-  test(`existing ${transport} setup is retained until the owner explicitly selects trusted HTTPS`, async ({
+  test(`existing ${transport} setup changes only after saving the trusted HTTPS upgrade`, async ({
     page,
   }) => {
-    await managedSettingsFixture(page, {
+    const fixture = await managedSettingsFixture(page, {
+      enabled: true,
+      ready: true,
+      listening: true,
       transport,
       publicUrl: "https://existing.example.test:3004",
       port: 3004,
     });
     await page.goto("/");
-    const dialog = await openSettings(page);
+    let dialog = await openSettings(page);
     await dialog
       .getByRole("tab", { name: "Remote Access", exact: true })
       .click();
-    const setup = dialog.getByRole("region", { name: "Remote access setup" });
-    await expect(setup.getByLabel("HTTPS setup", { exact: true })).toHaveValue(
-      transport,
+    let setup = dialog.getByRole("region", { name: "Remote access setup" });
+    const original = { ...fixture.settings };
+    await expect(setup.getByRole("combobox")).toHaveCount(0);
+    await expect(
+      setup.getByRole("note", { name: "Trusted HTTPS upgrade" }),
+    ).toContainText("https://existing.example.test:3004");
+    await expect(setup).toContainText("It stays unchanged until you save");
+    await expect(setup).toContainText(
+      "Existing accounts, passwords, and server permissions are preserved",
     );
-    await expect(
-      setup.getByLabel("Public panel address", { exact: true }),
-    ).toHaveValue("https://existing.example.test:3004");
-    await expect(
-      setup.getByLabel("Remote access port", { exact: true }),
-    ).toHaveValue("3004");
-    await setup
-      .getByLabel("HTTPS setup", { exact: true })
-      .selectOption("managed");
     await expect(
       setup.getByLabel("Public panel address", { exact: true }),
     ).toHaveValue("https://existing.example.test");
@@ -635,6 +649,48 @@ for (const transport of ["direct", "proxy"]) {
     await expect(
       setup.getByLabel("Internal service port", { exact: true }),
     ).toHaveValue("3004");
+    await setup
+      .getByLabel("Public panel address", { exact: true })
+      .fill("https://unsaved.example.test");
+    await page.keyboard.press("Escape");
+    await expect(dialog).not.toBeVisible();
+    await page.reload();
+    expect(fixture.writes).toEqual([]);
+    expect(fixture.settings).toEqual(original);
+    dialog = await openSettings(page);
+    await dialog
+      .getByRole("tab", { name: "Remote Access", exact: true })
+      .click();
+    setup = dialog.getByRole("region", { name: "Remote access setup" });
+    await expect(
+      setup.getByLabel("Public panel address", { exact: true }),
+    ).toHaveValue("https://existing.example.test");
+    await setup
+      .getByRole("button", { name: "Save access settings", exact: true })
+      .click();
+    await expect(setup.getByRole("status")).toContainText(
+      "Requesting a trusted certificate",
+    );
+    expect(fixture.writes).toEqual([
+      {
+        enabled: true,
+        transport: "managed",
+        publicUrl: "https://existing.example.test",
+        port: 3004,
+      },
+    ]);
+    await expect(
+      setup.getByRole("note", { name: "Trusted HTTPS upgrade" }),
+    ).toHaveCount(0);
+    await expect(
+      dialog.getByRole("button", {
+        name: "Create invite link for invited@example.test",
+        exact: true,
+      }),
+    ).toBeDisabled();
+    await expect(
+      dialog.getByText("invited@example.test", { exact: true }),
+    ).toBeVisible();
   });
 }
 
@@ -701,4 +757,92 @@ test("managed certificate failures and unavailable status disable invitations, r
   await expect(
     dialog.getByText("invited@example.test", { exact: true }),
   ).toBeVisible();
+});
+
+test("a delayed save response cannot enable invitations in reopened settings for a newer address", async ({
+  page,
+}) => {
+  const fixture = await managedSettingsFixture(page, {
+    enabled: true,
+    transport: "managed",
+    publicUrl: "https://previous.example.test",
+    listening: true,
+    ready: false,
+    managedHttps: {
+      state: "error",
+      ready: false,
+      message: "Retry certificate setup.",
+    },
+  });
+  let releaseSave!: () => void;
+  const heldSave = new Promise<void>((resolve) => {
+    releaseSave = resolve;
+  });
+  let submitted = false;
+  await page.route("**/api/access/settings", async (route) => {
+    if (route.request().method() !== "PUT") return route.fallback();
+    submitted = true;
+    await heldSave;
+    return route.fulfill({
+      json: {
+        ...fixture.settings,
+        publicUrl: "https://previous.example.test",
+        ready: true,
+        managedHttps: {
+          state: "ready",
+          ready: true,
+          message: "Trusted certificate is ready.",
+        },
+      },
+    });
+  });
+  await page.goto("/");
+  let dialog = await openSettings(page);
+  await dialog.getByRole("tab", { name: "Remote Access", exact: true }).click();
+  await dialog
+    .getByRole("button", { name: "Retry HTTPS setup", exact: true })
+    .click();
+  await expect.poll(() => submitted).toBe(true);
+  await dialog
+    .getByRole("button", { name: "Close Panel Settings", exact: true })
+    .click();
+  fixture.settings = {
+    ...fixture.settings,
+    publicUrl: "https://newer.example.test",
+    ready: false,
+    managedHttps: {
+      state: "provisioning",
+      ready: false,
+      message: "Requesting a certificate for the newer address.",
+    },
+  };
+  dialog = await openSettings(page);
+  await dialog.getByRole("tab", { name: "Remote Access", exact: true }).click();
+  const invite = dialog.getByRole("button", {
+    name: "Create invite link for invited@example.test",
+    exact: true,
+  });
+  await expect(invite).toBeDisabled();
+  const oldResponse = page.waitForResponse(
+    (response) =>
+      response.url().endsWith("/api/access/settings") &&
+      response.request().method() === "PUT",
+  );
+  releaseSave();
+  await (await oldResponse).finished();
+  await page.evaluate(
+    () =>
+      new Promise<void>((resolve) =>
+        requestAnimationFrame(() => requestAnimationFrame(() => resolve())),
+      ),
+  );
+  await expect(invite).toBeDisabled();
+  await expect(
+    dialog.getByLabel("Public panel address", { exact: true }),
+  ).toHaveValue("https://newer.example.test");
+  await expect(
+    dialog
+      .getByRole("region", { name: "Remote access setup" })
+      .getByRole("status"),
+  ).toContainText("Requesting a certificate for the newer address");
 });

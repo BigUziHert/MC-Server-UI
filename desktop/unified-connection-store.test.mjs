@@ -91,6 +91,37 @@ test("all 25000 supported roster rows survive save and restore with bounded meta
   assert.ok(!bytes.includes("C:/private"));
 });
 
+test("signed-out access-status proofs are encrypted and restore without credentials identity or permissions", async (t) => {
+  const h = await fixture(t),
+    proof = "r".repeat(43),
+    original = panel({ revocationToken: proof });
+  await h.store.save({
+    panels: [original],
+    selectedServer: { panelId: original.id, serverId: "server" },
+  });
+  await h.store.save({
+    panels: [{ ...original, token: null, session: undefined, servers: [] }],
+    selectedServer: null,
+  });
+  const raw = await fs.readFile(h.file, "utf8"),
+    saved = JSON.parse(raw).panels[0];
+  assert.equal(raw.includes(proof), false);
+  assert.equal(saved.revocationToken, undefined);
+  assert.deepEqual(
+    JSON.parse(
+      safeStorage.decryptString(Buffer.from(saved.credential, "base64")),
+    ),
+    { revocationToken: proof },
+  );
+  const restored = await h.store.read();
+  assert.equal(restored.warning, undefined);
+  assert.equal(restored.selectedServer, null);
+  assert.equal(restored.panels[0].revocationToken, proof);
+  assert.equal(restored.panels[0].token, undefined);
+  assert.equal(restored.panels[0].session, undefined);
+  assert.deepEqual(restored.panels[0].servers, []);
+});
+
 test("damaged JSON remains untouched on read and unchanged save, then is preserved before a new connection is saved", async (t) => {
   const h = await fixture(t);
   const original = "{damaged fixture bytes";

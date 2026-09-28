@@ -15,7 +15,13 @@ import PanelSignInForm from "./PanelSignInForm";
 import { DesktopWorkspaceContext } from "./workspace-target";
 import "./panel-connections.css";
 
-export default function PanelConnections({ onClose }: { onClose: () => void }) {
+export default function PanelConnections({
+  onClose,
+  onSignIn,
+}: {
+  onClose: () => void;
+  onSignIn?: () => void;
+}) {
   const dialog = useRef<HTMLDialogElement>(null);
   const mounted = useRef(true);
   const pending = useRef(false);
@@ -305,6 +311,18 @@ export default function PanelConnections({ onClose }: { onClose: () => void }) {
               ? "Manage each panel's sign-in independently. Local servers and other connections stay available in this workspace."
               : "Open a saved panel or forget its sign-in on this computer. Unavailable and signed-out panels remain here for retry."}
           </p>
+          {unified && onSignIn && !signingIn && (
+            <div className="panel-connections-entry">
+              <button
+                className="btn primary"
+                type="button"
+                disabled={Boolean(busy)}
+                onClick={onSignIn}
+              >
+                <LogIn size={16} /> Sign in
+              </button>
+            </div>
+          )}
           {!connections ? (
             <p role="status">Loading connections…</p>
           ) : !panels.length ? (

@@ -137,6 +137,8 @@ function decodeSnapshot(raw, home) {
     origins.add(item.origin);
     if (item.token !== null && !validToken(item.token))
       throw fail(503, "A saved browser credential is invalid.");
+    if (item.revocationToken !== undefined && !validToken(item.revocationToken))
+      throw fail(503, "A saved browser access-status proof is invalid.");
     if (
       item.pendingLeave !== undefined &&
       (!item.token || !uuid(item.pendingLeave?.requestId))
@@ -150,6 +152,9 @@ function decodeSnapshot(raw, home) {
       epoch: item.epoch,
       origin: item.origin,
       token: item.token,
+      ...(item.revocationToken
+        ? { revocationToken: item.revocationToken }
+        : {}),
       ...(session ? { session } : {}),
       servers: session ? browserRoster(item.servers ?? []) : [],
       ...(item.pendingLeave
@@ -337,6 +342,7 @@ export function createBrowserConnectionController({
         panels.set(item.id, panel);
       } else {
         panel.pendingLeave = item.pendingLeave;
+        panel.revocationToken = item.revocationToken;
         if (panel.state !== "connected")
           panel.servers = browserRoster(item.servers);
       }
@@ -486,6 +492,22 @@ export function createBrowserConnectionController({
     );
     if (panel.origin === home) homeCredential(null);
   }
+  async function signedOutRevocation(panel, epoch) {
+    if (!current(panel, epoch) || panel.token) return;
+    if (panel.authenticating) {
+      panel.revokedEpoch = epoch;
+      return;
+    }
+    await remove(panel, epoch);
+  }
+  async function finishDeferredRevocation(panel) {
+    if (panel.revokedEpoch === undefined) return;
+    if (!current(panel, panel.revokedEpoch) || panel.token) {
+      panel.revokedEpoch = undefined;
+      return;
+    }
+    if (!panel.authenticating) await remove(panel, panel.revokedEpoch);
+  }
   async function promoteHomeOwner(panel, epoch) {
     if (panel.origin !== home)
       throw fail(502, "A remote panel cannot grant local owner access.");
@@ -618,7 +640,7 @@ export function createBrowserConnectionController({
     )
       return;
     if (panel.refreshing) return panel.refreshing;
-    const epoch = panel.epoch;
+    let epoch = panel.epoch;
     panel.refreshing = (async () => {
       try {
         const account = await json(
@@ -647,6 +669,21 @@ export function createBrowserConnectionController({
           if (panel.token) {
             await clearSignIn(panel, epoch);
             panel = get(panel.id);
+            epoch = panel.epoch;
+            panel.nextRefresh = Date.now() + pollMs;
+          }
+          if (panel.revocationToken) {
+            const status = await json(panel, "/api/access/status", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ token: panel.revocationToken }),
+              tokenOverride: "",
+            });
+            requireCurrent(panel, epoch);
+            if (status.accessRevoked === true) {
+              await signedOutRevocation(panel, epoch);
+              return;
+            }
           }
           panel.state = "connected";
           panel.error = "";
@@ -915,6 +952,11 @@ export function createBrowserConnectionController({
         throw fail(409, "This panel sign-in changed.");
       if (!validToken(result.sessionToken))
         throw fail(502, "The host returned an invalid sign-in credential.");
+      if (
+        result.revocationToken !== undefined &&
+        !validToken(result.revocationToken)
+      )
+        throw fail(502, "The host returned an invalid access-status proof.");
       const session = browserSession(result);
       await commit(
         (next) => {
@@ -934,6 +976,9 @@ export function createBrowserConnectionController({
             next.panels.push(entry);
           } else entry = updateRecord(next, id);
           entry.token = result.sessionToken;
+          if (result.revocationToken)
+            entry.revocationToken = result.revocationToken;
+          else delete entry.revocationToken;
           entry.session = identity(session);
           entry.epoch = newId();
           entry.servers = [];
@@ -946,6 +991,7 @@ export function createBrowserConnectionController({
         panel.authenticating = false;
         panel.authAbort = undefined;
       }
+      await finishDeferredRevocation(panel).catch(() => {});
     }
     await refresh(get(id));
     return list();
@@ -994,7 +1040,14 @@ export function createBrowserConnectionController({
         throw cause;
       }
       if (panel.temporary) {
-        if (panel.removed || !drafts.has(panel.id)) return list();
+        if (panel.removed || !drafts.has(panel.id)) {
+          if (owner && target === home)
+            return { ...list(), openedPanelId: "local" };
+          throw fail(
+            409,
+            "This panel sign-in changed while the address was being verified.",
+          );
+        }
         if (panel.state !== "connected") {
           await bridge.cancelSignIn(panel.id);
           throw fail(
@@ -1004,9 +1057,13 @@ export function createBrowserConnectionController({
           );
         }
         const result = list();
-        return { ...result, panels: [...result.panels, describe(panel)] };
+        return {
+          ...result,
+          openedPanelId: panel.id,
+          panels: [...result.panels, describe(panel)],
+        };
       }
-      return list();
+      return { ...list(), openedPanelId: panel.id };
     },
     async cancelSignIn(id) {
       const panel = drafts.get(id) ?? panels.get(id);
@@ -1018,6 +1075,7 @@ export function createBrowserConnectionController({
           panel.authenticating = false;
           panel.previewing = false;
         }
+        await finishDeferredRevocation(panel);
         return;
       }
       panel.removed = true;
@@ -1083,18 +1141,46 @@ export function createBrowserConnectionController({
       await initialize();
       const panel = get(id),
         epoch = panel.epoch;
-      if (panel.pendingLeave) throw fail(409, pendingMessage);
-      panel.controls++;
-      const token = panel.token;
-      await clearSignIn(panel, epoch);
-      if (token)
-        void json(get(id), "/api/access/logout", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: "{}",
-          tokenOverride: token,
-        }).catch(() => {});
-      return list();
+      if (panel.signingOut) return panel.signingOut;
+      panel.signingOut = (async () => {
+        if (panel.pendingLeave) throw fail(409, pendingMessage);
+        panel.controls++;
+        const token = panel.token;
+        await clearSignIn(panel, epoch);
+        if (token) {
+          const signedOut = get(id),
+            signedOutEpoch = signedOut.epoch;
+          void json(signedOut, "/api/access/logout", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: "{}",
+            tokenOverride: token,
+          })
+            .then(async (result) => {
+              if (
+                !current(signedOut, signedOutEpoch) ||
+                signedOut.token ||
+                signedOut.pendingLeave
+              )
+                return;
+              if (result.accessRevoked === true)
+                await signedOutRevocation(signedOut, signedOutEpoch);
+              else if (validToken(result.revocationToken))
+                await commit(
+                  (next) => {
+                    updateRecord(next, id).revocationToken =
+                      result.revocationToken;
+                  },
+                  { panel: signedOut, epoch: signedOutEpoch },
+                );
+            })
+            .catch(() => {});
+        }
+        return list();
+      })().finally(() => {
+        panel.signingOut = null;
+      });
+      return panel.signingOut;
     },
     async retry(id) {
       await initialize();
@@ -1265,7 +1351,7 @@ export function createBrowserConnectionController({
     const target = relativeApi(match[2] + url.search, panel.origin);
     if (
       /^\/api\/(?:desktop|panel-users)(?:\/|$)/i.test(target.pathname) ||
-      /^\/api\/access\/(?:login|invitation|accept|logout|leave)\/?$/i.test(
+      /^\/api\/access\/(?:login|invitation|accept|logout|leave|status)\/?$/i.test(
         target.pathname,
       )
     )

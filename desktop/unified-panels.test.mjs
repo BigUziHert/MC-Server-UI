@@ -2061,3 +2061,476 @@ test("failed saved authentication storage retains the previous usable account", 
   assert.equal(retained.servers.length, 1);
   assert.equal((await h.proxy(first, "/server?serverId=same-id")).status, 200);
 });
+
+test("native revocation sequences remove a signed-out account without disturbing colliding servers on another panel", async (t) => {
+  for (const sequence of [
+    "signout-revoke",
+    "revoke-signout",
+    "expired-revoke",
+    "restart-revoke",
+  ]) {
+    await t.test(sequence, async (t) => {
+      const revoked = new Set(),
+        expired = new Set(),
+        proofs = new Map([
+          ["https://a.example.test", "r".repeat(43)],
+          ["https://c.example.test", "s".repeat(43)],
+        ]);
+      const behavior = async (url, options) => {
+        if (url.pathname === "/api/access/login")
+          return response({
+            ...account,
+            sessionToken: token,
+            revocationToken: proofs.get(url.origin),
+          });
+        if (url.pathname === "/api/access/logout")
+          return response({
+            ok: true,
+            revocationToken: proofs.get(url.origin),
+            accessRevoked: revoked.has(url.origin),
+          });
+        if (url.pathname === "/api/access/status") {
+          assert.equal(
+            new Headers(options.headers).has("Authorization"),
+            false,
+          );
+          assert.equal(JSON.parse(options.body).token, proofs.get(url.origin));
+          return response({ accessRevoked: revoked.has(url.origin) });
+        }
+        if (url.pathname === "/api/access/session" && expired.has(url.origin))
+          return response({ role: "guest" });
+      };
+      const h = await harness(t, { behavior }),
+        first = await h.signIn("https://a.example.test"),
+        other = await h.signIn("https://c.example.test");
+      assert.equal(
+        JSON.stringify(h.controller.list()).includes(proofs.get(first.origin)),
+        false,
+      );
+      await h.controller.selectServer(first.id, "same-id");
+      if (sequence === "revoke-signout") revoked.add(first.origin);
+      if (sequence === "expired-revoke") {
+        expired.add(first.origin);
+        await h.controller.retry(first.id);
+      } else {
+        await Promise.all([
+          h.controller.signOut(first.id),
+          h.controller.signOut(first.id),
+        ]);
+        await new Promise((resolve) => setImmediate(resolve));
+      }
+      assert.equal(h.controller.list().selectedServer, null);
+      await h.controller.selectServer(other.id, "same-id");
+      if (sequence !== "revoke-signout") {
+        const retained = h.persisted
+          .at(-1)
+          .panels.find((panel) => panel.id === first.id);
+        assert.equal(retained.token, null);
+        assert.equal(retained.session, undefined);
+        assert.deepEqual(retained.servers, []);
+        assert.equal(retained.revocationToken, proofs.get(first.origin));
+      }
+      revoked.add(first.origin);
+      let controller = h.controller;
+      if (sequence === "restart-revoke") {
+        await controller.close();
+        const state = h.persisted.at(-1);
+        const restarted = await harness(t, {
+          behavior,
+          storeRead: async () => state,
+        });
+        controller = restarted.controller;
+        await controller.restore();
+      } else if (
+        controller.list().panels.some((panel) => panel.id === first.id)
+      )
+        await controller.retry(first.id);
+      const snapshot = controller.list();
+      assert.equal(
+        snapshot.panels.some((panel) => panel.id === first.id),
+        false,
+      );
+      assert.equal(
+        snapshot.panels.find((panel) => panel.id === other.id).signedIn,
+        true,
+      );
+      assert.deepEqual(snapshot.selectedServer, {
+        panelId: other.id,
+        serverId: "same-id",
+      });
+    });
+  }
+});
+
+test("native signed-out status errors retain the connection until explicit proof confirms revocation", async (t) => {
+  let state = "unknown";
+  const h = await harness(t, {
+    behavior: async (url) => {
+      if (url.pathname === "/api/access/login")
+        return response({
+          ...account,
+          sessionToken: token,
+          revocationToken: "r".repeat(43),
+        });
+      if (url.pathname !== "/api/access/status") return;
+      if (state === "offline") throw new Error("offline");
+      if (typeof state === "number")
+        return response({ error: "Unavailable", accessRevoked: true }, state);
+      return response({
+        accessRevoked: state === "string-marker" ? "true" : state === "revoked",
+      });
+    },
+  });
+  const panel = await h.signIn("https://a.example.test");
+  await h.controller.signOut(panel.id);
+  await new Promise((resolve) => setImmediate(resolve));
+  for (state of ["offline", 429, 401, 403, "unknown", "string-marker"]) {
+    if (state === "offline" || typeof state === "number")
+      await assert.rejects(h.controller.retry(panel.id));
+    else await h.controller.retry(panel.id);
+    const retained = h.controller
+      .list()
+      .panels.find((row) => row.id === panel.id);
+    assert.ok(retained, String(state));
+    assert.equal(retained.signedIn, false);
+    assert.deepEqual(retained.servers, []);
+  }
+  state = "revoked";
+  await h.controller.retry(panel.id);
+  assert.equal(
+    h.controller.list().panels.some((row) => row.id === panel.id),
+    false,
+  );
+});
+
+test("late native logout confirmation cannot remove a replacement account or its new status proof", async (t) => {
+  let entered,
+    release,
+    replacement = false;
+  const started = new Promise((resolve) => {
+    entered = resolve;
+  });
+  const h = await harness(t, {
+    behavior: async (url) => {
+      if (url.pathname === "/api/access/login")
+        return response({
+          ...account,
+          sessionToken: token,
+          revocationToken: (replacement ? "n" : "r").repeat(43),
+        });
+      if (url.pathname === "/api/access/status")
+        return response({ accessRevoked: false });
+      if (url.pathname === "/api/access/logout") {
+        entered();
+        await new Promise((resolve) => {
+          release = resolve;
+        });
+        return response({
+          ok: true,
+          accessRevoked: true,
+          revocationToken: "r".repeat(43),
+        });
+      }
+    },
+  });
+  const first = await h.signIn("https://a.example.test");
+  await h.controller.signOut(first.id);
+  await started;
+  replacement = true;
+  await h.controller.signIn(first.id, {
+    email: account.email,
+    password: "password",
+  });
+  const next = h.controller
+    .list()
+    .panels.find((panel) => panel.id === first.id);
+  release();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(
+    h.controller.list().panels.find((panel) => panel.id === first.id)
+      .sessionEpoch,
+    next.sessionEpoch,
+  );
+  assert.equal(
+    h.persisted.at(-1).panels.find((panel) => panel.id === first.id)
+      .revocationToken,
+    "n".repeat(43),
+  );
+});
+
+test("legacy native sign-out learns a status proof without keeping a sign-in credential", async (t) => {
+  const h = await harness(t, {
+    behavior: async (url) =>
+      url.pathname === "/api/access/logout"
+        ? response({ ok: true, revocationToken: "r".repeat(43) })
+        : url.pathname === "/api/access/status"
+          ? response({ accessRevoked: true })
+          : undefined,
+  });
+  const panel = await h.signIn("https://a.example.test");
+  await h.controller.signOut(panel.id);
+  await new Promise((resolve) => setImmediate(resolve));
+  const saved = h.persisted.at(-1).panels.find((row) => row.id === panel.id);
+  assert.equal(saved.token, null);
+  assert.equal(saved.revocationToken, "r".repeat(43));
+  await h.controller.retry(panel.id);
+  assert.equal(
+    h.controller.list().panels.some((row) => row.id === panel.id),
+    false,
+  );
+});
+
+test("native background polling removes revoked membership after normal sign-out without a retry", async (t) => {
+  let revoked = false;
+  const h = await harness(t, {
+    pollMs: 20,
+    behavior: async (url) =>
+      url.pathname === "/api/access/login"
+        ? response({
+            ...account,
+            sessionToken: token,
+            revocationToken: "r".repeat(43),
+          })
+        : url.pathname === "/api/access/status"
+          ? response({ accessRevoked: revoked })
+          : undefined,
+  });
+  const panel = await h.signIn("https://a.example.test");
+  await h.controller.signOut(panel.id);
+  revoked = true;
+  const deadline = Date.now() + 2000;
+  while (
+    h.controller.list().panels.some((row) => row.id === panel.id) &&
+    Date.now() < deadline
+  )
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.equal(
+    h.controller.list().panels.some((row) => row.id === panel.id),
+    false,
+  );
+  assert.equal(h.persisted.at(-1).panels.length, 0);
+});
+
+test("a native guest session drops stale credentials before a failing optional status probe", async (t) => {
+  for (const failure of [404, 429, "offline"]) {
+    let expired = false;
+    const h = await harness(t, {
+      behavior: async (url) => {
+        if (url.pathname === "/api/access/login")
+          return response({
+            ...account,
+            sessionToken: token,
+            revocationToken: "r".repeat(43),
+          });
+        if (!expired) return;
+        if (url.pathname === "/api/access/session")
+          return response({ role: "guest" });
+        if (url.pathname === "/api/access/status") {
+          if (failure === "offline") throw new Error("offline");
+          return response({ error: "Retry later" }, failure);
+        }
+      },
+    });
+    const panel = await h.signIn("https://a.example.test");
+    expired = true;
+    await assert.rejects(h.controller.retry(panel.id));
+    const retained = h.controller
+        .list()
+        .panels.find((row) => row.id === panel.id),
+      saved = h.persisted.at(-1).panels[0];
+    assert.equal(retained.signedIn, false);
+    assert.equal(retained.session, undefined);
+    assert.deepEqual(retained.servers, []);
+    assert.equal(saved.token, null);
+    assert.equal(saved.revocationToken, "r".repeat(43));
+  }
+});
+
+test("native old-account logout confirmation waits for a queued replacement outcome", async (t) => {
+  for (const outcome of ["success", "cancel"])
+    await t.test(outcome, async (t) => {
+      let block = false,
+        releaseWrite,
+        writing,
+        releaseLogout,
+        logoutStarted,
+        authenticated;
+      const writingReady = new Promise((resolve) => {
+          writing = resolve;
+        }),
+        loggingOut = new Promise((resolve) => {
+          logoutStarted = resolve;
+        }),
+        responseReady = new Promise((resolve) => {
+          authenticated = resolve;
+        });
+      const h = await harness(t, {
+        storeSave: async () => {
+          if (block) {
+            writing();
+            await new Promise((resolve) => {
+              releaseWrite = resolve;
+            });
+          }
+        },
+        behavior: async (url, options) => {
+          if (url.pathname === "/api/access/login" && block) {
+            authenticated();
+            return response({
+              ...account,
+              accountId: "replacement",
+              sessionToken: "b".repeat(43),
+              revocationToken: "n".repeat(43),
+            });
+          }
+          if (
+            url.pathname === "/api/access/session" &&
+            new Headers(options.headers).get("Authorization") ===
+              `Bearer ${"b".repeat(43)}`
+          )
+            return response({ ...account, accountId: "replacement" });
+          if (url.pathname !== "/api/access/logout") return;
+          logoutStarted();
+          await new Promise((resolve) => {
+            releaseLogout = resolve;
+          });
+          return response({ ok: true, accessRevoked: true });
+        },
+      });
+      const panel = await h.signIn("https://a.example.test");
+      await h.controller.signOut(panel.id);
+      await loggingOut;
+      block = true;
+      const selecting = h.controller.selectServer("local", "same-id");
+      await writingReady;
+      const signingIn = h.controller.signIn(panel.id, {
+        email: account.email,
+        password: "password",
+      });
+      const settled =
+        outcome === "cancel"
+          ? assert.rejects(signingIn, /changed|abort/i)
+          : signingIn;
+      await responseReady;
+      await new Promise((resolve) => setImmediate(resolve));
+      releaseLogout();
+      await new Promise((resolve) => setImmediate(resolve));
+      assert.equal(
+        h.controller.list().panels.some((row) => row.id === panel.id),
+        true,
+      );
+      const cancelling =
+        outcome === "cancel"
+          ? h.controller.cancelSignIn(panel.id)
+          : Promise.resolve();
+      block = false;
+      releaseWrite();
+      await Promise.all([selecting, settled, cancelling]);
+      const retained = h.controller
+        .list()
+        .panels.find((row) => row.id === panel.id);
+      if (outcome === "success")
+        assert.equal(retained.session.accountId, "replacement");
+      else assert.equal(retained, undefined);
+    });
+});
+
+test("overlapping native opens identify their own draft after another form saves the same origin", async (t) => {
+  let entered,
+    release,
+    first = true;
+  const started = new Promise((resolve) => {
+    entered = resolve;
+  });
+  const h = await harness(t, {
+    behavior: async (url) => {
+      if (url.pathname !== "/api/access/session" || !first) return;
+      first = false;
+      entered();
+      await new Promise((resolve) => {
+        release = resolve;
+      });
+      return response({ role: "guest" });
+    },
+  });
+  const opening = h.controller.open("https://a.example.test");
+  await started;
+  const second = await h.controller.open("https://a.example.test"),
+    target = second.panels.find((panel) => panel.id === second.openedPanelId);
+  assert.equal(target.temporary, true);
+  await h.controller.signIn(target.id, {
+    email: account.email,
+    password: "password",
+  });
+  release();
+  const stale = await opening,
+    owned = stale.panels.find((panel) => panel.id === stale.openedPanelId);
+  assert.notEqual(stale.openedPanelId, second.openedPanelId);
+  assert.equal(owned.temporary, true);
+  assert.equal(
+    stale.panels.find((panel) => panel.origin === target.origin).id,
+    target.id,
+    "origin matching would select the newer saved panel",
+  );
+  await h.controller.cancelSignIn(owned.id);
+  const retained = h.controller
+    .list()
+    .panels.find((panel) => panel.id === target.id);
+  assert.equal(retained.signedIn, true);
+  assert.ok(
+    h.cleanup.some((entry) => entry.partition === `mc-unified-${owned.id}`),
+  );
+  assert.equal(
+    h.cleanup.some((entry) => entry.partition === `mc-unified-${target.id}`),
+    false,
+  );
+  const reopened = await h.controller.open(target.origin);
+  assert.equal(reopened.openedPanelId, target.id);
+  await assert.rejects(
+    h.controller.signIn(owned.id, {
+      email: account.email,
+      password: "password",
+    }),
+    /no longer available/,
+  );
+});
+
+test("a failed native saved-address probe cannot cancel another form's queued sign-in", async (t) => {
+  let hold = false,
+    entered,
+    release;
+  const started = new Promise((resolve) => {
+    entered = resolve;
+  });
+  const h = await harness(t, {
+    behavior: async (url) => {
+      if (!hold || url.pathname !== "/api/access/session") return;
+      hold = false;
+      entered();
+      await new Promise((_, reject) => {
+        release = () => reject(new Error("Host temporarily offline"));
+      });
+    },
+  });
+  const panel = await h.savedSignedOut("https://a.example.test");
+  hold = true;
+  const opening = h.controller.open(panel.origin);
+  const rejected = assert.rejects(opening, /unavailable/i);
+  await started;
+  const signingIn = h.controller.signIn(panel.id, {
+    email: account.email,
+    password: "password",
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  release();
+  await rejected;
+  await signingIn;
+  assert.equal(
+    h.controller.list().panels.find((row) => row.id === panel.id).signedIn,
+    true,
+  );
+  assert.equal(
+    h.persisted.at(-1).panels.find((row) => row.id === panel.id).token,
+    token,
+  );
+});

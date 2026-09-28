@@ -5,7 +5,7 @@ import type { PanelConnections } from "./desktop-connections";
 
 type Panel = Pick<
   PanelConnections["panels"][number],
-  "id" | "label" | "origin"
+  "id" | "label" | "origin" | "temporary"
 >;
 
 export default function PanelSignInForm({
@@ -99,10 +99,16 @@ export default function PanelSignInForm({
         // the password submission ahead of this awaited validation boundary.
         const result = await bridge.open(url);
         target = result.panels.find(
-          (item) => !item.local && item.origin === new URL(url).origin,
+          (item) =>
+            !item.local &&
+            (result.openedPanelId
+              ? item.id === result.openedPanelId
+              : item.origin === new URL(url).origin),
         );
         if (!mounted.current) {
-          if (target) await bridge.cancelSignIn?.(target.id);
+          // This form has not started authentication yet. A late saved-panel
+          // response must never cancel work started by a newer form.
+          if (target?.temporary) await bridge.cancelSignIn?.(target.id);
           return;
         }
         const existing = result.panels.find((item) => item.id === target?.id);
@@ -170,9 +176,15 @@ export default function PanelSignInForm({
             spellCheck={false}
             required
             maxLength={2048}
-            placeholder="https://panel.example.com:3002"
+            placeholder="https://panel.example.com"
             value={address}
-            onChange={(event) => setAddress(event.target.value)}
+            onChange={(event) => {
+              setAddress(event.target.value);
+              setEmail("");
+              setPassword("");
+              setConfirmation("");
+              setError("");
+            }}
             disabled={busy}
             autoFocus={!address}
           />
@@ -252,10 +264,10 @@ export default function PanelSignInForm({
       )}
       {token && error && (
         <p>
-          If your password was saved but the connection was interrupted, use
-          Sign in with that password. If the invitation expired, ask the owner
-          to create a new link for your existing account; your server
-          permissions stay in place.
+          If your password was saved but the connection was interrupted, close
+          this invitation and choose Sign in in Manage Connections with that
+          password. If the invitation expired, ask the owner to create a new
+          link for your existing account; your server permissions stay in place.
         </p>
       )}
       <div className="panel-connections-actions">

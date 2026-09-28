@@ -38,6 +38,7 @@ export default defineConfig({
     "browser-workspace.spec.ts",
     "browser-transport.spec.ts",
     "unified-connections.spec.ts",
+    "connection-sequences.spec.ts",
     "unified-transport.spec.ts",
     "direct-remote.spec.ts",
     "remote-origin-isolation.spec.ts",

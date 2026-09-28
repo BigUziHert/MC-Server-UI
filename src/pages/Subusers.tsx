@@ -99,6 +99,20 @@ const permissionIds = catalog.groups.flatMap((group) =>
   group.permissions.map((permission) => permission.id),
 );
 
+function trustedAddress(settings: AccessSettings) {
+  if (settings.transport === "managed" || !settings.publicUrl)
+    return settings.publicUrl || "";
+  // Preparing an upgrade draft must not change the saved listener or its origin.
+  try {
+    const address = new URL(settings.publicUrl);
+    address.protocol = "https:";
+    address.port = "";
+    return address.origin;
+  } catch {
+    return settings.publicUrl;
+  }
+}
+
 function permissionsFor(user: Subuser) {
   const defaults =
     catalog.roleDefaults[
@@ -120,7 +134,6 @@ export function RemoteAccessSetup({
   const [draft, setDraft] = useState({
     enabled: false,
     publicUrl: "",
-    transport: "managed" as AccessSettings["transport"],
     port: "3002",
   });
   const [loading, setLoading] = useState(true);
@@ -145,15 +158,11 @@ export function RemoteAccessSetup({
   );
 
   const applySettings = useCallback(
-    (value: AccessSettings, initial = false) => {
+    (value: AccessSettings) => {
       publishSettings(value);
       setDraft({
         enabled: value.enabled,
-        publicUrl: value.publicUrl || "",
-        transport:
-          initial && !value.enabled && !value.publicUrl
-            ? "managed"
-            : value.transport || "direct",
+        publicUrl: trustedAddress(value),
         port: String(value.port || 3002),
       });
     },
@@ -169,8 +178,8 @@ export function RemoteAccessSetup({
           signal,
         });
         if (signal?.aborted) return;
-        applySettings(result, true);
-        setExpanded(!accessReady(result));
+        applySettings(result);
+        setExpanded(!accessReady(result) || result.transport !== "managed");
       } catch (cause) {
         if (signal?.aborted) return;
         if ((cause as { status?: number }).status === 403) {
@@ -191,8 +200,12 @@ export function RemoteAccessSetup({
 
   useEffect(() => {
     const controller = new AbortController();
+    setSaving(false);
     void load(controller.signal);
-    return () => controller.abort();
+    return () => {
+      settingsRevision.current++;
+      controller.abort();
+    };
   }, [load]);
 
   // Certificate issuance and renewal continue in the host. Refresh status without
@@ -244,26 +257,6 @@ export function RemoteAccessSetup({
     onSettings,
   ]);
 
-  function changeTransport(transport: AccessSettings["transport"]) {
-    setDraft((current) => {
-      let publicUrl = current.publicUrl;
-      try {
-        const url = new URL(publicUrl);
-        if (transport === "managed") url.port = "";
-        else if (
-          transport === "direct" &&
-          current.transport === "managed" &&
-          !url.port
-        )
-          url.port = current.port || "3002";
-        publicUrl = url.origin;
-      } catch {
-        /* Keep an incomplete address editable. */
-      }
-      return { ...current, transport, publicUrl };
-    });
-  }
-
   async function discoverAddress() {
     setDiscovering(true);
     setNetworkError("");
@@ -275,7 +268,7 @@ export function RemoteAccessSetup({
           : value.publicIp;
         setDraft((current) => ({
           ...current,
-          publicUrl: `https://${host}${current.transport === "direct" ? `:${current.port || 3002}` : ""}`,
+          publicUrl: `https://${host}`,
         }));
       } else
         setNetworkError(
@@ -295,7 +288,7 @@ export function RemoteAccessSetup({
   async function save(event: FormEvent) {
     event.preventDefault();
     if (saving) return;
-    settingsRevision.current++;
+    const revision = ++settingsRevision.current;
     setSaving(true);
     setError("");
     setPollError("");
@@ -305,15 +298,17 @@ export function RemoteAccessSetup({
         body: JSON.stringify({
           enabled: draft.enabled,
           publicUrl: draft.publicUrl.trim(),
-          transport: draft.transport,
+          transport: "managed",
           port: Number(draft.port),
         }),
       });
+      if (revision !== settingsRevision.current) return;
       applySettings(result);
       if (result.error && result.transport !== "managed")
         setError(result.error);
       else notify("Remote access settings saved.");
     } catch (cause) {
+      if (revision !== settingsRevision.current) return;
       setError(
         cause instanceof Error
           ? cause.message
@@ -323,8 +318,10 @@ export function RemoteAccessSetup({
       // Refresh readiness while retaining the owner's draft for correction.
       try {
         const current = await panelApi<AccessSettings>("/access/settings");
+        if (revision !== settingsRevision.current) return;
         publishSettings(current);
       } catch {
+        if (revision !== settingsRevision.current) return;
         setSettings((current) =>
           current ? { ...current, ready: false } : null,
         );
@@ -334,7 +331,7 @@ export function RemoteAccessSetup({
         );
       }
     } finally {
-      setSaving(false);
+      if (revision === settingsRevision.current) setSaving(false);
     }
   }
 
@@ -381,6 +378,29 @@ export function RemoteAccessSetup({
           {expanded ? "Hide setup" : "Edit setup"}
         </button>
       </div>
+      {settings.transport !== "managed" && settings.publicUrl && (
+        <div
+          className="subusers-https-status"
+          role="note"
+          aria-label="Trusted HTTPS upgrade"
+        >
+          <strong>Upgrade your saved remote access setup</strong>
+          <p>
+            Your saved address is <code>{settings.publicUrl}</code>. It stays
+            unchanged until you save.
+          </p>
+          <p>
+            Saving switches this panel to trusted HTTPS on port 443. Forward TCP
+            port 443 to this computer first, and stop any other service using
+            that port. Wait for the trusted certificate, then share the new
+            address and invitation links. People using an old address must sign
+            in at the new one.
+          </p>
+          <p>
+            Existing accounts, passwords, and server permissions are preserved.
+          </p>
+        </div>
+      )}
       {settings.enabled && settings.transport === "managed" && (
         <div
           className={`subusers-https-status ${accessReady(settings) ? "ready" : ""}`}
@@ -438,214 +458,106 @@ export function RemoteAccessSetup({
               checked={draft.enabled}
               onChange={() => setDraft({ ...draft, enabled: !draft.enabled })}
             />
-            <div className="subusers-setup-field subusers-transport">
-              <label htmlFor="subusers-transport">HTTPS setup</label>
-              <select
-                id="subusers-transport"
-                value={draft.transport}
-                onChange={(event) =>
-                  changeTransport(
-                    event.target.value as AccessSettings["transport"],
-                  )
-                }
-              >
-                <option value="managed">Trusted HTTPS (recommended)</option>
-                <option value="direct">Self-signed HTTPS</option>
-                <option value="proxy">HTTPS handled by a proxy</option>
-              </select>
-              <small>
-                {draft.transport === "managed"
-                  ? "MC Panel runs bundled Caddy to obtain and renew a trusted certificate. No separate installation or domain is required."
-                  : draft.transport === "direct"
-                    ? "Use a configurable public port. Recipients must verify the self-signed certificate."
-                    : "Use your existing HTTPS reverse proxy or tunnel."}
-              </small>
+            <div className="subusers-setup-guidance">
+              <strong>Trusted HTTPS</strong>
+              <p>
+                MC Panel runs bundled Caddy to obtain and renew a trusted
+                certificate. No separate installation or domain is required.
+              </p>
             </div>
-            <div className="subusers-setup-grid">
-              <div className="subusers-setup-field">
-                <label htmlFor="subusers-public-url">
-                  Public panel address
-                </label>
-                <input
-                  id="subusers-public-url"
-                  type="url"
-                  placeholder={
-                    draft.transport === "direct"
-                      ? "https://203.0.113.10:3002"
-                      : "https://203.0.113.10"
-                  }
-                  required={draft.enabled}
-                  value={draft.publicUrl}
-                  onChange={(event) =>
-                    setDraft({ ...draft, publicUrl: event.target.value })
-                  }
-                />
-                <small>
-                  {draft.transport === "managed"
-                    ? "Your public IP or domain, starting with https://. Trusted HTTPS uses port 443."
-                    : "Your public HTTPS address, including a port when needed."}
-                </small>
-                <button
-                  type="button"
-                  className="btn subusers-detect"
-                  onClick={() => void discoverAddress()}
-                >
-                  {discovering ? "Detecting…" : "Use my public IP"}
-                </button>
-              </div>
-              {draft.transport !== "managed" && (
-                <div className="subusers-setup-field">
-                  <label htmlFor="subusers-remote-port">
-                    Remote access port
-                  </label>
-                  <input
-                    id="subusers-remote-port"
-                    type="number"
-                    min={1024}
-                    max={65535}
-                    required
-                    value={draft.port}
-                    onChange={(event) =>
-                      setDraft({ ...draft, port: event.target.value })
-                    }
-                  />
-                  <small>
-                    A separate port for authenticated remote access.
-                  </small>
-                </div>
-              )}
+            <div className="subusers-setup-field">
+              <label htmlFor="subusers-public-url">Public panel address</label>
+              <input
+                id="subusers-public-url"
+                type="url"
+                placeholder="https://203.0.113.10"
+                required={draft.enabled}
+                value={draft.publicUrl}
+                onChange={(event) =>
+                  setDraft({ ...draft, publicUrl: event.target.value })
+                }
+              />
+              <small>
+                Your public IP or domain, starting with https://. Trusted HTTPS
+                uses port 443.
+              </small>
+              <button
+                type="button"
+                className="btn subusers-detect"
+                onClick={() => void discoverAddress()}
+              >
+                {discovering ? "Detecting…" : "Use my public IP"}
+              </button>
             </div>
             {networkError && (
               <p className="subusers-form-error" role="alert">
                 {networkError}
               </p>
             )}
-            {draft.transport === "managed" && (
-              <details className="subusers-advanced">
-                <summary>Advanced connection options</summary>
-                <div className="subusers-setup-field">
-                  <label htmlFor="subusers-internal-port">
-                    Internal service port
-                  </label>
-                  <input
-                    id="subusers-internal-port"
-                    type="number"
-                    min={1024}
-                    max={65535}
-                    required
-                    value={draft.port}
-                    onChange={(event) =>
-                      setDraft({ ...draft, port: event.target.value })
-                    }
-                  />
-                  <small>
-                    Used only on this computer. Do not forward this port on your
-                    router.
-                  </small>
-                </div>
-              </details>
-            )}
-            <div className="subusers-setup-guidance">
-              {draft.transport === "managed" ? (
-                <>
-                  <strong>Connect securely from outside your home</strong>
-                  <ol>
-                    <li>
-                      Forward TCP port <code>443</code> on your router to this
-                      computer’s local IP on port <code>443</code>. Reserve that
-                      local IP and allow Caddy through Windows Firewall if
-                      prompted.
-                    </li>
-                    <li>
-                      Enable remote access and save. MC Panel automatically
-                      requests the trusted certificate and renews it while
-                      running.
-                    </li>
-                    <li>
-                      When the certificate is ready, check the public address on
-                      your phone using mobile data, then share invitations.
-                    </li>
-                  </ol>
-                  <p>
-                    Keep this computer and MC Panel running. Update this address
-                    if your public IP changes. Valid trusted certificates remove
-                    certificate warnings in desktop and phone browsers.
-                  </p>
-                  <p>
-                    These settings do not open router or firewall ports. A
-                    shared ISP address (CGNAT), blocked incoming port 443, or
-                    another service using port 443 may require a public IP from
-                    your provider or an existing HTTPS proxy or tunnel.
-                  </p>
-                  <p>
-                    Enabling and saving requests certificates from Let’s Encrypt
-                    for this public address under its{" "}
-                    <a
-                      href="https://letsencrypt.org/repository/"
-                      target="_blank"
-                      rel="noopener noreferrer"
-                    >
-                      Subscriber Agreement
-                    </a>
-                    .
-                  </p>
-                </>
-              ) : draft.transport === "direct" ? (
-                <>
-                  <strong>Connect from outside your home</strong>
-                  <ol>
-                    <li>
-                      Forward TCP port <code>{draft.port || "3002"}</code> on
-                      your router to this computer’s local IP, using the same
-                      port. Allow that port through Windows Firewall.
-                    </li>
-                    <li>
-                      Keep this computer and MC Panel running. Update the
-                      address here if your public IP changes.
-                    </li>
-                  </ol>
-                  <p>
-                    MC Panel provides HTTPS and generates its own certificate.
-                    Browsers will show a certificate warning. Compare the
-                    certificate below.
-                  </p>
-                  <p>
-                    These settings do not open router or firewall ports. If your
-                    provider uses shared public addresses (CGNAT), port
-                    forwarding may require a public IP from your provider or an
-                    HTTPS tunnel.
-                  </p>
-                </>
-              ) : (
-                <p>
-                  Point your HTTPS proxy or tunnel at{" "}
-                  <code>http://127.0.0.1:{draft.port || "3002"}</code> and
-                  preserve the public Host header. Keep the proxy and MC Panel
-                  running.
-                </p>
-              )}
-            </div>
-            {draft.transport === "direct" && settings.certificate && (
-              <div className="subusers-setup-field subusers-certificate">
-                <label htmlFor="subusers-fingerprint">
-                  Certificate SHA-256 fingerprint
+            <details className="subusers-advanced">
+              <summary>Advanced connection options</summary>
+              <div className="subusers-setup-field">
+                <label htmlFor="subusers-internal-port">
+                  Internal service port
                 </label>
-                <textarea
-                  id="subusers-fingerprint"
-                  rows={3}
-                  readOnly
-                  value={settings.certificate.fingerprint256}
-                  onFocus={(event) => event.target.select()}
+                <input
+                  id="subusers-internal-port"
+                  type="number"
+                  min={1024}
+                  max={65535}
+                  required
+                  value={draft.port}
+                  onChange={(event) =>
+                    setDraft({ ...draft, port: event.target.value })
+                  }
                 />
                 <small>
-                  Share this with your recipient so they can verify the
-                  certificate. Valid until{" "}
-                  {new Date(settings.certificate.validTo).toLocaleDateString()}.
-                  A changed public address may create a new certificate after
-                  saving.
+                  Used only on this computer. Do not forward this port on your
+                  router.
                 </small>
               </div>
-            )}
+            </details>
+            <div className="subusers-setup-guidance">
+              <strong>Connect securely from outside your home</strong>
+              <ol>
+                <li>
+                  Forward TCP port <code>443</code> on your router to this
+                  computer’s local IP on port <code>443</code>. Reserve that
+                  local IP and allow Caddy through Windows Firewall if prompted.
+                </li>
+                <li>
+                  Enable remote access and save. MC Panel automatically requests
+                  the trusted certificate and renews it while running.
+                </li>
+                <li>
+                  When the certificate is ready, check the public address on
+                  your phone using mobile data, then share invitations.
+                </li>
+              </ol>
+              <p>
+                Keep this computer and MC Panel running. Update this address if
+                your public IP changes. Valid trusted certificates remove
+                certificate warnings in desktop and phone browsers.
+              </p>
+              <p>
+                These settings do not open router or firewall ports. A shared
+                ISP address (CGNAT) or blocked incoming port 443 may require a
+                public IP from your provider. Port 443 must be available on this
+                computer and forwarded to it.
+              </p>
+              <p>
+                Enabling and saving requests certificates from Let’s Encrypt for
+                this public address under its{" "}
+                <a
+                  href="https://letsencrypt.org/repository/"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                >
+                  Subscriber Agreement
+                </a>
+                .
+              </p>
+            </div>
             {(error || settings.error) && (
               <p className="subusers-form-error" role="alert">
                 <AlertCircle size={16} />

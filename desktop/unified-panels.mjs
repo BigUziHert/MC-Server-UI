@@ -141,6 +141,7 @@ export function createUnifiedPanelController({
                   ? {
                       ...panel,
                       token: authentication.token,
+                      revocationToken: authentication.revocationToken,
                       session: authentication.account,
                       servers: [],
                     }
@@ -156,6 +157,7 @@ export function createUnifiedPanelController({
               throw failure(409, "This panel sign-in changed.");
             const panel = authentication.panel;
             panel.token = authentication.token;
+            panel.revocationToken = authentication.revocationToken;
             panel.account = authentication.account;
             panel.servers = [];
             invalidate(panel);
@@ -253,6 +255,7 @@ export function createUnifiedPanelController({
         panel.authenticating = false;
         panel.previewing = false;
       }
+      await finishDeferredRevocation(panel);
       return;
     }
     // An atomic disk write already in progress must finish. A promotion still
@@ -283,6 +286,23 @@ export function createUnifiedPanelController({
     panel.account = undefined;
     panel.servers = [];
     if (selectedServer?.panelId === panel.id) selectedServer = null;
+  }
+  async function signedOutRevocation(panel, epoch) {
+    if (panel.epoch !== epoch || panel.token || panel.removed || closed) return;
+    if (panel.authenticating) {
+      panel.revokedEpoch = epoch;
+      return;
+    }
+    await removeSavedPanel(panel, epoch);
+  }
+  async function finishDeferredRevocation(panel) {
+    if (panel.revokedEpoch === undefined) return;
+    if (panel.epoch !== panel.revokedEpoch || panel.token) {
+      panel.revokedEpoch = undefined;
+      return;
+    }
+    if (!panel.authenticating && !panel.removed && !closed)
+      await removeSavedPanel(panel, panel.revokedEpoch);
   }
   async function removeSavedPanel(panel, expectedEpoch) {
     if (panel.pendingLeave) throw failure(409, pendingLeaveMessage);
@@ -562,7 +582,7 @@ export function createUnifiedPanelController({
         throw failure(404, "This panel connection is no longer available.");
       return refresh(panel, true);
     }
-    const epoch = panel.epoch;
+    let epoch = panel.epoch;
     panel.refreshExplicit = explicit;
     panel.allowPrompt = explicit;
     if (explicit) {
@@ -580,6 +600,26 @@ export function createUnifiedPanelController({
         ) {
           await removeSavedPanel(panel, epoch);
           return;
+        }
+        if (account.role === "guest" && panel.token) {
+          // A failed optional membership check must not keep an invalid bearer
+          // or its cached permissions looking signed in.
+          forgetSession(panel);
+          epoch = panel.epoch;
+          if (!panel.temporary) await persist();
+        }
+        if (account.role === "guest" && panel.revocationToken) {
+          const status = await json(panel, "/api/access/status", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ token: panel.revocationToken }),
+            tokenOverride: "",
+          });
+          if (panel.epoch !== epoch || panel.removed || closed) return;
+          if (status.accessRevoked === true) {
+            await signedOutRevocation(panel, epoch);
+            return;
+          }
         }
         if (account.role !== "subuser" || !panel.token) {
           forgetSession(panel);
@@ -737,10 +777,16 @@ export function createUnifiedPanelController({
         get(panel.id);
         const snapshot = changed();
         return panel.temporary
-          ? { ...snapshot, panels: [...snapshot.panels, describe(panel)] }
-          : snapshot;
+          ? {
+              ...snapshot,
+              openedPanelId: panel.id,
+              panels: [...snapshot.panels, describe(panel)],
+            }
+          : { ...snapshot, openedPanelId: panel.id };
       } catch (cause) {
-        await cancelSignIn(panel.id);
+        // A saved address is shared by other forms. This open owns only a new
+        // temporary draft; its failed probe must not cancel another sign-in.
+        if (panel.temporary) await cancelSignIn(panel.id);
         throw cause;
       }
     },
@@ -818,6 +864,7 @@ export function createUnifiedPanelController({
       panel.pendingTrust?.abort.abort();
       panel.allowPrompt = false;
       forgetSession(panel);
+      const signedOutEpoch = panel.epoch;
       panel.state = "connected";
       panel.error = "";
       changed();
@@ -829,19 +876,37 @@ export function createUnifiedPanelController({
           headers: { "Content-Type": "application/json" },
           body: "{}",
           tokenOverride: credential,
-        }).catch((cause) => {
-          if (
-            cause.status !== 401 &&
-            version === panel.controls &&
-            !panel.token &&
-            !panel.removed &&
-            !closed
-          ) {
-            panel.error =
-              "Signed out on this computer. The host could not confirm session revocation.";
-            changed();
-          }
-        });
+        })
+          .then(async (result) => {
+            if (
+              panel.epoch !== signedOutEpoch ||
+              panel.token ||
+              panel.pendingLeave ||
+              panel.removed ||
+              panel.removing ||
+              closed
+            )
+              return;
+            if (result.accessRevoked === true) {
+              await signedOutRevocation(panel, signedOutEpoch);
+            } else if (validToken(result.revocationToken)) {
+              panel.revocationToken = result.revocationToken;
+              await persist();
+            }
+          })
+          .catch((cause) => {
+            if (
+              cause.status !== 401 &&
+              version === panel.controls &&
+              !panel.token &&
+              !panel.removed &&
+              !closed
+            ) {
+              panel.error =
+                "Signed out on this computer. The host could not confirm session revocation.";
+              changed();
+            }
+          });
       }
       return changed();
     },
@@ -1034,7 +1099,7 @@ export function createUnifiedPanelController({
         );
       if (
         /^\/api\/(?:desktop|panel-users)(?:\/|$)/i.test(url.pathname) ||
-        /^\/api\/access\/(?:login|invitation|accept|logout|leave)\/?$/i.test(
+        /^\/api\/access\/(?:login|invitation|accept|logout|leave|status)\/?$/i.test(
           url.pathname,
         )
       )
@@ -1260,9 +1325,15 @@ export function createUnifiedPanelController({
           502,
           "Update the remote host to use secure desktop sign-in.",
         );
+      if (
+        result.revocationToken !== undefined &&
+        !validToken(result.revocationToken)
+      )
+        throw failure(502, "The host returned an invalid access-status proof.");
       const account = sessionRecord(result);
       if (panel.temporary) {
         panel.token = result.sessionToken;
+        panel.revocationToken = result.revocationToken;
         panel.account = account;
         panel.servers = [];
         invalidate(panel);
@@ -1281,6 +1352,7 @@ export function createUnifiedPanelController({
           version,
           epoch: panel.epoch,
           token: result.sessionToken,
+          revocationToken: result.revocationToken,
           account,
         });
         try {
@@ -1295,6 +1367,7 @@ export function createUnifiedPanelController({
         panel.authenticating = false;
         panel.authAbort = undefined;
       }
+      await finishDeferredRevocation(panel).catch(onError);
     }
     try {
       await refresh(panel, true);

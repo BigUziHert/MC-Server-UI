@@ -228,16 +228,6 @@ function LegacyConnectPanel({
             >
               {unified ? "Back to invitation link" : "Back to panel address"}
             </button>
-            {target.token && !unified && (
-              <button
-                className="btn"
-                type="button"
-                disabled={busy}
-                onClick={() => setTarget({ panel: target.panel })}
-              >
-                Sign in with an existing account
-              </button>
-            )}
           </div>
         </>
       ) : (
@@ -289,7 +279,7 @@ function LegacyConnectPanel({
               placeholder={
                 mode === "invitation"
                   ? "https://panel.example.com/#invite=…"
-                  : "https://panel.example.com:3002"
+                  : "https://panel.example.com"
               }
               value={address}
               disabled={busy}

@@ -26,6 +26,8 @@ async function fixture(t, options = {}) {
   const values = new Map(),
     requests = [],
     sessions = new Map(),
+    monitors = new Map(),
+    sessionMonitors = new Map(),
     revoked = new Set(),
     leaveReceipts = new Map(),
     homes = [];
@@ -85,7 +87,25 @@ async function fixture(t, options = {}) {
       const sessionToken = randomBytes(32).toString("base64url"),
         session = account(body.email?.split("@")[0] ?? "member");
       sessions.set(sessionToken, session);
-      return response({ ...session, sessionToken });
+      const revocationToken = options.monitor
+        ? randomBytes(32).toString("base64url")
+        : undefined;
+      if (revocationToken) {
+        monitors.set(revocationToken, { origin: url.origin, revoked: false });
+        sessionMonitors.set(sessionToken, revocationToken);
+      }
+      return response({
+        ...session,
+        sessionToken,
+        ...(revocationToken ? { revocationToken } : {}),
+      });
+    }
+    if (url.pathname === "/api/access/status") {
+      const monitor = monitors.get(JSON.parse(init.body).token);
+      return response({
+        accessRevoked:
+          monitor?.origin === url.origin && monitor.revoked === true,
+      });
     }
     if (url.pathname === "/api/access/leave") {
       const { requestId } = JSON.parse(init.body);
@@ -98,7 +118,16 @@ async function fixture(t, options = {}) {
     }
     if (url.pathname === "/api/access/logout") {
       sessions.delete(token);
-      return response({ ok: true });
+      const revocationToken = sessionMonitors.get(token);
+      return response({
+        ok: true,
+        ...(revocationToken
+          ? {
+              revocationToken,
+              accessRevoked: monitors.get(revocationToken)?.revoked === true,
+            }
+          : {}),
+      });
     }
     if (!sessions.has(token))
       return response(
@@ -167,6 +196,7 @@ async function fixture(t, options = {}) {
     connect,
     requests,
     sessions,
+    monitors,
     revoked,
     leaveReceipts,
     homes,
@@ -1422,4 +1452,385 @@ test("browser page suspension cancels pending drafts and permits sign-in again a
     panelId: other.id,
     serverId: "server",
   });
+});
+
+test("browser revocation sequences remove only the proved panel before or after sign-out and restart", async (t) => {
+  for (const sequence of [
+    "signout-revoke",
+    "revoke-signout",
+    "expired-revoke",
+    "restart-revoke",
+  ]) {
+    await t.test(sequence, async (t) => {
+      const f = await fixture(t, { monitor: true }),
+        first = await f.connect(),
+        other = await f.connect("https://two.example.test");
+      const saved = JSON.parse(f.values.get(browserConnectionsKey)).panels.find(
+        (panel) => panel.id === first.id,
+      );
+      const proof = saved.revocationToken;
+      assert.ok(proof);
+      assert.equal(
+        JSON.stringify(await f.controller.bridge.list()).includes(proof),
+        false,
+      );
+      await f.controller.bridge.selectServer(first.id, "server");
+      if (sequence === "revoke-signout") f.monitors.get(proof).revoked = true;
+      if (sequence === "expired-revoke") {
+        f.sessions.delete(saved.token);
+        await f.controller.bridge.retry(first.id);
+      } else {
+        await Promise.all([
+          f.controller.bridge.signOut(first.id),
+          f.controller.bridge.signOut(first.id),
+        ]);
+        await new Promise((resolve) => setImmediate(resolve));
+      }
+      assert.equal((await f.controller.bridge.list()).selectedServer, null);
+      await f.controller.bridge.selectServer(other.id, "server");
+      if (sequence !== "revoke-signout") {
+        const signedOut = JSON.parse(
+          f.values.get(browserConnectionsKey),
+        ).panels.find((panel) => panel.id === first.id);
+        assert.equal(signedOut.token, null);
+        assert.equal(signedOut.session, undefined);
+        assert.equal(signedOut.revocationToken, proof);
+        assert.deepEqual(signedOut.servers, []);
+      }
+      f.monitors.get(proof).revoked = true;
+      const controller =
+        sequence === "restart-revoke" ? await f.boot() : f.controller;
+      if (
+        (await controller.bridge.list()).panels.some(
+          (panel) => panel.id === first.id,
+        )
+      )
+        await controller.bridge.retry(first.id);
+      const snapshot = await controller.bridge.list();
+      assert.equal(
+        snapshot.panels.some((panel) => panel.id === first.id),
+        false,
+      );
+      assert.equal(
+        snapshot.panels.find((panel) => panel.id === other.id).signedIn,
+        true,
+      );
+      assert.deepEqual(snapshot.selectedServer, {
+        panelId: other.id,
+        serverId: "server",
+      });
+      assert.equal(
+        JSON.parse(f.values.get(browserConnectionsKey)).panels.some(
+          (panel) => panel.id === first.id,
+        ),
+        false,
+      );
+      for (const request of f.requests.filter(
+        (request) => request.url.pathname === "/api/access/status",
+      )) {
+        assert.equal(request.token, undefined);
+        assert.equal(request.init.credentials, "omit");
+        assert.equal(
+          f.monitors.get(JSON.parse(request.init.body).token).origin,
+          request.url.origin,
+        );
+      }
+    });
+  }
+});
+
+test("signed-out browser status failures and unproved responses never remove the saved panel", async (t) => {
+  const f = await fixture(t, { monitor: true }),
+    panel = await f.connect();
+  await f.controller.bridge.signOut(panel.id);
+  await new Promise((resolve) => setImmediate(resolve));
+  for (const state of ["offline", 429, 401, 403, "unknown", "string-marker"]) {
+    f.handler((url) => {
+      if (url.pathname !== "/api/access/status") return;
+      if (state === "offline") throw new TypeError("offline");
+      if (typeof state === "number")
+        return response({ error: "Unavailable", accessRevoked: true }, state);
+      return response({
+        accessRevoked: state === "string-marker" ? "true" : false,
+      });
+    });
+    await f.controller.bridge.retry(panel.id);
+    const retained = (await f.controller.bridge.list()).panels.find(
+      (row) => row.id === panel.id,
+    );
+    assert.ok(retained, String(state));
+    assert.equal(retained.signedIn, false);
+    assert.deepEqual(retained.servers, []);
+  }
+});
+
+test("a delayed browser logout revocation cannot remove a replacement account on the same origin", async (t) => {
+  const f = await fixture(t, { monitor: true }),
+    first = await f.connect();
+  let entered, release;
+  const started = new Promise((resolve) => {
+    entered = resolve;
+  });
+  f.handler(async (url) => {
+    if (url.pathname !== "/api/access/logout") return;
+    entered();
+    await new Promise((resolve) => {
+      release = resolve;
+    });
+    return response({ ok: true, accessRevoked: true });
+  });
+  await f.controller.bridge.signOut(first.id);
+  await started;
+  const snapshot = await f.controller.bridge.signIn(first.id, {
+    email: "replacement@example.test",
+    password: "correct password",
+  });
+  const replacement = snapshot.panels.find((panel) => panel.id === first.id);
+  release();
+  await new Promise((resolve) => setImmediate(resolve));
+  const retained = (await f.controller.bridge.list()).panels.find(
+    (panel) => panel.id === first.id,
+  );
+  assert.equal(retained.session.email, "replacement@example.test");
+  assert.equal(retained.sessionEpoch, replacement.sessionEpoch);
+  assert.equal(retained.signedIn, true);
+});
+
+test("cancelled browser account replacement preserves the previous non-authenticating revocation proof", async (t) => {
+  const f = await fixture(t, { monitor: true }),
+    panel = await f.connect();
+  await f.controller.bridge.signOut(panel.id);
+  await new Promise((resolve) => setImmediate(resolve));
+  const proof = JSON.parse(f.values.get(browserConnectionsKey)).panels[0]
+    .revocationToken;
+  let entered, release;
+  const started = new Promise((resolve) => {
+    entered = resolve;
+  });
+  f.handler(async (url) => {
+    if (url.pathname !== "/api/access/login") return;
+    entered();
+    await new Promise((resolve) => {
+      release = resolve;
+    });
+    return response({
+      ...account("replacement"),
+      sessionToken: "x".repeat(43),
+      revocationToken: "y".repeat(43),
+    });
+  });
+  const pending = f.controller.bridge.signIn(panel.id, {
+    email: "replacement@example.test",
+    password: "correct password",
+  });
+  const rejected = assert.rejects(pending, /changed|abort/i);
+  await started;
+  await f.controller.bridge.cancelSignIn(panel.id);
+  release();
+  await rejected;
+  assert.equal(
+    JSON.parse(f.values.get(browserConnectionsKey)).panels[0].revocationToken,
+    proof,
+  );
+  f.monitors.get(proof).revoked = true;
+  await f.controller.bridge.retry(panel.id);
+  assert.equal(
+    (await f.controller.bridge.list()).panels.some(
+      (row) => row.id === panel.id,
+    ),
+    false,
+  );
+});
+
+test("browser background polling removes revoked membership after normal sign-out without a retry", async (t) => {
+  const f = await fixture(t, { monitor: true, pollMs: 20 }),
+    panel = await f.connect();
+  await f.controller.bridge.signOut(panel.id);
+  await new Promise((resolve) => setImmediate(resolve));
+  const proof = JSON.parse(f.values.get(browserConnectionsKey)).panels[0]
+    .revocationToken;
+  f.monitors.get(proof).revoked = true;
+  const deadline = Date.now() + 2000;
+  while (
+    (await f.controller.bridge.list()).panels.some(
+      (row) => row.id === panel.id,
+    ) &&
+    Date.now() < deadline
+  )
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.equal(
+    (await f.controller.bridge.list()).panels.some(
+      (row) => row.id === panel.id,
+    ),
+    false,
+  );
+});
+
+test("a pre-upgrade browser sign-out stores the host's non-authenticating status proof", async (t) => {
+  const f = await fixture(t),
+    panel = await f.connect();
+  f.handler((url) =>
+    url.pathname === "/api/access/logout"
+      ? response({ ok: true, revocationToken: "r".repeat(43) })
+      : url.pathname === "/api/access/status"
+        ? response({ accessRevoked: true })
+        : undefined,
+  );
+  await f.controller.bridge.signOut(panel.id);
+  await new Promise((resolve) => setImmediate(resolve));
+  const saved = JSON.parse(f.values.get(browserConnectionsKey)).panels[0];
+  assert.equal(saved.token, null);
+  assert.equal(saved.session, undefined);
+  assert.equal(saved.revocationToken, "r".repeat(43));
+  await f.controller.bridge.retry(panel.id);
+  assert.equal(
+    (await f.controller.bridge.list()).panels.some(
+      (row) => row.id === panel.id,
+    ),
+    false,
+  );
+});
+
+test("a guest browser session clears stale credentials even when its status probe fails", async (t) => {
+  for (const failure of [404, 429, "offline"]) {
+    const f = await fixture(t, { monitor: true }),
+      panel = await f.connect();
+    f.handler((url) =>
+      url.pathname === "/api/access/session" && url.origin === remote
+        ? response({ role: "guest" })
+        : url.pathname === "/api/access/status"
+          ? failure === "offline"
+            ? Promise.reject(new TypeError("offline"))
+            : response({ error: "Retry later" }, failure)
+          : undefined,
+    );
+    await f.controller.bridge.retry(panel.id);
+    const retained = (await f.controller.bridge.list()).panels.find(
+        (row) => row.id === panel.id,
+      ),
+      saved = JSON.parse(f.values.get(browserConnectionsKey)).panels[0];
+    assert.equal(retained.signedIn, false);
+    assert.equal(retained.session, undefined);
+    assert.deepEqual(retained.servers, []);
+    assert.equal(saved.token, null);
+    assert.ok(saved.revocationToken);
+  }
+});
+
+test("browser old-account logout confirmation waits for a staged replacement outcome", async (t) => {
+  for (const outcome of ["success", "cancel"])
+    await t.test(outcome, async (t) => {
+      let block = false,
+        releaseWrite,
+        writing,
+        releaseLogout,
+        logoutStarted;
+      const writingReady = new Promise((resolve) => {
+          writing = resolve;
+        }),
+        loggingOut = new Promise((resolve) => {
+          logoutStarted = resolve;
+        });
+      const f = await fixture(t, {
+        monitor: true,
+        lock: async (operation) => {
+          if (block) {
+            writing();
+            await new Promise((resolve) => {
+              releaseWrite = resolve;
+            });
+          }
+          return operation();
+        },
+      });
+      const panel = await f.connect();
+      f.handler(async (url) => {
+        if (url.pathname !== "/api/access/logout") return;
+        logoutStarted();
+        await new Promise((resolve) => {
+          releaseLogout = resolve;
+        });
+        return response({ ok: true, accessRevoked: true });
+      });
+      await f.controller.bridge.signOut(panel.id);
+      await loggingOut;
+      block = true;
+      const signingIn = f.controller.bridge.signIn(panel.id, {
+        email: "replacement@example.test",
+        password: "correct password",
+      });
+      const settled =
+        outcome === "cancel"
+          ? assert.rejects(signingIn, /changed|abort/i)
+          : signingIn;
+      await writingReady;
+      releaseLogout();
+      await new Promise((resolve) => setImmediate(resolve));
+      assert.equal(
+        (await f.controller.bridge.list()).panels.some(
+          (row) => row.id === panel.id,
+        ),
+        true,
+      );
+      const cancelling =
+        outcome === "cancel"
+          ? f.controller.bridge.cancelSignIn(panel.id)
+          : Promise.resolve();
+      block = false;
+      releaseWrite();
+      await Promise.all([settled, cancelling]);
+      const retained = (await f.controller.bridge.list()).panels.find(
+        (row) => row.id === panel.id,
+      );
+      if (outcome === "success")
+        assert.equal(retained.session.email, "replacement@example.test");
+      else assert.equal(retained, undefined);
+    });
+});
+
+test("an older browser open never adopts another form's newly saved panel at the same origin", async (t) => {
+  const f = await fixture(t);
+  let entered,
+    release,
+    first = true;
+  const started = new Promise((resolve) => {
+    entered = resolve;
+  });
+  f.handler(async (url) => {
+    if (
+      url.origin !== remote ||
+      url.pathname !== "/api/access/session" ||
+      !first
+    )
+      return;
+    first = false;
+    entered();
+    await new Promise((resolve) => {
+      release = resolve;
+    });
+    return response({ role: "guest" });
+  });
+  const opening = f.controller.bridge.open(remote);
+  const rejected = assert.rejects(opening, /sign-in changed/);
+  await started;
+  const second = await f.controller.bridge.open(remote),
+    target = second.panels.find((panel) => panel.id === second.openedPanelId);
+  assert.equal(target.temporary, true);
+  await f.controller.bridge.signIn(target.id, {
+    email: "member@example.test",
+    password: "correct password",
+  });
+  release();
+  await rejected;
+  const snapshot = await f.controller.bridge.list();
+  assert.equal(
+    snapshot.panels.filter((panel) => panel.origin === remote).length,
+    1,
+  );
+  assert.equal(
+    snapshot.panels.find((panel) => panel.id === target.id).signedIn,
+    true,
+  );
+  const reopened = await f.controller.bridge.open(remote);
+  assert.equal(reopened.openedPanelId, target.id);
 });

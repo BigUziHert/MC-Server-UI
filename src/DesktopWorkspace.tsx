@@ -470,7 +470,9 @@ export default function DesktopWorkspace() {
                       onSignedOut={expire}
                     />
                   </ServerScope.Provider>
-                ) : selected ? (
+                ) : selected &&
+                  (!remote ||
+                    (panel?.signedIn === true && !panel.pendingLeave)) ? (
                   <div className="app-shell workspace-unavailable">
                     <aside className="sidebar">
                       <a
@@ -614,7 +616,14 @@ export default function DesktopWorkspace() {
         />
       )}
       {managingConnections && (
-        <PanelConnectionsDialog onClose={() => setManagingConnections(false)} />
+        <PanelConnectionsDialog
+          onClose={() => setManagingConnections(false)}
+          onSignIn={() => {
+            setManagingConnections(false);
+            setInvitationUrl("");
+            setConnection("signin");
+          }}
+        />
       )}
       {chooseHost && (
         <ChooseHost

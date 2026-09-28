@@ -59,7 +59,9 @@ declare global {
       runtime?: "desktop" | "browser";
       unified?: boolean;
       list: () => Promise<PanelConnections>;
-      open: (url: string) => Promise<PanelConnections>;
+      open: (
+        url: string,
+      ) => Promise<PanelConnections & { openedPanelId?: string }>;
       activate: (id: string) => Promise<PanelConnections>;
       openUpdates?: () => Promise<void>;
       openLocalServerSetup?: (

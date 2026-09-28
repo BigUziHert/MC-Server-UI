@@ -18,6 +18,8 @@ const sessionLifetime = 7 * 24 * 60 * 60 * 1000;
 const leaveReceiptLifetime = 7 * 24 * 60 * 60 * 1000;
 const maximumLeaveReceipts = 4096;
 const maximumAccessRevocations = 4096;
+const revocationProofLifetime = 90 * 24 * 60 * 60 * 1000;
+const maximumRevocationProofs = 4096;
 const maxEmailMemberships = 32;
 const invalidLink =
   "This invitation link is invalid, expired, or already used. If you saved your password, choose Sign in. Otherwise, ask the server owner to reissue the invitation for your existing account.";
@@ -207,6 +209,7 @@ export async function createAccessService({
     retiredLegacyEmails: [],
     leaveReceipts: [],
     accessRevocations: [],
+    revocationProofs: [],
   };
   let migrationNeeded = false;
   try {
@@ -244,6 +247,8 @@ export async function createAccessService({
       leaveReceipts: saved.leaveReceipts ?? [],
       accessRevocations:
         saved.accessRevocations === undefined ? [] : saved.accessRevocations,
+      revocationProofs:
+        saved.revocationProofs === undefined ? [] : saved.revocationProofs,
     };
     if (
       !Array.isArray(state.leaveReceipts) ||
@@ -280,6 +285,38 @@ export async function createAccessService({
       })
     )
       throw new Error("Invalid access revocation receipt storage.");
+    const proofHashes = new Set();
+    if (
+      !Array.isArray(state.revocationProofs) ||
+      state.revocationProofs.length > maximumRevocationProofs ||
+      state.revocationProofs.some((proof) => {
+        if (
+          !proof ||
+          typeof proof !== "object" ||
+          Array.isArray(proof) ||
+          Object.keys(proof).length !== 3 ||
+          typeof proof.hash !== "string" ||
+          !/^[a-f0-9]{64}$/.test(proof.hash) ||
+          typeof proof.accountId !== "string" ||
+          !proof.accountId ||
+          proof.accountId.length > 128 ||
+          !Number.isSafeInteger(proof.expiresAt) ||
+          proof.expiresAt < 0 ||
+          proofHashes.has(proof.hash)
+        )
+          return true;
+        proofHashes.add(proof.hash);
+        return false;
+      })
+    )
+      throw new Error("Invalid signed-out account status proof storage.");
+    const activeProofs = state.revocationProofs.filter(
+      (proof) => proof.expiresAt > now(),
+    );
+    if (activeProofs.length !== state.revocationProofs.length) {
+      state.revocationProofs = activeProofs;
+      migrationNeeded = true;
+    }
     const activeRevocations = state.accessRevocations.filter(
       (receipt) => receipt.expiresAt > now(),
     );
@@ -460,7 +497,30 @@ export async function createAccessService({
     accessRevocations: state.accessRevocations.filter(
       (receipt) => receipt.expiresAt > now(),
     ),
+    revocationProofs: state.revocationProofs.filter(
+      (proof) => proof.expiresAt > now(),
+    ),
   });
+  // This separate capability can only confirm deletion of the original account.
+  // It never appears in the session table and cannot authorize panel requests.
+  const createRevocationProof = (accountId) => {
+    const token = secret();
+    return {
+      token,
+      record: {
+        hash: digest(token),
+        accountId,
+        expiresAt: now() + revocationProofLifetime,
+      },
+    };
+  };
+  const withRevocationProof = (next, proof) =>
+    [
+      ...next.revocationProofs.filter((entry) => entry.expiresAt > now()),
+      proof.record,
+    ]
+      .sort((a, b) => a.expiresAt - b.expiresAt)
+      .slice(-maximumRevocationProofs);
   // Keep only an expiring, bearer-token proof of a deliberate loss of access.
   // This never records an identity, plaintext credential or ordinary sign-out.
   // Evict the earliest-expiring receipts at capacity so removing access cannot
@@ -869,8 +929,10 @@ export async function createAccessService({
   };
   const createAccountSession = (account) => {
     const value = secret();
+    const proof = createRevocationProof(account.id);
     return {
       token: value,
+      proof,
       session: {
         transport: "bearer",
         accountId: account.id,
@@ -1036,6 +1098,15 @@ export async function createAccessService({
     status,
     hostAuthority,
     isAccessRevoked,
+    accountStatus(token) {
+      if (!validSecret(token))
+        throw fail(400, "A valid saved account status proof is required.");
+      const hash = digest(token);
+      const proof = state.revocationProofs.find(
+        (entry) => entry.hash === hash && entry.expiresAt > now(),
+      );
+      return { accessRevoked: Boolean(proof && !accountById(proof.accountId)) };
+    },
     // Serialize identity reservation with account creation/promotion so a raw
     // server identity cannot become invisible between validation and commit.
     withLegacyIdentity: (email, create) =>
@@ -1651,6 +1722,7 @@ export async function createAccessService({
           const next = replaceAccount(cleaned(), updated);
           await persist({
             ...next,
+            revocationProofs: withRevocationProof(next, issued.proof),
             retiredLegacyEmails: [
               ...new Set([...next.retiredLegacyEmails, account.email]),
             ],
@@ -1671,6 +1743,7 @@ export async function createAccessService({
           });
           return {
             token: issued.token,
+            revocationToken: issued.proof.token,
             cookie: issued.cookie,
             session: accountSessionView(updated),
           };
@@ -1736,10 +1809,12 @@ export async function createAccessService({
           const next = cleaned();
           await persist({
             ...next,
+            revocationProofs: withRevocationProof(next, issued.proof),
             sessions: [...next.sessions, issued.session],
           });
           return {
             token: issued.token,
+            revocationToken: issued.proof.token,
             cookie: issued.cookie,
             session: accountSessionView(account),
           };
@@ -1890,24 +1965,39 @@ export async function createAccessService({
         return { left: true, requestId };
       });
     },
-    logout: (req) => {
+    logout: (req, { report = false } = {}) => {
       if (closing)
         return Promise.reject(fail(503, "Remote access is shutting down."));
       const token = cookieSecret(req);
       const hash = token ? digest(token) : null;
+      const result = (extra = {}) =>
+        report ? { ok: true, ...extra } : clearCookie;
       // Unknown cookies need no queued disk write. Check again after acquiring
       // the queue so concurrent logout requests only invalidate the session once.
       if (!hash || !state.sessions.some((item) => item.hash === hash))
-        return Promise.resolve(clearCookie);
+        return Promise.resolve(
+          result(isAccessRevoked(req) ? { accessRevoked: true } : {}),
+        );
       return serialize(async () => {
+        let proof;
+        const revoked = isAccessRevoked(req);
         if (state.sessions.some((item) => item.hash === hash)) {
+          const account = report && (await authenticatedSession(req));
+          if (account?.accountId)
+            proof = createRevocationProof(account.accountId);
           const next = cleaned();
           await persist({
             ...next,
+            ...(proof
+              ? { revocationProofs: withRevocationProof(next, proof) }
+              : {}),
             sessions: next.sessions.filter((item) => item.hash !== hash),
           });
         }
-        return clearCookie;
+        return result({
+          ...(proof ? { revocationToken: proof.token } : {}),
+          ...(revoked ? { accessRevoked: true } : {}),
+        });
       });
     },
     revoke: (serverId, userId, { created = false } = {}) =>

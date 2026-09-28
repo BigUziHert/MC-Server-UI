@@ -68,6 +68,9 @@ try {
   await accountMenu.click();
   await expect(
     page.getByRole("menuitem", { name: "Sign in", exact: true }),
+  ).toHaveCount(0);
+  await expect(
+    page.getByRole("menuitem", { name: "Manage Connections", exact: true }),
   ).toBeVisible();
   await page
     .getByRole("menuitem", { name: "Accept invitation", exact: true })
@@ -126,10 +129,10 @@ try {
       exact: true,
     }),
   ).toHaveCount(0);
-  await page.keyboard.press("Escape");
+  await connectionManager
+    .getByRole("button", { name: "Sign in", exact: true })
+    .click();
   await expect(connectionManager).not.toBeVisible();
-  await accountMenu.click();
-  await page.getByRole("menuitem", { name: "Sign in", exact: true }).click();
   const signIn = page.getByRole("dialog", { name: "Sign in", exact: true });
   await expect(
     signIn.getByLabel("Panel address", { exact: true }),

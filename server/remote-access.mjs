@@ -366,7 +366,9 @@ export function createRemoteGateway({
         // Login and invitations may omit a bearer, but still require JSON.
         if (
           req.method === "POST" &&
-          /^\/api\/access\/(?:login|invitation|accept)\/?$/i.test(req.path) &&
+          /^\/api\/access\/(?:login|invitation|accept|status)\/?$/i.test(
+            req.path,
+          ) &&
           !/^application\/json(?:\s*;|$)/i.test(
             req.headers["content-type"] ?? "",
           )
@@ -433,7 +435,13 @@ export function createRemoteGateway({
     accountLoginLimit,
     async (req, res) => {
       const result = await access.login(req.body ?? {});
-      res.json({ ...result.session, sessionToken: result.token });
+      res.json({
+        ...result.session,
+        sessionToken: result.token,
+        ...(result.revocationToken
+          ? { revocationToken: result.revocationToken }
+          : {}),
+      });
     },
   );
   app.post("/api/access/accept", acceptLimit, async (req, res) => {
@@ -443,15 +451,25 @@ export function createRemoteGateway({
       req,
     );
     await accepted?.(result.session);
-    res.json({ ...result.session, sessionToken: result.token });
+    res.json({
+      ...result.session,
+      sessionToken: result.token,
+      ...(result.revocationToken
+        ? { revocationToken: result.revocationToken }
+        : {}),
+    });
   });
   app.post("/api/access/invitation", acceptLimit, async (req, res) => {
     res.set("Cache-Control", "no-store");
     res.json(await access.previewInvitation(req.body?.token));
   });
   app.post("/api/access/logout", async (req, res) => {
-    await access.logout(req);
-    res.json({ ok: true });
+    res.json(await access.logout(req, { report: true }));
+  });
+  const statusLimit = createAccessRateLimiter({ limit: 1200 });
+  app.post("/api/access/status", statusLimit, (req, res) => {
+    res.set("Cache-Control", "no-store");
+    res.json(access.accountStatus(req.body?.token));
   });
   app.post("/api/access/leave", async (req, res) => {
     res.json(await access.leave(req, req.body));

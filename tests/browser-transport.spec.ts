@@ -295,6 +295,52 @@ test("browser workspace connects to independent HTTPS panels with isolated files
       .getByRole("button", { name: "Close panel connections", exact: true })
       .click();
 
+    await expect(page.getByText(a.label, { exact: true })).toHaveCount(0);
+    await expect(
+      page.getByRole("button", {
+        name: `Select server Shared name on ${c.label}`,
+        exact: true,
+      }),
+    ).toBeVisible();
+    // Deleting an account while its client is signed out and closed must still
+    // remove the saved address on restart without retaining login credentials.
+    const signedOutStorage = await context.storageState();
+    await context.close();
+    await a.fleet.access.deleteAccount(a.account.id);
+    context = await browser.newContext({
+      baseURL,
+      ignoreHTTPSErrors: true,
+      acceptDownloads: true,
+      storageState: signedOutStorage,
+    });
+    page = await context.newPage();
+    await page.goto("/");
+    await accountMenu(page);
+    await page
+      .getByRole("menuitem", { name: "Manage Connections", exact: true })
+      .click();
+    manager = page.getByRole("dialog", {
+      name: "Manage Connections",
+      exact: true,
+    });
+    await expect(manager.getByText(a.label, { exact: true })).toHaveCount(0);
+    await expect(
+      manager.getByRole("button", {
+        name: `Sign out of ${c.label}`,
+        exact: true,
+      }),
+    ).toBeVisible();
+    const checks = a.received.filter(
+      (request) => request.path === "/api/access/status",
+    );
+    expect(checks.length).toBeGreaterThan(0);
+    expect(
+      checks.every((request) => !request.authorization && !request.cookie),
+    ).toBe(true);
+    await manager
+      .getByRole("button", { name: "Close panel connections", exact: true })
+      .click();
+
     // Removing a single server grant keeps the panel account; deleting that
     // account subsequently removes its saved connection without a manual retry.
     await c.fleet.access.revoke(sharedServerId, c.account.id);
@@ -315,7 +361,7 @@ test("browser workspace connects to independent HTTPS panels with isolated files
     await expect(manager.getByText(c.label, { exact: true })).toBeVisible();
     await c.fleet.access.deleteAccount(c.account.id);
     await expect(manager.getByText(c.label, { exact: true })).toHaveCount(0);
-    await expect(manager.getByText(a.label, { exact: true })).toBeVisible();
+    await expect(manager.getByText(a.label, { exact: true })).toHaveCount(0);
     expect(c.fleet.runtimes.size).toBe(1);
   } finally {
     await context?.close();

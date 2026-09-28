@@ -190,12 +190,23 @@ export function createUnifiedConnectionStore({ dataDir, safeStorage }) {
           }
         }
         const signedIn = validToken(credential?.token) && session;
+        const revocationToken = validToken(credential?.revocationToken)
+          ? credential.revocationToken
+          : undefined;
         if (
           credential?.pendingLeave !== undefined &&
           !validRequestId(credential.pendingLeave?.requestId)
         )
           damaged = true;
-        if (entry.credential !== undefined && !signedIn) renewSignIn = true;
+        if (
+          entry.credential !== undefined &&
+          !signedIn &&
+          (!revocationToken ||
+            credential?.token !== undefined ||
+            credential?.session !== undefined ||
+            credential?.pendingLeave !== undefined)
+        )
+          renewSignIn = true;
         if (
           !Array.isArray(entry.servers) ||
           entry.servers.length > 500 ||
@@ -211,6 +222,7 @@ export function createUnifiedConnectionStore({ dataDir, safeStorage }) {
             : {}),
           servers: signedIn ? displayRoster(entry.servers) : [],
           ...(signedIn ? { token: credential.token, session } : {}),
+          ...(revocationToken ? { revocationToken } : {}),
           ...(signedIn && validRequestId(credential?.pendingLeave?.requestId)
             ? { pendingLeave: { requestId: credential.pendingLeave.requestId } }
             : {}),
@@ -260,6 +272,11 @@ export function createUnifiedConnectionStore({ dataDir, safeStorage }) {
             validToken(panel.token) &&
             session &&
             safeStorage.isEncryptionAvailable();
+          const revocationToken =
+            validToken(panel.revocationToken) &&
+            safeStorage.isEncryptionAvailable()
+              ? panel.revocationToken
+              : undefined;
           if (panel.id === requireCredentialFor && !signedIn)
             throw new Error(
               "This sign-in could not be encrypted and saved. Restore this computer's secure storage and try again; the new connection was not saved.",
@@ -279,6 +296,7 @@ export function createUnifiedConnectionStore({ dataDir, safeStorage }) {
               : {}),
             servers: signedIn ? displayRoster(panel.servers) : [],
             ...(signedIn ? { token: panel.token, session } : {}),
+            ...(revocationToken ? { revocationToken } : {}),
             ...(panel.pendingLeave
               ? { pendingLeave: { requestId: panel.pendingLeave.requestId } }
               : {}),
@@ -307,12 +325,12 @@ export function createUnifiedConnectionStore({ dataDir, safeStorage }) {
             version: 1,
             selectedServer: snapshot.selectedServer,
             panels: snapshot.panels.map(
-              ({ token, session, pendingLeave, ...panel }) => {
-                if (!token) return panel;
+              ({ token, session, revocationToken, pendingLeave, ...panel }) => {
+                if (!token && !revocationToken) return panel;
                 const encrypted = safeStorage.encryptString(
                   JSON.stringify({
-                    token,
-                    session,
+                    ...(token ? { token, session } : {}),
+                    ...(revocationToken ? { revocationToken } : {}),
                     ...(pendingLeave ? { pendingLeave } : {}),
                   }),
                 );

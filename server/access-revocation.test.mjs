@@ -10,6 +10,7 @@ import { createRemoteGateway } from "./remote-access.mjs";
 
 const password = "Revocation fixture password!";
 const lifetime = 7 * 24 * 60 * 60 * 1000;
+const proofLifetime = 90 * 24 * 60 * 60 * 1000;
 const hash = (value) => createHash("sha256").update(value).digest("hex");
 const bearer = (value) => ({ headers: { authorization: `Bearer ${value}` } });
 const invitationToken = (invitation) =>
@@ -86,6 +87,191 @@ async function fixture(t) {
     write: (state) => fs.writeFile(file, JSON.stringify(state)),
   };
 }
+
+for (const order of [
+  ["logout", "delete"],
+  ["delete", "logout"],
+  ["logout", "restart", "delete"],
+  ["expire-session", "delete", "restart"],
+  ["delete", "recreate", "logout", "restart"],
+])
+  test(`signed-out membership proof survives ${order.join(" → ")}`, async (t) => {
+    const f = await fixture(t);
+    const member = await f.enroll();
+    const other = await f.enroll("unrelated@example.test");
+    assert.match(member.revocationToken, /^[\w-]{43}$/);
+    assert.notEqual(member.revocationToken, member.token);
+    let access = f.access;
+    let removed = false;
+    for (const action of order) {
+      if (action === "logout") {
+        const result = await access.logout(bearer(member.token), {
+          report: true,
+        });
+        assert.equal(result.ok, true);
+        if (removed && access.isAccessRevoked(bearer(member.token)))
+          assert.equal(result.accessRevoked, true);
+        if (result.revocationToken) {
+          assert.equal(
+            await access.authenticate(bearer(result.revocationToken)),
+            null,
+          );
+          assert.deepEqual(access.accountStatus(result.revocationToken), {
+            accessRevoked: false,
+          });
+        }
+        assert.equal(await access.authenticate(bearer(member.token)), null);
+      } else if (action === "delete") {
+        await access.deleteAccount(member.account.id);
+        removed = true;
+      } else if (action === "restart") {
+        await access.close();
+        access = await f.boot();
+      } else if (action === "expire-session") f.advance(lifetime + 1);
+      else {
+        const replacement = await access.createAccount({
+          email: member.account.email,
+        });
+        assert.notEqual(replacement.id, member.account.id);
+      }
+      assert.deepEqual(access.accountStatus(member.revocationToken), {
+        accessRevoked: removed,
+      });
+      assert.deepEqual(access.accountStatus(other.revocationToken), {
+        accessRevoked: false,
+      });
+      assert.equal(
+        await access.authenticate(bearer(member.revocationToken)),
+        null,
+      );
+      assert.deepEqual(
+        access.accountStatus(member.token),
+        { accessRevoked: false },
+        "a session credential is not a membership-status proof",
+      );
+    }
+  });
+
+test("signed-out proof preserves zero-server membership through revoke grants, reinvite, cancel, acceptance and account replacement", async (t) => {
+  const f = await fixture(t);
+  const member = await f.enroll();
+  await f.access.logout(bearer(member.token));
+  for (const serverId of ["a", "b"])
+    await f.access.grantServer(serverId, member.account.id, {
+      permissions: ["server.view"],
+    });
+  for (const serverId of ["a", "b"]) {
+    await f.access.revoke(serverId, member.account.id);
+    assert.deepEqual(f.access.accountStatus(member.revocationToken), {
+      accessRevoked: false,
+    });
+  }
+  const invitation = await f.access.inviteAccount(member.account.id);
+  const before = await f.read();
+  for (let attempt = 0; attempt < 3; attempt++)
+    await f.access.previewInvitation(invitationToken(invitation));
+  assert.deepEqual(
+    await f.read(),
+    before,
+    "repeated preview/cancel never activates or consumes an invitation",
+  );
+  assert.deepEqual(f.access.accountStatus(member.revocationToken), {
+    accessRevoked: false,
+  });
+  const accepted = await f.access.accept(invitationToken(invitation), password);
+  assert.deepEqual(f.access.accountStatus(accepted.revocationToken), {
+    accessRevoked: false,
+  });
+  await f.access.deleteAccount(member.account.id);
+  const replacement = await f.enroll();
+  assert.notEqual(replacement.account.id, member.account.id);
+  for (const token of [member.revocationToken, accepted.revocationToken])
+    assert.deepEqual(f.access.accountStatus(token), { accessRevoked: true });
+  assert.deepEqual(f.access.accountStatus(replacement.revocationToken), {
+    accessRevoked: false,
+  });
+});
+
+test("membership status proofs expire, remain panel-scoped, are hashed, and never authorize account removal", async (t) => {
+  const f = await fixture(t);
+  const second = await fixture(t);
+  const member = await f.enroll();
+  assert.deepEqual(second.access.accountStatus(member.revocationToken), {
+    accessRevoked: false,
+  });
+  await assert.rejects(
+    f.access.leave(bearer(member.revocationToken), {
+      confirmed: true,
+      requestId: randomUUID(),
+    }),
+    { status: 401 },
+  );
+  const proofs = (await f.read()).revocationProofs;
+  assert.equal(proofs.length, 1);
+  assert.deepEqual(proofs[0], {
+    hash: hash(member.revocationToken),
+    accountId: member.account.id,
+    expiresAt: f.now() + proofLifetime,
+  });
+  assert.ok(!JSON.stringify(proofs).includes(member.revocationToken));
+  await f.access.deleteAccount(member.account.id);
+  f.advance(proofLifetime);
+  assert.deepEqual(f.access.accountStatus(member.revocationToken), {
+    accessRevoked: false,
+  });
+  await f.access.close();
+  const restarted = await f.boot();
+  assert.deepEqual(restarted.accountStatus(member.revocationToken), {
+    accessRevoked: false,
+  });
+  assert.deepEqual((await f.read()).revocationProofs, []);
+  for (const token of [null, "short", {}, member.account.email])
+    assert.throws(() => restarted.accountStatus(token), { status: 400 });
+});
+
+test("membership proof storage is bounded and rejects malformed persistent capabilities", async (t) => {
+  const f = await fixture(t);
+  const member = await f.enroll();
+  await f.access.close();
+  const original = await f.read();
+  const proof = original.revocationProofs[0];
+  for (const revocationProofs of [
+    null,
+    {},
+    [null],
+    [{ ...proof, accountId: "" }],
+    [{ ...proof, token: member.revocationToken }],
+    [{ ...proof, expiresAt: "later" }],
+    [proof, proof],
+    Array(4097).fill(proof),
+  ]) {
+    await f.write({ ...original, revocationProofs });
+    await assert.rejects(f.boot(), { status: 500 });
+  }
+  await f.write({
+    ...original,
+    revocationProofs: Array.from({ length: 4096 }, (_, index) => ({
+      hash: hash(`watch-${index}`),
+      accountId: member.account.id,
+      expiresAt: f.now() + 1000 + index,
+    })),
+  });
+  const restarted = await f.boot();
+  const signed = await restarted.login({
+    email: member.account.email,
+    password,
+  });
+  const saved = await f.read();
+  assert.equal(saved.revocationProofs.length, 4096);
+  assert.ok(
+    saved.revocationProofs.some(
+      (item) => item.hash === hash(signed.revocationToken),
+    ),
+  );
+  assert.ok(
+    !saved.revocationProofs.some((item) => item.hash === hash("watch-0")),
+  );
+});
 
 test("account deletion records only matching bearer proofs and survives a restart", async (t) => {
   const f = await fixture(t);
@@ -313,11 +499,25 @@ test("gateway distinguishes proven removal from generic guest, logout, expiry, c
         listener.close(resolve);
       }),
   );
-  const request = (route, headers = {}) =>
+  const request = (route, headers = {}, body) =>
     new Promise((resolve, reject) => {
+      const data = body === undefined ? undefined : JSON.stringify(body);
       const outgoing = http.request(
         `http://127.0.0.1:${listener.address().port}${route}`,
-        { headers: { Host: "panel.example.test", ...headers } },
+        {
+          method: data === undefined ? "GET" : "POST",
+          headers: {
+            Host: "panel.example.test",
+            ...(data
+              ? {
+                  Origin: "https://panel.example.test",
+                  "Content-Type": "application/json",
+                  "Content-Length": Buffer.byteLength(data),
+                }
+              : {}),
+            ...headers,
+          },
+        },
         (response) => {
           let body = "";
           response.setEncoding("utf8");
@@ -330,9 +530,51 @@ test("gateway distinguishes proven removal from generic guest, logout, expiry, c
         },
       );
       outgoing.on("error", reject);
-      outgoing.end();
+      outgoing.end(data);
     });
   const authenticated = bearer(member.token).headers;
+  assert.deepEqual(
+    await request("/api/access/status", {}, { token: member.revocationToken }),
+    { status: 200, body: { accessRevoked: false } },
+  );
+  const upgrading = await f.enroll("upgrade@example.test");
+  const logout = await request(
+    "/api/access/logout",
+    bearer(upgrading.token).headers,
+    {},
+  );
+  assert.equal(logout.status, 200);
+  assert.equal(logout.body.ok, true);
+  assert.match(logout.body.revocationToken, /^[\w-]{43}$/);
+  assert.equal(
+    (await request("/api/servers", bearer(upgrading.token).headers)).status,
+    401,
+  );
+  await f.access.deleteAccount(upgrading.account.id);
+  assert.deepEqual(
+    (
+      await request(
+        "/api/access/status",
+        {},
+        { token: logout.body.revocationToken },
+      )
+    ).body,
+    { accessRevoked: true },
+  );
+  assert.equal(
+    (
+      await request(
+        "/api/access/status",
+        { Origin: "https://unapproved.example" },
+        { token: member.revocationToken },
+      )
+    ).status,
+    403,
+  );
+  assert.equal(
+    (await request("/api/access/status", {}, { token: "invalid" })).status,
+    400,
+  );
   assert.equal(
     (await request("/api/access/session", authenticated)).body.role,
     "subuser",
@@ -343,6 +585,38 @@ test("gateway distinguishes proven removal from generic guest, logout, expiry, c
     "a zero-server account is still valid",
   );
   await f.access.deleteAccount(member.account.id);
+  assert.deepEqual(
+    await request("/api/access/status", {}, { token: member.revocationToken }),
+    { status: 200, body: { accessRevoked: true } },
+  );
+  assert.deepEqual(
+    (await request("/api/access/logout", authenticated, {})).body,
+    { ok: true, accessRevoked: true },
+  );
+  assert.deepEqual(
+    (
+      await request(
+        "/api/access/session",
+        bearer(member.revocationToken).headers,
+      )
+    ).body,
+    { role: "guest" },
+  );
+  assert.equal(
+    (await request("/api/servers", bearer(member.revocationToken).headers))
+      .status,
+    401,
+  );
+  assert.deepEqual(
+    (
+      await request(
+        "/api/access/status",
+        { Origin: "https://workspace.example", "X-MC-Panel-Client": "browser" },
+        { token: member.revocationToken },
+      )
+    ).body,
+    { accessRevoked: true },
+  );
   assert.deepEqual(await request("/api/access/session", authenticated), {
     status: 200,
     body: { role: "guest", accessRevoked: true },

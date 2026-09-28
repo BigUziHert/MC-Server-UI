@@ -76,13 +76,8 @@ async function openSignIn(page: Page) {
     exact: true,
   });
   if (await saved.isVisible()) await saved.click();
-  else {
-    await dialog
-      .getByRole("button", { name: "Close panel connections", exact: true })
-      .click();
-    await page.getByRole("button", { name: /^Account menu for/ }).click();
-    await page.getByRole("menuitem", { name: "Sign in", exact: true }).click();
-  }
+  else
+    await dialog.getByRole("button", { name: "Sign in", exact: true }).click();
   await expect(page.getByLabel("Panel address", { exact: true })).toHaveValue(
     new URL(page.url()).origin,
   );

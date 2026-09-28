@@ -1217,6 +1217,9 @@ test("the account menu and connection dialog support Escape and restore keyboard
   ).toBeVisible();
   await expect(
     page.getByRole("menuitem", { name: "Sign in", exact: true }),
+  ).toHaveCount(0);
+  await expect(
+    page.getByRole("menuitem", { name: "Manage Connections", exact: true }),
   ).toBeVisible();
   await page.keyboard.press("Escape");
   await expect(page.getByRole("menuitem")).toHaveCount(0);
@@ -1242,6 +1245,32 @@ test("the account menu and connection dialog support Escape and restore keyboard
   await expect(dialog).toHaveCount(0);
   await expect(account).toBeFocused();
   await expect(page).toHaveURL(/\/#console$/);
+
+  await account.press("Enter");
+  await page
+    .getByRole("menuitem", { name: "Manage Connections", exact: true })
+    .click();
+  const manager = page.getByRole("dialog", {
+    name: "Manage Connections",
+    exact: true,
+  });
+  const signInEntry = manager.getByRole("button", {
+    name: "Sign in",
+    exact: true,
+  });
+  await signInEntry.focus();
+  await signInEntry.press("Enter");
+  const signInDialog = page.getByRole("dialog", {
+    name: "Sign in",
+    exact: true,
+  });
+  await expect(manager).not.toBeVisible();
+  await expect(
+    signInDialog.getByLabel("Panel address", { exact: true }),
+  ).toBeFocused();
+  await page.keyboard.press("Escape");
+  await expect(signInDialog).not.toBeVisible();
+  await expect(account).toBeFocused();
 });
 
 test("a fresh workspace can connect without creating or importing a local server", async ({
@@ -2462,10 +2491,15 @@ for (const invitation of [false, true]) {
       .click();
     await page
       .getByRole("menuitem", {
-        name: invitation ? "Accept invitation" : "Sign in",
+        name: invitation ? "Accept invitation" : "Manage Connections",
         exact: true,
       })
       .click();
+    if (!invitation)
+      await page
+        .getByRole("dialog", { name: "Manage Connections", exact: true })
+        .getByRole("button", { name: "Sign in", exact: true })
+        .click();
     const dialog = page.getByRole("dialog", {
       name: invitation ? "Accept invitation" : "Sign in",
       exact: true,

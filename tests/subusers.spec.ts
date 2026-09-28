@@ -773,22 +773,23 @@ test("resetting activated access explains immediate sign-out and can be cancelle
   expect(resets).toBe(1);
 });
 
-test("direct remote setup detects the public IP on request, supports a proxy, and surfaces listener failures", async ({
+test("trusted remote setup detects the public IP on request and surfaces listener failures while retaining edits", async ({
   page,
   server,
 }, testInfo) => {
   const changes: Record<string, unknown>[] = [];
-  const configured = {
+  let configured = {
     enabled: true,
-    publicUrl: "https://203.0.113.10:3002",
-    transport: "direct",
+    publicUrl: "https://203.0.113.10",
+    transport: "managed",
     port: 3002,
     ready: true,
     listening: true,
-    certificate: {
-      fingerprint256: "AA:BB:CC:DD:EE:FF",
-      validTo: "2028-01-01T00:00:00Z",
-      hosts: ["203.0.113.10"],
+    error: "",
+    managedHttps: {
+      state: "ready",
+      ready: true,
+      message: "Trusted certificate is ready.",
     },
   };
   let discoveries = 0;
@@ -804,27 +805,26 @@ test("direct remote setup detects the public IP on request, supports a proxy, an
   });
   await page.route("**/api/access/settings", async (route) => {
     if (route.request().method() === "GET")
-      return route.fulfill({
-        json: {
-          ...configured,
-          ...(changes.length === 3
-            ? {
-                enabled: false,
-                ready: false,
-                listening: false,
-                error: "Remote access port is already in use.",
-              }
-            : {}),
-        },
-      });
+      return route.fulfill({ json: configured });
     const body = route.request().postDataJSON();
     changes.push(body);
-    if (changes.length === 3)
-      return route.fulfill({
-        status: 409,
-        json: { error: "Remote access port is already in use." },
-      });
-    return route.fulfill({ json: { ...configured, ...body } });
+    if (changes.length === 2) {
+      configured = {
+        ...configured,
+        enabled: false,
+        ready: false,
+        listening: false,
+        error: "Internal service port is already in use.",
+        managedHttps: {
+          state: "error",
+          ready: false,
+          message: "Internal service port is already in use.",
+        },
+      };
+      return route.fulfill({ status: 409, json: { error: configured.error } });
+    }
+    configured = { ...configured, ...body };
+    return route.fulfill({ json: configured });
   });
   await openSubusers(page, server.id);
   await openPanelUsers(page);
@@ -834,26 +834,19 @@ test("direct remote setup detects the public IP on request, supports a proxy, an
     exact: true,
   });
   expect(discoveries).toBe(0);
+  await expect(setup.getByRole("combobox")).toHaveCount(0);
   await expect(
     setup.getByLabel("Certificate SHA-256 fingerprint", { exact: true }),
-  ).toHaveValue(configured.certificate.fingerprint256);
-  await expect(setup.getByText("Sending address", { exact: true })).toHaveCount(
-    0,
-  );
-  await expect(setup.getByText("Resend API key", { exact: true })).toHaveCount(
-    0,
-  );
-  await setup.getByLabel("Remote access port", { exact: true }).fill("3004");
+  ).toHaveCount(0);
+  await setup.getByText("Advanced connection options", { exact: true }).click();
+  await setup.getByLabel("Internal service port", { exact: true }).fill("3004");
   await setup
     .getByRole("button", { name: "Use my public IP", exact: true })
     .click();
   await expect(
     setup.getByLabel("Public panel address", { exact: true }),
-  ).toHaveValue("https://203.0.113.20:3004");
-  await expect(setup).not.toContainText("192.168.1.5");
-  await expect(setup).not.toContainText("mobile data");
-  await expect(setup).not.toContainText("Forward only the remote access port");
-  await expect(setup).toContainText("Compare the certificate below.");
+  ).toHaveValue("https://203.0.113.20");
+  await expect(setup).toContainText("Forward TCP port 443");
   await expect(setup).toContainText(
     "These settings do not open router or firewall ports",
   );
@@ -864,8 +857,8 @@ test("direct remote setup detects the public IP on request, supports a proxy, an
   await expect.poll(() => changes.length).toBe(1);
   expect(changes[0]).toEqual({
     enabled: true,
-    publicUrl: "https://203.0.113.20:3004",
-    transport: "direct",
+    publicUrl: "https://203.0.113.20",
+    transport: "managed",
     port: 3004,
   });
   await expect(
@@ -875,37 +868,29 @@ test("direct remote setup detects the public IP on request, supports a proxy, an
     path: testInfo.outputPath("subusers-access-setup-desktop.png"),
     fullPage: true,
   });
-  await setup.getByLabel("HTTPS setup", { exact: true }).selectOption("proxy");
-  await expect(setup).toContainText("http://127.0.0.1:3004");
+  await setup.getByLabel("Internal service port", { exact: true }).fill("80");
+  await setup
+    .getByRole("button", { name: "Save access settings", exact: true })
+    .click();
+  expect(changes).toHaveLength(1);
+  await setup.getByLabel("Internal service port", { exact: true }).fill("3003");
   await setup
     .getByLabel("Public panel address", { exact: true })
-    .fill("https://panel.example.test");
+    .fill("https://203.0.113.30");
   await setup
     .getByRole("button", { name: "Save access settings", exact: true })
     .click();
   await expect.poll(() => changes.length).toBe(2);
-  expect(changes[1].transport).toBe("proxy");
-  await setup.getByLabel("HTTPS setup", { exact: true }).selectOption("direct");
-  await setup.getByLabel("Remote access port", { exact: true }).fill("80");
-  await setup
-    .getByRole("button", { name: "Save access settings", exact: true })
-    .click();
-  expect(changes).toHaveLength(2);
-  await setup.getByLabel("Remote access port", { exact: true }).fill("3003");
-  await setup
-    .getByLabel("Public panel address", { exact: true })
-    .fill("https://203.0.113.20:3003");
-  await setup
-    .getByRole("button", { name: "Save access settings", exact: true })
-    .click();
-  await expect.poll(() => changes.length).toBe(3);
   await expect(setup.getByRole("alert")).toContainText(
-    "Remote access port is already in use.",
+    "Internal service port is already in use.",
   );
   await expect(
     setup.getByRole("heading", { name: "Remote access", exact: true }),
   ).toBeVisible();
   await expect(
-    setup.getByLabel("Remote access port", { exact: true }),
+    setup.getByLabel("Internal service port", { exact: true }),
   ).toHaveValue("3003");
+  await expect(
+    setup.getByLabel("Public panel address", { exact: true }),
+  ).toHaveValue("https://203.0.113.30");
 });

@@ -99,7 +99,6 @@
   font-size: 12px;
 }
 .subusers-setup-field input,
-.subusers-setup-field select,
 .subusers-setup-field textarea {
   min-width: 0;
   width: 100%;
@@ -124,9 +123,6 @@
   margin-top: 21px;
   color: var(--muted);
   font-size: 12px;
-}
-.subusers-transport {
-  margin-top: 18px;
 }
 .subusers-https-status {
   margin: 0 20px 20px;
@@ -159,9 +155,6 @@
 .subusers-advanced summary {
   cursor: pointer;
   margin-bottom: 10px;
-}
-.subusers-certificate {
-  margin: 0 0 20px;
 }
 .subusers-setup-guidance strong {
   color: var(--text);
