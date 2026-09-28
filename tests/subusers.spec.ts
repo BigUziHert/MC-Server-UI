@@ -129,6 +129,263 @@ async function readyRemoteAccess(page: Page) {
     }),
   );
 }
+
+for (const view of ["accounts", "server"] as const) {
+  test(`the open owner ${view} list removes externally revoked access without a reload`, async ({
+    page,
+    request,
+    server,
+  }) => {
+    const departed = await createAccount(
+      request,
+      `departed-${view}@example.test`,
+    );
+    const remaining = await createAccount(
+      request,
+      `remaining-${view}@example.test`,
+    );
+    for (const account of [departed, remaining]) {
+      const granted = await request.post("/api/subusers", {
+        headers: { "X-Server-Id": server.id },
+        data: {
+          accountId: account.id,
+          permissions: ["server.view", "control.start"],
+        },
+      });
+      expect(granted.status()).toBe(201);
+    }
+    await openSubusers(page, server.id);
+    if (view === "accounts") await openPanelUsers(page);
+    const list = page.locator(
+      view === "accounts" ? ".panel-users" : ".subusers-page:not(.panel-users)",
+    );
+    await expect(
+      list.getByRole("row").filter({ hasText: departed.email }),
+    ).toBeVisible();
+    // A remote Forget updates the same host records; this separate client does
+    // not send any window event or click the owner's Refresh button.
+    expect((await request.delete(`/api/panel-users/${departed.id}`)).ok()).toBe(
+      true,
+    );
+    await expect(
+      list.getByRole("row").filter({ hasText: departed.email }),
+    ).toHaveCount(0);
+    await expect(
+      list.getByRole("row").filter({ hasText: remaining.email }),
+    ).toBeVisible();
+    expect(
+      (await serverUsers(request, server.id)).map((user) => user.id),
+    ).toEqual([remaining.id]);
+  });
+}
+
+for (const action of [
+  "grant",
+  "edit",
+  "remove",
+  "reset",
+  "invitation",
+] as const) {
+  test(`a host removal closes a stale ${action} dialog while ordinary refresh preserves its input`, async ({
+    page,
+    request,
+    server,
+  }) => {
+    const account = await createAccount(
+      request,
+      `stale-${action}@example.test`,
+    );
+    const panelAction = action === "reset" || action === "invitation";
+    await readyRemoteAccess(page);
+    if (action === "reset") {
+      await page.route("**/api/panel-users", async (route) => {
+        const response = await route.fetch();
+        const body = await response.json();
+        return route.fulfill({
+          response,
+          json: {
+            ...body,
+            users: body.users.map((user: { id: string }) =>
+              user.id === account.id
+                ? { ...user, inviteStatus: "accepted" }
+                : user,
+            ),
+          },
+        });
+      });
+    }
+    if (action === "invitation") {
+      await page.route(`**/api/panel-users/${account.id}/invite`, (route) =>
+        route.fulfill({
+          json: {
+            user: { ...account, inviteStatus: "pending" },
+            invitationUrl: "https://example.test/#invite=fixture-private-link",
+            inviteExpiresAt: new Date(Date.now() + 86_400_000).toISOString(),
+          },
+        }),
+      );
+    }
+    if (action === "edit" || action === "remove") {
+      const granted = await request.post("/api/subusers", {
+        headers: { "X-Server-Id": server.id },
+        data: { accountId: account.id, permissions: ["server.view"] },
+      });
+      expect(granted.status()).toBe(201);
+    }
+    await openSubusers(page, server.id);
+    if (panelAction) await openPanelUsers(page);
+    await page
+      .getByRole("button", {
+        name:
+          action === "grant"
+            ? "Grant server access"
+            : action === "edit"
+              ? `Edit permissions for ${account.email}`
+              : action === "remove"
+                ? `Remove access record for ${account.email}`
+                : action === "reset"
+                  ? `Reset access for ${account.email}`
+                  : `Create invite link for ${account.email}`,
+        exact: true,
+      })
+      .click();
+    const dialog = page.getByRole("dialog", {
+      name:
+        action === "grant"
+          ? "Grant server access"
+          : action === "edit"
+            ? "Edit subuser permissions"
+            : action === "remove"
+              ? "Remove access record?"
+              : action === "reset"
+                ? "Reset subuser access?"
+                : "Share invitation link",
+      exact: true,
+    });
+    await expect(dialog).toBeVisible();
+    if (action === "grant") {
+      await dialog
+        .getByLabel("Panel account", { exact: true })
+        .selectOption(account.id);
+      await dialog
+        .getByRole("button", { name: "Use Viewer preset", exact: true })
+        .click();
+    }
+    if (action === "edit") {
+      await showPermissionDetails(dialog);
+      await dialog
+        .getByRole("checkbox", { name: "Start", exact: true })
+        .check();
+    }
+    const refreshed = page.waitForResponse(
+      (response) =>
+        new URL(response.url()).pathname ===
+          (panelAction ? "/api/panel-users" : "/api/subusers") &&
+        response.request().method() === "GET",
+    );
+    await page.evaluate(() => window.dispatchEvent(new Event("focus")));
+    await refreshed;
+    await expect(dialog).toBeVisible();
+    if (action === "grant")
+      await expect(
+        dialog.getByLabel("Panel account", { exact: true }),
+      ).toHaveValue(account.id);
+    if (action === "edit")
+      await expect(
+        dialog.getByRole("checkbox", { name: "Start", exact: true }),
+      ).toBeChecked();
+
+    expect((await request.delete(`/api/panel-users/${account.id}`)).ok()).toBe(
+      true,
+    );
+    await page.evaluate(() => window.dispatchEvent(new Event("focus")));
+    await expect(dialog).not.toBeVisible();
+    await expect(
+      page
+        .getByRole("status")
+        .filter({ hasText: "This access record was removed on the host" }),
+    ).toBeVisible();
+    expect((await users(request)).some((user) => user.id === account.id)).toBe(
+      false,
+    );
+    expect(await serverUsers(request, server.id)).toEqual([]);
+  });
+}
+
+test("a new invitation remains usable when its follow-up account refresh fails", async ({
+  page,
+  request,
+  server,
+}) => {
+  let created: { id: string; email: string } | undefined;
+  let failReads = false;
+  let failedReads = 0;
+  await readyRemoteAccess(page);
+  await page.route("**/api/panel-users", async (route) => {
+    if (route.request().method() === "GET" && failReads) {
+      failedReads++;
+      return route.fulfill({
+        status: 503,
+        json: { error: "Fixture refresh unavailable." },
+      });
+    }
+    const response = await route.fetch();
+    if (route.request().method() === "POST") {
+      const result = await response.json();
+      created = result.user ?? result;
+      failReads = true;
+    }
+    return route.fulfill({ response });
+  });
+  await page.route("**/api/panel-users/*/invite", (route) =>
+    route.fulfill({
+      json: {
+        user: { ...created, inviteStatus: "pending" },
+        invitationUrl:
+          "https://example.test/#invite=created-before-read-failure",
+        inviteExpiresAt: new Date(Date.now() + 86_400_000).toISOString(),
+      },
+    }),
+  );
+  await openSubusers(page, server.id);
+  await openPanelUsers(page);
+  await page
+    .getByRole("button", { name: "Invite person", exact: true })
+    .click();
+  const editor = page.getByRole("dialog", {
+    name: "Invite person",
+    exact: true,
+  });
+  await editor
+    .getByLabel("Email address", { exact: true })
+    .fill("refresh-failed@example.test");
+  await editor
+    .getByRole("button", { name: "Create account", exact: true })
+    .click();
+  await expect.poll(() => failedReads).toBeGreaterThan(0);
+  const invitation = page.getByRole("dialog", {
+    name: "Share invitation link",
+    exact: true,
+  });
+  await expect(invitation).toBeVisible();
+  await expect(
+    invitation.getByLabel("Invitation link", { exact: true }),
+  ).toHaveValue("https://example.test/#invite=created-before-read-failure");
+  expect((await users(request)).some((user) => user.id === created?.id)).toBe(
+    true,
+  );
+  expect(await serverUsers(request, server.id)).toEqual([]);
+  // A subsequent confirmed read preserves the same invitation, too.
+  failReads = false;
+  const recovered = page.waitForResponse(
+    (response) =>
+      new URL(response.url()).pathname === "/api/panel-users" && response.ok(),
+  );
+  await page.evaluate(() => window.dispatchEvent(new Event("focus")));
+  await recovered;
+  await expect(invitation).toBeVisible();
+});
+
 test("an account invite grants no server access, and grant/edit/revoke affect only the current server", async ({
   page,
   request,

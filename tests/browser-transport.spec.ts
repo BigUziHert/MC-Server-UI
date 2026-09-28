@@ -247,6 +247,109 @@ test("browser workspace connects to independent HTTPS panels with isolated files
       false,
     );
 
+    // Forget must revoke the host account, not just hide this browser's saved
+    // address. Another signed-in device loses access while panel C stays usable.
+    const otherDevice = await a.fleet.access.login({
+      email: a.email,
+      password,
+    });
+    await accountMenu(page);
+    await page
+      .getByRole("menuitem", { name: "Manage Connections", exact: true })
+      .click();
+    const forgetDialog = page.getByRole("dialog", {
+      name: "Manage Connections",
+      exact: true,
+    });
+    await forgetDialog
+      .getByRole("button", { name: `Forget ${a.label}`, exact: true })
+      .click();
+    await expect(forgetDialog).toContainText("access to every shared server");
+    await forgetDialog
+      .getByRole("button", { name: "Cancel", exact: true })
+      .click();
+    expect(a.fleet.access.account(a.account.id)).not.toBeNull();
+    expect(
+      a.fleet.access.userForServer(sharedServerId, a.account.id),
+    ).not.toBeNull();
+    expect(
+      a.received.some((request) => request.path === "/api/access/leave"),
+    ).toBe(false);
+    await forgetDialog
+      .getByRole("button", { name: `Forget ${a.label}`, exact: true })
+      .click();
+    await forgetDialog
+      .getByRole("button", { name: "Forget connection", exact: true })
+      .click();
+    await expect(forgetDialog.getByText(a.label, { exact: true })).toHaveCount(
+      0,
+    );
+    expect(a.fleet.access.account(a.account.id)).toBeNull();
+    expect(
+      a.fleet.access.userForServer(sharedServerId, a.account.id),
+    ).toBeNull();
+    expect(a.fleet.access.listAccounts()).toEqual([]);
+    const oldDeviceSession = await context.request.get(
+      `${a.origin}/api/access/session`,
+      {
+        headers: { Authorization: `Bearer ${otherDevice.token}` },
+      },
+    );
+    expect(await oldDeviceSession.json()).toMatchObject({
+      role: "guest",
+      accessRevoked: true,
+    });
+    const oldPassword = await context.request.post(
+      `${a.origin}/api/access/login`,
+      {
+        headers: { Origin: a.origin },
+        data: { email: a.email, password },
+      },
+    );
+    expect(oldPassword.status()).toBe(401);
+    expect(a.fleet.runtimes.size).toBe(1);
+    expect(
+      await fs.readFile(path.join(a.directory, "private.txt"), "utf8"),
+    ).toBe("a private bytes");
+    await expect(
+      forgetDialog.getByRole("button", {
+        name: `Sign out of ${c.label}`,
+        exact: true,
+      }),
+    ).toBeVisible();
+    await forgetDialog
+      .getByRole("button", { name: "Close panel connections", exact: true })
+      .click();
+    await select(c.label);
+    await page.getByRole("link", { name: "File Manager", exact: true }).click();
+    await expect(
+      page.getByRole("button", { name: "Download private.txt", exact: true }),
+    ).toBeVisible();
+    await page.reload();
+    await expect(page.getByText(a.label, { exact: true })).toHaveCount(0);
+    await expect(
+      page.getByRole("button", {
+        name: `Select server Shared name on ${c.label}`,
+        exact: true,
+      }),
+    ).toBeVisible();
+
+    // Only a new owner-issued account and invitation restore access after Forget.
+    a.account = await a.fleet.access.createAccount({ email: a.email });
+    await a.fleet.access.grantServer(sharedServerId, a.account.id, {
+      permissions: [
+        "server.view",
+        "file.read",
+        "file.read-content",
+        "file.create",
+        "file.update",
+      ],
+    });
+    a.invitation = (
+      await a.fleet.access.inviteAccount(a.account.id)
+    ).invitationUrl;
+    await addPanel(a.invitation);
+
     // Saved browser connections survive reload and a new browser context.
     const storageState = await context.storageState();
     await context.close();

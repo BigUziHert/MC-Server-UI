@@ -23,6 +23,33 @@ const stop = async (listener) => {
   listener.closeAllConnections();
   await new Promise((resolve) => listener.close(resolve));
 };
+const remoteRequest = (host, route, options = {}) =>
+  new Promise((resolve, reject) => {
+    const headers = new Headers(options.headers);
+    headers.set("Host", new URL(host.origin).host);
+    headers.set("Origin", host.origin);
+    const request = http.request(
+      `http://127.0.0.1:${host.remote.address().port}${route}`,
+      {
+        method: options.method,
+        headers: Object.fromEntries(headers),
+        signal: options.signal,
+      },
+      (response) =>
+        resolve(
+          new Response(Readable.toWeb(response), {
+            status: response.statusCode,
+            headers: Object.fromEntries(
+              Object.entries(response.headers).filter(
+                ([, value]) => typeof value === "string",
+              ),
+            ),
+          }),
+        ),
+    );
+    request.on("error", reject);
+    request.end(options.body);
+  });
 
 // These are real independent host APIs and stores. Only HTTPS transport is
 // adapted to loopback HTTP; unified-panels.smoke verifies Electron's real TLS.
@@ -399,6 +426,32 @@ test("unified bridge preserves real host permissions and filesystem isolation ac
     ).status,
     201,
   );
+  const secondDeviceSignIn = await remoteRequest(
+    a,
+    "/api/access/login",
+    json("POST", {
+      email: "a@example.test",
+      password: "Correct-fixture-password!",
+    }),
+  );
+  assert.equal(secondDeviceSignIn.status, 200);
+  const secondDevice = await secondDeviceSignIn.json();
+  const secondDeviceHeaders = {
+    Authorization: `Bearer ${secondDevice.sessionToken}`,
+  };
+  for (const id of [serverId, created.server.id]) {
+    const grants = await (await a.local(`/subusers?serverId=${id}`)).json();
+    assert.ok(grants.users.some((user) => user.email === "a@example.test"));
+  }
+  assert.equal(
+    (
+      await remoteRequest(a, "/api/servers", {
+        headers: secondDeviceHeaders,
+      })
+    ).status,
+    200,
+  );
+  await controller.selectServer(c.panelId, serverId);
   await controller.forget(
     a.panelId,
     snapshot(a).session.accountId ?? snapshot(a).session.userId,
@@ -415,7 +468,47 @@ test("unified bridge preserves real host permissions and filesystem isolation ac
     ),
     true,
   );
+  for (const id of [serverId, created.server.id]) {
+    const grants = await (await a.local(`/subusers?serverId=${id}`)).json();
+    assert.equal(
+      grants.users.some((user) => user.email === "a@example.test"),
+      false,
+      "Forgetting removes host grants from every shared server",
+    );
+  }
+  const endedSession = await remoteRequest(a, "/api/access/session", {
+    headers: secondDeviceHeaders,
+  });
+  assert.deepEqual(await endedSession.json(), {
+    role: "guest",
+    accessRevoked: true,
+  });
+  for (const route of ["/api/servers", "/api/server-setup/directories"]) {
+    const revoked = await remoteRequest(a, route, {
+      headers: secondDeviceHeaders,
+    });
+    assert.equal(revoked.status, 401);
+    assert.equal((await revoked.json()).accessRevoked, true);
+  }
+  assert.equal(
+    (
+      await remoteRequest(
+        a,
+        "/api/access/login",
+        json("POST", {
+          email: "a@example.test",
+          password: "Correct-fixture-password!",
+        }),
+      )
+    ).status,
+    401,
+    "The forgotten account cannot sign in again without a new invitation",
+  );
   assert.equal(snapshot(c).signedIn, true);
+  assert.deepEqual(controller.list().selectedServer, {
+    panelId: c.panelId,
+    serverId,
+  });
   assert.equal((await through(c, "/server")).status, 200);
   assert.equal(
     a.fleet.runtimes.size,

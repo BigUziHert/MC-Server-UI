@@ -864,64 +864,135 @@ function AccessManagement({
     return () =>
       window.removeEventListener("mc-panel-access-settings-changed", update);
   }, [accountsView]);
-  const refresh = useCallback(async () => {
-    request.current?.abort();
-    if (!canRead) {
-      setLoading(false);
-      return false;
-    }
-    const controller = new AbortController();
-    request.current = controller;
-    if (!loaded.current) setLoading(true);
-    setError("");
-    try {
-      const [result, panelResult, settings] = await Promise.all([
-        api<{ users: Subuser[] }>(basePath, { signal: controller.signal }),
-        !remote && !accountsView
-          ? panelApi<{ users: Subuser[] }>("/panel-users", {
-              signal: controller.signal,
-            })
-          : Promise.resolve(null),
-        accountsView
-          ? panelApi<AccessSettings>("/access/settings", {
-              signal: controller.signal,
-            }).catch(() => null)
-          : Promise.resolve(null),
-      ]);
-      if (controller.signal.aborted) return false;
-      setUsers(result.users);
-      setAccounts(panelResult?.users ?? (accountsView ? result.users : []));
-      setAccessSettings(settings);
-      loaded.current = true;
-      return true;
-    } catch (cause) {
-      if (!controller.signal.aborted)
-        setError(
-          cause instanceof Error ? cause.message : "Unable to load subusers.",
-        );
-      return false;
-    } finally {
-      if (!controller.signal.aborted) setLoading(false);
-    }
-  }, [api, canRead, basePath, remote, accountsView]);
+  const refresh = useCallback(
+    async (background = false) => {
+      // A slow read must be allowed to finish. Periodic refreshes must not keep
+      // aborting it, or clear the last refresh failure while the host is down.
+      if (background && request.current) return false;
+      request.current?.abort();
+      if (!canRead) {
+        setLoading(false);
+        return false;
+      }
+      const controller = new AbortController();
+      request.current = controller;
+      if (!loaded.current) setLoading(true);
+      if (!background) setError("");
+      try {
+        const [result, panelResult, settings] = await Promise.all([
+          api<{ users: Subuser[] }>(basePath, { signal: controller.signal }),
+          !remote && !accountsView
+            ? panelApi<{ users: Subuser[] }>("/panel-users", {
+                signal: controller.signal,
+              })
+            : Promise.resolve(null),
+          accountsView
+            ? panelApi<AccessSettings>("/access/settings", {
+                signal: controller.signal,
+              }).catch(() => null)
+            : Promise.resolve(null),
+        ]);
+        if (controller.signal.aborted) return false;
+        setUsers(result.users);
+        setAccounts(panelResult?.users ?? (accountsView ? result.users : []));
+        setAccessSettings(settings);
+        setError("");
+        loaded.current = true;
+        return true;
+      } catch (cause) {
+        if (!controller.signal.aborted)
+          setError(
+            cause instanceof Error ? cause.message : "Unable to load subusers.",
+          );
+        return false;
+      } finally {
+        if (!controller.signal.aborted) setLoading(false);
+        if (request.current === controller) request.current = null;
+      }
+    },
+    [api, panelApi, canRead, basePath, remote, accountsView],
+  );
   useEffect(() => {
-    if (accountsView || remote) return;
+    if (remote) return;
     const update = () => void refresh();
     window.addEventListener("mc-panel-accounts-changed", update);
     return () =>
       window.removeEventListener("mc-panel-accounts-changed", update);
-  }, [accountsView, remote, refresh]);
+  }, [remote, refresh]);
   useEffect(() => {
     loaded.current = false;
     setUsers([]);
     setAccounts([]);
     setSearch("");
     setPage(1);
+    setEditor(null);
+    setAccountId("");
     setDeleting(null);
     setResetting(null);
+    setInvitation(null);
     void refresh();
     return () => request.current?.abort();
   }, [refresh]);
+  useEffect(() => {
+    if (!canRead) return;
+    // Forget runs on the invited user's device. The owner's account and grant
+    // tables must catch up even when no action occurs in this window.
+    const update = () => {
+      if (document.visibilityState === "visible") void refresh(true);
+    };
+    const timer = window.setInterval(update, 5000);
+    window.addEventListener("focus", update);
+    document.addEventListener("visibilitychange", update);
+    return () => {
+      window.clearInterval(timer);
+      window.removeEventListener("focus", update);
+      document.removeEventListener("visibilitychange", update);
+    };
+  }, [canRead, refresh]);
+  useEffect(() => {
+    if (!loaded.current || busy || inviting) return;
+    const record = editing ?? deleting ?? resetting;
+    const missingRecord =
+      record && !users.some((user) => user.id === record.id);
+    const missingGrantAccount =
+      editor === "grant" &&
+      !remote &&
+      accountId &&
+      !accounts.some((account) => account.id === accountId);
+    const missingInvitation =
+      invitation &&
+      !(invitation.panelWide && !accountsView ? accounts : users).some(
+        (user) => user.id === invitation.user.id,
+      );
+    if (missingRecord || missingGrantAccount) {
+      setEditor(null);
+      setAccountId("");
+      setDeleting(null);
+      setResetting(null);
+      setFormError("");
+    }
+    if (missingInvitation) setInvitation(null);
+    if (missingRecord || missingGrantAccount || missingInvitation) {
+      setInvitationError("");
+      notify(
+        "This access record was removed on the host. The list has been updated.",
+      );
+    }
+  }, [
+    users,
+    accounts,
+    editing,
+    deleting,
+    resetting,
+    editor,
+    accountId,
+    invitation,
+    accountsView,
+    remote,
+    busy,
+    inviting,
+    notify,
+  ]);
   useEffect(() => {
     const element = dialog.current;
     if (editor || deleting || resetting) {
@@ -1072,6 +1143,14 @@ function AccessManagement({
           },
         );
         const user = "user" in result ? result.user : result;
+        // The write itself confirms this identity exists. A failed follow-up
+        // read must not make its new invitation look like a removed account.
+        const includeAccount = (previous: Subuser[]) => [
+          ...previous.filter((item) => item.id !== user.id),
+          user,
+        ];
+        setAccounts(includeAccount);
+        if (accountsView) setUsers(includeAccount);
         setEditor(null);
         // Show the saved identity even if the separate invitation request fails.
         await refresh();
