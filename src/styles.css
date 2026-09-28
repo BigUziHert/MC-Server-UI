@@ -1426,15 +1426,45 @@ input:disabled {
 .sidebar-shade {
   display: none;
 }
+@media (min-width: 1001px) {
+  /* Let the console use spare window height without shrinking its controls. */
+  .main-shell:has(.console-panel) {
+    display: flex;
+    flex-direction: column;
+    min-height: 100dvh;
+  }
+  .main-shell:has(.console-panel) > .topbar {
+    flex-shrink: 0;
+  }
+  .main-shell:has(.console-panel) > .main-content {
+    display: flex;
+    flex-direction: column;
+    flex: 1 0 auto;
+  }
+  .main-shell:has(.console-panel) > .main-content > * {
+    flex-shrink: 0;
+  }
+  .main-shell:has(.console-panel) .console-layout {
+    flex-grow: 1;
+  }
+  .console-panel {
+    align-self: stretch;
+  }
+  .console-panel > * {
+    flex-shrink: 0;
+  }
+  .console-panel > .console-output {
+    height: 220px;
+    min-height: 220px;
+    flex: 1 1 auto;
+  }
+}
 @media (min-width: 1600px) {
   .main-content {
     padding: 40px 45px 25px;
   }
   .topbar {
     padding: 0 45px;
-  }
-  .console-output {
-    height: 420px;
   }
   .metrics-grid {
     gap: 20px;

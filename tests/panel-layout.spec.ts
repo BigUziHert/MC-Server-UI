@@ -1,4 +1,5 @@
-import { expect, test, type Page } from "@playwright/test";
+import { expect, test, type Page, type TestInfo } from "@playwright/test";
+import { writeFile } from "node:fs/promises";
 import catalog from "../shared/subuser-permissions.json" with { type: "json" };
 
 const permissions = catalog.groups.flatMap((group) =>
@@ -29,13 +30,18 @@ const server = {
   javaPath: "java",
 };
 
-// Exercise the same renderer with a native local-owner bridge and the real
-// browser connection controller. Only API data is mocked; both use built CSS.
-async function workspace(page: Page, local: boolean, grants = permissions) {
+// Exercise the built renderer with local/remote native bridges and the real
+// browser connection controller. Server data and native bridge calls are mocked.
+async function workspace(
+  page: Page,
+  local: boolean,
+  grants = permissions,
+  nativeRemote = false,
+) {
   await page.addInitScript(
-    ({ server, local, grants }) => {
+    ({ server, local, grants, nativeRemote }) => {
       localStorage.clear();
-      if (!local) {
+      if (!local && !nativeRemote) {
         localStorage.setItem("mc-panel.session.v1", "p".repeat(43));
         return;
       }
@@ -44,8 +50,11 @@ async function workspace(page: Page, local: boolean, grants = permissions) {
         ready: true,
         unified: true,
         activeId: "local",
-        selectedServer: { panelId: "local", serverId: server.id },
-        localServers: [selected],
+        selectedServer: {
+          panelId: nativeRemote ? "remote" : "local",
+          serverId: server.id,
+        },
+        localServers: local ? [selected] : [],
         panels: [
           {
             id: "local",
@@ -56,6 +65,28 @@ async function workspace(page: Page, local: boolean, grants = permissions) {
             connectionState: "connected",
             servers: [],
           },
+          ...(nativeRemote
+            ? [
+                {
+                  id: "remote",
+                  local: false,
+                  label: "Remote computer",
+                  origin: "https://remote.example.test",
+                  signedIn: true,
+                  connectionState: "connected",
+                  sessionEpoch: "layout-epoch",
+                  servers: [selected],
+                  session: {
+                    role: "subuser",
+                    email: "member@example.test",
+                    userId: "member",
+                    serverId: server.id,
+                    permissions: grants,
+                    hostPermissions: [],
+                  },
+                },
+              ]
+            : []),
         ],
       };
       Object.assign(window, {
@@ -71,10 +102,17 @@ async function workspace(page: Page, local: boolean, grants = permissions) {
         },
       });
     },
-    { server, local, grants },
+    { server, local, grants, nativeRemote },
   );
   const requests: string[] = [];
   const unexpected: string[] = [];
+  const targets: { panel: string; path: string; serverId: string | null }[] =
+    [];
+  let players: { name: string }[] = [];
+  let lines = [
+    { id: 1, time: "12:00:00", level: "INFO", message: "Server ready" },
+  ];
+  await page.route("https://mc-heads.net/**", (route) => route.abort());
   await page.route("**/api/**", (route) => {
     const request = route.request();
     const url = new URL(request.url());
@@ -83,33 +121,41 @@ async function workspace(page: Page, local: boolean, grants = permissions) {
     );
     const path = proxy?.[2] ?? url.pathname;
     requests.push(path);
+    targets.push({
+      panel: proxy?.[1] ?? "local",
+      path,
+      serverId:
+        url.searchParams.get("serverId") ??
+        request.headers()["x-server-id"] ??
+        null,
+    });
     const json: Record<string, unknown> = {
-      "/api/access/session": local
-        ? { role: "owner" }
-        : {
-            role: "subuser",
-            accountId: "member",
-            userId: "member",
-            email: "member@example.test",
-            serverId: server.id,
-            permissions: grants,
-            hostPermissions: [],
-          },
+      "/api/access/session":
+        local || (nativeRemote && !proxy)
+          ? { role: "owner" }
+          : {
+              role: "subuser",
+              accountId: "member",
+              userId: "member",
+              email: "member@example.test",
+              serverId: server.id,
+              permissions: grants,
+              hostPermissions: [],
+            },
       "/api/desktop/preferences": { desktop: true, preferences: {} },
       "/api/desktop/selection": {
         desktop: true,
         activeServerId: server.id,
       },
       "/api/servers": {
-        servers: [{ ...server, accessPermissions: grants }],
-        defaultServerId: server.id,
+        servers:
+          nativeRemote && !proxy
+            ? []
+            : [{ ...server, accessPermissions: grants }],
+        defaultServerId: nativeRemote && !proxy ? null : server.id,
       },
-      "/api/server": { ...server, accessPermissions: grants },
-      "/api/console": {
-        lines: [
-          { id: 1, time: "12:00:00", level: "INFO", message: "Server ready" },
-        ],
-      },
+      "/api/server": { ...server, players, accessPermissions: grants },
+      "/api/console": { lines },
       "/api/files": {
         path: "",
         entries: [
@@ -265,7 +311,7 @@ async function workspace(page: Page, local: boolean, grants = permissions) {
       },
     };
     if (
-      local &&
+      (local || nativeRemote) &&
       path === "/api/desktop/preferences" &&
       request.method() === "PUT"
     )
@@ -278,7 +324,24 @@ async function workspace(page: Page, local: boolean, grants = permissions) {
       json: { error: "Unexpected layout fixture request" },
     });
   });
-  return { requests, unexpected };
+  return {
+    requests,
+    unexpected,
+    targets,
+    populateConsole(populated = true) {
+      players = Array.from({ length: populated ? 45 : 0 }, (_, index) => ({
+        name: `Player_${index}`,
+      }));
+      lines = Array.from({ length: populated ? 400 : 1 }, (_, index) => ({
+        id: index + 1,
+        time: "12:00:00",
+        level: "INFO",
+        message: populated
+          ? `Layout log ${index}: ${"server output ".repeat(24)}`
+          : "Server ready",
+      }));
+    },
+  };
 }
 
 const pages = [
@@ -321,6 +384,238 @@ async function geometry(page: Page, selector: string) {
           .height ?? null,
     };
   }, selector);
+}
+
+async function consoleGeometry(page: Page) {
+  return page.evaluate(() => {
+    const element = (selector: string) =>
+      document.querySelector<HTMLElement>(selector)!;
+    const box = (selector: string) => element(selector).getBoundingClientRect();
+    const panel = box(".console-panel");
+    const output = element(".console-output");
+    const players = element(".players-list");
+    const command = box(".command-form");
+    return {
+      viewportWidth: document.documentElement.clientWidth,
+      viewportHeight: document.documentElement.clientHeight,
+      documentWidth: document.documentElement.scrollWidth,
+      documentHeight: document.documentElement.scrollHeight,
+      paddingBottom: parseFloat(
+        getComputedStyle(element(".main-content")).paddingBottom,
+      ),
+      footerBottom: box(".footer").bottom + window.scrollY,
+      panelHeight: panel.height,
+      panelBottom: panel.bottom + window.scrollY,
+      sideBottom: box(".console-side").bottom + window.scrollY,
+      outputHeight: output.clientHeight,
+      outputScrollHeight: output.scrollHeight,
+      playersHeight: players.clientHeight,
+      playersScrollHeight: players.scrollHeight,
+      commandTop: command.top + window.scrollY,
+      commandBottom: command.bottom + window.scrollY,
+    };
+  });
+}
+
+async function attachGeometry(
+  testInfo: TestInfo,
+  name: string,
+  measured: unknown,
+) {
+  const path = testInfo.outputPath(name);
+  await writeFile(path, JSON.stringify(measured, null, 2));
+  await testInfo.attach(name, { path, contentType: "application/json" });
+}
+
+const consoleModes = ["local", "browser-remote", "native-remote"] as const;
+for (const mode of consoleModes) {
+  test(`console uses viewport height and internal scrolling for ${mode}`, async ({
+    page,
+  }, testInfo) => {
+    const fixture = await workspace(
+      page,
+      mode === "local",
+      permissions,
+      mode === "native-remote",
+    );
+    await page.setViewportSize({ width: 1440, height: 960 });
+    await page.goto("/#console");
+    await expect(page.getByRole("log")).toContainText("Server ready");
+    await page.evaluate(() => document.fonts.ready);
+    expect(await page.evaluate(() => window.mcPanelConnections?.runtime)).toBe(
+      mode === "browser-remote" ? "browser" : "desktop",
+    );
+    const measurements = [];
+    for (const viewport of [
+      { width: 1440, height: 960 },
+      { width: 1920, height: 1080 },
+      { width: 2560, height: 960 },
+      { width: 2560, height: 1368 },
+      { width: 2560, height: 1392 },
+    ]) {
+      await page.setViewportSize(viewport);
+      const measured = await consoleGeometry(page);
+      measurements.push(measured);
+      await attachGeometry(
+        testInfo,
+        `geometry-${viewport.width}x${viewport.height}.json`,
+        measured,
+      );
+      await page.screenshot({
+        path: testInfo.outputPath(
+          `${mode}-${viewport.width}x${viewport.height}.png`,
+        ),
+      });
+      expect
+        .soft(measured.documentWidth, "no horizontal overflow")
+        .toBeLessThanOrEqual(measured.viewportWidth + 1);
+      if (viewport.height >= 1080) {
+        expect
+          .soft(
+            measured.documentHeight,
+            "the tall dashboard fits without document scrolling",
+          )
+          .toBeLessThanOrEqual(measured.viewportHeight + 1);
+      }
+      expect
+        .soft(
+          measured.documentHeight - measured.footerBottom,
+          "footer ends at normal bottom padding, with no unused lower window or document",
+        )
+        .toBeCloseTo(measured.paddingBottom, 0);
+      expect
+        .soft(measured.panelBottom, "console and player sidebar end together")
+        .toBeCloseTo(measured.sideBottom, 0);
+      expect
+        .soft(measured.outputHeight, "console retains a readable minimum")
+        .toBeGreaterThanOrEqual(220);
+      expect
+        .soft(measured.commandBottom)
+        .toBeLessThanOrEqual(measured.panelBottom);
+    }
+    const short = measurements[2];
+    const tall = measurements[4];
+    expect
+      .soft(
+        Math.abs(
+          tall.outputHeight -
+            short.outputHeight -
+            (tall.viewportHeight - short.documentHeight),
+        ),
+        "same-width window growth becomes usable console space",
+      )
+      .toBeLessThanOrEqual(2);
+    expect
+      .soft(
+        tall.outputHeight - measurements[3].outputHeight,
+        "a taller window grows the console even without changing width breakpoints",
+      )
+      .toBeCloseTo(24, 0);
+    fixture.populateConsole();
+    await expect(page.locator(".online-players .player-row")).toHaveCount(45);
+    await expect(page.getByRole("log")).toContainText("Layout log 399:");
+    const populated = await consoleGeometry(page);
+    expect(populated.panelHeight).toBeCloseTo(tall.panelHeight, 0);
+    expect(populated.playersHeight).toBeCloseTo(tall.playersHeight, 0);
+    expect(populated.documentHeight).toBeLessThanOrEqual(
+      tall.documentHeight + 1,
+    );
+    expect(populated.documentWidth).toBeLessThanOrEqual(
+      populated.viewportWidth + 1,
+    );
+    expect(populated.outputScrollHeight).toBeGreaterThan(
+      populated.outputHeight,
+    );
+    expect(populated.playersScrollHeight).toBeGreaterThan(
+      populated.playersHeight,
+    );
+    await expect(
+      page.getByRole("textbox", { name: "Server command", exact: true }),
+    ).toBeInViewport();
+    if (mode === "native-remote") {
+      expect(fixture.targets).toContainEqual({
+        panel: "remote",
+        path: "/api/console",
+        serverId: server.id,
+      });
+      expect(
+        fixture.targets
+          .filter((target) => target.path === "/api/server")
+          .every((target) => target.panel === "remote"),
+      ).toBe(true);
+      await expect(page.locator(".server-details")).toContainText(
+        "Remote server",
+      );
+    }
+    expect(fixture.unexpected).toEqual([]);
+    await attachGeometry(
+      testInfo,
+      "populated-console-geometry.json",
+      populated,
+    );
+    await page.screenshot({
+      path: testInfo.outputPath(`${mode}-populated-tall.png`),
+    });
+  });
+
+  test(`short and mobile console keeps controls reachable for ${mode}`, async ({
+    page,
+  }, testInfo) => {
+    const fixture = await workspace(
+      page,
+      mode === "local",
+      permissions,
+      mode === "native-remote",
+    );
+    for (const viewport of [
+      { width: 1280, height: 600 },
+      { width: 390, height: 844 },
+    ]) {
+      fixture.populateConsole(false);
+      await page.setViewportSize(viewport);
+      await page.goto("/#console");
+      await expect(page.getByRole("log")).toContainText("Server ready");
+      await page.evaluate(() => document.fonts.ready);
+      const before = await consoleGeometry(page);
+      expect(before.outputHeight).toBeGreaterThanOrEqual(220);
+      expect(before.documentWidth).toBeLessThanOrEqual(
+        before.viewportWidth + 1,
+      );
+      expect(before.documentHeight).toBeGreaterThan(before.viewportHeight);
+      fixture.populateConsole();
+      await expect(page.locator(".online-players .player-row")).toHaveCount(45);
+      await expect(page.getByRole("log")).toContainText("Layout log 399:");
+      const after = await consoleGeometry(page);
+      expect(after.panelHeight).toBeCloseTo(before.panelHeight, 0);
+      expect(after.documentHeight).toBeLessThanOrEqual(
+        before.documentHeight + 1,
+      );
+      expect(after.outputScrollHeight).toBeGreaterThan(after.outputHeight);
+      expect(after.playersScrollHeight).toBeGreaterThan(after.playersHeight);
+      const command = page.getByRole("textbox", {
+        name: "Server command",
+        exact: true,
+      });
+      await command.scrollIntoViewIfNeeded();
+      await expect(command).toBeInViewport();
+      await command.fill("help");
+      await expect(command).toHaveValue("help");
+      await page.locator(".footer").scrollIntoViewIfNeeded();
+      await expect(page.locator(".footer")).toBeInViewport();
+      await attachGeometry(
+        testInfo,
+        `geometry-${viewport.width}x${viewport.height}.json`,
+        after,
+      );
+      await page.screenshot({
+        path: testInfo.outputPath(
+          `${mode}-${viewport.width}x${viewport.height}.png`,
+        ),
+        fullPage: true,
+      });
+    }
+    expect(fixture.unexpected).toEqual([]);
+  });
 }
 
 for (const viewport of [

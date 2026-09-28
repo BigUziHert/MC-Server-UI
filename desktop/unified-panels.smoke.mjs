@@ -160,7 +160,12 @@ async function smoke() {
           email: `${host}@example.test`,
           userId: host,
           serverId: "same-id",
-          permissions: ["server.view", "file.read-content", "file.create"],
+          permissions: [
+            "server.view",
+            "control.console",
+            "file.read-content",
+            "file.create",
+          ],
           hostPermissions: [],
         };
         if (
@@ -489,9 +494,9 @@ async function smoke() {
     assert.equal(a.signedIn, true);
     assert.equal(c.signedIn, true);
 
-    // Wide displays must use the available workspace for either host. Keep a
-    // user's native zoom choice while switching; connection type does not set
-    // display density. This server lives only in this smoke's temporary data.
+    // Wide displays must use the available width and height for either host.
+    // Keep a user's native zoom choice while switching; connection type does
+    // not set display density. This fixture uses only temporary smoke data.
     const localServerId = await page.evaluate(async () => {
       const response = await fetch("/api/servers", {
         method: "POST",
@@ -508,15 +513,10 @@ async function smoke() {
       width: innerWidth,
       height: innerHeight,
     }));
-    const previousZoom = await application.evaluate(({ BrowserWindow }) => {
-      const contents = BrowserWindow.getAllWindows()[0].webContents;
-      const previous = contents.getZoomFactor();
-      contents.setZoomFactor(1.25);
-      return previous;
-    });
-    // A test-only viewport override also works on small CI virtual displays.
-    await page.setViewportSize({ width: 2560, height: 1392 });
-    const measureWorkspace = async (panelId, serverId, name) => {
+    const previousZoom = await application.evaluate(({ BrowserWindow }) =>
+      BrowserWindow.getAllWindows()[0].webContents.getZoomFactor(),
+    );
+    const measureWorkspace = async (panelId, serverId, name, zoom) => {
       await page.evaluate(
         ({ panelId, serverId }) =>
           window.mcPanelConnections.selectServer(panelId, serverId),
@@ -525,20 +525,42 @@ async function smoke() {
       await expect(
         page.getByRole("heading", { name, exact: true }),
       ).toBeVisible({ timeout: 15000 });
-      const geometry = await page.evaluate(() => {
+      await expect(
+        page.getByRole("log", { name: "Server console output" }),
+      ).toBeVisible();
+      const geometry = await page.evaluate(async () => {
+        await document.fonts.ready;
         const shell = document.querySelector(".main-shell");
         const content = document.querySelector(".main-content");
         const sidebar = document.querySelector(".sidebar");
+        const output = document.querySelector(".console-output");
+        const command = document.querySelector(".command-form");
+        const footer = document.querySelector(".main-content > .footer");
         const shellBounds = shell.getBoundingClientRect();
         const contentBounds = content.getBoundingClientRect();
+        const outputBounds = output.getBoundingClientRect();
+        const commandBounds = command.getBoundingClientRect();
+        const footerBounds = footer.getBoundingClientRect();
         return {
           viewport: innerWidth,
+          viewportHeight: innerHeight,
           documentWidth: document.documentElement.clientWidth,
+          documentHeight: document.documentElement.scrollHeight,
           shellLeft: shellBounds.left,
           shellRight: shellBounds.right,
           contentLeft: contentBounds.left,
           contentRight: contentBounds.right,
           contentWidth: contentBounds.width,
+          contentBottom: contentBounds.bottom,
+          contentBottomPadding: parseFloat(
+            getComputedStyle(content).paddingBottom,
+          ),
+          consoleTop: outputBounds.top,
+          consoleBottom: outputBounds.bottom,
+          consoleHeight: outputBounds.height,
+          commandBottom: commandBounds.bottom,
+          footerTop: footerBounds.top,
+          footerBottom: footerBounds.bottom,
           sidebarWidth: sidebar.getBoundingClientRect().width,
           fontSize: getComputedStyle(document.documentElement).fontSize,
         };
@@ -551,38 +573,92 @@ async function smoke() {
       assert.ok(Math.abs(geometry.contentLeft - geometry.shellLeft) < 1);
       assert.ok(Math.abs(geometry.contentRight - geometry.shellRight) < 1);
       assert.ok(Math.abs(geometry.contentRight - geometry.documentWidth) < 1);
+      assert.ok(
+        Math.abs(geometry.contentBottom - geometry.viewportHeight) < 1,
+        `${name}: the console page fills the viewport height`,
+      );
+      assert.ok(
+        geometry.documentHeight <= geometry.viewportHeight + 1,
+        `${name}: the console and footer fit without page scrolling`,
+      );
+      assert.ok(
+        Math.abs(
+          geometry.viewportHeight -
+            geometry.footerBottom -
+            geometry.contentBottomPadding,
+        ) < 1,
+        `${name}: the footer stays at the bottom padding`,
+      );
+      assert.ok(
+        geometry.consoleHeight >= 200 &&
+          geometry.consoleBottom < geometry.commandBottom &&
+          geometry.commandBottom < geometry.footerTop,
+        `${name}: the console remains usable with its command input above the footer`,
+      );
       assert.equal(
         await application.evaluate(({ BrowserWindow }) =>
           BrowserWindow.getAllWindows()[0].webContents.getZoomFactor(),
         ),
-        1.25,
+        zoom,
         "Switching panels must retain the chosen desktop zoom",
       );
-      // Different server content may need a vertical scrollbar. Compare the
-      // usable area rather than treating that scrollbar as a layout inset.
       return {
         viewport: geometry.viewport,
+        viewportHeight: geometry.viewportHeight,
         contentLeft: geometry.contentLeft,
         rightInset: geometry.documentWidth - geometry.contentRight,
+        contentBottom: geometry.contentBottom,
+        consoleTop: geometry.consoleTop,
+        consoleBottom: geometry.consoleBottom,
+        consoleHeight: geometry.consoleHeight,
+        commandBottom: geometry.commandBottom,
+        footerTop: geometry.footerTop,
+        footerBottom: geometry.footerBottom,
         sidebarWidth: geometry.sidebarWidth,
         fontSize: geometry.fontSize,
       };
     };
-    const localGeometry = await measureWorkspace(
-      "local",
-      localServerId,
-      "Local geometry fixture",
-    );
-    assert.deepEqual(
-      await measureWorkspace(a.id, "same-id", "Computer A"),
-      localGeometry,
-      "Local and remote pages share the same width, typography and sidebar",
-    );
-    assert.deepEqual(
-      await measureWorkspace(c.id, "same-id", "Computer C"),
-      localGeometry,
-      "Another connected panel must not change workspace geometry",
-    );
+    const geometryChecks = [];
+    for (const zoom of [1, 1.25]) {
+      await application.evaluate(({ BrowserWindow }, factor) => {
+        BrowserWindow.getAllWindows()[0].webContents.setZoomFactor(factor);
+      }, zoom);
+      let shorterGeometry;
+      for (const height of [1080, 1392]) {
+        // The test-only override exercises large viewports even on small CI
+        // displays. Production never sets the selected native zoom factor.
+        await page.setViewportSize({ width: 2560, height });
+        const localGeometry = await measureWorkspace(
+          "local",
+          localServerId,
+          "Local geometry fixture",
+          zoom,
+        );
+        assert.deepEqual(
+          await measureWorkspace(a.id, "same-id", "Computer A", zoom),
+          localGeometry,
+          `Local and remote console geometry matches at ${zoom * 100}% zoom, ${height}px high`,
+        );
+        assert.deepEqual(
+          await measureWorkspace(c.id, "same-id", "Computer C", zoom),
+          localGeometry,
+          `A second remote panel retains geometry at ${zoom * 100}% zoom, ${height}px high`,
+        );
+        if (shorterGeometry) {
+          assert.ok(
+            Math.abs(
+              localGeometry.consoleHeight -
+                shorterGeometry.consoleHeight -
+                (localGeometry.viewportHeight - shorterGeometry.viewportHeight),
+            ) < 1,
+            "The console uses the extra height when the same-width window grows",
+          );
+        }
+        shorterGeometry = localGeometry;
+        geometryChecks.push({ zoom, ...localGeometry });
+      }
+    }
+    console.log("Native local/two-remote viewport geometry:", geometryChecks);
     await application.evaluate(({ BrowserWindow }, zoom) => {
       BrowserWindow.getAllWindows()[0].webContents.setZoomFactor(zoom);
     }, previousZoom);
