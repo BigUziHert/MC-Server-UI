@@ -65,6 +65,12 @@ try {
   await expect(
     page.getByRole("button", { name: "Sign in", exact: true }),
   ).toHaveCount(0);
+  await expect(
+    page.locator(".fleet-welcome-shell .fleet-switcher"),
+  ).toHaveCount(0);
+  await expect(
+    page.getByRole("button", { name: "App updates", exact: true }),
+  ).toHaveCount(0);
   await accountMenu.click();
   await expect(
     page.getByRole("menuitem", { name: "Sign in", exact: true }),
@@ -272,7 +278,7 @@ try {
   ).toBeVisible({ timeout: 15000 });
   await expect(
     page.getByRole("button", { name: "App updates", exact: true }),
-  ).toBeVisible();
+  ).toHaveCount(0);
   await application.evaluate(({ BrowserWindow }) => {
     BrowserWindow.getAllWindows()[0].webContents.send("mc-panel-updates-open");
   });

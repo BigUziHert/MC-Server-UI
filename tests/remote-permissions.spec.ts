@@ -562,14 +562,25 @@ test("remote subuser managers grant only their own permissions and invite withou
       name: "Create invite link for privileged@example.test",
     }),
   ).toBeDisabled();
-  await page.getByRole("button", { name: "New user", exact: true }).click();
+  await page
+    .getByRole("button", { name: "Grant server access", exact: true })
+    .click();
   const editor = page.getByRole("dialog", {
-    name: "Create new subuser",
+    name: "Grant server access",
     exact: true,
   });
+  await expect(editor.getByLabel("Panel account", { exact: true })).toHaveCount(
+    0,
+  );
+  await expect(editor).toContainText(
+    "Existing panel accounts and their invitations are managed by the panel owner.",
+  );
   await editor
     .getByLabel("Email address", { exact: true })
     .fill("helper@example.test");
+  const details = editor.locator(".subusers-permission-details");
+  await expect(details).toHaveJSProperty("open", false);
+  await details.locator("summary").click();
   await expect(
     editor.getByRole("checkbox", { name: "Console", exact: true }),
   ).toHaveCount(0);
@@ -580,7 +591,7 @@ test("remote subuser managers grant only their own permissions and invite withou
     .getByRole("checkbox", { name: "All permissions", exact: true })
     .check();
   await editor
-    .getByRole("button", { name: "Create subuser", exact: true })
+    .getByRole("button", { name: "Grant access", exact: true })
     .click();
   await expect(editor).not.toBeVisible();
   await page

@@ -1,8 +1,6 @@
-import { test, expect } from "@playwright/test";
+import { test, expect, type Page } from "@playwright/test";
 
-test("Panel Settings opens update errors without losing the settings dialog", async ({
-  page,
-}) => {
+test.beforeEach(async ({ page }) => {
   await page.route("**/api/desktop/settings", (route) =>
     route.fulfill({
       json: {
@@ -14,13 +12,12 @@ test("Panel Settings opens update errors without losing the settings dialog", as
       },
     }),
   );
-  await page.route("**/api/desktop/updates", (route) =>
-    route.fulfill({
-      status: 503,
-      json: { error: "Updater temporarily unavailable." },
-    }),
-  );
-  await page.goto("/");
+});
+
+async function openUpdatesFromSettings(page: Page) {
+  await expect(
+    page.getByRole("button", { name: "App updates", exact: true }),
+  ).toHaveCount(0);
   await page
     .getByRole("button", { name: "Panel Settings", exact: true })
     .click();
@@ -31,6 +28,20 @@ test("Panel Settings opens update errors without losing the settings dialog", as
   await settings
     .getByRole("button", { name: "App updates", exact: true })
     .click();
+  return settings;
+}
+
+test("Panel Settings opens update errors without losing the settings dialog", async ({
+  page,
+}) => {
+  await page.route("**/api/desktop/updates", (route) =>
+    route.fulfill({
+      status: 503,
+      json: { error: "Updater temporarily unavailable." },
+    }),
+  );
+  await page.goto("/");
+  const settings = await openUpdatesFromSettings(page);
   const updates = page.getByRole("dialog", {
     name: "App updates on this computer",
     exact: true,
@@ -100,7 +111,7 @@ test("restarting to update waits for the selected server to finish saving", asyn
   });
   await page.goto("/");
   await expect.poll(() => saving).toBe(true);
-  await page.getByRole("button", { name: "App updates", exact: true }).click();
+  await openUpdatesFromSettings(page);
   const restart = page.getByRole("button", {
     name: "Restart to update",
     exact: true,
@@ -152,8 +163,11 @@ test("desktop updates show version, manual download, and restart without submitt
     await route.fulfill({ json: state });
   });
   await page.goto("/");
-  await page.getByRole("button", { name: "App updates", exact: true }).click();
-  const dialog = page.getByRole("dialog", { name: "App updates" });
+  await openUpdatesFromSettings(page);
+  const dialog = page.getByRole("dialog", {
+    name: "App updates on this computer",
+    exact: true,
+  });
   await expect(dialog).toContainText("0.1.3-dev.0");
   expect(actions).toEqual([]);
   await dialog.getByRole("button", { name: "Check for updates" }).click();
@@ -194,15 +208,22 @@ test("portable builds explain the one-time Setup requirement and never offer an 
     route.fulfill({ json: { servers: [], defaultServerId: null } }),
   );
   await page.goto("/");
-  await page.getByRole("button", { name: "App updates", exact: true }).click();
-  const dialog = page.getByRole("dialog", { name: "App updates" });
+  const settings = await openUpdatesFromSettings(page);
+  const dialog = page.getByRole("dialog", {
+    name: "App updates on this computer",
+    exact: true,
+  });
   await expect(dialog).toContainText("Setup edition once");
   await expect(
     dialog.getByRole("button", { name: "Check for updates" }),
   ).toHaveCount(0);
   await page.keyboard.press("Escape");
   await expect(dialog).not.toBeVisible();
-  // Both the tray and remote-panel shortcut open this trusted local dialog.
+  await expect(settings).toBeVisible();
+  await expect(
+    settings.getByRole("button", { name: "App updates", exact: true }),
+  ).toBeFocused();
+  // Older native event senders can still open the local dialog.
   await page.evaluate(() =>
     window.dispatchEvent(new Event("mc-panel-updates-open")),
   );

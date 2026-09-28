@@ -26,10 +26,6 @@
 .fleet-server-group-error {
   color: #ff9c9c;
 }
-.fleet-available-servers {
-  max-width: 420px;
-  margin-top: 24px;
-}
 .fleet-server-list {
   list-style: none;
   padding: 0;

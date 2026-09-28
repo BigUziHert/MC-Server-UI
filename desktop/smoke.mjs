@@ -745,11 +745,39 @@ async function assertDesktopUpdates(page) {
       actions.push(request.url());
   };
   page.on("request", recordAction);
+  let updater;
   try {
+    await ui(
+      page.getByRole("button", { name: "App updates", exact: true }),
+    ).toHaveCount(0);
     await page
+      .getByRole("button", { name: "Panel Settings", exact: true })
+      .click();
+    const settings = page.getByRole("dialog", {
+      name: "Panel Settings",
+      exact: true,
+    });
+    await settings
       .getByRole("button", { name: "App updates", exact: true })
       .click();
-    const dialog = page.getByRole("dialog", {
+    await ui
+      .poll(
+        () =>
+          application
+            .windows()
+            .filter((item) => item.url().includes("?app-updates=1")).length,
+      )
+      .toBe(1);
+    updater = application
+      .windows()
+      .find((item) => item.url().includes("?app-updates=1"));
+    updater.on("request", recordAction);
+    assert.equal(new URL(updater.url()).origin, currentOrigin);
+    assert.equal(
+      await updater.evaluate(() => window.mcPanelConnections),
+      undefined,
+    );
+    const dialog = updater.getByRole("dialog", {
       name: "App updates on this computer",
       exact: true,
     });
@@ -765,11 +793,18 @@ async function assertDesktopUpdates(page) {
         0,
       );
     await capturePackaged("packaged-updates.png");
-    await page.keyboard.press("Escape");
-    await ui(dialog).not.toBeVisible();
+    await updater.keyboard.press("Escape").catch((cause) => {
+      if (!updater.isClosed()) throw cause;
+    });
+    await ui.poll(() => updater.isClosed()).toBe(true);
+    await ui(settings).toBeVisible();
+    await settings
+      .getByRole("button", { name: "Close Panel Settings", exact: true })
+      .click();
     assert.deepEqual(actions, []);
   } finally {
     page.off("request", recordAction);
+    updater?.off("request", recordAction);
   }
 }
 

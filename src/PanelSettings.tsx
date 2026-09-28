@@ -43,12 +43,15 @@ type StartupServer = { id: string; name: string; unavailable?: boolean };
 const ignoreSettings = () => {};
 const localSessionActive = () => true;
 
-export default function PanelSettings({ notify }: PageProps) {
+export default function PanelSettings({
+  notify,
+  remote = false,
+}: PageProps & { remote?: boolean }) {
   const [open, setOpen] = useState(false);
   const workspace = useContext(DesktopWorkspaceContext);
   const owner = workspace
     ? workspace.connections?.panels.some((panel) => panel.local) === true
-    : true;
+    : !remote;
   const native = window.mcPanelConnections?.runtime !== "browser";
   return (
     <>
@@ -103,6 +106,8 @@ function SettingsDialog({
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
+  const [updatesError, setUpdatesError] = useState("");
+  const [openingUpdates, setOpeningUpdates] = useState(false);
   const [attempt, setAttempt] = useState(0);
   useEffect(() => {
     const element = dialog.current;
@@ -345,7 +350,8 @@ function SettingsDialog({
             </div>
           )}
         </section>
-        {settings?.desktop && (
+        {(settings?.desktop ||
+          (native && window.mcPanelConnections?.openUpdates)) && (
           <section
             className="panel-updates-settings"
             aria-labelledby="panel-updates-title"
@@ -362,18 +368,29 @@ function SettingsDialog({
             <button
               className="btn"
               aria-label="App updates"
-              onClick={() => {
+              title="Open app updates on this computer"
+              disabled={openingUpdates}
+              onClick={async () => {
+                if (openingUpdates) return;
+                setUpdatesError("");
                 const bridge = window.mcPanelConnections;
-                if (bridge?.unified && bridge.runtime !== "browser") {
+                if (native && (bridge?.unified || bridge?.openUpdates)) {
                   if (!bridge.openUpdates) {
-                    setError("App updates are unavailable on this computer.");
+                    setUpdatesError(
+                      "App updates are unavailable on this computer.",
+                    );
                     return;
                   }
-                  void bridge
-                    .openUpdates()
-                    .catch((cause) =>
-                      setError(messageOf(cause, "Unable to open app updates.")),
+                  setOpeningUpdates(true);
+                  try {
+                    await bridge.openUpdates();
+                  } catch (cause) {
+                    setUpdatesError(
+                      messageOf(cause, "Unable to open app updates."),
                     );
+                  } finally {
+                    setOpeningUpdates(false);
+                  }
                 } else {
                   // The proved browser owner uses the updater for this origin;
                   // native workspaces open their trusted local updater via IPC.
@@ -383,6 +400,11 @@ function SettingsDialog({
             >
               <ArrowDownToLine size={16} /> Updates
             </button>
+            {updatesError && (
+              <p className="panel-settings-error" role="alert">
+                {updatesError}
+              </p>
+            )}
           </section>
         )}
       </div>

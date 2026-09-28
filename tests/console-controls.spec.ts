@@ -218,6 +218,82 @@ for (const { width, remote } of [
   });
 }
 
+test("Stop sends one graceful request across both controls and can retry a failed request without a dialog", async ({
+  page,
+  request,
+  serverId,
+}) => {
+  const seed = await (
+    await request.get("/api/server", { headers: { "X-Server-Id": serverId } })
+  ).json();
+  let status = "running";
+  let failFirst!: () => void;
+  const firstRequest = new Promise<void>((resolve) => {
+    failFirst = resolve;
+  });
+  const actions: { id: string; body: unknown }[] = [];
+  await page.route("**/api/server", (route) =>
+    route.fulfill({ json: { ...seed, status } }),
+  );
+  await page.route("**/api/server/power", async (route) => {
+    actions.push({
+      id: route.request().headers()["x-server-id"],
+      body: route.request().postDataJSON(),
+    });
+    if (actions.length === 1) {
+      await firstRequest;
+      await route.fulfill({
+        status: 503,
+        json: { error: "The stop request failed. Try again." },
+      });
+    } else {
+      status = "offline";
+      await route.fulfill({ json: { status } });
+    }
+  });
+  await page.addInitScript(
+    (id) => localStorage.setItem("mc-panel.active-server", id),
+    serverId,
+  );
+  await page.goto("/#console");
+  const stops = page.locator(".power-buttons .stop-button");
+  await expect(stops).toHaveCount(2);
+  await expect(stops.first()).toBeEnabled();
+  try {
+    // Queue repeated activations from both copies before a network response.
+    await stops.evaluateAll((buttons) => {
+      for (let repeat = 0; repeat < 3; repeat++)
+        for (const button of buttons) (button as HTMLButtonElement).click();
+    });
+    await expect
+      .poll(() => actions)
+      .toEqual([{ id: serverId, body: { action: "stop" } }]);
+    await expect(page.getByRole("dialog")).toHaveCount(0);
+    for (const button of await stops.all()) await expect(button).toBeDisabled();
+    failFirst();
+    await expect(page.getByRole("alert")).toContainText(
+      "The stop request failed. Try again.",
+    );
+    await expect(stops.first()).toBeEnabled();
+    await page
+      .locator(".server-power")
+      .getByRole("button", { name: "Stop", exact: true })
+      .click();
+    await expect(page.getByRole("dialog")).toHaveCount(0);
+    await expect(
+      page
+        .locator(".server-power")
+        .getByRole("button", { name: "Start", exact: true }),
+    ).toBeEnabled();
+    expect(actions).toEqual([
+      { id: serverId, body: { action: "stop" } },
+      { id: serverId, body: { action: "stop" } },
+    ]);
+  } finally {
+    failFirst();
+  }
+});
+
 for (const width of [1348, 390]) {
   test(`a stopping server offers a confirmed Force Stop and recovers at ${width}px`, async ({
     page,
@@ -264,10 +340,7 @@ for (const width of [1348, 390]) {
     await consolePower
       .getByRole("button", { name: "Stop", exact: true })
       .click();
-    await page
-      .getByRole("dialog")
-      .getByRole("button", { name: "Stop server", exact: true })
-      .click();
+    await expect(page.getByRole("dialog")).toHaveCount(0);
     const force = consolePower.getByRole("button", {
       name: "Force Stop",
       exact: true,
@@ -470,10 +543,7 @@ for (const width of [1348, 390]) {
       await openSidebar();
       await expect(stop).toBeEnabled();
       await stop.click();
-      await page
-        .getByRole("dialog", { name: "Stop your server?", exact: true })
-        .getByRole("button", { name: "Stop server", exact: true })
-        .click();
+      await expect(page.getByRole("dialog")).toHaveCount(0);
       await expect(start).toBeEnabled();
       await expect(consoleStart).toBeEnabled();
       await expect(consoleStop).toBeDisabled();
@@ -566,9 +636,7 @@ for (const stopSource of ["power", "console"] as const) {
         .locator(".server-power")
         .getByRole("button", { name: "Stop", exact: true })
         .click();
-      await page
-        .getByRole("button", { name: "Stop server", exact: true })
-        .click();
+      await expect(page.getByRole("dialog")).toHaveCount(0);
     }
     const force = page
       .locator(".server-power")

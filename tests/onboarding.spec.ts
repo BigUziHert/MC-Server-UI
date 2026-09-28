@@ -261,6 +261,15 @@ test("welcome choices are centered at desktop, tablet, and mobile widths", async
     "Start a new Minecraft server, or bring one you already have.",
   );
   await expect(
+    page.locator(".fleet-welcome-shell .fleet-server-group"),
+  ).toHaveCount(0);
+  await expect(
+    page.locator(".fleet-welcome-shell .fleet-server-button"),
+  ).toHaveCount(0);
+  await expect(
+    page.getByText("No servers on this computer.", { exact: true }),
+  ).toHaveCount(0);
+  await expect(
     page.getByRole("button", { name: "Create a new server", exact: true }),
   ).toHaveAccessibleDescription("Choose your software. We’ll guide the setup.");
   await expect(

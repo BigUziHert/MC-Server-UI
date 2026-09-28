@@ -422,11 +422,17 @@ test("a remote user manager cannot grant computer permissions or edit an existin
       exact: true,
     }),
   ).toBeDisabled();
-  await page.getByRole("button", { name: "New user", exact: true }).click();
+  await page
+    .getByRole("button", { name: "Grant server access", exact: true })
+    .click();
   const dialog = page.getByRole("dialog", {
-    name: "Create new subuser",
+    name: "Grant server access",
     exact: true,
   });
+  await expect(dialog.locator(".subusers-permission-details")).toHaveJSProperty(
+    "open",
+    false,
+  );
   await expect(
     dialog.getByRole("checkbox", {
       name: "Create and import servers",
@@ -440,7 +446,7 @@ test("a remote user manager cannot grant computer permissions or edit an existin
     .getByRole("button", { name: "Use Control preset", exact: true })
     .click();
   await dialog
-    .getByRole("button", { name: "Create subuser", exact: true })
+    .getByRole("button", { name: "Grant access", exact: true })
     .click();
   await expect(dialog).not.toBeVisible();
   const created = state.calls.find(

@@ -25,56 +25,10 @@ export default function DesktopUpdates({
     return workspace?.connections?.panels.some((panel) => panel.local) ? (
       <LocalUpdates />
     ) : null;
-  return remote ? <RemoteUpdates /> : <LocalUpdates />;
-}
-
-function RemoteUpdates() {
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState("");
-  const openUpdates = window.mcPanelConnections?.openUpdates;
-  if (!openUpdates) return null;
-
-  async function open() {
-    setBusy(true);
-    setError("");
-    try {
-      // App updates belong to this desktop, even while viewing another host.
-      // Only open the trusted local dialog; never call the remote update API.
-      await openUpdates!();
-    } catch (cause) {
-      setError(
-        cause instanceof Error ? cause.message : "Unable to open app updates.",
-      );
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  return (
-    <>
-      <button
-        className="help-button update-button"
-        aria-label="App updates"
-        title="Open app updates on this computer"
-        disabled={busy}
-        onClick={() => void open()}
-      >
-        <ArrowDownToLine size={16} />
-        <span>Updates</span>
-      </button>
-      {error && (
-        <div className="toast" role="alert">
-          <span>{error}</span>
-          <button
-            aria-label="Dismiss update error"
-            onClick={() => setError("")}
-          >
-            <X size={16} />
-          </button>
-        </div>
-      )}
-    </>
-  );
+  // Panel Settings owns the only workspace entry point. Keep the local
+  // listener mounted for owner-browser/older-desktop events; remote native
+  // workspaces open the isolated local updater through their IPC bridge.
+  return remote ? null : <LocalUpdates />;
 }
 
 export function DesktopUpdatesOverlay() {
@@ -117,13 +71,12 @@ function LocalUpdates({ standalone = false }: { standalone?: boolean }) {
                 : "Unable to contact the updater.",
             );
         });
-    void refresh();
     const showUpdates = () => {
       setOpen(true);
-      void refresh();
     };
     window.addEventListener("mc-panel-updates-open", showUpdates);
-    const timer = setInterval(refresh, open ? 1000 : 30000);
+    if (open) void refresh();
+    const timer = open ? setInterval(refresh, 1000) : undefined;
     return () => {
       active = false;
       clearInterval(timer);
@@ -169,19 +122,8 @@ function LocalUpdates({ standalone = false }: { standalone?: boolean }) {
   const working =
     busy ||
     ["checking", "downloading", "installing"].includes(state?.status || "");
-  const ready = ["available", "downloaded"].includes(state?.status || "");
   return (
     <>
-      {!standalone && state && (
-        <button
-          className={`help-button update-button ${ready ? "update-ready" : ""}`}
-          onClick={() => setOpen(true)}
-          aria-label="App updates"
-        >
-          <ArrowDownToLine size={16} />
-          <span>{ready ? "Update available" : "Updates"}</span>
-        </button>
-      )}
       <dialog
         className="updates-dialog"
         ref={dialog}

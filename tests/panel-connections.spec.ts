@@ -511,7 +511,13 @@ for (const width of [1434, 390]) {
     await expect(
       page.getByRole("button", { name: "Back to this computer", exact: true }),
     ).toHaveCount(0);
-    await expect(page.getByText("No servers on this computer.")).toBeVisible();
+    await expect(page.getByText("No servers on this computer.")).toHaveCount(0);
+    await expect(
+      page.locator(".fleet-welcome-shell .fleet-server-group"),
+    ).toHaveCount(0);
+    await expect(
+      page.locator(".fleet-welcome-shell .fleet-server-button"),
+    ).toHaveCount(0);
     await page.screenshot({
       path: testInfo.outputPath(`welcome-remote-${width}.png`),
       fullPage: true,
@@ -1030,7 +1036,14 @@ for (const empty of [false, true]) {
         name: "App updates",
         exact: true,
       });
+      await expect(updates).toHaveCount(0);
       if (desktop) {
+        await page
+          .getByRole("button", { name: "Panel Settings", exact: true })
+          .click();
+        await expect(
+          page.getByRole("tab", { name: "Remote Access", exact: true }),
+        ).toHaveCount(0);
         await expect(updates).toBeVisible();
         await expect(updates).toHaveAttribute(
           "title",
@@ -1050,6 +1063,9 @@ for (const empty of [false, true]) {
           (await page.evaluate(() => window.mcPanelConnections!.list()))
             .activeId,
         ).toBe("pc-one");
+        await page
+          .getByRole("button", { name: "Close Panel Settings" })
+          .click();
         await expect(
           page.getByRole("heading", {
             name: heading,
@@ -1082,7 +1098,7 @@ for (const empty of [false, true]) {
   }
 }
 
-test("remote update shortcut reports a bridge failure and can be retried", async ({
+test("remote Panel Settings reports an updater bridge failure and can be retried", async ({
   page,
 }) => {
   await desktopBridge(page, { activeId: "pc-one", updatesFailure: true });
@@ -1099,6 +1115,12 @@ test("remote update shortcut reports a bridge failure and can be retried", async
     }),
   );
   await page.goto("/#console");
+  await expect(
+    page.getByRole("button", { name: "App updates", exact: true }),
+  ).toHaveCount(0);
+  await page
+    .getByRole("button", { name: "Panel Settings", exact: true })
+    .click();
   const updates = page.getByRole("button", {
     name: "App updates",
     exact: true,
@@ -1991,7 +2013,7 @@ test("returning to this computer keeps each remote roster and selects colliding 
   await expect(localList.getByRole("button")).toBeVisible();
 });
 
-test("an empty local workspace keeps connected remote servers available without local server requests", async ({
+test("an empty local welcome keeps remote panels reachable through the account menu without showing server lists", async ({
   page,
 }) => {
   await desktopBridge(page, {
@@ -2011,9 +2033,21 @@ test("an empty local workspace keeps connected remote servers available without 
   await expect(
     page.getByRole("heading", { name: "Welcome to MC Panel", exact: true }),
   ).toBeVisible();
+  await expect(
+    page.locator(".fleet-welcome-shell .fleet-server-group"),
+  ).toHaveCount(0);
+  await expect(
+    page.getByRole("button", { name: /^Open remote server / }),
+  ).toHaveCount(0);
   await page
     .getByRole("button", {
-      name: "Open remote server Friends creative world on pc-two.example:3002",
+      name: "Account menu for Local administrator",
+      exact: true,
+    })
+    .click();
+  await page
+    .getByRole("menuitem", {
+      name: "Switch to pc-two.example:3002",
       exact: true,
     })
     .click();
@@ -2021,9 +2055,7 @@ test("an empty local workspace keeps connected remote servers available without 
     await page.evaluate(
       () => (window as unknown as { connectionCalls: unknown }).connectionCalls,
     ),
-  ).toEqual([
-    { action: "selectRemoteServer", value: `pc-two:${localServer.id}` },
-  ]);
+  ).toEqual([{ action: "activate", value: "pc-two" }]);
   expect(scopedRequests).toEqual([]);
 });
 

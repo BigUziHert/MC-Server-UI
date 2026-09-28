@@ -520,7 +520,20 @@ async function smoke() {
     const browserConnectionsBeforeUpdates = await local.evaluate(() =>
       localStorage.getItem("mc-panel.browser-connections.v1"),
     );
+    await expect(
+      remote.getByRole("button", { name: "App updates", exact: true }),
+    ).toHaveCount(0);
     await remote
+      .getByRole("button", { name: "Panel Settings", exact: true })
+      .click();
+    const remoteSettings = remote.getByRole("dialog", {
+      name: "Panel Settings",
+      exact: true,
+    });
+    await expect(
+      remoteSettings.getByRole("tab", { name: "Remote Access", exact: true }),
+    ).toHaveCount(0);
+    await remoteSettings
       .getByRole("button", { name: "App updates", exact: true })
       .click();
     await expect
@@ -646,6 +659,10 @@ async function smoke() {
         ),
       )
       .toBe("none");
+    await expect(remoteSettings).toBeVisible();
+    await remoteSettings
+      .getByRole("button", { name: "Close Panel Settings", exact: true })
+      .click();
     await remote.getByRole("button", { name: "Filter console levels" }).click();
     await expect(levels).toBeHidden();
     await remote.getByRole("button", { name: "Filter console levels" }).click();
@@ -660,6 +677,9 @@ async function smoke() {
       "New remote output",
     ]);
     await remote
+      .getByRole("button", { name: "Panel Settings", exact: true })
+      .click();
+    await remoteSettings
       .getByRole("button", { name: "App updates", exact: true })
       .click();
     await expect

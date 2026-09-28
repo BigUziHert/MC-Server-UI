@@ -440,6 +440,13 @@ test("an account invite grants no server access, and grant/edit/revoke affect on
     exact: true,
   });
   await expect(dialog.getByRole("combobox")).toHaveCount(1);
+  await expect(dialog.getByLabel("Email address", { exact: true })).toHaveCount(
+    0,
+  );
+  await expect(dialog.locator(".subusers-permission-details")).toHaveJSProperty(
+    "open",
+    false,
+  );
   await expect(
     dialog.getByLabel("Servers available to this person", { exact: true }),
   ).toHaveCount(0);

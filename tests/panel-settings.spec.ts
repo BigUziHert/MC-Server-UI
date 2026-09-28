@@ -286,6 +286,9 @@ test("General settings can open the desktop updater", async ({ page }) => {
     }),
   );
   await page.goto("/");
+  await expect(
+    page.getByRole("button", { name: "App updates", exact: true }),
+  ).toHaveCount(0);
   const dialog = await openSettings(page);
   await dialog
     .getByRole("button", { name: "App updates", exact: true })
@@ -307,6 +310,9 @@ test("browser Panel Settings persists host Remote Access and fits a phone", asyn
   await page.setViewportSize({ width: 390, height: 844 });
   await page.goto("/");
   const dialog = await openSettings(page);
+  await expect(
+    dialog.getByRole("button", { name: "App updates", exact: true }),
+  ).toHaveCount(0);
   await expect(dialog).toContainText(
     "Startup and system tray settings are managed in the desktop app.",
   );

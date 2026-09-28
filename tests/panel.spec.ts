@@ -108,8 +108,7 @@ test("console loads subprocess logs, sends commands, and controls its lifecycle"
     .click();
   await expect(
     page.getByRole("dialog", { name: "Stop your server?" }),
-  ).toBeVisible();
-  await page.getByRole("button", { name: "Stop server", exact: true }).click();
+  ).toHaveCount(0);
   await expect(
     page
       .locator(".server-power")
@@ -1361,10 +1360,7 @@ test("Players grants and removes OP through the subprocess independently of pane
     .locator(".server-power")
     .getByRole("button", { name: "Stop", exact: true })
     .click();
-  await page
-    .getByRole("dialog", { name: "Stop your server?", exact: true })
-    .getByRole("button", { name: "Stop server", exact: true })
-    .click();
+  await expect(page.getByRole("dialog")).toHaveCount(0);
   await expect(
     page
       .locator(".server-power")

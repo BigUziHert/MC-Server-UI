@@ -1238,8 +1238,7 @@ function AccessManagement({
               disabled={!canCreate || busy || !!inviting || loading}
               onClick={() => openEditor()}
             >
-              <Plus size={16} />
-              {remote ? "New user" : "Grant server access"}
+              <Plus size={16} /> Grant server access
             </button>
           )}
         </div>
@@ -1523,9 +1522,7 @@ function AccessManagement({
                       ? accountsView
                         ? "Edit account"
                         : "Edit subuser permissions"
-                      : remote
-                        ? "Create new subuser"
-                        : "Grant server access"}
+                      : "Grant server access"}
             </h2>
             <button
               type="button"
@@ -1571,7 +1568,7 @@ function AccessManagement({
                         ? "Computer permissions are separate from access to existing servers."
                         : "Permission changes apply immediately, including to active sessions. These permissions apply only to this server."
                       : remote
-                        ? "Explicitly grant this person access to this server. Creating an invitation afterward only lets them set up sign-in; it does not grant additional server access."
+                        ? "Grant only permissions you already have on this server. Existing panel accounts and their invitations are managed by the panel owner."
                         : "Choose an existing panel account and explicitly grant access to this server. No other server is shared."}
                 </p>
                 {editor === "grant" && !remote ? (
@@ -1743,10 +1740,7 @@ function AccessManagement({
                       <legend className="subusers-sr-only">
                         Additional permissions
                       </legend>
-                      <details
-                        className="subusers-permission-details"
-                        open={remote || undefined}
-                      >
+                      <details className="subusers-permission-details">
                         <summary>Customize permissions</summary>
                         {groups.map((group) => {
                           const ids = group.permissions.map(
@@ -1866,9 +1860,7 @@ function AccessManagement({
                           ? accountsView
                             ? "Save account"
                             : "Save permissions"
-                          : remote
-                            ? "Create subuser"
-                            : "Grant access"}
+                          : "Grant access"}
               </button>
             </div>
           </footer>

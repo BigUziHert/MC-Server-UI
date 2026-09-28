@@ -894,8 +894,10 @@ export function EmptyFleet({
           </span>
         </div>
         <div className="welcome-header-actions">
-          {(!session || window.mcPanelConnections?.unified) && (
-            <PanelSettings notify={notify} />
+          {(!session ||
+            window.mcPanelConnections?.unified ||
+            window.mcPanelConnections?.openUpdates) && (
+            <PanelSettings notify={notify} remote={Boolean(session)} />
           )}
           <DesktopUpdates remote={Boolean(session)} />
           <a
@@ -963,15 +965,6 @@ export function EmptyFleet({
             )}
             <div className="welcome-remote-account">
               {session && !showWelcome && <DesktopPanelReturn />}
-              {window.mcPanelConnections && (
-                <div className="fleet-available-servers">
-                  <ServerSwitcher
-                    servers={[]}
-                    remoteHost={session ? window.location.host : undefined}
-                    onSelect={() => {}}
-                  />
-                </div>
-              )}
               <PanelAccount
                 session={session}
                 onSignedOut={onSignedOut}
@@ -1459,8 +1452,10 @@ export function ServerWorkspace({
             )}
           </nav>
           <div className="topbar-right">
-            {(!session || window.mcPanelConnections?.unified) && (
-              <PanelSettings notify={notify} />
+            {(!session ||
+              window.mcPanelConnections?.unified ||
+              window.mcPanelConnections?.openUpdates) && (
+              <PanelSettings notify={notify} remote={Boolean(session)} />
             )}
             <DesktopUpdates remote={Boolean(session)} />
             <button
@@ -1650,6 +1645,7 @@ function useServerPower(
   const [powerAction, setPowerAction] = useState<
     "start" | "stop" | "restart" | "force-stop" | null
   >(null);
+  const activePowerAction = useRef<typeof powerAction>(null);
   const powerRequest = useRef(0);
   const busy = commandBusy || powerAction !== null;
   const canPower = (action: "start" | "stop" | "restart" | "force-stop") =>
@@ -1658,7 +1654,7 @@ function useServerPower(
       `control.${action === "force-stop" ? "stop" : action}`,
     );
   const [confirmPower, setConfirmPower] = useState<
-    "stop" | "restart" | "force-stop" | null
+    "restart" | "force-stop" | null
   >(null);
   useDialogFocus(confirmPower !== null, () => setConfirmPower(null));
   useEffect(() => {
@@ -1667,11 +1663,20 @@ function useServerPower(
   }, [confirmPower, server?.status]);
   async function power(action: "start" | "stop" | "restart" | "force-stop") {
     if (!canPower(action)) return;
+    // Block repeated clicks before React updates both sets of controls. A
+    // confirmed force stop can still replace a graceful stop that is stuck.
+    if (
+      activePowerAction.current &&
+      (action !== "force-stop" || activePowerAction.current === "force-stop")
+    )
+      return;
+    if (action === "force-stop" && server?.status !== "stopping") return;
     const token = ++powerRequest.current;
     if (action === "force-stop") {
       ++commandRequest.current;
       setCommandBusy(false);
     }
+    activePowerAction.current = action;
     setPowerAction(action);
     setConfirmPower(null);
     try {
@@ -1689,7 +1694,10 @@ function useServerPower(
       if (token === powerRequest.current)
         notify((error as Error).message, true);
     } finally {
-      if (token === powerRequest.current) setPowerAction(null);
+      if (token === powerRequest.current) {
+        activePowerAction.current = null;
+        setPowerAction(null);
+      }
     }
   }
   return {
@@ -1743,11 +1751,10 @@ function PowerButtons({
               ? powerAction === "force-stop"
               : (!isRunning && server?.status !== "starting") || busy
           }
-          onClick={() =>
-            setConfirmPower(
-              server?.status === "stopping" ? "force-stop" : "stop",
-            )
-          }
+          onClick={() => {
+            if (server?.status === "stopping") setConfirmPower("force-stop");
+            else void power("stop");
+          }}
         >
           <Square size={12} fill="currentColor" />
           {server?.status === "stopping" ? "Force Stop" : "Stop"}
@@ -1774,12 +1781,8 @@ function PowerConfirmation({
             aria-labelledby="power-title"
           >
             <h2 id="power-title">
-              {confirmPower === "force-stop"
-                ? "Force stop"
-                : confirmPower === "stop"
-                  ? "Stop"
-                  : "Restart"}{" "}
-              your server?
+              {confirmPower === "force-stop" ? "Force stop" : "Restart"} your
+              server?
             </h2>
             <p>
               {confirmPower === "force-stop"
@@ -1796,9 +1799,7 @@ function PowerConfirmation({
               >
                 {confirmPower === "force-stop"
                   ? "Force stop server"
-                  : confirmPower === "stop"
-                    ? "Stop server"
-                    : "Restart server"}
+                  : "Restart server"}
               </button>
             </div>
           </section>

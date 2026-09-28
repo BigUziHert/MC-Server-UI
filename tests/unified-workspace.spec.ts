@@ -279,6 +279,9 @@ test("Panel Settings opens this computer's updater once from local and remote se
   );
   for (const [index, host] of ["This computer", "Computer A"].entries()) {
     await select(page, host);
+    await expect(
+      page.getByRole("button", { name: "App updates", exact: true }),
+    ).toHaveCount(0);
     await page
       .getByRole("button", { name: "Panel Settings", exact: true })
       .click();
