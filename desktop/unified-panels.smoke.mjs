@@ -67,10 +67,54 @@ async function fixture() {
   });
   let prompts = 0;
   const certificateControl = { pause: false, release: null };
+  const cleanupControl = { delayNextMs: 0, operations: [] };
+  const observeCleanup = async (operation, action, delayMs = 0) => {
+    const record = {
+      operation,
+      delayMs,
+      startedAt: Date.now(),
+      durationMs: null,
+    };
+    cleanupControl.operations.push(record);
+    try {
+      // Preserve the actual Electron cleanup, including any failure. A one-off
+      // delay below tests a slow native callback without bypassing cleanup.
+      await action();
+      if (delayMs) await new Promise((resolve) => setTimeout(resolve, delayMs));
+    } finally {
+      record.durationMs = Date.now() - record.startedAt;
+    }
+  };
   controller = createUnifiedPanelController({
     window,
     localOrigin: runtime.url,
-    session,
+    session: {
+      fromPartition(partition) {
+        const native = session.fromPartition(partition);
+        if (!partition.startsWith("persist:mc-remote-")) return native;
+        return new Proxy(native, {
+          get(target, property) {
+            if (property === "clearStorageData")
+              return (...args) => {
+                const delayMs = cleanupControl.delayNextMs;
+                cleanupControl.delayNextMs = 0;
+                return observeCleanup(
+                  "clearStorageData",
+                  () => target.clearStorageData(...args),
+                  delayMs,
+                );
+              };
+            if (property === "closeAllConnections")
+              return (...args) =>
+                observeCleanup("closeAllConnections", () =>
+                  target.closeAllConnections(...args),
+                );
+            const value = Reflect.get(target, property, target);
+            return typeof value === "function" ? value.bind(target) : value;
+          },
+        });
+      },
+    },
     dialog: {
       showMessageBox: async () => {
         prompts++;
@@ -93,6 +137,7 @@ async function fixture() {
   globalThis.__unifiedSmoke = {
     ready: true,
     certificateControl,
+    cleanupControl,
     inspect: () => ({
       snapshot: controller.list(),
       prompts,
@@ -870,15 +915,56 @@ async function smoke() {
     await manager
       .getByRole("button", { name: `Sign out of ${labelA}`, exact: true })
       .click();
+    await application.evaluate(() => {
+      globalThis.__unifiedSmoke.cleanupControl.delayNextMs = 6000;
+    });
+    const signOutStarted = Date.now();
+    const priorLogouts = requests.filter(
+      (request) =>
+        request.host === "a" && request.path === "/api/access/logout",
+    ).length;
     await manager
       .getByRole("button", { name: "Sign out of this panel", exact: true })
       .click();
+    // Completing sign-out includes real native partition cleanup. The default
+    // five-second assertion is shorter than a legitimate slow callback. Allow
+    // the injected delay plus slower Windows cleanup within a bounded wait.
     await expect(
       manager.getByRole("button", {
         name: `Sign in to ${labelA}`,
         exact: true,
       }),
-    ).toBeVisible();
+    ).toBeVisible({ timeout: 30000 });
+    const signOutDurationMs = Date.now() - signOutStarted;
+    const cleanup = await application.evaluate(
+      () => globalThis.__unifiedSmoke.cleanupControl.operations,
+    );
+    const delayedCleanup = cleanup.find((entry) => entry.delayMs === 6000);
+    assert.ok(
+      delayedCleanup?.durationMs >= 6000 && signOutDurationMs >= 6000,
+      "Sign-out waits for the delayed real native cleanup before completing",
+    );
+    await expect
+      .poll(
+        () =>
+          requests.filter(
+            (request) =>
+              request.host === "a" && request.path === "/api/access/logout",
+          ).length,
+        { timeout: 15000 },
+      )
+      .toBe(priorLogouts + 1);
+    assert.equal(
+      requests
+        .filter(
+          (request) =>
+            request.host === "a" && request.path === "/api/access/logout",
+        )
+        .at(-1).authorization,
+      `Bearer ${token("a")}`,
+      "The new logout request revokes A's own session",
+    );
+    console.log("Native sign-out completed:", { signOutDurationMs, cleanup });
     await page.evaluate(
       (id) => window.mcPanelConnections.retry(id),
       reconnectedA.id,
@@ -967,6 +1053,26 @@ async function smoke() {
       "Passed native unified workspace: invitation cancellation/reopening preserves pending password setup and grants; one-form sign-in waits for certificate confirmation; local/A/C workspace geometry fills wide displays while preserving native zoom; A/C bearer isolation with colliding IDs; streamed multipart upload and client download surviving selection changes; encrypted session restart, trust persistence, epoch rejection; signed-out panels stay only in Manage Connections and non-authenticating status proof removes confirmed revoked accounts without affecting other panels.",
     );
   } catch (cause) {
+    if (application) {
+      console.error(
+        "Native cleanup timing at failure:",
+        await application
+          .evaluate(() => ({
+            cleanup: globalThis.__unifiedSmoke?.cleanupControl.operations,
+            panels: globalThis.__unifiedSmoke
+              ?.inspect()
+              .snapshot.panels.map(
+                ({ local, signedIn, connectionState, error }) => ({
+                  local,
+                  signedIn,
+                  connectionState,
+                  error,
+                }),
+              ),
+          }))
+          .catch(() => "unavailable"),
+      );
+    }
     if (stderr) console.error(stderr);
     throw cause;
   } finally {
