@@ -11,6 +11,8 @@ files:
   - server/access.mjs
   - server/remote-access.mjs
   - server/remote-tls.mjs
+  - server/managed-https.mjs
+  - server/managed-https-child.mjs
   - server/audit.mjs
   - server/installed-minecraft.mjs
   - server/minecraft-version.mjs
@@ -78,6 +80,17 @@ files:
   - desktop/assets/**/*
   - package.json
 asar: true
+extraResources:
+  - from: desktop/vendor/caddy
+    to: caddy
+    filter:
+      - caddy.exe
+      - LICENSE
+      - README.md
+      - AUTHORS
+      - NOTICE
+      - MC-Panel-NOTICE.txt
+      - manifest.json
 npmRebuild: false
 publish:
   provider: github

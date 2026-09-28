@@ -59,12 +59,19 @@ type Subuser = {
 type AccessSettings = {
   enabled: boolean;
   publicUrl: string;
-  transport: "direct" | "proxy";
+  transport: "managed" | "direct" | "proxy";
   port: number;
   ready: boolean;
   listening?: boolean;
   error?: string;
+  networkWarning?: string;
   certificate?: { fingerprint256: string; validTo: string; hosts: string[] };
+  managedHttps?: {
+    state: "disabled" | "starting" | "provisioning" | "ready" | "error";
+    ready: boolean;
+    message: string;
+    certificate?: { validTo: string };
+  };
 };
 type NetworkInfo = {
   publicIp: string | null;
@@ -79,7 +86,14 @@ type Invitation = {
   panelWide?: boolean;
 };
 function accessReady(settings: AccessSettings | null) {
-  return !!settings?.ready && !settings.error && settings.listening !== false;
+  return (
+    !!settings?.enabled &&
+    !!settings.ready &&
+    !settings.error &&
+    settings.listening !== false &&
+    (settings.transport !== "managed" ||
+      (settings.managedHttps?.state === "ready" && settings.managedHttps.ready))
+  );
 }
 const permissionIds = catalog.groups.flatMap((group) =>
   group.permissions.map((permission) => permission.id),
@@ -106,7 +120,7 @@ export function RemoteAccessSetup({
   const [draft, setDraft] = useState({
     enabled: false,
     publicUrl: "",
-    transport: "direct" as "direct" | "proxy",
+    transport: "managed" as AccessSettings["transport"],
     port: "3002",
   });
   const [loading, setLoading] = useState(true);
@@ -116,19 +130,34 @@ export function RemoteAccessSetup({
   const [error, setError] = useState("");
   const [discovering, setDiscovering] = useState(false);
   const [networkError, setNetworkError] = useState("");
+  const [pollError, setPollError] = useState("");
+  const settingsRevision = useRef(0);
 
-  const applySettings = useCallback(
+  const publishSettings = useCallback(
     (value: AccessSettings) => {
       setSettings(value);
       onSettings(value);
+      window.dispatchEvent(
+        new CustomEvent("mc-panel-access-settings-changed", { detail: value }),
+      );
+    },
+    [onSettings],
+  );
+
+  const applySettings = useCallback(
+    (value: AccessSettings, initial = false) => {
+      publishSettings(value);
       setDraft({
         enabled: value.enabled,
         publicUrl: value.publicUrl || "",
-        transport: value.transport || "direct",
+        transport:
+          initial && !value.enabled && !value.publicUrl
+            ? "managed"
+            : value.transport || "direct",
         port: String(value.port || 3002),
       });
     },
-    [onSettings],
+    [publishSettings],
   );
 
   const load = useCallback(
@@ -140,7 +169,7 @@ export function RemoteAccessSetup({
           signal,
         });
         if (signal?.aborted) return;
-        applySettings(result);
+        applySettings(result, true);
         setExpanded(!accessReady(result));
       } catch (cause) {
         if (signal?.aborted) return;
@@ -166,6 +195,75 @@ export function RemoteAccessSetup({
     return () => controller.abort();
   }, [load]);
 
+  // Certificate issuance and renewal continue in the host. Refresh status without
+  // replacing an owner's unfinished edits or accepting a pre-save response.
+  useEffect(() => {
+    if (!settings?.enabled || settings.transport !== "managed" || saving)
+      return;
+    const controller = new AbortController();
+    let timer: ReturnType<typeof setTimeout>;
+    async function poll() {
+      const revision = settingsRevision.current;
+      try {
+        const value = await panelApi<AccessSettings>("/access/settings", {
+          signal: controller.signal,
+        });
+        if (controller.signal.aborted || revision !== settingsRevision.current)
+          return;
+        setPollError("");
+        publishSettings(value);
+      } catch {
+        if (controller.signal.aborted || revision !== settingsRevision.current)
+          return;
+        setPollError(
+          "Unable to check certificate status. MC Panel will try again automatically.",
+        );
+        setSettings((current) =>
+          current ? { ...current, ready: false } : null,
+        );
+        onSettings(null);
+        window.dispatchEvent(
+          new CustomEvent("mc-panel-access-settings-changed", { detail: null }),
+        );
+      } finally {
+        if (!controller.signal.aborted)
+          timer = setTimeout(() => void poll(), 3000);
+      }
+    }
+    timer = setTimeout(() => void poll(), 3000);
+    return () => {
+      controller.abort();
+      clearTimeout(timer);
+    };
+  }, [
+    settings?.enabled,
+    settings?.transport,
+    saving,
+    panelApi,
+    publishSettings,
+    onSettings,
+  ]);
+
+  function changeTransport(transport: AccessSettings["transport"]) {
+    setDraft((current) => {
+      let publicUrl = current.publicUrl;
+      try {
+        const url = new URL(publicUrl);
+        if (transport === "managed") url.port = "";
+        else if (
+          transport === "direct" &&
+          current.transport === "managed" &&
+          !url.port
+        )
+          url.port = current.port || "3002";
+        publicUrl = url.origin;
+      } catch {
+        /* Keep an incomplete address editable. */
+      }
+      return { ...current, transport, publicUrl };
+    });
+  }
+
   async function discoverAddress() {
     setDiscovering(true);
     setNetworkError("");
@@ -177,7 +275,7 @@ export function RemoteAccessSetup({
           : value.publicIp;
         setDraft((current) => ({
           ...current,
-          publicUrl: `https://${host}:${current.port || 3002}`,
+          publicUrl: `https://${host}${current.transport === "direct" ? `:${current.port || 3002}` : ""}`,
         }));
       } else
         setNetworkError(
@@ -197,8 +295,10 @@ export function RemoteAccessSetup({
   async function save(event: FormEvent) {
     event.preventDefault();
     if (saving) return;
+    settingsRevision.current++;
     setSaving(true);
     setError("");
+    setPollError("");
     try {
       const result = await panelApi<AccessSettings>("/access/settings", {
         method: "PUT",
@@ -210,10 +310,8 @@ export function RemoteAccessSetup({
         }),
       });
       applySettings(result);
-      window.dispatchEvent(
-        new CustomEvent("mc-panel-access-settings-changed", { detail: result }),
-      );
-      if (result.error) setError(result.error);
+      if (result.error && result.transport !== "managed")
+        setError(result.error);
       else notify("Remote access settings saved.");
     } catch (cause) {
       setError(
@@ -225,18 +323,15 @@ export function RemoteAccessSetup({
       // Refresh readiness while retaining the owner's draft for correction.
       try {
         const current = await panelApi<AccessSettings>("/access/settings");
-        setSettings(current);
-        onSettings(current);
-        window.dispatchEvent(
-          new CustomEvent("mc-panel-access-settings-changed", {
-            detail: current,
-          }),
-        );
+        publishSettings(current);
       } catch {
         setSettings((current) =>
           current ? { ...current, ready: false } : null,
         );
         onSettings(null);
+        window.dispatchEvent(
+          new CustomEvent("mc-panel-access-settings-changed", { detail: null }),
+        );
       }
     } finally {
       setSaving(false);
@@ -286,6 +381,50 @@ export function RemoteAccessSetup({
           {expanded ? "Hide setup" : "Edit setup"}
         </button>
       </div>
+      {settings.enabled && settings.transport === "managed" && (
+        <div
+          className={`subusers-https-status ${accessReady(settings) ? "ready" : ""}`}
+          role="status"
+          aria-live="polite"
+        >
+          <strong>
+            {accessReady(settings)
+              ? "Trusted certificate is ready"
+              : "Trusted HTTPS setup"}
+          </strong>
+          <p>
+            {pollError ||
+              settings.managedHttps?.message ||
+              "Checking the certificate for your public panel address…"}
+          </p>
+          {settings.networkWarning && (
+            <p className="subusers-https-warning">{settings.networkWarning}</p>
+          )}
+          {accessReady(settings) && (
+            <p>
+              Automatic renewal is enabled while MC Panel is running.
+              {settings.managedHttps?.certificate?.validTo &&
+                ` Current certificate expires ${new Date(settings.managedHttps.certificate.validTo).toLocaleString()}.`}{" "}
+              <a
+                href={settings.publicUrl}
+                target="_blank"
+                rel="noopener noreferrer"
+              >
+                Open public panel
+              </a>{" "}
+              on your phone using mobile data to check access from outside your
+              home.
+            </p>
+          )}
+          {!accessReady(settings) && (
+            <p>
+              Invitation links are available after the trusted certificate is
+              ready. Your existing accounts and server permissions are
+              unchanged.
+            </p>
+          )}
+        </div>
+      )}
       {expanded && (
         <form
           id="subusers-access-settings"
@@ -299,6 +438,29 @@ export function RemoteAccessSetup({
               checked={draft.enabled}
               onChange={() => setDraft({ ...draft, enabled: !draft.enabled })}
             />
+            <div className="subusers-setup-field subusers-transport">
+              <label htmlFor="subusers-transport">HTTPS setup</label>
+              <select
+                id="subusers-transport"
+                value={draft.transport}
+                onChange={(event) =>
+                  changeTransport(
+                    event.target.value as AccessSettings["transport"],
+                  )
+                }
+              >
+                <option value="managed">Trusted HTTPS (recommended)</option>
+                <option value="direct">Self-signed HTTPS</option>
+                <option value="proxy">HTTPS handled by a proxy</option>
+              </select>
+              <small>
+                {draft.transport === "managed"
+                  ? "MC Panel runs bundled Caddy to obtain and renew a trusted certificate. No separate installation or domain is required."
+                  : draft.transport === "direct"
+                    ? "Use a configurable public port. Recipients must verify the self-signed certificate."
+                    : "Use your existing HTTPS reverse proxy or tunnel."}
+              </small>
+            </div>
             <div className="subusers-setup-grid">
               <div className="subusers-setup-field">
                 <label htmlFor="subusers-public-url">
@@ -307,7 +469,11 @@ export function RemoteAccessSetup({
                 <input
                   id="subusers-public-url"
                   type="url"
-                  placeholder="https://203.0.113.10:3002"
+                  placeholder={
+                    draft.transport === "direct"
+                      ? "https://203.0.113.10:3002"
+                      : "https://203.0.113.10"
+                  }
                   required={draft.enabled}
                   value={draft.publicUrl}
                   onChange={(event) =>
@@ -315,7 +481,9 @@ export function RemoteAccessSetup({
                   }
                 />
                 <small>
-                  Your public IP and forwarded port, starting with https://.
+                  {draft.transport === "managed"
+                    ? "Your public IP or domain, starting with https://. Trusted HTTPS uses port 443."
+                    : "Your public HTTPS address, including a port when needed."}
                 </small>
                 <button
                   type="button"
@@ -325,47 +493,104 @@ export function RemoteAccessSetup({
                   {discovering ? "Detecting…" : "Use my public IP"}
                 </button>
               </div>
-              <div className="subusers-setup-field">
-                <label htmlFor="subusers-remote-port">Remote access port</label>
-                <input
-                  id="subusers-remote-port"
-                  type="number"
-                  min={1024}
-                  max={65535}
-                  required
-                  value={draft.port}
-                  onChange={(event) =>
-                    setDraft({ ...draft, port: event.target.value })
-                  }
-                />
-                <small>A separate port for authenticated remote access.</small>
-              </div>
+              {draft.transport !== "managed" && (
+                <div className="subusers-setup-field">
+                  <label htmlFor="subusers-remote-port">
+                    Remote access port
+                  </label>
+                  <input
+                    id="subusers-remote-port"
+                    type="number"
+                    min={1024}
+                    max={65535}
+                    required
+                    value={draft.port}
+                    onChange={(event) =>
+                      setDraft({ ...draft, port: event.target.value })
+                    }
+                  />
+                  <small>
+                    A separate port for authenticated remote access.
+                  </small>
+                </div>
+              )}
             </div>
             {networkError && (
               <p className="subusers-form-error" role="alert">
                 {networkError}
               </p>
             )}
-            <details
-              className="subusers-advanced"
-              open={draft.transport === "proxy" || undefined}
-            >
-              <summary>Advanced connection options</summary>
-              <PermissionCheckbox
-                label="HTTPS handled by a proxy"
-                checked={draft.transport === "proxy"}
-                description="Use an existing HTTPS reverse proxy or tunnel instead of the panel’s built-in HTTPS."
-                onChange={() =>
-                  setDraft({
-                    ...draft,
-                    transport:
-                      draft.transport === "direct" ? "proxy" : "direct",
-                  })
-                }
-              />
-            </details>
+            {draft.transport === "managed" && (
+              <details className="subusers-advanced">
+                <summary>Advanced connection options</summary>
+                <div className="subusers-setup-field">
+                  <label htmlFor="subusers-internal-port">
+                    Internal service port
+                  </label>
+                  <input
+                    id="subusers-internal-port"
+                    type="number"
+                    min={1024}
+                    max={65535}
+                    required
+                    value={draft.port}
+                    onChange={(event) =>
+                      setDraft({ ...draft, port: event.target.value })
+                    }
+                  />
+                  <small>
+                    Used only on this computer. Do not forward this port on your
+                    router.
+                  </small>
+                </div>
+              </details>
+            )}
             <div className="subusers-setup-guidance">
-              {draft.transport === "direct" ? (
+              {draft.transport === "managed" ? (
+                <>
+                  <strong>Connect securely from outside your home</strong>
+                  <ol>
+                    <li>
+                      Forward TCP port <code>443</code> on your router to this
+                      computer’s local IP on port <code>443</code>. Reserve that
+                      local IP and allow Caddy through Windows Firewall if
+                      prompted.
+                    </li>
+                    <li>
+                      Enable remote access and save. MC Panel automatically
+                      requests the trusted certificate and renews it while
+                      running.
+                    </li>
+                    <li>
+                      When the certificate is ready, check the public address on
+                      your phone using mobile data, then share invitations.
+                    </li>
+                  </ol>
+                  <p>
+                    Keep this computer and MC Panel running. Update this address
+                    if your public IP changes. Valid trusted certificates remove
+                    certificate warnings in desktop and phone browsers.
+                  </p>
+                  <p>
+                    These settings do not open router or firewall ports. A
+                    shared ISP address (CGNAT), blocked incoming port 443, or
+                    another service using port 443 may require a public IP from
+                    your provider or an existing HTTPS proxy or tunnel.
+                  </p>
+                  <p>
+                    Enabling and saving requests certificates from Let’s Encrypt
+                    for this public address under its{" "}
+                    <a
+                      href="https://letsencrypt.org/repository/"
+                      target="_blank"
+                      rel="noopener noreferrer"
+                    >
+                      Subscriber Agreement
+                    </a>
+                    .
+                  </p>
+                </>
+              ) : draft.transport === "direct" ? (
                 <>
                   <strong>Connect from outside your home</strong>
                   <ol>
@@ -431,10 +656,17 @@ export function RemoteAccessSetup({
               <span>
                 {accessReady(settings)
                   ? "Remote access settings saved."
-                  : "Save the setup, then create an invitation link below."}
+                  : settings.enabled && settings.transport === "managed"
+                    ? "Waiting for a trusted certificate before sharing invitation links."
+                    : "Save the setup, then create an invitation link below."}
               </span>
               <button className="btn primary" type="submit">
-                {saving ? "Saving…" : "Save access settings"}
+                {saving
+                  ? "Saving…"
+                  : settings.transport === "managed" &&
+                      settings.managedHttps?.state === "error"
+                    ? "Retry HTTPS setup"
+                    : "Save access settings"}
               </button>
             </div>
           </fieldset>
@@ -1025,7 +1257,9 @@ function AccessManagement({
         <p className="subusers-editor-notice">
           {accessReady(accessSettings)
             ? "Remote Access is enabled. Invited people can sign in, and see only servers the host has shared with them."
-            : "Enable Remote Access and configure the public panel address in Panel Settings before sharing invitation links."}
+            : accessSettings?.enabled && accessSettings.transport === "managed"
+              ? "Wait for the trusted certificate to be ready before sharing invitation links. Existing accounts and server permissions are preserved."
+              : "Enable Remote Access and configure the public panel address in Panel Settings before sharing invitation links."}
         </p>
       )}
       {invitationError && (

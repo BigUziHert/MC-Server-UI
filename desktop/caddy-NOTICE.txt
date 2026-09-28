@@ -1,0 +1,11 @@
+MC Panel includes the unmodified Windows x64 executable of Caddy 2.11.4.
+Caddy is Copyright 2015 Matthew Holt and the Caddy authors.
+Project and source: https://github.com/caddyserver/caddy/tree/v2.11.4
+Release: https://github.com/caddyserver/caddy/releases/tag/v2.11.4
+Licensed under the Apache License, Version 2.0; the complete upstream LICENSE
+and README are included beside caddy.exe. Caddy is a separate executable;
+MC Panel does not modify its source or imply endorsement by the Caddy authors.
+
+The release archive SHA-256 is pinned in desktop/caddy-release.json from the
+official GitHub release asset metadata. Build preparation checks the archive,
+extracts its original license and README, and records the executable digest.

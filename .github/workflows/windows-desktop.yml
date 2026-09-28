@@ -60,6 +60,13 @@ jobs:
       - name: Verify installer update manifest and checksum
         run: node desktop/verify-update-artifacts.mjs
 
+      - name: Verify bundled HTTPS helper and packaged guardian
+        run: node desktop/caddy.smoke.mjs --packaged
+
+      - name: Verify local ACME IP issuance and automatic renewal
+        timeout-minutes: 3
+        run: node desktop/caddy-acme.smoke.mjs
+
       - name: Run backend and desktop unit tests
         run: pnpm test
 

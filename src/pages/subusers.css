@@ -99,6 +99,7 @@
   font-size: 12px;
 }
 .subusers-setup-field input,
+.subusers-setup-field select,
 .subusers-setup-field textarea {
   min-width: 0;
   width: 100%;
@@ -123,6 +124,37 @@
   margin-top: 21px;
   color: var(--muted);
   font-size: 12px;
+}
+.subusers-transport {
+  margin-top: 18px;
+}
+.subusers-https-status {
+  margin: 0 20px 20px;
+  padding: 13px 16px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: #1d1e27;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.7;
+  overflow-wrap: anywhere;
+}
+.subusers-https-status strong {
+  color: var(--text);
+}
+.subusers-https-status.ready {
+  border-color: #43795b;
+}
+.subusers-https-status p {
+  margin: 6px 0 0;
+}
+.subusers-https-status .subusers-https-warning {
+  color: #e7c583;
+}
+.subusers-https-status a,
+.subusers-setup-guidance a {
+  color: var(--text);
+  text-decoration: underline;
 }
 .subusers-advanced summary {
   cursor: pointer;

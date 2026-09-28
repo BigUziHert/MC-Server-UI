@@ -8,3 +8,4 @@ playwright-report/
 .dev-*.log
 .dev-*.pid
 release/
+desktop/vendor/

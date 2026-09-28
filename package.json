@@ -18,7 +18,7 @@
     "test:e2e": "playwright test",
     "format": "prettier --write src server tests *.ts *.json *.md *.yaml index.html",
     "preview": "vite preview --host 127.0.0.1",
-    "desktop:prepare": "node node_modules/electron/install.js && node desktop/generate-icons.mjs",
+    "desktop:prepare": "node node_modules/electron/install.js && node desktop/generate-icons.mjs && node desktop/prepare-caddy.mjs",
     "desktop": "pnpm desktop:prepare && pnpm build && electron .",
     "desktop:pack": "pnpm desktop:prepare && pnpm build && electron-builder --config electron-builder.yml --win --x64 --dir --publish never",
     "desktop:dist": "pnpm desktop:prepare && pnpm build && electron-builder --config electron-builder.yml --win --x64 --publish never",

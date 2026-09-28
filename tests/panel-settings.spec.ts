@@ -423,3 +423,282 @@ test("an invited account with no servers has no host settings or server controls
     ),
   ).toEqual([]);
 });
+
+type ManagedSettingsFixture = {
+  enabled: boolean;
+  ready: boolean;
+  publicUrl: string;
+  port: number;
+  transport: string;
+  listening: boolean;
+  error?: string;
+  networkWarning?: string;
+  managedHttps?: {
+    state: string;
+    ready: boolean;
+    message: string;
+    certificate?: { validTo: string };
+  };
+};
+
+async function managedSettingsFixture(
+  page: Page,
+  initial: Partial<ManagedSettingsFixture> = {},
+) {
+  await settingsFixture(page, { desktop: false });
+  const fixture = {
+    settings: {
+      enabled: false,
+      ready: false,
+      publicUrl: "",
+      port: 3002,
+      transport: "direct",
+      listening: false,
+      ...initial,
+    } as ManagedSettingsFixture,
+    writes: [] as Record<string, unknown>[],
+    reads: 0,
+    failRead: false,
+  };
+  await page.route("**/api/access/network", (route) =>
+    route.fulfill({
+      json: {
+        publicIp: "203.0.113.20",
+        localAddresses: ["192.168.1.5"],
+        port: 3002,
+      },
+    }),
+  );
+  await page.route("**/api/panel-users", (route) =>
+    route.fulfill({
+      json: {
+        users: [
+          {
+            id: "invited",
+            email: "invited@example.test",
+            panelAccount: true,
+            inviteStatus: "pending",
+            serverIds: ["survival"],
+            permissions: ["server.view"],
+          },
+        ],
+        servers: startupServers,
+      },
+    }),
+  );
+  await page.route("**/api/access/settings", (route) => {
+    if (route.request().method() === "PUT") {
+      const body = route.request().postDataJSON();
+      fixture.writes.push(body);
+      fixture.settings = {
+        ...fixture.settings,
+        ...body,
+        ready: false,
+        listening: true,
+        error: undefined,
+        managedHttps: {
+          state: "provisioning",
+          ready: false,
+          message:
+            "Requesting a trusted certificate. Check that TCP port 443 is forwarded to this computer.",
+        },
+      };
+    } else {
+      fixture.reads++;
+      if (fixture.failRead) return route.abort("failed");
+    }
+    return route.fulfill({ json: fixture.settings });
+  });
+  return fixture;
+}
+
+test("new remote setup recommends trusted HTTPS on 443 and waits for the certificate without replacing edits", async ({
+  page,
+}, testInfo) => {
+  const fixture = await managedSettingsFixture(page);
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.goto("/");
+  const dialog = await openSettings(page);
+  await dialog.getByRole("tab", { name: "Remote Access", exact: true }).click();
+  const setup = dialog.getByRole("region", { name: "Remote access setup" });
+  await expect(setup.getByLabel("HTTPS setup", { exact: true })).toHaveValue(
+    "managed",
+  );
+  await expect(
+    setup.getByLabel("Remote access port", { exact: true }),
+  ).toHaveCount(0);
+  await expect(
+    setup.getByLabel("Internal service port", { exact: true }),
+  ).not.toBeVisible();
+  await expect(setup).toContainText("Forward TCP port 443");
+  await expect(setup).toContainText("CGNAT");
+  await setup
+    .getByRole("button", { name: "Use my public IP", exact: true })
+    .click();
+  await expect(
+    setup.getByLabel("Public panel address", { exact: true }),
+  ).toHaveValue("https://203.0.113.20");
+  const invite = dialog.getByRole("button", {
+    name: "Create invite link for invited@example.test",
+    exact: true,
+  });
+  await expect(invite).toBeDisabled();
+  await setup
+    .getByRole("checkbox", { name: "Enable remote access", exact: true })
+    .check();
+  await setup
+    .getByRole("button", { name: "Save access settings", exact: true })
+    .click();
+  await expect(setup.getByRole("status")).toContainText(
+    "Requesting a trusted certificate",
+  );
+  expect(fixture.writes).toEqual([
+    {
+      enabled: true,
+      transport: "managed",
+      publicUrl: "https://203.0.113.20",
+      port: 3002,
+    },
+  ]);
+  await expect(invite).toBeDisabled();
+  await setup
+    .getByLabel("Public panel address", { exact: true })
+    .fill("https://unfinished.example.test");
+  fixture.settings.ready = true;
+  fixture.settings.networkWarning =
+    "A different public IP was detected. Confirm your router’s address before updating it.";
+  fixture.settings.managedHttps = {
+    state: "ready",
+    ready: true,
+    message: "Your public address has a trusted certificate.",
+    certificate: { validTo: "2028-01-01T00:00:00Z" },
+  };
+  await expect(setup.getByRole("status")).toContainText(
+    "Trusted certificate is ready",
+    { timeout: 10000 },
+  );
+  await expect(invite).toBeEnabled();
+  await expect(setup.getByRole("status")).toContainText(
+    "A different public IP was detected",
+  );
+  await expect(
+    setup.getByLabel("Public panel address", { exact: true }),
+  ).toHaveValue("https://unfinished.example.test");
+  await expect(
+    setup.getByRole("link", { name: "Open public panel" }),
+  ).toHaveAttribute("href", "https://203.0.113.20");
+  await expect(setup).toContainText("using mobile data to check access");
+  expect(
+    await dialog.evaluate(
+      (element) => element.scrollWidth > element.clientWidth,
+    ),
+  ).toBe(false);
+  await page.screenshot({
+    path: testInfo.outputPath("managed-https-mobile.png"),
+    fullPage: true,
+  });
+});
+
+for (const transport of ["direct", "proxy"]) {
+  test(`existing ${transport} setup is retained until the owner explicitly selects trusted HTTPS`, async ({
+    page,
+  }) => {
+    await managedSettingsFixture(page, {
+      transport,
+      publicUrl: "https://existing.example.test:3004",
+      port: 3004,
+    });
+    await page.goto("/");
+    const dialog = await openSettings(page);
+    await dialog
+      .getByRole("tab", { name: "Remote Access", exact: true })
+      .click();
+    const setup = dialog.getByRole("region", { name: "Remote access setup" });
+    await expect(setup.getByLabel("HTTPS setup", { exact: true })).toHaveValue(
+      transport,
+    );
+    await expect(
+      setup.getByLabel("Public panel address", { exact: true }),
+    ).toHaveValue("https://existing.example.test:3004");
+    await expect(
+      setup.getByLabel("Remote access port", { exact: true }),
+    ).toHaveValue("3004");
+    await setup
+      .getByLabel("HTTPS setup", { exact: true })
+      .selectOption("managed");
+    await expect(
+      setup.getByLabel("Public panel address", { exact: true }),
+    ).toHaveValue("https://existing.example.test");
+    await setup
+      .getByText("Advanced connection options", { exact: true })
+      .click();
+    await expect(
+      setup.getByLabel("Internal service port", { exact: true }),
+    ).toHaveValue("3004");
+  });
+}
+
+test("managed certificate failures and unavailable status disable invitations, retry recovers without losing accounts or draft edits", async ({
+  page,
+}) => {
+  const fixture = await managedSettingsFixture(page, {
+    enabled: true,
+    transport: "managed",
+    publicUrl: "https://203.0.113.20",
+    listening: true,
+    // Even a mismatched overall ready flag cannot enable invitation creation.
+    ready: true,
+    managedHttps: {
+      state: "error",
+      ready: false,
+      message: "Port 443 is already in use. Close the other service and retry.",
+    },
+  });
+  await page.goto("/");
+  const dialog = await openSettings(page);
+  await dialog.getByRole("tab", { name: "Remote Access", exact: true }).click();
+  const setup = dialog.getByRole("region", { name: "Remote access setup" });
+  const invite = dialog.getByRole("button", {
+    name: "Create invite link for invited@example.test",
+    exact: true,
+  });
+  await expect(setup.getByRole("status")).toContainText(
+    "Port 443 is already in use",
+  );
+  await expect(invite).toBeDisabled();
+  await setup
+    .getByRole("button", { name: "Retry HTTPS setup", exact: true })
+    .click();
+  await expect(setup.getByRole("status")).toContainText(
+    "Requesting a trusted certificate",
+  );
+  await expect.poll(() => fixture.writes.length).toBe(1);
+  fixture.settings.ready = true;
+  fixture.settings.managedHttps = {
+    state: "ready",
+    ready: true,
+    message: "Your public address has a trusted certificate.",
+  };
+  await expect(invite).toBeEnabled({ timeout: 10000 });
+  await setup
+    .getByLabel("Public panel address", { exact: true })
+    .fill("https://editing.example.test");
+  fixture.failRead = true;
+  await expect(setup.getByRole("status")).toContainText(
+    "Unable to check certificate status",
+    { timeout: 10000 },
+  );
+  await expect(invite).toBeDisabled();
+  await expect(
+    setup.getByLabel("Public panel address", { exact: true }),
+  ).toHaveValue("https://editing.example.test");
+  fixture.failRead = false;
+  await expect(invite).toBeEnabled({ timeout: 10000 });
+  await expect(
+    setup.getByLabel("Public panel address", { exact: true }),
+  ).toHaveValue("https://editing.example.test");
+  expect(fixture.writes).toHaveLength(1);
+  await expect(
+    dialog.getByText("invited@example.test", { exact: true }),
+  ).toBeVisible();
+});

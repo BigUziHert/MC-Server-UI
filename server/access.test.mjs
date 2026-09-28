@@ -126,6 +126,88 @@ test("direct IP access needs only HTTPS address and port, with no email service"
   );
 });
 
+test("automatic HTTPS accepts public origins on 443 and preserves legacy transport defaults", () => {
+  for (const publicUrl of [
+    "https://8.8.8.8",
+    "https://panel.example.com",
+    "https://[2606:4700:4700::1111]:443",
+  ]) {
+    const configuration = validateAccessConfiguration({
+      transport: "managed",
+      enabled: true,
+      publicUrl,
+    });
+    assert.equal(configuration.transport, "managed");
+    assert.equal(
+      configuration.port,
+      3002,
+      "443 belongs to Caddy, never the plaintext upstream",
+    );
+    assert.equal(new URL(configuration.publicUrl).port, "");
+  }
+  for (const publicUrl of [
+    "https://8.8.8.8:3002",
+    "https://127.0.0.1",
+    "https://localhost",
+    "https://10.0.0.1",
+    "https://100.64.1.2",
+    "https://[::1]",
+    "https://[fd00::1]",
+    "https://panel.local",
+    "https://panel.test",
+  ]) {
+    assert.throws(
+      () => validateAccessConfiguration({ transport: "managed", publicUrl }),
+      { status: 400 },
+    );
+  }
+  assert.equal(validateAccessConfiguration({}).transport, "direct");
+  assert.equal(
+    validateAccessConfiguration({}, { transport: "proxy" }).transport,
+    "proxy",
+  );
+});
+
+test("automatic HTTPS readiness blocks invitation issuance without changing pending accounts or grants", async (t) => {
+  let ready = false;
+  const f = await fixture(t, {
+    canIssueInvitations: () => ready,
+    listServerIds: () => ["server-a"],
+  });
+  await f.access.configure({
+    transport: "managed",
+    publicUrl: "https://panel.example.com",
+  });
+  const account = await f.access.createAccount({
+    email: "pending@example.com",
+  });
+  await f.access.grantServer("server-a", account.id, {
+    permissions: ["server.view", "control.start"],
+  });
+  const before = await f.read();
+  await assert.rejects(f.access.inviteAccount(account.id), { status: 409 });
+  await assert.rejects(f.invite(), { status: 409 });
+  assert.deepEqual(await f.read(), before);
+  ready = true;
+  const invitation = await f.access.inviteAccount(account.id);
+  const pending = await f.read();
+  ready = false;
+  await assert.rejects(f.access.inviteAccount(account.id), { status: 409 });
+  assert.deepEqual(
+    await f.read(),
+    pending,
+    "renewal outages must not consume invitations, reset passwords, or revoke grants",
+  );
+  ready = true;
+  const accepted = await f.access.accept(tokenFrom(invitation), password);
+  assert.equal(accepted.session.email, "pending@example.com");
+  assert.deepEqual(
+    accepted.session.memberships.map(({ serverId }) => serverId),
+    ["server-a"],
+  );
+  assert.ok(accepted.session.permissions.includes("control.start"));
+});
+
 test("invitations persist only token hashes, accept once, and preserve live permissions", async (t) => {
   const f = await fixture(t);
   const invitation = await f.invite();

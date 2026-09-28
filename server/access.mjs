@@ -8,6 +8,8 @@ import {
 import fs from "node:fs/promises";
 import path from "node:path";
 import { promisify } from "node:util";
+import { isIP } from "node:net";
+import { legacyConnectionHost } from "./connection.mjs";
 import permissionCatalog from "../shared/subuser-permissions.json" with { type: "json" };
 
 export const SUBUSER_COOKIE = "__Host-mc-subuser";
@@ -119,8 +121,11 @@ export function validateAccessConfiguration(input, current = {}) {
     result.port = input.port;
   }
   if (Object.hasOwn(input, "transport")) {
-    if (input.transport !== "direct" && input.transport !== "proxy")
-      throw fail(400, "Choose direct HTTPS or an HTTPS reverse proxy.");
+    if (!["managed", "direct", "proxy"].includes(input.transport))
+      throw fail(
+        400,
+        "Choose automatic HTTPS, direct HTTPS, or an HTTPS reverse proxy.",
+      );
     result.transport = input.transport;
   }
   if (Object.hasOwn(input, "publicUrl")) {
@@ -157,6 +162,27 @@ export function validateAccessConfiguration(input, current = {}) {
       400,
       "Enter the HTTPS panel address before enabling remote access.",
     );
+  if (result.transport === "managed" && result.publicUrl) {
+    const url = new URL(result.publicUrl);
+    const host = url.hostname.replace(/^\[|\]$/g, "");
+    if (url.port)
+      throw fail(
+        400,
+        "Automatic HTTPS uses public TCP port 443. Enter the address without a custom port.",
+      );
+    if (
+      !legacyConnectionHost(url.host) ||
+      (isIP(host) === 6 && !/^[23]/i.test(host)) ||
+      (!isIP(host) &&
+        /(?:^|\.)(?:localhost|local|internal|invalid|test|onion)\.?$/i.test(
+          host,
+        ))
+    )
+      throw fail(
+        400,
+        "Automatic HTTPS requires a public IP address or public domain. Local and shared ISP addresses cannot receive a trusted public certificate.",
+      );
+  }
   return result;
 }
 
@@ -166,6 +192,7 @@ export async function createAccessService({
   getUser,
   listServerIds = () => [],
   listLegacyUsers = () => [],
+  canIssueInvitations = () => true,
   now = Date.now,
 }) {
   const storage = path.join(dataDir, "remote-access.json");
@@ -485,6 +512,11 @@ export async function createAccessService({
       throw fail(
         409,
         "Configure the HTTPS panel address and enable remote access before creating an invitation link.",
+      );
+    if (state.configuration.transport === "managed" && !canIssueInvitations())
+      throw fail(
+        409,
+        "Automatic HTTPS is not ready. Wait for a trusted certificate in Remote Access, then create an invitation link. Existing accounts and server permissions are preserved.",
       );
   };
   const permissionIds = new Set(

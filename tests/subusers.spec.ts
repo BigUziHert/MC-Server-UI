@@ -875,10 +875,7 @@ test("direct remote setup detects the public IP on request, supports a proxy, an
     path: testInfo.outputPath("subusers-access-setup-desktop.png"),
     fullPage: true,
   });
-  await setup.getByText("Advanced connection options", { exact: true }).click();
-  await setup
-    .getByRole("checkbox", { name: "HTTPS handled by a proxy", exact: true })
-    .check();
+  await setup.getByLabel("HTTPS setup", { exact: true }).selectOption("proxy");
   await expect(setup).toContainText("http://127.0.0.1:3004");
   await setup
     .getByLabel("Public panel address", { exact: true })
@@ -888,9 +885,7 @@ test("direct remote setup detects the public IP on request, supports a proxy, an
     .click();
   await expect.poll(() => changes.length).toBe(2);
   expect(changes[1].transport).toBe("proxy");
-  await setup
-    .getByRole("checkbox", { name: "HTTPS handled by a proxy", exact: true })
-    .uncheck();
+  await setup.getByLabel("HTTPS setup", { exact: true }).selectOption("direct");
   await setup.getByLabel("Remote access port", { exact: true }).fill("80");
   await setup
     .getByRole("button", { name: "Save access settings", exact: true })

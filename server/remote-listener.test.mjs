@@ -62,29 +62,39 @@ async function fixture(
     listen = true,
     delayListening,
     transport = "proxy",
+    managedHttps,
+    publicAddress,
+    bindHost = "127.0.0.1",
   } = {},
 ) {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "mc-remote-listener-"));
   const servers = [],
     events = [];
+  let remote;
   const access = await createAccessService({
     dataDir: root,
     getUser: () => null,
     listMemberships: () => [],
+    canIssueInvitations: () => remote?.status().ready === true,
   });
   await access.configure({
     enabled,
-    publicUrl: "https://panel.example.test",
+    publicUrl:
+      transport === "managed"
+        ? "https://panel.example.com"
+        : "https://panel.example.test",
     transport,
     port: port ?? (await freePort()),
   });
   const app = (_req, res) => res.end("remote listener fixture");
-  const remote = createRemoteListener({
+  remote = createRemoteListener({
     app,
     access,
     dataDir: root,
     listen,
-    bindHost: "127.0.0.1",
+    bindHost,
+    managedHttps,
+    publicAddress,
     localAddresses: () => ["192.168.10.20"],
     createServer(settings, tlsOptions, handler) {
       const server =
@@ -243,6 +253,258 @@ test("test-mode remote listener preserves settings without opening sockets", asy
   assert.equal(f.remote.status().listening, false);
   assert.equal(f.servers.length, 0);
   assert.equal(f.remote.status().publicUrl, "https://other-panel.example.test");
+});
+
+const fakeManaged = () => {
+  const state = {
+    ready: false,
+    enabled: false,
+    fail: false,
+    calls: [],
+    closed: false,
+  };
+  return Object.assign(state, {
+    status: () => ({
+      ready: state.enabled && state.ready,
+      state: state.enabled
+        ? state.ready
+          ? "ready"
+          : "provisioning"
+        : "disabled",
+      message: "Test certificate state",
+      publicUrl: state.publicUrl,
+    }),
+    async configure(input) {
+      state.calls.push(input);
+      state.enabled = input.enabled;
+      state.publicUrl = input.enabled ? input.publicUrl : undefined;
+      if (input.enabled && state.fail)
+        throw Object.assign(new Error("missing binary"), { code: "ENOENT" });
+    },
+    async close() {
+      state.enabled = false;
+      state.closed = true;
+    },
+  });
+};
+
+test("automatic HTTPS keeps the upstream on loopback and waits for a verified certificate", async (t) => {
+  const managed = fakeManaged();
+  const f = await fixture(t, {
+    transport: "managed",
+    managedHttps: managed,
+    bindHost: "0.0.0.0",
+  });
+  await f.remote.configure({ enabled: true });
+  assert.equal(f.remote.status().listening, true);
+  assert.equal(f.remote.status().ready, false);
+  assert.equal(f.remote.status().managedHttps.state, "provisioning");
+  assert.deepEqual(managed.calls.at(-1), {
+    enabled: true,
+    publicUrl: "https://panel.example.com",
+    upstreamPort: f.port,
+  });
+  assert.equal((await read(f.port)).status, 200);
+  managed.ready = true;
+  assert.equal(f.remote.status().ready, true);
+  managed.ready = false;
+  assert.equal(
+    f.remote.status().ready,
+    false,
+    "expired or unavailable certificate must stop reporting readiness",
+  );
+  await f.remote.configure({ enabled: false });
+  assert.equal(managed.enabled, false);
+  await assert.rejects(read(f.port), { code: "ECONNREFUSED" });
+  await f.remote.close();
+  assert.equal(managed.closed, true);
+});
+
+test("automatic HTTPS startup failure preserves pending invitations and account grants for retry", async (t) => {
+  const managed = fakeManaged();
+  const f = await fixture(t, { transport: "managed", managedHttps: managed });
+  await f.remote.configure({ enabled: true });
+  managed.ready = true;
+  const account = await f.access.createAccount({
+    email: "invited@example.com",
+  });
+  const invite = await f.access.inviteAccount(account.id);
+  const token = invite.invitationUrl.split("#invite=")[1];
+  const before = JSON.parse(
+    await fs.readFile(path.join(f.root, "remote-access.json"), "utf8"),
+  );
+  managed.fail = true;
+  await assert.rejects(f.remote.configure({ enabled: true }), { status: 409 });
+  assert.equal(f.remote.status().enabled, true);
+  assert.equal(f.remote.status().ready, false);
+  assert.equal(f.remote.status().listening, false);
+  const after = JSON.parse(
+    await fs.readFile(path.join(f.root, "remote-access.json"), "utf8"),
+  );
+  assert.deepEqual(after.accounts, before.accounts);
+  assert.deepEqual(after.tokens, before.tokens);
+  assert.equal((await f.access.previewInvitation(token)).email, account.email);
+  managed.fail = false;
+  await f.remote.configure({ enabled: true });
+  assert.equal(f.remote.status().ready, true);
+  assert.equal(f.remote.status().error, undefined);
+});
+
+test("managed address and port changes cannot borrow readiness or invitations from the old listener", async (t) => {
+  const managed = fakeManaged();
+  let release,
+    reportListening,
+    shouldHold = false;
+  const hold = new Promise((resolve) => {
+    release = resolve;
+  });
+  const listening = new Promise((resolve) => {
+    reportListening = resolve;
+  });
+  const f = await fixture(t, {
+    transport: "managed",
+    managedHttps: managed,
+    delayListening: async () => {
+      if (shouldHold) {
+        reportListening();
+        await hold;
+      }
+    },
+  });
+  await f.remote.configure({ enabled: true });
+  managed.ready = true;
+  const account = await f.access.createAccount({
+    email: "invited@example.com",
+  });
+  assert.equal(f.remote.status().ready, true);
+  shouldHold = true;
+  const nextPort = await freePort();
+  const configuring = f.remote.configure({
+    publicUrl: "https://new-panel.example.com:443",
+    port: nextPort,
+  });
+  await listening;
+  try {
+    assert.equal(
+      managed.status().ready,
+      true,
+      "The old certificate is still valid for the old origin.",
+    );
+    assert.equal(managed.status().publicUrl, "https://panel.example.com");
+    assert.equal(f.remote.status().publicUrl, "https://new-panel.example.com");
+    assert.equal(f.remote.status().ready, false);
+    assert.equal(f.remote.status().managedHttps.ready, false);
+    assert.equal(f.remote.status().managedHttps.state, "starting");
+    await assert.rejects(f.access.inviteAccount(account.id), { status: 409 });
+  } finally {
+    release();
+  }
+  await configuring;
+  assert.equal(f.remote.status().ready, true);
+  const invite = await f.access.inviteAccount(account.id);
+  assert.ok(
+    invite.invitationUrl.startsWith("https://new-panel.example.com/#invite="),
+  );
+  managed.publicUrl = "https://panel.example.com";
+  assert.equal(
+    f.remote.status().ready,
+    false,
+    "Origin matching also applies when the listener port matches.",
+  );
+  await assert.rejects(f.access.inviteAccount(account.id), { status: 409 });
+});
+
+test("managed port and transport identity must match the current persisted settings", async (t) => {
+  const managed = fakeManaged();
+  const f = await fixture(t, { transport: "proxy", managedHttps: managed });
+  await f.remote.configure({
+    enabled: true,
+    publicUrl: "https://panel.example.com",
+  });
+  await managed.configure({
+    enabled: true,
+    publicUrl: "https://panel.example.com",
+  });
+  managed.ready = true;
+  // Hold the state at the precise boundary between persistence and sync.
+  await f.access.configure({ transport: "managed" });
+  assert.equal(
+    f.remote.status().ready,
+    false,
+    "A prior proxy socket is not the managed listener.",
+  );
+  await f.remote.configure({ transport: "managed" });
+  assert.equal(f.remote.status().ready, true);
+  await f.access.configure({ port: await freePort() });
+  assert.equal(
+    f.remote.status().ready,
+    false,
+    "A verified old upstream port cannot satisfy new settings.",
+  );
+});
+
+test("shutdown during managed socket binding does not start its HTTPS guardian", async (t) => {
+  const managed = fakeManaged();
+  let release, reportListening;
+  const hold = new Promise((resolve) => {
+    release = resolve;
+  });
+  const listening = new Promise((resolve) => {
+    reportListening = resolve;
+  });
+  const f = await fixture(t, {
+    transport: "managed",
+    managedHttps: managed,
+    delayListening: async () => {
+      reportListening();
+      await hold;
+    },
+  });
+  const configuring = f.remote.configure({ enabled: true });
+  await listening;
+  const closing = f.remote.close();
+  try {
+    assert.equal(f.remote.status().ready, false);
+  } finally {
+    release();
+  }
+  await configuring;
+  await closing;
+  assert.equal(
+    managed.calls.some((value) => value.enabled),
+    false,
+  );
+  assert.equal(managed.closed, true);
+  assert.equal(f.remote.status().listening, false);
+  await assert.rejects(read(f.port), { code: "ECONNREFUSED" });
+});
+
+test("switching away from automatic HTTPS stops Caddy and preserves the direct fallback", async (t) => {
+  const managed = fakeManaged();
+  const f = await fixture(t, { transport: "managed", managedHttps: managed });
+  await f.remote.configure({ enabled: true });
+  await f.remote.configure({ transport: "direct" });
+  assert.equal(managed.enabled, false);
+  assert.equal(f.remote.status().managedHttps, undefined);
+  const saved = JSON.parse(
+    await fs.readFile(path.join(f.root, "remote-tls.json"), "utf8"),
+  );
+  assert.equal((await read(f.port, saved.cert)).status, 200);
+});
+
+test("changed public IP is reported without silently rewriting addresses or invalidating invitations", async (t) => {
+  const managed = fakeManaged();
+  const f = await fixture(t, {
+    transport: "managed",
+    managedHttps: managed,
+    publicAddress: { resolve: async () => "9.9.9.9" },
+  });
+  await f.remote.configure({ enabled: true, publicUrl: "https://8.8.8.8" });
+  await new Promise(setImmediate);
+  assert.match(f.remote.status().networkWarning, /9\.9\.9\.9/);
+  assert.equal(f.remote.status().publicUrl, "https://8.8.8.8");
+  await f.remote.configure({ enabled: false });
+  assert.equal(f.remote.status().networkWarning, undefined);
 });
 
 test("direct access serves verified HTTPS, preserves its certificate, and can switch to proxy on the same port", async (t) => {

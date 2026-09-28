@@ -4031,6 +4031,7 @@ export async function createFleet(options = {}) {
   };
   const runtimes = new Map();
   let access;
+  let remote;
   let updateManagedServer;
   let registry;
   let changeChain = Promise.resolve();
@@ -4611,6 +4612,7 @@ export async function createFleet(options = {}) {
   try {
     access = await createAccessService({
       dataDir,
+      canIssueInvitations: () => remote?.status().ready === true,
       listServerIds: () => registry.servers.map((entry) => entry.id),
       listLegacyUsers: () =>
         [...runtimes].flatMap(([serverId, runtime]) =>
@@ -4646,13 +4648,15 @@ export async function createFleet(options = {}) {
     localAddresses: options.localAddresses,
     hostApp: remoteHostApp,
   });
-  const remote = createRemoteListener({
+  remote = createRemoteListener({
     app: remoteApp,
     access,
     dataDir,
     localAddresses: options.localAddresses,
     bindHost: options.remoteBindHost,
     listen: options.remoteListen !== false,
+    managedHttps: options.managedHttps,
+    publicAddress,
   });
   const app = express();
   app.disable("x-powered-by");

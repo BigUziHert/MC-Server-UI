@@ -4,7 +4,9 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import http from "node:http";
 import https from "node:https";
 import { createHash } from "node:crypto";
+import { isIP } from "node:net";
 import { createAccessRateLimiter, SUBUSER_COOKIE } from "./access.mjs";
+import { createManagedHttps } from "./managed-https.mjs";
 import {
   createRemoteTls,
   addressHost,
@@ -393,7 +395,7 @@ export function createRemoteGateway({
   // peer limit, and combine a generous proxy budget with a per-account limit.
   // Forwarding headers remain untrusted in both modes.
   const loginLimit = createAccessRateLimiter({
-    limit: () => (access.status().transport === "proxy" ? 240 : 8),
+    limit: () => (access.status().transport === "direct" ? 8 : 240),
   });
   const accountLoginLimit = createAccessRateLimiter({
     limit: 8,
@@ -407,7 +409,7 @@ export function createRemoteGateway({
         .digest("hex"),
   });
   const acceptLimit = createAccessRateLimiter({
-    limit: () => (access.status().transport === "proxy" ? 240 : 30),
+    limit: () => (access.status().transport === "direct" ? 30 : 240),
   });
   app.get("/api/access/session", async (req, res) => {
     // Retire credentials issued by older versions. They cannot authenticate
@@ -608,6 +610,8 @@ export function createRemoteListener({
   listen = true,
   localAddresses = localNetworkAddresses,
   bindHost,
+  managedHttps,
+  publicAddress,
   createServer = (settings, tlsOptions, handler) =>
     settings.transport === "direct"
       ? https.createServer({ ...tlsOptions, minVersion: "TLSv1.2" }, handler)
@@ -620,6 +624,45 @@ export function createRemoteListener({
   let listenerError = "";
   let chain = Promise.resolve();
   let closed = false;
+  let managed = managedHttps;
+  let networkTimer;
+  let networkWarning;
+  let networkRevision = 0;
+  const manager = () => (managed ??= createManagedHttps({ dataDir }));
+  const checkAddress = () => {
+    clearTimeout(networkTimer);
+    const revision = ++networkRevision;
+    networkWarning = undefined;
+    const settings = access.status();
+    if (
+      closed ||
+      !settings.enabled ||
+      settings.transport !== "managed" ||
+      !publicAddress
+    )
+      return;
+    const host = new URL(settings.publicUrl).hostname.replace(/^\[|\]$/g, "");
+    // The resolver detects outward-facing IPv4. It cannot authoritatively
+    // replace an owner's inbound address (VPNs and multiple WANs may differ).
+    if (isIP(host) !== 4) return;
+    const run = async () => {
+      try {
+        const current = await publicAddress.resolve();
+        if (closed || revision !== networkRevision) return;
+        networkWarning =
+          current && current !== host
+            ? `Your detected public IP is now ${current}, but the panel address uses ${host}. Check your router's public address; if it changed, use your public IP and save again, then share new invitation links. Accounts and server permissions are kept.`
+            : undefined;
+      } catch {
+        /* Certificate state remains authoritative when IP lookup fails. */
+      }
+      if (!closed && revision === networkRevision) {
+        networkTimer = setTimeout(run, 60_000);
+        networkTimer.unref?.();
+      }
+    };
+    void run();
+  };
   const tls = dataDir ? createRemoteTls({ dataDir, localAddresses }) : null;
   const stop = async (current) => {
     if (!current) return;
@@ -629,11 +672,14 @@ export function createRemoteListener({
   const sync = async () => {
     const settings = access.status();
     if (closed || !settings.enabled) {
+      await managed?.configure({ enabled: false });
       await stop(listener);
       listener = undefined;
       return;
     }
     if (!listen) return;
+    if (settings.transport !== "managed")
+      await managed?.configure({ enabled: false });
     const tlsOptions =
       settings.transport === "direct"
         ? await tls.ensure(settings.publicUrl)
@@ -654,6 +700,12 @@ export function createRemoteListener({
           minVersion: "TLSv1.2",
         });
       certificate = tlsOptions?.certificate;
+      if (settings.transport === "managed")
+        await manager().configure({
+          enabled: true,
+          publicUrl: settings.publicUrl,
+          upstreamPort: settings.port,
+        });
       return;
     }
     // A transport change on the same port must release the previous socket.
@@ -661,6 +713,7 @@ export function createRemoteListener({
       await stop(listener);
       listener = undefined;
     }
+    if (closed) return;
     const next = await new Promise((resolve, reject) => {
       const candidate = createServer(settings, tlsOptions, app);
       candidate.once("error", reject);
@@ -668,33 +721,89 @@ export function createRemoteListener({
       // unencrypted upstream is accessible only on this computer.
       candidate.listen(
         settings.port,
-        bindHost ?? (settings.transport === "proxy" ? "127.0.0.1" : undefined),
+        settings.transport === "managed"
+          ? "127.0.0.1"
+          : (bindHost ??
+              (settings.transport === "proxy" ? "127.0.0.1" : undefined)),
         () => resolve(candidate),
       );
     });
+    if (closed) {
+      await stop(next);
+      return;
+    }
     const previous = listener;
     listener = next;
     listenerPort = settings.port;
     listenerTransport = settings.transport;
     certificate = tlsOptions?.certificate;
     await stop(previous);
+    if (closed) return;
+    if (settings.transport === "managed")
+      await manager().configure({
+        enabled: true,
+        publicUrl: settings.publicUrl,
+        upstreamPort: settings.port,
+      });
   };
-  const status = () => ({
-    ...access.status(),
-    ready: access.status().ready && !listenerError,
-    listening: !!listener,
-    ...(access.status().transport === "direct" && certificate
-      ? { certificate }
-      : {}),
-    ...(listenerError ? { error: listenerError } : {}),
-  });
+  const status = () => {
+    const settings = access.status();
+    const managedStatus = managed?.status();
+    const managedMatches =
+      !!listener &&
+      listenerPort === settings.port &&
+      listenerTransport === settings.transport &&
+      managedStatus?.publicUrl === settings.publicUrl;
+    return {
+      ...settings,
+      ready:
+        !closed &&
+        settings.ready &&
+        !listenerError &&
+        (settings.transport !== "managed" ||
+          (managedMatches && managedStatus?.ready === true)),
+      listening: !!listener,
+      ...(settings.transport === "managed"
+        ? {
+            // Settings are persisted before replacement sockets and certificates
+            // are ready. An old origin's certificate must not enable invitations
+            // or show a ready message for the newly configured panel address.
+            managedHttps:
+              managedStatus?.ready && (!managedMatches || closed)
+                ? {
+                    state: closed ? "disabled" : "starting",
+                    ready: false,
+                    publicUrl: settings.publicUrl,
+                    message: closed
+                      ? "Managed HTTPS is off."
+                      : "Applying the updated HTTPS address and local service settings…",
+                  }
+                : (managedStatus ?? {
+                    state: "disabled",
+                    ready: false,
+                    message:
+                      "Save automatic HTTPS settings to start certificate setup.",
+                  }),
+          }
+        : {}),
+      ...(networkWarning ? { networkWarning } : {}),
+      ...(settings.transport === "direct" && certificate
+        ? { certificate }
+        : {}),
+      ...(listenerError ? { error: listenerError } : {}),
+    };
+  };
   const failed = async (cause) => {
     listenerError = ["EADDRINUSE", "EACCES", "EADDRNOTAVAIL"].includes(
       cause.code,
     )
       ? "The remote port is unavailable. Choose another port and save remote access settings."
       : "Remote HTTPS could not start. Check that the panel can write its data folder and that remote-tls.json contains a valid certificate and private key.";
-    await access.configure({ enabled: false });
+    if (access.status().transport === "managed") {
+      listenerError =
+        "Automatic HTTPS could not start. Check that its bundled files are installed and the internal remote port is free, then save again. Your accounts and invitations are preserved.";
+      await managed?.configure({ enabled: false });
+    } else await access.configure({ enabled: false });
     await stop(listener);
     listener = undefined;
   };
@@ -706,6 +815,7 @@ export function createRemoteListener({
       } catch (cause) {
         await failed(cause);
       }
+      checkAddress();
     },
     configure(input) {
       const operation = chain
@@ -720,6 +830,7 @@ export function createRemoteListener({
             await failed(cause);
             throw failure(409, listenerError);
           }
+          checkAddress();
           return status();
         });
       chain = operation;
@@ -727,7 +838,10 @@ export function createRemoteListener({
     },
     async close() {
       closed = true;
+      networkRevision++;
+      clearTimeout(networkTimer);
       await chain.catch(() => {});
+      await managed?.close();
       await stop(listener);
       listener = undefined;
     },
