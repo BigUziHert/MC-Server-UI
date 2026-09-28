@@ -212,9 +212,15 @@ test("browser origins isolate sign-ins, replay protection, icons and streamed do
     await expect(
       restarted.getByRole("heading", { name: "Welcome to MC Panel" }),
     ).toBeVisible();
-    await restarted
-      .getByRole("button", { name: "Account menu for Signed out", exact: true })
-      .click();
+    await expect(
+      restarted.getByText(new URL(C.origin).host, { exact: true }),
+    ).toHaveCount(0);
+    const signedOutAccount = restarted.getByRole("button", {
+      name: "Account menu for Not signed in",
+      exact: true,
+    });
+    await expect(signedOutAccount).toBeVisible();
+    await signedOutAccount.click();
     await restarted
       .getByRole("menuitem", { name: "Manage Connections", exact: true })
       .click();
