@@ -422,8 +422,7 @@ input:disabled {
   color: #ffd000;
 }
 .main-content {
-  max-width: 1780px;
-  margin: 0 auto;
+  min-width: 0;
   padding: 31px 34px 20px;
 }
 .page-heading {

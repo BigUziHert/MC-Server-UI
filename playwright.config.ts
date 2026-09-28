@@ -53,6 +53,7 @@ export default defineConfig({
     "navigation.spec.ts",
     "sidebar-files.spec.ts",
     "ui-consistency.spec.ts",
+    "panel-layout.spec.ts",
     "onboarding.spec.ts",
     "review-regressions.spec.ts",
   ],

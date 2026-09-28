@@ -488,6 +488,119 @@ async function smoke() {
       c = snapshot.panels.find((panel) => panel.origin === servers[1].origin);
     assert.equal(a.signedIn, true);
     assert.equal(c.signedIn, true);
+
+    // Wide displays must use the available workspace for either host. Keep a
+    // user's native zoom choice while switching; connection type does not set
+    // display density. This server lives only in this smoke's temporary data.
+    const localServerId = await page.evaluate(async () => {
+      const response = await fetch("/api/servers", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name: "Local geometry fixture", port: 25567 }),
+      });
+      if (!response.ok) throw new Error("Geometry fixture creation failed.");
+      const id = (await response.json()).server.id;
+      // API fixture creation bypasses the UI's usual roster refresh.
+      window.dispatchEvent(new Event("focus"));
+      return id;
+    });
+    const previousViewport = await page.evaluate(() => ({
+      width: innerWidth,
+      height: innerHeight,
+    }));
+    const previousZoom = await application.evaluate(({ BrowserWindow }) => {
+      const contents = BrowserWindow.getAllWindows()[0].webContents;
+      const previous = contents.getZoomFactor();
+      contents.setZoomFactor(1.25);
+      return previous;
+    });
+    // A test-only viewport override also works on small CI virtual displays.
+    await page.setViewportSize({ width: 2560, height: 1392 });
+    const measureWorkspace = async (panelId, serverId, name) => {
+      await page.evaluate(
+        ({ panelId, serverId }) =>
+          window.mcPanelConnections.selectServer(panelId, serverId),
+        { panelId, serverId },
+      );
+      await expect(
+        page.getByRole("heading", { name, exact: true }),
+      ).toBeVisible({ timeout: 15000 });
+      const geometry = await page.evaluate(() => {
+        const shell = document.querySelector(".main-shell");
+        const content = document.querySelector(".main-content");
+        const sidebar = document.querySelector(".sidebar");
+        const shellBounds = shell.getBoundingClientRect();
+        const contentBounds = content.getBoundingClientRect();
+        return {
+          viewport: innerWidth,
+          documentWidth: document.documentElement.clientWidth,
+          shellLeft: shellBounds.left,
+          shellRight: shellBounds.right,
+          contentLeft: contentBounds.left,
+          contentRight: contentBounds.right,
+          contentWidth: contentBounds.width,
+          sidebarWidth: sidebar.getBoundingClientRect().width,
+          fontSize: getComputedStyle(document.documentElement).fontSize,
+        };
+      });
+      assert.ok(geometry.viewport > 2012, "Exercise the former page width cap");
+      assert.ok(
+        geometry.contentWidth > 1780,
+        "Wide pages must not stay capped",
+      );
+      assert.ok(Math.abs(geometry.contentLeft - geometry.shellLeft) < 1);
+      assert.ok(Math.abs(geometry.contentRight - geometry.shellRight) < 1);
+      assert.ok(Math.abs(geometry.contentRight - geometry.documentWidth) < 1);
+      assert.equal(
+        await application.evaluate(({ BrowserWindow }) =>
+          BrowserWindow.getAllWindows()[0].webContents.getZoomFactor(),
+        ),
+        1.25,
+        "Switching panels must retain the chosen desktop zoom",
+      );
+      // Different server content may need a vertical scrollbar. Compare the
+      // usable area rather than treating that scrollbar as a layout inset.
+      return {
+        viewport: geometry.viewport,
+        contentLeft: geometry.contentLeft,
+        rightInset: geometry.documentWidth - geometry.contentRight,
+        sidebarWidth: geometry.sidebarWidth,
+        fontSize: geometry.fontSize,
+      };
+    };
+    const localGeometry = await measureWorkspace(
+      "local",
+      localServerId,
+      "Local geometry fixture",
+    );
+    assert.deepEqual(
+      await measureWorkspace(a.id, "same-id", "Computer A"),
+      localGeometry,
+      "Local and remote pages share the same width, typography and sidebar",
+    );
+    assert.deepEqual(
+      await measureWorkspace(c.id, "same-id", "Computer C"),
+      localGeometry,
+      "Another connected panel must not change workspace geometry",
+    );
+    await application.evaluate(({ BrowserWindow }, zoom) => {
+      BrowserWindow.getAllWindows()[0].webContents.setZoomFactor(zoom);
+    }, previousZoom);
+    await page.setViewportSize(previousViewport);
+    await page.evaluate(async (id) => {
+      const response = await fetch(`/api/servers/${encodeURIComponent(id)}`, {
+        method: "DELETE",
+      });
+      if (!response.ok) throw new Error("Geometry fixture removal failed.");
+      window.dispatchEvent(new Event("focus"));
+    }, localServerId);
+    await expect(
+      page.getByRole("button", {
+        name: "Select server Local geometry fixture on This computer",
+        exact: true,
+      }),
+    ).toHaveCount(0, { timeout: 15000 });
+
     const proxy = (panel, endpoint) =>
       `/api/desktop/panels/${panel.id}/proxy/api${endpoint}${endpoint.includes("?") ? "&" : "?"}desktopEpoch=${panel.sessionEpoch}&serverId=same-id`;
     await page.evaluate(
@@ -775,7 +888,7 @@ async function smoke() {
       "Switching/signing out/restarting the client must not stop a remote server",
     );
     console.log(
-      "Passed native unified workspace: invitation cancellation/reopening preserves pending password setup and grants; one-form sign-in waits for certificate confirmation; A/C bearer isolation with colliding IDs; streamed multipart upload and client download surviving selection changes; encrypted session restart, trust persistence, epoch rejection; signed-out panels stay only in Manage Connections and non-authenticating status proof removes confirmed revoked accounts without affecting other panels.",
+      "Passed native unified workspace: invitation cancellation/reopening preserves pending password setup and grants; one-form sign-in waits for certificate confirmation; local/A/C workspace geometry fills wide displays while preserving native zoom; A/C bearer isolation with colliding IDs; streamed multipart upload and client download surviving selection changes; encrypted session restart, trust persistence, epoch rejection; signed-out panels stay only in Manage Connections and non-authenticating status proof removes confirmed revoked accounts without affecting other panels.",
     );
   } catch (cause) {
     if (stderr) console.error(stderr);

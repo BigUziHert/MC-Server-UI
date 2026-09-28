@@ -1,7 +1,6 @@
 .versions-page {
   gap: 0;
-  max-width: 1600px;
-  margin: 0 auto;
+  min-width: 0;
 }
 .versions-page .panel-title {
   padding: 18px 20px;
