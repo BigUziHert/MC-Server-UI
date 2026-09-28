@@ -5,6 +5,101 @@ import {
   serverButton,
 } from "./server-fixtures";
 
+test("double-dot file and folder names remain editable and recoverable after creation", async ({
+  page,
+  request,
+}) => {
+  const fleet = await (await request.get("/api/servers")).json();
+  let port = 29950;
+  while (fleet.servers.some((server: { port: number }) => server.port === port))
+    port++;
+  const created = await request.post("/api/servers", {
+    data: { name: "Double-dot file names", port },
+  });
+  expect(created.status()).toBe(201);
+  const { server } = await created.json();
+  const headers = { "X-Server-Id": server.id };
+  const folder = "..backups";
+  const name = "..notes.txt";
+  try {
+    await page.addInitScript(
+      (id) => localStorage.setItem("mc-panel.active-server", id),
+      server.id,
+    );
+    await page.goto("/#files");
+    await page.getByRole("button", { name: "New folder", exact: true }).click();
+    let dialog = page.getByRole("dialog");
+    await dialog.getByLabel("Folder name").fill(folder);
+    await dialog
+      .getByRole("button", { name: "Create folder", exact: true })
+      .click();
+    await expect(dialog).not.toBeVisible();
+    await page.getByRole("button", { name: folder, exact: true }).click();
+    await page.getByRole("button", { name: "New file", exact: true }).click();
+    dialog = page.getByRole("dialog");
+    await dialog.getByLabel("File name").fill(name);
+    await dialog
+      .getByLabel("Contents (optional)")
+      .fill("Original double-dot file");
+    await dialog
+      .getByRole("button", { name: "Create file", exact: true })
+      .click();
+    await expect(dialog).not.toBeVisible();
+    await page
+      .getByRole("button", { name: `Edit ${name}`, exact: true })
+      .click();
+    dialog = page.getByRole("dialog");
+    await expect(dialog.getByLabel("File contents")).toHaveValue(
+      "Original double-dot file",
+    );
+    await dialog.getByLabel("File contents").fill("Edited double-dot file");
+    await dialog
+      .getByRole("button", { name: "Save changes", exact: true })
+      .click();
+    await expect(dialog).not.toBeVisible();
+    await page.reload();
+    await page.getByRole("button", { name: folder, exact: true }).click();
+    await page
+      .getByRole("button", { name: `Delete ${name}`, exact: true })
+      .click();
+    await page
+      .getByRole("dialog")
+      .getByRole("button", { name: "Move to Recycle Bin", exact: true })
+      .click();
+    await expect(page.getByRole("dialog")).not.toBeVisible();
+    await expect(page.getByRole("button", { name, exact: true })).toHaveCount(
+      0,
+    );
+    await page
+      .getByRole("navigation", { name: "Breadcrumb", exact: true })
+      .getByRole("button", { name: "File Manager", exact: true })
+      .click();
+    await page
+      .getByRole("button", { name: "Open Recycle Bin", exact: true })
+      .click();
+    await page
+      .getByRole("button", { name: `Restore ${name}`, exact: true })
+      .click();
+    await expect(
+      page.getByRole("button", { name: `Restore ${name}`, exact: true }),
+    ).toHaveCount(0);
+    const restored = await request.get(
+      `/api/files/content?path=${encodeURIComponent(`${folder}/${name}`)}`,
+      { headers },
+    );
+    expect(restored.status()).toBe(200);
+    expect((await restored.json()).content).toBe("Edited double-dot file");
+    await page
+      .getByRole("navigation", { name: "Breadcrumb", exact: true })
+      .getByRole("button", { name: "File Manager", exact: true })
+      .click();
+    await page.getByRole("button", { name: folder, exact: true }).click();
+    await expect(page.getByRole("button", { name, exact: true })).toBeVisible();
+  } finally {
+    await removeTestServer(request, server.id);
+  }
+});
+
 for (const width of [1434, 390]) {
   test(`server list and folder breadcrumbs stay scoped and usable at ${width}px`, async ({
     page,

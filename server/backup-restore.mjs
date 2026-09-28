@@ -9,8 +9,8 @@ const canonical = (value) =>
   process.platform === "win32" ? value.toLowerCase() : value;
 const sharingRetryDelays = [50, 100, 200, 400, 800, 1000, 1000, 1000];
 
-async function renameDirectory(source, destination) {
-  const original = await fs.lstat(source);
+async function renameDirectory(source, destination, expected) {
+  const original = expected ?? (await fs.lstat(source));
   for (let attempt = 0; ; attempt++) {
     const current = await fs.lstat(source);
     if (
@@ -18,6 +18,7 @@ async function renameDirectory(source, destination) {
       current.isSymbolicLink() ||
       current.dev !== original.dev ||
       current.ino !== original.ino ||
+      current.birthtimeMs !== original.birthtimeMs ||
       canonical(await fs.realpath(source)) !== canonical(source)
     )
       throw failure(
@@ -159,6 +160,7 @@ export async function restoreBackupArchive(
   const snapshot = path.join(workspace, "backup.tar.gz");
   let preserveWorkspace = false;
   let restored = false;
+  let restoredRoot;
   let restoreError;
   try {
     const available = await fs.statfs(parent);
@@ -201,11 +203,18 @@ export async function restoreBackupArchive(
     // Check the restored startup files before touching the live tree. Panel
     // launch settings are intentionally retained rather than silently restored.
     await validate?.(staged);
+    const stagedStat = await fs.lstat(staged);
+    restoredRoot = {
+      dev: stagedStat.dev,
+      ino: stagedStat.ino,
+      birthtimeMs: stagedStat.birthtimeMs,
+    };
     const current = await fs.lstat(root);
     if (
       current.isSymbolicLink() ||
       current.dev !== rootStat.dev ||
       current.ino !== rootStat.ino ||
+      current.birthtimeMs !== rootStat.birthtimeMs ||
       canonical(await fs.realpath(root)) !== canonical(root)
     )
       throw failure(
@@ -213,7 +222,7 @@ export async function restoreBackupArchive(
         "The server folder changed during restore. Try again.",
       );
     try {
-      await renameDirectory(root, previous);
+      await renameDirectory(root, previous, rootStat);
     } catch (cause) {
       throw failure(
         409,
@@ -222,10 +231,10 @@ export async function restoreBackupArchive(
       );
     }
     try {
-      await renameDirectory(staged, root);
+      await renameDirectory(staged, root, restoredRoot);
     } catch (cause) {
       try {
-        await renameDirectory(previous, root);
+        await renameDirectory(previous, root, rootStat);
       } catch (rollback) {
         preserveWorkspace = true;
         throw failure(
@@ -266,6 +275,7 @@ export async function restoreBackupArchive(
       } catch (cause) {
         if (restored)
           return {
+            restoredRoot,
             warning: `The backup was restored, but temporary restore files could not be removed from ${workspace}. ${cause.message}`,
           };
         if (!restoreError) throw cause;
@@ -273,5 +283,7 @@ export async function restoreBackupArchive(
       }
     }
   }
-  return { warning: null };
+  // Callers may adopt only the staged directory this transaction promoted.
+  // Do not recapture a potentially externally replaced live root after cleanup.
+  return { warning: null, restoredRoot };
 }

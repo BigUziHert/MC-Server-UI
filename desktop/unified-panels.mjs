@@ -83,6 +83,7 @@ export function createUnifiedPanelController({
   const panels = new Map();
   let selectedServer = null,
     closed = false,
+    closing,
     loaded,
     ready = false,
     initializationError = "",
@@ -93,7 +94,7 @@ export function createUnifiedPanelController({
       window.webContents.send("mc-panel-connections:changed");
     return list();
   };
-  const persist = (removeId, promote, authentication) => {
+  const persist = (removeId, promote, authentication, signingOut) => {
     const write = saving
       .catch(() => {})
       .then(async () => {
@@ -110,6 +111,14 @@ export function createUnifiedPanelController({
             throw failure(409, "This panel sign-in changed.");
           authentication.panel.authenticationWriting = true;
         }
+        if (
+          signingOut &&
+          (closed ||
+            signingOut.panel.removed ||
+            panels.get(signingOut.panel.id) !== signingOut.panel ||
+            signingOut.panel.controls !== signingOut.version)
+        )
+          throw failure(409, "This panel sign-in changed.");
         if (promote) {
           if (closed || promote.removed || panels.get(promote.id) !== promote)
             throw failure(409, "This panel sign-in changed.");
@@ -137,17 +146,22 @@ export function createUnifiedPanelController({
               )
               .map((entry) => {
                 const { temporary, ...panel } = entry;
-                return authentication?.panel === entry
-                  ? {
-                      ...panel,
-                      token: authentication.token,
-                      revocationToken: authentication.revocationToken,
-                      session: authentication.account,
-                      servers: [],
-                    }
-                  : { ...panel, session: panel.account };
+                return signingOut?.panel === entry
+                  ? { ...panel, token: null, session: undefined, servers: [] }
+                  : authentication?.panel === entry
+                    ? {
+                        ...panel,
+                        token: authentication.token,
+                        revocationToken: authentication.revocationToken,
+                        session: authentication.account,
+                        servers: [],
+                      }
+                    : { ...panel, session: panel.account };
               }),
-            selectedServer,
+            selectedServer:
+              signingOut && selectedServer?.panelId === signingOut.panel.id
+                ? null
+                : selectedServer,
             ...(promote || authentication
               ? { requireCredentialFor: promote?.id ?? authentication.panel.id }
               : {}),
@@ -162,6 +176,10 @@ export function createUnifiedPanelController({
             panel.servers = [];
             invalidate(panel);
           }
+          // Keep the original credential available for retry until its cleared
+          // snapshot is durable. Apply inside the queue so later writes cannot
+          // put that credential back after a successful sign-out.
+          if (signingOut) forgetSession(signingOut.panel);
           if (promote) promote.temporary = false;
           // Remove in-memory state only after the corresponding disk write succeeds.
           // Do it inside the write queue so a later snapshot cannot resurrect it.
@@ -221,8 +239,9 @@ export function createUnifiedPanelController({
       ...[...panels.values()].filter((panel) => !panel.temporary).map(describe),
     ],
   });
-  const ensure = () => {
-    if (closed) throw failure(503, "MC Panel is shutting down.");
+  const ensure = (allowClosing = false) => {
+    if (closed || (closing && !allowClosing))
+      throw failure(503, "MC Panel is shutting down.");
   };
   const get = (id) => {
     ensure();
@@ -505,9 +524,10 @@ export function createUnifiedPanelController({
       signal,
       timeout = 10000,
       tokenOverride,
+      allowClosing = false,
     } = {},
   ) {
-    ensure();
+    ensure(allowClosing);
     if (panel.removed || panel.removing || panels.get(panel.id) !== panel)
       throw failure(404, "This panel connection is no longer available.");
     const control = new AbortController();
@@ -573,7 +593,13 @@ export function createUnifiedPanelController({
     }
   }
   async function refresh(panel, explicit = false) {
-    if (panel.pendingLeave || panel.removing || panel.removed) return;
+    if (
+      panel.pendingLeave ||
+      panel.signingOut ||
+      panel.removing ||
+      panel.removed
+    )
+      return;
     if (panel.refreshing) {
       if (!explicit || panel.refreshExplicit) return panel.refreshing;
       await panel.refreshing.catch(() => {});
@@ -798,6 +824,8 @@ export function createUnifiedPanelController({
         throw failure(409, "This panel sign-in changed.");
       const panel = get(id);
       if (panel.pendingLeave) throw failure(409, pendingLeaveMessage);
+      if (panel.signingOut)
+        throw failure(409, "Sign-out is still being saved.");
       if (!validToken(credentials?.token))
         throw failure(400, "Provide a valid invitation.");
       if (panel.authenticating || panel.previewing)
@@ -858,57 +886,90 @@ export function createUnifiedPanelController({
       await initialize();
       const panel = get(id);
       if (panel.pendingLeave) throw failure(409, pendingLeaveMessage);
-      const version = ++panel.controls;
-      const credential = panel.token;
-      panel.authenticating = false;
-      panel.pendingTrust?.abort.abort();
-      panel.allowPrompt = false;
-      forgetSession(panel);
-      const signedOutEpoch = panel.epoch;
-      panel.state = "connected";
-      panel.error = "";
-      changed();
-      await persist();
-      await clearLegacy(id);
-      if (credential) {
-        void json(panel, "/api/access/logout", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: "{}",
-          tokenOverride: credential,
-        })
-          .then(async (result) => {
-            if (
-              panel.epoch !== signedOutEpoch ||
-              panel.token ||
-              panel.pendingLeave ||
-              panel.removed ||
-              panel.removing ||
-              closed
-            )
-              return;
-            if (result.accessRevoked === true) {
-              await signedOutRevocation(panel, signedOutEpoch);
-            } else if (validToken(result.revocationToken)) {
-              panel.revocationToken = result.revocationToken;
-              await persist();
-            }
-          })
-          .catch((cause) => {
-            if (
-              cause.status !== 401 &&
-              version === panel.controls &&
-              !panel.token &&
-              !panel.removed &&
-              !closed
-            ) {
-              panel.error =
-                "Signed out on this computer. The host could not confirm session revocation.";
-              changed();
-            }
-          });
-      }
-      return changed();
+      if (panel.signingOut) return panel.signingOut;
+      panel.signingOut = (async () => {
+        // An authentication write already in progress must finish before we
+        // capture the credential to revoke. Queued attempts are invalidated.
+        if (panel.authenticationWriting) await panel.authSaving.catch(() => {});
+        const version = ++panel.controls;
+        const credential = panel.token;
+        panel.authenticating = false;
+        panel.previewing = false;
+        panel.pendingTrust?.abort.abort();
+        panel.allowPrompt = false;
+        invalidate(panel);
+        panel.state = "unavailable";
+        panel.servers = displayRoster(panel.servers);
+        changed();
+        let saveFailed = false;
+        try {
+          await persist(undefined, undefined, undefined, { panel, version });
+          panel.state = "connected";
+          panel.error = "";
+          changed();
+          await clearLegacy(id);
+        } catch (cause) {
+          if (panel.token && version === panel.controls && !closed) {
+            saveFailed = true;
+            panel.error = `Sign-out could not be saved on this computer. ${cause.message || "Check storage permissions and available space."} Retry Sign out to finish.`;
+            panel.nextRefresh = Date.now() + 30000;
+            changed();
+          }
+          throw cause;
+        } finally {
+          // Revocation is independent of local persistence/legacy cleanup. A
+          // failed save retains the bearer for retry, but must not skip the
+          // host request and leave the old durable bearer usable on restart.
+          const signedOutEpoch = panel.epoch;
+          if (credential) {
+            const revocation = json(panel, "/api/access/logout", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: "{}",
+              tokenOverride: credential,
+              allowClosing: true,
+            })
+              .then(async (result) => {
+                if (
+                  panel.epoch !== signedOutEpoch ||
+                  panel.token ||
+                  panel.pendingLeave ||
+                  panel.removed ||
+                  panel.removing ||
+                  closed
+                )
+                  return;
+                if (result.accessRevoked === true) {
+                  await signedOutRevocation(panel, signedOutEpoch);
+                } else if (validToken(result.revocationToken)) {
+                  panel.revocationToken = result.revocationToken;
+                  await persist();
+                }
+              })
+              .catch((cause) => {
+                if (
+                  cause.status !== 401 &&
+                  version === panel.controls &&
+                  !panel.token &&
+                  !panel.removed &&
+                  !closed
+                ) {
+                  panel.error =
+                    "Signed out on this computer. The host could not confirm session revocation.";
+                  changed();
+                }
+              });
+            // A caller may close/restart as soon as the failed action returns.
+            // Give its revocation the normal bounded request deadline first;
+            // offline failure still retains the original bearer for retry.
+            if (saveFailed || closing) await revocation;
+          }
+        }
+        return changed();
+      })().finally(() => {
+        panel.signingOut = null;
+      });
+      return panel.signingOut;
     },
     async retry(id) {
       await initialize();
@@ -920,6 +981,8 @@ export function createUnifiedPanelController({
     async forget(id, expectedAccountId) {
       await initialize();
       const panel = get(id);
+      if (panel.signingOut)
+        throw failure(409, "Sign-out is still being saved.");
       if (panel.temporary || !panel.token || !panel.account)
         throw failure(
           409,
@@ -1254,25 +1317,37 @@ export function createUnifiedPanelController({
       }
     },
     async close() {
-      if (closed) return saving;
-      closed = true;
-      clearInterval(timer);
-      window.webContents.off?.("did-start-navigation", workspaceNavigation);
-      window.webContents.off?.("render-process-gone", cancelWorkspaceAttempts);
-      for (const panel of panels.values()) {
-        panel.pendingTrust?.abort.abort();
-        for (const request of panel.requests) request.abort();
-      }
-      await loaded?.catch(() => {});
-      if (ready) await persist();
-      else await saving.catch(() => {});
-      await store?.close();
-      await Promise.allSettled(
-        [...panels.values()].map(async (panel) => {
-          panel.network.setCertificateVerifyProc(null);
-          await panel.network.closeAllConnections?.();
-        }),
-      );
+      if (closing) return closing;
+      closing = (async () => {
+        // Reject new controls, but finish sign-outs already accepted before
+        // closing the store or aborting their captured revocation request.
+        // This also drains a sign-out waiting for an authentication disk write.
+        await Promise.allSettled(
+          [...panels.values()].map((panel) => panel.signingOut),
+        );
+        closed = true;
+        clearInterval(timer);
+        window.webContents.off?.("did-start-navigation", workspaceNavigation);
+        window.webContents.off?.(
+          "render-process-gone",
+          cancelWorkspaceAttempts,
+        );
+        for (const panel of panels.values()) {
+          panel.pendingTrust?.abort.abort();
+          for (const request of panel.requests) request.abort();
+        }
+        await loaded?.catch(() => {});
+        if (ready) await persist();
+        else await saving.catch(() => {});
+        await store?.close();
+        await Promise.allSettled(
+          [...panels.values()].map(async (panel) => {
+            panel.network.setCertificateVerifyProc(null);
+            await panel.network.closeAllConnections?.();
+          }),
+        );
+      })();
+      return closing;
     },
   };
   async function authenticate(id, pathname, credentials) {
@@ -1282,6 +1357,7 @@ export function createUnifiedPanelController({
       throw failure(409, "This panel sign-in changed.");
     const panel = get(id);
     if (panel.pendingLeave) throw failure(409, pendingLeaveMessage);
+    if (panel.signingOut) throw failure(409, "Sign-out is still being saved.");
     if (panel.authenticating || panel.previewing)
       throw failure(
         409,

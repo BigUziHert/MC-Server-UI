@@ -5,6 +5,7 @@ import { renameSync, symlinkSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { cleanInstall, prepareCleanSettings } from "./clean-install.mjs";
+import { parseProperties } from "./import.mjs";
 import { createRecycleBin } from "./recycle-bin.mjs";
 import { safePath, validateServerConfiguration } from "./index.mjs";
 
@@ -344,6 +345,41 @@ test("fresh settings use pack defaults with the explicit EULA decision and selec
   );
   assert.equal(f.result.files.length, 3);
 });
+
+for (const [name, content, accepted] of [
+  ["the final declined value", "eula=true\neula=false\n", false],
+  ["the final accepted value", "eula=false\neula=TrUe\n", true],
+  ["a colon separator", "eula:true\n", true],
+  ["a whitespace separator", "eula true\n", true],
+  ["escaped keys and continuation values", "e\\u0075la=tr\\\n  ue\n", true],
+  [
+    "a continued unrelated value",
+    "eula=false\nother=value\\\neula=true\n",
+    false,
+  ],
+  ["commented acceptance", "#eula=true\neula=false\n", false],
+]) {
+  test(`clean installation preserves ${name} from EULA properties`, async (t) => {
+    const f = await fixture(t);
+    await f.put(f.serverDir, "eula.txt", content);
+    await f.stage("server.jar", "new runtime fixture");
+    await f.stage("eula.txt", `eula=${!accepted}\n`);
+    await prepareCleanSettings(f.result, f.ctx);
+    assert.equal(
+      await fs.readFile(path.join(f.serverDir, "eula.txt"), "utf8"),
+      content,
+      "preparation must leave the existing decision untouched",
+    );
+    await cleanInstall(f.result, f.ctx);
+    for (const directory of [f.stageDir, f.serverDir])
+      assert.equal(
+        parseProperties(
+          await fs.readFile(path.join(directory, "eula.txt"), "utf8"),
+        ).get("eula"),
+        String(accepted),
+      );
+  });
+}
 
 for (const [name, raw, display] of [
   ["escaped newline", "Line one\\nLine two", "Line one Line two"],

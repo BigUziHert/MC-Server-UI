@@ -868,6 +868,65 @@ test("delegated managers cannot grant themselves a private server or alter panel
   );
 });
 
+test("committed panel account creation and computer-permission edits return durable audit warnings", async (t) => {
+  const { root, boot } = await fixture(t, { createDefaultServer: false });
+  const panel = await boot();
+  const auditFile = path.join(root, "panel-audit.json");
+  const previousAudit = await fs.readFile(auditFile, "utf8");
+  const rename = fs.rename;
+  const failure = t.mock.method(fs, "rename", async (...args) => {
+    if (args[1] === auditFile)
+      throw Object.assign(new Error("Injected panel audit write failure"), {
+        code: "EIO",
+      });
+    return rename(...args);
+  });
+  const created = await panel.local(
+    "/api/panel-users",
+    json("POST", { email: "audit-warning@example.test" }),
+  );
+  assert.equal(created.status, 201, JSON.stringify(created.body));
+  assert.equal(typeof created.body.id, "string");
+  assert.match(created.body.warning, /change was saved.*audit history/);
+  const updated = await panel.local(
+    `/api/panel-users/${created.body.id}`,
+    json("PATCH", { hostPermissions: ["server.create"] }),
+  );
+  assert.equal(updated.status, 200, JSON.stringify(updated.body));
+  assert.equal(updated.body.id, created.body.id);
+  assert.match(updated.body.warning, /change was saved.*audit history/);
+  assert.deepEqual(updated.body.hostPermissions, ["server.create"]);
+  const stored = JSON.parse(
+    await fs.readFile(path.join(root, "remote-access.json"), "utf8"),
+  ).accounts;
+  assert.deepEqual(
+    stored.find((user) => user.id === created.body.id).hostPermissions,
+    ["server.create"],
+  );
+  assert.equal(await fs.readFile(auditFile, "utf8"), previousAudit);
+  assert.equal(
+    (await panel.local("/api/panel-users")).body.users.filter(
+      (user) => user.email === created.body.email,
+    ).length,
+    1,
+  );
+
+  failure.mock.restore();
+  const recovered = await panel.local(
+    `/api/panel-users/${created.body.id}`,
+    json("PATCH", { hostPermissions: [] }),
+  );
+  assert.equal(recovered.status, 200, JSON.stringify(recovered.body));
+  assert.equal(recovered.body.warning, undefined);
+  const healthy = await panel.local(
+    "/api/panel-users",
+    json("POST", { email: "healthy-audit@example.test" }),
+  );
+  assert.equal(healthy.status, 201, JSON.stringify(healthy.body));
+  assert.equal(healthy.body.warning, undefined);
+  assert.notEqual(await fs.readFile(auditFile, "utf8"), previousAudit);
+});
+
 test("committed server grants, edits, and revocation return audit warnings instead of false failures", async (t) => {
   const { boot } = await fixture(t);
   const panel = await boot();

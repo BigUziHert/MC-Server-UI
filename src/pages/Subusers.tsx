@@ -1031,7 +1031,11 @@ function AccessManagement({
     setInviteOnCreate(invite && invitationReady);
     setEditor(user ?? (invite ? "invite" : "grant"));
   }
-  async function createInvitation(user: Subuser, panelAccount = accountsView) {
+  async function createInvitation(
+    user: Subuser,
+    panelAccount = accountsView,
+    accountWarning?: string,
+  ) {
     if (!canCreate || (remote && !manageable(user))) return false;
     setInviting(user.id);
     setInvitationError("");
@@ -1043,7 +1047,14 @@ function AccessManagement({
       setUsers((previous) =>
         previous.map((item) => (item.id === user.id ? result.user : item)),
       );
-      setInvitation({ ...result, panelWide: panelAccount });
+      const warning = [...new Set([accountWarning, result.warning])]
+        .filter(Boolean)
+        .join(" ");
+      setInvitation({
+        ...result,
+        warning: warning || undefined,
+        panelWide: panelAccount,
+      });
       if (panelAccount)
         window.dispatchEvent(new Event("mc-panel-accounts-changed"));
       return true;
@@ -1053,7 +1064,12 @@ function AccessManagement({
           ? cause.message
           : "Unable to create the invitation link.";
       setInvitationError(
-        `The ${panelAccount ? "account" : "subuser"} is saved, but an invitation link for ${user.email} could not be created. ${message} Use ${user.inviteStatus === "accepted" ? "Reset access" : "Create invite link"} to retry.`,
+        [
+          accountWarning,
+          `The ${panelAccount ? "account" : "subuser"} is saved, but an invitation link for ${user.email} could not be created. ${message} Use ${user.inviteStatus === "accepted" ? "Reset access" : "Create invite link"} to retry.`,
+        ]
+          .filter(Boolean)
+          .join(" "),
       );
       notify(
         "Invitation link could not be created. The account is still saved.",
@@ -1135,13 +1151,12 @@ function AccessManagement({
           !!result.warning,
         );
       } else if (invitingAccount) {
-        const result = await panelApi<Subuser | { user: Subuser }>(
-          "/panel-users",
-          {
-            method: "POST",
-            body: JSON.stringify({ email: email.trim() }),
-          },
-        );
+        const result = await panelApi<
+          (Subuser | { user: Subuser }) & { warning?: string }
+        >("/panel-users", {
+          method: "POST",
+          body: JSON.stringify({ email: email.trim() }),
+        });
         const user = "user" in result ? result.user : result;
         // The write itself confirms this identity exists. A failed follow-up
         // read must not make its new invitation look like a removed account.
@@ -1155,12 +1170,14 @@ function AccessManagement({
         // Show the saved identity even if the separate invitation request fails.
         await refresh();
         window.dispatchEvent(new Event("mc-panel-accounts-changed"));
-        if (inviteOnCreate) await createInvitation(user, true);
+        if (inviteOnCreate) await createInvitation(user, true, result.warning);
         else
           notify(
-            invitationReady
-              ? "Account created with no server access. Use Create invite link when you are ready to share it."
-              : "Account created with no server access. Enable Remote Access in Panel Settings to share an invitation.",
+            result.warning ||
+              (invitationReady
+                ? "Account created with no server access. Use Create invite link when you are ready to share it."
+                : "Account created with no server access. Enable Remote Access in Panel Settings to share an invitation."),
+            !!result.warning,
           );
         return;
       } else {

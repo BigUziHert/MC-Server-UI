@@ -37,6 +37,7 @@ import {
   minecraftServerMessage,
 } from "./launcher-stop.mjs";
 import { decodeText, encodeText } from "./text-encoding.mjs";
+import { updateProperties, encodeProperties } from "./properties.mjs";
 import { createAccessService } from "./access.mjs";
 import { createPanelRecovery } from "./panel-recovery.mjs";
 import { localNetworkAddresses } from "./remote-tls.mjs";
@@ -504,7 +505,11 @@ export async function safePath(root, relative = "") {
         );
       const real = await fs.realpath(current);
       const rel = path.relative(base, real);
-      if (rel.startsWith("..") || path.isAbsolute(rel))
+      if (
+        rel === ".." ||
+        rel.startsWith(`..${path.sep}`) ||
+        path.isAbsolute(rel)
+      )
         throw error(400, "Path must stay inside the server directory.");
     } catch (cause) {
       if (cause.code !== "ENOENT") throw cause;
@@ -915,19 +920,19 @@ export async function createPanel(options = {}) {
 
   async function writeProperties(updates) {
     const target = await safePath(serverDir, "server.properties");
-    let content = "";
+    let buffer = Buffer.alloc(0);
     try {
-      content = await fs.readFile(target, "utf8");
+      buffer = await fs.readFile(target);
     } catch (cause) {
       if (cause.code !== "ENOENT") throw cause;
     }
-    for (const [key, value] of Object.entries(updates)) {
-      const line = `${key}=${escapeProperty(value)}`;
-      const pattern = new RegExp(`^\\s*${key}\\s*[=:].*$`, "gm");
-      content = pattern.test(content)
-        ? content.replace(pattern, () => line)
-        : `${content}${content.endsWith("\n") || !content ? "" : "\n"}${line}\n`;
-    }
+    const { text, encoding } = decodeText(buffer);
+    const content = encodeProperties(
+      updateProperties(text, new Map(Object.entries(updates)), {
+        appendMissing: true,
+      }),
+      encoding,
+    );
     const temp = path.join(serverDir, `.panel-properties-${randomUUID()}.tmp`);
     try {
       await fs.writeFile(temp, content, { flag: "wx" });
@@ -1120,7 +1125,7 @@ export async function createPanel(options = {}) {
       } catch {
         /* Shown as an actionable error below. */
       }
-      if (!/^\s*eula\s*=\s*true\s*$/im.test(eula))
+      if (parseProperties(eula).get("eula")?.toLowerCase() !== "true")
         throw error(
           400,
           "Read the Minecraft EULA, then set eula=true in your server eula.txt before starting.",
@@ -3430,97 +3435,106 @@ export async function createPanel(options = {}) {
             const archive = await safePath(backupDir, `${item.id}.tar.gz`);
             if (!(await exists(archive)))
               throw error(404, "Backup archive not found.");
-            const restored = await restoreBackupArchive(serverDir, archive, {
-              validate: async (staged) => {
-                try {
-                  const validateRetainedExecutable = async (value) => {
-                    let relative;
-                    if (path.isAbsolute(value)) {
-                      relative = path.relative(serverDir, value);
-                      // External Java installations and system executables
-                      // are not replaced by restoring this server directory.
-                      if (
-                        path.isAbsolute(relative) ||
-                        relative === ".." ||
-                        relative.startsWith(`..${path.sep}`)
-                      )
-                        return;
-                    } else {
-                      if (!/[\\/]/.test(value)) {
-                        // Windows searches cwd before PATH, including implicit
-                        // .com/.exe suffixes. Preserve a currently selected
-                        // bundled executable even when settings use a bare name.
+            await recycleBin.assertServerRoot();
+            const restoredResult = await restoreBackupArchive(
+              serverDir,
+              archive,
+              {
+                validate: async (staged) => {
+                  try {
+                    const validateRetainedExecutable = async (value) => {
+                      let relative;
+                      if (path.isAbsolute(value)) {
+                        relative = path.relative(serverDir, value);
+                        // External Java installations and system executables
+                        // are not replaced by restoring this server directory.
                         if (
-                          process.platform !== "win32" ||
-                          process.env.NoDefaultCurrentDirectoryInExePath !==
-                            undefined
+                          path.isAbsolute(relative) ||
+                          relative === ".." ||
+                          relative.startsWith(`..${path.sep}`)
                         )
                           return;
-                        const base = value.endsWith(".") ? value : `${value}.`;
-                        const candidates = [
-                          ...(value.includes(".") && !value.endsWith(".")
-                            ? [value]
-                            : []),
-                          `${base}com`,
-                          `${base}exe`,
-                        ];
-                        for (const candidate of candidates) {
-                          const present = await fs
-                            .stat(await safePath(serverDir, candidate))
-                            .catch((cause) => {
-                              if (
-                                cause.code === "ENOENT" ||
-                                cause.code === "ENOTDIR"
-                              )
-                                return null;
-                              throw cause;
-                            });
-                          if (present?.isFile()) {
-                            relative = candidate;
-                            break;
+                      } else {
+                        if (!/[\\/]/.test(value)) {
+                          // Windows searches cwd before PATH, including implicit
+                          // .com/.exe suffixes. Preserve a currently selected
+                          // bundled executable even when settings use a bare name.
+                          if (
+                            process.platform !== "win32" ||
+                            process.env.NoDefaultCurrentDirectoryInExePath !==
+                              undefined
+                          )
+                            return;
+                          const base = value.endsWith(".")
+                            ? value
+                            : `${value}.`;
+                          const candidates = [
+                            ...(value.includes(".") && !value.endsWith(".")
+                              ? [value]
+                              : []),
+                            `${base}com`,
+                            `${base}exe`,
+                          ];
+                          for (const candidate of candidates) {
+                            const present = await fs
+                              .stat(await safePath(serverDir, candidate))
+                              .catch((cause) => {
+                                if (
+                                  cause.code === "ENOENT" ||
+                                  cause.code === "ENOTDIR"
+                                )
+                                  return null;
+                                throw cause;
+                              });
+                            if (present?.isFile()) {
+                              relative = candidate;
+                              break;
+                            }
                           }
-                        }
-                        if (!relative) return;
-                      } else relative = value;
+                          if (!relative) return;
+                        } else relative = value;
+                      }
+                      const executable = await safePath(
+                        staged,
+                        relative.replace(/\\/g, "/").replace(/^\.\//, ""),
+                      );
+                      if (!(await fs.stat(executable)).isFile())
+                        throw new Error(
+                          "The selected startup executable is missing.",
+                        );
+                    };
+                    if (configuration.launchType === "jar") {
+                      const jar = await safePath(staged, configuration.jar);
+                      if (!(await fs.stat(jar)).isFile())
+                        throw new Error(
+                          "The selected server JAR is not a regular file.",
+                        );
+                    } else {
+                      await validateStartupFiles(staged, configuration);
                     }
-                    const executable = await safePath(
-                      staged,
-                      relative.replace(/\\/g, "/").replace(/^\.\//, ""),
+                    if (configuration.launchType === "executable")
+                      await validateRetainedExecutable(
+                        configuration.launchExecutable,
+                      );
+                    else if (
+                      ["jar", "java-args"].includes(configuration.launchType)
+                    )
+                      await validateRetainedExecutable(configuration.javaPath);
+                  } catch (cause) {
+                    const detail =
+                      cause.code === "ENOENT" || cause.code === "ENOTDIR"
+                        ? "The archive does not contain the selected startup files."
+                        : "The archive's startup files could not be validated.";
+                    throw error(
+                      409,
+                      `This backup is incompatible with the retained launch settings. No server files were replaced. Ask the owner to select startup settings matching this backup before restoring. ${detail}`,
                     );
-                    if (!(await fs.stat(executable)).isFile())
-                      throw new Error(
-                        "The selected startup executable is missing.",
-                      );
-                  };
-                  if (configuration.launchType === "jar") {
-                    const jar = await safePath(staged, configuration.jar);
-                    if (!(await fs.stat(jar)).isFile())
-                      throw new Error(
-                        "The selected server JAR is not a regular file.",
-                      );
-                  } else {
-                    await validateStartupFiles(staged, configuration);
                   }
-                  if (configuration.launchType === "executable")
-                    await validateRetainedExecutable(
-                      configuration.launchExecutable,
-                    );
-                  else if (
-                    ["jar", "java-args"].includes(configuration.launchType)
-                  )
-                    await validateRetainedExecutable(configuration.javaPath);
-                } catch (cause) {
-                  const detail =
-                    cause.code === "ENOENT" || cause.code === "ENOTDIR"
-                      ? "The archive does not contain the selected startup files."
-                      : "The archive's startup files could not be validated.";
-                  throw error(
-                    409,
-                    `This backup is incompatible with the retained launch settings. No server files were replaced. Ask the owner to select startup settings matching this backup before restoring. ${detail}`,
-                  );
-                }
+                },
               },
-            });
+            );
+            const { restoredRoot, ...restored } = restoredResult;
+            await recycleBin.adoptServerRoot(restoredRoot);
             invalidateDiskUsage();
             startupMetadataAt = 0;
             iconReadAt = 0;
@@ -4780,13 +4794,16 @@ export async function createFleet(options = {}) {
   };
   app.post("/api/panel-users", async (req, res) => {
     const user = await access.createAccount(req.body ?? {});
-    await accountAudit("Panel account created", user.email);
-    res.status(201).json(user);
+    const warning = await accountAudit("Panel account created", user.email);
+    res.status(201).json({ ...user, ...(warning ? { warning } : {}) });
   });
   app.patch("/api/panel-users/:id", async (req, res) => {
     const user = await access.updateAccount(req.params.id, req.body ?? {});
-    await accountAudit("Panel account access updated", user.email);
-    res.json(user);
+    const warning = await accountAudit(
+      "Panel account access updated",
+      user.email,
+    );
+    res.json({ ...user, ...(warning ? { warning } : {}) });
   });
   app.delete("/api/panel-users/:id", async (req, res) => {
     const user = access.account(req.params.id);

@@ -27,7 +27,14 @@ const response = (value, status = 200) =>
 
 async function harness(
   t,
-  { hostPermissions = [], behavior, storeRead, storeSave, pollMs = 60000 } = {},
+  {
+    hostPermissions = [],
+    behavior,
+    storeRead,
+    storeSave,
+    storeForgetLegacy,
+    pollMs = 60000,
+  } = {},
 ) {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "mc-unified-test-"));
   let controller;
@@ -57,7 +64,10 @@ async function harness(
         persisted.push(value);
       },
       close: async () => {},
-      forgetLegacy: async (id) => cleanup.push({ action: "legacy", id }),
+      forgetLegacy: async (id) => {
+        await storeForgetLegacy?.(id);
+        cleanup.push({ action: "legacy", id });
+      },
     },
     session: {
       fromPartition: (partition) => ({
@@ -485,6 +495,412 @@ test("sign-out hides cached rows before a stalled remote logout completes", asyn
   assert.deepEqual(signedOut.servers, []);
   assert.equal(h.persisted.at(-1).panels[0].token, null);
   release();
+});
+
+test("failed sign-out persistence retains a retryable credential and still attempts host revocation", async (t) => {
+  let failSave = false,
+    offline = true;
+  const loggedOut = [];
+  const h = await harness(t, {
+    storeSave: async () => {
+      if (failSave)
+        throw Object.assign(new Error("Injected ENOSPC"), { code: "ENOSPC" });
+    },
+    behavior: async (url, options) => {
+      if (url.pathname !== "/api/access/logout") return;
+      loggedOut.push({
+        origin: url.origin,
+        token: new Headers(options.headers).get("Authorization"),
+      });
+      if (offline) throw new Error("Host unavailable");
+      return response({ ok: true });
+    },
+  });
+  const a = await h.signIn("https://a.example.test"),
+    c = await h.signIn("https://c.example.test");
+  await h.controller.selectServer(a.id, "same-id");
+  failSave = true;
+  await assert.rejects(h.controller.signOut(a.id), /ENOSPC/);
+  const retained = h.controller
+    .list()
+    .panels.find((panel) => panel.id === a.id);
+  assert.equal(
+    retained.signedIn,
+    true,
+    "keep the Sign out row action available after the failure",
+  );
+  assert.equal(retained.connectionState, "unavailable");
+  assert.match(retained.error, /Sign-out could not be saved.*Retry Sign out/);
+  assert.equal(
+    h.persisted.at(-1).panels.find((panel) => panel.id === a.id).token,
+    token,
+  );
+  assert.equal((await h.proxy(a, "/server?serverId=same-id")).status, 409);
+  assert.equal(
+    (await h.proxy(retained, "/server?serverId=same-id")).status,
+    503,
+  );
+  assert.equal((await h.proxy(c, "/server?serverId=same-id")).status, 200);
+  assert.deepEqual(loggedOut, [{ origin: a.origin, token: `Bearer ${token}` }]);
+  failSave = false;
+  offline = false;
+  await h.controller.signOut(a.id);
+  assert.deepEqual(loggedOut, [
+    { origin: a.origin, token: `Bearer ${token}` },
+    { origin: a.origin, token: `Bearer ${token}` },
+  ]);
+  const finished = h.controller.list();
+  assert.equal(
+    finished.panels.find((panel) => panel.id === a.id).signedIn,
+    false,
+  );
+  assert.equal(
+    finished.panels.find((panel) => panel.id === c.id).signedIn,
+    true,
+  );
+  assert.equal(finished.selectedServer, null);
+  assert.equal(
+    h.persisted.at(-1).panels.find((panel) => panel.id === a.id).token,
+    null,
+  );
+});
+
+test("restart after a failed local sign-out cannot reuse the bearer revoked on the host", async (t) => {
+  let failSave = false,
+    revoked = false;
+  const behavior = async (url, options) => {
+    if (url.pathname === "/api/access/logout") {
+      assert.equal(
+        new Headers(options.headers).get("Authorization"),
+        `Bearer ${token}`,
+      );
+      revoked = true;
+      return response({ ok: true });
+    }
+    if (url.pathname === "/api/access/session" && revoked)
+      return response({ role: "guest" });
+  };
+  const h = await harness(t, {
+    behavior,
+    storeSave: async () => {
+      if (failSave) throw new Error("Injected ENOSPC");
+    },
+  });
+  const panel = await h.signIn("https://a.example.test");
+  failSave = true;
+  await assert.rejects(h.controller.signOut(panel.id), /ENOSPC/);
+  assert.equal(revoked, true);
+  // Restore the exact identity/bearer left on disk by the failed write, rather
+  // than the live controller state. The reachable host must reject that bearer.
+  const saved = h.persisted.at(-1);
+  const durable = {
+    selectedServer: saved.selectedServer,
+    panels: saved.panels.map(({ id, origin, token, session, servers }) => ({
+      id,
+      origin,
+      token,
+      session,
+      servers,
+    })),
+  };
+  failSave = false;
+  const restarted = await harness(t, {
+    behavior,
+    storeRead: async () => durable,
+  });
+  await restarted.controller.restore();
+  const restored = restarted.controller
+    .list()
+    .panels.find((entry) => entry.id === panel.id);
+  assert.equal(restored.signedIn, false);
+  assert.deepEqual(restored.servers, []);
+  assert.equal(restarted.persisted.at(-1).panels[0].token, null);
+  assert.equal(
+    (await restarted.proxy(restored, "/server?serverId=same-id")).status,
+    401,
+  );
+});
+
+test("failed sign-out waits for its bounded host attempt before a caller can restart", async (t) => {
+  let failSave = false,
+    entered,
+    release,
+    revoked = false,
+    settled = false;
+  const started = new Promise((resolve) => {
+    entered = resolve;
+  });
+  const h = await harness(t, {
+    storeSave: async () => {
+      if (failSave) throw new Error("Injected ENOSPC");
+    },
+    behavior: async (url) => {
+      if (url.pathname !== "/api/access/logout") return;
+      entered();
+      await new Promise((resolve) => {
+        release = resolve;
+      });
+      revoked = true;
+      return response({ ok: true });
+    },
+  });
+  const panel = await h.signIn("https://a.example.test");
+  failSave = true;
+  const signOut = h.controller.signOut(panel.id).finally(() => {
+    settled = true;
+  });
+  const rejected = assert.rejects(signOut, /ENOSPC/);
+  await started;
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(settled, false);
+  assert.equal(
+    h.controller.list().panels.find((entry) => entry.id === panel.id).signedIn,
+    true,
+  );
+  release();
+  await rejected;
+  assert.equal(revoked, true);
+  failSave = false;
+  await h.controller.close();
+});
+
+test("legacy cleanup failure cannot skip revocation after durable sign-out", async (t) => {
+  const h = await harness(t, {
+    storeForgetLegacy: async () => {
+      throw new Error("Legacy cleanup failed");
+    },
+  });
+  const panel = await h.signIn("https://a.example.test");
+  await assert.rejects(h.controller.signOut(panel.id), /Legacy cleanup failed/);
+  assert.equal(
+    h.controller.list().panels.find((entry) => entry.id === panel.id).signedIn,
+    false,
+  );
+  assert.equal(h.persisted.at(-1).panels[0].token, null);
+  assert.equal(
+    h.calls
+      .find((call) => call.url.pathname === "/api/access/logout")
+      .headers.get("Authorization"),
+    `Bearer ${token}`,
+  );
+});
+
+test("a sign-out transaction blocks replacement controls and applies before later queued saves", async (t) => {
+  let block = false,
+    entered,
+    release;
+  const writing = new Promise((resolve) => {
+    entered = resolve;
+  });
+  const h = await harness(t, {
+    storeSave: async () => {
+      if (!block) return;
+      block = false;
+      entered();
+      await new Promise((resolve) => {
+        release = resolve;
+      });
+    },
+  });
+  const panel = await h.signIn("https://a.example.test");
+  block = true;
+  const signingOut = h.controller.signOut(panel.id);
+  await writing;
+  const overlapping = h.controller.signOut(panel.id);
+  await assert.rejects(
+    h.controller.signIn(panel.id, {
+      email: account.email,
+      password: "replacement",
+    }),
+    /Sign-out is still being saved/,
+  );
+  await assert.rejects(
+    h.controller.forget(panel.id, account.accountId),
+    /Sign-out is still being saved/,
+  );
+  const selecting = h.controller.selectServer("local", "same-id");
+  release();
+  await Promise.all([signingOut, overlapping, selecting]);
+  assert.equal(h.persisted.at(-1).panels[0].token, null);
+  assert.deepEqual(h.persisted.at(-1).selectedServer, {
+    panelId: "local",
+    serverId: "same-id",
+  });
+  assert.equal(
+    h.calls.filter((call) => call.url.pathname === "/api/access/logout").length,
+    1,
+  );
+});
+
+test("sign-out waits for an active authentication write and revokes its newly durable bearer", async (t) => {
+  let block = false,
+    entered,
+    release;
+  const writing = new Promise((resolve) => {
+    entered = resolve;
+  });
+  const replacement = "b".repeat(43);
+  const h = await harness(t, {
+    storeSave: async () => {
+      if (!block) return;
+      block = false;
+      entered();
+      await new Promise((resolve) => {
+        release = resolve;
+      });
+    },
+    behavior: async (url) =>
+      block && url.pathname === "/api/access/login"
+        ? response({ ...account, sessionToken: replacement })
+        : undefined,
+  });
+  const panel = await h.signIn("https://a.example.test");
+  block = true;
+  const signingIn = h.controller.signIn(panel.id, {
+    email: account.email,
+    password: "replacement",
+  });
+  await writing;
+  const signingOut = h.controller.signOut(panel.id);
+  await new Promise((resolve) => setImmediate(resolve));
+  release();
+  await Promise.all([signingIn, signingOut]);
+  assert.equal(h.persisted.at(-1).panels[0].token, null);
+  assert.equal(
+    h.controller.list().panels.find((entry) => entry.id === panel.id).signedIn,
+    false,
+  );
+  assert.equal(
+    h.calls
+      .find((call) => call.url.pathname === "/api/access/logout")
+      .headers.get("Authorization"),
+    `Bearer ${replacement}`,
+  );
+});
+
+test("shutdown drains an accepted sign-out behind pending selection or authentication writes", async (t) => {
+  for (const pending of ["selection", "authentication"])
+    await t.test(pending, async (t) => {
+      let block = false,
+        entered,
+        release,
+        logoutEntered,
+        finishLogout,
+        revoked = false,
+        closed = false;
+      const writing = new Promise((resolve) => {
+        entered = resolve;
+      });
+      const loggingOut = new Promise((resolve) => {
+        logoutEntered = resolve;
+      });
+      const replacement = "b".repeat(43);
+      const h = await harness(t, {
+        storeSave: async () => {
+          if (!block) return;
+          block = false;
+          entered();
+          await new Promise((resolve) => {
+            release = resolve;
+          });
+        },
+        behavior: async (url) => {
+          if (block && url.pathname === "/api/access/login")
+            return response({ ...account, sessionToken: replacement });
+          if (url.pathname === "/api/access/logout") {
+            logoutEntered();
+            await new Promise((resolve) => {
+              finishLogout = resolve;
+            });
+            revoked = true;
+            return response({ ok: true });
+          }
+        },
+      });
+      const panel = await h.signIn("https://a.example.test");
+      block = true;
+      const pendingWrite =
+        pending === "selection"
+          ? h.controller.selectServer("local", "same-id")
+          : h.controller.signIn(panel.id, {
+              email: account.email,
+              password: "replacement",
+            });
+      await writing;
+      const signingOut = h.controller.signOut(panel.id);
+      await new Promise((resolve) => setImmediate(resolve));
+      const closing = h.controller.close().then(() => {
+        closed = true;
+      });
+      release();
+      await loggingOut;
+      await new Promise((resolve) => setImmediate(resolve));
+      assert.equal(closed, false);
+      finishLogout();
+      const outcomes = await Promise.allSettled([
+        pendingWrite,
+        signingOut,
+        closing,
+      ]);
+      assert.equal(outcomes[1].status, "fulfilled");
+      assert.equal(outcomes[2].status, "fulfilled");
+      assert.equal(revoked, true);
+      assert.equal(h.persisted.at(-1).panels[0].token, null);
+      const logout = h.calls.find(
+        (call) => call.url.pathname === "/api/access/logout",
+      );
+      assert.equal(
+        logout?.headers.get("Authorization"),
+        `Bearer ${pending === "authentication" ? replacement : token}`,
+      );
+    });
+});
+
+test("shutdown waits for failed sign-out revocation while rejecting new account controls", async (t) => {
+  let failSave = false,
+    entered,
+    release,
+    revoked = false,
+    closed = false;
+  const started = new Promise((resolve) => {
+    entered = resolve;
+  });
+  const h = await harness(t, {
+    storeSave: async () => {
+      if (failSave) {
+        failSave = false;
+        throw new Error("Injected ENOSPC");
+      }
+    },
+    behavior: async (url) => {
+      if (url.pathname !== "/api/access/logout") return;
+      entered();
+      await new Promise((resolve) => {
+        release = resolve;
+      });
+      revoked = true;
+      return response({ ok: true });
+    },
+  });
+  const panel = await h.signIn("https://a.example.test");
+  failSave = true;
+  const signingOut = assert.rejects(h.controller.signOut(panel.id), /ENOSPC/);
+  await started;
+  const closing = h.controller.close().then(() => {
+    closed = true;
+  });
+  await assert.rejects(
+    h.controller.signIn(panel.id, {
+      email: account.email,
+      password: "replacement",
+    }),
+    /shutting down/,
+  );
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(closed, false);
+  release();
+  await Promise.all([signingOut, closing]);
+  assert.equal(revoked, true);
 });
 
 test("revocation clears persisted credentials and signed-out cached records never expose a roster", async (t) => {

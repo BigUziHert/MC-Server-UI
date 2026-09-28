@@ -89,15 +89,15 @@ export async function createRecycleBin({
   const io = fileSystem;
   const directory = await safePath(dataDir, "recycle-bin");
   const originalRoot = await io.realpath(serverDir);
-  const originalRootStat = await io.lstat(serverDir);
-  const assertServerRoot = async () => {
+  let originalRootStat = await io.lstat(serverDir);
+  const assertServerRoot = async (expected = originalRootStat) => {
     const current = await io.lstat(serverDir);
     if (
       !current.isDirectory() ||
       current.isSymbolicLink() ||
-      current.ino !== originalRootStat.ino ||
-      current.dev !== originalRootStat.dev ||
-      current.birthtimeMs !== originalRootStat.birthtimeMs ||
+      current.ino !== expected.ino ||
+      current.dev !== expected.dev ||
+      current.birthtimeMs !== expected.birthtimeMs ||
       (await io.realpath(serverDir)) !== originalRoot
     )
       throw error(
@@ -721,6 +721,15 @@ export async function createRecycleBin({
   return {
     directory,
     directories,
+    assertServerRoot,
+    async adoptServerRoot(expected) {
+      if (!expected)
+        throw error(409, "A verified restored server folder is required.");
+      // Only an explicit successful restore can change the accepted root.
+      // Ordinary recycle/restore operations still reject external replacements.
+      await assertServerRoot(expected);
+      originalRootStat = { ...expected };
+    },
     inspect(id, { signal, includeHash = true } = {}) {
       return exclusive(async () => {
         signal?.throwIfAborted();

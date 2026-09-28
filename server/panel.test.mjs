@@ -497,6 +497,100 @@ test("live lifecycle audits confirmed starts, restarts and exits, never chat or 
   );
 });
 
+test("File Manager can edit, delete, and recover contained double-dot names", async (t) => {
+  const { request, serverDir, base } = await fixture(t);
+  const folder = "..backups";
+  assert.equal(
+    (
+      await request(
+        "/api/files",
+        json("POST", { name: folder, type: "directory" }),
+      )
+    ).status,
+    201,
+  );
+  for (const parent of ["", folder]) {
+    const name = "..notes.txt";
+    const relative = parent ? `${parent}/${name}` : name;
+    assert.equal(
+      (
+        await request(
+          "/api/files",
+          json("POST", {
+            path: parent,
+            name,
+            type: "file",
+            content: "original bytes",
+          }),
+        )
+      ).status,
+      201,
+    );
+    const listed = await request(
+      `/api/files?path=${encodeURIComponent(parent)}`,
+    );
+    assert.equal(listed.status, 200);
+    assert.ok(listed.body.entries.some((entry) => entry.path === relative));
+    const loaded = await request(
+      `/api/files/content?path=${encodeURIComponent(relative)}`,
+    );
+    assert.equal(loaded.status, 200);
+    assert.equal(loaded.body.content, "original bytes");
+    const saved = await request(
+      "/api/files/content",
+      json("PUT", {
+        path: relative,
+        ...loaded.body,
+        content: "edited bytes",
+      }),
+    );
+    assert.equal(saved.status, 200);
+    const download = await fetch(
+      `${base}/api/files/download?path=${encodeURIComponent(relative)}`,
+    );
+    assert.equal(download.status, 200);
+    assert.equal(await download.text(), "edited bytes");
+    const removed = await request(
+      `/api/files?path=${encodeURIComponent(relative)}`,
+      { method: "DELETE" },
+    );
+    assert.equal(removed.status, 200);
+    await assert.rejects(fs.stat(path.join(serverDir, relative)), {
+      code: "ENOENT",
+    });
+    const restored = await request(
+      `/api/files/recycle-bin/${removed.body.recycled.id}/restore`,
+      json("POST", {}),
+    );
+    assert.equal(restored.status, 200);
+    assert.equal(
+      await fs.readFile(path.join(serverDir, relative), "utf8"),
+      "edited bytes",
+    );
+  }
+  const removed = await request(
+    `/api/files?path=${encodeURIComponent(folder)}`,
+    { method: "DELETE" },
+  );
+  assert.equal(removed.status, 200);
+  await assert.rejects(fs.stat(path.join(serverDir, folder)), {
+    code: "ENOENT",
+  });
+  assert.equal(
+    (
+      await request(
+        `/api/files/recycle-bin/${removed.body.recycled.id}/restore`,
+        json("POST", {}),
+      )
+    ).status,
+    200,
+  );
+  assert.equal(
+    await fs.readFile(path.join(serverDir, folder, "..notes.txt"), "utf8"),
+    "edited bytes",
+  );
+});
+
 test("sandbox rejects traversal, reserved names, root deletion, and symlink access", async (t) => {
   const { request, serverDir, dataDir } = await fixture(t);
   for (const malicious of [
@@ -505,6 +599,7 @@ test("sandbox rejects traversal, reserved names, root deletion, and symlink acce
     "C:/Windows",
     "/Windows",
     "world/../../panel.json",
+    "..backups/../../panel.json",
   ]) {
     assert.equal(
       (

@@ -137,40 +137,76 @@ function parse(filename, buffer) {
     );
   return { text, encoding, document, fields: yamlFields(document) };
 }
-function updateProperties(text, changes) {
-  const newline = text.includes("\r\n") ? "\r\n" : "\n";
-  const natural = text.split(/\r\n|\n|\r/),
+export function updateProperties(
+  text,
+  changes,
+  { appendMissing = false } = {},
+) {
+  const newline = text.match(/\r\n|\n|\r/)?.[0] ?? "\n";
+  const natural = (text.match(/[^\r\n]*(?:\r\n|\n|\r|$)/g) ?? []).filter(
+      Boolean,
+    ),
     groups = [];
   for (let i = 0; i < natural.length; i++) {
     let group = natural[i];
+    let ending = group.match(/(?:\r\n|\n|\r)$/)?.[0] ?? "";
+    const continues = () =>
+      (natural[i].replace(/(?:\r\n|\n|\r)$/, "").match(/\\+$/)?.[0].length ??
+        0) %
+        2 ===
+      1;
     // Java comment lines never continue, even when their last character is a
     // backslash. Keep them separate so editing the next key preserves them.
     const comment = /^[ \t\f]*[#!]/.test(group.replace(/^\uFEFF/, ""));
-    while (
-      !comment &&
-      (group.match(/\\+$/)?.[0].length ?? 0) % 2 &&
-      i + 1 < natural.length
-    )
-      group += newline + natural[++i];
+    while (!comment && continues() && i + 1 < natural.length) {
+      group += natural[++i];
+      ending = natural[i].match(/(?:\r\n|\n|\r)$/)?.[0] ?? "";
+    }
     const key = [...parseProperties(group).keys()][0];
-    groups.push({ group, key });
+    groups.push({ group, key, ending, continuing: !comment && continues() });
   }
   // Duplicate Java property keys use the last value. Replace every occurrence
   // so an older duplicate cannot become effective after a later manual edit.
-  return groups
-    .map(({ group, key }) =>
+  const line = (key, value) =>
+    `${String(key)
+      .replace(/\\/g, "\\\\")
+      .replace(
+        /[\x00-\x1f\x7f]/g,
+        (char) => `\\u${char.charCodeAt(0).toString(16).padStart(4, "0")}`,
+      )
+      .replace(/[:= #!]/g, "\\$&")}=${escape(value)}`;
+  let content = groups
+    .map(({ group, key, ending }, index) =>
       changes.has(key)
-        ? `${String(key)
-            .replace(/\\/g, "\\\\")
-            .replace(
-              /[\x00-\x1f\x7f]/g,
-              (char) =>
-                `\\u${char.charCodeAt(0).toString(16).padStart(4, "0")}`,
-            )
-            .replace(/[:= #!]/g, "\\$&")}=${escape(changes.get(key))}`
+        ? `${index === 0 && group.startsWith("\uFEFF") ? "\uFEFF" : ""}${line(key, changes.get(key))}${ending}`
         : group,
     )
-    .join(newline);
+    .join("");
+  if (appendMissing) {
+    const present = new Set(groups.map(({ key }) => key));
+    const missing = [...changes].filter(([key]) => !present.has(key));
+    if (missing.length) {
+      if (content && !/[\r\n]$/.test(content)) content += newline;
+      // End an unfinished logical line before appending another property.
+      const last = groups.at(-1);
+      if (last?.continuing && !changes.has(last.key)) content += newline;
+      content += missing
+        .map(([key, value]) => line(key, value) + newline)
+        .join("");
+    }
+  }
+  return content;
+}
+
+export function encodeProperties(text, encoding) {
+  const content =
+    encoding === "latin1"
+      ? text.replace(
+          /[^\x00-\xff]/g,
+          (char) => `\\u${char.charCodeAt(0).toString(16).padStart(4, "0")}`,
+        )
+      : text;
+  return Buffer.from(content, encoding);
 }
 
 export function createPropertiesService(ctx) {
@@ -308,12 +344,10 @@ export function createPropertiesService(ctx) {
               400,
               "This YAML file uses a legacy text encoding. Convert it to UTF-8 in File Manager before adding these characters.",
             );
-          content = content.replace(
-            /[^\x00-\xff]/g,
-            (char) => `\\u${char.charCodeAt(0).toString(16).padStart(4, "0")}`,
-          );
         }
-        const buffer = Buffer.from(content, loaded.encoding);
+        const buffer = loaded.document
+          ? Buffer.from(content, loaded.encoding)
+          : encodeProperties(content, loaded.encoding);
         // Revalidate immediately before replacing the loaded file, including its
         // revision: external editors are not covered by the panel mutation lock.
         const target = await ctx.safePath(ctx.serverDir, input.path);

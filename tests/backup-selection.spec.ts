@@ -229,6 +229,24 @@ test("restoring a backup requires a stopped server and explicit confirmation", a
   ).toBeDisabled();
   await dialog.getByRole("button", { name: "Cancel", exact: true }).click();
   await stopTestServer(request, backups.id);
+  const recoveryName = "pre-restore-recovery.txt";
+  expect(
+    (
+      await request.post("/api/files", {
+        headers,
+        data: {
+          type: "file",
+          name: recoveryName,
+          content: "Preserved recovery bytes",
+        },
+      })
+    ).status(),
+  ).toBe(201);
+  expect(
+    (
+      await request.delete(`/api/files?path=${recoveryName}`, { headers })
+    ).status(),
+  ).toBe(200);
   const added = await request.post("/api/files", {
     headers,
     data: { type: "file", name: "added-after-backup.txt" },
@@ -266,6 +284,56 @@ test("restoring a backup requires a stopped server and explicit confirmation", a
     "Beta backup",
     "Gamma backup",
   ]);
+  // A restore replaces the root directory. Both new deletions and older
+  // recovery entries must work immediately, without restarting the host.
+  const restoredProperties = await (
+    await request.get("/api/files/content?path=server.properties", { headers })
+  ).json();
+  await page.getByRole("link", { name: "File Manager", exact: true }).click();
+  await page
+    .getByRole("button", { name: "Delete server.properties", exact: true })
+    .click();
+  await page
+    .getByRole("dialog")
+    .getByRole("button", { name: "Move to Recycle Bin", exact: true })
+    .click();
+  await expect(page.getByRole("dialog")).not.toBeVisible();
+  expect(
+    (
+      await request.get("/api/files/content?path=server.properties", {
+        headers,
+      })
+    ).status(),
+  ).toBe(404);
+  await page
+    .getByRole("button", { name: "Open Recycle Bin", exact: true })
+    .click();
+  for (const name of [recoveryName, "server.properties"]) {
+    await page
+      .getByRole("button", { name: `Restore ${name}`, exact: true })
+      .click();
+    await expect(
+      page.getByRole("button", { name: `Restore ${name}`, exact: true }),
+    ).toHaveCount(0);
+  }
+  expect(
+    (
+      await (
+        await request.get(`/api/files/content?path=${recoveryName}`, {
+          headers,
+        })
+      ).json()
+    ).content,
+  ).toBe("Preserved recovery bytes");
+  expect(
+    (
+      await (
+        await request.get("/api/files/content?path=server.properties", {
+          headers,
+        })
+      ).json()
+    ).content,
+  ).toBe(restoredProperties.content);
 });
 
 test("backup history shows compressed sizes and savings without requiring legacy metadata", async ({

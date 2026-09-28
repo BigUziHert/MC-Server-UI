@@ -33,9 +33,15 @@ export async function prepareCleanSettings(result, ctx) {
   const config = ctx.getConfiguration();
   let accepted = false;
   try {
-    accepted = /^\s*eula\s*=\s*true\s*$/im.test(
-      await fs.readFile(await ctx.safePath(ctx.serverDir, "eula.txt"), "utf8"),
-    );
+    accepted =
+      parseProperties(
+        await fs.readFile(
+          await ctx.safePath(ctx.serverDir, "eula.txt"),
+          "utf8",
+        ),
+      )
+        .get("eula")
+        ?.toLowerCase() === "true";
   } catch (cause) {
     if (cause.code !== "ENOENT") throw cause;
   }

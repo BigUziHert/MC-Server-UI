@@ -751,3 +751,167 @@ test("remote restore requires its explicit destructive-action permission", () =>
     ["backup.restore"],
   );
 });
+
+for (const cleanupWarning of [false, true]) {
+  test(`restored folders support deletion and existing recovery immediately${cleanupWarning ? " after a cleanup warning" : " across repeated restores"}`, async (t) => {
+    const { serverDir, boot } = await fixture(t);
+    const panel = await boot();
+    await fs.writeFile(
+      path.join(serverDir, "older.txt"),
+      "older recovery bytes",
+    );
+    const older = await panel.request(
+      "/api/files?path=older.txt",
+      {},
+      "DELETE",
+    );
+    assert.equal(older.status, 200, JSON.stringify(older));
+    await fs.writeFile(path.join(serverDir, "world.dat"), "saved world");
+    const backup = await panel.request("/api/backups", {
+      name: "Recycle after restore",
+    });
+    assert.equal(backup.status, 201, JSON.stringify(backup));
+    if (cleanupWarning) {
+      const remove = fs.rm.bind(fs);
+      t.mock.method(fs, "rm", async (target, options) => {
+        if (path.basename(target).startsWith(".external-server-restore-"))
+          throw Object.assign(new Error("Fixture cleanup busy"), {
+            code: "EBUSY",
+          });
+        return remove(target, options);
+      });
+    }
+    for (let iteration = 0; iteration < (cleanupWarning ? 1 : 2); iteration++) {
+      const restored = await panel.request(
+        `/api/backups/${backup.body.id}/restore`,
+        {
+          confirm: true,
+          requestId: randomUUID(),
+        },
+      );
+      assert.equal(restored.status, 200, JSON.stringify(restored));
+      assert.equal("restoredRoot" in restored.body, false);
+      assert.equal("ino" in restored.body, false);
+      if (cleanupWarning)
+        assert.match(restored.body.warning, /temporary restore files/);
+      const deleted = await panel.request(
+        "/api/files?path=world.dat",
+        {},
+        "DELETE",
+      );
+      assert.equal(deleted.status, 200, JSON.stringify(deleted));
+      const recovered = await panel.request(
+        `/api/files/recycle-bin/${deleted.body.recycled.id}/restore`,
+        {},
+      );
+      assert.equal(recovered.status, 200, JSON.stringify(recovered));
+      assert.equal(
+        await fs.readFile(path.join(serverDir, "world.dat"), "utf8"),
+        "saved world",
+      );
+    }
+    const recovered = await panel.request(
+      `/api/files/recycle-bin/${older.body.recycled.id}/restore`,
+      {},
+    );
+    assert.equal(recovered.status, 200, JSON.stringify(recovered));
+    assert.equal(
+      await fs.readFile(path.join(serverDir, "older.txt"), "utf8"),
+      "older recovery bytes",
+    );
+    t.mock.restoreAll();
+  });
+}
+
+test("a rolled-back backup replacement keeps the original Recycle Bin root usable", async (t) => {
+  const { serverDir, boot } = await fixture(t);
+  const panel = await boot();
+  await fs.writeFile(path.join(serverDir, "world.dat"), "saved world");
+  const backup = await panel.request("/api/backups", {
+    name: "Rollback binding",
+  });
+  await fs.writeFile(path.join(serverDir, "world.dat"), "current world");
+  const rename = fs.rename.bind(fs);
+  t.mock.method(fs, "rename", async (source, target) => {
+    if (path.basename(source) === "restored" && target === serverDir)
+      throw new Error("Fixture replacement denied");
+    return rename(source, target);
+  });
+  const result = await panel.request(`/api/backups/${backup.body.id}/restore`, {
+    confirm: true,
+  });
+  assert.equal(result.status, 409, JSON.stringify(result));
+  assert.match(result.body.error, /original files were restored/);
+  const deleted = await panel.request(
+    "/api/files?path=world.dat",
+    {},
+    "DELETE",
+  );
+  assert.equal(deleted.status, 200, JSON.stringify(deleted));
+  const recovered = await panel.request(
+    `/api/files/recycle-bin/${deleted.body.recycled.id}/restore`,
+    {},
+  );
+  assert.equal(recovered.status, 200, JSON.stringify(recovered));
+  assert.equal(
+    await fs.readFile(path.join(serverDir, "world.dat"), "utf8"),
+    "current world",
+  );
+});
+
+for (const replacementTime of ["before restore", "after promotion"]) {
+  test(`restore does not adopt an externally substituted folder ${replacementTime}`, async (t) => {
+    const { serverDir, directory, boot } = await fixture(t);
+    const panel = await boot();
+    await fs.writeFile(path.join(serverDir, "world.dat"), "saved world");
+    const backup = await panel.request("/api/backups", {
+      name: "Root identity",
+    });
+    const parked = path.join(directory, "parked-server");
+    const substitute = async () => {
+      await fs.rename(serverDir, parked);
+      await fs.mkdir(serverDir);
+      await fs.writeFile(
+        path.join(serverDir, "other.txt"),
+        "untouched replacement",
+      );
+    };
+    if (replacementTime === "before restore") await substitute();
+    else {
+      const remove = fs.rm.bind(fs);
+      let replaced = false;
+      t.mock.method(fs, "rm", async (target, options) => {
+        const result = await remove(target, options);
+        if (
+          !replaced &&
+          path.basename(target).startsWith(".external-server-restore-")
+        ) {
+          replaced = true;
+          await substitute();
+        }
+        return result;
+      });
+    }
+    const result = await panel.request(
+      `/api/backups/${backup.body.id}/restore`,
+      { confirm: true },
+    );
+    assert.equal(result.status, 409, JSON.stringify(result));
+    assert.match(result.body.error, /server folder changed/i);
+    const deleted = await panel.request(
+      "/api/files?path=other.txt",
+      {},
+      "DELETE",
+    );
+    assert.equal(deleted.status, 409, JSON.stringify(deleted));
+    assert.equal(
+      await fs.readFile(path.join(serverDir, "other.txt"), "utf8"),
+      "untouched replacement",
+    );
+    assert.equal(
+      await fs.readFile(path.join(parked, "world.dat"), "utf8"),
+      "saved world",
+    );
+    t.mock.restoreAll();
+  });
+}

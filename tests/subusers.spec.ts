@@ -312,6 +312,145 @@ for (const action of [
   });
 }
 
+for (const invitationResult of ["none", "success", "failure"] as const) {
+  test(`panel account audit warnings survive invitation ${invitationResult} without repeating the saved change`, async ({
+    page,
+    request,
+    server,
+  }) => {
+    const creationWarning =
+      "The account was saved, but its creation audit history could not be saved.";
+    const invitationWarning =
+      "The invitation was saved, but its audit history could not be saved.";
+    const editWarning =
+      "Computer permissions were saved, but their audit history could not be saved.";
+    const email = `audit-${invitationResult}@example.test`;
+    let created: { id: string; email: string } | undefined;
+    let creates = 0;
+    let invitations = 0;
+    await readyRemoteAccess(page);
+    await page.route("**/api/panel-users", async (route) => {
+      if (route.request().method() !== "POST") return route.continue();
+      creates++;
+      const response = await route.fetch();
+      const body = await response.json();
+      created = body.user ?? body;
+      return route.fulfill({
+        response,
+        json: { ...body, warning: creationWarning },
+      });
+    });
+    await page.route("**/api/panel-users/*/invite", (route) => {
+      invitations++;
+      if (invitationResult === "failure")
+        return route.fulfill({
+          status: 503,
+          json: { error: "Fixture invitation unavailable." },
+        });
+      return route.fulfill({
+        json: {
+          user: { ...created, inviteStatus: "pending" },
+          invitationUrl: "https://example.test/#invite=audit-warning-fixture",
+          inviteExpiresAt: new Date(Date.now() + 86_400_000).toISOString(),
+          warning: invitationWarning,
+        },
+      });
+    });
+    await openSubusers(page, server.id);
+    await openPanelUsers(page);
+    await page
+      .getByRole("button", { name: "Invite person", exact: true })
+      .click();
+    const editor = page.getByRole("dialog", {
+      name: "Invite person",
+      exact: true,
+    });
+    await editor.getByLabel("Email address", { exact: true }).fill(email);
+    if (invitationResult === "none")
+      await editor
+        .getByRole("checkbox", { name: "Create invitation link", exact: true })
+        .uncheck();
+    await editor
+      .getByRole("button", { name: "Create account", exact: true })
+      .click();
+    await expect(editor).not.toBeVisible();
+    if (invitationResult === "success") {
+      const invitation = page.getByRole("dialog", {
+        name: "Share invitation link",
+        exact: true,
+      });
+      await expect(invitation).toBeVisible();
+      await expect(invitation.getByRole("alert")).toContainText(
+        creationWarning,
+      );
+      await expect(invitation.getByRole("alert")).toContainText(
+        invitationWarning,
+      );
+      await expect(
+        invitation.getByLabel("Invitation link", { exact: true }),
+      ).toHaveValue("https://example.test/#invite=audit-warning-fixture");
+    } else {
+      const warning = page
+        .getByRole("alert")
+        .filter({ hasText: creationWarning });
+      await expect(warning).toBeVisible();
+      if (invitationResult === "failure")
+        await expect(warning).toContainText("Fixture invitation unavailable.");
+    }
+    expect(creates).toBe(1);
+    expect(invitations).toBe(invitationResult === "none" ? 0 : 1);
+    const stored = (await users(request)).filter(
+      (user) => user.email === email,
+    );
+    expect(stored).toHaveLength(1);
+    expect(stored[0].id).toBe(created?.id);
+    expect(stored[0].serverIds).toEqual([]);
+    expect(await serverUsers(request, server.id)).toEqual([]);
+
+    if (invitationResult === "none") {
+      let edits = 0;
+      await page.route(`**/api/panel-users/${stored[0].id}`, async (route) => {
+        if (route.request().method() !== "PATCH") return route.continue();
+        edits++;
+        expect(route.request().postDataJSON()).toEqual({
+          hostPermissions: ["server.create"],
+        });
+        const response = await route.fetch();
+        return route.fulfill({
+          response,
+          json: { ...(await response.json()), warning: editWarning },
+        });
+      });
+      await page
+        .getByRole("button", { name: `Edit account for ${email}`, exact: true })
+        .click();
+      const edit = page.getByRole("dialog", {
+        name: "Edit account",
+        exact: true,
+      });
+      await edit
+        .getByRole("checkbox", {
+          name: "Create and import servers",
+          exact: true,
+        })
+        .check();
+      await edit
+        .getByRole("button", { name: "Save account", exact: true })
+        .click();
+      await expect(edit).not.toBeVisible();
+      await expect(
+        page.getByRole("alert").filter({ hasText: editWarning }),
+      ).toBeVisible();
+      expect(edits).toBe(1);
+      expect(
+        (await users(request)).find((user) => user.id === stored[0].id)
+          ?.hostPermissions,
+      ).toEqual(["server.create"]);
+      expect(await serverUsers(request, server.id)).toEqual([]);
+    }
+  });
+}
+
 test("a new invitation remains usable when its follow-up account refresh fails", async ({
   page,
   request,
