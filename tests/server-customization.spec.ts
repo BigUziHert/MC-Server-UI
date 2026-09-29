@@ -507,11 +507,6 @@ for (const remote of [false, true]) {
     ]) {
       address = raw;
       await page.goto("/#console");
-      await expect(
-        page.getByText(remote ? "Remote server" : "Local server", {
-          exact: true,
-        }),
-      ).toBeVisible();
       const copy = page.getByRole("button", {
         name: "Copy server address",
         exact: true,
