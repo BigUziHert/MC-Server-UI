@@ -7,7 +7,6 @@ import {
   useState,
 } from "react";
 import {
-  Activity,
   ArrowDown,
   ArrowDownToLine,
   ArrowRight,
@@ -63,7 +62,6 @@ import Players from "./pages/Players";
 import Versions from "./pages/Versions";
 import Launchpad from "./pages/Launchpad";
 import Properties from "./pages/Properties";
-import PlayerHead from "./PlayerHead";
 import SearchField, { useDebouncedValue } from "./SearchField";
 import Switch from "./Switch";
 import DesktopUpdates from "./DesktopUpdates";
@@ -1353,7 +1351,13 @@ export function ServerWorkspace({
                       href={`#${item.id}`}
                       className={`nav-item ${page === item.id ? "active" : ""}`}
                       aria-current={page === item.id ? "page" : undefined}
-                      onClick={() => setSidebar(false)}
+                      onClick={() => {
+                        if (item.id === "files") {
+                          setFilePath("");
+                          setShowingFileBin(false);
+                        }
+                        setSidebar(false);
+                      }}
                     >
                       <item.icon size={19} aria-hidden="true" />
                       <span>{item.label}</span>
@@ -1488,13 +1492,11 @@ export function ServerWorkspace({
               history={history}
               notify={notify}
               refresh={refresh}
-              navigate={navigate}
               onSettings={
                 onSettings ? () => onSettings(server?.status) : undefined
               }
               controls={controls}
               permissions={permissions}
-              remote={Boolean(session)}
             />
           )}
           {page === "files" && (
@@ -1817,10 +1819,8 @@ function ConsolePage({
   history,
   notify,
   refresh,
-  navigate,
   onSettings,
   permissions,
-  remote,
 }: {
   server: Server | null;
   selected: ServerRecord;
@@ -1828,14 +1828,11 @@ function ConsolePage({
   controls: ReturnType<typeof useServerPower>;
   notify: (message: string, error?: boolean) => void;
   refresh: () => Promise<void>;
-  navigate: (page: Page) => void;
   onSettings?: () => void;
   permissions?: string[];
-  remote: boolean;
 }) {
   const { api, post } = useServerApi();
   const canConsole = !permissions || permissions.includes("control.console");
-  const canFiles = !permissions || permissions.includes("file.read");
   const gameAddress = formatGameAddress(server?.address ?? "");
   const [lines, setLines] = useState<LogLine[]>([]);
   const [inputMode, setInputMode] = useState<"command" | "message">("command");
@@ -2174,9 +2171,7 @@ function ConsolePage({
           </div>
         </div>
       </section>
-      <div
-        className={`console-layout ${canConsole ? "" : "console-layout-summary"}`}
-      >
+      <div className="console-layout">
         {canConsole && (
           <section className="panel console-panel">
             <div className="panel-heading">
@@ -2405,111 +2400,6 @@ function ConsolePage({
             </form>
           </section>
         )}
-        <aside className="console-side">
-          <section className="panel server-details">
-            <div className="panel-heading">
-              <div className="panel-title">
-                <Box size={16} />
-                <h2>Server details</h2>
-              </div>
-            </div>
-            <dl>
-              <div>
-                <dt>Software</dt>
-                <dd>
-                  <span className="software-dot" />
-                  {server?.software || "—"}
-                </dd>
-              </div>
-              <div>
-                <dt>Version</dt>
-                <dd>
-                  <span className="version-badge">
-                    {server?.version || "—"}
-                  </span>
-                </dd>
-              </div>
-              <div>
-                <dt>Environment</dt>
-                <dd>{remote ? "Remote server" : "Local server"}</dd>
-              </div>
-              <div>
-                <dt>Connection</dt>
-                <dd className="lime-text" title={server?.addressNote}>
-                  {server?.addressSource === "public"
-                    ? "Public IP"
-                    : server?.addressSource === "custom"
-                      ? "Custom address"
-                      : "Localhost"}
-                </dd>
-              </div>
-            </dl>
-            {canFiles && (
-              <button className="card-link" onClick={() => navigate("files")}>
-                Manage server files <ArrowRight size={14} />
-              </button>
-            )}
-          </section>
-          <section className="panel online-players">
-            <div className="panel-heading">
-              <div className="panel-title">
-                <Users size={16} />
-                <h2>Players</h2>
-                <span className="count-badge">
-                  {playersUnavailable ? "—" : server?.players.length || 0}
-                </span>
-              </div>
-              <span className="muted small">Online</span>
-            </div>
-            <div className="players-list">
-              {server?.players.length ? (
-                server.players.map((player) => (
-                  <div className="player-row" key={player.name}>
-                    <PlayerHead name={player.name} uuid={player.uuid} />
-                    <div>
-                      <strong>{player.name}</strong>
-                      <span>Exploring the world</span>
-                    </div>
-                    {typeof player.latency === "number" &&
-                      Number.isFinite(player.latency) &&
-                      player.latency >= 0 && (
-                        <span className="player-latency">
-                          <Activity size={11} />
-                          {player.latency} ms
-                        </span>
-                      )}
-                  </div>
-                ))
-              ) : (
-                <div className="players-empty">
-                  <Users size={23} />
-                  {playersUnavailable && (
-                    <strong>Player query not connected</strong>
-                  )}
-                  <p>
-                    {playersUnavailable ? (
-                      "Live player tracking is not configured yet."
-                    ) : (
-                      <>
-                        Players will appear here
-                        <br />
-                        when they join your server.
-                      </>
-                    )}
-                  </p>
-                </div>
-              )}
-            </div>
-          </section>
-        </aside>
-      </div>
-      <div className="console-bottom-note">
-        <ShieldCheck size={14} />
-        <span>
-          {remote
-            ? "Connected to a remote panel. Your permissions apply to this server."
-            : "Your panel is running locally. Server commands are sent directly to the server process."}
-        </span>
       </div>
     </>
   );

@@ -657,8 +657,6 @@ test("console shows detected NeoForge heap and version without substituting a de
   const memory = page.locator(".metric-card").filter({ hasText: "Memory" });
   await expect(memory.locator(".metric-value")).toHaveText("11.20/ 12 GB");
   await expect(memory).toContainText("startup heap limit");
-  await expect(page.locator(".server-details")).toContainText("NeoForge");
-  await expect(page.locator(".server-details")).toContainText("21.1.250");
   await expect(serverButton(page, serverId)).toContainText("NeoForge 1.21.1");
   await expect(serverButton(page, serverId)).not.toContainText("21.1.250");
 
@@ -684,7 +682,5 @@ test("console shows detected NeoForge heap and version without substituting a de
   };
   await expect(memory.locator(".metric-value")).toHaveText("11.20/ — GB");
   await expect(memory).toContainText("heap limit unknown");
-  await expect(page.locator(".server-details")).toContainText("Unknown");
-  await expect(page.locator(".server-details")).not.toContainText("21.1.250");
   await expect(serverButton(page, serverId)).not.toContainText("1.21.1");
 });

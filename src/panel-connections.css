@@ -44,7 +44,27 @@
 .panel-connections-entry {
   display: flex;
   justify-content: flex-end;
-  margin-top: 16px;
+  margin-top: 20px;
+  padding-top: 18px;
+  border-top: 1px solid var(--border);
+}
+.panel-connections-empty {
+  display: grid;
+  justify-items: center;
+  gap: 12px;
+  padding: 28px 16px;
+  margin-top: 20px;
+  text-align: center;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+}
+.panel-connections-empty > svg {
+  color: var(--muted);
+}
+.panel-connections-empty p {
+  margin: 0;
+  color: var(--muted);
+  line-height: 1.6;
 }
 .panel-connections-list li {
   justify-content: space-between;
@@ -53,7 +73,13 @@
   flex-wrap: wrap;
 }
 .panel-connections-identity {
+  flex: 1 1 220px;
+  align-items: flex-start;
   min-width: 0;
+}
+.panel-connections-identity > svg {
+  flex-shrink: 0;
+  margin-top: 2px;
 }
 .panel-connections-identity > div {
   min-width: 0;
@@ -66,6 +92,14 @@
   display: block;
   color: var(--muted);
   margin-top: 4px;
+}
+.panel-connections-access-hint {
+  margin: 10px 0 0;
+  padding: 10px 12px;
+  border-left: 2px solid var(--border);
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.6;
 }
 .panel-connections-actions {
   justify-content: flex-end;

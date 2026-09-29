@@ -227,6 +227,35 @@ for (const width of [1434, 390]) {
         .click();
       await expect(files).toBeVisible();
       await files.getByRole("button", { name: "world", exact: true }).click();
+      if (width < 761)
+        await page
+          .getByRole("button", { name: "Open navigation", exact: true })
+          .click();
+      await nav.getByRole("link", { name: "Console", exact: true }).click();
+      if (width < 761)
+        await page
+          .getByRole("button", { name: "Open navigation", exact: true })
+          .click();
+      await nav
+        .getByRole("link", { name: "File Manager", exact: true })
+        .click();
+      await expect(
+        files.getByRole("button", { name: "world", exact: true }),
+      ).toBeVisible();
+      await expect(
+        breadcrumb.getByRole("button", { name: "world", exact: true }),
+      ).toHaveCount(0);
+      await files.getByRole("button", { name: "world", exact: true }).click();
+      if (width < 761)
+        await page
+          .getByRole("button", { name: "Open navigation", exact: true })
+          .click();
+      await nav
+        .getByRole("link", { name: "File Manager", exact: true })
+        .click();
+      await expect(
+        files.getByRole("button", { name: "world", exact: true }),
+      ).toBeVisible();
       await selectServer(page, fleet.defaultServerId);
       await expect(
         breadcrumb.getByRole("button", { name: "world", exact: true }),

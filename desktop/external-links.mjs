@@ -1,5 +1,5 @@
 // External links leave the sandbox and open the user's browser. Only allow the
-// HTTPS catalog and software sites used by Launchpad, Versions, and Help.
+// HTTPS catalog/software sites and the public panel address saved by the owner.
 const websites = new Set([
   "modrinth.com",
   "www.modrinth.com",
@@ -28,12 +28,23 @@ const websites = new Set([
   "magmafoundation.org",
 ]);
 
-export function externalWebsite(value) {
+export function externalWebsite(value, { publicPanelUrl } = {}) {
   try {
     if (typeof value !== "string") return null;
     const url = new URL(value);
-    if (url.protocol !== "https:" || url.username || url.password || url.port)
-      return null;
+    if (url.protocol !== "https:" || url.username || url.password) return null;
+    // The host supplies this address from its saved access configuration, never
+    // from the renderer. Match only the root panel URL, not arbitrary links on
+    // the same host or query parameters that might redirect elsewhere.
+    if (publicPanelUrl && url.pathname === "/" && !url.search && !url.hash) {
+      try {
+        const panel = new URL(publicPanelUrl);
+        if (panel.href === url.href) return url.href;
+      } catch {
+        // A missing or invalid setting does not expand the website allowlist.
+      }
+    }
+    if (url.port) return null;
     if (websites.has(url.hostname)) return url.href;
     if (
       url.hostname === "aka.ms" &&
@@ -55,8 +66,11 @@ export function externalWebsite(value) {
   return null;
 }
 
-export async function openExternalWebsite(value, { openExternal, logError }) {
-  const url = externalWebsite(value);
+export async function openExternalWebsite(
+  value,
+  { openExternal, logError, publicPanelUrl },
+) {
+  const url = externalWebsite(value, { publicPanelUrl });
   if (!url) return false;
   try {
     await openExternal(url);

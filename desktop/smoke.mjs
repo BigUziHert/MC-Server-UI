@@ -725,6 +725,91 @@ async function assertExternalProjectLinks(page) {
   }
 }
 
+async function assertPublicPanelLink(page) {
+  step(
+    "Checking Open public panel uses the saved address and opens the browser.",
+  );
+  const previous = await browserApi(page, "/access/settings");
+  assert.equal(previous.status, 200);
+  assert.equal(previous.data.enabled, false);
+  const publicUrl = "https://203.0.113.20";
+  const saved = await browserApi(page, "/access/settings", {
+    method: "PUT",
+    body: { enabled: false, publicUrl, transport: "managed" },
+  });
+  assert.equal(saved.status, 200);
+  // Save the address in the real host while leaving its listener disabled. Only
+  // fake the certificate display so this test never requests a public certificate.
+  const routePattern = "**/api/access/settings";
+  const handler = (route) =>
+    route.fulfill({
+      json: {
+        ...saved.data,
+        enabled: true,
+        ready: true,
+        listening: true,
+        managedHttps: {
+          state: "ready",
+          ready: true,
+          message: "Trusted HTTPS is ready.",
+        },
+      },
+    });
+  await page.route(routePattern, handler);
+  await application.evaluate(({ shell }) => {
+    globalThis.__panelSmokeOpenExternal = shell.openExternal;
+    globalThis.__panelSmokeOpenedUrls = [];
+    shell.openExternal = async (url) => {
+      globalThis.__panelSmokeOpenedUrls.push(url);
+    };
+  });
+  try {
+    await page
+      .getByRole("button", { name: "Panel Settings", exact: true })
+      .click();
+    const settings = page.getByRole("dialog", {
+      name: "Panel Settings",
+      exact: true,
+    });
+    await settings
+      .getByRole("tab", { name: "Remote Access", exact: true })
+      .click();
+    await settings
+      .getByRole("link", { name: "Open public panel", exact: true })
+      .click();
+    await ui
+      .poll(() => application.evaluate(() => globalThis.__panelSmokeOpenedUrls))
+      .toEqual([`${publicUrl}/`]);
+    assert.equal(new URL(page.url()).origin, currentOrigin);
+    assert.equal(
+      await application.evaluate(
+        ({ BrowserWindow }) => BrowserWindow.getAllWindows().length,
+      ),
+      1,
+    );
+    await settings
+      .getByRole("button", { name: "Close Panel Settings", exact: true })
+      .click();
+  } finally {
+    await page.unroute(routePattern, handler);
+    const restored = await browserApi(page, "/access/settings", {
+      method: "PUT",
+      body: {
+        enabled: previous.data.enabled,
+        publicUrl: previous.data.publicUrl,
+        transport: previous.data.transport,
+        port: previous.data.port,
+      },
+    });
+    assert.equal(restored.status, 200);
+    await application.evaluate(({ shell }) => {
+      shell.openExternal = globalThis.__panelSmokeOpenExternal;
+      delete globalThis.__panelSmokeOpenExternal;
+      delete globalThis.__panelSmokeOpenedUrls;
+    });
+  }
+}
+
 async function assertDesktopUpdates(page) {
   step(
     "Checking packaged update status without contacting a release service or installing anything.",
@@ -1244,6 +1329,7 @@ ${processFixture}`,
   await assertDesktopUpdates(page);
   serverId = await createSmokeServer(page);
   await assertExternalProjectLinks(page);
+  await assertPublicPanelLink(page);
 
   step(
     "Checking bundled Minecraft management pages and configuration modules.",
@@ -1470,7 +1556,7 @@ ${processFixture}`,
   );
   await quitPackaged("query-session-end");
   step(
-    `Passed: clean startup, real process start/restart/commands, read-only update status, catalog browser links and blocked external navigation, explicit creation, inline folder browser cancellation/import without native dialogs, JAR and NeoForge imports, source/JVM/EULA preservation, isolation, authenticated API, sandboxing, uploads/downloads, backup recovery, persistence, tray close, normal quit, and Windows-session shutdown with owned-process exit. Artifacts: ${outputDirectory}`,
+    `Passed: clean startup, real process start/restart/commands, read-only update status, catalog and configured public panel browser links, blocked external navigation, explicit creation, inline folder browser cancellation/import without native dialogs, JAR and NeoForge imports, source/JVM/EULA preservation, isolation, authenticated API, sandboxing, uploads/downloads, backup recovery, persistence, tray close, normal quit, and Windows-session shutdown with owned-process exit. Artifacts: ${outputDirectory}`,
   );
 } catch (error) {
   failed = true;

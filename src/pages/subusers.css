@@ -23,12 +23,6 @@
   color: var(--text);
   font-size: 18px;
 }
-.subusers-basic-access {
-  padding: 7px;
-  border: 1px solid var(--border);
-  border-radius: 5px;
-  margin-bottom: 22px;
-}
 .subusers-additional-permissions {
   border: 0;
   padding: 0;

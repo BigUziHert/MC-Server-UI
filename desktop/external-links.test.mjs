@@ -106,3 +106,71 @@ test("desktop reports browser-opening errors without unhandled rejections", asyn
   );
   assert.deepEqual(errors, [failure]);
 });
+
+test("desktop opens only the saved public panel address in the browser", async () => {
+  for (const publicPanelUrl of [
+    "https://203.0.113.20",
+    "https://panel.example.com",
+    "https://[2001:db8::20]",
+    "https://panel.example.com:3004",
+  ]) {
+    const opened = [];
+    const contents = new EventEmitter();
+    let windowHandler;
+    contents.setWindowOpenHandler = (handler) => {
+      windowHandler = handler;
+    };
+    let savedAddress = publicPanelUrl;
+    installExternalLinkHandlers(contents, "http://127.0.0.1:45678", (url) =>
+      openExternalWebsite(url, {
+        publicPanelUrl: savedAddress,
+        openExternal: async (target) => opened.push(target),
+        logError: assert.fail,
+      }),
+    );
+    const expected = new URL(publicPanelUrl).href;
+    assert.deepEqual(windowHandler({ url: expected }), { action: "deny" });
+    assert.deepEqual(opened, [expected]);
+    let blocked = false;
+    contents.emit(
+      "will-navigate",
+      { preventDefault: () => (blocked = true) },
+      expected,
+    );
+    assert.equal(blocked, true);
+    assert.deepEqual(opened, [expected, expected]);
+    for (const url of [
+      `${publicPanelUrl}/redirect?url=https://elsewhere.example`,
+      `${publicPanelUrl}/?next=https://elsewhere.example`,
+      `${publicPanelUrl}/#redirect`,
+      publicPanelUrl.replace("https:", "http:"),
+      publicPanelUrl.replace("https://", "https://user:password@"),
+      "https://unconfigured.example/",
+      "https://203.0.113.21/",
+      "file:///C:/Windows/notepad.exe",
+    ]) {
+      assert.deepEqual(windowHandler({ url }), { action: "deny" });
+    }
+    assert.deepEqual(opened, [expected, expected]);
+    savedAddress = "https://changed.example";
+    windowHandler({ url: expected });
+    windowHandler({ url: `${savedAddress}/` });
+    assert.deepEqual(opened, [expected, expected, `${savedAddress}/`]);
+  }
+});
+
+test("malformed public panel settings do not allow unsafe destinations or disable catalog links", () => {
+  for (const publicPanelUrl of [
+    "",
+    "invalid",
+    "file:///C:/Windows/notepad.exe",
+    "http://panel.example.com",
+    "https://user:password@panel.example.com/",
+  ]) {
+    assert.equal(externalWebsite(publicPanelUrl, { publicPanelUrl }), null);
+    assert.equal(
+      externalWebsite(catalogLinks[0], { publicPanelUrl }),
+      catalogLinks[0],
+    );
+  }
+});

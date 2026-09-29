@@ -393,7 +393,6 @@ async function consoleGeometry(page: Page) {
     const box = (selector: string) => element(selector).getBoundingClientRect();
     const panel = box(".console-panel");
     const output = element(".console-output");
-    const players = element(".players-list");
     const command = box(".command-form");
     return {
       viewportWidth: document.documentElement.clientWidth,
@@ -406,11 +405,10 @@ async function consoleGeometry(page: Page) {
       footerBottom: box(".footer").bottom + window.scrollY,
       panelHeight: panel.height,
       panelBottom: panel.bottom + window.scrollY,
-      sideBottom: box(".console-side").bottom + window.scrollY,
+      panelWidth: panel.width,
+      layoutWidth: box(".console-layout").width,
       outputHeight: output.clientHeight,
       outputScrollHeight: output.scrollHeight,
-      playersHeight: players.clientHeight,
-      playersScrollHeight: players.scrollHeight,
       commandTop: command.top + window.scrollY,
       commandBottom: command.bottom + window.scrollY,
     };
@@ -484,8 +482,8 @@ for (const mode of consoleModes) {
         )
         .toBeCloseTo(measured.paddingBottom, 0);
       expect
-        .soft(measured.panelBottom, "console and player sidebar end together")
-        .toBeCloseTo(measured.sideBottom, 0);
+        .soft(measured.panelWidth, "console fills the available page width")
+        .toBeCloseTo(measured.layoutWidth, 0);
       expect
         .soft(measured.outputHeight, "console retains a readable minimum")
         .toBeGreaterThanOrEqual(220);
@@ -512,11 +510,10 @@ for (const mode of consoleModes) {
       )
       .toBeCloseTo(24, 0);
     fixture.populateConsole();
-    await expect(page.locator(".online-players .player-row")).toHaveCount(45);
+    await expect(page.locator(".console-side")).toHaveCount(0);
     await expect(page.getByRole("log")).toContainText("Layout log 399:");
     const populated = await consoleGeometry(page);
     expect(populated.panelHeight).toBeCloseTo(tall.panelHeight, 0);
-    expect(populated.playersHeight).toBeCloseTo(tall.playersHeight, 0);
     expect(populated.documentHeight).toBeLessThanOrEqual(
       tall.documentHeight + 1,
     );
@@ -525,9 +522,6 @@ for (const mode of consoleModes) {
     );
     expect(populated.outputScrollHeight).toBeGreaterThan(
       populated.outputHeight,
-    );
-    expect(populated.playersScrollHeight).toBeGreaterThan(
-      populated.playersHeight,
     );
     await expect(
       page.getByRole("textbox", { name: "Server command", exact: true }),
@@ -543,9 +537,7 @@ for (const mode of consoleModes) {
           .filter((target) => target.path === "/api/server")
           .every((target) => target.panel === "remote"),
       ).toBe(true);
-      await expect(page.locator(".server-details")).toContainText(
-        "Remote server",
-      );
+      await expect(page.locator(".server-details")).toHaveCount(0);
     }
     expect(fixture.unexpected).toEqual([]);
     await attachGeometry(
@@ -583,7 +575,7 @@ for (const mode of consoleModes) {
       );
       expect(before.documentHeight).toBeGreaterThan(before.viewportHeight);
       fixture.populateConsole();
-      await expect(page.locator(".online-players .player-row")).toHaveCount(45);
+      await expect(page.locator(".console-side")).toHaveCount(0);
       await expect(page.getByRole("log")).toContainText("Layout log 399:");
       const after = await consoleGeometry(page);
       expect(after.panelHeight).toBeCloseTo(before.panelHeight, 0);
@@ -591,7 +583,6 @@ for (const mode of consoleModes) {
         before.documentHeight + 1,
       );
       expect(after.outputScrollHeight).toBeGreaterThan(after.outputHeight);
-      expect(after.playersScrollHeight).toBeGreaterThan(after.playersHeight);
       const command = page.getByRole("textbox", {
         name: "Server command",
         exact: true,
@@ -709,7 +700,9 @@ test("a wide remote layout keeps console content and actions permission-restrict
   await page.setViewportSize({ width: 2560, height: 1368 });
   const fixture = await workspace(page, false, ["server.view"]);
   await page.goto("/#console");
-  await expect(page.locator(".console-layout-summary")).toBeVisible();
+  await expect(
+    page.getByRole("region", { name: "Server resources" }),
+  ).toBeVisible();
   await expect(page.locator(".server-banner")).toContainText(server.name);
   await expect(page.locator(".console-output")).toHaveCount(0);
   await expect(page.getByRole("textbox", { name: /command/i })).toHaveCount(0);

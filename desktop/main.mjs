@@ -94,6 +94,7 @@ function showWindow() {
 
 function openWebsite(url = documentation) {
   return openExternalWebsite(url, {
+    publicPanelUrl: runtime?.fleet.access.status().publicUrl,
     openExternal: (target) => shell.openExternal(target),
     logError,
   });

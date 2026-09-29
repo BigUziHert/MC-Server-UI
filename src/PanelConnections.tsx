@@ -308,25 +308,17 @@ export default function PanelConnections({
         <>
           <p>
             {unified
-              ? "Manage each panel's sign-in independently. Local servers and other connections stay available in this workspace."
+              ? "Manage your saved panels and sign in to another panel."
               : "Open a saved panel or forget its sign-in on this computer. Unavailable and signed-out panels remain here for retry."}
           </p>
-          {unified && onSignIn && !signingIn && (
-            <div className="panel-connections-entry">
-              <button
-                className="btn primary"
-                type="button"
-                disabled={Boolean(busy)}
-                onClick={onSignIn}
-              >
-                <LogIn size={16} /> Sign in
-              </button>
-            </div>
-          )}
           {!connections ? (
             <p role="status">Loading connections…</p>
           ) : !panels.length ? (
-            <p>No saved panel connections.</p>
+            <div className="panel-connections-empty">
+              <Globe2 size={26} aria-hidden="true" />
+              <strong>No saved panel connections.</strong>
+              <p>Sign in with a panel address and your account to connect.</p>
+            </div>
           ) : (
             <ul className="panel-connections-list">
               {panels.map((panel) => {
@@ -362,6 +354,17 @@ export default function PanelConnections({
                         {unified && panel.session?.email && (
                           <small>{panel.session.email}</small>
                         )}
+                        {unified &&
+                          panel.signedIn === true &&
+                          panel.connectionState === "connected" &&
+                          !panel.pendingLeave &&
+                          panel.servers?.length === 0 && (
+                            <p className="panel-connections-access-hint">
+                              No servers have been shared with this account. Ask
+                              the panel owner to add you as a subuser on a
+                              server.
+                            </p>
+                          )}
                         {unified && panel.error && (
                           <small className="form-error" role="alert">
                             {panel.error}
@@ -482,6 +485,18 @@ export default function PanelConnections({
                 );
               })}
             </ul>
+          )}
+          {unified && onSignIn && !signingIn && (
+            <div className="panel-connections-entry">
+              <button
+                className="btn primary"
+                type="button"
+                disabled={Boolean(busy)}
+                onClick={onSignIn}
+              >
+                <LogIn size={16} /> Sign in
+              </button>
+            </div>
           )}
         </>
       )}

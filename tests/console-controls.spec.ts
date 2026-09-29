@@ -769,7 +769,7 @@ for (const viewport of [
   { width: 1348, height: 1216 },
   { width: 390, height: 844 },
 ]) {
-  test(`console cleanup keeps player list bounded and messaging usable at ${viewport.width}px`, async ({
+  test(`console fills the page and keeps messaging usable at ${viewport.width}px`, async ({
     page,
     request,
     serverId,
@@ -798,6 +798,8 @@ for (const viewport of [
       ".workspace-note",
       ".console-heading p:not(.eyebrow)",
       ".players-metric .metric-footnote",
+      ".console-side",
+      ".console-bottom-note",
     ]) {
       await expect(page.locator(selector)).toHaveCount(0);
     }
@@ -806,38 +808,30 @@ for (const viewport of [
         const rect = (selector: string) =>
           document.querySelector(selector)!.getBoundingClientRect();
         const consolePanel = rect(".console-panel"),
-          side = rect(".console-side"),
-          playersPanel = rect(".online-players"),
-          list = document.querySelector(".players-list")!;
+          layout = rect(".console-layout");
         return {
           consoleHeight: consolePanel.height,
           consoleBottom: consolePanel.bottom,
-          sideBottom: side.bottom,
-          playerHeight: playersPanel.height,
-          listHeight: list.clientHeight,
-          listScrollHeight: list.scrollHeight,
+          consoleWidth: consolePanel.width,
+          layoutWidth: layout.width,
           documentHeight: document.documentElement.scrollHeight,
           documentWidth: document.documentElement.scrollWidth,
         };
       });
     const before = await geometry();
-    if (viewport.width > 1000) {
-      expect(Math.abs(before.consoleBottom - before.sideBottom)).toBeLessThan(
-        2,
-      );
-    }
+    expect(before.consoleWidth).toBeCloseTo(before.layoutWidth, 0);
     players = Array.from({ length: 45 }, (_, index) => ({
       name: `Player_${index}`,
     }));
-    await expect(page.locator(".online-players .player-row")).toHaveCount(45);
+    await expect(page.locator(".players-metric .metric-value")).toContainText(
+      "45",
+    );
     const after = await geometry();
     expect(Math.abs(after.consoleHeight - before.consoleHeight)).toBeLessThan(
       2,
     );
-    expect(Math.abs(after.playerHeight - before.playerHeight)).toBeLessThan(2);
     expect(after.documentHeight).toBeLessThanOrEqual(before.documentHeight + 2);
     expect(after.documentWidth).toBeLessThanOrEqual(viewport.width);
-    expect(after.listScrollHeight).toBeGreaterThan(after.listHeight);
     await page.getByRole("switch", { name: "Server messaging" }).click();
     await expect(
       page.getByRole("textbox", { name: "Server message", exact: true }),

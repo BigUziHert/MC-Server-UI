@@ -1429,6 +1429,20 @@ export default function FileManager({
           <div className="storage-actions">
             <button
               className="btn small"
+              onClick={copySelection}
+              disabled={
+                !selectedEntries.length ||
+                !canContent ||
+                loading ||
+                saving ||
+                !!error
+              }
+              title="Copy selected files and folders (Ctrl+C)"
+            >
+              <Copy size={15} /> Copy
+            </button>
+            <button
+              className="btn small"
               onClick={pasteSelection}
               disabled={
                 !canCreate ||
@@ -1475,7 +1489,6 @@ export default function FileManager({
             aria-label="Search files and folders"
             value={query}
             onValueChange={setQuery}
-            aria-describedby="file-search-scope"
           />
           <div className="file-selection-slot">
             {!selectedEntries.length && (
@@ -1514,14 +1527,6 @@ export default function FileManager({
                 </button>
                 <button
                   className="btn small"
-                  onClick={copySelection}
-                  disabled={!canContent || loading || saving}
-                  title="Copy selected files and folders (Ctrl+C)"
-                >
-                  <Copy size={15} /> Copy
-                </button>
-                <button
-                  className="btn small"
                   onClick={() => setSelected(new Set())}
                   disabled={saving}
                 >
@@ -1545,11 +1550,6 @@ export default function FileManager({
             </div>
           </div>
         </div>
-        <p className="file-search-scope" id="file-search-scope">
-          {requestedQuery
-            ? `Search results in /${path || "server"} and its subfolders`
-            : "Search file and folder names in this folder and its subfolders."}
-        </p>
         {error && (
           <StatePanel
             variant="error"

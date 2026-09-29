@@ -8,6 +8,7 @@ import {
   test,
   expect,
   type APIRequestContext,
+  type Locator,
   type Page,
 } from "@playwright/test";
 import {
@@ -1173,9 +1174,6 @@ test("server workspaces isolate files, commands and backups while panel users re
   await dialog
     .getByRole("combobox", { name: "Panel account", exact: true })
     .selectOption({ label: "secondary-only@example.com" });
-  await dialog
-    .getByRole("checkbox", { name: "Can View Server", exact: true })
-    .check();
   await expect(
     dialog.getByRole("combobox", { name: "Servers available to this person" }),
   ).toHaveCount(0);
@@ -1372,9 +1370,9 @@ test("Players grants and removes OP through the subprocess independently of pane
   await openPage(page, "players", "Players");
   await expect(
     page.getByText("Start the server to manage operators", { exact: true }),
-  ).toBeVisible();
-  await expect(grantButton).toBeDisabled();
-  await page.getByRole("link", { name: "Go to Console", exact: false }).click();
+  ).toHaveCount(0);
+  await expect(grantButton).toBeEnabled();
+  await openPage(page, "console", "Console");
   await page
     .locator(".server-power")
     .getByRole("button", { name: "Start", exact: true })
@@ -1536,17 +1534,26 @@ async function mockOnlinePlayers(
 
 async function mockOperators(
   page: Page,
-  operators: Array<{ name: string; uuid?: string; level?: number }>,
+  operators:
+    | Array<{ name: string; uuid?: string; level?: number }>
+    | (() => Array<{ name: string; uuid?: string; level?: number }>),
+  online: () => MockOnlinePlayer[] = () => [],
 ) {
   await page.route("**/api/players", (route) =>
     route.fulfill({
-      json: { operators, mode: "live", status: "running" },
+      json: {
+        operators: typeof operators === "function" ? operators() : operators,
+        online: online(),
+        mode: "live",
+        status: "running",
+        maxPlayers: 20,
+      },
     }),
   );
 }
 
 async function expectHeadImage(
-  page: Page,
+  page: Page | Locator,
   name: string,
   identifier: string,
   size: number,
@@ -1569,7 +1576,7 @@ async function expectHeadImage(
     .toBeGreaterThan(0);
 }
 
-test("Minecraft head images use UUIDs or usernames, while console polling updates player joins and leaves", async ({
+test("Minecraft heads use UUIDs or usernames and Players polling updates joins and leaves", async ({
   page,
 }, testInfo) => {
   const uuid = "4bd20cf8-60be-4bf0-a791-4ec8a88c82d7";
@@ -1579,10 +1586,14 @@ test("Minecraft head images use UUIDs or usernames, while console polling update
     { name: "Unknown_Ping", latency: null },
   ];
   await mockOnlinePlayers(page, () => online);
-  await mockOperators(page, [
-    { name: "UUID_Player", uuid, level: 4 },
-    { name: "Name_Only", level: 4 },
-  ]);
+  await mockOperators(
+    page,
+    [
+      { name: "UUID_Player", uuid, level: 4 },
+      { name: "Name_Only", level: 4 },
+    ],
+    () => online,
+  );
   await page.goto("/");
   await expect(
     page.getByRole("heading", { level: 1, name: "Console", exact: true }),
@@ -1590,24 +1601,26 @@ test("Minecraft head images use UUIDs or usernames, while console polling update
   await expect(
     page.getByRole("heading", { level: 1, name: "Console.", exact: true }),
   ).toHaveCount(0);
-  const playerRows = page.locator(".online-players .player-row");
-  await expect(playerRows).toHaveCount(3);
-  await expectHeadImage(page, "UUID_Player", uuid, 32);
-  await expectHeadImage(page, "Name_Only", "Name_Only", 32);
-  await expectHeadImage(page, "Unknown_Ping", "Unknown_Ping", 32);
-  await expect(playerRows.filter({ hasText: "Name_Only" })).toContainText(
-    "42 ms",
+  await expect(page.locator(".players-metric .metric-value")).toHaveText(
+    "3/ 20",
   );
-  await expect(
-    playerRows.filter({ hasText: "UUID_Player" }).locator(".player-latency"),
-  ).toHaveCount(0);
-  await expect(
-    playerRows.filter({ hasText: "Unknown_Ping" }).locator(".player-latency"),
-  ).toHaveCount(0);
-  await expect(page.locator(".online-players .count-badge")).toHaveText("3");
+  await expect(page.locator(".online-players")).toHaveCount(0);
+  await openPage(page, "players", "Players");
+  const onlineRoster = page.getByRole("region", {
+    name: "Online Players",
+    exact: true,
+  });
+  const playerRows = onlineRoster.getByRole("listitem");
+  await expect(playerRows).toHaveCount(3);
+  await expectHeadImage(onlineRoster, "UUID_Player", uuid, 30);
+  await expectHeadImage(onlineRoster, "Name_Only", "Name_Only", 30);
+  await expectHeadImage(onlineRoster, "Unknown_Ping", "Unknown_Ping", 30);
+  await expect(page.locator(".players-online-banner")).toContainText(
+    "3 / 20 players online",
+  );
   await page.evaluate(() => document.fonts.ready);
   await page.screenshot({
-    path: testInfo.outputPath("console-player-heads-desktop.png"),
+    path: testInfo.outputPath("online-player-heads-desktop.png"),
     fullPage: true,
   });
 
@@ -1616,14 +1629,19 @@ test("Minecraft head images use UUIDs or usernames, while console polling update
   await expect(playerRows.filter({ hasText: "UUID_Player" })).toHaveCount(0);
   await expect(playerRows.filter({ hasText: "Unknown_Ping" })).toHaveCount(0);
   await expect(playerRows).toHaveCount(2);
-  await expectHeadImage(page, "Joined_Player", "Joined_Player", 32);
-  await expect(page.locator(".online-players .count-badge")).toHaveText("2");
+  await expectHeadImage(onlineRoster, "Joined_Player", "Joined_Player", 30);
+  await expect(page.locator(".players-online-banner")).toContainText(
+    "2 / 20 players online",
+  );
   online = [];
   await expect(playerRows).toHaveCount(0);
-  await expect(page.locator(".online-players .count-badge")).toHaveText("0");
-  await expect(page.locator(".online-players .players-empty")).toBeVisible();
+  await expect(page.locator(".players-online-banner")).toContainText(
+    "0 / 20 players online",
+  );
+  await expect(
+    onlineRoster.getByText("No players online.", { exact: true }),
+  ).toBeVisible();
 
-  await openPage(page, "players", "Players");
   await expectHeadImage(page, "UUID_Player", uuid, 30);
   await expectHeadImage(page, "Name_Only", "Name_Only", 30);
   await expect(page.locator(".players-operator")).toHaveCount(2);
@@ -1645,6 +1663,7 @@ test("failed skin requests use local Minecraft heads and changing a player ident
 }, testInfo) => {
   const uuid = "59006320-8d7d-4c61-a2b4-2548b51c3c47";
   let online: MockOnlinePlayer[] = [{ name: "OfflineSkin" }];
+  let operators: Array<{ name: string; level: number }> = [];
   const failedRequests: string[] = [];
   await page.route(
     "https://mc-heads.net/avatar/OfflineSkin/64",
@@ -1654,9 +1673,17 @@ test("failed skin requests use local Minecraft heads and changing a player ident
     },
   );
   await mockOnlinePlayers(page, () => online);
-  await mockOperators(page, [{ name: "OfflineSkin", level: 4 }]);
-  await page.goto("/");
-  let fallback = page.getByRole("img", {
+  await mockOperators(
+    page,
+    () => operators,
+    () => online,
+  );
+  await page.goto("/#players");
+  const onlineRoster = page.getByRole("region", {
+    name: "Online Players",
+    exact: true,
+  });
+  let fallback = onlineRoster.getByRole("img", {
     name: "OfflineSkin's Minecraft head (default)",
     exact: true,
   });
@@ -1671,23 +1698,28 @@ test("failed skin requests use local Minecraft heads and changing a player ident
     .toBeGreaterThan(0);
   expect(failedRequests).toHaveLength(1);
   await expect(
-    page
-      .locator(".online-players .player-row")
-      .filter({ hasText: "OfflineSkin" }),
+    onlineRoster.getByRole("listitem", {
+      name: "Online Players OfflineSkin",
+      exact: true,
+    }),
   ).toBeVisible();
 
   // A resolved UUID for the same connected username must clear its failed-name lookup.
   online = [{ name: "OfflineSkin", uuid }];
-  await expectHeadImage(page, "OfflineSkin", uuid, 32);
+  await expectHeadImage(onlineRoster, "OfflineSkin", uuid, 30);
   await expect(
-    page.getByRole("img", {
+    onlineRoster.getByRole("img", {
       name: "OfflineSkin's Minecraft head (default)",
       exact: true,
     }),
   ).toHaveCount(0);
   expect(failedRequests).toHaveLength(1);
 
-  await openPage(page, "players", "Players");
+  online = [];
+  operators = [{ name: "OfflineSkin", level: 4 }];
+  await page
+    .getByRole("button", { name: "Refresh players", exact: true })
+    .click();
   fallback = page.getByRole("img", {
     name: "OfflineSkin's Minecraft head (default)",
     exact: true,
@@ -1715,7 +1747,7 @@ test("failed skin requests use local Minecraft heads and changing a player ident
   });
 });
 
-test("populated Minecraft head lists fit mobile Console and Players layouts", async ({
+test("mobile console player metrics and Players head lists fit the viewport", async ({
   page,
 }, testInfo) => {
   const uuid = "6eb7b2e9-3fa1-4fc6-bf8d-f293d731c421";
@@ -1730,12 +1762,21 @@ test("populated Minecraft head lists fit mobile Console and Players layouts", as
     players.map((player) => ({ ...player, level: 4 })),
   );
   for (const [hash, heading, size, screenshot] of [
-    ["console", "Console", 32, "console-player-heads-mobile.png"],
+    ["console", "Console", 30, "console-player-count-mobile.png"],
     ["players", "Players", 30, "operator-heads-mobile.png"],
   ] as const) {
     await openPage(page, hash, heading);
-    await expectHeadImage(page, "Long_Player_1234", uuid, size);
-    await expectHeadImage(page, "Mobile_Builder01", "Mobile_Builder01", size);
+    if (hash === "players") {
+      await expectHeadImage(page, "Long_Player_1234", uuid, size);
+      await expectHeadImage(page, "Mobile_Builder01", "Mobile_Builder01", size);
+    } else {
+      await expect(page.locator(".players-metric .metric-value")).toHaveText(
+        "2/ 20",
+      );
+      await expect(
+        page.getByRole("img", { name: /Minecraft head/ }),
+      ).toHaveCount(0);
+    }
     await page.evaluate(() => document.fonts.ready);
     const overflow = await page.evaluate(
       () => document.documentElement.scrollWidth - window.innerWidth,
@@ -1881,7 +1922,9 @@ test("an empty fleet shows only guided creation and refreshes after a server is 
       .locator(".server-power")
       .getByRole("button", { name: "Start", exact: true }),
   ).toBeEnabled();
-  await expect(page.locator(".online-players .player-row")).toHaveCount(0);
+  await expect(page.locator(".players-metric .metric-value")).toHaveText(
+    "0/ 20",
+  );
   await page.reload();
   await expect(
     page.getByRole("heading", { name: "E2E First Real Server", exact: true }),
@@ -2547,8 +2590,6 @@ test("detects NeoForge with joined nogui%* and preserves its script, JVM argumen
       .getByRole("button", { name: "Save changes", exact: true })
       .click();
     await expect(dialog).not.toBeVisible();
-    await expect(page.locator(".server-details")).toContainText("NeoForge");
-    await expect(page.locator(".server-details")).toContainText("21.1.250");
     await expect(
       page
         .locator(".metric-card")

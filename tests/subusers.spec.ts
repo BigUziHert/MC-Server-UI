@@ -602,9 +602,8 @@ test("an account invite grants no server access, and grant/edit/revoke affect on
     name: "Console",
     exact: true,
   });
-  await expect(basic).not.toBeChecked();
-  await expect(consoleAccess).toBeDisabled();
-  await basic.check();
+  await expect(basic).toHaveCount(0);
+  await expect(consoleAccess).toBeEnabled();
   await consoleAccess.check();
   await dialog
     .getByRole("button", { name: "Grant access", exact: true })
@@ -697,7 +696,46 @@ test("an account invite grants no server access, and grant/edit/revoke affect on
   );
 });
 
-test("permission presets and mixed groups preserve Can View Server as the required base", async ({
+test("granting access without optional permissions lets the account view only the selected server", async ({
+  page,
+  request,
+  server,
+}) => {
+  const account = await createAccount(request, "view-only@example.test");
+  await openSubusers(page, server.id);
+  await page
+    .getByRole("button", { name: "Grant server access", exact: true })
+    .click();
+  const dialog = page.getByRole("dialog", {
+    name: "Grant server access",
+    exact: true,
+  });
+  await dialog
+    .getByLabel("Panel account", { exact: true })
+    .selectOption(account.id);
+  await expect(
+    dialog.getByRole("checkbox", { name: "Can View Server", exact: true }),
+  ).toHaveCount(0);
+  await expect(
+    dialog.getByRole("checkbox", { name: "All permissions", exact: true }),
+  ).toHaveAttribute("aria-checked", "false");
+  await dialog
+    .getByRole("button", { name: "Grant access", exact: true })
+    .click();
+  await expect(dialog).not.toBeVisible();
+  expect(
+    (await serverUsers(request, server.id)).find(
+      (user) => user.id === account.id,
+    )?.permissions,
+  ).toEqual(["server.view"]);
+  expect(
+    (await serverUsers(request, server.otherServerId)).some(
+      (user) => user.id === account.id,
+    ),
+  ).toBe(false);
+});
+
+test("permission presets and mixed groups preserve automatic server access when all optional permissions are cleared", async ({
   page,
   request,
   server,
@@ -720,7 +758,7 @@ test("permission presets and mixed groups preserve Can View Server as the requir
   await showPermissionDetails(dialog);
   await expect(
     dialog.getByRole("checkbox", { name: "Can View Server", exact: true }),
-  ).toBeChecked();
+  ).toHaveCount(0);
   await expect(
     dialog.getByRole("checkbox", { name: "View audit logs", exact: true }),
   ).toBeChecked();
@@ -771,24 +809,29 @@ test("permission presets and mixed groups preserve Can View Server as the requir
   });
   await showPermissionDetails(edit);
   await edit
-    .getByRole("checkbox", { name: "Can View Server", exact: true })
+    .getByRole("checkbox", { name: "All permissions", exact: true })
+    .check();
+  await edit
+    .getByRole("checkbox", { name: "All permissions", exact: true })
     .uncheck();
   await expect(
     edit.getByRole("checkbox", { name: "Console", exact: true }),
   ).not.toBeChecked();
   await expect(
     edit.getByRole("checkbox", { name: "Console", exact: true }),
-  ).toBeDisabled();
+  ).toBeEnabled();
+  await expect(
+    edit.getByRole("checkbox", { name: "All permissions", exact: true }),
+  ).toHaveAttribute("aria-checked", "false");
   await edit
     .getByRole("button", { name: "Save permissions", exact: true })
     .click();
-  await expect(edit.getByRole("alert")).toContainText("use Revoke access");
-  await edit.getByRole("button", { name: "Cancel", exact: true }).click();
+  await expect(edit).not.toBeVisible();
   expect(
     (await serverUsers(request, server.id)).find(
       (user) => user.id === account.id,
     )?.permissions,
-  ).toEqual(expected);
+  ).toEqual(["server.view"]);
 });
 
 test("grant cancellation, save errors, and audit warnings preserve deliberate server access", async ({
@@ -849,9 +892,6 @@ test("grant cancellation, save errors, and audit warnings preserve deliberate se
     .getByLabel("Panel account", { exact: true })
     .selectOption(account.id);
   await showPermissionDetails(dialog);
-  await dialog
-    .getByRole("checkbox", { name: "Can View Server", exact: true })
-    .check();
   await dialog.getByRole("checkbox", { name: "Start", exact: true }).check();
   await dialog
     .getByRole("button", { name: "Grant access", exact: true })

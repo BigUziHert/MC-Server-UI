@@ -39,6 +39,7 @@ import {
 } from "./launcher-stop.mjs";
 import { decodeText, encodeText } from "./text-encoding.mjs";
 import { updateProperties, encodeProperties } from "./properties.mjs";
+import { saveOfflinePlayer } from "./offline-players.mjs";
 import { createAccessService } from "./access.mjs";
 import { createPanelRecovery } from "./panel-recovery.mjs";
 import { localNetworkAddresses } from "./remote-tls.mjs";
@@ -1943,7 +1944,13 @@ export async function createPanel(options = {}) {
             "A backup is in progress. Wait before changing files, server power, or console commands.",
           ),
         );
+      // Offline roster writes must exclude starts and other file mutations
+      // until their atomic replacement has finished. Capture that reservation:
+      // a live request must never switch to file writes if Java exits mid-read.
+      req.panelOfflinePlayerMutation =
+        status === "offline" && /^\/api\/players(?:\/|$)/.test(req.path);
       const recycling =
+        req.panelOfflinePlayerMutation ||
         (req.method === "POST" &&
           ["/api/files/copy", "/api/files/upload"].includes(req.path)) ||
         (req.method === "DELETE" && req.path === "/api/files") ||
@@ -2347,13 +2354,45 @@ export async function createPanel(options = {}) {
         "This player's identity changed or is unavailable. Refresh the player list before trying again.",
       );
   };
+  const offlineIdentity = (snapshot, name, uuid, authoritative) => {
+    const matches = (authoritative ?? snapshot.history).filter(
+      (player) => player.name.toLowerCase() === name.toLowerCase(),
+    );
+    const identities = new Set(
+      matches
+        .filter((player) => player.uuid)
+        .map((player) => player.uuid.toLowerCase()),
+    );
+    if (identities.size !== 1)
+      throw error(
+        409,
+        "This player has no unique saved profile. Let them join the server once before editing their access while it is offline.",
+      );
+    const resolvedUuid = uuid ?? [...identities][0];
+    validateKnownIdentity(snapshot, name, resolvedUuid, authoritative);
+    return { name, uuid: resolvedUuid.toLowerCase() };
+  };
+  const savedPlayerAction = async (res, command, filename) => {
+    const event = playerCommandAudit(command);
+    const message = `Saved ${command}. This takes effect when the server next starts.`;
+    await audit(
+      "player",
+      event.action.replace(" requested", " saved"),
+      `Saved to ${filename}: ${command}.`,
+    );
+    append(`[Panel] ${message}`);
+    res.json({ message, saved: true });
+  };
   for (const action of ["add", "remove", "state"]) {
     app.post(
       `/api/players/whitelist/${action}`,
       trackOperation(async (req, res) => {
         const command = whitelistCommand(action, req.body);
-        if (status !== "running")
-          throw error(409, "Start this server before changing its whitelist.");
+        if (!["running", "offline"].includes(status))
+          throw error(
+            409,
+            "Wait for the server to finish starting or stopping before changing its whitelist.",
+          );
         const snapshot = await loadPlayerHistory();
         if (action === "state") {
           if (!snapshot.whitelistSettingsAvailable)
@@ -2392,6 +2431,24 @@ export async function createPanel(options = {}) {
             action === "remove" ? snapshot.whitelist : undefined,
           );
         }
+        if (req.panelOfflinePlayerMutation) {
+          if (action === "state") {
+            await writeProperties({ "white-list": String(req.body.enabled) });
+          } else {
+            const player = offlineIdentity(
+              snapshot,
+              req.body.name,
+              req.body.uuid,
+              action === "remove" ? snapshot.whitelist : undefined,
+            );
+            await saveOfflinePlayer({ serverDir, safePath, action, player });
+          }
+          return savedPlayerAction(
+            res,
+            command,
+            action === "state" ? "server.properties" : "whitelist.json",
+          );
+        }
         if (!processHandle?.stdin.writable)
           throw error(409, "The server is not ready to receive commands.");
         await writeServer(processHandle, command);
@@ -2410,8 +2467,16 @@ export async function createPanel(options = {}) {
       trackOperation(async (req, res) => {
         const command = moderationCommand(action, req.body);
         const name = req.body.name;
-        if (status !== "running")
-          throw error(409, "Start this server before managing players.");
+        if (!["running", "offline"].includes(status))
+          throw error(
+            409,
+            "Wait for the server to finish starting or stopping before managing players.",
+          );
+        if (action === "kick" && status !== "running")
+          throw error(
+            409,
+            "There are no connected players to kick while the server is offline.",
+          );
         const snapshot = await loadPlayerHistory();
         const matches = snapshot.history.filter(
           (entry) => entry.name.toLowerCase() === name.toLowerCase(),
@@ -2444,6 +2509,16 @@ export async function createPanel(options = {}) {
             409,
             "This player is not in the saved ban list. Refresh the player list.",
           );
+        if (req.panelOfflinePlayerMutation) {
+          await saveOfflinePlayer({
+            serverDir,
+            safePath,
+            action,
+            player: offlineIdentity(snapshot, name, req.body.uuid),
+            reason: req.body.reason,
+          });
+          return savedPlayerAction(res, command, "banned-players.json");
+        }
         if (!processHandle?.stdin.writable)
           throw error(409, "The server is not ready to receive commands.");
         await writeServer(processHandle, command);
@@ -2475,12 +2550,23 @@ export async function createPanel(options = {}) {
             action === "deop" ? snapshot.operators : undefined,
           );
         }
-        if (status !== "running")
+        if (!["running", "offline"].includes(status))
           throw error(
             409,
-            "Start this server before changing in-game operators.",
+            "Wait for the server to finish starting or stopping before changing operators.",
           );
         const command = `${action} ${name}`;
+        if (req.panelOfflinePlayerMutation) {
+          const snapshot = await loadPlayerHistory();
+          const player = offlineIdentity(
+            snapshot,
+            name,
+            req.body.uuid,
+            action === "deop" ? snapshot.operators : undefined,
+          );
+          await saveOfflinePlayer({ serverDir, safePath, action, player });
+          return savedPlayerAction(res, command, "ops.json");
+        }
         if (!processHandle?.stdin.writable)
           throw error(409, "The server is not ready to receive commands.");
         await writeServer(processHandle, command);

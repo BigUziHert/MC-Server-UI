@@ -512,8 +512,8 @@ export function RemoteAccessSetup({
                   }
                 />
                 <small>
-                  Used only on this computer. Do not forward this port on your
-                  router.
+                  Caddy connects to MC Panel on this local port. Change it only
+                  if another app uses it. Do not forward it on your router.
                 </small>
               </div>
             </details>
@@ -793,6 +793,9 @@ function AccessManagement({
     permissionsFor(user).every(can) &&
     (!remote || (!user.hostPermissions?.length && !user.panelAccount));
   const grantablePermissions = permissionIds.filter(can);
+  const optionalPermissions = grantablePermissions.filter(
+    (permission) => permission !== "server.view",
+  );
   const groups = catalog.groups
     .map((group) => ({
       ...group,
@@ -820,6 +823,9 @@ function AccessManagement({
   const [email, setEmail] = useState("");
   const [accountId, setAccountId] = useState("");
   const [selected, setSelected] = useState<string[]>([]);
+  const selectedOptionalCount = selected.filter(
+    (permission) => permission !== "server.view",
+  ).length;
   const [allowServerCreation, setAllowServerCreation] = useState(false);
   const [deleting, setDeleting] = useState<Subuser | null>(null);
   const [resetting, setResetting] = useState<Subuser | null>(null);
@@ -1021,7 +1027,13 @@ function AccessManagement({
     if (user ? !canUpdate || !manageable(user) : !canCreate) return;
     setEmail(user?.email ?? "");
     setAccountId("");
-    setSelected(user ? permissionsFor(user) : []);
+    setSelected(
+      user
+        ? permissionsFor(user)
+        : !invite && !accountsView && can("server.view")
+          ? ["server.view"]
+          : [],
+    );
     setAllowServerCreation(
       (user?.effectiveHostPermissions ?? user?.hostPermissions)?.includes(
         "server.create",
@@ -1081,7 +1093,7 @@ function AccessManagement({
     }
   }
   function togglePermissions(ids: string[]) {
-    ids = ids.filter(can);
+    ids = ids.filter((id) => id !== "server.view" && can(id));
     setSelected((previous) => {
       const next = new Set(previous);
       const allSelected = ids.every((id) => next.has(id));
@@ -1089,7 +1101,7 @@ function AccessManagement({
         if (allSelected) next.delete(id);
         else next.add(id);
       }
-      if (!next.has("server.view")) return [];
+      if (can("server.view")) next.add("server.view");
       return grantablePermissions.filter((id) => next.has(id));
     });
   }
@@ -1103,7 +1115,7 @@ function AccessManagement({
       !selected.includes("server.view")
     ) {
       setFormError(
-        "Select Can View Server to grant access, or use Revoke access to remove this person's access.",
+        "You do not have permission to grant access to this server.",
       );
       return;
     }
@@ -1233,11 +1245,12 @@ function AccessManagement({
       <header className="page-heading">
         <div>
           {accountsView ? <h3>Panel users</h3> : <h1>Subusers</h1>}
-          <p className="subusers-page-description">
-            {accountsView
-              ? "Invite people to create an account and sign in. Invitations grant no server access."
-              : "Manage access to this server. Can View Server is required; every permission below applies only to this server."}
-          </p>
+          {accountsView && (
+            <p className="subusers-page-description">
+              Invite people to create an account and sign in. Invitations grant
+              no server access.
+            </p>
+          )}
         </div>
         <div className="subusers-heading-actions">
           {accountsView && (
@@ -1664,15 +1677,6 @@ function AccessManagement({
                     <legend className="subusers-sr-only">
                       Server permissions
                     </legend>
-                    <div className="subusers-basic-access">
-                      <PermissionCheckbox
-                        label="Can View Server"
-                        description="Show this server in their panel. Required for all other permissions on this server."
-                        checked={selected.includes("server.view")}
-                        disabled={!can("server.view")}
-                        onChange={() => togglePermissions(["server.view"])}
-                      />
-                    </div>
                     <div className="subusers-preset">
                       <div>
                         <strong>Server controls</strong>
@@ -1700,18 +1704,18 @@ function AccessManagement({
                         label="All permissions"
                         description="Grant every listed permission for this server."
                         checked={
-                          grantablePermissions.length > 0 &&
-                          selected.length === grantablePermissions.length
+                          optionalPermissions.length > 0 &&
+                          selectedOptionalCount === optionalPermissions.length
                         }
                         disabled={!can("server.view")}
                         mixed={
-                          selected.length > 0 &&
-                          selected.length < grantablePermissions.length
+                          selectedOptionalCount > 0 &&
+                          selectedOptionalCount < optionalPermissions.length
                         }
-                        onChange={() => togglePermissions(grantablePermissions)}
+                        onChange={() => togglePermissions(optionalPermissions)}
                       />
                       <span>
-                        {selected.length} / {grantablePermissions.length}
+                        {selectedOptionalCount} / {optionalPermissions.length}
                       </span>
                     </div>
                     <div
@@ -1845,7 +1849,7 @@ function AccessManagement({
                   ? invitingAccount
                     ? "No server access is granted."
                     : "Existing server grants are preserved."
-                  : `${selected.length} server ${selected.length === 1 ? "permission" : "permissions"} selected`}
+                  : `${selectedOptionalCount} server ${selectedOptionalCount === 1 ? "permission" : "permissions"} selected`}
               </span>
             )}
             <div>

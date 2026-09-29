@@ -1020,7 +1020,6 @@ export default function Backups({
                       <CalendarClock size={18} />
                       Automatic backups
                     </h2>
-                    <p>Set it once. Keep your world protected.</p>
                   </div>
                 </div>
                 <form onSubmit={saveSchedule}>
@@ -1084,7 +1083,6 @@ export default function Backups({
                   <div className="schedule-toggle-row">
                     <div>
                       <strong>Enable schedule</strong>
-                      <span>Run backups automatically</span>
                     </div>
                     <Switch
                       aria-label="Enable automatic backups"

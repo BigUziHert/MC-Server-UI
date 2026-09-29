@@ -262,7 +262,7 @@ async function fixture(t, mode = "live") {
   };
 }
 
-test("cache history and authoritative ban files persist across restart", async (t) => {
+test("offline ban edits and authoritative files persist across restart", async (t) => {
   const panel = await fixture(t);
   const cache = JSON.stringify([
     { ...profile, expiresOn: "2099-01-01 00:00:00 +0000" },
@@ -279,12 +279,9 @@ test("cache history and authoritative ban files persist across restart", async (
         json("POST", { ...profile, reason: "Fixture reason" }),
       )
     ).status,
-    409,
+    200,
   );
-  await fs.writeFile(
-    path.join(panel.serverDir, "banned-players.json"),
-    JSON.stringify([{ ...profile, reason: "Fixture reason" }]),
-  );
+  assert.deepEqual(panel.commands, []);
   await panel.restart();
   data = (await panel.request("/api/players")).body;
   assert.equal(data.history[0].banned, true);
@@ -459,8 +456,244 @@ test("live logger history ignores chat, supports Forge prefixes, and live modera
   assert.ok(data.history[0].lastSeen);
   assert.equal(
     (await panel.request("/api/players/ban", json("POST", profile))).status,
+    200,
+  );
+});
+
+test("offline operator, whitelist and ban edits preserve other records and persist without commands", async (t) => {
+  const panel = await fixture(t);
+  const other = {
+    name: "Other_Player",
+    uuid: "22345678-1234-1234-1234-123456789abc",
+  };
+  const otherOperator = {
+    ...other,
+    level: 2,
+    bypassesPlayerLimit: true,
+    pluginMetadata: "keep",
+  };
+  const otherBan = {
+    ...other,
+    created: "2026-09-29 12:00:00 +0000",
+    source: "Console",
+    expires: "2027-01-01 12:00:00 +0000",
+    reason: "Keep this ban",
+  };
+  await fs.writeFile(
+    path.join(panel.serverDir, "usercache.json"),
+    JSON.stringify([profile, other]),
+  );
+  await fs.writeFile(
+    path.join(panel.serverDir, "ops.json"),
+    JSON.stringify([otherOperator]),
+  );
+  await fs.writeFile(
+    path.join(panel.serverDir, "banned-players.json"),
+    JSON.stringify([otherBan]),
+  );
+  await fs.writeFile(
+    path.join(panel.serverDir, "server.properties"),
+    "# Preserve this comment\r\nwhite-list=false\r\nop-permission-level=3\r\nmotd=Keep this value\r\n",
+  );
+  for (const [route, body] of [
+    ["op", { name: profile.name }],
+    ["whitelist/add", profile],
+    ["whitelist/state", { enabled: true }],
+    ["ban", { ...profile, reason: "Offline moderation" }],
+  ]) {
+    const response = await panel.request(
+      `/api/players/${route}`,
+      json("POST", body),
+    );
+    assert.equal(response.status, 200, response.body.error);
+    assert.equal(response.body.saved, true);
+    assert.match(response.body.message, /Saved .*server next starts/);
+  }
+  const read = async (filename) =>
+    JSON.parse(await fs.readFile(path.join(panel.serverDir, filename), "utf8"));
+  assert.deepEqual(await read("ops.json"), [
+    otherOperator,
+    { ...profile, level: 3, bypassesPlayerLimit: false },
+  ]);
+  const bans = await read("banned-players.json");
+  assert.deepEqual(bans[0], otherBan);
+  assert.equal(bans[1].reason, "Offline moderation");
+  assert.equal(bans[1].expires, "forever");
+  assert.match(bans[1].created, /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} \+0000$/);
+  assert.deepEqual(await read("whitelist.json"), [profile]);
+  assert.equal(
+    await fs.readFile(path.join(panel.serverDir, "server.properties"), "utf8"),
+    "# Preserve this comment\r\nwhite-list=true\r\nop-permission-level=3\r\nmotd=Keep this value\r\n",
+  );
+  assert.deepEqual(panel.commands, []);
+  await panel.restart();
+  const snapshot = (await panel.request("/api/players")).body;
+  assert.equal(snapshot.whitelistEnabled, true);
+  assert.equal(
+    snapshot.operators.find((entry) => entry.uuid === uuid).level,
+    3,
+  );
+  assert.equal(
+    snapshot.history.find((entry) => entry.uuid === uuid).banned,
+    true,
+  );
+  for (const route of ["deop", "whitelist/remove", "unban"])
+    assert.equal(
+      (await panel.request(`/api/players/${route}`, json("POST", profile)))
+        .status,
+      200,
+    );
+  assert.deepEqual(await read("ops.json"), [otherOperator]);
+  assert.deepEqual(await read("banned-players.json"), [otherBan]);
+  assert.deepEqual(await read("whitelist.json"), []);
+  assert.equal(
+    (await panel.request("/api/players/kick", json("POST", profile))).status,
     409,
   );
+  assert.deepEqual(panel.commands, []);
+  const events = (await panel.request("/api/audit")).body.entries.filter(
+    (entry) => entry.category === "player",
+  );
+  assert.ok(events.some((entry) => entry.action === "Player op saved"));
+});
+
+test("offline access edits reject unknown identities and malformed files without changing them", async (t) => {
+  const panel = await fixture(t);
+  for (const route of ["op", "whitelist/add"]) {
+    const response = await panel.request(
+      `/api/players/${route}`,
+      json("POST", { name: "Unknown_Player" }),
+    );
+    assert.equal(response.status, 409);
+    assert.match(response.body.error, /no unique saved profile/);
+  }
+  await fs.writeFile(
+    path.join(panel.serverDir, "usercache.json"),
+    JSON.stringify([profile]),
+  );
+  for (const [route, filename] of [
+    ["op", "ops.json"],
+    ["ban", "banned-players.json"],
+    ["whitelist/add", "whitelist.json"],
+  ]) {
+    await fs.writeFile(path.join(panel.serverDir, filename), "invalid");
+    assert.equal(
+      (await panel.request(`/api/players/${route}`, json("POST", profile)))
+        .status,
+      409,
+    );
+    assert.equal(
+      await fs.readFile(path.join(panel.serverDir, filename), "utf8"),
+      "invalid",
+    );
+    await fs.writeFile(path.join(panel.serverDir, filename), "[]\n");
+  }
+  assert.deepEqual(panel.commands, []);
+});
+
+test("offline roster writes exclude server starts and concurrent changes until atomic publish", async (t) => {
+  const panel = await fixture(t);
+  await fs.writeFile(
+    path.join(panel.serverDir, "usercache.json"),
+    JSON.stringify([profile]),
+  );
+  let release, entered;
+  const gate = new Promise((resolve) => {
+    release = resolve;
+  });
+  const enteredGate = new Promise((resolve) => {
+    entered = resolve;
+  });
+  const original = fs.rename;
+  t.mock.method(fs, "rename", async (from, to) => {
+    if (path.basename(from).startsWith(".panel-players-")) {
+      entered();
+      await gate;
+    }
+    return original(from, to);
+  });
+  const mutation = panel.request("/api/players/op", json("POST", profile));
+  try {
+    await Promise.race([
+      enteredGate,
+      mutation.then((response) => assert.fail(JSON.stringify(response))),
+    ]);
+    for (const [route, body] of [
+      ["/api/server/power", { action: "start" }],
+      ["/api/players/ban", profile],
+      ["/api/files", { name: "ops.json", type: "file", content: "[]" }],
+    ])
+      assert.equal(
+        (await panel.request(route, json("POST", body))).status,
+        409,
+      );
+    assert.equal((await panel.request("/api/players")).body.status, "offline");
+  } finally {
+    release();
+    assert.equal((await mutation).status, 200);
+  }
+  assert.equal(
+    (await panel.request("/api/players/ban", json("POST", profile))).status,
+    200,
+  );
+  assert.deepEqual(panel.commands, []);
+});
+
+test("a live moderation request never switches to offline file writes after the process stops", async (t) => {
+  const panel = await fixture(t);
+  await fs.writeFile(
+    path.join(panel.serverDir, "usercache.json"),
+    JSON.stringify([profile]),
+  );
+  await fs.writeFile(path.join(panel.serverDir, "banned-players.json"), "[]\n");
+  await panel.start();
+  let release, entered;
+  const gate = new Promise((resolve) => {
+    release = resolve;
+  });
+  const enteredGate = new Promise((resolve) => {
+    entered = resolve;
+  });
+  const original = fs.readFile;
+  t.mock.method(fs, "readFile", async (filename, ...args) => {
+    if (filename === path.join(panel.serverDir, "usercache.json")) {
+      entered();
+      await gate;
+    }
+    return original(filename, ...args);
+  });
+  const mutation = panel.request("/api/players/ban", json("POST", profile));
+  try {
+    await Promise.race([
+      enteredGate,
+      mutation.then((response) => assert.fail(JSON.stringify(response))),
+    ]);
+    assert.equal(
+      (
+        await panel.request(
+          "/api/server/power",
+          json("POST", { action: "stop" }),
+        )
+      ).status,
+      200,
+    );
+    for (let attempt = 0; attempt < 30; attempt++) {
+      if ((await panel.request("/api/server")).body.status === "offline") break;
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.equal((await panel.request("/api/server")).body.status, "offline");
+  } finally {
+    release();
+    assert.equal((await mutation).status, 409);
+  }
+  assert.equal(
+    await fs.readFile(
+      path.join(panel.serverDir, "banned-players.json"),
+      "utf8",
+    ),
+    "[]\n",
+  );
+  assert.deepEqual(panel.commands, ["stop\n"]);
 });
 
 test("malformed files preserve known history, disable bans, and reject stale UUIDs and command injection", async (t) => {

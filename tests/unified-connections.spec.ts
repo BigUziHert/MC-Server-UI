@@ -364,6 +364,55 @@ async function fillSignIn(
   await dialog.getByLabel("Password", { exact: true }).fill(password);
 }
 
+test("connections explain verified empty server access without treating unavailable rosters as empty access", async ({
+  page,
+}, testInfo) => {
+  await workspace(page);
+  await page.evaluate(() => {
+    const fixture = (window as any).unifiedFixture;
+    fixture.state.panels.find(
+      (panel: any) => panel.id === "computer-a",
+    ).servers = [];
+    fixture.changed();
+  });
+  const manager = await manage(page);
+  const hint = manager.getByText(
+    "No servers have been shared with this account.",
+    {
+      exact: false,
+    },
+  );
+  await expect(hint).toHaveCount(1);
+  await expect(hint).toContainText("Ask the panel owner");
+  await expect(
+    manager.getByRole("button", { name: "Sign in", exact: true }),
+  ).toBeVisible();
+  await page.screenshot({
+    path: testInfo.outputPath("connections-no-access.png"),
+  });
+
+  for (const state of ["unavailable", "connecting", "connected"]) {
+    await page.evaluate((connectionState) => {
+      const fixture = (window as any).unifiedFixture;
+      fixture.state.panels.find(
+        (panel: any) => panel.id === "computer-a",
+      ).connectionState = connectionState;
+      fixture.changed();
+    }, state);
+    await expect(hint).toHaveCount(state === "connected" ? 1 : 0);
+  }
+  await page.evaluate(() => {
+    const fixture = (window as any).unifiedFixture;
+    const panel = fixture.state.panels.find(
+      (panel: any) => panel.id === "computer-a",
+    );
+    panel.signedIn = false;
+    panel.session = null;
+    fixture.changed();
+  });
+  await expect(hint).toHaveCount(0);
+});
+
 test("a new panel uses one sign-in form and saves only after authentication", async ({
   page,
 }) => {

@@ -298,7 +298,7 @@ test("mobile moderation confirms a single-line reason, recovers from command err
   ).toBeVisible();
 });
 
-test("offline and unreadable ban states retain history but disable unsafe player actions", async ({
+test("offline management stays available while unreadable ban lists disable ban actions", async ({
   page,
   server,
 }) => {
@@ -341,7 +341,7 @@ test("offline and unreadable ban states retain history but disable unsafe player
       name: "Grant OP for History_Player",
       exact: true,
     }),
-  ).toBeDisabled();
+  ).toBeEnabled();
   offline = false;
   await page.getByRole("button", { name: "Refresh players" }).click();
   await expect(
@@ -356,6 +356,120 @@ test("offline and unreadable ban states retain history but disable unsafe player
   await expect(
     page.getByText(/banned-players.json could not be read/),
   ).toBeVisible();
+});
+
+test("offline players support saved operator, ban and whitelist changes without a startup notice", async ({
+  page,
+  request,
+  server,
+}) => {
+  const headers = { "X-Server-Id": server.id };
+  expect(
+    (
+      await request.post("/api/server/power", {
+        headers,
+        data: { action: "stop" },
+      })
+    ).ok(),
+  ).toBe(true);
+  await expect
+    .poll(
+      async () =>
+        (await (await request.get("/api/server", { headers })).json()).status,
+    )
+    .toBe("offline");
+  await open(page, server.id);
+  await expect(
+    page.getByText("Start the server to manage operators", { exact: true }),
+  ).toHaveCount(0);
+  const row = page.getByRole("listitem", {
+    name: "Player History_Player",
+    exact: true,
+  });
+  await expect(
+    row.getByRole("button", { name: "Kick History_Player", exact: true }),
+  ).toBeDisabled();
+  await row
+    .getByRole("button", { name: "Grant OP for History_Player", exact: true })
+    .click();
+  let dialog = page.getByRole("dialog", {
+    name: "Grant operator permissions",
+    exact: true,
+  });
+  await dialog.getByRole("button", { name: "Grant OP", exact: true }).click();
+  await expect(dialog).not.toBeVisible();
+  await expect(
+    page.getByText("Player access saved", { exact: true }),
+  ).toBeVisible();
+  await expect(
+    row.getByRole("button", {
+      name: "Grant OP for History_Player",
+      exact: true,
+    }),
+  ).toBeDisabled();
+  await row
+    .getByRole("button", { name: "Ban History_Player", exact: true })
+    .click();
+  dialog = page.getByRole("dialog", { name: "Ban player?", exact: true });
+  await expect(dialog).toContainText("saved now");
+  await dialog.getByLabel("Reason (optional)").fill("Saved offline");
+  await dialog.getByRole("button", { name: "Ban player", exact: true }).click();
+  await expect(dialog).not.toBeVisible();
+  await expect(row).toContainText("Saved offline");
+  await row
+    .getByRole("button", {
+      name: "Add History_Player to whitelist",
+      exact: true,
+    })
+    .click();
+  dialog = page.getByRole("dialog", {
+    name: "Add player to whitelist",
+    exact: true,
+  });
+  await dialog
+    .getByRole("button", { name: "Add to whitelist", exact: true })
+    .click();
+  await expect(dialog).not.toBeVisible();
+  await page
+    .getByRole("switch", { name: "Enable whitelist", exact: true })
+    .click();
+  dialog = page.getByRole("dialog", { name: "Enable whitelist?", exact: true });
+  await dialog
+    .getByRole("button", { name: "Enable whitelist", exact: true })
+    .click();
+  await expect(dialog).not.toBeVisible();
+  await page.reload();
+  await expect(
+    row.getByRole("button", { name: "Unban History_Player", exact: true }),
+  ).toBeEnabled();
+  await expect(
+    page.getByRole("switch", { name: "Enable whitelist", exact: true }),
+  ).toBeChecked();
+  await row
+    .getByRole("button", { name: "Unban History_Player", exact: true })
+    .click();
+  dialog = page.getByRole("dialog", { name: "Unban player?", exact: true });
+  await dialog
+    .getByRole("button", { name: "Unban player", exact: true })
+    .click();
+  await expect(dialog).not.toBeVisible();
+  await page
+    .getByRole("button", { name: "Remove OP for History_Player", exact: true })
+    .click();
+  dialog = page.getByRole("dialog", {
+    name: "Remove operator permissions?",
+    exact: true,
+  });
+  await dialog.getByRole("button", { name: "Remove OP", exact: true }).click();
+  await expect(dialog).not.toBeVisible();
+  const data = await (await request.get("/api/players", { headers })).json();
+  expect(data.status).toBe("offline");
+  expect(data.operators).toEqual([]);
+  expect(
+    data.history.find(
+      (player: { name: string }) => player.name === profile.name,
+    ).banned,
+  ).toBe(false);
 });
 
 test("Add operator accepts a new username without changing known-player identity confirmation", async ({

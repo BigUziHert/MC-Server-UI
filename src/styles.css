@@ -778,7 +778,7 @@ input:disabled {
 }
 .console-layout {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) 277px;
+  grid-template-columns: minmax(0, 1fr);
   gap: 20px;
 }
 .panel-heading {
@@ -1045,77 +1045,6 @@ input:disabled {
 .console-empty p {
   margin-top: 12px;
 }
-.console-side {
-  display: flex;
-  flex-direction: column;
-  gap: 16px;
-  min-height: 0;
-  position: relative;
-}
-.console-side .server-details {
-  flex: 0 0 auto;
-}
-.server-details dl {
-  padding: 1px 18px;
-  margin: 16px 0;
-}
-.server-details dl > div {
-  display: flex;
-  justify-content: space-between;
-  font-size: 10px;
-  margin-bottom: 17px;
-  align-items: center;
-}
-.server-details dl > div:last-child {
-  margin-bottom: 0;
-}
-.server-details dt {
-  color: #969bb3;
-}
-.server-details dd {
-  margin: 0;
-  color: #d4d8e9;
-  display: flex;
-  align-items: center;
-  gap: 5px;
-}
-.software-dot {
-  width: 5px;
-  height: 5px;
-  background: #e0cd9a;
-  border-radius: 2px;
-}
-.version-badge {
-  background: #272833;
-  border: 1px solid #303140;
-  border-radius: 4px;
-  font-family: "JetBrains Mono", monospace;
-  font-size: 9px;
-  padding: 3px 6px;
-}
-.card-link {
-  width: 100%;
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  padding: 13px 18px;
-  background: #20212b;
-  border-top: 1px solid #303140;
-  color: #b1b6ce;
-  font-size: 10px;
-}
-.card-link:hover {
-  background: #272833;
-}
-.online-players {
-  flex: 1 1 0;
-  min-height: 170px;
-  display: flex;
-  flex-direction: column;
-}
-.online-players > .panel-heading {
-  flex-shrink: 0;
-}
 .count-badge {
   background: #303140;
   border: 1px solid #303140;
@@ -1123,79 +1052,6 @@ input:disabled {
   font-size: 9px;
   padding: 1px 5px;
   color: #b1b6ce;
-}
-.players-list {
-  padding: 4px 17px;
-  min-height: 0;
-  overflow: auto;
-  scrollbar-width: thin;
-  flex: 1;
-}
-.players-list:has(.players-empty) {
-  display: grid;
-  place-items: center;
-}
-.players-empty {
-  display: flex;
-  align-items: center;
-  flex-direction: column;
-  text-align: center;
-  padding: 18px 0 13px;
-  color: var(--muted);
-}
-.players-empty strong {
-  font-size: 10px;
-  color: #b1b6ce;
-  margin-top: 9px;
-  font-weight: 500;
-}
-.players-empty p {
-  font-size: 9px;
-  color: var(--muted);
-  margin: 5px 0;
-}
-.player-row {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  padding: 10px 0;
-}
-.player-row + .player-row {
-  border-top: 1px solid #272833;
-}
-.player-row > div {
-  min-width: 0;
-}
-.player-row > div > strong {
-  font-size: 10px;
-  display: block;
-  font-weight: 500;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-.player-row > div > span {
-  font-size: 8px;
-  display: block;
-  margin-top: 4px;
-  color: var(--muted);
-}
-.player-latency {
-  display: flex;
-  align-items: center;
-  gap: 3px;
-  font-size: 8px;
-  color: #b1b6ce;
-  margin-left: auto;
-  white-space: nowrap;
-}
-.console-bottom-note {
-  display: flex;
-  align-items: center;
-  gap: 7px;
-  color: var(--muted);
-  font-size: 9px;
-  margin: 18px 0 0;
 }
 .footer {
   margin-top: 34px;
@@ -1426,7 +1282,7 @@ input:disabled {
 .sidebar-shade {
   display: none;
 }
-@media (min-width: 1001px) {
+@media (min-width: 761px) {
   /* Let the console use spare window height without shrinking its controls. */
   .main-shell:has(.console-panel) {
     display: flex;
@@ -1446,6 +1302,9 @@ input:disabled {
   }
   .main-shell:has(.console-panel) .console-layout {
     flex-grow: 1;
+  }
+  .main-shell:has(.console-panel) .footer {
+    margin-top: 20px;
   }
   .console-panel {
     align-self: stretch;
@@ -1471,15 +1330,6 @@ input:disabled {
   }
   .metric-card {
     height: 170px;
-  }
-  .console-layout {
-    grid-template-columns: minmax(0, 1fr) 320px;
-  }
-  .console-side {
-    gap: 20px;
-  }
-  .online-players {
-    min-height: 170px;
   }
   .page-heading {
     margin-bottom: 30px;
@@ -1515,7 +1365,6 @@ input:disabled {
     display: none;
   }
   .console-layout {
-    grid-template-columns: minmax(0, 1fr) 245px;
     gap: 15px;
   }
   .metric-card {
@@ -1531,14 +1380,6 @@ input:disabled {
 @media (max-width: 1000px) {
   .console-layout {
     grid-template-columns: minmax(0, 1fr);
-  }
-  .console-side {
-    display: grid;
-    grid-template-columns: 1fr 1fr;
-  }
-  .online-players {
-    height: 300px;
-    max-height: 300px;
   }
   .console-output {
     height: 340px;
@@ -1686,18 +1527,9 @@ input:disabled {
     flex-wrap: wrap;
     gap: 10px;
   }
-  .console-side {
-    gap: 12px;
-  }
-  .server-details dl,
   .panel-heading {
     padding-left: 13px;
     padding-right: 13px;
-  }
-  .console-bottom-note {
-    font-size: 8px;
-    line-height: 1.7;
-    align-items: flex-start;
   }
   .footer {
     font-size: 7px;
@@ -1724,13 +1556,6 @@ input:disabled {
   .console-heading {
     margin-bottom: 20px;
   }
-}
-.console-layout-summary {
-  grid-template-columns: minmax(0, 1fr);
-}
-.console-layout-summary .console-side {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
 }
 .workspace-account-state {
   margin: 22px auto 0;
@@ -1767,10 +1592,6 @@ input:disabled {
   .address-button span {
     overflow-wrap: anywhere;
     min-width: 0;
-  }
-  .console-side,
-  .console-layout-summary .console-side {
-    grid-template-columns: minmax(0, 1fr);
   }
   .metric-card {
     padding: 15px 12px;

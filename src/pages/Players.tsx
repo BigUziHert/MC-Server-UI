@@ -9,12 +9,10 @@ import {
 } from "react";
 import {
   AlertCircle,
-  ArrowUpRight,
   Info,
   ShieldCheck,
   ShieldMinus,
   ShieldPlus,
-  Terminal,
   X,
   Users,
   LogOut,
@@ -62,7 +60,7 @@ type PlayersResponse = {
   whitelistAvailable?: boolean;
   whitelistSettingsAvailable?: boolean;
 };
-type OperationResponse = { message: string };
+type OperationResponse = { message: string; saved?: boolean };
 type WhitelistAction =
   | { kind: "add" | "remove"; player?: Operator }
   | { kind: "state"; enabled: boolean };
@@ -300,9 +298,12 @@ export default function Players({
   const canManage = Boolean(
     data &&
     !error &&
-    data.status === "running" &&
+    ["running", "offline"].includes(data.status) &&
     (permissions === undefined || permissions.includes("control.console")),
   );
+  const managementUnavailable =
+    "Player management is unavailable. Refresh or wait for the server to finish starting or stopping.";
+  const canKick = canManage && data?.status === "running";
   const operators = data?.operators ?? [];
   const filtered = operators.filter((player) =>
     player.name.toLowerCase().includes(query.trim().toLowerCase()),
@@ -351,7 +352,8 @@ export default function Players({
         : "Unban player";
 
   function openModeration(action: Moderation["action"], player: KnownPlayer) {
-    if (!canManage) return;
+    if (!canManage || (action === "kick" && (!canKick || !player.online)))
+      return;
     setReason("");
     setFormError("");
     setModerating({ action, player });
@@ -366,7 +368,13 @@ export default function Players({
     event.preventDefault();
     if (!moderating || busy) return;
     if (!canManage) {
-      setFormError("Start the server in Console before managing players.");
+      setFormError(managementUnavailable);
+      return;
+    }
+    if (moderating.action === "kick" && !canKick) {
+      setFormError(
+        "There are no connected players to kick while the server is offline.",
+      );
       return;
     }
     if (
@@ -442,9 +450,7 @@ export default function Players({
     event.preventDefault();
     if (!whitelistAction || busy) return;
     if (!canManage) {
-      setFormError(
-        "Start the server in Console before changing the whitelist.",
-      );
+      setFormError(managementUnavailable);
       return;
     }
     if (
@@ -506,9 +512,7 @@ export default function Players({
       return;
     }
     if (!canManage) {
-      setFormError(
-        "Start the server in Console before changing operator permissions.",
-      );
+      setFormError(managementUnavailable);
       return;
     }
     if (
@@ -560,23 +564,6 @@ export default function Players({
         </div>
       </div>
 
-      {data && data.status !== "running" && (
-        <div className="management-notice players-offline-notice">
-          <Terminal size={18} />
-          <div>
-            <strong>Start the server to manage operators</strong>
-            <p>
-              The server is {data.status}. You can view saved players and
-              operators now. Start it before changing permissions, kicking, or
-              managing bans.
-            </p>
-            <a href="#console">
-              Go to Console <ArrowUpRight size={14} />
-            </a>
-          </div>
-        </div>
-      )}
-
       <div className="panel players-online-banner">
         <Users size={19} />
         <strong>
@@ -613,7 +600,7 @@ export default function Players({
                 className="btn icon"
                 aria-label={`Kick online player ${player.name}`}
                 title="Kick player"
-                disabled={!canManage || busy}
+                disabled={!canKick || busy}
                 onClick={() => openModeration("kick", known(player))}
               >
                 <LogOut size={14} />
@@ -808,11 +795,12 @@ export default function Players({
         <div className="players-result" role="status">
           <Info size={17} />
           <div>
-            <strong>Player command requested</strong>
-            <p>
-              {result.message} Check Console for the command result. The list
-              refreshes as Minecraft saves its player files.
-            </p>
+            <strong>
+              {result.saved
+                ? "Player access saved"
+                : "Player command requested"}
+            </strong>
+            <p>{result.message}</p>
           </div>
           <button
             className="btn icon"
@@ -961,7 +949,7 @@ export default function Players({
                   <button
                     className="btn"
                     aria-label={`Kick ${player.name}`}
-                    disabled={!canManage || !player.online || busy}
+                    disabled={!canKick || !player.online || busy}
                     title={
                       !player.online
                         ? "Only online players can be kicked"
@@ -1079,14 +1067,15 @@ export default function Players({
             <ShieldCheck size={18} />
             <p>
               {removing
-                ? "Minecraft will process a deop command. Check Console for confirmation."
+                ? data?.status === "offline"
+                  ? "Operator access will be removed from the saved list before the server next starts."
+                  : "Minecraft will process a deop command. Check Console for confirmation."
                 : "OP grants powerful in-game commands, including changes to the world and player management, according to your server’s operator level. Only grant it to someone you trust."}
             </p>
           </div>
           {!canManage && (
             <p className="management-form-error" role="alert">
-              <AlertCircle size={15} /> The server must be running and connected
-              to change permissions.
+              <AlertCircle size={15} /> {managementUnavailable}
             </p>
           )}
           {formError && (
@@ -1180,15 +1169,15 @@ export default function Players({
           <div className="players-permission-note">
             <Info size={18} />
             <p>
-              The panel sends a Minecraft console command. The roster and switch
-              update when the server saves the result.
+              {data?.status === "offline"
+                ? "The whitelist will be saved now and applied when the server next starts."
+                : "The panel sends a Minecraft console command. The roster and switch update when the server saves the result."}
             </p>
           </div>
           {(!canManage || formError) && (
             <p className="management-form-error" role="alert">
               <AlertCircle size={15} />
-              {formError ||
-                "Start the server in Console before changing the whitelist."}
+              {formError || managementUnavailable}
             </p>
           )}
           <div className="management-dialog-actions">
@@ -1262,8 +1251,8 @@ export default function Players({
             ) : moderating?.action === "ban" ? (
               <>
                 Ban <strong>{moderating.player.name}</strong> from this server?
-                Minecraft will disconnect them and prevent them from joining
-                until unbanned.
+                They cannot join until unbanned. If connected, Minecraft will
+                disconnect them.
               </>
             ) : (
               <>
@@ -1293,15 +1282,15 @@ export default function Players({
           <div className="players-permission-note">
             <Info size={18} />
             <p>
-              The panel sends a Minecraft console command. Check Console for
-              confirmation; plugins may handle commands differently.
+              {data?.status === "offline"
+                ? "The ban list will be saved now and applied when the server next starts."
+                : "The panel sends a Minecraft console command. Check Console for confirmation; plugins may handle commands differently."}
             </p>
           </div>
           {(!canManage || formError) && (
             <p className="management-form-error" role="alert">
               <AlertCircle size={15} />
-              {formError ||
-                "Start the server in Console before managing players."}
+              {formError || managementUnavailable}
             </p>
           )}
           <div className="management-dialog-actions">
@@ -1316,7 +1305,11 @@ export default function Players({
             <button
               type="submit"
               className={`btn ${moderating?.action === "unban" ? "primary" : "danger"}`}
-              disabled={busy || !canManage}
+              disabled={
+                busy ||
+                !canManage ||
+                (moderating?.action === "kick" && !canKick)
+              }
             >
               {busy ? "Sending..." : actionLabel}
             </button>

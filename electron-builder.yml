@@ -35,6 +35,7 @@ files:
   - server/backup-archive.mjs
   - server/backup-restore.mjs
   - server/player-history.mjs
+  - server/offline-players.mjs
   - server/minecraft.mjs
   - server/clean-install.mjs
   - server/runtime-update.mjs
