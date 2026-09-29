@@ -344,9 +344,20 @@ test("file pagination preserves selections across pages and resets after searchi
       modified: new Date().toISOString(),
     };
   });
-  await page.route(/\/api\/files\?/, (route) =>
-    route.fulfill({ json: { path: "", entries } }),
-  );
+  await page.route(/\/api\/files\?/, (route) => {
+    const query = new URL(route.request().url()).searchParams.get("search");
+    return route.fulfill({
+      json: {
+        path: "",
+        entries: query
+          ? entries.filter((entry) =>
+              entry.name.toLowerCase().includes(query.toLowerCase()),
+            )
+          : entries,
+        ...(query ? { search: query, nextCursor: null } : {}),
+      },
+    });
+  });
   await page.goto("/#files");
   await page
     .getByRole("checkbox", { name: "Select file-01.txt", exact: true })
@@ -361,7 +372,7 @@ test("file pagination preserves selections across pages and resets after searchi
     .getByRole("checkbox", { name: "Select file-26.txt", exact: true })
     .check();
   await expect(
-    page.getByText("1 outside this page or filter", { exact: true }),
+    page.getByText("1 outside this page", { exact: true }),
   ).toBeVisible();
   await page
     .getByRole("button", { name: "Previous files page", exact: true })
@@ -382,12 +393,12 @@ test("file pagination preserves selections across pages and resets after searchi
     page.getByRole("checkbox", { name: "Select file-60.txt", exact: true }),
   ).toBeVisible();
   await expect(
-    page.getByText("2 outside this page or filter", { exact: true }),
-  ).toBeVisible();
+    page.getByRole("region", { name: "Selected files and folders" }),
+  ).toHaveCount(0);
   await page.getByRole("button", { name: "Clear search", exact: true }).click();
   await expect(
     page.getByRole("checkbox", { name: "Select file-01.txt", exact: true }),
-  ).toBeChecked();
+  ).not.toBeChecked();
 });
 
 test("dirty property refresh confirms reload and file changes clear the search", async ({

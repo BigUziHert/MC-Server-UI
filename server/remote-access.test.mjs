@@ -949,6 +949,66 @@ test("the shared panel exposes standard pages within the user's file and console
     assert.equal((await restricted(route)).status, 403, route);
 });
 
+test("recursive file search respects remote listing grants and server boundaries", async (t) => {
+  const { fleet, id, local, guest, invite } = await fixture(t);
+  const serverDir = fleet.runtimes.get(id).serverDir;
+  await fs.mkdir(path.join(serverDir, "mods", "config"), { recursive: true });
+  await fs.writeFile(
+    path.join(serverDir, "mods", "test-config.json5"),
+    "{secret: true}",
+  );
+  await fs.writeFile(
+    path.join(serverDir, "mods", "config", "TEST-config.jsonc"),
+    '{"secret": true}',
+  );
+  const other = await local(
+    "/api/servers",
+    json("POST", { name: "Private search server", port: 25566 }),
+  );
+  assert.equal(other.status, 201);
+  const reader = await invite(["file.read"], "search-reader@example.test");
+  const denied = await invite(
+    ["control.console"],
+    "search-denied@example.test",
+  );
+  const route = "/api/files?path=&search=test-config";
+  assert.equal((await guest(route)).status, 401);
+  assert.equal((await denied.asUser(route)).status, 403);
+  assert.equal(
+    (
+      await reader.asUser(route, {
+        headers: { "X-Server-Id": other.body.server.id },
+      })
+    ).status,
+    403,
+  );
+  const entries = [];
+  let cursor = null;
+  do {
+    const response = await reader.asUser(
+      `${route}${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ""}`,
+    );
+    assert.equal(response.status, 200, JSON.stringify(response.body));
+    assert.equal(response.body.search, "test-config");
+    entries.push(...response.body.entries);
+    cursor = response.body.nextCursor;
+  } while (cursor);
+  assert.deepEqual(entries.map((entry) => entry.path).sort(), [
+    "mods/config/TEST-config.jsonc",
+    "mods/test-config.json5",
+  ]);
+  assert.ok(entries.every((entry) => !Object.hasOwn(entry, "content")));
+  assert.equal(
+    (await reader.asUser("/api/files/content?path=mods/test-config.json5"))
+      .status,
+    403,
+  );
+  assert.equal(
+    (await reader.asUser("/api/files?path=../&search=test-config")).status,
+    400,
+  );
+});
+
 test("remote recycle progress is readable only within the current live file-reading grant", async (t) => {
   const { fleet, id, local, invite } = await fixture(t);
   const runtime = fleet.runtimes.get(id);

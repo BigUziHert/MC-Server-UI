@@ -8,6 +8,31 @@
   flex: 1;
   min-width: 0;
 }
+.file-search-scope {
+  margin: 0;
+  padding: 0 23px 14px;
+  color: var(--muted, #969bb3);
+  font-size: 11px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+.file-name > .file-search-name {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+  white-space: normal;
+}
+.file-search-name > span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.file-search-path {
+  color: var(--muted, #969bb3);
+  font-size: 10px;
+  font-weight: 400;
+  overflow-wrap: anywhere;
+}
 .file-selection-checkbox {
   flex: 0 0 auto;
   width: 16px;

@@ -19,6 +19,7 @@ import { decodeIcon, readServerIcon, writeServerIcon } from "./server-icon.mjs";
 import { createRecycleBin, recycleStorageDirectories } from "./recycle-bin.mjs";
 import { copyServerFiles, uploadServerFiles } from "./file-transfer.mjs";
 import { planFileDownload, streamFileArchive } from "./file-download.mjs";
+import { createFileSearch } from "./file-search.mjs";
 import { createBackupArchive } from "./backup-archive.mjs";
 import { restoreBackupArchive } from "./backup-restore.mjs";
 import { createOperationReceipts } from "./operation-receipts.mjs";
@@ -2742,8 +2743,37 @@ export async function createPanel(options = {}) {
       );
     }),
   );
+  const fileSearch = createFileSearch({ root: serverDir, safePath });
   app.get("/api/files", async (req, res) => {
     const relative = req.query.path ?? "";
+    const query = req.query.search ?? "";
+    if (typeof query !== "string" || query.length > 256 || query.includes("\0"))
+      throw error(400, "Enter a filename search of up to 256 characters.");
+    if (query.trim()) {
+      const disconnected = new AbortController();
+      const cancel = () => {
+        if (!res.writableFinished) disconnected.abort();
+      };
+      req.once("aborted", cancel);
+      res.once("close", cancel);
+      try {
+        const result = await fileSearch.search({
+          path: relative,
+          search: query,
+          cursor: req.query.cursor,
+          signal: disconnected.signal,
+        });
+        res.set("Cache-Control", "private, no-store");
+        res.json(result);
+      } catch (cause) {
+        if (disconnected.signal.aborted) res.destroy();
+        else throw cause;
+      } finally {
+        req.off("aborted", cancel);
+        res.off("close", cancel);
+      }
+      return;
+    }
     const target = await safePath(serverDir, relative);
     const entries = [];
     for (const item of await fs.readdir(target, { withFileTypes: true })) {
@@ -3909,6 +3939,7 @@ export async function createPanel(options = {}) {
         if (!options.telemetry) telemetry.close();
         clearTimeout(stopTimer);
         closePromise = (async () => {
+          await fileSearch.close();
           await minecraft.close();
           // An HTTP client can leave before its disk writes or backup finish.
           // Wait for the handler itself, including save-on and its audit write.

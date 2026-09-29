@@ -437,6 +437,108 @@ test("copying the server address falls back when the clipboard API is denied and
   await expect(copy).toBeFocused();
 });
 
+for (const remote of [false, true]) {
+  test(`${remote ? "remote" : "local"} game address display and copy omit only the default port`, async ({
+    page,
+    request,
+    serverId,
+  }) => {
+    const headers = { "X-Server-Id": serverId };
+    const seed = await (await request.get("/api/server", { headers })).json();
+    const propertiesBefore = await (
+      await request.get("/api/files/content?path=server.properties", {
+        headers,
+      })
+    ).json();
+    let address = "localhost:25565";
+    await page.route(/\/api\/server(?:\?|$)/, (route) =>
+      route.fulfill({ json: { ...seed, address } }),
+    );
+    await page.addInitScript(
+      ({ serverId, remote }) => {
+        localStorage.setItem("mc-panel.active-server", serverId);
+        if (remote) localStorage.setItem("mc-panel.session.v1", "a".repeat(43));
+        Object.defineProperty(navigator, "clipboard", {
+          configurable: true,
+          value: {
+            writeText: async (value: string) => {
+              (window as unknown as { copiedAddress: string }).copiedAddress =
+                value;
+            },
+          },
+        });
+      },
+      { serverId, remote },
+    );
+    if (remote) {
+      const permissions = ["server.view", "control.console"];
+      await page.route(/\/api\/access\/session(?:\?|$)/, (route) =>
+        route.fulfill({
+          json: {
+            role: "subuser",
+            email: "address@example.test",
+            userId: "address-reader",
+            serverId,
+            permissions,
+          },
+        }),
+      );
+      await page.route(/\/api\/servers(?:\?|$)/, (route) =>
+        route.fulfill({
+          json: {
+            servers: [{ ...seed, accessPermissions: permissions }],
+            defaultServerId: serverId,
+          },
+        }),
+      );
+      await page.route(/\/api\/console(?:\?|$)/, (route) =>
+        route.fulfill({ json: { lines: [] } }),
+      );
+    }
+    for (const [raw, displayed] of [
+      ["localhost:25565", "localhost"],
+      ["203.0.113.10:25565", "203.0.113.10"],
+      ["Play.Example.test:25565", "Play.Example.test"],
+      ["play.example.test", "play.example.test"],
+      ["[2001:db8::1]:25565", "[2001:db8::1]"],
+      ["203.0.113.10:25566", "203.0.113.10:25566"],
+      ["[2001:db8::1]:25566", "[2001:db8::1]:25566"],
+      ["2001:db8::1", "2001:db8::1"],
+    ]) {
+      address = raw;
+      await page.goto("/#console");
+      await expect(
+        page.getByText(remote ? "Remote server" : "Local server", {
+          exact: true,
+        }),
+      ).toBeVisible();
+      const copy = page.getByRole("button", {
+        name: "Copy server address",
+        exact: true,
+      });
+      await expect(copy).toHaveText(displayed);
+      await copy.click();
+      await expect(page.getByRole("status")).toContainText(
+        "Server address copied.",
+      );
+      expect(
+        await page.evaluate(
+          () => (window as unknown as { copiedAddress: string }).copiedAddress,
+        ),
+      ).toBe(displayed);
+    }
+    const actual = await (await request.get("/api/server", { headers })).json();
+    expect(actual.port).toBe(seed.port);
+    expect(
+      await (
+        await request.get("/api/files/content?path=server.properties", {
+          headers,
+        })
+      ).json(),
+    ).toEqual(propertiesBefore);
+  });
+}
+
 test("live telemetry renders memory against its allocation and CPU against whole-processor capacity", async ({
   page,
   request,

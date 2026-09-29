@@ -31,6 +31,7 @@ files:
   - server/recycle-bin.mjs
   - server/file-transfer.mjs
   - server/file-download.mjs
+  - server/file-search.mjs
   - server/backup-archive.mjs
   - server/backup-restore.mjs
   - server/player-history.mjs

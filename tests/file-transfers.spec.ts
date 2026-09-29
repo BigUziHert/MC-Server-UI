@@ -181,7 +181,19 @@ test("shared panel readers download files, folders, and selections to their comp
       .fill("world");
     await expect(
       page.getByRole("region", { name: "Selected files and folders" }),
-    ).toContainText("1 outside this page or filter");
+    ).toHaveCount(0);
+    await page
+      .getByRole("button", { name: "Clear search", exact: true })
+      .click();
+    await page
+      .getByRole("checkbox", { name: "Select world copy", exact: true })
+      .check();
+    await page
+      .getByRole("checkbox", {
+        name: "Select download & café.txt",
+        exact: true,
+      })
+      .check();
     downloadEvent = page.waitForEvent("download");
     await page
       .getByRole("button", { name: "Download selected", exact: true })

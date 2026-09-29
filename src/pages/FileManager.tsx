@@ -148,7 +148,12 @@ type Entry = {
   size: number;
   modified: string;
 };
-type FileResult = { path: string; entries: Entry[] };
+type FileResult = {
+  path: string;
+  entries: Entry[];
+  search?: string;
+  nextCursor?: string | null;
+};
 type RecycledItem = {
   id: string;
   name: string;
@@ -547,7 +552,7 @@ function MoveProgress({
   );
 }
 const editable = (name: string) =>
-  /\.(txt|log|json|ya?ml|toml|properties|conf|cfg|ini|md|xml|csv|js|ts|sh|bat|mcmeta)$/i.test(
+  /\.(txt|log|json[5c]?|ya?ml|toml|properties|conf|cfg|ini|md|xml|csv|js|ts|sh|bat|mcmeta)$/i.test(
     name,
   ) || !name.includes(".");
 
@@ -556,9 +561,21 @@ function EntryIcon({ entry }: { entry: Entry }) {
     return <Folder size={19} className="folder-icon" />;
   if (/\.(jar|zip|gz|tar|rar|7z)$/i.test(entry.name))
     return <FileArchive size={18} />;
-  if (/\.(json|ya?ml|properties|toml|cfg|conf)$/i.test(entry.name))
+  if (/\.(json[5c]?|ya?ml|properties|toml|cfg|conf)$/i.test(entry.name))
     return <FileCode2 size={18} />;
   return editable(entry.name) ? <FileText size={18} /> : <FileIcon size={18} />;
+}
+
+function selectedRoots(entries: Entry[], selected: Set<string>) {
+  const targets = entries.filter((entry) => selected.has(entry.path));
+  return targets.filter(
+    (entry) =>
+      !targets.some(
+        (parent) =>
+          parent.type === "directory" &&
+          entry.path.startsWith(`${parent.path}/`),
+      ),
+  );
 }
 
 export default function FileManager({
@@ -599,14 +616,36 @@ export default function FileManager({
   const transferring = transfer?.status === "running";
   const uploading = transferring && transfer.kind === "upload";
   const clipboard = useFileClipboard();
-  const [entries, setEntries] = useState<Entry[]>([]);
-  const [query, setQuery] = useState("");
-  const debouncedQuery = useDebouncedValue(query);
+  const [listing, setListing] = useState<{ scope: string; entries: Entry[] }>({
+    scope: "",
+    entries: [],
+  });
+  const searchScope = JSON.stringify([sessionScope, scopeKey, path]);
+  const [search, setSearch] = useState({ scope: searchScope, value: "" });
+  const debouncedSearch = useDebouncedValue(search);
+  const query = search.scope === searchScope ? search.value : "";
+  const requestedQuery = query.trim();
+  const debouncedQuery =
+    debouncedSearch.scope === searchScope ? debouncedSearch.value.trim() : "";
+  const listScope = JSON.stringify([searchScope, requestedQuery]);
+  const entries = listing.scope === listScope ? listing.entries : [];
+  function setEntries(update: Entry[] | ((previous: Entry[]) => Entry[])) {
+    setListing((previous) => ({
+      scope: listScope,
+      entries:
+        typeof update === "function"
+          ? update(previous.scope === listScope ? previous.entries : [])
+          : update,
+    }));
+  }
+  const activeListScope = useRef(listScope);
+  activeListScope.current = listScope;
   const [page, setPage] = useState(1),
     [pageSize, setPageSize] = useState(25);
   const loaded = useRef(false);
   useEffect(() => setPage(1), [debouncedQuery, pageSize, path]);
   const [loading, setLoading] = useState(true);
+  const [searchProgress, setSearchProgress] = useState(0);
   const [error, setError] = useState("");
   const [dragging, setDragging] = useState(false);
   const [dialog, setDialog] = useState<FileDialog | null>(null);
@@ -638,6 +677,7 @@ export default function FileManager({
   const folderInput = useRef<HTMLInputElement>(null);
   const searchInput = useRef<HTMLInputElement>(null);
   const requestId = useRef(0);
+  const listRequest = useRef<AbortController | null>(null);
   const dialogRef = useRef<HTMLDialogElement>(null);
   const focusSearchAfterClose = useRef(false);
   const dragDepth = useRef(0);
@@ -645,26 +685,85 @@ export default function FileManager({
   const savingRef = useRef(false);
   const pathRef = useRef(path);
   const handledMove = useRef<string | null>(null);
+  const moveSelectionScope = useRef<string | null>(null);
   const handledTransfer = useRef<string | null>(null);
   savingRef.current = saving;
   pathRef.current = path;
+
+  function setQuery(value: string) {
+    if (search.scope === searchScope && value.trim() === requestedQuery) {
+      setSearch({ scope: searchScope, value });
+      return;
+    }
+    requestId.current++;
+    listRequest.current?.abort();
+    loaded.current = false;
+    setSelected(new Set());
+    setEntries([]);
+    setError("");
+    setLoading(true);
+    setSearchProgress(0);
+    setPage(1);
+    setSearch({ scope: searchScope, value });
+  }
 
   const load = useCallback(async () => {
     if (!canRead) {
       setLoading(false);
       return false;
     }
+    if (requestedQuery !== debouncedQuery) return false;
+    listRequest.current?.abort();
+    const controller = new AbortController();
+    listRequest.current = controller;
     const id = ++requestId.current;
+    const current = () =>
+      id === requestId.current &&
+      activeListScope.current === listScope &&
+      !controller.signal.aborted;
     setLoading(true);
     setError("");
+    setSearchProgress(0);
+    if (debouncedQuery) {
+      loaded.current = false;
+      setEntries([]);
+    }
     try {
-      const result = await api<FileResult>(
-        `/files?path=${encodeURIComponent(path)}`,
-      );
-      if (id === requestId.current) {
+      const matches = new Map<string, Entry>();
+      const cursors = new Set<string>();
+      let cursor: string | null = null;
+      do {
+        const result: FileResult = await api<FileResult>(
+          `/files?path=${encodeURIComponent(path)}${debouncedQuery ? `&search=${encodeURIComponent(debouncedQuery)}` : ""}${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ""}`,
+          { signal: controller.signal },
+        );
+        if (!current()) return false;
+        if (
+          debouncedQuery &&
+          (result.search !== debouncedQuery ||
+            !(
+              result.nextCursor === null ||
+              (typeof result.nextCursor === "string" && result.nextCursor)
+            ))
+        ) {
+          throw new Error(
+            "Recursive search is not supported by this panel version. Update the panel on the server computer, then try again.",
+          );
+        }
+        result.entries.forEach((entry) => matches.set(entry.path, entry));
+        cursor = debouncedQuery ? result.nextCursor! : null;
+        if (cursor && cursors.has(cursor))
+          throw new Error(
+            "The file search could not finish. Refresh the search and try again.",
+          );
+        if (cursor) cursors.add(cursor);
+        if (debouncedQuery) setSearchProgress(matches.size);
+      } while (cursor);
+      if (current()) {
         loaded.current = true;
-        setEntries(result.entries);
-        const available = new Set(result.entries.map((entry) => entry.path));
+        const resultEntries = [...matches.values()];
+        setEntries(resultEntries);
+        const available = new Set(matches.keys());
         setSelected(
           (previous) =>
             new Set([...previous].filter((item) => available.has(item))),
@@ -673,12 +772,12 @@ export default function FileManager({
       }
       return false;
     } catch (failure) {
-      if (id === requestId.current) setError(messageOf(failure));
+      if (current()) setError(messageOf(failure));
       return false;
     } finally {
-      if (id === requestId.current) setLoading(false);
+      if (current()) setLoading(false);
     }
-  }, [path, api, canRead]);
+  }, [path, api, canRead, requestedQuery, debouncedQuery, listScope]);
 
   useEffect(() => {
     if (
@@ -745,7 +844,7 @@ export default function FileManager({
         (entry) =>
           completed.has(entry.path) &&
           document.activeElement?.getAttribute("aria-label") ===
-            `Delete ${entry.name}`,
+            `Delete ${requestedQuery ? entry.path : entry.name}`,
       )
     )
       searchInput.current?.focus();
@@ -756,7 +855,8 @@ export default function FileManager({
       const remaining = new Set(
         [...previous].filter((item) => !completed.has(item)),
       );
-      moveBatch.failures.forEach(({ entry }) => remaining.add(entry.path));
+      if (moveSelectionScope.current === listScope)
+        moveBatch.failures.forEach(({ entry }) => remaining.add(entry.path));
       return remaining;
     });
     // A background completion must not dismiss or overwrite a newer dialog.
@@ -794,6 +894,7 @@ export default function FileManager({
     if (!showingBin || !canBin) void load();
     return () => {
       requestId.current++;
+      listRequest.current?.abort();
     };
   }, [load, showingBin, canBin]);
   useEffect(() => {
@@ -845,7 +946,7 @@ export default function FileManager({
   }
   function openDeleteSelected() {
     if (!canDelete || movePending || checkingMove) return;
-    const targets = entries.filter((entry) => selected.has(entry.path));
+    const targets = selectedRoots(entries, selected);
     if (!targets.length || savingRef.current) return;
     editRequestId.current++;
     setReading(false);
@@ -1047,6 +1148,7 @@ export default function FileManager({
     if (dialog.type === "delete" || dialog.type === "delete-many") {
       if (movePending || checkingMove) return;
       setDialogError("");
+      moveSelectionScope.current = listScope;
       setDialogMoveId(
         startMoveBatch(
           api,
@@ -1092,12 +1194,10 @@ export default function FileManager({
   }
 
   const filtered = entries
-    .filter((entry) =>
-      entry.name.toLowerCase().includes(debouncedQuery.toLowerCase()),
-    )
+    .slice()
     .sort((a, b) =>
       a.type === b.type
-        ? a.name.localeCompare(b.name)
+        ? a.name.localeCompare(b.name) || a.path.localeCompare(b.path)
         : a.type === "directory"
           ? -1
           : 1,
@@ -1375,10 +1475,17 @@ export default function FileManager({
             aria-label="Search files and folders"
             value={query}
             onValueChange={setQuery}
+            aria-describedby="file-search-scope"
           />
           <div className="file-selection-slot">
             {!selectedEntries.length && (
-              <span className="muted files-count">{entries.length} items</span>
+              <span className="muted files-count">
+                {error
+                  ? "Unavailable"
+                  : loading
+                    ? "Loading…"
+                    : `${entries.length} ${requestedQuery ? "matches" : "items"}`}
+              </span>
             )}
             <div
               className="file-selection-bar"
@@ -1392,7 +1499,7 @@ export default function FileManager({
                 <strong>{selectedEntries.length} selected</strong>
                 <span>
                   {hiddenSelectedCount > 0
-                    ? `${hiddenSelectedCount} outside this page or filter`
+                    ? `${hiddenSelectedCount} outside this page`
                     : "\u00a0"}
                 </span>
               </div>
@@ -1438,6 +1545,11 @@ export default function FileManager({
             </div>
           </div>
         </div>
+        <p className="file-search-scope" id="file-search-scope">
+          {requestedQuery
+            ? `Search results in /${path || "server"} and its subfolders`
+            : "Search file and folder names in this folder and its subfolders."}
+        </p>
         {error && (
           <StatePanel
             variant="error"
@@ -1447,7 +1559,19 @@ export default function FileManager({
           />
         )}
         {loading && !loaded.current ? (
-          <StatePanel variant="loading" title="Loading your files…" />
+          <StatePanel
+            variant="loading"
+            title={
+              requestedQuery
+                ? "Searching files and folders…"
+                : "Loading your files…"
+            }
+            message={
+              requestedQuery
+                ? `${searchProgress} matches found. Checking remaining folders…`
+                : undefined
+            }
+          />
         ) : (
           <div className="table-wrap">
             <table className="data-table file-table">
@@ -1490,7 +1614,7 @@ export default function FileManager({
                 </thead>
               )}
               <tbody>
-                {!path && canBin && (
+                {!path && !requestedQuery && canBin && (
                   <tr
                     className="recycle-bin-entry"
                     aria-label="Protected Recycle Bin"
@@ -1517,7 +1641,7 @@ export default function FileManager({
                     </td>
                   </tr>
                 )}
-                {path && !query && (
+                {path && !requestedQuery && (
                   <tr className="parent-directory">
                     <td colSpan={4}>
                       <button
@@ -1545,7 +1669,7 @@ export default function FileManager({
                         <input
                           className="file-selection-checkbox"
                           type="checkbox"
-                          aria-label={`Select ${entry.name}`}
+                          aria-label={`Select ${requestedQuery ? entry.path : entry.name}`}
                           checked={selected.has(entry.path)}
                           disabled={(!canDelete && !canContent) || saving}
                           onChange={() => toggleSelection(entry.path)}
@@ -1554,10 +1678,22 @@ export default function FileManager({
                           className={`file-name ${entry.type === "directory" ? "directory" : ""}`}
                           onClick={() => void openEntry(entry)}
                           disabled={entry.type === "file" && !canContent}
-                          title={entry.name}
+                          title={entry.path}
+                          aria-label={requestedQuery ? entry.path : undefined}
                         >
                           <EntryIcon entry={entry} />
-                          <span>{entry.name}</span>
+                          <span
+                            className={
+                              requestedQuery ? "file-search-name" : undefined
+                            }
+                          >
+                            <span>{entry.name}</span>
+                            {requestedQuery && (
+                              <small className="file-search-path">
+                                /{entry.path}
+                              </small>
+                            )}
+                          </span>
                           {entry.type === "directory" && (
                             <ChevronRight
                               size={13}
@@ -1585,7 +1721,7 @@ export default function FileManager({
                           editable(entry.name) && (
                             <button
                               className="btn icon"
-                              aria-label={`${canUpdate ? "Edit" : "View"} ${entry.name}`}
+                              aria-label={`${canUpdate ? "Edit" : "View"} ${requestedQuery ? entry.path : entry.name}`}
                               title={canUpdate ? "Edit file" : "View file"}
                               onClick={() => void openEntry(entry)}
                             >
@@ -1596,7 +1732,7 @@ export default function FileManager({
                           <DownloadButton
                             className="btn icon"
                             onError={(message) => notify(message, true)}
-                            aria-label={`Download ${entry.name}`}
+                            aria-label={`Download ${requestedQuery ? entry.path : entry.name}`}
                             title={
                               entry.type === "directory"
                                 ? "Download folder as ZIP to this computer"
@@ -1611,7 +1747,7 @@ export default function FileManager({
                         )}
                         <button
                           className="btn icon delete-action"
-                          aria-label={`Delete ${entry.name}`}
+                          aria-label={`Delete ${requestedQuery ? entry.path : entry.name}`}
                           title="Move to Recycle Bin"
                           disabled={!canDelete || movePending || checkingMove}
                           onClick={() => openDelete(entry)}
@@ -1624,20 +1760,20 @@ export default function FileManager({
                 ))}
               </tbody>
             </table>
-            {!visible.length && (
+            {!visible.length && !error && (
               <StatePanel
                 variant="empty"
                 icon={<Folder size={30} />}
-                title={query ? "No matching files" : "A fresh start"}
+                title={requestedQuery ? "No matching files" : "A fresh start"}
                 message={
-                  query
+                  requestedQuery
                     ? "Try a different file or folder name."
                     : canCreate
                       ? "Upload your server files or create a new folder."
                       : "There are no files in this folder."
                 }
                 action={
-                  !query &&
+                  !requestedQuery &&
                   canCreate && (
                     <button
                       className="btn"
@@ -1667,7 +1803,8 @@ export default function FileManager({
         <div className="files-footer">
           <span>
             <span className="storage-status-dot" />
-            {formatBytes(totalSize)} in this directory
+            {formatBytes(totalSize)}{" "}
+            {requestedQuery ? "in matching files" : "in this directory"}
           </span>
           {canCreate && <span>Drag and drop files here to upload</span>}
         </div>
@@ -1776,7 +1913,7 @@ export default function FileManager({
             )}
             {dialog.type === "delete" && (
               <p className="delete-description">
-                Move <strong>{dialog.entry.name}</strong>
+                Move <strong>/{dialog.entry.path}</strong>
                 {dialog.entry.type === "directory"
                   ? " and everything inside it"
                   : ""}{" "}

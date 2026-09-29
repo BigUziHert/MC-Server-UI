@@ -70,6 +70,7 @@ import DesktopUpdates from "./DesktopUpdates";
 import PanelSettings from "./PanelSettings";
 import ServerIcon, { ServerIconImage } from "./ServerIcon";
 import { copyText } from "./clipboard";
+import { formatGameAddress } from "../shared/game-address.mjs";
 import { clearFileClipboard } from "./file-clipboard";
 import { clearFileTransfers } from "./file-transfer-state";
 import { clearRecoveryBatches } from "./recycle-action-state";
@@ -1835,6 +1836,7 @@ function ConsolePage({
   const { api, post } = useServerApi();
   const canConsole = !permissions || permissions.includes("control.console");
   const canFiles = !permissions || permissions.includes("file.read");
+  const gameAddress = formatGameAddress(server?.address ?? "");
   const [lines, setLines] = useState<LogLine[]>([]);
   const [inputMode, setInputMode] = useState<"command" | "message">("command");
   const [drafts, setDrafts] = useState({ command: "", message: "" });
@@ -1937,9 +1939,9 @@ function ConsolePage({
     }
   }
   async function copyAddress() {
-    if (!server?.address) return;
+    if (!gameAddress) return;
     try {
-      await copyText(server.address);
+      await copyText(gameAddress);
       notify("Server address copied.");
     } catch {
       notify("Could not access the clipboard.", true);
@@ -2034,11 +2036,11 @@ function ConsolePage({
             <button
               className="address-button"
               onClick={copyAddress}
-              disabled={!server?.address}
+              disabled={!gameAddress}
               aria-label="Copy server address"
               title={server?.addressNote}
             >
-              <span>{server?.address || "Loading address…"}</span>
+              <span>{gameAddress || "Loading address…"}</span>
               <Copy size={12} />
             </button>
           </div>

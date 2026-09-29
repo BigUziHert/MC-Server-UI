@@ -256,7 +256,7 @@ test("selected file and folder deletion confirms exact targets and preserves uns
   ).toHaveCount(0);
 });
 
-test("select visible all respects filters and selection clears on directory and server changes", async ({
+test("select visible all respects search and selection clears on query, directory and server changes", async ({
   page,
   files,
 }, testInfo) => {
@@ -295,7 +295,8 @@ test("select visible all respects filters and selection clears on directory and 
   await expect(searchField).toHaveCSS("box-shadow", "none");
   await expect(searchField).toHaveCSS("outline-style", "solid");
   await expect(searchField).toHaveCSS("outline-width", "2px");
-  await expect(all).toHaveAttribute("aria-checked", "mixed");
+  await expect(selection).toHaveCount(0);
+  await expect(all).not.toBeChecked();
   await expect(
     page.getByRole("checkbox", { name: "Select beta.txt", exact: true }),
   ).not.toBeChecked();
@@ -303,19 +304,20 @@ test("select visible all respects filters and selection clears on directory and 
     .getByRole("checkbox", { name: "Select beta.txt", exact: true })
     .check();
   await search.fill("alpha.txt");
-  await expect(selection).toContainText("3 selected");
-  await expect(selection).toContainText("2 outside this page or filter");
-  await all.uncheck();
+  await expect(selection).toHaveCount(0);
+  await all.check();
+  await expect(selection).toContainText("1 selected");
   await search.clear();
+  await expect(selection).toHaveCount(0);
   await expect(
     page.getByRole("checkbox", { name: "Select alpha.txt", exact: true }),
   ).not.toBeChecked();
   await expect(
     page.getByRole("checkbox", { name: "Select alpha-two.txt", exact: true }),
-  ).toBeChecked();
+  ).not.toBeChecked();
   await expect(
     page.getByRole("checkbox", { name: "Select beta.txt", exact: true }),
-  ).toBeChecked();
+  ).not.toBeChecked();
   await expect(
     page.getByRole("checkbox", { name: "Select archive", exact: true }),
   ).not.toBeChecked();
@@ -334,9 +336,6 @@ test("select visible all respects filters and selection clears on directory and 
     animations: "disabled",
     fullPage: true,
   });
-  await page
-    .getByRole("button", { name: "Clear selection", exact: true })
-    .click();
   await expect(selection).toHaveCount(0);
   // Focusing a lower row can scroll the smaller viewport. Compare document
   // coordinates so this checks layout movement, not the browser's focus scroll.
