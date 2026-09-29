@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { EventEmitter } from "node:events";
+import { EventEmitter, once } from "node:events";
 import { PassThrough, Writable } from "node:stream";
 import { createPanel } from "./index.mjs";
 import {
@@ -154,12 +154,18 @@ test("moderation validates Java names, UUIDs and single-line reasons before gene
   });
 });
 
-async function fixture(t, mode = "live") {
+async function fixture(t, mode = "live", { varyPathCase = false } = {}) {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "mc-player-history-"));
   const commands = [];
   let child;
   const options = {
     dataDir: root,
+    // Windows TEMP may use a different spelling than fs.realpath returns.
+    // Exercise the same distinction without depending on the runner's account.
+    serverDir:
+      varyPathCase && process.platform === "win32"
+        ? path.join(root, "server").toUpperCase()
+        : undefined,
     mode,
     useEnvironment: false,
     scheduler: false,
@@ -223,6 +229,9 @@ async function fixture(t, mode = "live") {
       return panel.serverDir;
     },
     commands,
+    waitForExit() {
+      return once(child, "close");
+    },
     output(line) {
       child.stdout.write(line + "\n");
     },
@@ -640,13 +649,17 @@ test("offline roster writes exclude server starts and concurrent changes until a
 });
 
 test("a live moderation request never switches to offline file writes after the process stops", async (t) => {
-  const panel = await fixture(t);
+  const panel = await fixture(t, "live", { varyPathCase: true });
   await fs.writeFile(
     path.join(panel.serverDir, "usercache.json"),
     JSON.stringify([profile]),
   );
   await fs.writeFile(path.join(panel.serverDir, "banned-players.json"), "[]\n");
   await panel.start();
+  const cachePath = path.join(
+    await fs.realpath(panel.serverDir),
+    "usercache.json",
+  );
   let release, entered;
   const gate = new Promise((resolve) => {
     release = resolve;
@@ -656,18 +669,20 @@ test("a live moderation request never switches to offline file writes after the 
   });
   const original = fs.readFile;
   t.mock.method(fs, "readFile", async (filename, ...args) => {
-    if (filename === path.join(panel.serverDir, "usercache.json")) {
+    if (filename === cachePath) {
       entered();
       await gate;
     }
     return original(filename, ...args);
   });
   const mutation = panel.request("/api/players/ban", json("POST", profile));
+  let response;
   try {
     await Promise.race([
       enteredGate,
       mutation.then((response) => assert.fail(JSON.stringify(response))),
     ]);
+    const exited = panel.waitForExit();
     assert.equal(
       (
         await panel.request(
@@ -677,15 +692,15 @@ test("a live moderation request never switches to offline file writes after the 
       ).status,
       200,
     );
-    for (let attempt = 0; attempt < 30; attempt++) {
-      if ((await panel.request("/api/server")).body.status === "offline") break;
-      await new Promise((resolve) => setTimeout(resolve, 10));
-    }
+    await exited;
     assert.equal((await panel.request("/api/server")).body.status, "offline");
   } finally {
     release();
-    assert.equal((await mutation).status, 409);
+    // Drain the request on failure too, without replacing a failed gate/setup
+    // assertion with a secondary status assertion.
+    response = await mutation;
   }
+  assert.equal(response.status, 409);
   assert.equal(
     await fs.readFile(
       path.join(panel.serverDir, "banned-players.json"),
