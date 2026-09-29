@@ -193,10 +193,13 @@ test("a slow cross-drive move can close, survive page navigation, and finish wit
     ).toBeDisabled();
     await page.getByRole("link", { name: "Console", exact: true }).click();
     await page.getByRole("link", { name: "File Manager", exact: true }).click();
+    await expect(
+      page.getByRole("heading", { name: "File Manager", exact: true }),
+    ).toBeVisible();
+    await expect(
+      page.getByRole("navigation", { name: "File path", exact: true }),
+    ).toHaveText("server");
     await expect(progress).toContainText("2 of 10 files");
-    await page
-      .getByRole("button", { name: "Server root", exact: true })
-      .click();
     await page.setViewportSize({ width: 390, height: 844 });
     await expect
       .poll(() =>
@@ -1181,8 +1184,12 @@ for (const action of ["delete", "restore"] as const) {
         .getByRole("link", { name: "File Manager", exact: true })
         .click();
       await expect(
-        page.getByRole("heading", { name: "Recycle Bin", exact: true }),
+        page.getByRole("heading", { name: "File Manager", exact: true }),
       ).toBeVisible();
+      await expect(
+        page.getByRole("navigation", { name: "File path", exact: true }),
+      ).toHaveText("server");
+      await openBin(page);
       const progress = page.getByRole("status", {
         name: "Recovery operation progress",
         exact: true,

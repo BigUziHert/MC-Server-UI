@@ -1078,6 +1078,15 @@ test("Recycle Bin restores archive bytes and backup history without changing ser
     .click();
   await expect(dialog).not.toBeVisible();
   await page.getByRole("link", { name: "File Manager", exact: true }).click();
+  await expect(
+    page.getByRole("heading", { name: "File Manager", exact: true }),
+  ).toBeVisible();
+  await expect(
+    page.getByRole("navigation", { name: "File path", exact: true }),
+  ).toHaveText("server");
+  await page
+    .getByRole("button", { name: "Open Recycle Bin", exact: true })
+    .click();
   const betaRow = page.getByRole("listitem", {
     name: "Recycled backup Beta backup",
     exact: true,
