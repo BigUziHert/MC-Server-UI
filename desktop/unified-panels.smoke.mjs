@@ -596,16 +596,16 @@ async function smoke() {
           contentLeft: contentBounds.left,
           contentRight: contentBounds.right,
           contentWidth: contentBounds.width,
-          contentBottom: contentBounds.bottom,
+          contentBottom: contentBounds.bottom + scrollY,
           contentBottomPadding: parseFloat(
             getComputedStyle(content).paddingBottom,
           ),
-          consoleTop: outputBounds.top,
-          consoleBottom: outputBounds.bottom,
+          consoleTop: outputBounds.top + scrollY,
+          consoleBottom: outputBounds.bottom + scrollY,
           consoleHeight: outputBounds.height,
-          commandBottom: commandBounds.bottom,
-          footerTop: footerBounds.top,
-          footerBottom: footerBounds.bottom,
+          commandBottom: commandBounds.bottom + scrollY,
+          footerTop: footerBounds.top + scrollY,
+          footerBottom: footerBounds.bottom + scrollY,
           sidebarWidth: sidebar.getBoundingClientRect().width,
           fontSize: getComputedStyle(document.documentElement).fontSize,
         };
@@ -619,23 +619,25 @@ async function smoke() {
       assert.ok(Math.abs(geometry.contentRight - geometry.shellRight) < 1);
       assert.ok(Math.abs(geometry.contentRight - geometry.documentWidth) < 1);
       assert.ok(
-        Math.abs(geometry.contentBottom - geometry.viewportHeight) < 1,
-        `${name}: the console page fills the viewport height`,
+        geometry.contentBottom >= geometry.viewportHeight - 1,
+        `${name}: the console page fills at least the viewport height`,
       );
-      assert.ok(
-        geometry.documentHeight <= geometry.viewportHeight + 1,
-        `${name}: the console and footer fit without page scrolling`,
-      );
+      if (geometry.viewportHeight >= 1368) {
+        assert.ok(
+          geometry.documentHeight <= geometry.viewportHeight + 1,
+          `${name}: the console and footer fit on a tall desktop`,
+        );
+      }
       assert.ok(
         Math.abs(
-          geometry.viewportHeight -
+          geometry.documentHeight -
             geometry.footerBottom -
             geometry.contentBottomPadding,
         ) < 1,
         `${name}: the footer stays at the bottom padding`,
       );
       assert.ok(
-        geometry.consoleHeight >= 200 &&
+        geometry.consoleHeight >= 480 &&
           geometry.consoleBottom < geometry.commandBottom &&
           geometry.commandBottom < geometry.footerTop,
         `${name}: the console remains usable with its command input above the footer`,
@@ -650,6 +652,7 @@ async function smoke() {
       return {
         viewport: geometry.viewport,
         viewportHeight: geometry.viewportHeight,
+        documentHeight: geometry.documentHeight,
         contentLeft: geometry.contentLeft,
         rightInset: geometry.documentWidth - geometry.contentRight,
         contentBottom: geometry.contentBottom,
@@ -694,7 +697,7 @@ async function smoke() {
             Math.abs(
               localGeometry.consoleHeight -
                 shorterGeometry.consoleHeight -
-                (localGeometry.viewportHeight - shorterGeometry.viewportHeight),
+                (localGeometry.viewportHeight - shorterGeometry.documentHeight),
             ) < 1,
             "The console uses the extra height when the same-width window grows",
           );

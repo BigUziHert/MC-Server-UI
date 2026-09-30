@@ -467,7 +467,7 @@ for (const mode of consoleModes) {
       expect
         .soft(measured.documentWidth, "no horizontal overflow")
         .toBeLessThanOrEqual(measured.viewportWidth + 1);
-      if (viewport.height >= 1080) {
+      if (viewport.height >= 1368) {
         expect
           .soft(
             measured.documentHeight,
@@ -486,7 +486,7 @@ for (const mode of consoleModes) {
         .toBeCloseTo(measured.layoutWidth, 0);
       expect
         .soft(measured.outputHeight, "console retains a readable minimum")
-        .toBeGreaterThanOrEqual(220);
+        .toBeGreaterThanOrEqual(480);
       expect
         .soft(measured.commandBottom)
         .toBeLessThanOrEqual(measured.panelBottom);
@@ -561,6 +561,8 @@ for (const mode of consoleModes) {
     );
     for (const viewport of [
       { width: 1280, height: 600 },
+      { width: 1920, height: 1008 },
+      { width: 1536, height: 800 },
       { width: 390, height: 844 },
     ]) {
       fixture.populateConsole(false);
@@ -569,7 +571,9 @@ for (const mode of consoleModes) {
       await expect(page.getByRole("log")).toContainText("Server ready");
       await page.evaluate(() => document.fonts.ready);
       const before = await consoleGeometry(page);
-      expect(before.outputHeight).toBeGreaterThanOrEqual(220);
+      expect(before.outputHeight).toBeGreaterThanOrEqual(
+        viewport.width > 760 ? 480 : 220,
+      );
       expect(before.documentWidth).toBeLessThanOrEqual(
         before.viewportWidth + 1,
       );

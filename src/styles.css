@@ -1283,7 +1283,7 @@ input:disabled {
   display: none;
 }
 @media (min-width: 761px) {
-  /* Let the console use spare window height without shrinking its controls. */
+  /* Keep logs readable on shorter desktops and use spare height on tall ones. */
   .main-shell:has(.console-panel) {
     display: flex;
     flex-direction: column;
@@ -1313,8 +1313,8 @@ input:disabled {
     flex-shrink: 0;
   }
   .console-panel > .console-output {
-    height: 220px;
-    min-height: 220px;
+    height: 480px;
+    min-height: 480px;
     flex: 1 1 auto;
   }
 }
