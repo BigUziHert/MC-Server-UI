@@ -664,3 +664,35 @@ test("manual catalog refresh bypasses both release and Maven build caches", asyn
   const releases = await f.service.versions("neoforge", { refresh: true });
   assert.ok(releases.versions.some((row) => row.id === "1.21.3"));
 });
+
+for (const buildsFirst of [false, true]) {
+  test(`concurrent Paper release and build refresh shares metadata (${buildsFirst ? "builds" : "releases"} first)`, async (t) => {
+    const project = `${PAPER}/paper`;
+    const builds = `${project}/versions/1.21.1/builds`;
+    const f = await fixture(t, {
+      [project]: { versions: { 1.21: ["1.21.1"] } },
+      [builds]: [],
+    });
+    await f.service.builds("paper", "1.21.1");
+    f.requests.length = 0;
+    const reached = Promise.withResolvers();
+    const release = Promise.withResolvers();
+    f.records[project] = async () => {
+      reached.resolve();
+      await release.promise;
+      return Response.json({ versions: { 1.21: ["1.21.1", "1.21.2"] } });
+    };
+    const refreshVersions = () =>
+      f.service.versions("paper", { refresh: true });
+    const refreshBuilds = () =>
+      f.service.builds("paper", "1.21.1", { refresh: true });
+    const first = buildsFirst ? refreshBuilds() : refreshVersions();
+    await reached.promise;
+    const second = buildsFirst ? refreshVersions() : refreshBuilds();
+    release.resolve();
+    await Promise.all([first, second]);
+    assert.equal(f.requests.filter(({ url }) => url === project).length, 1);
+    assert.equal(f.requests.filter(({ url }) => url === builds).length, 1);
+    assert.equal((await f.service.versions("paper")).versions[0].id, "1.21.2");
+  });
+}

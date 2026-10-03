@@ -395,15 +395,22 @@ export function createVersionsService({
   }
   function cached(key, work) {
     const previous = cache.get(key);
-    if (previous && previous.expires > Date.now()) return previous.value;
-    const value = Promise.resolve()
+    if (previous && (previous.pending || previous.expires > Date.now()))
+      return previous.value;
+    const entry = { pending: true, expires: 0, value: null };
+    entry.value = Promise.resolve()
       .then(work)
+      .then((result) => {
+        entry.pending = false;
+        entry.expires = Date.now() + cacheMs;
+        return result;
+      })
       .catch((cause) => {
-        cache.delete(key);
+        if (cache.get(key) === entry) cache.delete(key);
         throw cause;
       });
-    cache.set(key, { value, expires: Date.now() + cacheMs });
-    return value;
+    cache.set(key, entry);
+    return entry.value;
   }
   function provider(id) {
     const found = versionProviders.find((entry) => entry.id === id);
@@ -429,9 +436,15 @@ export function createVersionsService({
       return versions.sort(newest);
     });
   const refreshProvider = (id) => {
-    cache.delete(id);
-    for (const key of cache.keys())
-      if (key === `versions:${id}` || key.startsWith(`builds:${id}:`))
+    // Release and build refreshes run together in Versions. Invalidate stored
+    // results once while sharing any request already fetching current metadata.
+    for (const [key, entry] of cache)
+      if (
+        !entry.pending &&
+        (key === id ||
+          key === `versions:${id}` ||
+          key.startsWith(`builds:${id}:`))
+      )
         cache.delete(key);
   };
   async function versions(id, { refresh = false } = {}) {

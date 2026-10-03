@@ -35,6 +35,36 @@ const cacheOptions = (root, extra = {}) => ({
   ...extra,
 });
 
+test("CurseForge disposable metadata is purged at startup and never written back", async (t) => {
+  const root = await temporary(t);
+  const foreign = {
+    kind: "identity",
+    sha512: digest("cf"),
+    value: { ...identity(), platform: "curseforge" },
+  };
+  const valid = { kind: "identity", sha512: digest("mr"), value: identity() };
+  await fs.writeFile(
+    path.join(root, "metadata-cache.json"),
+    JSON.stringify({ version: 1, entries: [null, foreign, valid] }),
+  );
+  const cache = await createLaunchpadMetadataCache(cacheOptions(root));
+  assert.equal(cache.identity(digest("cf")), undefined);
+  assert.equal(cache.identity(digest("mr")).platform, "modrinth");
+  cache.rememberIdentity(digest("new-cf"), foreign.value);
+  cache.rememberProject(
+    "curseforge",
+    "project",
+    { title: "Forbidden retained metadata" },
+    Date.now(),
+  );
+  await cache.close();
+  assert.ok(
+    !(await fs
+      .readFile(path.join(root, "metadata-cache.json"), "utf8")
+      .then((value) => value.includes("curseforge"))),
+  );
+});
+
 test("metadata cache persists only bounded positive identities and safe display fields", async (t) => {
   const root = await temporary(t);
   const cache = await createLaunchpadMetadataCache(cacheOptions(root));

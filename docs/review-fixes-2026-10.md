@@ -1,0 +1,39 @@
+# October 3 comprehensive audit remediation
+
+This change implements corrections from the comprehensive audit of commit `066c89da1f823f3759518fd8568e6fbadbe86035`. Recovery and failure tests use disposable server trees, child processes, and controlled provider responses. Existing audit evidence stays separate from the intended-behavior regressions shipped with the application.
+
+| Finding                                                   | Correction                                                                                                                                                                            |
+| --------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| B1: interrupted restore loses the active root             | Flush a restore journal before moving directories; reconcile owned directory identities before startup can create a server root. Preserve and report ambiguous external replacements. |
+| B2: interrupted backup output disappears from history     | Record archive ownership and publication state, recover completed archives into history, and retain visible recovery information for unknown artifacts.                               |
+| B3: daylight-saving normalization changes later schedules | Construct each target date before applying the configured daily or weekly time.                                                                                                       |
+| L1: partial download retry fails with EEXIST              | Close and remove only the incomplete file owned by the failed transfer; retain verified downloads and externally replaced files.                                                      |
+| L2: CurseForge CDN request lacks authentication           | Resolve the configured key at download time and restrict authenticated redirects to the supported CurseForge CDN hosts.                                                               |
+| L3: catalog pages repeat beyond the provider ceiling      | Return canonical offsets and reachable totals; honor CurseForge's 10,000-result ceiling and reconcile the frontend page.                                                              |
+| L4: Retry-After is shortened                              | Honor the entire provider deadline before another request.                                                                                                                            |
+| L5: interrupted content replacement lacks recovery        | Persist original bytes and transaction state before promotion, reconcile interrupted installations, and preserve conflicting files with actionable recovery state.                    |
+| L6: forced FTB checks reuse stale releases                | Propagate explicit refresh through provider metadata caches while sharing current requests.                                                                                           |
+| L7: abandoned searches continue fetching                  | Propagate cancellation and retain shared work only while subscribers still need it.                                                                                                   |
+| AD-01: Remote Access reports failure after committing     | Return committed settings with a distinct audit warning and display it in the interface.                                                                                              |
+| AD-02: updater polls overwrite newer actions              | Coalesce reads and invalidate older responses when an action starts.                                                                                                                  |
+| AD-03: an old audit failure blocks shutdown               | Drain audit writes separately from required server/access persistence and always run final telemetry cleanup.                                                                         |
+| UI-01: Players polling starves slower reads               | Coalesce polling while preserving workspace guards and invalidate pre-mutation reads after player changes.                                                                            |
+| UI-02: Properties cannot refresh its file catalog         | Refresh the catalog even when empty, reconcile tabs and selected files, and preserve unsaved drafts on failed reads.                                                                  |
+| UI-03: a command response erases a newer draft            | Clear only the submitted draft when it has not been edited during the request; keep command and message drafts separate.                                                              |
+| DEP-01: Multer upload-abort advisory                      | Require Multer 2.4.0 and update the lockfile; test abort before filename assignment, eventual cleanup, and a successful retry.                                                        |
+
+Related improvements include explicit author-distribution denial handling, consistent refresh color and focus behavior, Properties tab keyboard navigation, Autoscroll toggle semantics, preserving drafts when browsing console history, coalescing concurrent Paper metadata refreshes, and compatible gzip level-6 backup compression. Legacy connection tests remain for compatibility; README now identifies the unified workspace smoke as the primary native transport check.
+
+## Validation and limits
+
+The final local Node run passed **1,430 tests**, with no failures and one existing Windows symlink-privilege skip. The normal test glob includes the new recovery, dependency, provider, and scheduling regressions. **85 targeted browser tests passed**, covering delayed reads, pending commands, update actions, configuration catalog changes, committed-settings warnings, and Launchpad cancellation/recovery/pagination. The production build and Windows unpacked packaging passed; Vite retains the existing large-chunk advisory. Additional TypeScript unused-symbol checks passed, and `pnpm audit --prod` reported no known vulnerabilities.
+
+The packaged desktop smoke passed, including file transfers, backup/restore, imports, relaunch persistence, tray behavior, normal quit, and simulated Windows-session shutdown. Native unified-workspace and menu smokes also passed with isolated profiles and loopback hosts.
+
+The `dev` workflow runs the complete backend/browser suites, packages Windows executables, verifies native behavior, and publishes only a successful current development build. See the associated commit's Actions run for complete browser and published-artifact results.
+
+CurseForge's disposable catalog/identity disk cache is excluded and legacy entries are purged. Installation receipts and transient metadata remain, so approval and permitted key deployment/retention still require external confirmation. No application was submitted, no developer key is bundled, and fixtures do not establish authorized live CDN access or provider approval. Installation cancellation remains unavailable once mutation begins; Versions and creation-wizard cancellation require their own safe host-side contract before adding controls.
+
+Further FTB catalog hydration optimization must preserve global sorting and compatibility filtering. Optional compression modes/Zstd and removal of legacy compatibility controllers remain separate design changes; this update keeps gzip compatibility and the existing migration coverage.
+
+Physical WAN/ACME behavior, installed Windows updater/reboot behavior, physical disk failure, and production-scale worlds remain outside these fixture results. Ambiguous recovery deliberately preserves bytes for inspection rather than guessing which external changes to discard.

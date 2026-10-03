@@ -382,14 +382,14 @@ test("backup job progress describes the compressed archive and completed files r
   const backup = backups[0];
   assert.equal(completed.backupId, backup.id);
   assert.equal(backup.compression, "gzip");
-  assert.equal(backup.compressionLevel, 9);
+  assert.equal(backup.compressionLevel, 6);
   assert.equal(backup.originalSize, content.length);
   assert.equal(completed.compressedBytes, backup.size);
   assert.ok(backup.size < content.length / 20);
   const archive = path.join(panel.dataDir, "backups", `${backup.id}.tar.gz`);
   const bytes = await fs.readFile(archive);
   assert.deepEqual([...bytes.subarray(0, 2)], [0x1f, 0x8b]);
-  assert.equal(bytes[8], 2);
+  assert.equal(bytes[8], 0);
   const download = await fetch(
     `${panel.base}/api/backups/${backup.id}/download`,
   );

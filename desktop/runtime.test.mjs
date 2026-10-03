@@ -628,6 +628,67 @@ test("desktop startup requires an explicit absolute data directory", async () =>
   );
 });
 
+test("a historical audit failure does not poison quit or downloaded-update shutdown", async (t) => {
+  const { launch, dataDir } = await fixture(t);
+  const commands = [];
+  const child = new EventEmitter();
+  child.stdout = new PassThrough();
+  child.stderr = new PassThrough();
+  child.kill = () => assert.fail("Update shutdown must stop Java gracefully");
+  child.stdin = new Writable({
+    write(chunk, _encoding, callback) {
+      commands.push(chunk.toString().trim());
+      if (chunk.toString().trim() === "stop")
+        setImmediate(() => child.emit("close", 0));
+      callback();
+    },
+  });
+  const runtime = await launch({
+    spawnServer: () => {
+      setImmediate(() =>
+        child.stdout.write(
+          '[Server thread/INFO]: Done (1s)! For help, type "help"\n',
+        ),
+      );
+      return child;
+    },
+  });
+  const server = await addServer(runtime, { mode: "live" });
+  const serverDir = runtime.fleet.runtimes.get(server.id).serverDir;
+  await fs.writeFile(path.join(serverDir, "server.jar"), "never executed");
+  await fs.writeFile(path.join(serverDir, "eula.txt"), "eula=true\n");
+  const started = await runtime.request("/api/server/power", {
+    ...json("POST", { action: "start" }),
+    headers: { "X-Server-Id": server.id },
+  });
+  assert.equal(started.status, 200);
+  const auditPath = path.join(dataDir, "panel-audit.json");
+  const rename = fs.rename;
+  let failed = false;
+  t.mock.method(console, "error", () => {});
+  t.mock.method(fs, "rename", async (from, to) => {
+    if (!failed && to === auditPath) {
+      failed = true;
+      throw Object.assign(new Error("Fixture audit storage unavailable"), {
+        code: "EIO",
+      });
+    }
+    return rename(from, to);
+  });
+  const response = await runtime.request(
+    "/api/access/settings",
+    json("PUT", { enabled: false, transport: "direct", port: 3322 }),
+  );
+  assert.equal(response.status, 200);
+  assert.match((await response.json()).warning, /audit history/);
+  assert.equal(failed, true);
+  // This is the graceful close used before installing a downloaded update.
+  await assert.doesNotReject(runtime.close({ gracefulOnly: true }));
+  await assert.doesNotReject(runtime.close());
+  assert.deepEqual(commands, ["stop"]);
+  await assert.rejects(fetch(runtime.url + "/api/server"));
+});
+
 test("desktop shutdown aborts an unfinished upload without hanging or publishing partial server files", async (t) => {
   const { launch } = await fixture(t);
   const runtime = await launch();

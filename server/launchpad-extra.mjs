@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
+import { AsyncLocalStorage } from "node:async_hooks";
 import {
   checkedProviderUrl,
   createDownloadDeadline,
@@ -8,6 +9,7 @@ import {
   providerJson,
   strongestHash,
   USER_AGENT,
+  curseforgeDownloadHosts,
 } from "./launchpad-network.mjs";
 import { safeInstallPath } from "./launchpad-archives.mjs";
 
@@ -157,19 +159,38 @@ async function pooled(values, fn, concurrency = 5) {
 
 // Extra platforms use only these explicit HTTPS hosts. Redirect destinations are
 // checked before fetching, and catalog bodies and pinning downloads are bounded.
-export function createExtraProviders({ fetch: request = fetch, json } = {}) {
+export function createExtraProviders({
+  fetch: request = fetch,
+  json,
+  key,
+} = {}) {
   const cache = new Map();
+  const requests = new AsyncLocalStorage();
   async function response(url, hosts, method = "GET", callerSignal) {
     let address = checkedProviderUrl(url, hosts);
-    const signal = callerSignal ?? AbortSignal.timeout(60000);
+    const authenticatedCdn = curseforgeDownloadHosts.includes(
+      new URL(address).hostname,
+    );
+    const secret = authenticatedCdn && key ? await key() : null;
+    if (authenticatedCdn && key && !secret)
+      throw error(
+        400,
+        "Add a CurseForge API key in Launchpad settings before downloading this file.",
+      );
+    const signal =
+      callerSignal ?? requests.getStore()?.signal ?? AbortSignal.timeout(60000);
     for (let redirects = 0; redirects <= 4; redirects++) {
+      signal.throwIfAborted();
       let reply;
       try {
         reply = await request(address, {
           method,
           redirect: "manual",
           signal,
-          headers: { "User-Agent": USER_AGENT },
+          headers: {
+            "User-Agent": USER_AGENT,
+            ...(secret ? { "x-api-key": secret } : {}),
+          },
         });
       } catch {
         if (signal.aborted)
@@ -187,6 +208,14 @@ export function createExtraProviders({ fetch: request = fetch, json } = {}) {
           new URL(reply.headers.get("location") || "", address).href,
           hosts,
         );
+        if (
+          secret &&
+          !curseforgeDownloadHosts.includes(new URL(address).hostname)
+        )
+          throw error(
+            502,
+            "The provider redirected an authenticated request to a different service.",
+          );
         continue;
       }
       if (!reply.ok) {
@@ -203,7 +232,7 @@ export function createExtraProviders({ fetch: request = fetch, json } = {}) {
     throw error(502, "The platform redirected this download too many times.");
   }
   async function read(url, hosts) {
-    const deadline = createDownloadDeadline();
+    const deadline = createDownloadDeadline(requests.getStore()?.signal);
     try {
       const { reply } = await response(url, hosts, "GET", deadline.signal);
       const chunks = [];
@@ -228,26 +257,74 @@ export function createExtraProviders({ fetch: request = fetch, json } = {}) {
     }
   }
   function remember(key, load, duration = 5 * 60 * 1000) {
+    const input = requests.getStore() ?? {};
+    input.signal?.throwIfAborted();
     const existing = cache.get(key);
-    if (existing?.until > Date.now()) {
+    if (existing?.until > Date.now() && !existing.pending && !input.refresh) {
       cache.delete(key);
       cache.set(key, existing);
       return existing.value;
     }
-    cache.delete(key);
-    const value = Promise.resolve()
-      .then(load)
-      .catch((cause) => {
-        if (cache.get(key)?.value === value) cache.delete(key);
-        throw cause;
-      });
-    cache.set(key, { until: Date.now() + duration, value });
+    let entry =
+      existing?.pending && !existing.controller.signal.aborted
+        ? existing
+        : null;
+    if (!entry) {
+      const controller = new AbortController();
+      entry = {
+        pending: true,
+        controller,
+        subscribers: 0,
+        until: Date.now() + duration,
+      };
+      entry.value = Promise.resolve()
+        .then(() => {
+          controller.signal.throwIfAborted();
+          return requests.run({ ...input, signal: controller.signal }, load);
+        })
+        .then((value) => {
+          controller.signal.throwIfAborted();
+          entry.pending = false;
+          return value;
+        })
+        .catch((cause) => {
+          if (cache.get(key) === entry) cache.delete(key);
+          throw cause;
+        });
+      cache.set(key, entry);
+    }
     while (cache.size > 1000) cache.delete(cache.keys().next().value);
-    return value;
+    entry.subscribers++;
+    return new Promise((resolve, reject) => {
+      let done = false;
+      const finish = (callback, value) => {
+        if (done) return;
+        done = true;
+        input.signal?.removeEventListener("abort", abort);
+        entry.subscribers--;
+        if (!entry.subscribers && entry.pending)
+          entry.controller.abort(
+            new DOMException("Catalog request cancelled.", "AbortError"),
+          );
+        callback(value);
+      };
+      const abort = () => finish(reject, input.signal.reason);
+      input.signal?.addEventListener("abort", abort, { once: true });
+      entry.value.then(
+        (value) => finish(resolve, value),
+        (cause) => finish(reject, cause),
+      );
+      if (input.signal?.aborted) abort();
+    });
   }
   const apiJson = (url) =>
     remember(url, () =>
-      json ? json(url) : providerJson(url, { fetch: request }),
+      json
+        ? json(url, { signal: requests.getStore()?.signal })
+        : providerJson(url, {
+            fetch: request,
+            signal: requests.getStore()?.signal,
+          }),
     );
   const cdnJson = (url) =>
     remember(url, async () => {
@@ -560,7 +637,7 @@ export function createExtraProviders({ fetch: request = fetch, json } = {}) {
           )?.version,
         },
         warnings: [
-          `Requires ${input.loader} ${manifest.targets?.find((target) => target.type === "modloader")?.version ?? ""}. Install the matching runtime in Versions before starting.`,
+          `The matching ${input.loader} runtime is prepared with this modpack installation.`,
           ...(skipped
             ? [`Skipped ${skipped} client-only or optional files.`]
             : []),
@@ -792,7 +869,7 @@ export function createExtraProviders({ fetch: request = fetch, json } = {}) {
             manifest.loader?.version ?? manifest.loader?.metadata?.loader,
         },
         warnings: [
-          `Requires ${input.loader} ${manifest.loader?.version ?? manifest.loader?.metadata?.loader ?? ""}. Set up the matching runtime in Versions before starting.`,
+          `The matching ${input.loader} runtime is prepared with this modpack installation.`,
           ...(pinned ? [pinWarning] : []),
           ...(manifest.mods.length > mods.length
             ? [
@@ -1183,5 +1260,27 @@ export function createExtraProviders({ fetch: request = fetch, json } = {}) {
       };
     },
   };
-  return [spigot, ftb, at, voids];
+  return [spigot, ftb, at, voids].map((provider) => {
+    for (const method of [
+      "search",
+      "versions",
+      "resolve",
+      "installedVersion",
+    ]) {
+      if (!provider[method]) continue;
+      const work = provider[method];
+      provider[method] = async (input) =>
+        requests.run(
+          {
+            signal: input.signal,
+            refresh: input.refresh === true || input.refresh === "true",
+          },
+          () => {
+            input.signal?.throwIfAborted();
+            return work(input);
+          },
+        );
+    }
+    return provider;
+  });
 }

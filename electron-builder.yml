@@ -34,6 +34,8 @@ files:
   - server/file-search.mjs
   - server/backup-archive.mjs
   - server/backup-restore.mjs
+  - server/backup-journal.mjs
+  - server/backup-creation-recovery.mjs
   - server/player-history.mjs
   - server/offline-players.mjs
   - server/minecraft.mjs
@@ -44,6 +46,7 @@ files:
   - server/text-encoding.mjs
   - server/versions.mjs
   - server/launchpad.mjs
+  - server/launchpad-transaction.mjs
   - server/launchpad-network.mjs
   - server/launchpad-recovery.mjs
   - server/launchpad-identification.mjs

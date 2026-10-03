@@ -102,6 +102,10 @@ type Job = {
   total: number;
   error?: string;
   retryable?: boolean;
+  cancellable?: boolean;
+  cancelled?: boolean;
+  recoveryRequired?: boolean;
+  retainedRecoveryPath?: string;
   retryInput?: {
     planId: string;
     confirmed: true;
@@ -471,6 +475,7 @@ export default function Launchpad({
   const [scanRefreshing, setScanRefreshing] = useState(false);
   const [scanError, setScanError] = useState("");
   const [reload, setReload] = useState(0);
+  const catalogRefresh = useRef(false);
   const scanEpoch = useRef(0);
   const forceScan = useRef<{ api: typeof api; token: number } | null>(null);
   const refreshSequence = useRef(0);
@@ -478,6 +483,7 @@ export default function Launchpad({
   const manualCompletion = useRef<((success: boolean) => void) | null>(null);
   const [pendingPaths, setPendingPaths] = useState<Set<string>>(new Set());
   const reloadContent = useCallback(() => {
+    catalogRefresh.current = true;
     setReload((value) => value + 1);
   }, []);
   const [selection, setSelection] = useState<Selection | null>(null);
@@ -503,6 +509,9 @@ export default function Launchpad({
   const [job, setJob] = useState<Job | null>(null);
   const [jobError, setJobError] = useState("");
   const [jobReload, setJobReload] = useState(0);
+  const [jobAction, setJobAction] = useState(false);
+  const jobActionPending = useRef(false);
+  const jobEpoch = useRef(0);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [apiKey, setApiKey] = useState("");
   const [settingsError, setSettingsError] = useState("");
@@ -528,7 +537,8 @@ export default function Launchpad({
       item.projectId &&
       !pendingPaths.has(item.path),
   );
-  const canInstall = allowChanges && status === "offline" && !working;
+  const canRecover = allowChanges && status === "offline" && !working;
+  const canInstall = canRecover && !job?.recoveryRequired;
   const contentName =
     type === "plugin" ? "plugin" : type === "datapack" ? "datapack" : "mod";
   const minecraftVersions = [
@@ -620,6 +630,7 @@ export default function Launchpad({
   );
 
   const refreshInstalled = useCallback(async () => {
+    catalogRefresh.current = true;
     const currentSession = session.current;
     manualCompletion.current?.(false);
     setManualRefreshing(true);
@@ -671,6 +682,9 @@ export default function Launchpad({
 
   useEffect(() => {
     session.current++;
+    jobActionPending.current = false;
+    jobEpoch.current++;
+    setJobAction(false);
     setViewReady(null);
     setConfig(null);
     setResults(null);
@@ -784,13 +798,16 @@ export default function Launchpad({
     setSearchLoading(true);
     setSearchError("");
     const timer = window.setTimeout(() => {
+      const refresh = catalogRefresh.current;
+      catalogRefresh.current = false;
       void api<SearchResult>(
-        `/launchpad/search?${queryString({ platform, type, query: query.trim(), gameVersion: gameVersion.trim(), loader, sort: catalogSort, offset, limit })}`,
+        `/launchpad/search?${queryString({ platform, type, query: query.trim(), gameVersion: gameVersion.trim(), loader, sort: catalogSort, offset, limit, ...(refresh ? { refresh: "true" } : {}) })}`,
         { signal: controller.signal },
       )
         .then((next) => {
           if (controller.signal.aborted) return;
-          if (offset > 0 && offset >= next.total)
+          if (next.offset !== offset) setOffset(next.offset);
+          else if (offset > 0 && offset >= next.total)
             setOffset(Math.max(0, Math.ceil(next.total / limit) - 1) * limit);
           else setResults(next);
         })
@@ -1082,12 +1099,21 @@ export default function Launchpad({
     const controller = new AbortController();
     let timer: number;
     const poll = async () => {
+      if (jobActionPending.current) {
+        timer = window.setTimeout(poll, 1000);
+        return;
+      }
+      const epoch = jobEpoch.current;
       try {
         const next = await api<{ job: Job }>(
           `/launchpad/jobs/${encodeURIComponent(job.id)}`,
           { signal: controller.signal },
         );
         if (controller.signal.aborted) return;
+        if (epoch !== jobEpoch.current) {
+          timer = window.setTimeout(poll, 1000);
+          return;
+        }
         setJob(next.job);
         setJobError("");
         if (next.job.status === "completed") {
@@ -1101,7 +1127,7 @@ export default function Launchpad({
         if (["queued", "running"].includes(next.job.status))
           timer = window.setTimeout(poll, 1000);
       } catch (cause) {
-        if (!controller.signal.aborted) {
+        if (!controller.signal.aborted && epoch === jobEpoch.current) {
           if ((cause as { status?: number }).status === 404) {
             setJob(null);
             setJobError(
@@ -1121,6 +1147,41 @@ export default function Launchpad({
       window.clearTimeout(timer);
     };
   }, [api, job?.id, job?.status, jobReload, notify, reconcileJob]);
+
+  async function actOnJob(action: "cancel" | "recover") {
+    if (
+      !job ||
+      !allowChanges ||
+      (action === "recover" && !canRecover) ||
+      jobActionPending.current
+    )
+      return;
+    const currentSession = session.current;
+    const id = job.id;
+    jobActionPending.current = true;
+    jobEpoch.current++;
+    setJobAction(true);
+    try {
+      const result = await post<{ job?: Job }>(
+        action === "cancel"
+          ? `/launchpad/jobs/${encodeURIComponent(id)}/cancel`
+          : "/launchpad/recovery/resolve",
+      );
+      if (session.current === currentSession && result.job)
+        setJob((current) =>
+          current?.id === id && result.job?.id === id ? result.job : current,
+        );
+    } catch (cause) {
+      if (session.current === currentSession) notify(messageOf(cause), true);
+    } finally {
+      if (session.current === currentSession) {
+        jobActionPending.current = false;
+        jobEpoch.current++;
+        setJobAction(false);
+        setJobReload((value) => value + 1);
+      }
+    }
+  }
 
   function chooseProject(project: Project, entry?: InstalledItem) {
     if (!allowChanges) return;
@@ -1957,9 +2018,14 @@ export default function Launchpad({
                   ? "Installing server content"
                   : job.status === "completed"
                     ? "Installation completed"
-                    : "Installation failed"}
+                    : job.cancelled
+                      ? "Installation cancelled"
+                      : "Installation failed"}
               </strong>
               <p>{job.error || job.message}</p>
+              {job.retainedRecoveryPath && (
+                <p>Recovery copies: {job.retainedRecoveryPath}</p>
+              )}
               {job.status === "completed" &&
                 Boolean(job.recoveryEntries?.length) &&
                 (permissions === undefined ||
@@ -1978,7 +2044,26 @@ export default function Launchpad({
                 Retry download
               </button>
             )}
+            {working && job.cancellable && allowChanges && (
+              <button
+                className="btn"
+                disabled={jobAction}
+                onClick={() => void actOnJob("cancel")}
+              >
+                Cancel installation
+              </button>
+            )}
+            {job.recoveryRequired && canRecover && (
+              <button
+                className="btn"
+                disabled={jobAction}
+                onClick={() => void actOnJob("recover")}
+              >
+                Retry recovery
+              </button>
+            )}
             {!working &&
+              !job.recoveryRequired &&
               (permissions === undefined ||
                 permissions.includes("file.update")) && (
                 <button

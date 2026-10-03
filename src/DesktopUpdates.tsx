@@ -42,6 +42,8 @@ function LocalUpdates({ standalone = false }: { standalone?: boolean }) {
   const [error, setError] = useState("");
   const [loadError, setLoadError] = useState("");
   const dialog = useRef<HTMLDialogElement>(null);
+  const revision = useRef(0);
+  const actionPending = useRef(false);
   const close = () => {
     if (standalone) window.mcPanelUpdates?.close();
     else {
@@ -53,10 +55,14 @@ function LocalUpdates({ standalone = false }: { standalone?: boolean }) {
   };
   useEffect(() => {
     let active = true;
-    const refresh = () =>
-      api<UpdateState>("/desktop/updates")
+    let inFlight = false;
+    const refresh = () => {
+      if (inFlight || actionPending.current) return;
+      inFlight = true;
+      const current = revision.current;
+      void api<UpdateState>("/desktop/updates")
         .then((next) => {
-          if (!active) return;
+          if (!active || current !== revision.current) return;
           if (next.desktop) {
             setState(next);
             setLoadError("");
@@ -64,13 +70,17 @@ function LocalUpdates({ standalone = false }: { standalone?: boolean }) {
             setLoadError("App updates are only available in MC Panel desktop.");
         })
         .catch((cause) => {
-          if (active && (standalone || open))
+          if (active && current === revision.current && (standalone || open))
             setLoadError(
               cause instanceof Error
                 ? cause.message
                 : "Unable to contact the updater.",
             );
+        })
+        .finally(() => {
+          inFlight = false;
         });
+    };
     const showUpdates = () => {
       setOpen(true);
     };
@@ -79,6 +89,7 @@ function LocalUpdates({ standalone = false }: { standalone?: boolean }) {
     const timer = open ? setInterval(refresh, 1000) : undefined;
     return () => {
       active = false;
+      ++revision.current;
       clearInterval(timer);
       window.removeEventListener("mc-panel-updates-open", showUpdates);
     };
@@ -89,6 +100,9 @@ function LocalUpdates({ standalone = false }: { standalone?: boolean }) {
   }, [open, state !== null]);
 
   async function action(name: "check" | "download" | "install") {
+    if (actionPending.current) return;
+    actionPending.current = true;
+    const current = ++revision.current;
     setBusy(true);
     setError("");
     try {
@@ -107,14 +121,20 @@ function LocalUpdates({ standalone = false }: { standalone?: boolean }) {
           clearTimeout(timer);
         }
       }
-      setState(await post<UpdateState>(`/desktop/updates/${name}`));
+      const next = await post<UpdateState>(`/desktop/updates/${name}`);
+      if (current === revision.current) {
+        setState(next);
+        setLoadError("");
+      }
     } catch (cause) {
-      setError(
-        cause instanceof Error
-          ? cause.message
-          : "Unable to contact the updater.",
-      );
+      if (current === revision.current)
+        setError(
+          cause instanceof Error
+            ? cause.message
+            : "Unable to contact the updater.",
+        );
     } finally {
+      actionPending.current = false;
       setBusy(false);
     }
   }

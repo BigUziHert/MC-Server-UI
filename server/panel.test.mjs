@@ -696,7 +696,7 @@ test("backup is a readable gzip tar containing uploaded files, and survives a re
   assert.equal(created.status, 201);
   assert.ok(created.body.size > 0);
   assert.equal(created.body.compression, "gzip");
-  assert.equal(created.body.compressionLevel, 9);
+  assert.equal(created.body.compressionLevel, 6);
   assert.equal(created.body.originalSize, Buffer.byteLength(content));
   assert.ok(created.body.size < created.body.originalSize / 20);
   const response = await fetch(
@@ -705,7 +705,7 @@ test("backup is a readable gzip tar containing uploaded files, and survives a re
   assert.equal(response.status, 200);
   const bytes = Buffer.from(await response.arrayBuffer());
   assert.deepEqual([...bytes.subarray(0, 2)], [0x1f, 0x8b]);
-  assert.equal(bytes[8], 2, "Gzip XFL must indicate maximum compression.");
+  assert.equal(bytes[8], 0, "Gzip XFL must indicate default compression.");
   assert.equal(bytes.length, created.body.size);
   const unpackDir = path.join(dataDir, "verify");
   await fs.mkdir(unpackDir);
@@ -725,7 +725,7 @@ test("backup is a readable gzip tar containing uploaded files, and survives a re
   );
   assert.equal(state.backups[0].id, created.body.id);
   assert.equal(state.backups[0].compression, "gzip");
-  assert.equal(state.backups[0].compressionLevel, 9);
+  assert.equal(state.backups[0].compressionLevel, 6);
   assert.equal(state.backups[0].originalSize, Buffer.byteLength(content));
   assert.equal(
     (await request(`/api/backups/${created.body.id}`, { method: "DELETE" }))
@@ -1042,7 +1042,7 @@ test("scheduled live backups omit locked session files and preserve complete wor
   assert.equal(backups.length, 1);
   assert.equal(backups[0].trigger, "scheduled");
   assert.equal(backups[0].compression, "gzip");
-  assert.equal(backups[0].compressionLevel, 9);
+  assert.equal(backups[0].compressionLevel, 6);
   assert.equal(
     backups[0].originalSize,
     [...files.values()].reduce((total, content) => total + content.length, 0),

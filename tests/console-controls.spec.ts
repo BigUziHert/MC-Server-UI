@@ -4,7 +4,7 @@ import {
   removeTestServer,
   stopTestServer,
 } from "./server-fixtures";
-import { test as base, expect } from "@playwright/test";
+import { test as base, expect, type Route } from "@playwright/test";
 
 const test = base.extend<{ serverId: string }>({
   serverId: async ({ request }, use) => {
@@ -37,6 +37,72 @@ const test = base.extend<{ serverId: string }>({
     }
   },
 });
+
+for (const mode of ["command", "message"] as const) {
+  test(`slow console ${mode} success preserves the next draft and history restores it`, async ({
+    page,
+    serverId,
+  }) => {
+    let held: Route | undefined;
+    await page.route("**/api/console/command", (route) => {
+      held = route;
+    });
+    await page.addInitScript(
+      (id) => localStorage.setItem("mc-panel.active-server", id),
+      serverId,
+    );
+    await page.goto("/#console");
+    if (mode === "message")
+      await page.getByRole("switch", { name: "Server messaging" }).click();
+    const input = page.getByRole("textbox", {
+      name: mode === "message" ? "Server message" : "Server command",
+      exact: true,
+    });
+    const send = page.getByRole("button", {
+      name: mode === "message" ? "Send message" : "Send command",
+      exact: true,
+    });
+    await input.fill("First text");
+    await send.click();
+    await expect.poll(() => Boolean(held)).toBe(true);
+    expect(held!.request().postDataJSON().command).toBe(
+      mode === "message" ? "say First text" : "First text",
+    );
+    await input.fill("Next unsent draft");
+    await held!.fulfill({ json: { message: "Command sent" } });
+    await expect(send).toBeEnabled();
+    await expect(input).toHaveValue("Next unsent draft");
+    await input.press("ArrowUp");
+    await expect(input).toHaveValue("First text");
+    await input.press("ArrowDown");
+    await expect(input).toHaveValue("Next unsent draft");
+    held = undefined;
+    await send.click();
+    await expect.poll(() => Boolean(held)).toBe(true);
+    await input.fill("Changed while sending");
+    await input.fill("Next unsent draft");
+    await held!.fulfill({ json: { message: "Command sent" } });
+    await expect(send).toBeEnabled();
+    await expect(input).toHaveValue("Next unsent draft");
+    held = undefined;
+    await send.click();
+    await expect.poll(() => Boolean(held)).toBe(true);
+    await input.fill("Retain after error");
+    await held!.fulfill({
+      status: 503,
+      json: { error: "Console unavailable" },
+    });
+    await expect(send).toBeEnabled();
+    await expect(input).toHaveValue("Retain after error");
+    const autoscroll = page.getByRole("button", {
+      name: "Autoscroll",
+      exact: true,
+    });
+    await expect(autoscroll).toHaveAttribute("aria-pressed", "true");
+    await autoscroll.click();
+    await expect(autoscroll).toHaveAttribute("aria-pressed", "false");
+  });
+}
 
 test("cleared console lines stay hidden when the marker is absent and recover after a new log sequence", async ({
   page,

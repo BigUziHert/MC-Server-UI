@@ -6,6 +6,124 @@ import os from "node:os";
 import { createHash } from "node:crypto";
 import { downloadVerified, providerJson } from "./launchpad-network.mjs";
 
+test("CurseForge download credentials rotate at execution and only follow trusted CDN redirects", async (t) => {
+  const f = await downloadFixture(t, Buffer.from("fixture"));
+  f.file.url = "https://edge.forgecdn.net/files/example.jar";
+  const hosts = [
+    "edge.forgecdn.net",
+    "mediafilez.forgecdn.net",
+    "cdn.modrinth.com",
+  ];
+  let secret = "canary-first-key";
+  const requests = [];
+  const request = async (url, options) => {
+    requests.push({ url, key: new Headers(options.headers).get("x-api-key") });
+    return new URL(url).hostname === "edge.forgecdn.net"
+      ? new Response(null, {
+          status: 302,
+          headers: {
+            location: "https://mediafilez.forgecdn.net/files/example.jar",
+          },
+        })
+      : new Response("fixture");
+  };
+  await downloadVerified(f.file, f.target, hosts, request, {
+    curseforgeKey: async () => secret,
+  });
+  assert.deepEqual(
+    requests.map((entry) => entry.key),
+    [secret, secret],
+  );
+  await fs.unlink(f.target);
+  secret = "canary-rotated-key";
+  await downloadVerified(f.file, f.target, hosts, request, {
+    curseforgeKey: async () => secret,
+  });
+  assert.deepEqual(
+    requests.slice(2).map((entry) => entry.key),
+    [secret, secret],
+  );
+  await fs.unlink(f.target);
+  let calls = 0;
+  await assert.rejects(
+    downloadVerified(
+      f.file,
+      f.target,
+      hosts,
+      async () => {
+        calls++;
+        return new Response(null, {
+          status: 302,
+          headers: { location: "https://cdn.modrinth.com/unrelated.jar" },
+        });
+      },
+      { curseforgeKey: async () => secret },
+    ),
+    /different service/,
+  );
+  assert.equal(calls, 1);
+  await assert.rejects(
+    downloadVerified(f.file, f.target, hosts, request, {
+      curseforgeKey: async () => null,
+    }),
+    /Add a CurseForge API key/,
+  );
+  assert.equal(requests.length, 4);
+  for (const status of [401, 403]) {
+    await assert.rejects(
+      downloadVerified(
+        f.file,
+        f.target,
+        hosts,
+        async () => new Response(secret, { status }),
+        { curseforgeKey: async () => secret },
+      ),
+      (cause) =>
+        !cause.message.includes(secret) && /denied access/.test(cause.message),
+    );
+  }
+  f.file.url = "https://cdn.modrinth.com/unrelated.jar";
+  await downloadVerified(
+    f.file,
+    f.target,
+    hosts,
+    async (_url, options) => {
+      assert.equal(new Headers(options.headers).get("x-api-key"), null);
+      return new Response("fixture");
+    },
+    { curseforgeKey: async () => secret },
+  );
+});
+
+test("failed download never deletes a pre-existing target", async (t) => {
+  const f = await downloadFixture(t, Buffer.from("fixture"));
+  await fs.writeFile(f.target, "external file");
+  await assert.rejects(
+    downloadVerified(
+      f.file,
+      f.target,
+      f.hosts,
+      async () => new Response("fixture"),
+    ),
+    { code: "EEXIST" },
+  );
+  assert.equal(await fs.readFile(f.target, "utf8"), "external file");
+});
+
+test("Retry-After preserves long deadlines and HTTP dates", async () => {
+  for (const header of ["7200", new Date(Date.now() + 7200000).toUTCString()])
+    await assert.rejects(
+      providerJson("https://api.curseforge.com/v1/mods", {
+        fetch: async () =>
+          new Response(null, {
+            status: 429,
+            headers: { "Retry-After": header },
+          }),
+      }),
+      (cause) => cause.retryAfterMs >= 7198000,
+    );
+});
+
 test("provider errors preserve upstream status and retry-after for safe recovery", async () => {
   for (const status of [401, 403, 429, 503]) {
     await assert.rejects(

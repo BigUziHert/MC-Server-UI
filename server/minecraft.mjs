@@ -468,6 +468,7 @@ export async function createMinecraft(ctx) {
   const extras =
     ctx.extraProviders ??
     (await createExtraProviders({
+      key: async () => (await platformConfig.get()).curseforgeApiKey,
       json: (url, options) =>
         providerJson(url, { ...options, fetch: catalogFetch }),
       fetch: catalogFetch,
@@ -515,6 +516,11 @@ export async function createMinecraft(ctx) {
       : null;
   function install(input, requestId = null) {
     if (closing) throw fail(503, "Minecraft management is shutting down.");
+    if (launchpad.isRecoveryRequired())
+      throw fail(
+        409,
+        "Resolve the interrupted Launchpad installation before changing the server runtime.",
+      );
     if (input?.confirmed !== true)
       throw fail(400, "Review and confirm the selected server build first.");
     if (input.cleanInstall === true && input.updateRuntime === true)
@@ -823,6 +829,18 @@ export async function createMinecraft(ctx) {
       ),
     );
     app.post(
+      "/api/launchpad/jobs/:id/cancel",
+      endpoint(async (req, res) =>
+        res.json(await launchpad.cancelInstall(req.params.id)),
+      ),
+    );
+    app.post(
+      "/api/launchpad/recovery/resolve",
+      endpoint(async (_req, res) =>
+        res.json(await launchpad.resolveRecovery()),
+      ),
+    );
+    app.post(
       "/api/launchpad/jobs/:id/dismiss",
       endpoint(async (req, res) =>
         res.json(await launchpad.dismissJob(req.params.id)),
@@ -861,6 +879,7 @@ export async function createMinecraft(ctx) {
     );
   }
   return {
+    isRecoveryRequired: launchpad.isRecoveryRequired,
     duplicateCheck: launchpad.duplicateCheck,
     mount,
     async close() {

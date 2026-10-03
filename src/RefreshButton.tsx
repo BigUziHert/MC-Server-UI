@@ -22,6 +22,7 @@ export default function RefreshButton({
       type="button"
       className="btn icon"
       aria-label={label}
+      aria-busy={refreshing || pending}
       title={label}
       disabled={disabled || refreshing || pending}
       onClick={async () => {

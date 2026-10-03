@@ -71,7 +71,7 @@ test("large files stream with real progress and preserve portable archive conten
   const expectedBytes =
     60 * 1024 * 1024 + Buffer.byteLength("unicode path contents");
   assert.equal(metadata.originalSize, expectedBytes);
-  assert.equal(metadata.compressionLevel, 9);
+  assert.equal(metadata.compressionLevel, 6);
   const final = snapshots.at(-1);
   assert.equal(final.totalFiles, 5);
   assert.equal(final.processedFiles, 5);

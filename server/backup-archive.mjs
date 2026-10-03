@@ -2,7 +2,8 @@ import fs, { createWriteStream } from "node:fs";
 import io from "node:fs/promises";
 import path from "node:path";
 import { pipeline } from "node:stream/promises";
-import { constants, createGzip } from "node:zlib";
+import { once } from "node:events";
+import { createGzip } from "node:zlib";
 import { Header, Pax } from "tar";
 
 const chunkSize = 256 * 1024;
@@ -50,7 +51,7 @@ function* headers(relative, stat) {
 export async function createBackupArchive(
   serverDir,
   destination,
-  { signal, onProgress } = {},
+  { signal, onProgress, onOutputReady } = {},
 ) {
   const progress = {
     phase: "scanning",
@@ -197,17 +198,16 @@ export async function createBackupArchive(
       }
     }
     output = createWriteStream(destination, { flags: "wx" });
+    if (onOutputReady) {
+      await once(output, "open");
+      await onOutputReady(await call("fstat", output.fd));
+    }
     timer = setInterval(report, 100);
     timer.unref();
     try {
       // All readers use bounded chunks and close in finally. Node's pipeline
       // handles backpressure and aborts without draining the rest of a file.
-      await pipeline(
-        source,
-        createGzip({ level: constants.Z_BEST_COMPRESSION }),
-        output,
-        { signal },
-      );
+      await pipeline(source, createGzip({ level: 6 }), output, { signal });
     } finally {
       // Pipeline may reject while an asynchronous read is still completing.
       if (sourceStarted) await sourceFinished.promise;
@@ -216,7 +216,7 @@ export async function createBackupArchive(
     report(true);
     return {
       compression: "gzip",
-      compressionLevel: constants.Z_BEST_COMPRESSION,
+      compressionLevel: 6,
       originalSize: progress.processedBytes,
     };
   } catch (cause) {
@@ -242,5 +242,10 @@ export async function createBackupArchive(
     throw cause;
   } finally {
     clearInterval(timer);
+    if (output && !output.destroyed) {
+      const closed = once(output, "close").catch(() => {});
+      output.destroy();
+      await closed;
+    }
   }
 }

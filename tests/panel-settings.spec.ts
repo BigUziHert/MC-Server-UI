@@ -15,6 +15,7 @@ async function settingsFixture(
     startupReason?: string;
     missingAutoStartServerIds?: string[];
     servers?: typeof startupServers;
+    remoteWarning?: string;
   } = {},
 ) {
   let settings = {
@@ -96,7 +97,15 @@ async function settingsFixture(
           : "Remote access is disabled.",
       };
     }
-    return route.fulfill({ json: remote });
+    return route.fulfill({
+      json: {
+        ...remote,
+        warning:
+          route.request().method() === "PUT"
+            ? options.remoteWarning
+            : undefined,
+      },
+    });
   });
   return { writes, remoteWrites };
 }
@@ -107,6 +116,69 @@ async function openSettings(page: Page) {
     .click();
   return page.getByRole("dialog", { name: "Panel Settings", exact: true });
 }
+
+test("startup roster failures can retry without discarding settings edits", async ({
+  page,
+}) => {
+  await settingsFixture(page);
+  await page.goto("/");
+  await expect(page.locator(".server-title h2")).toHaveText("Survival world");
+  let fail = true;
+  await page.route("**/api/servers", (route) =>
+    route.fulfill(
+      fail
+        ? { status: 503, json: { error: "Startup roster unavailable" } }
+        : { json: { servers: startupServers, defaultServerId: "survival" } },
+    ),
+  );
+  const dialog = await openSettings(page);
+  await expect(dialog.getByRole("alert")).toContainText(
+    "Startup roster unavailable",
+  );
+  const tray = dialog.getByRole("switch", {
+    name: "Keep MC Panel in the system tray",
+    exact: true,
+  });
+  await tray.click();
+  await expect(tray).not.toBeChecked();
+  fail = false;
+  await dialog.getByRole("button", { name: "Try again", exact: true }).click();
+  await expect(dialog.getByRole("alert")).toHaveCount(0);
+  await expect(tray).not.toBeChecked();
+  await dialog
+    .getByRole("button", {
+      name: "Servers to start when the panel opens",
+      exact: true,
+    })
+    .click();
+  await expect(
+    dialog.getByRole("checkbox", { name: "Survival world", exact: true }),
+  ).toBeVisible();
+});
+
+test("Remote Access reports a committed save with an audit warning without retrying", async ({
+  page,
+}) => {
+  const warning =
+    "Remote access settings were saved, but their audit history could not be saved.";
+  const { remoteWrites } = await settingsFixture(page, {
+    remoteWarning: warning,
+  });
+  await page.goto("/");
+  const dialog = await openSettings(page);
+  await dialog.getByRole("tab", { name: "Remote Access", exact: true }).click();
+  const address = dialog.getByLabel("Public panel address", { exact: true });
+  await address.fill("https://saved.example.test");
+  await dialog
+    .getByRole("button", { name: "Save access settings", exact: true })
+    .click();
+  await expect(page.getByText(warning, { exact: true })).toBeVisible();
+  await expect(address).toHaveValue("https://saved.example.test");
+  expect(remoteWrites).toHaveLength(1);
+  await expect(
+    page.getByText("Remote access settings saved.", { exact: true }),
+  ).toHaveCount(0);
+});
 
 test("General settings save multiple automatic servers independently of sign-in and persist deselection", async ({
   page,

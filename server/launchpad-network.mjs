@@ -1,5 +1,12 @@
 import fs from "node:fs/promises";
 import { createHash } from "node:crypto";
+import path from "node:path";
+
+export const curseforgeDownloadHosts = [
+  "edge.forgecdn.net",
+  "mediafilez.forgecdn.net",
+  "media.forgecdn.net",
+];
 
 export const launchpadError = (status, message) =>
   Object.assign(new Error(message), { status });
@@ -39,15 +46,34 @@ export function checkedProviderUrl(value, hosts) {
 }
 async function responseFor(
   url,
-  { fetch: request = fetch, headers = {}, deadlineMs = 60000, ...options } = {},
+  {
+    fetch: request = fetch,
+    headers = {},
+    deadlineMs = 60000,
+    curseforgeKey,
+    ...options
+  } = {},
   hosts,
 ) {
   let address = checkedProviderUrl(url, hosts);
+  const authenticatedCdn = curseforgeDownloadHosts.includes(
+    new URL(address).hostname,
+  );
+  if (authenticatedCdn && curseforgeKey) {
+    const secret = await curseforgeKey();
+    if (!secret)
+      throw launchpadError(
+        400,
+        "Add a CurseForge API key in Launchpad settings before downloading this file.",
+      );
+    headers = { ...headers, "x-api-key": secret };
+  }
   const deadline = AbortSignal.timeout(deadlineMs);
   const signal = options.signal
     ? AbortSignal.any([options.signal, deadline])
     : deadline;
   for (let redirects = 0; redirects <= 4; redirects++) {
+    signal.throwIfAborted();
     const response = await request(address, {
       ...options,
       redirect: "manual",
@@ -64,7 +90,11 @@ async function responseFor(
         Object.keys(headers).some((name) =>
           /^(?:x-api-key|authorization)$/i.test(name),
         ) &&
-        new URL(redirected).origin !== new URL(address).origin
+        new URL(redirected).origin !== new URL(address).origin &&
+        !(
+          authenticatedCdn &&
+          curseforgeDownloadHosts.includes(new URL(redirected).hostname)
+        )
       )
         throw launchpadError(
           502,
@@ -97,7 +127,7 @@ async function responseFor(
           upstreamStatus: response.status,
           upstreamContentType: response.headers.get("content-type") || "",
           ...(Number.isFinite(retryAfterMs) && retryAfterMs >= 0
-            ? { retryAfterMs: Math.min(retryAfterMs, 3600000) }
+            ? { retryAfterMs }
             : {}),
         },
       );
@@ -192,7 +222,7 @@ export async function downloadVerified(
   target,
   hosts,
   request = fetch,
-  { signal } = {},
+  { signal, curseforgeKey } = {},
 ) {
   const [algorithm, expected] = strongestHash(file.hashes);
   const limit = file.archive === true ? 2 * 1024 ** 3 : 512 * 1024 ** 2;
@@ -208,6 +238,9 @@ export async function downloadVerified(
     );
   const deadline = createDownloadDeadline(signal);
   let handle;
+  let owned,
+    parentIdentity,
+    complete = false;
   let size = 0;
   try {
     deadline.signal.throwIfAborted();
@@ -217,11 +250,14 @@ export async function downloadVerified(
         fetch: request,
         signal: deadline.signal,
         deadlineMs: 30 * 60 * 1000,
+        curseforgeKey,
       },
       hosts,
     );
     try {
+      parentIdentity = await fs.realpath(path.dirname(target));
       handle = await fs.open(target, "wx");
+      owned = await handle.stat();
     } catch (cause) {
       await response.body?.cancel().catch(() => {});
       throw cause;
@@ -254,11 +290,30 @@ export async function downloadVerified(
         "Downloaded file failed its size or checksum check. No server files were changed.",
       );
     await handle.sync();
+    complete = true;
   } catch (cause) {
     throw deadline.reason(cause);
   } finally {
     deadline.close();
     await handle?.close();
+    if (owned && !complete) {
+      // Remove only the file this attempt created, after closing its handle.
+      // EEXIST and externally replaced stages never authorize deleting a path.
+      try {
+        const current = await fs.lstat(target);
+        if (
+          current.isFile() &&
+          !current.isSymbolicLink() &&
+          current.ino === owned.ino &&
+          current.dev === owned.dev &&
+          current.birthtimeMs === owned.birthtimeMs &&
+          (await fs.realpath(path.dirname(target))) === parentIdentity
+        )
+          await fs.unlink(target);
+      } catch {
+        /* Preserve the original transfer failure. */
+      }
+    }
   }
   return size;
 }

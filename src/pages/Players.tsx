@@ -235,26 +235,44 @@ export default function Players({
   const whitelistDialog = useRef<HTMLDialogElement>(null);
   const usernameInput = useRef<HTMLInputElement>(null);
   const request = useRef(0);
+  const inFlight = useRef<Promise<boolean> | null>(null);
+  const readController = useRef<AbortController | null>(null);
   const session = useRef(0);
   const historyList = useRef<HTMLUListElement>(null);
 
   const refresh = useCallback(
-    async (silent = false) => {
+    (silent = false, afterMutation = false): Promise<boolean> => {
+      if (inFlight.current && !afterMutation) return inFlight.current;
       const currentRequest = ++request.current;
+      readController.current?.abort();
+      const controller = new AbortController();
+      readController.current = controller;
       if (!silent) setLoading(true);
-      try {
-        const response = await api<PlayersResponse>("/players");
-        if (currentRequest !== request.current) return false;
-        setData(response);
-        setError("");
-        return true;
-      } catch (e) {
-        if (currentRequest !== request.current) return false;
-        setError(e instanceof Error ? e.message : "Unable to load operators.");
-        return false;
-      } finally {
-        if (currentRequest === request.current) setLoading(false);
-      }
+      const pending = (async () => {
+        try {
+          const response = await api<PlayersResponse>("/players", {
+            signal: controller.signal,
+          });
+          if (currentRequest !== request.current) return false;
+          setData(response);
+          setError("");
+          return true;
+        } catch (e) {
+          if (currentRequest !== request.current) return false;
+          setError(
+            e instanceof Error ? e.message : "Unable to load operators.",
+          );
+          return false;
+        } finally {
+          if (currentRequest === request.current) {
+            setLoading(false);
+            inFlight.current = null;
+            readController.current = null;
+          }
+        }
+      })();
+      inFlight.current = pending;
+      return pending;
     },
     [api],
   );
@@ -276,6 +294,9 @@ export default function Players({
     return () => {
       window.clearInterval(interval);
       request.current += 1;
+      readController.current?.abort();
+      readController.current = null;
+      inFlight.current = null;
       session.current += 1;
     };
   }, [refresh]);
@@ -400,7 +421,7 @@ export default function Players({
       setResult(response);
       notify(response.message);
       setModerating(null);
-      await refresh(true);
+      await refresh(true, true);
     } catch (cause) {
       if (currentSession === session.current)
         setFormError(
@@ -481,7 +502,7 @@ export default function Players({
       setResult(response);
       notify(response.message);
       setWhitelistAction(null);
-      await refresh(true);
+      await refresh(true, true);
     } catch (cause) {
       if (currentSession === session.current)
         setFormError(
@@ -543,7 +564,7 @@ export default function Players({
       notify(response.message);
       setGranting(false);
       setRemoving(null);
-      await refresh(true);
+      await refresh(true, true);
     } catch (e) {
       if (currentSession !== session.current) return;
       setFormError(

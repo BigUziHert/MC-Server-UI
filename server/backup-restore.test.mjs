@@ -772,8 +772,8 @@ for (const cleanupWarning of [false, true]) {
     });
     assert.equal(backup.status, 201, JSON.stringify(backup));
     if (cleanupWarning) {
-      const remove = fs.rm.bind(fs);
-      t.mock.method(fs, "rm", async (target, options) => {
+      const remove = fs.rmdir.bind(fs);
+      t.mock.method(fs, "rmdir", async (target, options) => {
         if (path.basename(target).startsWith(".external-server-restore-"))
           throw Object.assign(new Error("Fixture cleanup busy"), {
             code: "EBUSY",
@@ -878,9 +878,9 @@ for (const replacementTime of ["before restore", "after promotion"]) {
     };
     if (replacementTime === "before restore") await substitute();
     else {
-      const remove = fs.rm.bind(fs);
+      const remove = fs.rmdir.bind(fs);
       let replaced = false;
-      t.mock.method(fs, "rm", async (target, options) => {
+      t.mock.method(fs, "rmdir", async (target, options) => {
         const result = await remove(target, options);
         if (
           !replaced &&

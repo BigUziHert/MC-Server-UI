@@ -73,6 +73,7 @@ export async function createServerSetup({ dataDir, safePath, ...options }) {
   const extraProviders =
     options.extraProviders ??
     (await createExtraProviders({
+      key: async () => (await platformConfig.get()).curseforgeApiKey,
       json: (url, init) => providerJson(url, { ...init, fetch: catalogFetch }),
       fetch: catalogFetch,
     }));

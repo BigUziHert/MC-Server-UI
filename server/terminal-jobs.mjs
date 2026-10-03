@@ -46,7 +46,8 @@ export async function terminalJobs(
     visible: (job = saved) =>
       !!job &&
       !job.dismissed &&
-      (!["completed", "failed"].includes(job.status) ||
+      (job.recoveryRequired ||
+        !["completed", "failed"].includes(job.status) ||
         Date.now() - Date.parse(job.finishedAt) < 600_000),
     async save(job) {
       saved = { ...job };

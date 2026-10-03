@@ -19,6 +19,7 @@
 }
 .players-online-banner > button {
   margin-left: auto;
+  color: var(--text);
 }
 .players-rosters {
   display: grid;

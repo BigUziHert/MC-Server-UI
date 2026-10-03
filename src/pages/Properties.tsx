@@ -50,7 +50,7 @@ export default function Properties({
     "load",
   );
   const debouncedSearch = useDebouncedValue(search);
-  const [catalogReload, setCatalogReload] = useState(0);
+  const [focusedTab, setFocusedTab] = useState("");
   const [pendingReload, setPendingReload] = useState(false);
   const [pending, setPending] = useState<string | null>(null);
   const [missingDraft, setMissingDraft] = useState(false);
@@ -106,7 +106,7 @@ export default function Properties({
     };
   }, [config, values, dirty, loading, drafts, draftKey]);
   const load = useCallback(
-    async (file: string, preserve = false) => {
+    async (file: string, preserve = false, discard = false) => {
       if (!canRead) return false;
       const id = ++request.current;
       setLoading(true);
@@ -122,6 +122,7 @@ export default function Properties({
         );
         if (id !== request.current) return false;
         setMissingDraft(false);
+        if (discard) drafts.delete(draftKey);
         const draft = drafts.get(draftKey);
         if (draft?.config.path === file) {
           setConfig(draft.config);
@@ -155,6 +156,7 @@ export default function Properties({
     ++request.current;
     setFiles([]);
     setSelected("");
+    setFocusedTab("");
     setConfig(null);
     setValues({});
     setSearch("");
@@ -204,7 +206,7 @@ export default function Properties({
       session.current++;
       request.current++;
     };
-  }, [api, load, catalogReload, canRead, drafts, draftKey]);
+  }, [api, load, canRead, drafts, draftKey]);
   useEffect(() => {
     if (pending || discardMissingDraft) dialog.current?.showModal();
     else dialog.current?.close();
@@ -218,7 +220,7 @@ export default function Properties({
     return () => window.removeEventListener("beforeunload", warn);
   }, [dirty]);
   const select = (file: string) => {
-    if (saving || loading) return;
+    if (saving || loading || file === selected) return;
     if (dirty) {
       setPendingReload(false);
       setPending(file);
@@ -229,14 +231,43 @@ export default function Properties({
     setSelected(file);
     void load(file);
   };
+  const reloadCatalog = async (discard = false) => {
+    const id = ++request.current;
+    setLoading(true);
+    setError("");
+    setErrorKind("load");
+    try {
+      const data = await api<{ files: { path: string; name: string }[] }>(
+        "/minecraft/properties",
+      );
+      if (id !== request.current) return false;
+      setFiles(data.files);
+      const target = data.files.some((file) => file.path === selected)
+        ? selected
+        : (data.files[0]?.path ?? "");
+      setSelected(target);
+      setFocusedTab(target);
+      if (target) return await load(target, target === selected, discard);
+      if (discard) drafts.delete(draftKey);
+      setMissingDraft(false);
+      setConfig(null);
+      setValues({});
+      return true;
+    } catch (cause) {
+      if (id === request.current) setError((cause as Error).message);
+      return false;
+    } finally {
+      if (id === request.current) setLoading(false);
+    }
+  };
   const reload = async () => {
-    if (loading || saving || !selected) return false;
+    if (loading || saving) return false;
     if (dirty) {
       setPendingReload(true);
       setPending(selected);
       return false;
     }
-    return load(selected, true);
+    return reloadCatalog();
   };
   async function save() {
     if (
@@ -328,9 +359,32 @@ export default function Properties({
           <button
             role="tab"
             aria-selected={selected === file.path}
+            tabIndex={(focusedTab || selected) === file.path ? 0 : -1}
             className={selected === file.path ? "selected" : ""}
             key={file.path}
             onClick={() => select(file.path)}
+            onFocus={() => setFocusedTab(file.path)}
+            onKeyDown={(event) => {
+              const tabs = Array.from(
+                event.currentTarget.parentElement!.querySelectorAll<HTMLButtonElement>(
+                  '[role="tab"]',
+                ),
+              );
+              const index = tabs.indexOf(event.currentTarget);
+              const next =
+                event.key === "ArrowRight"
+                  ? (index + 1) % tabs.length
+                  : event.key === "ArrowLeft"
+                    ? (index + tabs.length - 1) % tabs.length
+                    : event.key === "Home"
+                      ? 0
+                      : event.key === "End"
+                        ? tabs.length - 1
+                        : -1;
+              if (next < 0) return;
+              event.preventDefault();
+              tabs[next].focus();
+            }}
             disabled={saving || loading}
           >
             {file.name}
@@ -348,7 +402,7 @@ export default function Properties({
         <span>{filtered.length} properties</span>
         <RefreshButton
           label="Refresh properties"
-          disabled={loading || saving || !selected || missingDraft}
+          disabled={loading || saving || missingDraft}
           onRefresh={reload}
           notify={notify}
           successMessage="Properties refreshed."
@@ -393,8 +447,7 @@ export default function Properties({
           onRetry={() => {
             if (missingDraft) void load(selected, true);
             else if (errorKind === "save") void save();
-            else if (selected) void reload();
-            else setCatalogReload((v) => v + 1);
+            else void reload();
           }}
         />
       )}
@@ -583,11 +636,14 @@ export default function Properties({
               const target = pending;
               setPending(null);
               if (target) {
-                drafts.delete(draftKey);
                 setMissingDraft(false);
                 if (!pendingReload) setSearch("");
-                setSelected(target);
-                void load(target, pendingReload).then((ok) => {
+                if (!pendingReload) setSelected(target);
+                void (
+                  pendingReload
+                    ? reloadCatalog(true)
+                    : load(target, false, true)
+                ).then((ok) => {
                   if (ok && pendingReload) notify("Properties refreshed.");
                 });
               }

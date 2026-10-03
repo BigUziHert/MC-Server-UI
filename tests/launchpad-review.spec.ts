@@ -50,7 +50,11 @@ const installed = (id: string, platform = "modrinth") => ({
   updateCheck: "checked",
   url: `https://modrinth.com/project/${id}`,
 });
-async function catalog(page: Page, type = "mod") {
+async function catalog(
+  page: Page,
+  type = "mod",
+  job?: Record<string, unknown>,
+) {
   await page.route(/\/api\/launchpad(?:\?.*)?$/, (route) =>
     route.fulfill({
       json: {
@@ -65,6 +69,7 @@ async function catalog(page: Page, type = "mod") {
         loader: "neoforge",
         gameVersions: ["1.21.1"],
         warnings: [],
+        job,
       },
     }),
   );
@@ -97,6 +102,196 @@ const plan = {
   files: [{ path: "mods/a.jar", size: 100, action: "replace" }],
   warnings: [],
 };
+
+test("accepted installation cancellation waits for the action and ignores an older cancellable poll", async ({
+  page,
+}) => {
+  const job = {
+    id: "cancellable-job",
+    status: "running",
+    message: "Downloading reviewed files",
+    completed: 0,
+    total: 2,
+    cancellable: true,
+  };
+  await catalog(page, "mod", job);
+  let heldPoll: Route | undefined;
+  let heldCancel: Route | undefined;
+  let polls = 0;
+  let cancels = 0;
+  let cancelled = false;
+  await page.route("**/api/launchpad/jobs/cancellable-job", (route) => {
+    if (++polls === 1) {
+      heldPoll = route;
+      return;
+    }
+    return route.fulfill({
+      json: {
+        job: cancelled
+          ? {
+              ...job,
+              status: "failed",
+              cancellable: false,
+              cancelled: true,
+              message: "Installation cancelled. No server files were changed.",
+            }
+          : job,
+      },
+    });
+  });
+  await page.route("**/api/launchpad/jobs/cancellable-job/cancel", (route) => {
+    cancels++;
+    heldCancel = route;
+  });
+  await page.goto("/#launchpad");
+  const cancel = page.getByRole("button", {
+    name: "Cancel installation",
+    exact: true,
+  });
+  await expect.poll(() => Boolean(heldPoll)).toBe(true);
+  await cancel.click();
+  await expect.poll(() => Boolean(heldCancel)).toBe(true);
+  await expect(cancel).toBeDisabled();
+  await heldPoll!.fulfill({ json: { job } });
+  await expect(cancel).toBeDisabled();
+  expect(cancels).toBe(1);
+  cancelled = true;
+  await heldCancel!.fulfill({ json: { job: { ...job, cancellable: false } } });
+  await expect(
+    page.getByRole("status", { name: "Installation status", exact: true }),
+  ).toContainText("Installation cancelled. No server files were changed.");
+  await expect(page.locator(".launchpad-job strong")).toHaveText(
+    "Installation cancelled",
+  );
+  await expect(cancel).toHaveCount(0);
+  expect(cancels).toBe(1);
+});
+
+test("interrupted installation recovery stays visible through a failed retry and releases controls after recovery", async ({
+  page,
+}) => {
+  const job = {
+    id: "interrupted-job",
+    status: "failed",
+    message: "Interrupted installation needs recovery.",
+    completed: 0,
+    total: 1,
+    recoveryRequired: true,
+    retainedRecoveryPath: "private/launchpad/recovery",
+  };
+  await catalog(page, "mod", job);
+  const retries: Route[] = [];
+  await page.route("**/api/launchpad/recovery/resolve", (route) => {
+    retries.push(route);
+  });
+  await page.goto("/#launchpad");
+  const status = page.getByRole("status", {
+    name: "Installation status",
+    exact: true,
+  });
+  const retry = page.getByRole("button", {
+    name: "Retry recovery",
+    exact: true,
+  });
+  const dismiss = page.getByRole("button", {
+    name: "Dismiss installation status",
+    exact: true,
+  });
+  await expect(status).toContainText(
+    "Recovery copies: private/launchpad/recovery",
+  );
+  await expect(dismiss).toHaveCount(0);
+  await retry.click();
+  await expect.poll(() => retries.length).toBe(1);
+  await expect(retry).toBeDisabled();
+  await retries[0].fulfill({
+    status: 503,
+    json: { error: "Recovery storage unavailable" },
+  });
+  await expect(page.getByRole("alert")).toContainText(
+    "Recovery storage unavailable",
+  );
+  await expect(retry).toBeEnabled();
+  await expect(dismiss).toHaveCount(0);
+  await retry.click();
+  await expect.poll(() => retries.length).toBe(2);
+  await retries[1].fulfill({
+    json: {
+      ok: true,
+      job: {
+        ...job,
+        recoveryRequired: false,
+        retainedRecoveryPath: undefined,
+        message: "Previous server files were restored.",
+      },
+    },
+  });
+  await expect(status).toContainText("Previous server files were restored.");
+  await expect(retry).toHaveCount(0);
+  await expect(dismiss).toBeVisible();
+});
+
+test("catalog pagination follows the provider canonical offset and explicit refresh requests fresh metadata", async ({
+  page,
+}) => {
+  await catalog(page);
+  const searches: URL[] = [];
+  let clamped = false;
+  await page.route("**/api/launchpad/search?**", (route) => {
+    const url = new URL(route.request().url());
+    searches.push(url);
+    if (Number(url.searchParams.get("offset")) > 0) clamped = true;
+    return route.fulfill({
+      json: {
+        projects: [
+          {
+            id: "Canonical",
+            title: "Canonical",
+            platform: "modrinth",
+            description: "Current provider page",
+          },
+        ],
+        total: clamped ? 1 : 21,
+        offset: 0,
+        limit: Number(url.searchParams.get("limit")),
+      },
+    });
+  });
+  await page.route("**/api/launchpad/installed?**", (route) =>
+    route.fulfill({ json: { items: [], warnings: [] } }),
+  );
+  await page.goto("/#launchpad");
+  const next = page.getByRole("button", {
+    name: "Next Launchpad page",
+    exact: true,
+  });
+  await expect(next).toBeEnabled();
+  await next.click();
+  await expect
+    .poll(() => searches.map((url) => Number(url.searchParams.get("offset"))))
+    .toEqual([0, 10, 0]);
+  await expect(
+    page.getByRole("status", { name: "Launchpad page", exact: true }),
+  ).toHaveText("Page 1 of 1");
+  await expect(next).toBeDisabled();
+  const beforeRefresh = searches.length;
+  await page
+    .getByRole("button", {
+      name: "Refresh Launchpad and check updates",
+      exact: true,
+    })
+    .click();
+  await expect
+    .poll(() =>
+      searches
+        .slice(beforeRefresh)
+        .some((url) => url.searchParams.get("refresh") === "true"),
+    )
+    .toBe(true);
+  await expect(
+    page.getByRole("article", { name: "Canonical", exact: true }),
+  ).toBeVisible();
+});
 
 test("220 installed files stay usable while provider checks run without rescanning on list controls", async ({
   page,

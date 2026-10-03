@@ -1837,9 +1837,12 @@ function ConsolePage({
   const [lines, setLines] = useState<LogLine[]>([]);
   const [inputMode, setInputMode] = useState<"command" | "message">("command");
   const [drafts, setDrafts] = useState({ command: "", message: "" });
+  const draftRevision = useRef({ command: 0, message: 0 });
   const command = drafts[inputMode];
-  const setCommand = (value: string) =>
+  const setCommand = (value: string) => {
+    draftRevision.current[inputMode]++;
     setDrafts((previous) => ({ ...previous, [inputMode]: value }));
+  };
   const [search, setSearch] = useState("");
   const query = useDebouncedValue(search);
   const [showSearch, setShowSearch] = useState(false);
@@ -1858,6 +1861,7 @@ function ConsolePage({
     message: [],
   });
   const historyIndex = useRef(-1);
+  const historyDraft = useRef("");
   const logRequest = useRef(0);
   const latestLogResponse = useRef(0);
   const loadLogs = useCallback(async () => {
@@ -1912,6 +1916,7 @@ function ConsolePage({
     e.preventDefault();
     if (!canConsole || !command.trim() || busy) return;
     const token = ++commandRequest.current;
+    const submittedRevision = draftRevision.current[inputMode];
     setCommandBusy(true);
     try {
       await post("/console/command", {
@@ -1921,7 +1926,12 @@ function ConsolePage({
       if (token !== commandRequest.current) return;
       commandHistory.current[inputMode].unshift(command);
       historyIndex.current = -1;
-      setCommand("");
+      setDrafts((current) =>
+        current[inputMode] === command &&
+        draftRevision.current[inputMode] === submittedRevision
+          ? { ...current, [inputMode]: "" }
+          : current,
+      );
       await loadLogs();
       if (token !== commandRequest.current) return;
       await refresh();
@@ -1962,7 +1972,7 @@ function ConsolePage({
     anchor.download = "server-console.log";
     anchor.click();
     URL.revokeObjectURL(url);
-    notify("Console log downloaded.");
+    notify("Console log download started.");
   }
   const isRunning = server?.status === "running";
   const unavailable = server?.metricsAvailable === false;
@@ -2333,6 +2343,7 @@ function ConsolePage({
                 />
                 <button
                   onClick={() => setAutoScroll((v) => !v)}
+                  aria-pressed={autoScroll}
                   className={autoScroll ? "autoscroll active" : "autoscroll"}
                 >
                   {autoScroll ? <Check size={12} /> : <ArrowDown size={12} />}
@@ -2361,10 +2372,16 @@ function ConsolePage({
                 maxLength={inputMode === "message" ? 2044 : 2048}
                 value={command}
                 disabled={!isRunning}
-                onChange={(e) => setCommand(e.target.value)}
+                onChange={(e) => {
+                  historyIndex.current = -1;
+                  setCommand(e.target.value);
+                }}
                 onKeyDown={(e) => {
                   if (e.key === "ArrowUp") {
                     e.preventDefault();
+                    if (!commandHistory.current[inputMode].length) return;
+                    if (historyIndex.current === -1)
+                      historyDraft.current = command;
                     historyIndex.current = Math.min(
                       historyIndex.current + 1,
                       commandHistory.current[inputMode].length - 1,
@@ -2376,13 +2393,17 @@ function ConsolePage({
                   }
                   if (e.key === "ArrowDown") {
                     e.preventDefault();
+                    if (historyIndex.current === -1) return;
                     historyIndex.current = Math.max(
                       -1,
                       historyIndex.current - 1,
                     );
                     setCommand(
-                      commandHistory.current[inputMode][historyIndex.current] ||
-                        "",
+                      historyIndex.current === -1
+                        ? historyDraft.current
+                        : commandHistory.current[inputMode][
+                            historyIndex.current
+                          ],
                     );
                   }
                 }}

@@ -2732,8 +2732,8 @@ test("metadata timeout cools down queued batches without hiding cached icons or 
   ]);
   assert.equal(
     requests.length,
-    2,
-    "only the first missing batch calls the stalled provider",
+    1,
+    "a pre-aborted metadata request never dispatches to the provider",
   );
   assert.deepEqual(
     timeouts,
@@ -2755,7 +2755,7 @@ test("metadata timeout cools down queued batches without hiding cached icons or 
     "new-during-cooldown",
     "cached",
   ]);
-  assert.equal(requests.length, 2);
+  assert.equal(requests.length, 1);
   assert.equal(
     duringCooldown.projects[0].iconUrl,
     "https://cdn.modrinth.com/cached.png",
@@ -2769,10 +2769,10 @@ test("metadata timeout cools down queued batches without hiding cached icons or 
   ]);
   assert.equal(
     requests.length,
-    3,
+    2,
     "queued fallbacks keep the original cooldown deadline",
   );
-  assert.deepEqual(requests[2], ["mod0", "new-during-cooldown"]);
+  assert.deepEqual(requests[1], ["mod0", "new-during-cooldown"]);
   assert.equal(recovered.projects.length, 3);
   assert.deepEqual(recovered.warnings, []);
   assert.equal(

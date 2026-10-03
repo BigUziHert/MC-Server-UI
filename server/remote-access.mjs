@@ -159,7 +159,9 @@ export function requiredPermissions(req) {
         "/api/launchpad/removal-preview",
         "/api/launchpad/remove",
         "/api/launchpad/install",
+        "/api/launchpad/recovery/resolve",
       ].includes(route) ||
+      /^\/api\/launchpad\/jobs\/[^/]+\/cancel$/.test(route) ||
       /^\/api\/launchpad\/(?:preview|removal-preview)\/[^/]+\/cancel$/.test(
         route,
       )

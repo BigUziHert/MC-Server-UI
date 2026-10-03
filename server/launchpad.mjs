@@ -1,4 +1,5 @@
 import { terminalJobs } from "./terminal-jobs.mjs";
+import { createLaunchpadRecovery } from "./launchpad-transaction.mjs";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { createHash, randomUUID } from "node:crypto";
@@ -362,6 +363,57 @@ export async function createLaunchpad(ctx) {
     jobs.set(job.id, job);
     lastJob = job.id;
   }
+  const recovery = ctx.catalogOnly
+    ? null
+    : await createLaunchpadRecovery({
+        privatePath,
+        serverDir,
+        safePath,
+        applyConfiguration: ctx.applyConfiguration,
+        getConfiguration: ctx.getConfiguration,
+      });
+  let recoveryRequired = false;
+  async function reconcileInstallation({ publish = true } = {}) {
+    const pending = recovery?.get();
+    if (!pending) return { ok: true };
+    let result, issue;
+    try {
+      result = await recovery.reconcile();
+      if (!result.committed) {
+        replaceReceipts(result.record.receipts);
+        await saveReceipts();
+      }
+    } catch (cause) {
+      issue = cause;
+    }
+    recoveryRequired = Boolean(issue);
+    recovery?.release();
+    const job = {
+      ...pending.job,
+      status: result?.committed ? "completed" : "failed",
+      recoveryRequired,
+      cancellable: false,
+      retryable: false,
+      message: issue
+        ? `Interrupted installation needs recovery. ${issue.message}`
+        : result.committed
+          ? "Installation completed before the panel stopped."
+          : "The interrupted installation was rolled back. Previous server files were restored, along with their settings.",
+      ...(issue
+        ? { retainedRecoveryPath: await privatePath(pending.directory) }
+        : {}),
+      finishedAt: new Date().toISOString(),
+    };
+    if (job.status === "failed") job.error = job.message;
+    if (publish) {
+      jobs.set(job.id, job);
+      lastJob = job.id;
+      await terminal.save(job);
+    }
+    if (!issue) await recovery.clear();
+    return { ok: !issue, job };
+  }
+  await reconcileInstallation();
   const backgroundChecks = new Map();
   const publicJob = (job) => ({
     ...job,
@@ -475,7 +527,10 @@ export async function createLaunchpad(ctx) {
       );
     const query =
       typeof input.query === "string" ? input.query.trim().slice(0, 200) : "";
-    const offset = Math.min(9900, Math.max(0, Number(input.offset) || 0));
+    const offset = Math.min(
+      Number.MAX_SAFE_INTEGER,
+      Math.max(0, Number(input.offset) || 0),
+    );
     const limit = Math.min(100, Math.max(1, Number(input.limit) || 20));
     return {
       ...input,
@@ -878,7 +933,18 @@ export async function createLaunchpad(ctx) {
           cause.status === 429 ? found.id : `${found.id}:${item.projectId}`,
           {
             message,
-            until: Date.now() + (cause.status === 429 ? 60_000 : 30_000),
+            until: Math.max(
+              updateFailures.get(
+                cause.status === 429
+                  ? found.id
+                  : `${found.id}:${item.projectId}`,
+              )?.until ?? 0,
+              Date.now() +
+                Math.max(
+                  cause.status === 429 ? 60_000 : 30_000,
+                  Number.isFinite(cause.retryAfterMs) ? cause.retryAfterMs : 0,
+                ),
+            ),
           },
         );
     };
@@ -1819,7 +1885,7 @@ export async function createLaunchpad(ctx) {
           parent.stagedPath,
           parent.hosts,
           request,
-          { signal: input.signal },
+          { signal: input.signal, curseforgeKey: key },
         );
       }
       if (
@@ -2124,6 +2190,7 @@ export async function createLaunchpad(ctx) {
         source = path.join(stage, `dependency-inspection-${index}.jar`);
         await downloadVerified(file, source, file.hosts, request, {
           signal: input.signal,
+          curseforgeKey: key,
         });
         // Keep the verified download for installation instead of fetching it twice.
         file.stagedPath = source;
@@ -2280,7 +2347,7 @@ export async function createLaunchpad(ctx) {
         archive,
         found.downloadHosts,
         request,
-        { signal: input.signal },
+        { signal: input.signal, curseforgeKey: key },
       );
     const extracted = path.join(stage, "archive");
     await fs.mkdir(extracted);
@@ -2976,6 +3043,20 @@ export async function createLaunchpad(ctx) {
           );
       }
       try {
+        await recovery.begin({
+          job: { ...job },
+          planId: plan.id,
+          files: plan.files.map((file) => ({
+            path: file.path,
+            sha512: file.sha512,
+          })),
+          originals: plan.files.flatMap((file) =>
+            [file.expected ? file.path : null, file.previous?.path].filter(
+              Boolean,
+            ),
+          ),
+          receipts: previousReceipts,
+        });
         for (const file of plan.files) {
           job.message = `Installing ${file.path}`;
           for (const relative of [
@@ -3157,6 +3238,19 @@ export async function createLaunchpad(ctx) {
         packFiles.push(file);
       }
       await prepareCleanSettings(runtime, ctx);
+      await recovery.begin({
+        job: { ...job },
+        planId: plan.id,
+        wholeRoot: true,
+        files: await Promise.all(
+          runtime.files.map(async (file) => ({
+            path: file.path,
+            sha512: await fileHash(await safePath(runtime.stageDir, file.path)),
+          })),
+        ),
+        receipts: previousReceipts,
+        configuration: previousConfiguration,
+      });
       let configured = false;
       const clearCaches = () => {
         fileCache.clear();
@@ -3165,7 +3259,7 @@ export async function createLaunchpad(ctx) {
         updateCache.clear();
         updateFailures.clear();
       };
-      const recovery = await cleanInstall(runtime, {
+      const packRecovery = await cleanInstall(runtime, {
         ...ctx,
         signal: lifetime.signal,
         onProgress: (value) => {
@@ -3231,7 +3325,7 @@ export async function createLaunchpad(ctx) {
             );
         },
       });
-      Object.assign(job, recovery);
+      Object.assign(job, packRecovery);
       job.completed = job.total;
       await ctx
         .audit?.(
@@ -3244,6 +3338,11 @@ export async function createLaunchpad(ctx) {
   }
   async function install(input) {
     if (closing) throw error(503, "Launchpad is shutting down.");
+    if (recoveryRequired)
+      throw error(
+        409,
+        "Resolve the interrupted Launchpad installation before installing content.",
+      );
     if (input?.confirmed !== true)
       throw error(
         400,
@@ -3295,6 +3394,7 @@ export async function createLaunchpad(ctx) {
     const job = {
       id: randomUUID(),
       status: "queued",
+      cancellable: true,
       message: "Preparing verified downloads…",
       completed: 0,
       total: plan.files.length,
@@ -3328,6 +3428,7 @@ export async function createLaunchpad(ctx) {
               const destination = path.join(plan.stage, `download-${index}`);
               await downloadVerified(file, destination, file.hosts, request, {
                 signal: controller.signal,
+                curseforgeKey: key,
               });
               file.stagedPath = destination;
             }
@@ -3350,13 +3451,24 @@ export async function createLaunchpad(ctx) {
           }
           controller.signal.throwIfAborted();
           phase = "promote";
+          job.cancellable = false;
           await promote(plan, job);
+          await recovery.commit();
           removal.invalidate();
           outcome = {
             status: "completed",
             message: `${plan.title} installed. Replaced files remain recoverable in Recycle Bin.`,
           };
         } catch (cause) {
+          if (recovery.get()) {
+            const restored = await reconcileInstallation({ publish: false });
+            if (!restored.ok) {
+              recoveryRequired = true;
+              job.recoveryRequired = true;
+              job.retainedRecoveryPath = restored.job.retainedRecoveryPath;
+              cause.message += ` Recovery needs attention. ${restored.job.message}`;
+            }
+          }
           if (
             phase === "download" &&
             !closing &&
@@ -3376,6 +3488,7 @@ export async function createLaunchpad(ctx) {
           }
           outcome = {
             status: "failed",
+            cancelled: controller.signal.aborted && !closing,
             error:
               phase !== "promote" && failedFile
                 ? `${failedFile}: ${cause.message}`
@@ -3405,7 +3518,7 @@ export async function createLaunchpad(ctx) {
         } finally {
           job.message = "Finishing installation cleanup…";
           try {
-            if (!retained)
+            if (!retained && !recoveryRequired)
               await fs.rm(await privatePath(plan.id), {
                 recursive: true,
                 force: true,
@@ -3432,12 +3545,26 @@ export async function createLaunchpad(ctx) {
           ...job,
           ...outcome,
           finishedAt: new Date().toISOString(),
+          cancellable: false,
         };
         if (final.status === "failed")
           await ctx
             .audit?.("Content installation failed", final.error, "file")
             .catch(() => {});
-        await terminal?.save(final).catch(() => {});
+        let saved = false;
+        await terminal
+          ?.save(final)
+          .then(() => {
+            saved = true;
+          })
+          .catch(() => {});
+        recovery?.release();
+        if (
+          saved &&
+          !recoveryRequired &&
+          recovery?.get()?.state === "committed"
+        )
+          await recovery.clear();
         active = null;
         activeController = null;
         Object.assign(job, final);
@@ -3476,6 +3603,23 @@ export async function createLaunchpad(ctx) {
   }
   const api = {
     isBusy: () => Boolean(active || preparingInstall || removal.busy),
+    isRecoveryRequired: () => recoveryRequired,
+    resolveRecovery: () => withMinecraftMutation(reconcileInstallation),
+    async cancelInstall(id) {
+      const job = jobs.get(id);
+      if (!job || id !== lastJob || !activeController)
+        throw error(404, "This installation is no longer running.");
+      if (!job.cancellable)
+        throw error(
+          409,
+          "Installation is committing server files and must finish safely.",
+        );
+      job.cancellable = false;
+      activeController.abort(
+        error(409, "Installation cancelled. No server files were changed."),
+      );
+      return { job: publicJob(job) };
+    },
     config,
     async settings(input) {
       const value = input?.curseforgeApiKey;
@@ -3566,6 +3710,11 @@ export async function createLaunchpad(ctx) {
     cancelRemovalPreview: removal.cancel,
     async dismissJob(id) {
       const job = jobs.get(id);
+      if (job?.recoveryRequired)
+        throw error(
+          409,
+          "Resolve installation recovery before dismissing its status.",
+        );
       if (job && ["completed", "failed"].includes(job.status)) {
         job.dismissed = true;
         await terminal?.dismiss(id);

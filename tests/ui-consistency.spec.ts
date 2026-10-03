@@ -1,5 +1,205 @@
 import { test, expect, type Route } from "@playwright/test";
 
+test("a Players mutation replaces the older active poll with a fresh roster read", async ({
+  page,
+}) => {
+  await page.clock.install();
+  let reads = 0;
+  let held: Route | undefined;
+  let granted = false;
+  const roster = (operator: boolean) => ({
+    mode: "live",
+    status: "offline",
+    operators: operator ? [{ name: "Fresh_operator" }] : [],
+    history: [],
+    online: [],
+    banned: [],
+    whitelist: [],
+  });
+  await page.route("**/api/players", (route) => {
+    if (++reads === 2) {
+      held = route;
+      return;
+    }
+    return route.fulfill({ json: roster(granted) });
+  });
+  await page.route("**/api/players/op", (route) => {
+    granted = true;
+    return route.fulfill({ json: { message: "Operator saved", saved: true } });
+  });
+  await page.goto("/#players");
+  const add = page.getByRole("button", { name: "Add operator", exact: true });
+  await expect(add).toBeEnabled();
+  await page.clock.runFor(5_100);
+  await expect.poll(() => Boolean(held)).toBe(true);
+  await add.click();
+  await page
+    .getByRole("textbox", { name: "Minecraft username", exact: true })
+    .fill("Fresh_operator");
+  await page.getByRole("button", { name: "Grant OP", exact: true }).click();
+  await expect(
+    page.getByRole("listitem", {
+      name: "Operators Fresh_operator",
+      exact: true,
+    }),
+  ).toBeVisible();
+  expect(reads).toBe(3);
+  await held!.fulfill({ json: roster(false) });
+  await expect(
+    page.getByRole("listitem", {
+      name: "Operators Fresh_operator",
+      exact: true,
+    }),
+  ).toBeVisible();
+});
+
+test("slow Players reads coalesce polling and manual refresh without starving the roster", async ({
+  page,
+}) => {
+  await page.clock.install();
+  const held: Route[] = [];
+  await page.route("**/api/players", (route) => {
+    held.push(route);
+  });
+  const roster = (name: string) => ({
+    mode: "live",
+    status: "running",
+    operators: [{ name }],
+    history: [],
+    online: [],
+    banned: [],
+    whitelist: [],
+  });
+  await page.goto("/#players");
+  await expect.poll(() => held.length).toBe(1);
+  await page.clock.runFor(6_000);
+  expect(held).toHaveLength(1);
+  await held[0].fulfill({ json: roster("First_roster") });
+  await expect(
+    page.getByRole("listitem", { name: "Operators First_roster", exact: true }),
+  ).toBeVisible();
+  await page.clock.runFor(5_000);
+  await expect.poll(() => held.length).toBe(2);
+  const refresh = page.getByRole("button", {
+    name: "Refresh players",
+    exact: true,
+  });
+  await refresh.click();
+  await expect(refresh).toHaveAttribute("aria-busy", "true");
+  await page.clock.runFor(6_000);
+  expect(held).toHaveLength(2);
+  await held[1].fulfill({ json: roster("Next_roster") });
+  await expect(
+    page.getByRole("listitem", { name: "Operators Next_roster", exact: true }),
+  ).toBeVisible();
+  await expect(
+    page.getByText("Players refreshed.", { exact: true }),
+  ).toBeVisible();
+  await page.clock.runFor(5_000);
+  await expect.poll(() => held.length).toBe(3);
+  await refresh.click();
+  await held[2].fulfill({ status: 503, json: { error: "Roster unavailable" } });
+  await expect(page.getByRole("alert")).toContainText("Roster unavailable");
+  await expect(refresh).toBeEnabled();
+  await expect(
+    page.getByText("Players refreshed.", { exact: true }),
+  ).toHaveCount(0);
+});
+
+test("Properties refresh discovers generated files, reconciles tabs, and retains state on catalog failure", async ({
+  page,
+}) => {
+  let files: { path: string; name: string }[] = [];
+  let fail = false;
+  let reads = 0;
+  await page.route("**/api/minecraft/properties", (route) => {
+    reads++;
+    return route.fulfill(
+      fail
+        ? { status: 503, json: { error: "Catalog unavailable" } }
+        : { json: { files } },
+    );
+  });
+  await page.route("**/api/minecraft/properties/file?*", (route) => {
+    const path = new URL(route.request().url()).searchParams.get("path");
+    return route.fulfill({
+      json: {
+        path,
+        status: "offline",
+        revision: "v1",
+        fields: [
+          { key: "motd", label: "Server message", type: "string", value: path },
+        ],
+      },
+    });
+  });
+  await page.goto("/#properties");
+  await expect(
+    page.getByRole("heading", { name: "No configuration files yet" }),
+  ).toBeVisible();
+  const refresh = page.getByRole("button", {
+    name: "Refresh properties",
+    exact: true,
+  });
+  await expect(refresh).toBeEnabled();
+  files = [{ path: "server.properties", name: "server.properties" }];
+  await refresh.click();
+  const field = page.getByRole("textbox", {
+    name: "Server message",
+    exact: true,
+  });
+  await expect(field).toHaveValue("server.properties");
+  files.push({ path: "bukkit.yml", name: "bukkit.yml" });
+  await refresh.click();
+  const first = page.getByRole("tab", {
+    name: "server.properties",
+    exact: true,
+  });
+  const second = page.getByRole("tab", { name: "bukkit.yml", exact: true });
+  await expect(second).toBeEnabled();
+  await expect(first).toHaveAttribute("aria-selected", "true");
+  await first.focus();
+  await first.press("ArrowRight");
+  await expect(second).toBeFocused();
+  await expect(first).toHaveAttribute("tabindex", "-1");
+  await second.press("Enter");
+  await expect(field).toHaveValue("bukkit.yml");
+  fail = true;
+  await refresh.click();
+  await expect(page.getByRole("alert")).toContainText("Catalog unavailable");
+  await expect(field).toHaveValue("bukkit.yml");
+  await field.fill("Keep draft");
+  const before = reads;
+  await refresh.click();
+  await page.getByRole("button", { name: "Keep editing", exact: true }).click();
+  expect(reads).toBe(before);
+  await expect(field).toHaveValue("Keep draft");
+  fail = false;
+  files = files.slice(0, 1);
+  await refresh.click();
+  await page
+    .getByRole("button", { name: "Reload properties", exact: true })
+    .click();
+  await expect(second).toHaveCount(0);
+  await expect(field).toHaveValue("server.properties");
+});
+
+test("file dialog backdrop restores keyboard focus to its opener", async ({
+  page,
+}) => {
+  await page.goto("/#files");
+  const trigger = page.getByRole("button", { name: "New file", exact: true });
+  await trigger.click();
+  await expect(
+    page.getByRole("dialog", { name: "New file", exact: true }),
+  ).toBeVisible();
+  await page.mouse.click(1, 1);
+  await expect(
+    page.getByRole("dialog", { name: "New file", exact: true }),
+  ).toHaveCount(0);
+  await expect(trigger).toBeFocused();
+});
+
 test.afterEach(async ({ page }) => {
   // Polling can still be inside route.fetch when the final assertion completes.
   // Finish active handlers before Playwright disposes the request context.

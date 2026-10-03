@@ -106,6 +106,7 @@ function SettingsDialog({
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
+  const [loadFailed, setLoadFailed] = useState(false);
   const [updatesError, setUpdatesError] = useState("");
   const [openingUpdates, setOpeningUpdates] = useState(false);
   const [attempt, setAttempt] = useState(0);
@@ -123,6 +124,7 @@ function SettingsDialog({
     const controller = new AbortController();
     setLoading(true);
     setError("");
+    setLoadFailed(false);
     void Promise.allSettled([
       api<DesktopSettings>("/desktop/settings", { signal: controller.signal }),
       api<{ servers: StartupServer[] }>("/servers", {
@@ -132,13 +134,18 @@ function SettingsDialog({
       if (controller.signal.aborted) return;
       if (desktop.status === "fulfilled") {
         setSettings(desktop.value);
-        setDraft(desktop.value);
+        setDraft((current) => current ?? desktop.value);
       } else if (desktop.reason?.status === 404) {
         setSettings({ desktop: false } as DesktopSettings);
-      } else setError(messageOf(desktop.reason));
+      } else {
+        setError(messageOf(desktop.reason));
+        setLoadFailed(true);
+      }
       if (roster.status === "fulfilled") setServers(roster.value.servers);
-      else if (desktop.status === "fulfilled" && desktop.value.desktop)
+      else if (desktop.status === "fulfilled" && desktop.value.desktop) {
         setError(messageOf(roster.reason, "Unable to load startup servers."));
+        setLoadFailed(true);
+      }
       setLoading(false);
     });
     return () => controller.abort();
@@ -149,6 +156,7 @@ function SettingsDialog({
     if (!draft || busy) return;
     setBusy(true);
     setError("");
+    setLoadFailed(false);
     try {
       const next = await api<DesktopSettings>("/desktop/settings", {
         method: "PUT",
@@ -339,9 +347,10 @@ function SettingsDialog({
           {error && (
             <div className="panel-settings-error" role="alert">
               <p>{error}</p>
-              {!settings && (
+              {loadFailed && (
                 <button
                   className="btn"
+                  disabled={loading || busy}
                   onClick={() => setAttempt((value) => value + 1)}
                 >
                   Try again

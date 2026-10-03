@@ -21,7 +21,17 @@ import { copyServerFiles, uploadServerFiles } from "./file-transfer.mjs";
 import { planFileDownload, streamFileArchive } from "./file-download.mjs";
 import { createFileSearch } from "./file-search.mjs";
 import { createBackupArchive } from "./backup-archive.mjs";
-import { restoreBackupArchive } from "./backup-restore.mjs";
+import {
+  reconcileInterruptedRestores,
+  restoreBackupArchive,
+} from "./backup-restore.mjs";
+import {
+  claimBackupJournal,
+  fileIdentity,
+  persistJournal,
+  syncDirectory,
+} from "./backup-journal.mjs";
+import { reconcileBackupCreations } from "./backup-creation-recovery.mjs";
 import { createOperationReceipts } from "./operation-receipts.mjs";
 import { createMinecraft } from "./minecraft.mjs";
 import { createServerSetup } from "./server-setup.mjs";
@@ -468,15 +478,26 @@ export function nextRunFor(schedule, now = new Date()) {
     return new Date(
       now.getTime() + schedule.intervalHours * 3_600_000,
     ).toISOString();
-  const next = new Date(now);
   const [hours, minutes] = schedule.time.split(":").map(Number);
-  next.setHours(hours, minutes, 0, 0);
-  if (schedule.type === "weekly")
-    next.setDate(
-      next.getDate() + ((schedule.dayOfWeek - next.getDay() + 7) % 7),
+  const offset =
+    schedule.type === "weekly"
+      ? (schedule.dayOfWeek - now.getDay() + 7) % 7
+      : 0;
+  // Choose the calendar day before applying wall-clock fields. Nonexistent
+  // spring times move forward by the gap; repeated fall times use the first
+  // occurrence. Neither normalization carries into the following recurrence.
+  const onDay = (days) =>
+    new Date(
+      now.getFullYear(),
+      now.getMonth(),
+      now.getDate() + days,
+      hours,
+      minutes,
+      0,
+      0,
     );
-  if (next <= now)
-    next.setDate(next.getDate() + (schedule.type === "weekly" ? 7 : 1));
+  let next = onDay(offset);
+  if (next <= now) next = onDay(offset + (schedule.type === "weekly" ? 7 : 1));
   return next.toISOString();
 }
 
@@ -582,7 +603,12 @@ export async function createPanel(options = {}) {
       "Server memory must be an integer between 256 and 262144 MB.",
     );
   await fs.mkdir(dataDir, { recursive: true });
+  const restoreRecovery = [
+    ...(options.restoreRecovery ?? []),
+    ...(await reconcileInterruptedRestores(serverDir)),
+  ];
   const backupDir = await safePath(dataDir, "backups");
+  const backupJournalDir = await safePath(dataDir, "backup-jobs");
   const uploadDir = await safePath(dataDir, "uploads");
   const statePath = await safePath(dataDir, "panel.json");
   if (options.existingServerDir)
@@ -591,6 +617,7 @@ export async function createPanel(options = {}) {
     dataDir,
     ...(options.existingServerDir ? [] : [serverDir]),
     backupDir,
+    backupJournalDir,
     uploadDir,
   ])
     await fs.mkdir(dir, { recursive: true });
@@ -639,8 +666,18 @@ export async function createPanel(options = {}) {
   const writeState = async (next) => {
     const temp = `${statePath}.${randomUUID()}.tmp`;
     try {
-      await fs.writeFile(temp, JSON.stringify(next, null, 2));
+      await fs.writeFile(temp, JSON.stringify(next, null, 2), {
+        flag: "wx",
+        mode: 0o600,
+      });
+      const handle = await fs.open(temp, "r+");
+      try {
+        await handle.sync();
+      } finally {
+        await handle.close();
+      }
       await fs.rename(temp, statePath);
+      await syncDirectory(dataDir);
     } finally {
       await fs.rm(temp, { force: true }).catch(() => {});
     }
@@ -685,6 +722,18 @@ export async function createPanel(options = {}) {
     state.audit = state.audit.slice(0, 2000);
     await save();
   };
+  for (const detail of restoreRecovery)
+    await audit("backup", "Interrupted restore recovered", detail);
+  await reconcileBackupCreations({
+    directory: backupJournalDir,
+    backupDir,
+    commit: async (item, job, detail) => {
+      if (item && !state.backups.some((entry) => entry.id === item.id))
+        state.backups.unshift(item);
+      state.lastBackupJob = job;
+      await audit("backup", "Interrupted backup recovered", detail);
+    },
+  });
   // A crash can occur after an archive enters the journal but before its active
   // history is saved. Recovery records remain authoritative for missing files.
   const recycledBackups = (await recycleBin.list()).filter(
@@ -1082,6 +1131,11 @@ export async function createPanel(options = {}) {
     return audit("server", action, detail, actor).catch(() => {});
   };
   async function startServer(restarting = false) {
+    if (minecraft.isRecoveryRequired())
+      throw error(
+        409,
+        "Resolve the interrupted content installation in Launchpad before starting this server.",
+      );
     if (status !== "offline")
       throw error(409, "The server is already running or changing state.");
     // Reserve the transition before any filesystem awaits so concurrent starts cannot spawn twice.
@@ -1649,8 +1703,10 @@ export async function createPanel(options = {}) {
     );
     return recycled;
   }
-  const backupJobs = new Map();
-  let latestBackupJob = null;
+  const backupJobs = new Map(
+    state.lastBackupJob ? [[state.lastBackupJob.id, state.lastBackupJob]] : [],
+  );
+  let latestBackupJob = state.lastBackupJob ?? null;
   const backupControllers = new Map();
   const cancelledBackup = () =>
     Object.assign(new Error("Backup cancelled. No archive was retained."), {
@@ -1688,7 +1744,7 @@ export async function createPanel(options = {}) {
       name: backupName,
       trigger,
       status: "running",
-      phase: "saving",
+      phase: "scanning",
       totalBytes: 0,
       processedBytes: 0,
       totalFiles: 0,
@@ -1714,12 +1770,24 @@ export async function createPanel(options = {}) {
   async function runBackup(job, signal) {
     const { id, name: backupName, trigger } = job;
     const target = path.join(backupDir, `${id}.tar.gz`);
+    const journal = path.join(backupJournalDir, `${id}.json`);
+    const releaseJournal = claimBackupJournal(journal);
+    const transaction = {
+      version: 1,
+      ownerPid: process.pid,
+      job: { ...job },
+      phase: "writing",
+    };
     const liveChild = status === "running" ? processHandle : null;
     let failed;
     let committed = false;
+    let historySaved = false;
+    let cleanupComplete = true;
     try {
+      await persistJournal(journal, transaction);
       signal.throwIfAborted();
       if (liveChild) {
+        updateBackupJob(job, { phase: "saving" });
         append(
           "[Panel] Flushing the world and pausing automatic saves for backup…",
         );
@@ -1731,6 +1799,10 @@ export async function createPanel(options = {}) {
         {
           signal,
           onProgress: (progress) => updateBackupJob(job, progress),
+          onOutputReady: async (stat) => {
+            transaction.output = fileIdentity(stat);
+            await persistJournal(journal, transaction);
+          },
         },
       );
       signal.throwIfAborted();
@@ -1742,18 +1814,31 @@ export async function createPanel(options = {}) {
       // Cancellation ends at the atomic publish boundary. Once published, the
       // archive must finish its history commit and restore automatic saves.
       updateBackupJob(job, { phase: "finalizing", cancellable: false });
-      await fs.rename(`${target}.tmp`, target);
       const item = {
         id,
         name: backupName,
-        size: (await fs.stat(target)).size,
+        size: (await fs.stat(`${target}.tmp`)).size,
         ...compression,
         createdAt: new Date().toISOString(),
         status: "completed",
         trigger,
       };
-      state.backups.unshift(item);
+      const completedArchive = await fs.open(`${target}.tmp`, "r+");
+      try {
+        await completedArchive.sync();
+      } finally {
+        await completedArchive.close();
+      }
+      transaction.phase = "ready";
+      transaction.item = item;
+      await persistJournal(journal, transaction);
+      await fs.rename(`${target}.tmp`, target);
       committed = true;
+      state.backups.unshift(item);
+      await syncDirectory(backupDir);
+      await save();
+      historySaved = true;
+      job.backupId = id;
       if (trigger === "scheduled") {
         const obsolete = state.backups
           .filter((item) => item.trigger === "scheduled")
@@ -1770,13 +1855,13 @@ export async function createPanel(options = {}) {
           ? "Scheduler"
           : (requestActor.getStore() ?? "Local administrator"),
       );
-      job.backupId = id;
       return item;
     } catch (cause) {
       failed = signal.aborted && !committed ? signal.reason : cause;
       try {
         await fs.rm(`${target}.tmp`, { force: true });
       } catch (cleanupError) {
+        cleanupComplete = false;
         failed = new Error(
           `${failed.message} The incomplete archive could not be removed: ${cleanupError.message}`,
           { cause: failed },
@@ -1811,9 +1896,8 @@ export async function createPanel(options = {}) {
           }
         }
       } finally {
-        backupBusy = false;
-        backupControllers.delete(id);
-        updateBackupJob(job, {
+        const terminal = {
+          ...job,
           status: failed
             ? failed.code === "BACKUP_CANCELLED"
               ? "cancelled"
@@ -1822,7 +1906,24 @@ export async function createPanel(options = {}) {
           finishedAt: new Date().toISOString(),
           ...(failed ? { error: failed.message } : {}),
           currentFile: null,
-        });
+        };
+        state.lastBackupJob = terminal;
+        // A published archive keeps its journal until history is durable. A
+        // persistence failure must never turn the archive into an orphan.
+        try {
+          await save();
+          if ((!committed && cleanupComplete) || historySaved)
+            await fs.rm(journal, { force: true });
+        } catch (cause) {
+          append(
+            `[Panel] Backup recovery metadata remains at ${journal}: ${cause.message}`,
+            "error",
+          );
+        }
+        updateBackupJob(job, terminal);
+        releaseJournal();
+        backupBusy = false;
+        backupControllers.delete(id);
       }
     }
   }
@@ -4341,6 +4442,7 @@ export async function createFleet(options = {}) {
     preserveFiles = false,
     publish = true,
   ) => {
+    const restoreRecovery = await reconcileInterruptedRestores(entry.serverDir);
     if (entry.storage === "external") {
       await inspectImport(entry.serverDir, entry.id, true);
       if (entry.launchType !== "jar")
@@ -4415,6 +4517,7 @@ export async function createFleet(options = {}) {
     }
     const runtime = await createPanel({
       ...entry,
+      restoreRecovery,
       memoryLimit: entry.memoryLimitMB,
       useEnvironment: false,
       resolveAccessUser: (userId, base) =>
@@ -4954,14 +5057,20 @@ export async function createFleet(options = {}) {
   );
   app.put("/api/access/settings", async (req, res) => {
     const settings = await remote.configure(req.body ?? {});
-    await panelAudit(
-      "user",
-      "Remote access settings updated",
-      settings.enabled
-        ? "Authenticated remote access enabled."
-        : "Remote access disabled.",
-    );
-    res.json(settings);
+    let warning;
+    try {
+      await panelAudit(
+        "user",
+        "Remote access settings updated",
+        settings.enabled
+          ? "Authenticated remote access enabled."
+          : "Remote access disabled.",
+      );
+    } catch {
+      warning =
+        "Remote access settings were saved, but their audit history could not be saved.";
+    }
+    res.json({ ...settings, ...(warning ? { warning } : {}) });
   });
   app.get("/api/panel/audit", (_req, res) =>
     res.json({ entries: auditHistory(panelAuditEntries) }),
@@ -5712,15 +5821,25 @@ export async function createFleet(options = {}) {
       Promise.all([...runtimes.values()].map((runtime) => runtime.tick(now))),
     close: async (closeOptions = {}) => {
       closed = true;
-      await remote.close();
-      await setup.close();
-      await changeChain.catch(() => {});
-      await Promise.all(
-        [...runtimes.values()].map((runtime) => runtime.close(closeOptions)),
-      );
-      await access.close();
-      await panelAuditChain;
-      if (!options.telemetry) telemetry.close();
+      try {
+        await remote.close();
+        await setup.close();
+        await changeChain.catch(() => {});
+        await Promise.all(
+          [...runtimes.values()].map((runtime) => runtime.close(closeOptions)),
+        );
+        await access.close();
+        // Mutations already report audit persistence failures. They must not
+        // turn a completed server shutdown into a permanently failed quit.
+        await panelAuditChain.catch((cause) => {
+          console.error(
+            "Panel audit history could not be saved during shutdown:",
+            cause,
+          );
+        });
+      } finally {
+        if (!options.telemetry) telemetry.close();
+      }
     },
   };
 }

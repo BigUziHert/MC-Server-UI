@@ -38,7 +38,11 @@ export async function createLaunchpadMetadataCache({
   now = Date.now,
   debounceMs = 250,
 }) {
-  const allowed = new Set(platforms);
+  // CurseForge metadata retention needs separate written permission. Do not
+  // persist its disposable catalog/identity cache or retain older saved rows.
+  const allowed = new Set(
+    platforms.filter((platform) => platform !== "curseforge"),
+  );
   const entries = new Map();
   let bytes = 0,
     generation = 0,
@@ -152,6 +156,11 @@ export async function createLaunchpadMetadataCache({
               for (const candidate of saved.entries.slice(-maximumEntries)) {
                 const row = normalize(candidate);
                 if (row) insert(row);
+                else if (
+                  candidate?.platform === "curseforge" ||
+                  candidate?.value?.platform === "curseforge"
+                )
+                  dirty = true;
               }
           }
         }
@@ -211,6 +220,7 @@ export async function createLaunchpadMetadataCache({
     entries.set(key, entry);
     return structuredClone(entry.row);
   };
+  await flush();
   return {
     get generation() {
       return generation;

@@ -2,12 +2,124 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { t as list, x as extract } from "tar";
+import {
+  assertInactiveOwner,
+  claimBackupJournal,
+  fileIdentity,
+  optionalStat,
+  persistJournal,
+  sameIdentity,
+  syncDirectory,
+} from "./backup-journal.mjs";
 
 const failure = (status, message, cause) =>
   Object.assign(new Error(message, { cause }), { status });
 const canonical = (value) =>
   process.platform === "win32" ? value.toLowerCase() : value;
 const sharingRetryDelays = [50, 100, 200, 400, 800, 1000, 1000, 1000];
+
+async function cleanupWorkspace(workspace) {
+  // Keep the journal until all large tree cleanup is complete. A kill during
+  // cleanup can then be reconciled using the still-active root's identity.
+  for (const name of await fs.readdir(workspace)) {
+    if (name === "transaction.json") continue;
+    await fs.rm(path.join(workspace, name), {
+      recursive: true,
+      force: true,
+      maxRetries: 6,
+      retryDelay: 100,
+    });
+  }
+  await fs.rm(path.join(workspace, "transaction.json"), { force: true });
+  await fs.rmdir(workspace);
+}
+
+// Resolve an interrupted replacement before any caller creates a missing root.
+// The directory identities distinguish our two trees from external replacements;
+// ambiguous states remain untouched and make only this server unavailable.
+export async function reconcileInterruptedRestores(serverDir) {
+  const root = path.resolve(serverDir);
+  const parent = path.dirname(root);
+  const names = await fs.readdir(parent).catch((cause) => {
+    if (cause.code === "ENOENT") return [];
+    throw cause;
+  });
+  const recovered = [];
+  for (const name of names.filter((name) =>
+    name.startsWith(`.${path.basename(root)}-restore-`),
+  )) {
+    const workspace = path.join(parent, name);
+    const journal = path.join(workspace, "transaction.json");
+    const blocked = (detail) =>
+      failure(
+        409,
+        `An interrupted backup restore needs recovery at ${workspace}. ${detail} Original and staged files were preserved. Do not start the server until this is resolved.`,
+      );
+    const workspaceStat = await optionalStat(workspace);
+    if (
+      !workspaceStat?.isDirectory() ||
+      workspaceStat.isSymbolicLink() ||
+      canonical(await fs.realpath(workspace)) !== canonical(workspace)
+    )
+      throw blocked("The recovery folder changed.");
+    let record;
+    try {
+      const journalStat = await fs.lstat(journal);
+      if (!journalStat.isFile() || journalStat.isSymbolicLink())
+        throw new Error("Invalid journal.");
+      record = JSON.parse(await fs.readFile(journal, "utf8"));
+    } catch {
+      if ((await fs.readdir(workspace)).length === 0) {
+        await fs.rmdir(workspace);
+        continue;
+      }
+      throw blocked("The transaction journal could not be read.");
+    }
+    if (
+      record.version !== 1 ||
+      canonical(record.root ?? "") !== canonical(root) ||
+      record.workspace !== workspace ||
+      !sameIdentity(workspaceStat, record.workspaceIdentity)
+    )
+      throw blocked("The transaction journal does not match these folders.");
+    assertInactiveOwner(record, workspace);
+    const previous = path.join(workspace, "previous");
+    const staged = path.join(workspace, "restored");
+    const [live, old, pending] = await Promise.all([
+      optionalStat(root),
+      optionalStat(previous),
+      optionalStat(staged),
+    ]);
+    let detail;
+    if (sameIdentity(live, record.original) && !old) {
+      detail =
+        "The interrupted restore did not replace the server; the original files remain active.";
+    } else if (
+      !live &&
+      sameIdentity(old, record.original) &&
+      sameIdentity(pending, record.staged)
+    ) {
+      await renameDirectory(previous, root, record.original);
+      await syncDirectory(parent);
+      detail =
+        "The interrupted restore was rolled back; the original server files are active.";
+    } else if (
+      sameIdentity(live, record.staged) &&
+      !pending &&
+      (!old || sameIdentity(old, record.original))
+    ) {
+      detail =
+        "The interrupted restore had completed replacement; the restored server files are active.";
+    } else
+      throw blocked(
+        "The active, original or staged folder has an unexpected identity.",
+      );
+    recovered.push(detail);
+    await cleanupWorkspace(workspace);
+    await syncDirectory(parent);
+  }
+  return recovered;
+}
 
 async function renameDirectory(source, destination, expected) {
   const original = expected ?? (await fs.lstat(source));
@@ -128,6 +240,12 @@ function archiveManifest() {
   };
 }
 
+export async function validateBackupArchive(archive) {
+  const manifest = archiveManifest();
+  await list({ file: archive, strict: true, filter: manifest.filter });
+  manifest.check();
+}
+
 export async function restoreBackupArchive(
   serverDir,
   archive,
@@ -158,11 +276,24 @@ export async function restoreBackupArchive(
   const staged = path.join(workspace, "restored");
   const previous = path.join(workspace, "previous");
   const snapshot = path.join(workspace, "backup.tar.gz");
+  const journal = path.join(workspace, "transaction.json");
+  const releaseJournal = claimBackupJournal(workspace);
+  const transaction = {
+    version: 1,
+    ownerPid: process.pid,
+    root,
+    workspace,
+    workspaceIdentity: fileIdentity(await fs.lstat(workspace)),
+    original: fileIdentity(rootStat),
+    staged: null,
+    phase: "preparing",
+  };
   let preserveWorkspace = false;
   let restored = false;
   let restoredRoot;
   let restoreError;
   try {
+    await persistJournal(journal, transaction);
     const available = await fs.statfs(parent);
     if (available.bavail * available.bsize < archiveStat.size)
       throw failure(
@@ -221,6 +352,9 @@ export async function restoreBackupArchive(
         409,
         "The server folder changed during restore. Try again.",
       );
+    transaction.staged = restoredRoot;
+    transaction.phase = "replacing";
+    await persistJournal(journal, transaction);
     try {
       await renameDirectory(root, previous, rootStat);
     } catch (cause) {
@@ -231,7 +365,9 @@ export async function restoreBackupArchive(
       );
     }
     try {
+      await syncDirectory(parent);
       await renameDirectory(staged, root, restoredRoot);
+      await syncDirectory(parent);
     } catch (cause) {
       try {
         await renameDirectory(previous, root, rootStat);
@@ -261,26 +397,25 @@ export async function restoreBackupArchive(
         : cause;
     throw restoreError;
   } finally {
-    if (!preserveWorkspace) {
-      // Only this unique, verified sibling workspace is ever removed recursively.
-      if (path.dirname(workspace) !== parent || workspace === root)
-        throw new Error("Invalid backup restore workspace.");
-      try {
-        await fs.rm(workspace, {
-          recursive: true,
-          force: true,
-          maxRetries: 6,
-          retryDelay: 100,
-        });
-      } catch (cause) {
-        if (restored)
-          return {
-            restoredRoot,
-            warning: `The backup was restored, but temporary restore files could not be removed from ${workspace}. ${cause.message}`,
-          };
-        if (!restoreError) throw cause;
-        restoreError.message += ` Temporary restore files remain at ${workspace} because Windows or another application still has them open.`;
+    try {
+      if (!preserveWorkspace) {
+        // Only this unique, verified sibling workspace is ever removed recursively.
+        if (path.dirname(workspace) !== parent || workspace === root)
+          throw new Error("Invalid backup restore workspace.");
+        try {
+          await cleanupWorkspace(workspace);
+        } catch (cause) {
+          if (restored)
+            return {
+              restoredRoot,
+              warning: `The backup was restored, but temporary restore files could not be removed from ${workspace}. ${cause.message}`,
+            };
+          if (!restoreError) throw cause;
+          restoreError.message += ` Temporary restore files remain at ${workspace} because Windows or another application still has them open.`;
+        }
       }
+    } finally {
+      releaseJournal();
     }
   }
   // Callers may adopt only the staged directory this transaction promoted.

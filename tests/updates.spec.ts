@@ -1,4 +1,58 @@
-import { test, expect, type Page } from "@playwright/test";
+import { test, expect, type Page, type Route } from "@playwright/test";
+
+test("updater coalesces slow polls and ignores snapshots preceding an action", async ({
+  page,
+}) => {
+  await page.clock.install();
+  const idle = {
+    desktop: true,
+    supported: true,
+    version: "0.1.3-dev.0",
+    channel: "dev",
+    status: "idle",
+    message: "Ready",
+  };
+  const held: Route[] = [];
+  let reads = 0;
+  let state = idle;
+  await page.route("**/api/desktop/updates**", (route) => {
+    if (route.request().method() === "POST") {
+      state = { ...idle, status: "checking", message: "Checking now" };
+      return route.fulfill({ json: state });
+    }
+    if (++reads === 1) return route.fulfill({ json: idle });
+    held.push(route);
+  });
+  await page.goto("/");
+  await openUpdatesFromSettings(page);
+  const check = page.getByRole("button", {
+    name: "Check for updates",
+    exact: true,
+  });
+  await expect(check).toBeEnabled();
+  await page.clock.runFor(1_100);
+  await expect.poll(() => held.length).toBe(1);
+  await page.clock.runFor(2_100);
+  expect(reads).toBe(2);
+  await check.click();
+  const checking = page.getByRole("button", { name: "Checking…", exact: true });
+  await expect(checking).toBeDisabled();
+  await held[0].fulfill({ json: idle });
+  await expect(checking).toBeDisabled();
+  await page.clock.runFor(1_100);
+  await expect.poll(() => held.length).toBe(2);
+  await held[1].fulfill({
+    json: {
+      ...state,
+      status: "available",
+      message: "New update",
+      availableVersion: "0.1.3-dev.1",
+    },
+  });
+  await expect(
+    page.getByRole("button", { name: "Download update", exact: true }),
+  ).toBeEnabled();
+});
 
 test.beforeEach(async ({ page }) => {
   await page.route("**/api/desktop/settings", (route) =>

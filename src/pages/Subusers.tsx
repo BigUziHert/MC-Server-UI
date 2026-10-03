@@ -64,6 +64,7 @@ type AccessSettings = {
   ready: boolean;
   listening?: boolean;
   error?: string;
+  warning?: string;
   networkWarning?: string;
   certificate?: { fingerprint256: string; validTo: string; hosts: string[] };
   managedHttps?: {
@@ -306,7 +307,11 @@ export function RemoteAccessSetup({
       applySettings(result);
       if (result.error && result.transport !== "managed")
         setError(result.error);
-      else notify("Remote access settings saved.");
+      else
+        notify(
+          result.warning || "Remote access settings saved.",
+          Boolean(result.warning),
+        );
     } catch (cause) {
       if (revision !== settingsRevision.current) return;
       setError(

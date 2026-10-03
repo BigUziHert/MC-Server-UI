@@ -1202,7 +1202,10 @@ export function createCoreProviders({
               ? "follows"
               : input.sort || (input.query ? "relevance" : "downloads"),
         });
-        const result = await json(`${mr}/search?${query}`);
+        input.signal?.throwIfAborted();
+        const result = await json(`${mr}/search?${query}`, {
+          signal: input.signal,
+        });
         return {
           projects: result.hits.map((value) => ({
             id: value.project_id,
@@ -1579,23 +1582,38 @@ export function createCoreProviders({
         return cfMetadata(ids);
       },
       async search(input) {
+        input.signal?.throwIfAborted();
+        // CurseForge exposes only the first 10,000 matches. Preserve the
+        // requested page size while shrinking the final upstream page.
+        input = {
+          ...input,
+          offset: Math.min(
+            input.offset,
+            Math.floor(9999 / input.limit) * input.limit,
+          ),
+        };
+        const reachable = Math.min(input.limit, 10000 - input.offset);
         const query = new URLSearchParams({
           gameId: "432",
           classId: String(await cfClass(input.type)),
           searchFilter: input.query,
           index: String(input.offset),
-          pageSize: String(Math.min(input.limit, 50)),
+          pageSize: String(Math.min(reachable, 50)),
           sortField: String(cfSortFields[input.sort || "popular"]),
           sortOrder: input.sort === "name" ? "asc" : "desc",
         });
         if (input.gameVersion) query.set("gameVersion", input.gameVersion);
         if (cfLoaders[input.loader])
           query.set("modLoaderType", String(cfLoaders[input.loader]));
-        const result = await curseJson(`/mods/search?${query}`);
-        if (input.limit > 50 && result.data.length === 50) {
+        const result = await curseJson(`/mods/search?${query}`, {
+          signal: input.signal,
+        });
+        if (reachable > 50 && result.data.length === 50) {
           query.set("index", String(input.offset + 50));
-          query.set("pageSize", String(input.limit - 50));
-          const next = await curseJson(`/mods/search?${query}`);
+          query.set("pageSize", String(reachable - 50));
+          const next = await curseJson(`/mods/search?${query}`, {
+            signal: input.signal,
+          });
           result.data.push(...next.data);
         }
         return {
@@ -1609,7 +1627,10 @@ export function createCoreProviders({
             author: value.authors?.map((author) => author.name).join(", "),
             url: iconUrl(value.links?.websiteUrl),
           })),
-          total: result.pagination?.totalCount ?? result.data.length,
+          total: Math.min(
+            10000,
+            result.pagination?.totalCount ?? input.offset + result.data.length,
+          ),
           offset: input.offset,
           limit: input.limit,
         };
@@ -1684,7 +1705,11 @@ export function createCoreProviders({
               "The provider returned an invalid server pack.",
             );
         }
-        if (!file.downloadUrl || file.isAvailable === false)
+        if (
+          project.allowModDistribution === false ||
+          !file.downloadUrl ||
+          file.isAvailable === false
+        )
           throw launchpadError(
             400,
             "The author restricts automated downloads of this file. Download it manually from CurseForge and use File Manager.",

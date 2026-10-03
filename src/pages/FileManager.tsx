@@ -1836,8 +1836,12 @@ export default function FileManager({
               event.clientX > bounds.right ||
               event.clientY < bounds.top ||
               event.clientY > bounds.bottom
-            )
+            ) {
+              // Keep the pointer's default focus action from stealing focus
+              // back from the trigger restored by closeDialog.
+              event.preventDefault();
               closeDialog();
+            }
           }}
         >
           <form onSubmit={submitDialog}>

@@ -367,3 +367,30 @@ test("removed-server events remain accessible after deleting the last server and
   assert.equal(removed.serverName, "Removed world");
   assert.equal((await f.request("/api/panel/audit")).status, 200);
 });
+
+test("remote settings return committed values with a warning when only audit persistence fails", async (t) => {
+  const f = await fixture(t, { fleet: true, remoteListen: false });
+  const auditPath = path.join(f.root, "panel-audit.json");
+  await fs.mkdir(auditPath);
+  const result = await f.request(
+    "/api/access/settings",
+    json("PUT", {
+      enabled: false,
+      transport: "direct",
+      publicUrl: "https://panel.example.test",
+      port: 3322,
+    }),
+  );
+  assert.equal(result.status, 200);
+  assert.match(result.body.warning, /settings were saved.*audit history/);
+  assert.equal(result.body.publicUrl, "https://panel.example.test");
+  assert.equal(result.body.port, 3322);
+  const stored = (await f.request("/api/access/settings")).body;
+  assert.equal(stored.port, result.body.port);
+  assert.equal(stored.publicUrl, result.body.publicUrl);
+  await fs.rmdir(auditPath);
+  // Repairing the disk is enough: shutdown must not need another mutation to
+  // replace the rejected audit promise, nor report the committed change failed.
+  t.mock.method(console, "error", () => {});
+  await assert.doesNotReject(f.panel.close({ gracefulOnly: true }));
+});
