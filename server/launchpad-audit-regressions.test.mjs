@@ -88,7 +88,9 @@ test("extra-provider cancellation keeps another subscriber alive and stops an ab
   assert.equal(receivedSignal.aborted, true);
 });
 
-const directory = os.tmpdir();
+// Windows runners may expose TEMP through an 8.3 alias. Fixtures must use the
+// same canonical root as the production containment checks.
+const directory = await fs.realpath(os.tmpdir());
 const input = {
   platform: "audit",
   type: "plugin",

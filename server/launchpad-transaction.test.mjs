@@ -13,7 +13,8 @@ const safePath = (root, name = "") =>
   name ? containedSourcePath(root, name) : fs.realpath(root);
 const hash = (value) => createHash("sha512").update(value).digest("hex");
 async function fixture(t) {
-  const root = await fs.mkdtemp(path.join(os.tmpdir(), "launchpad-crash-"));
+  const temporary = await fs.realpath(os.tmpdir());
+  const root = await fs.mkdtemp(path.join(temporary, "launchpad-crash-"));
   t.after(() => fs.rm(root, { recursive: true, force: true }));
   const serverDir = path.join(root, "server"),
     dataDir = path.join(root, "panel");

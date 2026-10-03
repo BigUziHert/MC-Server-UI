@@ -629,7 +629,7 @@ test("desktop startup requires an explicit absolute data directory", async () =>
 });
 
 test("a historical audit failure does not poison quit or downloaded-update shutdown", async (t) => {
-  const { launch, dataDir } = await fixture(t);
+  const { launch } = await fixture(t);
   const commands = [];
   const child = new EventEmitter();
   child.stdout = new PassThrough();
@@ -662,7 +662,7 @@ test("a historical audit failure does not poison quit or downloaded-update shutd
     headers: { "X-Server-Id": server.id },
   });
   assert.equal(started.status, 200);
-  const auditPath = path.join(dataDir, "panel-audit.json");
+  const auditPath = path.join(runtime.fleet.dataDir, "panel-audit.json");
   const rename = fs.rename;
   let failed = false;
   t.mock.method(console, "error", () => {});
