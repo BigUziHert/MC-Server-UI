@@ -3255,6 +3255,235 @@ test("JEI-style missing Modrinth dependencies require explicit acknowledgement o
   );
 });
 
+test("server mod plans skip unpinned client-only catalog dependencies without fetching their releases or children", async (t) => {
+  const f = await fixture(t, {
+    request: async (url) => {
+      const pathname = new URL(url).pathname;
+      if (pathname === "/v2/project/project")
+        return Response.json({
+          id: "project",
+          title: "Create Deep Seas",
+          project_type: "mod",
+          server_side: "required",
+        });
+      if (pathname === "/v2/project/dependency")
+        return Response.json({
+          id: "dependency",
+          title: "Iris & Oculus Flywheel Compat",
+          project_type: "mod",
+          server_side: "unsupported",
+        });
+    },
+  });
+  f.versions.new.dependencies = [
+    { project_id: "dependency", version_id: null, dependency_type: "required" },
+  ];
+  f.versions.dep.environment = "client_only";
+  f.versions.dep.dependencies = [
+    {
+      project_id: "client-child",
+      version_id: null,
+      dependency_type: "required",
+    },
+  ];
+  const plan = await f.service.preview(selection);
+  assert.deepEqual(
+    plan.files.map((file) => file.path),
+    ["mods/new.jar"],
+  );
+  assert.deepEqual(plan.unavailableDependencies, []);
+  assert.ok(
+    plan.warnings.some(
+      (warning) =>
+        warning.includes("Iris & Oculus Flywheel Compat") &&
+        warning.includes("Create Deep Seas") &&
+        /client/i.test(warning),
+    ),
+  );
+  const job = await finish(f.service, { planId: plan.planId, confirmed: true });
+  assert.equal(job.status, "completed", job.error);
+  assert.ok(
+    f.requests.every(
+      ({ url }) =>
+        !url.includes("/project/dependency/version") &&
+        !url.includes("/version/dep") &&
+        !url.includes("client-child") &&
+        url !== "https://cdn.modrinth.com/dep.jar",
+    ),
+  );
+  await assert.rejects(fs.stat(path.join(f.serverDir, "mods", "dep.jar")), {
+    code: "ENOENT",
+  });
+});
+
+for (const environment of ["client_only", "singleplayer_only"]) {
+  test(`server mod plans skip pinned ${environment} dependencies while direct installations remain blocked`, async (t) => {
+    const f = await fixture(t, {
+      request: async (url) => {
+        if (new URL(url).pathname === "/v2/project/dependency")
+          return Response.json({
+            id: "dependency",
+            title: "Iris & Oculus Flywheel Compat",
+            project_type: "mod",
+            server_side: "optional",
+          });
+      },
+    });
+    f.versions.new.dependencies = [
+      {
+        project_id: "dependency",
+        version_id: "dep",
+        dependency_type: "required",
+      },
+    ];
+    f.versions.dep.environment = environment;
+    f.versions.dep.dependencies = [
+      {
+        project_id: "client-child",
+        version_id: null,
+        dependency_type: "required",
+      },
+    ];
+    const plan = await f.service.preview(selection);
+    assert.deepEqual(
+      plan.files.map((file) => file.path),
+      ["mods/new.jar"],
+    );
+    assert.deepEqual(plan.unavailableDependencies, []);
+    assert.ok(
+      plan.warnings.some(
+        (warning) =>
+          warning.includes("Iris & Oculus Flywheel Compat") &&
+          warning.includes("Fixture Project") &&
+          /client|singleplayer/i.test(warning),
+      ),
+    );
+    const job = await finish(f.service, {
+      planId: plan.planId,
+      confirmed: true,
+    });
+    assert.equal(job.status, "completed", job.error);
+    await assert.rejects(
+      f.service.preview({
+        ...selection,
+        projectId: "dependency",
+        versionId: "dep",
+      }),
+      /intended for clients/,
+    );
+    assert.ok(
+      f.requests.every(
+        ({ url }) =>
+          !url.includes("client-child") &&
+          url !== "https://cdn.modrinth.com/dep.jar",
+      ),
+    );
+  });
+}
+
+test("client-only dependency exclusions preserve project identity, type, and runtime validation", async (t) => {
+  for (const mismatch of [
+    "unpinned-project",
+    "unpinned-type",
+    "pinned-project",
+    "pinned-project-response",
+    "pinned-version-response",
+    "pinned-type",
+    "loader",
+    "game-version",
+  ]) {
+    await t.test(mismatch, async (t) => {
+      const unpinned = mismatch.startsWith("unpinned");
+      const f = await fixture(t, {
+        request: async (url) => {
+          if (new URL(url).pathname === "/v2/project/dependency")
+            return Response.json({
+              id: ["unpinned-project", "pinned-project-response"].includes(
+                mismatch,
+              )
+                ? "unrelated"
+                : "dependency",
+              title: "Iris & Oculus Flywheel Compat",
+              project_type: mismatch.endsWith("type") ? "modpack" : "mod",
+              server_side: "unsupported",
+            });
+        },
+      });
+      f.versions.new.dependencies = [
+        {
+          project_id: "dependency",
+          version_id: unpinned ? null : "dep",
+          dependency_type: "required",
+        },
+      ];
+      f.versions.dep.environment = "client_only";
+      if (mismatch === "pinned-project")
+        f.versions.dep.project_id = "unrelated";
+      if (mismatch === "pinned-version-response")
+        f.versions.dep.id = "unrelated";
+      if (mismatch === "loader") f.versions.dep.loaders = ["fabric"];
+      if (mismatch === "game-version")
+        f.versions.dep.game_versions = ["1.20.1"];
+      await assert.rejects(f.service.preview(selection), {
+        status: mismatch === "unpinned-project" ? 502 : 400,
+      });
+      assert.equal(f.mutations, 0);
+      assert.ok(
+        f.requests.every(
+          ({ url }) => url !== "https://cdn.modrinth.com/dep.jar",
+        ),
+      );
+    });
+  }
+});
+
+test("unavailable server dependencies remain blocked with their project and dependent names", async (t) => {
+  for (const serverSide of [undefined, "required"]) {
+    for (const availability of ["no-releases", "no-download"]) {
+      await t.test(`${serverSide ?? "unknown"}: ${availability}`, async (t) => {
+        const f = await fixture(t, {
+          request: async (url) => {
+            const pathname = new URL(url).pathname;
+            if (pathname === "/v2/project/dependency")
+              return Response.json({
+                id: "dependency",
+                title: "Required Server Library",
+                project_type: "mod",
+                server_side: serverSide,
+              });
+            if (
+              pathname === "/v2/project/dependency/version" &&
+              availability === "no-releases"
+            )
+              return Response.json([]);
+          },
+        });
+        f.versions.new.dependencies = [
+          {
+            project_id: "dependency",
+            version_id: null,
+            dependency_type: "required",
+          },
+        ];
+        if (availability === "no-download") f.versions.dep.files = [];
+        await assert.rejects(f.service.preview(selection), (cause) => {
+          assert.equal(cause.status, 400);
+          assert.match(cause.message, /Required Server Library/);
+          assert.match(cause.message, /Fixture Project/);
+          assert.match(cause.message, /no compatible downloadable version/);
+          return true;
+        });
+        assert.equal(f.mutations, 0);
+        assert.ok(
+          f.requests.every(
+            ({ url }) => url !== "https://cdn.modrinth.com/dep.jar",
+          ),
+        );
+      });
+    }
+  }
+});
+
 async function pinnedLoaderFixture(t, requestHook) {
   const catalog = [],
     identities = new Map();
@@ -3594,6 +3823,46 @@ test("a verified installed dependency satisfying the new mod's declared range is
     ["mods/old.jar"],
   );
 });
+
+for (const environment of ["client_only", "singleplayer_only"]) {
+  test(`a ${environment} installed release cannot omit a required server dependency during loader recovery`, async (t) => {
+    let installedVersion;
+    const { f, existing, installedBytes, installedPath, compatible } =
+      await installedRangeFixture(t, "[1.1.0,)", (url) => {
+        if (new URL(url).pathname === "/v2/version/dep-newer")
+          return Response.json({ ...installedVersion, environment });
+      });
+    installedVersion = existing;
+    await assert.rejects(f.service.preview(selection), {
+      status: 400,
+      code: "CLIENT_ONLY_CONTENT",
+    });
+    assert.ok(
+      f.requests.some(
+        ({ url }) => new URL(url).pathname === `/v2/version/${compatible.id}`,
+      ),
+      "the compatible server release was resolved before checking the installed release",
+    );
+    assert.ok(
+      f.requests.some(
+        ({ url }) => new URL(url).pathname === `/v2/version/${existing.id}`,
+      ),
+    );
+    assert.equal(f.mutations, 0);
+    assert.deepEqual(await fs.readFile(installedPath), installedBytes);
+    assert.deepEqual(
+      await fs.readFile(path.join(f.serverDir, "mods/old.jar")),
+      f.old,
+    );
+    assert.deepEqual(await f.bin.list(), []);
+    assert.ok(
+      f.requests.every(
+        ({ url }) =>
+          ![existing.files[0].url, compatible.files[0].url].includes(url),
+      ),
+    );
+  });
+}
 
 for (const range of ["[2.0.6,)", "[1.1.0,2.0.5)", "[2.0.3]", "unknown"])
   test(`an installed dependency cannot bypass an incompatible or unknown declaration ${range}`, async (t) => {
@@ -5169,7 +5438,7 @@ test("direct pack files and ZIP overrides replace old worlds and startup files t
   );
 });
 
-test("pack review selects its required runtime even when an older loader is installed and still rejects client-only dependencies", async (t) => {
+test("pack review selects its required runtime and direct client-only mod installs remain blocked", async (t) => {
   const f = await fixture(t);
   const service = await f.boot({
     extraProviders: [
@@ -5214,7 +5483,19 @@ test("pack review selects its required runtime even when an older loader is inst
     },
   ];
   f.versions.dep.environment = "client_only";
-  await assert.rejects(f.service.preview(selection), /intended for clients/);
+  const modPlan = await f.service.preview(selection);
+  assert.deepEqual(
+    modPlan.files.map((file) => file.path),
+    ["mods/new.jar"],
+  );
+  await assert.rejects(
+    f.service.preview({
+      ...selection,
+      projectId: "dependency",
+      versionId: "dep",
+    }),
+    /intended for clients/,
+  );
   assert.equal(f.mutations, 0);
 });
 

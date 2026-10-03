@@ -972,8 +972,8 @@ export function createCoreProviders({
         }),
     },
   );
-  const mrProject = async (projectId) =>
-    json(`${mr}/project/${enc(id(projectId))}`);
+  const mrProject = async (projectId, signal) =>
+    json(`${mr}/project/${enc(id(projectId))}`, { signal });
   const mrVersions = async (input) => {
     const query = new URLSearchParams();
     if (input.gameVersion)
@@ -1224,6 +1224,23 @@ export function createCoreProviders({
           .map(mrVersion)
           .filter((version) => fits(version, input));
       },
+      async dependencyInfo(input) {
+        const project = await mrProject(input.projectId, input.signal);
+        if (String(project.id) !== input.projectId)
+          throw launchpadError(
+            502,
+            "Modrinth returned a different dependency project.",
+          );
+        const supportedTypes = project.project_types ??
+          project.all_project_types ?? [project.project_type];
+        return {
+          title: project.title,
+          clientOnly:
+            input.type === "mod" &&
+            supportedTypes.includes("mod") &&
+            project.server_side === "unsupported",
+        };
+      },
       async compatibleDependencyVersion(input) {
         if (
           input.type !== "mod" ||
@@ -1300,7 +1317,12 @@ export function createCoreProviders({
           supportedTypes.includes(input.type) ||
           (["plugin", "datapack"].includes(input.type) &&
             supportedTypes.includes("mod"));
-        if (String(value.project_id) !== input.projectId || !matchesType)
+        if (
+          String(project.id) !== input.projectId ||
+          String(value.id) !== input.versionId ||
+          String(value.project_id) !== input.projectId ||
+          !matchesType
+        )
           throw launchpadError(
             400,
             "This version does not match the selected project, Minecraft version, or loader.",
@@ -1327,9 +1349,12 @@ export function createCoreProviders({
           project.server_side === "unsupported" ||
           !serverEnvironment(value.environment)
         )
-          throw launchpadError(
-            400,
-            "This version is intended for clients and cannot be installed on a server.",
+          throw Object.assign(
+            launchpadError(
+              400,
+              "This version is intended for clients and cannot be installed on a server.",
+            ),
+            { code: "CLIENT_ONLY_CONTENT", title: project.title },
           );
         const extension =
           input.type === "modpack"

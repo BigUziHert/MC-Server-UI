@@ -1865,12 +1865,25 @@ export async function createLaunchpad(ctx) {
         );
       let result;
       let recoveringDependency = false;
+      const skipClientDependency = (title) => {
+        warnings.push(
+          `Skipped ${title || value.projectId}, required by ${requiredBy}: ${found.name} marks it as client-only content.`,
+        );
+      };
       try {
         if (!value.projectId && value.versionId && found.version)
           value.projectId = String(
             (await found.version(value.versionId)).project_id,
           );
         if (!value.versionId) {
+          const dependency =
+            depth && value.type === "mod"
+              ? await found.dependencyInfo?.(value)
+              : null;
+          if (dependency?.clientOnly === true) {
+            skipClientDependency(dependency.title);
+            return;
+          }
           const versions = (await found.versions(value)).filter(
             (version) => version.downloadable !== false,
           );
@@ -1880,7 +1893,7 @@ export async function createLaunchpad(ctx) {
           if (!value.versionId)
             throw error(
               400,
-              "A required dependency has no compatible downloadable version. Install the dependency manually before continuing.",
+              `${dependency?.title || value.projectId || "The selected project"}${requiredBy ? `, required by ${requiredBy},` : ""} has no compatible downloadable version for ${input.loader} on Minecraft ${input.gameVersion}. Choose another project version or install a compatible dependency manually before continuing.`,
             );
         }
         const key = `${value.platform}:${value.projectId}`;
@@ -1892,6 +1905,16 @@ export async function createLaunchpad(ctx) {
         try {
           result = await found.resolve({ ...value, stage });
         } catch (cause) {
+          // Only the selected dependency's metadata can exclude it. A failure
+          // while verifying a different installed release must still block.
+          if (
+            depth &&
+            value.type === "mod" &&
+            cause.code === "CLIENT_ONLY_CONTENT"
+          ) {
+            skipClientDependency(cause.title);
+            return;
+          }
           if (
             !depth ||
             cause.code !== "INCOMPATIBLE_VERSION" ||
