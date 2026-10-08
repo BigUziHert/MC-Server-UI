@@ -25,6 +25,7 @@ files:
   - server/java-discovery.mjs
   - server/java-installation.mjs
   - server/launcher-stop.mjs
+  - server/windows-process-tree.mjs
   - server/connection.mjs
   - server/server-icon.mjs
   - server/telemetry.mjs

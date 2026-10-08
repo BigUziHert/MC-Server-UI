@@ -7,6 +7,7 @@ import { EventEmitter } from "node:events";
 import { spawn } from "node:child_process";
 import { PassThrough, Writable } from "node:stream";
 import { createPanel, terminateProcessTree } from "./index.mjs";
+import { createWindowsProcessTree } from "./windows-process-tree.mjs";
 
 const json = (body) => ({ method: "POST", body: JSON.stringify(body) });
 async function eventually(check) {
@@ -31,6 +32,12 @@ async function fixture(t, options = {}) {
     scheduler: false,
     stopTimeoutMs: 20,
     forceStopTimeoutMs: 200,
+    createWindowsProcessTree:
+      options.createWindowsProcessTree ??
+      ((child, settings) => ({
+        terminate: () =>
+          terminateProcessTree(child, { ...settings, tree: true }),
+      })),
     telemetry: { reset() {}, sample: async () => ({ available: false }) },
     publicAddress: { resolve: async () => null },
     spawnServer: () => {
@@ -187,10 +194,18 @@ test("a successful killer does not report offline before the child exits", async
 });
 
 test(
-  "Windows tree failure after wrapper exit remains blocked instead of restarting an unconfirmed tree",
+  "Windows tree failure after wrapper exit keeps retries available until the tree is verified stopped",
   { skip: process.platform !== "win32" },
   async (t) => {
-    const f = await fixture(t);
+    let verifiedStopped = false;
+    const f = await fixture(t, {
+      createWindowsProcessTree: (child, settings) => ({
+        terminate: () =>
+          verifiedStopped
+            ? Promise.resolve()
+            : terminateProcessTree(child, { ...settings, tree: true }),
+      }),
+    });
     await f.power("restart");
     const pending = f.power("force-stop", { confirmed: true });
     await eventually(() => f.killers.length === 1);
@@ -200,22 +215,85 @@ test(
     assert.equal(failed.status, 503);
     assert.match(
       failed.body.error,
-      /process tree could not be confirmed stopped/,
+      /some server processes may still be stopping/,
     );
-    assert.match(
-      failed.body.error,
-      /Check the server processes before restarting/,
-    );
+    assert.match(failed.body.error, /Try Force Stop again/);
     assert.doesNotMatch(failed.body.error, /taskkill/);
     assert.equal((await f.request("/api/server")).body.status, "stopping");
     assert.equal((await f.power("start")).status, 409);
+    assert.equal(f.children.length, 1);
+    verifiedStopped = true;
     assert.equal(
       (await f.power("force-stop", { confirmed: true })).status,
-      409,
+      200,
     );
-    assert.equal(f.children.length, 1);
+    assert.equal((await f.request("/api/server")).body.status, "offline");
+    assert.equal(
+      f.killers.length,
+      1,
+      "Do not target the exited root PID again",
+    );
+    assert.equal(f.children.length, 1, "Force Stop cancels a queued restart");
+    assert.equal((await f.power("start")).status, 200);
+    assert.equal(f.children.length, 2);
   },
 );
+
+for (const remainingExitsNaturally of [false, true]) {
+  test(
+    `Windows retry ${remainingExitsNaturally ? "verifies natural exit" : "stops surviving descendants"} after a failed kill and later launcher exit`,
+    { skip: process.platform !== "win32" },
+    async (t) => {
+      let rows = [];
+      let failKill = true;
+      const targeted = [];
+      const f = await fixture(t, {
+        createWindowsProcessTree: (child, { startedAt }) => {
+          const createdAt = String(
+            621355968000000000n + BigInt(startedAt) * 10000n,
+          );
+          rows = [
+            { pid: child.pid, parentPid: 1, createdAt },
+            {
+              pid: child.pid + 100,
+              parentPid: child.pid,
+              createdAt: String(BigInt(createdAt) + 10000n),
+            },
+          ];
+          return createWindowsProcessTree(child, {
+            startedAt,
+            readSnapshot: async () => rows,
+            killProcesses: async (owned) => {
+              targeted.push(owned.map((row) => row.pid));
+              if (failKill) throw new Error("Fixture access denied");
+              rows = [];
+            },
+          });
+        },
+      });
+      await f.power("restart");
+      const failure = await f.power("force-stop", { confirmed: true });
+      assert.equal(failure.status, 503);
+      assert.equal((await f.power("start")).status, 409);
+      const child = f.children[0];
+      rows = rows.filter((row) => row.pid !== child.pid);
+      child.emit("exit", 0);
+      child.emit("close", 0);
+      assert.equal((await f.request("/api/server")).body.status, "stopping");
+      failKill = false;
+      if (remainingExitsNaturally) rows = [];
+      const attemptsBeforeRetry = targeted.length;
+      const retried = await f.power("force-stop", { confirmed: true });
+      assert.equal(retried.status, 200, JSON.stringify(retried));
+      assert.equal((await f.request("/api/server")).body.status, "offline");
+      assert.equal(f.children.length, 1);
+      assert.equal(f.killers.length, 0, "Never use the dead launcher PID");
+      if (remainingExitsNaturally)
+        assert.equal(targeted.length, attemptsBeforeRetry);
+      else assert.deepEqual(targeted.at(-1), [child.pid + 100]);
+    },
+  );
+}
 
 test("a hung taskkill helper times out without targeting unrelated processes", async () => {
   const helper = new EventEmitter();

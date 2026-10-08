@@ -1319,6 +1319,9 @@ test("custom launcher restart waits for the entire owned tree after its wrapper 
   const killers = [];
   const { directory, prepare, boot } = await fixture(t, {
     stopTimeoutMs: 5,
+    createWindowsProcessTree: (child, settings) => ({
+      terminate: () => terminateProcessTree(child, { ...settings, tree: true }),
+    }),
     spawnServer: () => {
       const child = mockServer();
       child.pid = 12345 + launches.length;

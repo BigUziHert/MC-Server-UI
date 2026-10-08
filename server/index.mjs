@@ -9,6 +9,7 @@ import { availableParallelism } from "node:os";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import permissionsCatalog from "../shared/subuser-permissions.json" with { type: "json" };
 import { createProcessTelemetry } from "./telemetry.mjs";
+import { createWindowsProcessTree } from "./windows-process-tree.mjs";
 import {
   advertisedConnection,
   createPublicAddressResolver,
@@ -760,6 +761,7 @@ export async function createPanel(options = {}) {
   let stopTimer;
   let terminationPromise;
   let terminationFailure;
+  let terminationTarget;
   let restartRequested = false;
   let closed = false;
   let closePromise;
@@ -1199,6 +1201,7 @@ export async function createPanel(options = {}) {
         };
       status = "starting";
       append("[Panel] Starting server…");
+      const spawnedAt = Date.now();
       const child = (options.spawnServer ?? spawn)(executable, launchArgs, {
         cwd: serverDir,
         shell: false,
@@ -1211,6 +1214,22 @@ export async function createPanel(options = {}) {
         stdio: ["pipe", "pipe", "pipe"],
       });
       processHandle = child;
+      // Keep the owned tree separately: a launcher can exit while a failed
+      // termination still needs verification or a retry against its children.
+      terminationTarget = {
+        child,
+        tree:
+          process.platform === "win32"
+            ? (options.createWindowsProcessTree ?? createWindowsProcessTree)(
+                child,
+                {
+                  startedAt: spawnedAt,
+                  timeoutMs: options.forceStopTimeoutMs ?? 5000,
+                  spawnProcess: options.spawnProcess,
+                },
+              )
+            : undefined,
+      };
       startupMetadata = {
         ...metadataFor(configuration, detectedStartup),
         ...(detectedStartup.gameVersion
@@ -1342,6 +1361,8 @@ export async function createPanel(options = {}) {
 
   function finishProcessExit() {
     if (processHandle || terminationPromise || terminationFailure) return;
+    terminationTarget?.tree?.dispose?.();
+    terminationTarget = undefined;
     status = "offline";
     if (restartRequested && !closed) {
       restartRequested = false;
@@ -1362,14 +1383,17 @@ export async function createPanel(options = {}) {
     // wait for successful tree termination before another server can start.
     terminationFailure = undefined;
     const attempt = Promise.resolve().then(async () => {
-      await terminateProcessTree(child, {
-        tree:
-          process.platform === "win32" ||
-          ["script", "executable"].includes(configuration.launchType),
-        force: true,
-        spawnProcess: options.spawnProcess,
-        timeoutMs: options.forceStopTimeoutMs ?? 5000,
-      });
+      const killRoot = () =>
+        terminateProcessTree(child, {
+          tree:
+            process.platform === "win32" ||
+            ["script", "executable"].includes(configuration.launchType),
+          force: true,
+          spawnProcess: options.spawnProcess,
+          timeoutMs: options.forceStopTimeoutMs ?? 5000,
+        });
+      if (terminationTarget?.tree) await terminationTarget.tree.terminate();
+      else await killRoot();
       treeStopped = true;
       if (processHandle === child) {
         await Promise.race([
@@ -1393,6 +1417,7 @@ export async function createPanel(options = {}) {
       .then(
         async () => {
           terminationPromise = undefined;
+          terminationFailure = undefined;
           finishProcessExit();
           if (explicit) {
             append(
@@ -1438,10 +1463,15 @@ export async function createPanel(options = {}) {
         throw error(409, "Stop the server before using Force Stop.");
       restartRequested = false;
       clearTimeout(stopTimer);
-      if (!terminationPromise && !processHandle)
+      if (!terminationPromise && !terminationTarget)
         throw error(
           409,
-          "The server process has exited, but its process tree could not be confirmed stopped. Check the server processes before restarting the panel.",
+          "The server process is no longer available. Refresh the server status and try again.",
+        );
+      if (!terminationPromise && !processHandle && !terminationTarget.tree)
+        throw error(
+          409,
+          "The server process has exited, but its process group could not be confirmed stopped. Check the server processes before starting another copy.",
         );
       try {
         if (terminationPromise) await terminationPromise;
@@ -1451,7 +1481,7 @@ export async function createPanel(options = {}) {
             "[Panel] Force stopping the server and its owned process tree…",
             "warn",
           );
-          await terminateServer(processHandle, { explicit: true });
+          await terminateServer(terminationTarget.child, { explicit: true });
         }
       } catch {
         // Keep process/system details in the console and audit log while giving
@@ -1460,7 +1490,7 @@ export async function createPanel(options = {}) {
           503,
           processHandle
             ? "Could not force stop the server. It is still stopping. Try Force Stop again."
-            : "The server process exited, but its process tree could not be confirmed stopped. Check the server processes before restarting the panel.",
+            : "The launcher has exited, but some server processes may still be stopping. Try Force Stop again to check and stop the remaining processes.",
         );
       }
       return;
@@ -4555,6 +4585,7 @@ export async function createFleet(options = {}) {
       scheduler: options.scheduler,
       spawnServer: options.spawnServer,
       spawnProcess: options.spawnProcess,
+      createWindowsProcessTree: options.createWindowsProcessTree,
       stopTimeoutMs: options.stopTimeoutMs,
       forceStopTimeoutMs: options.forceStopTimeoutMs,
       backupFlushTimeoutMs: options.backupFlushTimeoutMs,
