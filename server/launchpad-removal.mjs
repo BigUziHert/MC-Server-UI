@@ -1,6 +1,7 @@
 import fs from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import { inspectInstalledMod } from "./launchpad-mod-metadata.mjs";
+import { installedModVersionSatisfies } from "./launchpad-dependency-ranges.mjs";
 import { launchpadError as error } from "./launchpad-network.mjs";
 
 export function createModRemoval(ctx) {
@@ -155,11 +156,57 @@ export function createModRemoval(ctx) {
             404,
             `This installed ${type} no longer exists. Refresh installed ${type}s.`,
           );
+        // A bundled library can also be supplied by a standalone mod or another
+        // bundle (including the dependent's own JAR). Keep each version: an old
+        // copy with the same ID must not hide the loss of a compatible library.
+        const remaining = new Map(),
+          requirements = new Map();
+        for (const row of rows) {
+          if (row === selected) continue;
+          for (const { id, version } of row.providers ?? []) {
+            if (!remaining.has(id)) remaining.set(id, new Set());
+            remaining.get(id).add(version);
+          }
+          for (const { id, range } of row.requirements ?? []) {
+            if (!requirements.has(id)) requirements.set(id, []);
+            requirements.get(id).push(range);
+          }
+        }
         const provided = new Set(selected.provided ?? []);
+        const stillProvided = (id) => {
+          const ranges = requirements.get(id) ?? [];
+          const removedVersions = (selected.providers ?? []).filter(
+            (value) => value.id === id,
+          );
+          return [...(remaining.get(id) ?? [])].some((version) => {
+            if (
+              ["forge", "neoforge"].includes(current.loader) &&
+              ranges.length &&
+              ranges.every((range) =>
+                installedModVersionSatisfies(version, range),
+              )
+            )
+              return true;
+            // For other loader syntax or versions we cannot order, retaining
+            // the same known version preserves the existing requirement. All
+            // selected copies must agree so a lower bundled version cannot
+            // conceal the removal of a higher one.
+            return (
+              typeof version === "string" &&
+              version.length > 0 &&
+              !version.includes("${") &&
+              removedVersions.length > 0 &&
+              removedVersions.every((value) => value.version === version)
+            );
+          });
+        };
         const dependents = rows
           .filter(
             (row) =>
-              row !== selected && row.required?.some((id) => provided.has(id)),
+              row !== selected &&
+              row.required?.some(
+                (id) => provided.has(id) && !stillProvided(id),
+              ),
           )
           .map(({ path, title }) => ({ path, title }));
         const warnings = rows

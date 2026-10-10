@@ -120,6 +120,37 @@ function manifestVersion(source) {
   return attributes.get("implementation-version");
 }
 
+/** A known version can prove an alternate removal provider. Unsupported Maven
+ * syntax and unknown versions remain inconclusive instead of allowing removal.
+ */
+export function installedModVersionSatisfies(version, range) {
+  try {
+    if (
+      typeof version !== "string" ||
+      !version ||
+      version.length > 256 ||
+      /[\s\x00-\x1f\x7f]/.test(version) ||
+      version.includes("${")
+    )
+      return false;
+    if (typeof range === "string" && range.trim() === "*") return true;
+    return permittedByRange(numericVersion(version), range);
+  } catch {
+    return false;
+  }
+}
+
+// Removal can retain mod identities even when their versions are unavailable.
+// The strict manifest parser still prevents an ambiguous substitution proving
+// that a different installed file provides the same version.
+export function installedModManifestVersion(source) {
+  try {
+    return manifestVersion(source);
+  } catch {
+    return undefined;
+  }
+}
+
 function modMetadata(metadata, loader) {
   const modern =
     loader === "neoforge" && metadata.raw.has("META-INF/neoforge.mods.toml");

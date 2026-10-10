@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { crc32 } from "node:zlib";
 import { inspectInstalledMod } from "./launchpad-mod-metadata.mjs";
+import { installedModVersionSatisfies } from "./launchpad-dependency-ranges.mjs";
 
 function zip(entries) {
   const chunks = [],
@@ -74,6 +75,8 @@ for (const type of ["required", "REQUIRED", "ReQuIrEd"]) {
         title: "Example mod",
         provided: ["example_mod"],
         required: ["shared_library"],
+        providers: [{ id: "example_mod", version: "1.0" }],
+        requirements: [{ id: "shared_library", range: undefined }],
       },
     );
   });
@@ -122,6 +125,8 @@ for (const loader of ["forge", "neoforge"]) {
       title: "Example mod",
       provided: ["example_mod"],
       required: ["shared_library"],
+      providers: [{ id: "example_mod", version: "1.0" }],
+      requirements: [{ id: "shared_library", range: undefined }],
     });
   });
 }
@@ -180,6 +185,9 @@ test("custom language loader requirements are retained even without explicit dep
     mod(descriptor("consumer", "", "language_support")),
   );
   assert.deepEqual(result.required, ["language_support"]);
+  assert.deepEqual(result.requirements, [
+    { id: "language_support", range: "[1,)" },
+  ]);
   const bundled = await inspect(wrapper(mod(descriptor("language_support"))));
   assert.deepEqual(bundled.provided, ["language_support"]);
   for (const language of ["javafml", "lowcodefml"])
@@ -196,6 +204,7 @@ test("Fabric metadata keeps aliases and required dependencies with metadata-only
         JSON.stringify({
           schemaVersion: 1,
           id: "example_mod",
+          version: "1.2.3+fabric",
           name: "Fabric example",
           provides: ["alias_mod"],
           depends: { required_library: "*" },
@@ -209,5 +218,242 @@ test("Fabric metadata keeps aliases and required dependencies with metadata-only
     title: "Fabric example",
     provided: ["example_mod", "alias_mod"],
     required: ["required_library"],
+    providers: [
+      { id: "example_mod", version: "1.2.3+fabric" },
+      { id: "alias_mod", version: "1.2.3+fabric" },
+    ],
+    requirements: [{ id: "required_library", range: "*" }],
   });
+});
+
+test("NeoForge preserves required and optional ranges for alternate-provider checks", async () => {
+  const result = await inspect(
+    mod(
+      descriptor(
+        "example_mod",
+        [
+          dependency("required", 'versionRange="[1.5,)"'),
+          dependency("REQUIRED", 'versionRange="(,2.0)"'),
+          dependency("optional", 'versionRange="[9,)"'),
+          dependency("required", 'versionRange="[9,)"\nside="CLIENT"'),
+        ].join("\n"),
+      ),
+    ),
+  );
+  assert.deepEqual(result.required, ["shared_library"]);
+  assert.deepEqual(result.requirements, [
+    { id: "shared_library", range: "[1.5,)" },
+    { id: "shared_library", range: "(,2.0)" },
+    { id: "shared_library", range: "[9,)" },
+  ]);
+});
+
+test("Forge optional constraints do not become mandatory dependencies", async () => {
+  const result = await inspect(
+    mod(
+      descriptor(
+        "example_mod",
+        '[[dependencies.example_mod]]\nmodId="shared_library"\nmandatory=false\nversionRange="[2,)"',
+      ),
+      "forge",
+    ),
+    "forge",
+  );
+  assert.deepEqual(result.required, []);
+  assert.deepEqual(result.requirements, [
+    { id: "shared_library", range: "[2,)" },
+  ]);
+});
+
+for (const type of ["incompatible", "discouraged"]) {
+  test(`NeoForge ${type} declarations keep alternate-provider compatibility inconclusive`, async () => {
+    const result = await inspect(
+      mod(descriptor("example_mod", dependency(type, 'versionRange="[2,)"'))),
+    );
+    assert.deepEqual(result.required, []);
+    assert.deepEqual(result.requirements, [
+      { id: "shared_library", range: undefined },
+    ]);
+  });
+}
+
+test("Forge mod versions resolve manifest substitutions without trusting ambiguous manifests", async () => {
+  const source = descriptor().replace(
+    'version="1.0"',
+    'version="${file.jarVersion}"',
+  );
+  for (const [manifest, expected] of [
+    [
+      "Manifest-Version: 1.0\r\nImplementation-Version: 1.\r\n 8.0\r\n\r\n",
+      "1.8.0",
+    ],
+    [
+      "Manifest-Version: 1.0\nImplementation-Version: 1.8.0\nImplementation-Version: 9.0\n\n",
+      undefined,
+    ],
+    [
+      "Manifest-Version: 1.0\n\nName: nested\nImplementation-Version: 9.0\n\n",
+      undefined,
+    ],
+    [
+      "Manifest-Version: 1.0\nImplementation-Version: ${unresolved}\n\n",
+      undefined,
+    ],
+    ["Manifest-Version: 1.0\nImplementation-Version: 1.8.0", undefined],
+  ]) {
+    const result = await inspect(
+      zip([
+        ["META-INF/mods.toml", source],
+        ["META-INF/MANIFEST.MF", manifest],
+      ]),
+      "forge",
+    );
+    assert.deepEqual(result.provided, ["example_mod"]);
+    assert.deepEqual(result.providers, [
+      { id: "example_mod", version: expected },
+    ]);
+  }
+});
+
+for (const loader of ["forge", "neoforge"]) {
+  test(`${loader} client-only metadata and its descendants cannot provide a server dependency`, async () => {
+    const name = `META-INF/${loader === "neoforge" ? "neoforge.mods.toml" : "mods.toml"}`;
+    const client = zip([
+      [
+        name,
+        `clientSideOnly=true\n${descriptor("client_mod", dependency("required"))}`,
+      ],
+      [
+        "META-INF/jarjar/metadata.json",
+        JSON.stringify({ jars: [{ path: "libs/descendant.jar" }] }),
+      ],
+      ["libs/descendant.jar", mod(descriptor("descendant_mod"), loader)],
+    ]);
+    const root = await inspect(client, loader);
+    assert.deepEqual(root.provided, []);
+    assert.deepEqual(root.required, []);
+    assert.deepEqual(root.providers, []);
+    assert.deepEqual(root.requirements, []);
+
+    const server = await inspect(
+      zip([
+        [name, descriptor("server_mod")],
+        [
+          "META-INF/jarjar/metadata.json",
+          JSON.stringify({
+            jars: [{ path: "libs/client.jar" }, { path: "libs/server.jar" }],
+          }),
+        ],
+        ["libs/client.jar", client],
+        ["libs/server.jar", mod(descriptor("server_library"), loader)],
+      ]),
+      loader,
+    );
+    assert.deepEqual(server.providers, [
+      { id: "server_mod", version: "1.0" },
+      { id: "server_library", version: "1.0" },
+    ]);
+    assert.deepEqual(server.requirements, []);
+    await assert.rejects(
+      inspect(mod(`clientSideOnly="true"\n${descriptor()}`, loader), loader),
+      /could not be read reliably/,
+    );
+  });
+}
+
+test("Fabric preserves raw alternative ranges and excludes client-only metadata", async () => {
+  const metadata = {
+    schemaVersion: 1,
+    id: "example_mod",
+    version: "2.0.0",
+    depends: { shared_library: [">=1.0", "~2.0"] },
+  };
+  const archive = (value) => zip([["fabric.mod.json", JSON.stringify(value)]]);
+  assert.deepEqual((await inspect(archive(metadata), "fabric")).requirements, [
+    { id: "shared_library", range: [">=1.0", "~2.0"] },
+  ]);
+  const client = await inspect(
+    archive({ ...metadata, environment: "client" }),
+    "fabric",
+  );
+  assert.deepEqual(client.providers, []);
+  assert.deepEqual(client.requirements, []);
+});
+
+test("Quilt records alias versions but keeps conditional requirements inconclusive", async () => {
+  const result = await inspect(
+    zip([
+      [
+        "quilt.mod.json",
+        JSON.stringify({
+          schema_version: 1,
+          quilt_loader: {
+            id: "example_mod",
+            version: "2.0",
+            provides: [{ id: "group:alias_mod", version: "1.0" }],
+            depends: [
+              { id: "shared_library", versions: ">=1.5" },
+              [
+                { id: "alternative_one", versions: "*" },
+                { id: "alternative_two", versions: "*" },
+              ],
+              {
+                id: "conditional_mod",
+                versions: "*",
+                unless: { id: "unless_mod", versions: "*" },
+              },
+              { id: "optional_mod", versions: "*", optional: true },
+              { id: "client_mod", versions: "*", environment: "client" },
+            ],
+          },
+        }),
+      ],
+    ]),
+    "quilt",
+  );
+  assert.deepEqual(result.providers, [
+    { id: "example_mod", version: "2.0" },
+    { id: "alias_mod", version: "1.0" },
+  ]);
+  assert.deepEqual(result.requirements, [
+    { id: "shared_library", range: ">=1.5" },
+    { id: "alternative_one", range: undefined },
+    { id: "alternative_two", range: undefined },
+    { id: "conditional_mod", range: undefined },
+    { id: "unless_mod", range: undefined },
+  ]);
+});
+
+test("alternate provider proof accepts numeric Maven ranges and explicit wildcards conservatively", () => {
+  for (const [version, range] of [
+    ["1.8.0", "[1.7.7,)"],
+    ["1.5", "[1.5,2)"],
+    ["1.0.0", "[1]"],
+    ["3", "(,1],[3,)"],
+    ["1.6.0", "*"],
+    ["1.6.0-beta", " * "],
+  ])
+    assert.equal(
+      installedModVersionSatisfies(version, range),
+      true,
+      `${version}: ${range}`,
+    );
+  for (const [version, range] of [
+    ["1.4.8", "[1.7.7,)"],
+    ["2.0", "[1.5,2)"],
+    ["1.0-beta", "[1,)"],
+    ["1.5", "1.5"],
+    ["1.5", ">=1.0"],
+    ["1.5", undefined],
+    ["1.5", ["*"]],
+    [undefined, "*"],
+    ["${file.jarVersion}", "*"],
+    ["", "*"],
+    ["1.5\n", "*"],
+  ])
+    assert.equal(
+      installedModVersionSatisfies(version, range),
+      false,
+      `${version}: ${range}`,
+    );
 });

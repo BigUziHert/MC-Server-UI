@@ -1,5 +1,6 @@
 import { parse } from "smol-toml";
 import { inspectBundledDependencies } from "./launchpad-bundled.mjs";
+import { installedModManifestVersion } from "./launchpad-dependency-ranges.mjs";
 import { launchpadError } from "./launchpad-network.mjs";
 
 const invalid = () => {
@@ -31,13 +32,18 @@ const libraryWrapper = (metadata) => {
   return ["LIBRARY", "GAMELIBRARY"].includes(types[0]?.[1]);
 };
 
-/** Read required mod IDs from the installed loader's authoritative metadata.
- * This checks removal, not version-range satisfaction. Alternate/conditional
- * requirements are treated conservatively, never used to justify deletion.
+/** Read mod identities and raw version constraints for removal checks.
+ * Alternate/conditional requirements are retained conservatively; the removal
+ * check decides whether a remaining provider can be proved compatible.
+ * `required` lists mandatory IDs; `requirements` also records constraints from
+ * optional dependencies that apply while a replacement provider is installed.
  */
 export async function inspectInstalledMod(archive, { loader, signal } = {}) {
   const provided = new Set(),
-    required = new Set();
+    required = new Set(),
+    providers = [],
+    requirements = [],
+    clientOnlyPaths = [];
   let title,
     recognized = false,
     wrapped = false;
@@ -45,10 +51,30 @@ export async function inspectInstalledMod(archive, { loader, signal } = {}) {
     loader,
     signal,
     metadataOnly: true,
-    visitMetadata(metadata, { depth, serverCompatible }) {
+    visitMetadata(metadata, { depth, path, serverCompatible }) {
       if (!depth && ["forge", "neoforge"].includes(loader))
         wrapped = libraryWrapper(metadata);
-      const add = (set, value) => set.add(identifier(value));
+      const provide = (value, version) => {
+        const id = identifier(value);
+        provided.add(id);
+        providers.push({
+          id,
+          version:
+            typeof version === "string" &&
+            version.length > 0 &&
+            version.length <= 256 &&
+            !/[\s\x00-\x1f\x7f]/.test(version) &&
+            !version.includes("${")
+              ? version
+              : undefined,
+        });
+      };
+      const constrain = (value, range) => {
+        const id = identifier(value);
+        requirements.push({ id, range });
+        return id;
+      };
+      const require = (value, range) => required.add(constrain(value, range));
       const named = (value) => {
         if (
           (!depth || (wrapped && !title)) &&
@@ -66,15 +92,19 @@ export async function inspectInstalledMod(archive, { loader, signal } = {}) {
         const mod = metadata.quilt.quilt_loader;
         if (!depth) recognized = true;
         if (!serverCompatible) return;
-        add(provided, mod.id);
+        provide(mod.id, mod.version);
         named(mod.metadata?.name ?? mod.id);
         for (const alias of list(mod.provides))
-          add(provided, object(alias) ? alias.id : alias);
-        const dependency = (value, depth = 0) => {
+          provide(
+            object(alias) ? alias.id : alias,
+            object(alias) ? (alias.version ?? mod.version) : mod.version,
+          );
+        const dependency = (value, depth = 0, conditional = false) => {
           if (depth > 16) invalid();
           if (Array.isArray(value)) {
-            for (const alternative of value) dependency(alternative, depth + 1);
-          } else if (typeof value === "string") add(required, value);
+            for (const alternative of value)
+              dependency(alternative, depth + 1, true);
+          } else if (typeof value === "string") require(value);
           else if (object(value)) {
             if (value.optional === true || value.environment === "client")
               return;
@@ -83,9 +113,12 @@ export async function inspectInstalledMod(archive, { loader, signal } = {}) {
               typeof value.optional !== "boolean"
             )
               invalid();
-            add(required, value.id);
+            require(value.id, conditional || value.unless !== undefined
+              ? undefined
+              : value.versions);
             // Removing an `unless` mod can activate a requirement as well.
-            if (value.unless !== undefined) dependency(value.unless, depth + 1);
+            if (value.unless !== undefined)
+              dependency(value.unless, depth + 1, true);
           } else invalid();
         };
         for (const value of list(mod.depends)) dependency(value);
@@ -97,11 +130,12 @@ export async function inspectInstalledMod(archive, { loader, signal } = {}) {
         if (mod.schemaVersion !== 1) invalid();
         if (!depth) recognized = true;
         if (!serverCompatible) return;
-        add(provided, mod.id);
+        provide(mod.id, mod.version);
         named(mod.name ?? mod.id);
-        for (const alias of list(mod.provides)) add(provided, alias);
+        for (const alias of list(mod.provides)) provide(alias, mod.version);
         if (mod.depends !== undefined && !object(mod.depends)) invalid();
-        for (const id of Object.keys(mod.depends ?? {})) add(required, id);
+        for (const [id, range] of Object.entries(mod.depends ?? {}))
+          require(id, range);
       } else if (loader === "forge" || loader === "neoforge") {
         const source =
           loader === "neoforge"
@@ -113,9 +147,29 @@ export async function inspectInstalledMod(archive, { loader, signal } = {}) {
         const mods = list(mod.mods);
         if (!mods.length) invalid();
         if (!depth) recognized = true;
-        if (!serverCompatible) return;
+        if (
+          mod.clientSideOnly !== undefined &&
+          typeof mod.clientSideOnly !== "boolean"
+        )
+          invalid();
+        if (mod.clientSideOnly === true) clientOnlyPaths.push(path);
+        if (
+          !serverCompatible ||
+          clientOnlyPaths.some(
+            (parent) =>
+              !parent || path === parent || path.startsWith(`${parent}!/`),
+          )
+        )
+          return;
         for (const value of mods) {
-          add(provided, value.modId);
+          provide(
+            value.modId,
+            value.version === "${file.jarVersion}"
+              ? installedModManifestVersion(
+                  metadata.raw.get("META-INF/MANIFEST.MF"),
+                )
+              : value.version,
+          );
           named(value.displayName ?? value.modId);
         }
         // Language support is required even when authors omit a matching entry
@@ -124,7 +178,7 @@ export async function inspectInstalledMod(archive, { loader, signal } = {}) {
           mod.modLoader !== undefined &&
           !["javafml", "lowcodefml"].includes(mod.modLoader)
         )
-          add(required, mod.modLoader);
+          require(mod.modLoader, mod.loaderVersion);
         if (mod.dependencies !== undefined && !object(mod.dependencies))
           invalid();
         for (const dependencies of Object.values(mod.dependencies ?? {})) {
@@ -150,12 +204,21 @@ export async function inspectInstalledMod(archive, { loader, signal } = {}) {
                 ].includes(type)
               )
                 invalid();
-              if (type !== "required") continue;
+              if (type !== "required") {
+                constrain(
+                  value.modId,
+                  type === "optional" ? value.versionRange : undefined,
+                );
+                continue;
+              }
             } else if (value.mandatory !== undefined) {
               if (typeof value.mandatory !== "boolean") invalid();
-              if (!value.mandatory) continue;
+              if (!value.mandatory) {
+                constrain(value.modId, value.versionRange);
+                continue;
+              }
             }
-            add(required, value.modId);
+            require(value.modId, value.versionRange);
           }
         }
       }
@@ -165,5 +228,11 @@ export async function inspectInstalledMod(archive, { loader, signal } = {}) {
   // language support packages). Only actual nested mod metadata identifies it;
   // a manifest label or arbitrary embedded files alone cannot justify removal.
   if (!recognized && !(wrapped && provided.size)) invalid();
-  return { title, provided: [...provided], required: [...required] };
+  return {
+    title,
+    provided: [...provided],
+    required: [...required],
+    providers,
+    requirements,
+  };
 }

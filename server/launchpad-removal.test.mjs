@@ -57,7 +57,11 @@ function zip(entries) {
   end.writeUInt32LE(offset, 16);
   return Buffer.concat([...chunks, directory, end]);
 }
-function mod(loader, id, dependencies = [], extra = {}) {
+function mod(loader, id, dependencies = [], extra = {}, bundled = []) {
+  const nested = bundled.map((contents, index) => [
+    `libs/nested-${index}.jar`,
+    contents,
+  ]);
   if (loader === "fabric" || loader === "quilt") {
     const metadata = {
       schemaVersion: 1,
@@ -65,9 +69,10 @@ function mod(loader, id, dependencies = [], extra = {}) {
       version: "1.0",
       name: id,
       depends: Object.fromEntries(dependencies.map((value) => [value, "*"])),
+      ...(nested.length && { jars: nested.map(([file]) => ({ file })) }),
       ...extra,
     };
-    return zip([["fabric.mod.json", JSON.stringify(metadata)]]);
+    return zip([["fabric.mod.json", JSON.stringify(metadata)], ...nested]);
   }
   const declaration = [
     'modLoader="javafml"',
@@ -75,7 +80,7 @@ function mod(loader, id, dependencies = [], extra = {}) {
     'license="MIT"',
     "[[mods]]",
     `modId="${id}"`,
-    'version="1.0"',
+    `version="${extra.version ?? "1.0"}"`,
     `displayName="${id}"`,
     ...dependencies.flatMap((value) => [
       `[[dependencies.${id}]]`,
@@ -83,7 +88,7 @@ function mod(loader, id, dependencies = [], extra = {}) {
       loader === "neoforge"
         ? `type="${value.type ?? "required"}"`
         : `mandatory=${value.mandatory ?? true}`,
-      'versionRange="[1,)"',
+      `versionRange="${value.range ?? "[1,)"}"`,
       `side="${value.side ?? "BOTH"}"`,
     ]),
   ].join("\n");
@@ -92,6 +97,15 @@ function mod(loader, id, dependencies = [], extra = {}) {
       `META-INF/${loader === "neoforge" ? "neoforge.mods.toml" : "mods.toml"}`,
       declaration,
     ],
+    ...(nested.length
+      ? [
+          [
+            "META-INF/jarjar/metadata.json",
+            JSON.stringify({ jars: nested.map(([path]) => ({ path })) }),
+          ],
+          ...nested,
+        ]
+      : []),
   ]);
 }
 async function fixture(
@@ -485,6 +499,374 @@ test("native Quilt metadata protects qualified aliases while optional and client
     (await f.service.removalPreview({ path: "mods/library.jar" })).blocked,
     false,
   );
+});
+
+for (const loader of ["neoforge", "forge", "fabric", "quilt"]) {
+  for (const provider of ["standalone", "bundled", "consumer"]) {
+    test(`${loader} removal permits shared bundled libraries supplied by another ${provider} JAR`, async (t) => {
+      const lithostitched = mod(loader, "lithostitched"),
+        sablecompanion = mod(loader, "sablecompanion");
+      const files = {
+        "create_submarine.jar": mod(loader, "create_submarine", [], {}, [
+          lithostitched,
+          sablecompanion,
+        ]),
+        "ctov.jar": mod(
+          loader,
+          "ctov",
+          ["lithostitched"],
+          {},
+          provider === "consumer" ? [lithostitched] : [],
+        ),
+        "terralith.jar": mod(loader, "terralith", ["lithostitched"]),
+        "createpropulsion.jar": mod(
+          loader,
+          "createpropulsion",
+          ["sablecompanion"],
+          {},
+          provider === "consumer" ? [sablecompanion] : [],
+        ),
+      };
+      if (provider === "standalone") {
+        files["lithostitched.jar"] = lithostitched;
+        files["sablecompanion.jar"] = sablecompanion;
+      } else if (provider === "bundled") {
+        files["other_bundle.jar"] = mod(loader, "other_bundle", [], {}, [
+          lithostitched,
+          sablecompanion,
+        ]);
+      }
+      const f = await fixture(t, { loader, files });
+      const plan = await f.service.removalPreview({
+        path: "mods/create_submarine.jar",
+      });
+      assert.equal(plan.blocked, false);
+      assert.deepEqual(plan.dependents, []);
+      assert.deepEqual(plan.warnings, []);
+      await f.service.remove({ planId: plan.planId, confirmed: true });
+      await assert.rejects(f.read("mods/create_submarine.jar"), {
+        code: "ENOENT",
+      });
+      for (const [name, contents] of Object.entries(files))
+        if (name !== "create_submarine.jar")
+          assert.deepEqual(await f.read(`mods/${name}`), contents);
+      assert.deepEqual(
+        (await f.bin.list()).map((entry) => entry.originalPath),
+        ["mods/create_submarine.jar"],
+      );
+      assert.deepEqual(f.state.network, []);
+    });
+  }
+
+  test(`${loader} alternate shared libraries do not hide unique bundled or direct required dependencies`, async (t) => {
+    const lithostitched = mod(loader, "lithostitched");
+    const selected = mod(loader, "create_submarine", [], {}, [
+      lithostitched,
+      mod(loader, "sablecompanion"),
+    ]);
+    const f = await fixture(t, {
+      loader,
+      files: {
+        "create_submarine.jar": selected,
+        "lithostitched.jar": lithostitched,
+        "ctov.jar": mod(loader, "ctov", ["lithostitched"]),
+        "terralith.jar": mod(loader, "terralith", ["lithostitched"]),
+        "createpropulsion.jar": mod(loader, "createpropulsion", [
+          "sablecompanion",
+        ]),
+        "submarine_addon.jar": mod(loader, "submarine_addon", [
+          "create_submarine",
+        ]),
+      },
+    });
+    const plan = await f.service.removalPreview({
+      path: "mods/create_submarine.jar",
+    });
+    assert.equal(plan.blocked, true);
+    assert.deepEqual(
+      plan.dependents.map((entry) => entry.path),
+      ["mods/createpropulsion.jar", "mods/submarine_addon.jar"],
+    );
+    assert.deepEqual(plan.warnings, []);
+    assert.equal(plan.planId, undefined);
+    assert.deepEqual(await f.read("mods/create_submarine.jar"), selected);
+    assert.deepEqual(await f.bin.list(), []);
+  });
+}
+
+for (const loader of ["fabric", "quilt"]) {
+  test(`${loader} remaining provided aliases satisfy shared bundled requirements`, async (t) => {
+    const library =
+      loader === "quilt"
+        ? zip([
+            [
+              "quilt.mod.json",
+              JSON.stringify({
+                schema_version: 1,
+                quilt_loader: {
+                  group: "test",
+                  id: "library",
+                  version: "1.0",
+                  provides: [{ id: "library_alias", version: "1.0" }],
+                },
+              }),
+            ],
+          ])
+        : mod(loader, "library", [], { provides: ["library_alias"] });
+    const f = await fixture(t, {
+      loader,
+      files: {
+        "selected.jar": mod(loader, "selected", [], {}, [library]),
+        "library.jar": library,
+        "consumer.jar": mod(loader, "consumer", ["library_alias"]),
+      },
+    });
+    const plan = await f.service.removalPreview({ path: "mods/selected.jar" });
+    assert.equal(plan.blocked, false);
+    assert.deepEqual(plan.dependents, []);
+    assert.deepEqual(plan.warnings, []);
+    await f.service.remove({ planId: plan.planId, confirmed: true });
+    const soleProvider = await f.service.removalPreview({
+      path: "mods/library.jar",
+    });
+    assert.equal(soleProvider.blocked, true);
+    assert.deepEqual(
+      soleProvider.dependents.map((entry) => entry.path),
+      ["mods/consumer.jar"],
+    );
+  });
+}
+
+test("unreadable and client-only bundles cannot satisfy a server dependency during removal", async (t) => {
+  const library = mod("fabric", "library");
+  const f = await fixture(t, {
+    loader: "fabric",
+    files: {
+      "selected.jar": mod("fabric", "selected", [], {}, [library]),
+      "consumer.jar": mod("fabric", "consumer", ["library"]),
+      // Inspection discovers the library ID before hitting invalid metadata.
+      "unreadable.jar": mod("fabric", "library", [], { depends: [] }),
+      "client.jar": mod("fabric", "client", [], { environment: "client" }, [
+        library,
+      ]),
+    },
+  });
+  const plan = await f.service.removalPreview({ path: "mods/selected.jar" });
+  assert.equal(plan.blocked, true);
+  assert.deepEqual(
+    plan.dependents.map((entry) => entry.path),
+    ["mods/consumer.jar"],
+  );
+  assert.equal(plan.warnings.length, 1);
+  assert.match(plan.warnings[0], /unreadable\.jar/);
+  assert.equal(plan.planId, undefined);
+  assert.deepEqual(await f.bin.list(), []);
+});
+
+for (const { name, ranges, versions, blocked, splitConsumers = false } of [
+  {
+    name: "an older alternate below the required version",
+    ranges: ["[2,)"],
+    versions: ["1.0"],
+    blocked: true,
+  },
+  {
+    name: "an older alternate within the required range",
+    ranges: ["[1,)"],
+    versions: ["1.0"],
+    blocked: false,
+  },
+  {
+    name: "alternates that satisfy different constraints separately",
+    ranges: ["[1,2]", "[2,3]"],
+    versions: ["1.0", "3.0"],
+    blocked: true,
+  },
+  {
+    name: "one alternate that satisfies all constraints",
+    ranges: ["[1,2]", "[2,3]"],
+    versions: ["1.0", "2.0", "3.0"],
+    blocked: false,
+  },
+  {
+    name: "separate consumers that cannot share any surviving version",
+    ranges: ["[1,2]", "[2,3]"],
+    versions: ["1.0", "3.0"],
+    blocked: true,
+    splitConsumers: true,
+  },
+  {
+    name: "separate consumers that can share one surviving version",
+    ranges: ["[1,2]", "[2,3]"],
+    versions: ["1.0", "2.0", "3.0"],
+    blocked: false,
+    splitConsumers: true,
+  },
+]) {
+  test(`NeoForge shared library removal checks ${name}`, async (t) => {
+    const selected = mod("neoforge", "selected", [], {}, [
+      mod("neoforge", "library", [], { version: "2.0" }),
+    ]);
+    const consumers = splitConsumers
+      ? Object.fromEntries(
+          ranges.map((range, index) => [
+            `consumer-${index}.jar`,
+            mod("neoforge", `consumer_${index}`, [{ id: "library", range }]),
+          ]),
+        )
+      : {
+          "consumer.jar": mod(
+            "neoforge",
+            "consumer",
+            ranges.map((range) => ({ id: "library", range })),
+          ),
+        };
+    const files = {
+      "selected.jar": selected,
+      ...consumers,
+      ...Object.fromEntries(
+        versions.map((version, index) => [
+          `alternate-${index}.jar`,
+          mod("neoforge", "library", [], { version }),
+        ]),
+      ),
+    };
+    const f = await fixture(t, { files });
+    const plan = await f.service.removalPreview({ path: "mods/selected.jar" });
+    assert.equal(plan.blocked, blocked);
+    assert.deepEqual(
+      plan.dependents.map((entry) => entry.path),
+      blocked ? Object.keys(consumers).map((name) => `mods/${name}`) : [],
+    );
+    assert.deepEqual(plan.warnings, []);
+    if (blocked) {
+      assert.equal(plan.planId, undefined);
+      assert.deepEqual(await f.read("mods/selected.jar"), selected);
+    } else {
+      await f.service.remove({ planId: plan.planId, confirmed: true });
+      await assert.rejects(f.read("mods/selected.jar"), { code: "ENOENT" });
+    }
+    for (const [filename, contents] of Object.entries(files))
+      if (filename !== "selected.jar")
+        assert.deepEqual(await f.read(`mods/${filename}`), contents);
+    assert.deepEqual(f.state.network, []);
+  });
+}
+
+for (const loader of ["forge", "neoforge"]) {
+  for (const version of ["1.0", "2.0"]) {
+    test(`${loader} shared library removal respects optional compatibility constraints with surviving version ${version}`, async (t) => {
+      const files = {
+        "selected.jar": mod(loader, "selected", [], {}, [
+          mod(loader, "library", [], { version: "2.0" }),
+        ]),
+        "alternate.jar": mod(loader, "library", [], { version }),
+        "required.jar": mod(loader, "required_consumer", [
+          { id: "library", range: "[1,)" },
+        ]),
+        "optional.jar": mod(loader, "optional_consumer", [
+          {
+            id: "library",
+            range: "[2,)",
+            type: "optional",
+            mandatory: false,
+          },
+        ]),
+      };
+      const f = await fixture(t, { loader, files });
+      const plan = await f.service.removalPreview({
+        path: "mods/selected.jar",
+      });
+      const blocked = version === "1.0";
+      assert.equal(plan.blocked, blocked);
+      assert.deepEqual(
+        plan.dependents.map((entry) => entry.path),
+        blocked ? ["mods/required.jar"] : [],
+      );
+      assert.deepEqual(plan.warnings, []);
+      if (blocked) {
+        assert.equal(plan.planId, undefined);
+        assert.deepEqual(
+          await f.read("mods/selected.jar"),
+          files["selected.jar"],
+        );
+        assert.deepEqual(await f.bin.list(), []);
+      } else {
+        await f.service.remove({ planId: plan.planId, confirmed: true });
+        await assert.rejects(f.read("mods/selected.jar"), { code: "ENOENT" });
+      }
+      for (const [name, contents] of Object.entries(files))
+        if (name !== "selected.jar")
+          assert.deepEqual(await f.read(`mods/${name}`), contents);
+      assert.deepEqual(f.state.network, []);
+    });
+  }
+}
+
+test("retaining one lower version cannot hide a higher bundled version needed by a Fabric consumer", async (t) => {
+  const lower = mod("fabric", "library", [], { version: "1.0" });
+  const selected = mod("fabric", "selected", [], {}, [
+    lower,
+    mod("fabric", "library", [], { version: "2.0" }),
+  ]);
+  const f = await fixture(t, {
+    loader: "fabric",
+    files: {
+      "selected.jar": selected,
+      "alternate.jar": lower,
+      "consumer.jar": mod("fabric", "consumer", [], {
+        depends: { library: ">=2.0" },
+      }),
+    },
+  });
+  const plan = await f.service.removalPreview({ path: "mods/selected.jar" });
+  assert.equal(plan.blocked, true);
+  assert.deepEqual(
+    plan.dependents.map((entry) => entry.path),
+    ["mods/consumer.jar"],
+  );
+  assert.deepEqual(plan.warnings, []);
+  assert.equal(plan.planId, undefined);
+  assert.deepEqual(await f.read("mods/selected.jar"), selected);
+});
+
+test("Create Submarine removal accepts retained Lithostitched and SableCompanion versions matching installed consumers", async (t) => {
+  const files = {
+    "create_submarine.jar": mod("neoforge", "create_submarine", [], {}, [
+      mod("neoforge", "lithostitched", [], { version: "1.4.8" }),
+      mod("neoforge", "sablecompanion", [], { version: "1.6.0" }),
+    ]),
+    "lithostitched.jar": mod("neoforge", "lithostitched", [], {
+      version: "1.8.0",
+    }),
+    "sablecompanion.jar": mod("neoforge", "sablecompanion", [], {
+      version: "1.4.2",
+    }),
+    "ctov.jar": mod("neoforge", "ctov", [
+      { id: "lithostitched", range: "[1.5,)" },
+    ]),
+    "terralith.jar": mod("neoforge", "terralith", [
+      { id: "lithostitched", range: "[1.7.7,)" },
+    ]),
+    "createpropulsion.jar": mod("neoforge", "createpropulsion", [
+      { id: "sablecompanion", range: "*" },
+    ]),
+  };
+  const f = await fixture(t, { files });
+  const plan = await f.service.removalPreview({
+    path: "mods/create_submarine.jar",
+  });
+  assert.equal(plan.blocked, false);
+  assert.deepEqual(plan.dependents, []);
+  assert.deepEqual(plan.warnings, []);
+  await f.service.remove({ planId: plan.planId, confirmed: true });
+  await assert.rejects(f.read("mods/create_submarine.jar"), {
+    code: "ENOENT",
+  });
+  for (const [name, contents] of Object.entries(files))
+    if (name !== "create_submarine.jar")
+      assert.deepEqual(await f.read(`mods/${name}`), contents);
+  assert.deepEqual(f.state.network, []);
 });
 
 for (const change of ["add", "replace", "remove"]) {
