@@ -57,6 +57,7 @@ files:
   - server/launchpad-archives.mjs
   - server/launchpad-bundled.mjs
   - server/launchpad-dependency-ranges.mjs
+  - server/launchpad-update-dependencies.mjs
   - server/launchpad-mod-metadata.mjs
   - server/launchpad-removal.mjs
   - server/launchpad-providers.mjs

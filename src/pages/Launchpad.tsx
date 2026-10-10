@@ -96,6 +96,7 @@ type InstalledItem = {
 };
 type Job = {
   id: string;
+  planId?: string;
   status: "queued" | "running" | "completed" | "failed";
   message: string;
   completed: number;
@@ -512,6 +513,7 @@ export default function Launchpad({
   const [jobAction, setJobAction] = useState(false);
   const jobActionPending = useRef(false);
   const jobEpoch = useRef(0);
+  const unavailableJobs = useRef(new Set<string>());
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [apiKey, setApiKey] = useState("");
   const [settingsError, setSettingsError] = useState("");
@@ -558,6 +560,8 @@ export default function Launchpad({
   const loadConfig = useCallback(
     async (initial = false, fresh = false) => {
       const current = session.current;
+      const currentOperation = operation.current;
+      const epoch = jobEpoch.current;
       setConfigLoading(true);
       setConfigError("");
       try {
@@ -568,6 +572,20 @@ export default function Launchpad({
         setConfig(next);
         setStatus(next.status);
         setStatusStale(false);
+        // Refresh can discover an accepted installation whose POST response was
+        // lost. Older reads must not replace a newer submission, poll or action.
+        if (
+          epoch === jobEpoch.current &&
+          currentOperation === operation.current &&
+          !jobActionPending.current &&
+          !pending.current &&
+          (!next.job || !unavailableJobs.current.has(next.job.id)) &&
+          (next.job || initial)
+        ) {
+          jobEpoch.current++;
+          setJob(next.job ?? null);
+          setJobError("");
+        }
         if (initial) {
           const saved = readSavedView(viewKey);
           const first =
@@ -616,7 +634,6 @@ export default function Launchpad({
           );
           setInstalledSort(saved.installedSort ?? "updates");
           setViewReady(viewKey);
-          setJob(next.job ?? null);
         }
         return true;
       } catch (cause) {
@@ -684,6 +701,7 @@ export default function Launchpad({
     session.current++;
     jobActionPending.current = false;
     jobEpoch.current++;
+    unavailableJobs.current.clear();
     setJobAction(false);
     setViewReady(null);
     setConfig(null);
@@ -1114,6 +1132,7 @@ export default function Launchpad({
           timer = window.setTimeout(poll, 1000);
           return;
         }
+        jobEpoch.current++;
         setJob(next.job);
         setJobError("");
         if (next.job.status === "completed") {
@@ -1127,8 +1146,14 @@ export default function Launchpad({
         if (["queued", "running"].includes(next.job.status))
           timer = window.setTimeout(poll, 1000);
       } catch (cause) {
-        if (!controller.signal.aborted && epoch === jobEpoch.current) {
+        if (!controller.signal.aborted) {
+          if (epoch !== jobEpoch.current) {
+            timer = window.setTimeout(poll, 1000);
+            return;
+          }
           if ((cause as { status?: number }).status === 404) {
+            unavailableJobs.current.add(job.id);
+            jobEpoch.current++;
             setJob(null);
             setJobError(
               "This installation is no longer being tracked. Check the installed list for its result.",
@@ -1406,6 +1431,27 @@ export default function Launchpad({
     }
     const currentSession = session.current,
       currentOperation = operation.current;
+    jobEpoch.current++;
+    const accept = (next: Job) => {
+      consumedPlans.current.add(plan.planId);
+      jobEpoch.current++;
+      setJob(next);
+      setPendingPaths(
+        new Set(
+          plan.cleanInstall || type === "modpack"
+            ? inventoryRef.current?.result.items.map((item) => item.path)
+            : plan.files.flatMap((file) => [
+                file.path,
+                ...(file.previousPath ? [file.previousPath] : []),
+              ]),
+        ),
+      );
+      setJobError("");
+      setSelection(null);
+      setPlan(null);
+      if (["completed", "failed"].includes(next.status)) void reconcileJob();
+      if (next.status === "completed") notify(next.message);
+    };
     pending.current = true;
     setBusy("install");
     setDialogError("");
@@ -1428,37 +1474,28 @@ export default function Launchpad({
           ? { acknowledgedUnavailableDependencies: true }
           : {}),
       });
-      consumedPlans.current.add(plan.planId);
       if (
         currentSession !== session.current ||
         currentOperation !== operation.current
       )
         return;
-      setJob(next.job);
-      setPendingPaths(
-        new Set(
-          plan.cleanInstall || type === "modpack"
-            ? inventoryRef.current?.result.items.map((item) => item.path)
-            : plan.files.flatMap((file) => [
-                file.path,
-                ...(file.previousPath ? [file.previousPath] : []),
-              ]),
-        ),
-      );
-      setJobError("");
-      setSelection(null);
-      setPlan(null);
-      if (next.job.status === "completed") {
-        void reconcileJob();
-        notify(next.job.message);
-      }
-      if (next.job.status === "failed") void reconcileJob();
+      accept(next.job);
     } catch (cause) {
+      // The host owns accepted work even when the transport loses its response.
+      // Correlate by review, never by whichever unrelated job is retained last.
+      const accepted = await recoverAcceptedJob(
+        plan.planId,
+        job?.id,
+        currentSession,
+        currentOperation,
+      );
       if (
         currentSession === session.current &&
         currentOperation === operation.current
-      )
-        setDialogError(messageOf(cause));
+      ) {
+        if (accepted) accept(accepted);
+        else setDialogError(messageOf(cause));
+      }
     } finally {
       if (
         currentSession === session.current &&
@@ -1468,6 +1505,32 @@ export default function Launchpad({
         setBusy(null);
       }
     }
+  }
+  async function recoverAcceptedJob(
+    planId: string,
+    previousJobId: string | undefined,
+    currentSession: number,
+    currentOperation: number,
+  ) {
+    if (
+      currentSession !== session.current ||
+      currentOperation !== operation.current
+    )
+      return null;
+    try {
+      const next = await api<Config>("/launchpad");
+      if (
+        currentSession === session.current &&
+        currentOperation === operation.current &&
+        next.job?.planId === planId &&
+        next.job.id !== previousJobId
+      )
+        return next.job;
+    } catch {
+      // Keep the original submission error. Refresh can recover when the host
+      // becomes reachable again without repeating the installation request.
+    }
+    return null;
   }
   async function reviewAllUpdates() {
     if (pending.current || !canInstall || type === "modpack") return;
@@ -1530,7 +1593,17 @@ export default function Launchpad({
   async function retryDownload() {
     if (pending.current || !canInstall || !job?.retryable || !job.retryInput)
       return;
-    const currentSession = session.current;
+    const currentSession = session.current,
+      currentOperation = ++operation.current;
+    jobEpoch.current++;
+    const accept = (next: Job) => {
+      jobEpoch.current++;
+      setJob(next);
+      setJobError("");
+      if (["completed", "failed"].includes(next.status)) void reconcileJob();
+      if (next.status === "completed")
+        notify(next.message || "Installation completed.");
+    };
     pending.current = true;
     setBusy("install");
     setJobError("");
@@ -1539,17 +1612,30 @@ export default function Launchpad({
         "/launchpad/install",
         job.retryInput,
       );
-      if (currentSession === session.current) {
-        setJob(result.job);
-        if (["completed", "failed"].includes(result.job.status))
-          void reconcileJob();
-        if (result.job.status === "completed")
-          notify(result.job.message || "Installation completed.");
-      }
+      if (
+        currentSession === session.current &&
+        currentOperation === operation.current
+      )
+        accept(result.job);
     } catch (cause) {
-      if (currentSession === session.current) setJobError(messageOf(cause));
+      const accepted = await recoverAcceptedJob(
+        job.retryInput.planId,
+        job.id,
+        currentSession,
+        currentOperation,
+      );
+      if (
+        currentSession === session.current &&
+        currentOperation === operation.current
+      ) {
+        if (accepted) accept(accepted);
+        else setJobError(messageOf(cause));
+      }
     } finally {
-      if (currentSession === session.current) {
+      if (
+        currentSession === session.current &&
+        currentOperation === operation.current
+      ) {
         pending.current = false;
         setBusy(null);
       }
@@ -2075,10 +2161,12 @@ export default function Launchpad({
                       `/launchpad/jobs/${encodeURIComponent(job.id)}/dismiss`,
                     )
                       .then(() => {
-                        if (currentSession === session.current)
+                        if (currentSession === session.current) {
+                          jobEpoch.current++;
                           setJob((current) =>
                             current?.id === job.id ? null : current,
                           );
+                        }
                       })
                       .catch((cause) => notify(messageOf(cause), true));
                   }}

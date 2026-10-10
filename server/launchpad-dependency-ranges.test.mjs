@@ -353,7 +353,7 @@ test("malformed identities, dependency shapes and unknown type or side return fa
   assert.equal(await proof(zip([["description.txt", "sable 2.0.5"]])), false);
 });
 
-test("NeoForge defaults type to required and excludes client-only archives", async () => {
+test("NeoForge defaults type to required and ignores Forge's clientSideOnly flag", async () => {
   assert.equal(
     await proof(
       jar({
@@ -366,15 +366,34 @@ test("NeoForge defaults type to required and excludes client-only archives", asy
   );
   assert.equal(
     await proof(parent("[1,)", { header: "clientSideOnly=true" })),
-    false,
+    true,
   );
   assert.equal(
     await proof(
       parent(),
       installed("2.0.5", { header: "clientSideOnly=true" }),
     ),
-    false,
+    true,
   );
+  assert.equal(
+    await proof(parent("[1,)", { header: 'clientSideOnly="true"' })),
+    true,
+  );
+  for (const [range, expected] of [
+    ["[2,3)", true],
+    ["[3,)", false],
+  ]) {
+    const bundled = jar({
+      mods: [["bundled_consumer", "1.0"]],
+      header: "clientSideOnly=true",
+      dependencies: [dependency(range)],
+    });
+    assert.equal(
+      await proof(parent("[1,)", { extra: nested(bundled) })),
+      expected,
+      "NeoForge checks required ranges declared by marked bundled mods",
+    );
+  }
 });
 
 test("Forge mandatory server requirements use Forge metadata, with no fabricated Fabric proof", async () => {
@@ -411,6 +430,36 @@ test("Forge mandatory server requirements use Forge metadata, with no fabricated
       await installedDependencySatisfies(parent(), installed(), { loader }),
       false,
     );
+});
+
+test("Forge clientSideOnly archives still cannot prove an installed server dependency", async () => {
+  const forgeParent = (header = "") =>
+    parent("[1,)", {
+      loader: "forge",
+      header,
+      dependencies: [dependency("[1,)", { mandatory: true, type: undefined })],
+    });
+  const forgeChild = (header = "") =>
+    installed("2.0.5", { loader: "forge", header });
+  for (const marker of ["true", '"true"']) {
+    const header = `clientSideOnly=${marker}`;
+    assert.equal(
+      await proof(forgeParent(header), forgeChild(), "forge"),
+      false,
+    );
+    assert.equal(
+      await proof(forgeParent(), forgeChild(header), "forge"),
+      false,
+    );
+  }
+  assert.equal(
+    await proof(
+      forgeParent("clientSideOnly=false"),
+      forgeChild("clientSideOnly=false"),
+      "forge",
+    ),
+    true,
+  );
 });
 
 test("only an unambiguous main manifest version resolves file.jarVersion", async () => {

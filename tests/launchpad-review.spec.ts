@@ -1,5 +1,10 @@
 import { test as base, expect, type Page, type Route } from "@playwright/test";
-import { createProcessServer, removeTestServer } from "./server-fixtures";
+import {
+  createProcessServer,
+  removeTestServer,
+  stopTestServer,
+} from "./server-fixtures";
+import { createRequire } from "node:module";
 
 const test = base.extend<{ serverId: string }>({
   serverId: async ({ request }, use) => {
@@ -15,6 +20,7 @@ const test = base.extend<{ serverId: string }>({
     expect(response.status()).toBe(201);
     const { server } = await response.json();
     try {
+      await stopTestServer(request, server.id);
       await use(server.id);
     } finally {
       await removeTestServer(request, server.id);
@@ -102,6 +108,551 @@ const plan = {
   files: [{ path: "mods/a.jar", size: 100, action: "replace" }],
   warnings: [],
 };
+
+const acceptedJob = {
+  id: "accepted-job",
+  planId: "review",
+  status: "running",
+  message: "Downloading example.jar",
+  completed: 0,
+  total: 1,
+  cancellable: true,
+};
+
+async function reviewInstallation(page: Page) {
+  await page.getByRole("button", { name: "Install Pack", exact: true }).click();
+  await page
+    .getByRole("button", { name: "Review installation", exact: true })
+    .click();
+  return page.getByRole("dialog", { name: "Review installation", exact: true });
+}
+
+for (const manual of [false, true]) {
+  test(`accepted installation response loss recovers ${manual ? "with Refresh after a failed lookup" : "automatically"} and reaches its result`, async ({
+    page,
+  }) => {
+    await catalog(page);
+    await page.route("**/api/launchpad/installed?**", (route) =>
+      route.fulfill({ json: { items: [], warnings: [] } }),
+    );
+    await page.route("**/api/launchpad/preview", (route) =>
+      route.fulfill({ json: plan }),
+    );
+    let accepted = false;
+    let installCalls = 0;
+    let failedLookup = false;
+    let jobReads = 0;
+    let completed = false;
+    await page.route(/\/api\/launchpad(?:\?.*)?$/, (route) => {
+      if (accepted && manual && !failedLookup) {
+        failedLookup = true;
+        return route.abort("connectionreset");
+      }
+      return route.fulfill({
+        json: {
+          platforms: [
+            {
+              id: "modrinth",
+              name: "Modrinth",
+              available: true,
+              types: ["mod"],
+            },
+          ],
+          status: "offline",
+          gameVersion: "1.21.1",
+          loader: "neoforge",
+          warnings: [],
+          job: accepted
+            ? {
+                ...acceptedJob,
+                ...(completed
+                  ? {
+                      status: "completed",
+                      cancellable: false,
+                      message: "Example Mod installed.",
+                      completed: 1,
+                    }
+                  : {}),
+              }
+            : null,
+        },
+      });
+    });
+    await page.route("**/api/launchpad/install", (route) => {
+      installCalls++;
+      accepted = true;
+      return route.abort("connectionreset");
+    });
+    await page.route("**/api/launchpad/jobs/accepted-job", (route) => {
+      jobReads++;
+      return route.fulfill({
+        json: {
+          job: completed
+            ? {
+                ...acceptedJob,
+                status: "completed",
+                cancellable: false,
+                message: "Example Mod installed.",
+                completed: 1,
+              }
+            : acceptedJob,
+        },
+      });
+    });
+    await page.goto("/#launchpad");
+    const dialog = await reviewInstallation(page);
+    await dialog
+      .getByRole("button", { name: "Confirm installation", exact: true })
+      .click();
+    if (manual) {
+      await expect(dialog.getByRole("alert")).toContainText("Failed to fetch");
+      await dialog.getByRole("button", { name: "Cancel", exact: true }).click();
+      await page
+        .getByRole("button", {
+          name: "Refresh Launchpad and check updates",
+          exact: true,
+        })
+        .click();
+    }
+    await expect(dialog).not.toBeVisible();
+    const status = page.getByRole("status", {
+      name: "Installation status",
+      exact: true,
+    });
+    await expect(status).toContainText("Downloading example.jar");
+    await expect(
+      page.getByRole("button", { name: "Cancel installation", exact: true }),
+    ).toBeVisible();
+    await expect.poll(() => jobReads).toBeGreaterThan(0);
+    completed = true;
+    await expect(status).toContainText("Example Mod installed.");
+    await expect(
+      page.getByRole("button", { name: "Cancel installation", exact: true }),
+    ).toHaveCount(0);
+    expect(installCalls).toBe(1);
+  });
+}
+
+test("a lost retry response recovers the new attempt and can cancel it", async ({
+  page,
+}) => {
+  const previous = {
+    ...acceptedJob,
+    id: "failed-download",
+    status: "failed",
+    cancellable: false,
+    message: "Download stalled",
+    retryable: true,
+    retryInput: { planId: "review", confirmed: true },
+  };
+  await catalog(page, "mod", previous);
+  await page.route("**/api/launchpad/installed?**", (route) =>
+    route.fulfill({ json: { items: [], warnings: [] } }),
+  );
+  let accepted = false;
+  let cancelled = false;
+  let installs = 0;
+  await page.route(/\/api\/launchpad(?:\?.*)?$/, (route) =>
+    route.fulfill({
+      json: {
+        platforms: [
+          { id: "modrinth", name: "Modrinth", available: true, types: ["mod"] },
+        ],
+        status: "offline",
+        gameVersion: "1.21.1",
+        loader: "neoforge",
+        warnings: [],
+        job: accepted ? acceptedJob : previous,
+      },
+    }),
+  );
+  await page.route("**/api/launchpad/install", (route) => {
+    installs++;
+    expect(route.request().postDataJSON()).toEqual(previous.retryInput);
+    accepted = true;
+    return route.abort("connectionreset");
+  });
+  const cancelledJob = {
+    ...acceptedJob,
+    status: "failed",
+    cancelled: true,
+    cancellable: false,
+    message: "Installation cancelled. No server files were changed.",
+  };
+  await page.route("**/api/launchpad/jobs/accepted-job", (route) =>
+    route.fulfill({ json: { job: cancelled ? cancelledJob : acceptedJob } }),
+  );
+  await page.route("**/api/launchpad/jobs/accepted-job/cancel", (route) => {
+    cancelled = true;
+    return route.fulfill({ json: { job: cancelledJob } });
+  });
+  await page.goto("/#launchpad");
+  await page
+    .getByRole("button", { name: "Retry download", exact: true })
+    .click();
+  await page
+    .getByRole("button", { name: "Cancel installation", exact: true })
+    .click();
+  await expect(
+    page.getByRole("status", { name: "Installation status", exact: true }),
+  ).toContainText("Installation cancelled");
+  expect(installs).toBe(1);
+});
+
+test("failed submission does not attach another review's retained job", async ({
+  page,
+}) => {
+  await catalog(page);
+  let submitted = false;
+  await page.route(/\/api\/launchpad(?:\?.*)?$/, (route) =>
+    route.fulfill({
+      json: {
+        platforms: [
+          { id: "modrinth", name: "Modrinth", available: true, types: ["mod"] },
+        ],
+        status: "offline",
+        gameVersion: "1.21.1",
+        loader: "neoforge",
+        warnings: [],
+        job: submitted ? { ...acceptedJob, planId: "unrelated" } : null,
+      },
+    }),
+  );
+  await page.route("**/api/launchpad/installed?**", (route) =>
+    route.fulfill({ json: { items: [], warnings: [] } }),
+  );
+  await page.route("**/api/launchpad/preview", (route) =>
+    route.fulfill({ json: plan }),
+  );
+  await page.route("**/api/launchpad/install", (route) => {
+    submitted = true;
+    return route.abort("connectionreset");
+  });
+  await page.goto("/#launchpad");
+  const dialog = await reviewInstallation(page);
+  await dialog
+    .getByRole("button", { name: "Confirm installation", exact: true })
+    .click();
+  await expect(dialog.getByRole("alert")).toContainText("Failed to fetch");
+  await expect(dialog).toBeVisible();
+  await expect(
+    page.getByRole("status", { name: "Installation status", exact: true }),
+  ).toHaveCount(0);
+});
+
+test("a failed retry does not mistake its prior failed job for a newly accepted attempt", async ({
+  page,
+}) => {
+  await catalog(page, "mod", {
+    ...acceptedJob,
+    status: "failed",
+    cancellable: false,
+    message: "Previous download stalled",
+    retryable: true,
+    retryInput: { planId: "review", confirmed: true },
+  });
+  await page.route("**/api/launchpad/installed?**", (route) =>
+    route.fulfill({ json: { items: [], warnings: [] } }),
+  );
+  let installs = 0;
+  await page.route("**/api/launchpad/install", (route) => {
+    installs++;
+    return route.abort("connectionreset");
+  });
+  await page.goto("/#launchpad");
+  const retry = page.getByRole("button", {
+    name: "Retry download",
+    exact: true,
+  });
+  await retry.click();
+  const status = page.getByRole("status", {
+    name: "Installation status",
+    exact: true,
+  });
+  await expect(status.getByRole("alert")).toContainText("Failed to fetch");
+  await expect(status).toContainText("Previous download stalled");
+  await expect(retry).toBeEnabled();
+  await expect(
+    page.getByRole("button", { name: "Cancel installation", exact: true }),
+  ).toHaveCount(0);
+  expect(installs).toBe(1);
+});
+
+test("a delayed Refresh cannot overwrite a newer accepted job", async ({
+  page,
+}) => {
+  const previous = {
+    ...acceptedJob,
+    id: "previous",
+    planId: "old-review",
+    status: "completed",
+    cancellable: false,
+    message: "Earlier installation completed",
+  };
+  await catalog(page, "mod", previous);
+  await page.route("**/api/launchpad/installed?**", (route) =>
+    route.fulfill({ json: { items: [], warnings: [] } }),
+  );
+  await page.route("**/api/launchpad/preview", (route) =>
+    route.fulfill({ json: plan }),
+  );
+  await page.route("**/api/launchpad/install", (route) =>
+    route.fulfill({ json: { job: acceptedJob } }),
+  );
+  await page.route("**/api/launchpad/jobs/accepted-job", (route) =>
+    route.fulfill({ json: { job: acceptedJob } }),
+  );
+  let heldRefresh: Route | undefined;
+  await page.route("**/api/launchpad?refresh=1", (route) => {
+    heldRefresh = route;
+  });
+  await page.goto("/#launchpad");
+  await page
+    .getByRole("button", {
+      name: "Refresh Launchpad and check updates",
+      exact: true,
+    })
+    .click();
+  await expect.poll(() => Boolean(heldRefresh)).toBe(true);
+  const dialog = await reviewInstallation(page);
+  await dialog
+    .getByRole("button", { name: "Confirm installation", exact: true })
+    .click();
+  const status = page.getByRole("status", {
+    name: "Installation status",
+    exact: true,
+  });
+  await expect(status).toContainText("Downloading example.jar");
+  await heldRefresh!.fulfill({
+    json: {
+      platforms: [
+        { id: "modrinth", name: "Modrinth", available: true, types: ["mod"] },
+      ],
+      status: "offline",
+      gameVersion: "1.21.1",
+      loader: "neoforge",
+      warnings: [],
+      job: previous,
+    },
+  });
+  await expect(
+    page.getByRole("button", {
+      name: "Refresh Launchpad and check updates",
+      exact: true,
+    }),
+  ).toBeEnabled();
+  await expect(status).toContainText("Downloading example.jar");
+});
+
+const require = createRequire(import.meta.url);
+const { build: bundleHarness } = createRequire(require.resolve("vite"))(
+  "esbuild",
+);
+let recoveryHarness: Promise<string> | undefined;
+function recoveryScopeHarness() {
+  recoveryHarness ??= bundleHarness({
+    stdin: {
+      contents: `
+        import React, { useMemo, useState } from 'react';
+        import { createRoot } from 'react-dom/client';
+        import { PanelScope, ServerScope } from './src/api';
+        import Launchpad from './src/pages/Launchpad';
+        const notify = () => {};
+        function Harness() {
+          const [scope, setScope] = useState({ panelId:'A', sessionEpoch:'epoch-A', serverId:'same-server' });
+          const panel = useMemo(() => ({ ...scope, label:scope.panelId, origin:'https://' + scope.panelId.toLowerCase() + '.example.test' }), [scope]);
+          return <>
+            <button onClick={() => setScope(current => ({...current, serverId:'other-server'}))}>Switch server</button>
+            <button onClick={() => setScope(current => ({...current, panelId:'B'}))}>Switch connection</button>
+            <button onClick={() => setScope(current => ({...current, sessionEpoch:'replacement-A'}))}>Replace session</button>
+            <PanelScope.Provider value={panel}><ServerScope.Provider value={scope.serverId}>
+              <Launchpad notify={notify}/>
+            </ServerScope.Provider></PanelScope.Provider>
+          </>;
+        }
+        createRoot(document.getElementById('root')).render(<Harness/>);
+      `,
+      resolveDir: process.cwd(),
+      sourcefile: "launchpad-recovery-harness.tsx",
+      loader: "tsx",
+    },
+    bundle: true,
+    write: false,
+    format: "iife",
+    platform: "browser",
+    jsx: "automatic",
+    loader: { ".css": "empty" },
+    define: { "process.env.NODE_ENV": '"test"' },
+  }).then(
+    (result: { outputFiles: { text: string }[] }) => result.outputFiles[0].text,
+  );
+  return recoveryHarness!;
+}
+
+for (const switchScope of [
+  "Switch server",
+  "Switch connection",
+  "Replace session",
+]) {
+  for (const delayed of ["submission", "recovery"]) {
+    test(`late ${delayed} response stays in its original scope after ${switchScope.toLowerCase()}`, async ({
+      page,
+    }) => {
+      let accepted = false;
+      let held: Route | undefined;
+      let installs = 0;
+      const jobReads: string[] = [];
+      const config = (job: Record<string, unknown> | null) => ({
+        platforms: [
+          { id: "modrinth", name: "Modrinth", available: true, types: ["mod"] },
+        ],
+        status: "offline",
+        gameVersion: "1.21.1",
+        loader: "neoforge",
+        warnings: [],
+        job,
+      });
+      const destinationJob = {
+        ...acceptedJob,
+        id: "destination-job",
+        planId: "destination-review",
+        status: "completed",
+        cancellable: false,
+        message: "Destination installation completed",
+      };
+      await page.route("**/api/desktop/panels/**/proxy/api/**", (route) => {
+        const url = new URL(route.request().url());
+        const original =
+          url.pathname.includes("/panels/A/") &&
+          url.searchParams.get("desktopEpoch") === "epoch-A" &&
+          url.searchParams.get("serverId") === "same-server";
+        const path = url.pathname.split("/proxy/api")[1];
+        if (path === "/launchpad") {
+          if (original && accepted && delayed === "recovery") {
+            held = route;
+            return;
+          }
+          return route.fulfill({
+            json: config(original ? null : destinationJob),
+          });
+        }
+        if (path === "/server")
+          return route.fulfill({ json: { status: "offline" } });
+        if (path === "/launchpad/search")
+          return route.fulfill({
+            json: {
+              projects: [
+                {
+                  id: "Pack",
+                  title: "Pack",
+                  platform: "modrinth",
+                  description: "Pack",
+                },
+              ],
+              total: 1,
+              offset: 0,
+              limit: 10,
+            },
+          });
+        if (path === "/launchpad/versions")
+          return route.fulfill({ json: { versions: [version] } });
+        if (path === "/launchpad/installed")
+          return route.fulfill({ json: { items: [], warnings: [] } });
+        if (path === "/launchpad/preview") return route.fulfill({ json: plan });
+        if (path === "/launchpad/install") {
+          expect(original).toBe(true);
+          installs++;
+          accepted = true;
+          if (delayed === "submission") {
+            held = route;
+            return;
+          }
+          return route.abort("connectionreset");
+        }
+        if (path.startsWith("/launchpad/jobs/")) jobReads.push(path);
+        return route.fulfill({ json: { ok: true } });
+      });
+      await page.route("**/launchpad-recovery-harness", async (route) =>
+        route.fulfill({
+          contentType: "text/html",
+          body: `<!doctype html><div id="root"></div><script>${(await recoveryScopeHarness()).replace(/<\/script/gi, "<\\/script")}</script>`,
+        }),
+      );
+      await page.goto("/launchpad-recovery-harness");
+      const dialog = await reviewInstallation(page);
+      await dialog
+        .getByRole("button", { name: "Confirm installation", exact: true })
+        .click();
+      await expect.poll(() => Boolean(held)).toBe(true);
+      // Model a workspace context change while its native review dialog is open.
+      await page
+        .getByRole("button", { name: switchScope, exact: true })
+        .evaluate((button) => (button as HTMLButtonElement).click());
+      const status = page.getByRole("status", {
+        name: "Installation status",
+        exact: true,
+      });
+      await expect(status).toContainText("Destination installation completed");
+      const response = page.waitForResponse(
+        (response) => response.url() === held!.request().url(),
+      );
+      await held!.fulfill({
+        json:
+          delayed === "submission" ? { job: acceptedJob } : config(acceptedJob),
+      });
+      await (await response).finished();
+      await page.evaluate(
+        () =>
+          new Promise<void>((resolve) =>
+            requestAnimationFrame(() => requestAnimationFrame(() => resolve())),
+          ),
+      );
+      await expect(status).toContainText("Destination installation completed");
+      await expect(dialog).not.toBeVisible();
+      expect(installs).toBe(1);
+      expect(jobReads).toEqual([]);
+    });
+  }
+}
+
+test("Refresh keeps polling after an older job poll fails", async ({
+  page,
+}) => {
+  const job = { ...acceptedJob };
+  await catalog(page, "mod", job);
+  await page.route("**/api/launchpad/installed?**", (route) =>
+    route.fulfill({ json: { items: [], warnings: [] } }),
+  );
+  let heldPoll: Route | undefined;
+  let polls = 0;
+  await page.route("**/api/launchpad/jobs/accepted-job", (route) => {
+    if (++polls === 1) {
+      heldPoll = route;
+      return;
+    }
+    Object.assign(job, {
+      status: "completed",
+      message: "Refreshed installation completed",
+      cancellable: false,
+      completed: 1,
+    });
+    return route.fulfill({ json: { job } });
+  });
+  await page.goto("/#launchpad");
+  await expect.poll(() => Boolean(heldPoll)).toBe(true);
+  const refresh = page.getByRole("button", {
+    name: "Refresh Launchpad and check updates",
+    exact: true,
+  });
+  await refresh.click();
+  await expect(refresh).toBeEnabled();
+  await heldPoll!.abort("connectionreset");
+  await expect(
+    page.getByRole("status", { name: "Installation status", exact: true }),
+  ).toContainText("Refreshed installation completed");
+  expect(polls).toBe(2);
+  await expect(page.getByRole("alert")).toHaveCount(0);
+});
 
 test("accepted installation cancellation waits for the action and ignores an older cancellable poll", async ({
   page,

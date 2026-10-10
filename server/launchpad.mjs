@@ -7,6 +7,8 @@ import { createCoreProviders } from "./launchpad-providers.mjs";
 import { safeInstallPath, unpackProviderZip } from "./launchpad-archives.mjs";
 import { inspectBundledDependencies } from "./launchpad-bundled.mjs";
 import { installedDependencySatisfies } from "./launchpad-dependency-ranges.mjs";
+import { inspectInstalledMod } from "./launchpad-mod-metadata.mjs";
+import { assertUpdatedModDependencies } from "./launchpad-update-dependencies.mjs";
 import { createModRemoval } from "./launchpad-removal.mjs";
 import { createLaunchpadMetadataCache } from "./launchpad-metadata-cache.mjs";
 import { recoverJarIdentity } from "./launchpad-jar-recovery.mjs";
@@ -660,6 +662,52 @@ export async function createLaunchpad(ctx) {
     if (startupFiles.includes(lower) || lower.startsWith("libraries/"))
       return true;
     return lower === "eula.txt";
+  }
+  async function snapshotInventory(type) {
+    if (type === "modpack") return null;
+    const folder = await destination(type);
+    const directory = await safePath(serverDir, folder);
+    const entries = await fs.readdir(directory).catch((cause) => {
+      if (missing(cause)) return [];
+      throw cause;
+    });
+    const packages = entries
+      .filter((name) =>
+        (type === "datapack" ? /\.zip$/i : /\.jar$/i).test(name),
+      )
+      .sort();
+    if (packages.length > 1000)
+      throw error(
+        400,
+        "This folder has over 1,000 packages. Use File Manager to narrow the installed collection.",
+      );
+    const rows = [];
+    for (const name of packages) {
+      lifetime.signal.throwIfAborted();
+      const stat = await statOrNull(
+        await safePath(serverDir, `${folder}/${name}`),
+      );
+      rows.push([name, stat ? fileStamp(stat) : null]);
+    }
+    return JSON.stringify([folder, rows]);
+  }
+  async function assertReviewedInventory(plan) {
+    const current = await snapshotInventory(plan.input.type);
+    if (current !== plan.inventorySnapshot) {
+      const [folder, entries] = JSON.parse(current);
+      const [reviewedFolder, reviewedEntries] = JSON.parse(
+        plan.inventorySnapshot,
+      );
+      const before = new Map(reviewedEntries),
+        after = new Map(entries);
+      const changed = [...new Set([...before.keys(), ...after.keys()])].find(
+        (name) => before.get(name) !== after.get(name),
+      );
+      throw error(
+        409,
+        `${folder === reviewedFolder && changed ? `${folder}/${changed}` : "Installed content"} changed since review. Refresh installed files and review the installation again.`,
+      );
+    }
   }
   async function scan(
     type,
@@ -2603,6 +2651,79 @@ export async function createLaunchpad(ctx) {
     } else throw error(400, "This provider's archive format is unsupported.");
     return { files, warnings, loaderInstall };
   }
+  async function validateUpdatedDependencies(
+    input,
+    stage,
+    local,
+    files,
+    warnings,
+  ) {
+    if (
+      input.type !== "mod" ||
+      !files.some((file) => file.action === "replace")
+    )
+      return;
+    const replaced = new Set(
+      files.flatMap((file) =>
+        [file.expected ? file.path : null, file.previous?.path].filter(Boolean),
+      ),
+    );
+    const inspect = async (source, row) => {
+      try {
+        return {
+          ...row,
+          ...(await inspectInstalledMod(source, {
+            loader: input.loader,
+            signal: input.signal,
+          })),
+        };
+      } catch (cause) {
+        input.signal.throwIfAborted();
+        warnings.push(
+          `Dependency requirements in ${row.path} could not be verified: ${cause.message}`,
+        );
+        return row;
+      }
+    };
+    const before = [];
+    for (const row of local)
+      before.push(await inspect(await safePath(serverDir, row.path), row));
+    const knownProviders = new Set(before.flatMap((row) => row.provided ?? []));
+    const affected = new Set(
+      before
+        .filter((row) => replaced.has(row.path))
+        .flatMap((row) => row.provided ?? []),
+    );
+    // Unrelated, already missing requirements do not become new update guards.
+    // New declarations in a combined dependent update must also be inspected.
+    if (!affected.size) return;
+    const after = before.filter((row) => !replaced.has(row.path));
+    let downloaded = 0;
+    for (const [index, file] of files.entries()) {
+      if (!file.stagedPath) {
+        const source = path.join(stage, `update-dependency-${index}.jar`);
+        await downloadVerified(file, source, file.hosts, request, {
+          signal: input.signal,
+          curseforgeKey: key,
+        });
+        file.stagedPath = source;
+      }
+      const verified = await verifyStaged(file, stage, input.signal);
+      if ((downloaded += verified.size) > 2 * 1024 ** 3)
+        throw error(
+          400,
+          "This installation exceeds the 2 GB total size limit.",
+        );
+      const row = await inspect(file.stagedPath, file);
+      after.push(row);
+      // Updating a dependent can tighten its requirements without changing
+      // the provider. Check known local providers even if the catalog omitted
+      // that dependency; unrelated pre-existing missing requirements stay out.
+      for (const id of row.required ?? [])
+        if (knownProviders.has(id)) affected.add(id);
+    }
+    assertUpdatedModDependencies(before, after, affected, input.loader);
+  }
   function preview(raw) {
     const task = preparePreview(raw);
     previews.add(task);
@@ -2675,6 +2796,9 @@ export async function createLaunchpad(ctx) {
     const stage = await privatePath(planId);
     await fs.mkdir(stage);
     try {
+      // Capture before identification: new paths must not silently expand an
+      // approved replacement, even when another client uploads the same project.
+      const inventorySnapshot = await snapshotInventory(input.type);
       const identified =
         input.type === "modpack"
           ? { items: [], warnings: [] }
@@ -2936,7 +3060,15 @@ export async function createLaunchpad(ctx) {
             );
           claimedPaths.set(folded, file);
         }
+      await validateUpdatedDependencies(
+        input,
+        stage,
+        local,
+        files,
+        result.warnings,
+      );
       await inspectUnavailableDependencies(result, input, stage);
+      await assertReviewedInventory({ input, inventorySnapshot });
       const expiresAt = new Date(Date.now() + 15 * 60 * 1000).toISOString();
       const plan = {
         id: planId,
@@ -2944,6 +3076,7 @@ export async function createLaunchpad(ctx) {
         stage,
         files,
         unchanged,
+        inventorySnapshot,
         title: result.title,
         url: result.url,
         iconUrl: result.iconUrl,
@@ -3024,6 +3157,7 @@ export async function createLaunchpad(ctx) {
       const recovered = [],
         promoted = [];
       // Validate the entire reviewed snapshot before making any server changes.
+      await assertReviewedInventory(plan);
       for (const file of [...plan.files, ...plan.unchanged]) {
         const target = await safePath(serverDir, file.path);
         const stat = await statOrNull(target);
@@ -3393,6 +3527,7 @@ export async function createLaunchpad(ctx) {
     plans.delete(plan.id);
     const job = {
       id: randomUUID(),
+      planId: plan.id,
       status: "queued",
       cancellable: true,
       message: "Preparing verified downloads…",
@@ -3418,6 +3553,9 @@ export async function createLaunchpad(ctx) {
           phase = "verify",
           retained = false;
         try {
+          // Runs under the shared mutation lock on initial confirmation and
+          // every download retry; promotion checks again after downloads.
+          await assertReviewedInventory(plan);
           let downloaded = 0;
           for (const [index, file] of plan.files.entries()) {
             controller.signal.throwIfAborted();

@@ -163,7 +163,8 @@ function modMetadata(metadata, loader) {
     !Array.isArray(value.mods) ||
     !value.mods.length ||
     value.mods.length > 128 ||
-    (value.clientSideOnly !== undefined &&
+    (loader === "forge" &&
+      value.clientSideOnly !== undefined &&
       typeof value.clientSideOnly !== "boolean")
   )
     unverifiable();
@@ -199,7 +200,11 @@ export async function installedDependencySatisfies(
       visitMetadata(metadata, { depth }) {
         if (depth) return;
         const model = modMetadata(metadata, loader);
-        if (!model || model.value.clientSideOnly === true) unverifiable();
+        if (
+          !model ||
+          (loader === "forge" && model.value.clientSideOnly === true)
+        )
+          unverifiable();
         for (const mod of model.value.mods) {
           const version =
             mod.version === "${file.jarVersion}"
@@ -221,7 +226,10 @@ export async function installedDependencySatisfies(
         if (!model) return;
         const { value, ids, modern } = model;
         if (!depth) recognized = true;
-        if (!serverCompatible || value.clientSideOnly === true) {
+        if (
+          !serverCompatible ||
+          (loader === "forge" && value.clientSideOnly === true)
+        ) {
           if (!depth) unverifiable();
           return;
         }

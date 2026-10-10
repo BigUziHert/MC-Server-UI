@@ -78,6 +78,9 @@ function mod(loader, id, dependencies = [], extra = {}, bundled = []) {
     'modLoader="javafml"',
     'loaderVersion="[1,)"',
     'license="MIT"',
+    ...(extra.clientSideOnly === undefined
+      ? []
+      : [`clientSideOnly=${JSON.stringify(extra.clientSideOnly)}`]),
     "[[mods]]",
     `modId="${id}"`,
     `version="${extra.version ?? "1.0"}"`,
@@ -280,6 +283,101 @@ for (const loader of ["neoforge", "forge", "fabric", "quilt"]) {
   });
 }
 
+for (const loader of ["forge", "neoforge"]) {
+  for (const clientSideOnly of [false, true]) {
+    test(`${loader} removal applies clientSideOnly=${clientSideOnly} using the selected loader`, async (t) => {
+      const library = mod(loader, "library");
+      const consumer = mod(loader, "consumer", ["library"], { clientSideOnly });
+      const f = await fixture(t, {
+        loader,
+        files: { "library.jar": library, "consumer.jar": consumer },
+      });
+      const plan = await f.service.removalPreview({ path: "mods/library.jar" });
+      const blocked = loader === "neoforge" || !clientSideOnly;
+      assert.equal(plan.blocked, blocked);
+      assert.deepEqual(
+        plan.dependents,
+        blocked ? [{ path: "mods/consumer.jar", title: "consumer" }] : [],
+      );
+      assert.deepEqual(plan.warnings, []);
+      assert.equal(plan.requiresAcknowledgement, false);
+      if (blocked) {
+        assert.equal(plan.planId, undefined);
+        await assert.rejects(
+          f.service.remove({
+            planId: plan.planId,
+            confirmed: true,
+            acknowledgedUnreadableDependencies: true,
+          }),
+          { status: 409 },
+        );
+        assert.deepEqual(await f.read("mods/library.jar"), library);
+        assert.deepEqual(await f.bin.list(), []);
+        assert.equal(f.state.mutations, 0);
+      } else {
+        await f.service.remove({ planId: plan.planId, confirmed: true });
+        await assert.rejects(f.read("mods/library.jar"), { code: "ENOENT" });
+      }
+      assert.deepEqual(await f.read("mods/consumer.jar"), consumer);
+      assert.deepEqual(f.state.network, []);
+    });
+  }
+}
+
+test("NeoForge clientSideOnly does not hide bundled dependents or bypass unreadable metadata guards", async (t) => {
+  const library = mod("neoforge", "library", [], { clientSideOnly: true });
+  const consumer = mod(
+    "neoforge",
+    "consumer_container",
+    [],
+    {
+      clientSideOnly: true,
+    },
+    [mod("neoforge", "consumer", ["library"], { clientSideOnly: true })],
+  );
+  const f = await fixture(t, {
+    files: {
+      "library.jar": library,
+      "consumer.jar": consumer,
+      "broken.jar": "not a ZIP",
+    },
+  });
+  const blocked = await f.service.removalPreview({ path: "mods/library.jar" });
+  assert.equal(blocked.blocked, true);
+  assert.deepEqual(blocked.dependents, [
+    { path: "mods/consumer.jar", title: "consumer_container" },
+  ]);
+  assert.equal(blocked.requiresAcknowledgement, true);
+  assert.match(blocked.warnings.join("\n"), /broken.jar/);
+  assert.equal(blocked.planId, undefined);
+  await assert.rejects(
+    f.service.remove({
+      planId: blocked.planId,
+      confirmed: true,
+      acknowledgedUnreadableDependencies: true,
+    }),
+    { status: 409 },
+  );
+  const removable = await f.service.removalPreview({
+    path: "mods/consumer.jar",
+  });
+  assert.equal(removable.blocked, false);
+  assert.equal(removable.requiresAcknowledgement, true);
+  await assert.rejects(
+    f.service.remove({ planId: removable.planId, confirmed: true }),
+    { status: 400 },
+  );
+  await f.service.remove({
+    planId: removable.planId,
+    confirmed: true,
+    acknowledgedUnreadableDependencies: true,
+  });
+  await assert.rejects(f.read("mods/consumer.jar"), { code: "ENOENT" });
+  assert.deepEqual(await f.read("mods/library.jar"), library);
+  assert.equal((await f.read("mods/broken.jar")).toString(), "not a ZIP");
+  assert.deepEqual(f.state.network, []);
+});
+
 for (const loader of ["neoforge", "forge", "fabric"]) {
   test(`${loader} optional and client-only dependencies do not prevent removal`, async (t) => {
     const files = { "library.jar": mod(loader, "library") };
@@ -292,12 +390,18 @@ for (const loader of ["neoforge", "forge", "fabric"]) {
         environment: "client",
       });
     } else {
-      files["optional.jar"] = mod(loader, "optional", [
-        { id: "library", type: "optional", mandatory: false },
-      ]);
-      files["client.jar"] = mod(loader, "client", [
-        { id: "library", side: "CLIENT" },
-      ]);
+      files["optional.jar"] = mod(
+        loader,
+        "optional",
+        [{ id: "library", type: "optional", mandatory: false }],
+        { clientSideOnly: loader === "neoforge" },
+      );
+      files["client.jar"] = mod(
+        loader,
+        "client",
+        [{ id: "library", side: "CLIENT" }],
+        { clientSideOnly: loader === "neoforge" },
+      );
     }
     const f = await fixture(t, { loader, files });
     const plan = await f.service.removalPreview({ path: "mods/library.jar" });
@@ -1053,9 +1157,10 @@ test("removal and installation serialize in both directions and shutdown drains 
   f.state.recycleGate.release.resolve();
   await removing;
   f.state.recycleGate = null;
+  const currentInstallPlan = await f.service.preview(f.selection);
   f.state.downloadGate = { entered: gate(), release: gate() };
   const { job } = await f.service.install({
-    planId: installPlan.planId,
+    planId: currentInstallPlan.planId,
     confirmed: true,
   });
   await f.state.downloadGate.entered.promise;

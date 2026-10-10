@@ -316,7 +316,7 @@ test("Forge mod versions resolve manifest substitutions without trusting ambiguo
 });
 
 for (const loader of ["forge", "neoforge"]) {
-  test(`${loader} client-only metadata and its descendants cannot provide a server dependency`, async () => {
+  test(`${loader} uses its own clientSideOnly semantics for mods and bundled descendants`, async () => {
     const name = `META-INF/${loader === "neoforge" ? "neoforge.mods.toml" : "mods.toml"}`;
     const client = zip([
       [
@@ -330,10 +330,25 @@ for (const loader of ["forge", "neoforge"]) {
       ["libs/descendant.jar", mod(descriptor("descendant_mod"), loader)],
     ]);
     const root = await inspect(client, loader);
-    assert.deepEqual(root.provided, []);
-    assert.deepEqual(root.required, []);
-    assert.deepEqual(root.providers, []);
-    assert.deepEqual(root.requirements, []);
+    const markedProviders =
+      loader === "forge"
+        ? []
+        : [
+            { id: "client_mod", version: "1.0" },
+            { id: "descendant_mod", version: "1.0" },
+          ];
+    const markedRequirements =
+      loader === "forge" ? [] : [{ id: "shared_library", range: undefined }];
+    assert.deepEqual(
+      root.provided,
+      markedProviders.map(({ id }) => id),
+    );
+    assert.deepEqual(
+      root.required,
+      markedRequirements.map(({ id }) => id),
+    );
+    assert.deepEqual(root.providers, markedProviders);
+    assert.deepEqual(root.requirements, markedRequirements);
 
     const server = await inspect(
       zip([
@@ -351,13 +366,17 @@ for (const loader of ["forge", "neoforge"]) {
     );
     assert.deepEqual(server.providers, [
       { id: "server_mod", version: "1.0" },
+      ...markedProviders,
       { id: "server_library", version: "1.0" },
     ]);
-    assert.deepEqual(server.requirements, []);
-    await assert.rejects(
-      inspect(mod(`clientSideOnly="true"\n${descriptor()}`, loader), loader),
-      /could not be read reliably/,
+    assert.deepEqual(server.requirements, markedRequirements);
+    const nonBoolean = inspect(
+      mod(`clientSideOnly="true"\n${descriptor()}`, loader),
+      loader,
     );
+    if (loader === "forge")
+      await assert.rejects(nonBoolean, /could not be read reliably/);
+    else assert.deepEqual((await nonBoolean).provided, ["example_mod"]);
   });
 }
 

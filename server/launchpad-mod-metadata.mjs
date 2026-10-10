@@ -147,12 +147,16 @@ export async function inspectInstalledMod(archive, { loader, signal } = {}) {
         const mods = list(mod.mods);
         if (!mods.length) invalid();
         if (!depth) recognized = true;
-        if (
-          mod.clientSideOnly !== undefined &&
-          typeof mod.clientSideOnly !== "boolean"
-        )
-          invalid();
-        if (mod.clientSideOnly === true) clientOnlyPaths.push(path);
+        // This file-level flag is implemented by Forge, not NeoForge FML.
+        // On NeoForge it cannot hide the mod or any of its required libraries.
+        if (loader === "forge") {
+          if (
+            mod.clientSideOnly !== undefined &&
+            typeof mod.clientSideOnly !== "boolean"
+          )
+            invalid();
+          if (mod.clientSideOnly === true) clientOnlyPaths.push(path);
+        }
         if (
           !serverCompatible ||
           clientOnlyPaths.some(

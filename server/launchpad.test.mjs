@@ -351,6 +351,155 @@ async function waitForJob(service, id) {
   );
 }
 
+for (const timing of ["confirmation", "retry", "lock acquisition", "download"])
+  test(`changed inventory rejects a fresh mod review at ${timing} without creating duplicates`, async (t) => {
+    const identities = new Map();
+    let failDownload = timing === "retry";
+    let addDuringDownload = false;
+    let f;
+    const jar = (version) =>
+      zip([
+        [
+          "META-INF/neoforge.mods.toml",
+          `modLoader="javafml"\nloaderVersion="[1,)"\nlicense="MIT"\n[[mods]]\nmodId="examplemod"\nversion="${version}"\ndisplayName="Example Mod"`,
+        ],
+      ]);
+    const previous = jar("1.0"),
+      next = jar("2.0");
+    const addMod = () =>
+      fs.writeFile(
+        path.join(f.serverDir, "mods/manual-example-1.0.jar"),
+        previous,
+      );
+    f = await fixture(t, {
+      request: async (url, init) => {
+        if (new URL(url).pathname === "/v2/version_files")
+          return Response.json(
+            Object.fromEntries(
+              JSON.parse(init.body)
+                .hashes.filter((hash) => identities.has(hash))
+                .map((hash) => [hash, identities.get(hash)]),
+            ),
+          );
+        if (String(url) === "https://cdn.modrinth.com/new.jar") {
+          if (failDownload)
+            return new Response("Temporary fixture outage", { status: 503 });
+          if (addDuringDownload) {
+            addDuringDownload = false;
+            await addMod();
+          }
+          return new Response(next);
+        }
+      },
+    });
+    await fs.unlink(path.join(f.serverDir, "mods/old.jar"));
+    Object.assign(f.versions.old.files[0], {
+      size: previous.length,
+      hashes: hashes(previous),
+    });
+    Object.assign(f.versions.new.files[0], {
+      size: next.length,
+      hashes: hashes(next),
+    });
+    f.downloads.delete("https://cdn.modrinth.com/new.jar");
+    identities.set(hashes(previous).sha512, f.versions.old);
+    identities.set(hashes(next).sha512, f.versions.new);
+    let injectAtLock = timing === "lock acquisition";
+    const service =
+      timing === "lock acquisition"
+        ? await f.boot({
+            withMinecraftMutation: async (work) => {
+              if (injectAtLock) {
+                injectAtLock = false;
+                await addMod();
+              }
+              return work();
+            },
+          })
+        : f.service;
+    const plan = await service.preview(selection);
+    assert.equal(plan.files.length, 1);
+    assert.equal(plan.files[0].action, "install");
+    if (timing === "retry") {
+      const first = await finish(service, {
+        planId: plan.planId,
+        confirmed: true,
+      });
+      assert.equal(first.status, "failed");
+      assert.equal(first.retryable, true, first.error);
+      failDownload = false;
+    }
+    if (["confirmation", "retry"].includes(timing)) await addMod();
+    if (timing === "download") addDuringDownload = true;
+    const accepted = await service.install({
+      planId: plan.planId,
+      confirmed: true,
+    });
+    assert.equal(
+      accepted.job.planId,
+      plan.planId,
+      "accepted jobs identify the approved review",
+    );
+    const job = await waitForJob(service, accepted.job.id);
+    assert.equal(job.status, "failed");
+    assert.match(
+      job.error,
+      /mods\/manual-example-1.0.jar changed since review.*review the installation again/i,
+    );
+    assert.equal(job.retryable, false, "stale inventory requires a new review");
+    assert.deepEqual(await fs.readdir(path.join(f.serverDir, "mods")), [
+      "manual-example-1.0.jar",
+    ]);
+    assert.deepEqual(
+      await fs.readFile(path.join(f.serverDir, "mods/manual-example-1.0.jar")),
+      previous,
+    );
+    assert.equal((await service.config()).job.planId, plan.planId);
+    await assert.rejects(
+      service.install({ planId: plan.planId, confirmed: true }),
+      /review expired/i,
+    );
+
+    const fresh = await service.preview(selection);
+    assert.equal(fresh.files[0].previousPath, "mods/manual-example-1.0.jar");
+    const done = await finish(service, {
+      planId: fresh.planId,
+      confirmed: true,
+    });
+    assert.equal(done.status, "completed", done.error);
+    assert.deepEqual(await fs.readdir(path.join(f.serverDir, "mods")), [
+      "new.jar",
+    ]);
+    assert.deepEqual(
+      await fs.readFile(path.join(f.serverDir, "mods/new.jar")),
+      next,
+    );
+    const after = await service.installed({ ...selection, identityOnly: true });
+    assert.equal(after.items.length, 1);
+    assert.equal(after.items[0].duplicates?.length ?? 0, 0);
+  });
+
+test("content reviews ignore changes outside their package inventory", async (t) => {
+  const f = await fixture(t);
+  const plan = await f.service.preview(selection);
+  await fs.mkdir(path.join(f.serverDir, "plugins"));
+  await fs.writeFile(
+    path.join(f.serverDir, "plugins/unrelated.jar"),
+    "unrelated plugin",
+  );
+  await fs.writeFile(path.join(f.serverDir, "mods/notes.txt"), "local notes");
+  const done = await finish(f.service, {
+    planId: plan.planId,
+    confirmed: true,
+  });
+  assert.equal(done.status, "completed", done.error);
+  assert.equal(done.planId, plan.planId);
+  assert.equal(
+    await fs.readFile(path.join(f.serverDir, "mods/notes.txt"), "utf8"),
+    "local notes",
+  );
+});
+
 for (const tamper of [false, true])
   test(`Spigot pinned downloads are reused and verified at install (tamper=${tamper})`, async (t) => {
     const f = await fixture(t);
@@ -1797,7 +1946,9 @@ for (const sameName of [false, true]) {
           root === f.serverDir &&
           relative === (sameName ? "mods/old.jar" : "mods/new.jar")
         ) {
-          if (!sameName || ++matches === 2) {
+          // The inventory snapshot now precedes identity lookup; tamper only
+          // after both reads, when the replacement bytes are checked.
+          if (!sameName || ++matches === 3) {
             armed = false;
             await fs.writeFile(
               path.join(f.serverDir, "mods", "old.jar"),
@@ -1875,8 +2026,15 @@ for (const fails of [false, true]) {
       assert.equal(completed.status, fails ? "failed" : "completed");
       assert.ok(completed.finishedAt);
       if (fails) assert.match(completed.error, /checksum|size/);
+      const next = fails
+        ? second
+        : await f.service.preview({
+            ...selection,
+            projectId: "dependency",
+            versionId: "dep",
+          });
       assert.equal(
-        (await finish(f.service, { planId: second.planId, confirmed: true }))
+        (await finish(f.service, { planId: next.planId, confirmed: true }))
           .status,
         "completed",
       );
@@ -7117,4 +7275,341 @@ test("cancelling a claimed review during asynchronous server validation cannot d
   const accepted = await installing;
   const completed = await waitForJob(service, accepted.job.id);
   assert.equal(completed.status, "completed", completed.error);
+});
+
+async function dependencyUpdateFixture(
+  t,
+  {
+    loader = "neoforge",
+    range = "[1.0,2.0)",
+    nextRange = "[2.0,3.0)",
+    libraryVersion = "2.0",
+    dependencyType = "required",
+  } = {},
+) {
+  const identities = new Map();
+  const f = await fixture(t, {
+    request: async (url, init) => {
+      if (new URL(url).pathname === "/v2/version_files")
+        return Response.json(
+          Object.fromEntries(
+            JSON.parse(init.body)
+              .hashes.filter((hash) => identities.has(hash))
+              .map((hash) => [hash, identities.get(hash)]),
+          ),
+        );
+    },
+  });
+  const jar = (id, version, requirement) =>
+    zip([
+      [
+        loader === "fabric"
+          ? "fabric.mod.json"
+          : loader === "forge"
+            ? "META-INF/mods.toml"
+            : "META-INF/neoforge.mods.toml",
+        loader === "fabric"
+          ? JSON.stringify({
+              schemaVersion: 1,
+              id,
+              version,
+              name: id,
+              ...(requirement ? { depends: { corelib: requirement } } : {}),
+            })
+          : [
+              'modLoader="javafml"',
+              'loaderVersion="[1,)"',
+              'license="MIT"',
+              "[[mods]]",
+              `modId="${id}"`,
+              `version="${version}"`,
+              `displayName="${id}"`,
+              ...(requirement
+                ? [
+                    `[[dependencies.${id}]]`,
+                    'modId="corelib"',
+                    loader === "forge"
+                      ? `mandatory=${dependencyType === "required"}`
+                      : `type="${dependencyType}"`,
+                    `versionRange="${requirement}"`,
+                    'side="BOTH"',
+                  ]
+                : []),
+            ].join("\n"),
+      ],
+    ]);
+  f.setServer({ loader });
+  const library1 = jar("corelib", "1.0"),
+    library2 = jar("corelib", libraryVersion),
+    addon1 = jar("addon", "1.0", range),
+    addon2 = jar("addon", "2.0", nextRange);
+  await fs.writeFile(path.join(f.serverDir, "mods", "old.jar"), library1);
+  await fs.writeFile(path.join(f.serverDir, "mods", "addon.jar"), addon1);
+  const version = (base, id, project, filename, data) => ({
+    ...base,
+    id,
+    project_id: project,
+    loaders: [loader],
+    files: [
+      {
+        ...base.files[0],
+        filename,
+        url: `https://cdn.modrinth.com/${filename}`,
+        size: data.length,
+        hashes: hashes(data),
+      },
+    ],
+  });
+  f.versions.old = version(
+    f.versions.old,
+    "old",
+    "project",
+    "old.jar",
+    library1,
+  );
+  f.versions.new = version(
+    f.versions.new,
+    "new",
+    "project",
+    "new.jar",
+    library2,
+  );
+  f.versions.addon1 = version(
+    f.versions.old,
+    "addon1",
+    "addon-project",
+    "addon.jar",
+    addon1,
+  );
+  f.versions.addon2 = version(
+    f.versions.new,
+    "addon2",
+    "addon-project",
+    "addon-new.jar",
+    addon2,
+  );
+  identities.set(hashes(library1).sha512, f.versions.old);
+  identities.set(hashes(addon1).sha512, f.versions.addon1);
+  f.downloads.set("https://cdn.modrinth.com/new.jar", library2);
+  f.downloads.set("https://cdn.modrinth.com/addon-new.jar", addon2);
+  return {
+    ...f,
+    library1,
+    library2,
+    addon1,
+    addon2,
+    input: { ...selection, loader, replacePath: "mods/old.jar" },
+    bulk: {
+      type: "mod",
+      loader,
+      gameVersion: "1.21.1",
+      updates: [
+        {
+          platform: "modrinth",
+          projectId: "project",
+          versionId: "new",
+          replacePath: "mods/old.jar",
+        },
+        {
+          platform: "modrinth",
+          projectId: "addon-project",
+          versionId: "addon2",
+          replacePath: "mods/addon.jar",
+        },
+      ],
+    },
+  };
+}
+
+for (const loader of ["forge", "neoforge", "fabric"])
+  test(`${loader} update rejects a retained addon's incompatible required library range`, async (t) => {
+    const f = await dependencyUpdateFixture(t, {
+      loader,
+      ...(loader === "fabric" ? { range: ">=1.0 <2.0" } : {}),
+    });
+    const removal = await f.service.removalPreview({
+      type: "mod",
+      path: "mods/old.jar",
+    });
+    assert.equal(removal.blocked, true);
+    await assert.rejects(
+      f.service.preview(f.input),
+      (cause) =>
+        cause.status === 409 &&
+        /addon.*mods\/addon.jar.*requires corelib/.test(cause.message) &&
+        cause.message.includes(
+          loader === "fabric" ? ">=1.0 <2.0" : "[1.0,2.0)",
+        ),
+    );
+    assert.deepEqual(
+      await fs.readFile(path.join(f.serverDir, "mods", "old.jar")),
+      f.library1,
+    );
+    assert.deepEqual(
+      await fs.readFile(path.join(f.serverDir, "mods", "addon.jar")),
+      f.addon1,
+    );
+    assert.deepEqual(await fs.readdir(path.join(f.serverDir, "mods")), [
+      "addon.jar",
+      "old.jar",
+    ]);
+  });
+
+test("combined updates use the resulting dependent requirements and retain checksum-verified downloads", async (t) => {
+  const f = await dependencyUpdateFixture(t);
+  // Real catalog dependencies and explicit roots share the same candidate.
+  f.versions.addon2.dependencies = [
+    { project_id: "project", version_id: "new", dependency_type: "required" },
+  ];
+  const plan = await f.service.preview(f.bulk);
+  assert.equal(plan.files.length, 2);
+  const downloads = f.requests.filter(
+    ({ url }) =>
+      url === "https://cdn.modrinth.com/new.jar" ||
+      url === "https://cdn.modrinth.com/addon-new.jar",
+  ).length;
+  const job = await finish(f.service, { planId: plan.planId, confirmed: true });
+  assert.equal(job.status, "completed", job.error);
+  assert.deepEqual(
+    await fs.readFile(path.join(f.serverDir, "mods", "new.jar")),
+    f.library2,
+  );
+  assert.deepEqual(
+    await fs.readFile(path.join(f.serverDir, "mods", "addon-new.jar")),
+    f.addon2,
+  );
+  assert.equal(
+    f.requests.filter(
+      ({ url }) =>
+        url === "https://cdn.modrinth.com/new.jar" ||
+        url === "https://cdn.modrinth.com/addon-new.jar",
+    ).length,
+    downloads,
+  );
+});
+
+test("combined updates reject incompatible new dependent declarations", async (t) => {
+  const f = await dependencyUpdateFixture(t, { nextRange: "[3.0,4.0)" });
+  await assert.rejects(
+    f.service.preview(f.bulk),
+    /addon.*requires corelib.*\[3.0,4.0\)/,
+  );
+  assert.deepEqual(
+    await fs.readFile(path.join(f.serverDir, "mods", "old.jar")),
+    f.library1,
+  );
+  assert.deepEqual(
+    await fs.readFile(path.join(f.serverDir, "mods", "addon.jar")),
+    f.addon1,
+  );
+});
+
+test("combined updates also check newly introduced dependent requirements", async (t) => {
+  const f = await dependencyUpdateFixture(t, {
+    range: null,
+    nextRange: "[3.0,4.0)",
+  });
+  await assert.rejects(
+    f.service.preview(f.bulk),
+    /addon.*requires corelib.*\[3.0,4.0\)/,
+  );
+});
+
+test("a compatible library update keeps the retained dependent's exact path and bytes", async (t) => {
+  const f = await dependencyUpdateFixture(t, { libraryVersion: "1.5" });
+  const plan = await f.service.preview(f.input);
+  assert.deepEqual(
+    plan.files.map((file) => file.path),
+    ["mods/new.jar"],
+  );
+  const job = await finish(f.service, { planId: plan.planId, confirmed: true });
+  assert.equal(job.status, "completed", job.error);
+  assert.deepEqual(
+    await fs.readFile(path.join(f.serverDir, "mods", "addon.jar")),
+    f.addon1,
+  );
+});
+
+for (const compatible of [false, true])
+  test(`updating a dependent alone checks its new requirements against the retained library (compatible=${compatible})`, async (t) => {
+    const f = await dependencyUpdateFixture(t, {
+      range: null,
+      nextRange: compatible ? "[1.0,2.0)" : "[2.0,3.0)",
+    });
+    assert.equal(
+      f.versions.addon2.dependencies,
+      undefined,
+      "the catalog omits the locally declared dependency",
+    );
+    const input = {
+      ...f.input,
+      projectId: "addon-project",
+      versionId: "addon2",
+      replacePath: "mods/addon.jar",
+    };
+    if (compatible) {
+      const plan = await f.service.preview(input);
+      assert.deepEqual(
+        plan.files.map((file) => file.path),
+        ["mods/addon-new.jar"],
+      );
+      const job = await finish(f.service, {
+        planId: plan.planId,
+        confirmed: true,
+      });
+      assert.equal(job.status, "completed", job.error);
+      assert.deepEqual(
+        await fs.readFile(path.join(f.serverDir, "mods", "addon-new.jar")),
+        f.addon2,
+      );
+    } else {
+      await assert.rejects(
+        f.service.preview(input),
+        /addon.*requires corelib.*\[2.0,3.0\)/,
+      );
+      assert.deepEqual(
+        await fs.readFile(path.join(f.serverDir, "mods", "addon.jar")),
+        f.addon1,
+      );
+      assert.equal(
+        await fs.stat(path.join(f.serverDir, "mods", "addon-new.jar")).then(
+          () => true,
+          () => false,
+        ),
+        false,
+      );
+    }
+    assert.deepEqual(
+      await fs.readFile(path.join(f.serverDir, "mods", "old.jar")),
+      f.library1,
+    );
+    assert.equal(
+      f.requests.filter(({ url }) => url === "https://cdn.modrinth.com/new.jar")
+        .length,
+      0,
+      "the retained library is never downloaded or replaced",
+    );
+  });
+
+test("optional dependencies do not become required update blockers", async (t) => {
+  const f = await dependencyUpdateFixture(t, { dependencyType: "optional" });
+  const plan = await f.service.preview(f.input);
+  const job = await finish(f.service, { planId: plan.planId, confirmed: true });
+  assert.equal(job.status, "completed", job.error);
+});
+
+test("update dependency inspection rejects a failed candidate checksum before changing files", async (t) => {
+  const f = await dependencyUpdateFixture(t);
+  f.downloads.set(
+    "https://cdn.modrinth.com/new.jar",
+    Buffer.from("corrupt candidate"),
+  );
+  await assert.rejects(
+    f.service.preview(f.input),
+    /size|checksum|verification/i,
+  );
+  assert.deepEqual(
+    await fs.readFile(path.join(f.serverDir, "mods", "old.jar")),
+    f.library1,
+  );
 });
