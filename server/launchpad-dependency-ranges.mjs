@@ -1,5 +1,9 @@
 import { parse } from "smol-toml";
 import { inspectBundledDependencies } from "./launchpad-bundled.mjs";
+import {
+  mavenVersion,
+  compareMavenVersions as compare,
+} from "./maven-version.mjs";
 
 const unverifiable = () => {
   throw new Error("The installed dependency's compatibility cannot be proved.");
@@ -20,17 +24,8 @@ const numericVersion = (value) => {
     unverifiable();
   return value.split(".").map((part) => BigInt(part));
 };
-const compare = (left, right) => {
-  for (let index = 0; index < Math.max(left.length, right.length); index++) {
-    const a = left[index] ?? 0n,
-      b = right[index] ?? 0n;
-    if (a !== b) return a < b ? -1 : 1;
-  }
-  return 0;
-};
-
-// A deliberately narrow subset of Maven hard requirements. Bare versions are
-// recommendations, and qualifiers need Maven's full ordering implementation.
+// Maven hard requirements, including qualified mod versions. Bare versions are
+// recommendations and cannot prove a required range.
 // https://maven.apache.org/pom.html#Dependency_Version_Requirement_Specification
 function permittedByRange(version, value) {
   if (typeof value !== "string" || value.length > 4096) unverifiable();
@@ -47,10 +42,10 @@ function permittedByRange(version, value) {
       includeUpper = closing === "]";
     if (parts.length === 1) {
       if (!includeLower || !includeUpper) unverifiable();
-      lower = upper = numericVersion(parts[0]);
+      lower = upper = mavenVersion(parts[0]);
     } else if (parts.length === 2) {
-      lower = parts[0] ? numericVersion(parts[0]) : null;
-      upper = parts[1] ? numericVersion(parts[1]) : null;
+      lower = parts[0] ? mavenVersion(parts[0]) : null;
+      upper = parts[1] ? mavenVersion(parts[1]) : null;
       if (
         (!lower && !upper) ||
         (!lower && includeLower) ||
@@ -134,7 +129,7 @@ export function installedModVersionSatisfies(version, range) {
     )
       return false;
     if (typeof range === "string" && range.trim() === "*") return true;
-    return permittedByRange(numericVersion(version), range);
+    return permittedByRange(mavenVersion(version), range);
   } catch {
     return false;
   }
@@ -183,7 +178,7 @@ function modMetadata(metadata, loader) {
  * must already establish the installed project's identity and target runtime.
  * Only root mod versions identify the retained dependency. Required declarations
  * in the parent's declared nested mods also constrain it. Unknown metadata,
- * soft/empty ranges, or qualified versions return false; cancellation propagates.
+ * soft/empty ranges, or unsupported versions return false; cancellation propagates.
  */
 export async function installedDependencySatisfies(
   parentArchive,
@@ -210,7 +205,7 @@ export async function installedDependencySatisfies(
             mod.version === "${file.jarVersion}"
               ? manifestVersion(metadata.raw.get("META-INF/MANIFEST.MF"))
               : mod.version;
-          installed.set(mod.modId, numericVersion(version));
+          installed.set(mod.modId, mavenVersion(version));
         }
       },
     });

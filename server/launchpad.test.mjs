@@ -7284,6 +7284,10 @@ async function dependencyUpdateFixture(
     range = "[1.0,2.0)",
     nextRange = "[2.0,3.0)",
     libraryVersion = "2.0",
+    installedLibraryVersion = "1.0",
+    libraryId = "corelib",
+    addonId = "addon",
+    retainedAddons = [],
     dependencyType = "required",
   } = {},
 ) {
@@ -7314,7 +7318,7 @@ async function dependencyUpdateFixture(
               id,
               version,
               name: id,
-              ...(requirement ? { depends: { corelib: requirement } } : {}),
+              ...(requirement ? { depends: { [libraryId]: requirement } } : {}),
             })
           : [
               'modLoader="javafml"',
@@ -7327,7 +7331,7 @@ async function dependencyUpdateFixture(
               ...(requirement
                 ? [
                     `[[dependencies.${id}]]`,
-                    'modId="corelib"',
+                    `modId="${libraryId}"`,
                     loader === "forge"
                       ? `mandatory=${dependencyType === "required"}`
                       : `type="${dependencyType}"`,
@@ -7339,10 +7343,10 @@ async function dependencyUpdateFixture(
       ],
     ]);
   f.setServer({ loader });
-  const library1 = jar("corelib", "1.0"),
-    library2 = jar("corelib", libraryVersion),
-    addon1 = jar("addon", "1.0", range),
-    addon2 = jar("addon", "2.0", nextRange);
+  const library1 = jar(libraryId, installedLibraryVersion),
+    library2 = jar(libraryId, libraryVersion),
+    addon1 = jar(addonId, "1.0", range),
+    addon2 = jar(addonId, "2.0", nextRange);
   await fs.writeFile(path.join(f.serverDir, "mods", "old.jar"), library1);
   await fs.writeFile(path.join(f.serverDir, "mods", "addon.jar"), addon1);
   const version = (base, id, project, filename, data) => ({
@@ -7390,6 +7394,23 @@ async function dependencyUpdateFixture(
   );
   identities.set(hashes(library1).sha512, f.versions.old);
   identities.set(hashes(addon1).sha512, f.versions.addon1);
+  const retained = [];
+  for (const addon of retainedAddons) {
+    const data = jar(addon.id, addon.version, addon.range),
+      filename = `${addon.id}.jar`,
+      relative = `mods/${filename}`;
+    await fs.writeFile(path.join(f.serverDir, relative), data);
+    const installed = version(
+      f.versions.old,
+      `${addon.id}-installed`,
+      `${addon.id}-project`,
+      filename,
+      data,
+    );
+    f.versions[installed.id] = installed;
+    identities.set(hashes(data).sha512, installed);
+    retained.push({ path: relative, data });
+  }
   f.downloads.set("https://cdn.modrinth.com/new.jar", library2);
   f.downloads.set("https://cdn.modrinth.com/addon-new.jar", addon2);
   return {
@@ -7398,6 +7419,7 @@ async function dependencyUpdateFixture(
     library2,
     addon1,
     addon2,
+    retained,
     input: { ...selection, loader, replacePath: "mods/old.jar" },
     bulk: {
       type: "mod",
@@ -7420,6 +7442,103 @@ async function dependencyUpdateFixture(
     },
   };
 }
+
+async function moonlightUpdateFixture(t, options = {}) {
+  return dependencyUpdateFixture(t, {
+    libraryId: "moonlight",
+    addonId: "amendments",
+    installedLibraryVersion: "1.21.1-3.7.1",
+    libraryVersion: "1.21.1-3.7.2",
+    range: "[1.21-3.1.0c,)",
+    nextRange: "[1.21-3.1.0c,)",
+    retainedAddons: [
+      { id: "supplementaries", version: "3.9.9", range: "[1.21-3.6.4,)" },
+      { id: "vista", version: "5.5.7", range: "[1.21-3.4.0,)" },
+    ],
+    ...options,
+  });
+}
+
+test("NeoForge Moonlight update accepts Minecraft-prefixed ranges of retained mods", async (t) => {
+  const f = await moonlightUpdateFixture(t);
+  const plan = await f.service.preview(f.input);
+  assert.deepEqual(
+    plan.files.map((file) => file.path),
+    ["mods/new.jar"],
+  );
+  const job = await finish(f.service, { planId: plan.planId, confirmed: true });
+  assert.equal(job.status, "completed", job.error);
+  assert.deepEqual(
+    await fs.readFile(path.join(f.serverDir, "mods/new.jar")),
+    f.library2,
+  );
+  for (const retained of [
+    { path: "mods/addon.jar", data: f.addon1 },
+    ...f.retained,
+  ])
+    assert.deepEqual(
+      await fs.readFile(path.join(f.serverDir, retained.path)),
+      retained.data,
+    );
+});
+
+for (const compatible of [true, false])
+  test(`NeoForge Amendments update checks its Minecraft-prefixed range against retained Moonlight (compatible=${compatible})`, async (t) => {
+    const f = await moonlightUpdateFixture(t, {
+      installedLibraryVersion: "1.21.1-3.7.2",
+      range: null,
+      nextRange: compatible ? "[1.21-3.1.0c,)" : "[1.21.1-3.8,)",
+    });
+    const input = {
+      ...f.input,
+      projectId: "addon-project",
+      versionId: "addon2",
+      replacePath: "mods/addon.jar",
+    };
+    if (compatible) {
+      const plan = await f.service.preview(input);
+      assert.deepEqual(
+        plan.files.map((file) => file.path),
+        ["mods/addon-new.jar"],
+      );
+      const job = await finish(f.service, {
+        planId: plan.planId,
+        confirmed: true,
+      });
+      assert.equal(job.status, "completed", job.error);
+      assert.deepEqual(
+        await fs.readFile(path.join(f.serverDir, "mods/addon-new.jar")),
+        f.addon2,
+      );
+    } else {
+      await assert.rejects(
+        f.service.preview(input),
+        (cause) =>
+          cause.status === 409 &&
+          /amendments.*requires moonlight.*\[1\.21\.1-3\.8,\)/.test(
+            cause.message,
+          ),
+      );
+      assert.deepEqual(
+        await fs.readFile(path.join(f.serverDir, "mods/addon.jar")),
+        f.addon1,
+      );
+    }
+    for (const retained of [
+      { path: "mods/old.jar", data: f.library1 },
+      ...f.retained,
+    ])
+      assert.deepEqual(
+        await fs.readFile(path.join(f.serverDir, retained.path)),
+        retained.data,
+      );
+    assert.equal(
+      f.requests.filter(({ url }) => url === "https://cdn.modrinth.com/new.jar")
+        .length,
+      0,
+      "updating Amendments does not download or replace retained Moonlight",
+    );
+  });
 
 for (const loader of ["forge", "neoforge", "fabric"])
   test(`${loader} update rejects a retained addon's incompatible required library range`, async (t) => {

@@ -443,7 +443,7 @@ test("Quilt records alias versions but keeps conditional requirements inconclusi
   ]);
 });
 
-test("alternate provider proof accepts numeric Maven ranges and explicit wildcards conservatively", () => {
+test("alternate provider proof accepts Maven ranges and explicit wildcards conservatively", () => {
   for (const [version, range] of [
     ["1.8.0", "[1.7.7,)"],
     ["1.5", "[1.5,2)"],
@@ -451,6 +451,8 @@ test("alternate provider proof accepts numeric Maven ranges and explicit wildcar
     ["3", "(,1],[3,)"],
     ["1.6.0", "*"],
     ["1.6.0-beta", " * "],
+    ["1.21.1-3.7.2", "[1.21-3.1.0c,)"],
+    ["1.5-beta2", "[1.5-beta1,1.5)"],
   ])
     assert.equal(
       installedModVersionSatisfies(version, range),
@@ -461,6 +463,7 @@ test("alternate provider proof accepts numeric Maven ranges and explicit wildcar
     ["1.4.8", "[1.7.7,)"],
     ["2.0", "[1.5,2)"],
     ["1.0-beta", "[1,)"],
+    ["1.21.1-3.7.2", "[1.21.1-3.7.3,)"],
     ["1.5", "1.5"],
     ["1.5", ">=1.0"],
     ["1.5", undefined],

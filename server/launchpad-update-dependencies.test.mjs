@@ -22,6 +22,10 @@ test("dependency update proof supports loader-specific ranges and rejects unknow
   for (const [version, range, loader, expected] of [
     ["2.0", "[1,2)", "neoforge", false],
     ["1.5", "[1,2)", "forge", true],
+    ["1.21.1-3.7.2", "[1.21-3.6.4,)", "neoforge", true],
+    ["1.21.1-3.7.2", "[1.21-3.1.0c,)", "forge", true],
+    ["1.21.1-3.7.2", "[1.21.1-3.7.3,)", "neoforge", false],
+    ["2.0-beta", "[2.0,)", "neoforge", false],
     ["1.5", ">=1 <2", "fabric", true],
     ["2", ">=1 <2", "fabric", false],
     ["0.9", "^0.1", "fabric", true],
@@ -76,7 +80,7 @@ test("an alternate bundled provider must satisfy all retained required ranges", 
 });
 
 test("unknown ranges only preserve an unchanged dependent's known provider version", () => {
-  const addon = dependent("[1.0-beta,)"),
+  const addon = dependent("unsupported range"),
     old = provider("1.1-beta");
   assert.doesNotThrow(() => check([addon, old], [addon, provider("1.1-beta")]));
   assert.throws(

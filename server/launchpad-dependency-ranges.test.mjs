@@ -160,6 +160,33 @@ test("numeric Maven ranges honor boundaries, unions, numeric order, and zero pad
     );
 });
 
+test("qualified Maven ranges prove retained Moonlight versions without weakening bounds", async () => {
+  for (const [range, version, expected] of [
+    ["[1.21-3.6.4,)", "1.21.1-3.7.2", true],
+    ["[1.21-3.4.0,)", "1.21.1-3.7.2", true],
+    ["[1.21-3.1.0c,)", "1.21.1-3.7.2", true],
+    ["[1.21.1-3.7.2]", "1.21.1-3.7.2", true],
+    ["[1.21.1-3.7.2]", "1.21.1-3.7.3", false],
+    ["[1.21.1-3.6.4,1.21.1-3.7.2)", "1.21.1-3.7.2", false],
+    ["(1.21.1-3.7.2,)", "1.21.1-3.7.2", false],
+    ["[1.21.1-3.7.3,)", "1.21.1-3.7.2", false],
+    ["[1.21-3.1.0c,)", "1.21-3.1.0b", false],
+    ["(,2.0-beta],[2.0,)", "2.0-rc1", false],
+    ["(,2.0-beta],[2.0,)", "2.0-final", true],
+    ["[2.0.5-alpha,)", "2.0.5", true],
+    ["[2.0.5+build]", "2.0.5+build", true],
+    ["[2.0.5+build]", "2.0.5", false],
+    ["[2],[3-alpha]", "3-alpha", true],
+  ])
+    assert.equal(
+      await proof(parent(range), installed(version)),
+      expected,
+      `${range} / ${version}`,
+    );
+  for (const version of ["2.0.5-beta", "2.0.5+mc1.21.1"])
+    assert.equal(await proof(parent(), installed(version)), true);
+});
+
 test("soft, malformed, overlapping, and unsupported range expressions cannot prove compatibility", async () => {
   for (const range of [
     "",
@@ -167,8 +194,6 @@ test("soft, malformed, overlapping, and unsupported range expressions cannot pro
     "2.0.5",
     "*",
     "^2.0.0",
-    "[2.0.5-alpha,)",
-    "[2.0.5+build]",
     "(,)",
     "[,2]",
     "[2,]",
@@ -187,7 +212,6 @@ test("soft, malformed, overlapping, and unsupported range expressions cannot pro
     "[3,4],[1,2]",
     "[2,),[3]",
     "[2],bogus",
-    "[2],[3-alpha]",
     "[1.1..0,)",
     "[+2,)",
     2,
@@ -196,10 +220,8 @@ test("soft, malformed, overlapping, and unsupported range expressions cannot pro
     assert.equal(await proof(parent(range)), false, String(range));
 });
 
-test("unknown or qualified installed versions are never inferred from labels", async () => {
+test("unknown or malformed installed versions are never inferred from labels", async () => {
   for (const version of [
-    "2.0.5-beta",
-    "2.0.5+mc1.21.1",
     "v2.0.5",
     "2.0.5 ",
     "2..5",
@@ -467,6 +489,8 @@ test("only an unambiguous main manifest version resolves file.jarVersion", async
   for (const manifest of [
     "Manifest-Version: 1.0\r\nImplementation-Version: 2.0.5\r\n\r\n",
     "Manifest-Version: 1.0\nimplementation-version: 2.0.\n 5\n\n",
+    "Manifest-Version: 1.0\nImplementation-Version: 2.0.5-beta\n\n",
+    "Manifest-Version: 1.0\nImplementation-Version: 1.21.1-3.7.2\n\n",
   ])
     assert.equal(await proof(parent(), child(manifest)), true);
   for (const manifest of [
@@ -474,7 +498,6 @@ test("only an unambiguous main manifest version resolves file.jarVersion", async
     "Manifest-Version: 1.0\n\nName: sable.class\nImplementation-Version: 2.0.5\n",
     "Manifest-Version: 1.0\nImplementation-Version: 2.0.5\nimplementation-version: 1.0\n\n",
     "Manifest-Version: 1.0\nSpecification-Version: 2.0.5\n\n",
-    "Manifest-Version: 1.0\nImplementation-Version: 2.0.5-beta\n\n",
     "Manifest-Version: 1.0\nImplementation-Version: 2.0.5",
     "Manifest-Version: 1.0\nImplementation-Version: 2.0.5\n",
     "Manifest-Version: 1.0\nImplementation-Version: 2.0.5\ninvalid header\n\n",
