@@ -46,12 +46,11 @@ function permittedByRange(version, value) {
     } else if (parts.length === 2) {
       lower = parts[0] ? mavenVersion(parts[0]) : null;
       upper = parts[1] ? mavenVersion(parts[1]) : null;
-      if (
-        (!lower && !upper) ||
-        (!lower && includeLower) ||
-        (!upper && includeUpper)
-      )
-        unverifiable();
+      // Maven ignores inclusivity when that endpoint is absent. Real mods use
+      // [minimum,] (Supplementaries) as well as [minimum,) for no upper limit.
+      // Both endpoints absent still form an invalid Maven restriction.
+      // https://maven.apache.org/ref/3.8.5/xref/org/apache/maven/artifact/versioning/VersionRange.html
+      if (!lower && !upper) unverifiable();
       if (lower && upper) {
         const order = compare(lower, upper);
         if (order > 0 || (order === 0 && !(includeLower && includeUpper)))

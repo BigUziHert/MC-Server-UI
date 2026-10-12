@@ -7452,7 +7452,7 @@ async function moonlightUpdateFixture(t, options = {}) {
     range: "[1.21-3.1.0c,)",
     nextRange: "[1.21-3.1.0c,)",
     retainedAddons: [
-      { id: "supplementaries", version: "3.9.9", range: "[1.21-3.6.4,)" },
+      { id: "supplementaries", version: "3.9.9", range: "[1.21-3.6.4,]" },
       { id: "vista", version: "5.5.7", range: "[1.21-3.4.0,)" },
     ],
     ...options,
@@ -7479,6 +7479,34 @@ test("NeoForge Moonlight update accepts Minecraft-prefixed ranges of retained mo
     assert.deepEqual(
       await fs.readFile(path.join(f.serverDir, retained.path)),
       retained.data,
+    );
+});
+
+test("NeoForge combined Moonlight and Supplementaries updates accept the published inclusive unbounded range", async (t) => {
+  const f = await moonlightUpdateFixture(t, {
+    addonId: "supplementaries",
+    range: "[1.21-3.6.4,]",
+    nextRange: "[1.21-3.6.4,]",
+    retainedAddons: [
+      { id: "amendments", version: "1.21-2.1.10", range: "[1.21-3.1.0c,)" },
+      { id: "vista", version: "1.21.1-5.5.7", range: "[1.21-3.4.0,)" },
+    ],
+  });
+  const plan = await f.service.preview(f.bulk);
+  assert.deepEqual(plan.files.map((file) => file.path).sort(), [
+    "mods/addon-new.jar",
+    "mods/new.jar",
+  ]);
+  const job = await finish(f.service, { planId: plan.planId, confirmed: true });
+  assert.equal(job.status, "completed", job.error);
+  for (const expected of [
+    { path: "mods/new.jar", data: f.library2 },
+    { path: "mods/addon-new.jar", data: f.addon2 },
+    ...f.retained,
+  ])
+    assert.deepEqual(
+      await fs.readFile(path.join(f.serverDir, expected.path)),
+      expected.data,
     );
 });
 

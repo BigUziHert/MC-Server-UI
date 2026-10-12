@@ -187,6 +187,29 @@ test("qualified Maven ranges prove retained Moonlight versions without weakening
     assert.equal(await proof(parent(), installed(version)), true);
 });
 
+test("Maven ignores inclusivity on an absent bound, as used by Supplementaries", async () => {
+  for (const [range, version, expected] of [
+    // Supplementaries 3.9.9 declares this exact range in its NeoForge JAR.
+    ["[1.21-3.6.4,]", "1.21.1-3.7.2", true],
+    ["[1.21-3.6.4,]", "1.21-3.6.4", true],
+    ["[1.21-3.6.4,]", "1.21-3.6.3", false],
+    ["(1.21-3.6.4,]", "1.21-3.6.4", false],
+    ["(1.21-3.6.4,]", "1.21-3.6.5", true],
+    ["[,2.0]", "1.0", true],
+    ["[,2.0]", "2.0", true],
+    ["[,2.0]", "2.0.1", false],
+    ["[,2.0)", "2.0", false],
+    ["[,2.0)", "1.9", true],
+    ["[,1.0],[2.0,]", "1.5", false],
+    ["[,1.0],[2.0,]", "2.5", true],
+  ])
+    assert.equal(
+      await proof(parent(range), installed(version)),
+      expected,
+      `${range} / ${version}`,
+    );
+});
+
 test("soft, malformed, overlapping, and unsupported range expressions cannot prove compatibility", async () => {
   for (const range of [
     "",
@@ -195,8 +218,9 @@ test("soft, malformed, overlapping, and unsupported range expressions cannot pro
     "*",
     "^2.0.0",
     "(,)",
-    "[,2]",
-    "[2,]",
+    "[,]",
+    "[,)",
+    "(,]",
     "[3,2]",
     "(2,2]",
     "[2,2)",
