@@ -4,6 +4,25 @@ import { createHash, randomUUID } from "node:crypto";
 
 const error = (status, message) =>
   Object.assign(new Error(message), { status });
+// Stop scheduling after the first failure, but retain the mutation lock until
+// every started filesystem operation has settled.
+async function parallelFiles(items, limit, work) {
+  let next = 0,
+    failure;
+  await Promise.all(
+    Array.from({ length: Math.min(limit, items.length) }, async () => {
+      while (!failure && next < items.length) {
+        const item = items[next++];
+        try {
+          await work(item);
+        } catch (cause) {
+          failure ??= cause;
+        }
+      }
+    }),
+  );
+  if (failure) throw failure;
+}
 const ids = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i;
 const phases = new Set([
   "prepared",
@@ -452,7 +471,7 @@ export async function createRecycleBin({
           "The file changed during recovery. Try again when it is no longer being edited.",
         );
       const hash = createHash(algorithm);
-      const buffer = Buffer.allocUnsafe(128 * 1024);
+      const buffer = Buffer.allocUnsafe(1024 * 1024);
       for (;;) {
         signal?.throwIfAborted();
         const { bytesRead } = await handle.read(buffer, 0, buffer.length, null);
@@ -471,31 +490,41 @@ export async function createRecycleBin({
     const hashes = new Map();
     let filesProcessed = 0,
       bytesProcessed = 0;
+    const partialBytes = new Map();
     const totalFiles = initial.filter((row) => row.type === "file").length;
     const totalBytes = initial.reduce((total, row) => total + row.size, 0);
-    const report = (partial = 0) =>
+    const report = () =>
       onProgress?.({
         phase: "copying",
         filesProcessed,
         totalFiles,
-        bytesProcessed: Math.floor(bytesProcessed + partial),
+        bytesProcessed: Math.floor(
+          bytesProcessed +
+            [...partialBytes.values()].reduce((sum, value) => sum + value, 0),
+        ),
         totalBytes,
       });
     report();
-    for (const row of initial) {
-      const from = await safePath(source, row.path);
-      // Resolve from the server/private boundary each time. An external process
-      // must not redirect recovery by replacing a parent while journaling waits.
-      const target = await resolveDestination(row.path);
-      if (row.type === "directory") await io.mkdir(target);
-      else {
+    // Establish parents in snapshot order, then copy independent files with a
+    // small worker pool. Keep per-file verification and durable flushes intact.
+    for (const row of initial.filter((row) => row.type === "directory"))
+      await io.mkdir(await resolveDestination(row.path));
+    await parallelFiles(
+      initial.filter((row) => row.type === "file"),
+      4,
+      async (row) => {
+        const from = await safePath(source, row.path);
+        // Resolve from the server/private boundary each time. An external process
+        // must not redirect recovery by replacing a parent while journaling waits.
+        const target = await resolveDestination(row.path);
         await io.copyFile(from, target, 1); // COPYFILE_EXCL: never replace existing files.
         let checkedBytes = 0;
         const checking = (bytes) => {
           checkedBytes += bytes;
           // Count each byte once across both checksum passes. copyFile itself
           // remains an exclusive OS copy; these counters describe checked data.
-          report(Math.min(row.size, checkedBytes / 2));
+          partialBytes.set(row.path, Math.min(row.size, checkedBytes / 2));
+          report();
         };
         const digest = await hashFile(from, "sha256", undefined, checking);
         if (
@@ -523,9 +552,10 @@ export async function createRecycleBin({
         hashes.set(row.path, digest);
         filesProcessed++;
         bytesProcessed += row.size;
+        partialBytes.delete(row.path);
         report();
-      }
-    }
+      },
+    );
     const after = await walk(source);
     if (JSON.stringify(initial) !== JSON.stringify(after))
       throw error(
@@ -770,33 +800,33 @@ export async function createRecycleBin({
           entries.push(entry);
         }
       }
-      const items = [];
-      for (const entry of entries) {
-        if (
-          !entry.isDirectory() ||
-          entry.isSymbolicLink() ||
-          !ids.test(entry.name)
-        )
-          continue;
-        try {
-          const record = await read(entry.name, { validateOriginal: false });
-          if (record.metadata.phase !== "restored")
-            items.push(await view(record));
-        } catch (cause) {
-          items.push({
-            id: entry.name,
-            name: "Incomplete recovery item",
-            originalPath: "",
-            type: "file",
-            size: 0,
-            deletedAt: new Date(0).toISOString(),
-            status: "incomplete",
-            message:
-              "The recovery metadata is unavailable. Stored files have been retained.",
-          });
-        }
-      }
-      return items.sort((a, b) => b.deletedAt.localeCompare(a.deletedAt));
+      const items = new Array(entries.length);
+      await parallelFiles(
+        entries.map((entry, index) => ({ entry, index })),
+        8,
+        async ({ entry, index }) => {
+          try {
+            const record = await read(entry.name, { validateOriginal: false });
+            if (record.metadata.phase !== "restored")
+              items[index] = await view(record);
+          } catch (cause) {
+            items[index] = {
+              id: entry.name,
+              name: "Incomplete recovery item",
+              originalPath: "",
+              type: "file",
+              size: 0,
+              deletedAt: new Date(0).toISOString(),
+              status: "incomplete",
+              message:
+                "The recovery metadata is unavailable. Stored files have been retained.",
+            };
+          }
+        },
+      );
+      return items
+        .filter(Boolean)
+        .sort((a, b) => b.deletedAt.localeCompare(a.deletedAt));
     },
     recycle(originalPath, { backup, onProgress } = {}) {
       return exclusive(async () => {

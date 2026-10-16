@@ -62,6 +62,11 @@ export async function api<T = any>(
         ...(Number.isSafeInteger(body.uploaded) && body.uploaded >= 0
           ? { uploaded: body.uploaded }
           : {}),
+        ...(Array.isArray(body.uploadedPaths) &&
+        body.uploadedPaths.length <= 100 &&
+        body.uploadedPaths.every((path: unknown) => typeof path === "string")
+          ? { uploadedPaths: body.uploadedPaths }
+          : {}),
         ...(Number.isSafeInteger(body.directories) && body.directories >= 0
           ? { directories: body.directories }
           : {}),

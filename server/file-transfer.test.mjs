@@ -4,7 +4,11 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
-import { copyServerFiles, uploadServerFiles } from "./file-transfer.mjs";
+import {
+  copyServerFiles,
+  uploadServerFiles,
+  MAX_UPLOAD_FILES_PER_BATCH,
+} from "./file-transfer.mjs";
 import { createFleet, safePath } from "./index.mjs";
 
 const json = (body) => ({
@@ -43,6 +47,157 @@ async function fixture(t) {
       copyServerFiles({ sourceDir, serverDir, safePath, ...options }),
   };
 }
+
+test("same-volume uploads publish without copying file bytes and survive temporary cleanup", async (t) => {
+  const f = await fixture(t);
+  const temporary = path.join(f.root, "temporary-upload");
+  const bytes = Buffer.alloc(1024 * 1024, 47);
+  await fs.writeFile(temporary, bytes);
+  const result = await uploadServerFiles({
+    serverDir: f.serverDir,
+    files: [{ path: temporary, originalname: "mod.jar" }],
+    safePath,
+    fileSystem: {
+      ...fs,
+      copyFile: () =>
+        assert.fail("Same-volume uploads must not rewrite the payload."),
+    },
+  });
+  assert.equal(result.uploaded, 1);
+  const published = path.join(f.serverDir, "mod.jar");
+  assert.equal((await fs.stat(published)).ino, (await fs.stat(temporary)).ino);
+  await fs.unlink(temporary);
+  assert.deepEqual(await fs.readFile(published), bytes);
+});
+
+test("uploads fall back to exclusive copies across volumes and never fall back on conflicts", async (t) => {
+  const f = await fixture(t);
+  const temporary = path.join(f.root, "temporary-upload");
+  await fs.writeFile(temporary, "exact payload");
+  let copies = 0;
+  const options = {
+    serverDir: f.serverDir,
+    files: [{ path: temporary, originalname: "mod.jar" }],
+    safePath,
+    fileSystem: {
+      ...fs,
+      link: async () => {
+        throw Object.assign(new Error("Other volume"), { code: "EXDEV" });
+      },
+      copyFile: async (...args) => {
+        copies++;
+        assert.equal(args[2], 1, "The copy fallback must remain exclusive.");
+        await fs.copyFile(...args);
+      },
+    },
+  };
+  await uploadServerFiles(options);
+  assert.equal(copies, 1);
+  assert.equal(
+    await fs.readFile(path.join(f.serverDir, "mod.jar"), "utf8"),
+    "exact payload",
+  );
+  await assert.rejects(
+    uploadServerFiles({
+      ...options,
+      files: [{ path: temporary, originalname: "raced.jar" }],
+      fileSystem: {
+        ...options.fileSystem,
+        link: async (_source, target) => {
+          await fs.writeFile(target, "existing destination");
+          throw Object.assign(new Error("Destination appeared"), {
+            code: "EEXIST",
+          });
+        },
+      },
+    }),
+    { code: "EEXIST" },
+  );
+  assert.equal(copies, 1);
+  assert.equal(
+    await fs.readFile(path.join(f.serverDir, "raced.jar"), "utf8"),
+    "existing destination",
+  );
+});
+
+test("advertised upload capacity accepts a complete 100-file batch", async (t) => {
+  const f = await fixture(t);
+  const temporary = path.join(f.root, "temporary-upload");
+  await fs.writeFile(temporary, "payload");
+  const names = Array.from(
+    { length: MAX_UPLOAD_FILES_PER_BATCH },
+    (_, index) => `${index}.jar`,
+  );
+  const result = await uploadServerFiles({
+    serverDir: f.serverDir,
+    files: names.map((originalname) => ({ path: temporary, originalname })),
+    fields: {
+      paths: JSON.stringify(names),
+      modified: JSON.stringify(names.map(() => 1234567890000)),
+    },
+    safePath,
+  });
+  assert.equal(result.uploaded, 100);
+  assert.equal((await fs.readdir(f.serverDir)).length, 100);
+});
+
+test("upload publication is bounded and drains started files before returning partial failure", async (t) => {
+  const f = await fixture(t);
+  const temporary = path.join(f.root, "temporary-upload");
+  await fs.writeFile(temporary, "payload");
+  const blocked = deferred(),
+    failureReady = deferred(),
+    release = deferred();
+  const attempts = [],
+    uploaded = [];
+  let settled = false;
+  const work = uploadServerFiles({
+    serverDir: f.serverDir,
+    files: Array.from({ length: 20 }, (_, index) => ({
+      path: temporary,
+      originalname: `${index}.jar`,
+    })),
+    safePath,
+    onUploaded: (relative) => uploaded.push(relative),
+    fileSystem: {
+      ...fs,
+      link: async (source, destination) => {
+        attempts.push(destination);
+        if (path.basename(destination) === "0.jar") {
+          await blocked.promise;
+          failureReady.resolve();
+          throw Object.assign(new Error("Drive is full"), { code: "ENOSPC" });
+        }
+        blocked.resolve();
+        await release.promise;
+        await fs.link(source, destination);
+      },
+    },
+  }).finally(() => {
+    settled = true;
+  });
+  const rejected = assert.rejects(work, { code: "ENOSPC" });
+  try {
+    await failureReady.promise;
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(
+      settled,
+      false,
+      "Do not clean temporary files while publications are in flight.",
+    );
+  } finally {
+    release.resolve();
+  }
+  await rejected;
+  assert.equal(
+    attempts.length,
+    8,
+    "Stop scheduling after failure and bound filesystem work.",
+  );
+  assert.equal(uploaded.length, 7);
+  assert.ok(uploaded.every((relative) => relative !== "0.jar"));
+  assert.equal((await fs.readdir(f.serverDir)).length, 7);
+});
 
 test("native copy preserves nested files, empty folders, source bytes and modification times", async (t) => {
   const f = await fixture(t);
@@ -521,7 +676,7 @@ test("200-plus nested uploads complete as bounded sequential batches and preserv
       "jar 204",
     );
     const oversized = new FormData();
-    for (let i = 0; i < 21; i++)
+    for (let i = 0; i <= MAX_UPLOAD_FILES_PER_BATCH; i++)
       oversized.append("files", new Blob(["one"]), `too-many-${i}.jar`);
     assert.equal(
       (

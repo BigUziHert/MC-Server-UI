@@ -54,6 +54,8 @@ files:
   - server/launchpad-jar-identity.mjs
   - server/launchpad-jar-recovery.mjs
   - server/launchpad-metadata-cache.mjs
+  - server/launchpad-catalog-cache.mjs
+  - server/launchpad-transfers.mjs
   - server/launchpad-archives.mjs
   - server/launchpad-bundled.mjs
   - server/launchpad-dependency-ranges.mjs

@@ -4,7 +4,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import http from "node:http";
-import { createFileSearch } from "./file-search.mjs";
+import { createFileSearch, listServerFiles } from "./file-search.mjs";
 import { createFleet, safePath } from "./index.mjs";
 
 async function fixture(t, options = {}) {
@@ -49,7 +49,14 @@ async function fixture(t, options = {}) {
     });
     await fs.writeFile(path.join(serverDir, relative), text);
   };
-  return { root, serverDir, service, write, handles: () => handles };
+  return {
+    root,
+    serverDir,
+    service,
+    write,
+    fileSystem,
+    handles: () => handles,
+  };
 }
 
 async function allPages(service, search, relative = "") {
@@ -252,6 +259,133 @@ test("a directory replaced between search pages fails instead of following the r
       cursor: first.nextCursor,
     }),
     { status: 409 },
+  );
+  assert.equal(f.handles(), 0);
+});
+
+test("sparse searches skip nonmatching file metadata and batch ancestor checks", async (t) => {
+  const f = await fixture(t, { pageSize: 200, scanSize: 4000 });
+  for (let index = 0; index < 600; index++)
+    await f.write(`deep/tree/unrelated-${index}.log`);
+  await f.write("deep/tree/wanted.json");
+  let metadataReads = 0;
+  f.fileSystem.lstat = async (target) => {
+    metadataReads++;
+    assert.ok(!String(target).includes("unrelated-"));
+    return fs.lstat(target);
+  };
+  let ancestorChecks = 0;
+  const service = createFileSearch({
+    root: f.serverDir,
+    fileSystem: f.fileSystem,
+    safePath: async (...args) => {
+      ancestorChecks++;
+      return safePath(...args);
+    },
+  });
+  t.after(() => service.close());
+  const { entries } = await allPages(service, "wanted");
+  assert.deepEqual(
+    entries.map((entry) => entry.path),
+    ["deep/tree/wanted.json"],
+  );
+  assert.ok(
+    metadataReads < 100,
+    `${metadataReads} metadata reads for 603 entries`,
+  );
+  assert.ok(
+    ancestorChecks < 40,
+    `${ancestorChecks} ancestor checks for 603 entries`,
+  );
+});
+
+test("search and folder listing overlap metadata reads with a bounded worker pool", async (t) => {
+  const f = await fixture(t, { pageSize: 200, scanSize: 4000 });
+  for (let index = 0; index < 64; index++) await f.write(`match-${index}.txt`);
+  let active = 0,
+    peak = 0;
+  f.fileSystem.lstat = async (target) => {
+    if (!String(target).includes("match-")) return fs.lstat(target);
+    peak = Math.max(peak, ++active);
+    try {
+      await new Promise((resolve) => setTimeout(resolve, 2));
+      return await fs.lstat(target);
+    } finally {
+      active--;
+    }
+  };
+  const search = await allPages(f.service, "match");
+  assert.equal(search.entries.length, 64);
+  assert.ok(peak > 1 && peak <= 16, `Search metadata concurrency was ${peak}`);
+  peak = 0;
+  const listing = await listServerFiles({
+    root: f.serverDir,
+    safePath,
+    fileSystem: f.fileSystem,
+  });
+  assert.equal(listing.entries.length, 64);
+  assert.ok(peak > 1 && peak <= 16, `Listing metadata concurrency was ${peak}`);
+  assert.equal(active, 0);
+  assert.deepEqual(
+    listing.entries.map((entry) => entry.name),
+    listing.entries
+      .map((entry) => entry.name)
+      .sort((a, b) => a.localeCompare(b)),
+  );
+});
+
+test("a folder replaced during a metadata batch is rejected before publishing matches", async (t) => {
+  const f = await fixture(t, { pageSize: 200, scanSize: 4000 });
+  await f.write("nested/match.txt");
+  let replaced = false;
+  f.fileSystem.lstat = async (target) => {
+    const stat = await fs.lstat(target);
+    if (!replaced && String(target).endsWith("match.txt")) {
+      replaced = true;
+      await fs.rename(
+        path.join(f.serverDir, "nested"),
+        path.join(f.serverDir, "moved"),
+      );
+      await fs.mkdir(path.join(f.serverDir, "nested"));
+    }
+    return stat;
+  };
+  await assert.rejects(f.service.search({ path: "nested", search: "match" }), {
+    status: 409,
+  });
+  assert.equal(f.handles(), 0);
+});
+
+test("aborting concurrent metadata drains the workers and releases the cursor", async (t) => {
+  const f = await fixture(t, { pageSize: 200, scanSize: 4000 });
+  for (let index = 0; index < 64; index++) await f.write(`match-${index}.txt`);
+  const controller = new AbortController();
+  let active = 0,
+    reads = 0;
+  f.fileSystem.lstat = async (target) => {
+    if (!String(target).includes("match-")) return fs.lstat(target);
+    active++;
+    reads++;
+    try {
+      await new Promise((resolve) => setTimeout(resolve, 2));
+      controller.abort();
+      return await fs.lstat(target);
+    } finally {
+      active--;
+    }
+  };
+  await assert.rejects(
+    f.service.search({ search: "match", signal: controller.signal }),
+    { name: "AbortError" },
+  );
+  assert.equal(
+    active,
+    0,
+    "No metadata reads remain after cancellation returns",
+  );
+  assert.ok(
+    reads > 1 && reads <= 16,
+    `Only the active batch should finish (${reads} reads)`,
   );
   assert.equal(f.handles(), 0);
 });

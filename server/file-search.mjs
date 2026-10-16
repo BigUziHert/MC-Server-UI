@@ -1,11 +1,85 @@
 import fs from "node:fs/promises";
 import { randomUUID } from "node:crypto";
+import path from "node:path";
 
 const failure = (status, message) =>
   Object.assign(new Error(message), { status });
 const identity = (a, b) =>
   a.dev === b.dev && a.ino === b.ino && a.birthtimeMs === b.birthtimeMs;
 const missing = (cause) => ["ENOENT", "ENOTDIR"].includes(cause.code);
+
+// Bound metadata IO instead of serializing every stat or flooding the disk with
+// one promise per entry in a large folder.
+async function mapMetadata(items, read, concurrency = 16) {
+  const result = new Array(items.length);
+  let next = 0;
+  let failure;
+  await Promise.all(
+    Array.from({ length: Math.min(concurrency, items.length) }, async () => {
+      while (!failure && next < items.length) {
+        const index = next++;
+        try {
+          result[index] = await read(items[index]);
+        } catch (cause) {
+          failure ??= cause;
+        }
+      }
+    }),
+  );
+  if (failure) throw failure;
+  return result.filter(Boolean);
+}
+
+async function entryMetadata(io, target, relative, item, signal) {
+  signal?.throwIfAborted();
+  const stat = await io.lstat(path.join(target, item.name)).catch((cause) => {
+    if (missing(cause)) return null;
+    throw cause;
+  });
+  signal?.throwIfAborted();
+  if (!stat || stat.isSymbolicLink() || !(stat.isDirectory() || stat.isFile()))
+    return null;
+  return {
+    name: item.name,
+    path: [relative, item.name].filter(Boolean).join("/"),
+    type: stat.isDirectory() ? "directory" : "file",
+    size: stat.isDirectory() ? 0 : stat.size,
+    modified: stat.mtime.toISOString(),
+  };
+}
+
+export async function listServerFiles({
+  root,
+  relative = "",
+  safePath,
+  signal,
+  fileSystem: io = fs,
+}) {
+  signal?.throwIfAborted();
+  const target = await safePath(root, relative);
+  const original = await io.lstat(target);
+  if (!original.isDirectory() || original.isSymbolicLink())
+    throw failure(400, "Choose an ordinary server folder to browse.");
+  const items = await io.readdir(target, { withFileTypes: true });
+  const entries = await mapMetadata(
+    items.filter((item) => !item.isSymbolicLink()),
+    (item) => entryMetadata(io, target, relative, item, signal),
+  );
+  // Metadata is published only after rechecking the parent and its ancestors.
+  // This also catches a folder moved/replaced while its entries were read.
+  const checked = await safePath(root, relative);
+  if (!identity(original, await io.lstat(checked)))
+    throw failure(409, "A folder changed while loading. Refresh to try again.");
+  signal?.throwIfAborted();
+  entries.sort((a, b) =>
+    a.type === b.type
+      ? a.name.localeCompare(b.name)
+      : a.type === "directory"
+        ? -1
+        : 1,
+  );
+  return { path: relative, entries };
+}
 
 // Keep one directory handle open per scan. Pages bound work per request, while
 // the cursor retains traversal position rather than a truncated result set.
@@ -16,6 +90,7 @@ async function createScan(root, relative, needle, options) {
     pageSize,
     scanSize,
     pageDurationMs,
+    batchSize,
   } = options;
   const rootStat = await io.lstat(root);
   if (!rootStat.isDirectory() || rootStat.isSymbolicLink())
@@ -64,53 +139,67 @@ async function createScan(root, relative, needle, options) {
             performance.now() - started >= pageDurationMs)
         )
           break;
-        scanned++;
         if (!handle) {
+          // Missing/replaced queued folders still count toward the page budget.
+          scanned++;
           directory = directories.pop();
           try {
             const target = await checkedPath(directory, signal);
             directoryStat = await io.lstat(target);
-            handle = await io.opendir(target);
+            handle = await io.opendir(target, { bufferSize: 256 });
           } catch (cause) {
             if (missing(cause) || cause.status === 400) continue;
             throw cause;
           }
         }
-        // Recheck ancestors even on a retained handle: a folder could be moved
-        // or replaced between pages, and a stale handle must not reveal it.
+        // Validate the directory around a bounded batch, including retained
+        // handles from previous pages. Never publish metadata from a detached
+        // or replaced directory. Walking ancestors for every nonmatching file
+        // made sparse searches cost many filesystem round trips per entry.
         const target = await checkedPath(directory, signal);
         if (!identity(directoryStat, await io.lstat(target)))
           throw failure(
             409,
             "A folder changed during search. Start the search again.",
           );
-        const item = await handle.read();
-        if (!item) {
-          await closeHandle();
-        } else if (!item.isSymbolicLink()) {
-          const child = [directory, item.name].filter(Boolean).join("/");
-          let stat;
-          try {
-            stat = await io.lstat(await checkedPath(child, signal));
-          } catch (cause) {
-            if (!missing(cause) && cause.status !== 400) throw cause;
+        const candidates = [];
+        const children = [];
+        for (let batch = 0; batch < batchSize; batch++) {
+          signal?.throwIfAborted();
+          const item = await handle.read();
+          signal?.throwIfAborted();
+          scanned++;
+          if (!item) {
+            await closeHandle();
+            break;
+          }
+          if (!item.isSymbolicLink()) {
+            if (item.isDirectory())
+              children.push([directory, item.name].filter(Boolean).join("/"));
+            if (
+              (item.isFile() || item.isDirectory()) &&
+              item.name.toLowerCase().includes(needle)
+            )
+              candidates.push(item);
           }
           if (
-            stat &&
-            !stat.isSymbolicLink() &&
-            (stat.isFile() || stat.isDirectory())
-          ) {
-            if (stat.isDirectory()) directories.push(child);
-            if (item.name.toLowerCase().includes(needle))
-              entries.push({
-                name: item.name,
-                path: child,
-                type: stat.isDirectory() ? "directory" : "file",
-                size: stat.isDirectory() ? 0 : stat.size,
-                modified: stat.mtime.toISOString(),
-              });
-          }
+            entries.length + candidates.length >= pageSize ||
+            scanned >= scanSize ||
+            performance.now() - started >= pageDurationMs
+          )
+            break;
         }
+        const matches = await mapMetadata(candidates, (item) =>
+          entryMetadata(io, target, directory, item, signal),
+        );
+        const checked = await checkedPath(directory, signal);
+        if (!identity(directoryStat, await io.lstat(checked)))
+          throw failure(
+            409,
+            "A folder changed during search. Start the search again.",
+          );
+        entries.push(...matches);
+        directories.push(...children);
       }
       await checkRoot(signal);
       return { entries, done: !handle && !directories.length };
@@ -128,8 +217,9 @@ export function createFileSearch({
   safePath,
   fileSystem = fs,
   pageSize = 200,
-  scanSize = 500,
-  pageDurationMs = 1000,
+  scanSize = 4000,
+  pageDurationMs = 100,
+  batchSize = 128,
   cursorTtlMs = 60_000,
   maximumActive = 8,
 }) {
@@ -194,6 +284,7 @@ export function createFileSearch({
           pageSize,
           scanSize,
           pageDurationMs,
+          batchSize,
         });
         return state.scan.readPage(pageSignal);
       })();

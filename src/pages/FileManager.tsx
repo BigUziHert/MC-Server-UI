@@ -2,6 +2,7 @@ import {
   useCallback,
   useContext,
   useEffect,
+  useMemo,
   useRef,
   useState,
   useSyncExternalStore,
@@ -56,6 +57,7 @@ import {
   collectDroppedUpload,
   collectSelectedUpload,
   uploadInBatches,
+  UPLOAD_FILES_PER_BATCH,
   type UploadSource,
 } from "../file-uploads";
 import {
@@ -153,6 +155,7 @@ type FileResult = {
   entries: Entry[];
   search?: string;
   nextCursor?: string | null;
+  uploadFilesPerBatch?: number;
 };
 type RecycledItem = {
   id: string;
@@ -622,7 +625,7 @@ export default function FileManager({
   });
   const searchScope = JSON.stringify([sessionScope, scopeKey, path]);
   const [search, setSearch] = useState({ scope: searchScope, value: "" });
-  const debouncedSearch = useDebouncedValue(search);
+  const debouncedSearch = useDebouncedValue(search, 150);
   const query = search.scope === searchScope ? search.value : "";
   const requestedQuery = query.trim();
   const debouncedQuery =
@@ -646,6 +649,7 @@ export default function FileManager({
   useEffect(() => setPage(1), [debouncedQuery, pageSize, path]);
   const [loading, setLoading] = useState(true);
   const [searchProgress, setSearchProgress] = useState(0);
+  const [uploadLimit, setUploadLimit] = useState({ scope: "", value: 20 });
   const [error, setError] = useState("");
   const [dragging, setDragging] = useState(false);
   const [dialog, setDialog] = useState<FileDialog | null>(null);
@@ -732,12 +736,24 @@ export default function FileManager({
       const matches = new Map<string, Entry>();
       const cursors = new Set<string>();
       let cursor: string | null = null;
+      let published = 0;
+      let lastPublished = 0;
       do {
         const result: FileResult = await api<FileResult>(
           `/files?path=${encodeURIComponent(path)}${debouncedQuery ? `&search=${encodeURIComponent(debouncedQuery)}` : ""}${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ""}`,
           { signal: controller.signal },
         );
         if (!current()) return false;
+        const advertisedLimit = result.uploadFilesPerBatch;
+        const value =
+          Number.isInteger(advertisedLimit) && advertisedLimit! > 0
+            ? Math.min(advertisedLimit!, UPLOAD_FILES_PER_BATCH)
+            : 20;
+        setUploadLimit((previous) =>
+          previous.scope === transferKey && previous.value === value
+            ? previous
+            : { scope: transferKey, value },
+        );
         if (
           debouncedQuery &&
           (result.search !== debouncedQuery ||
@@ -757,7 +773,21 @@ export default function FileManager({
             "The file search could not finish. Refresh the search and try again.",
           );
         if (cursor) cursors.add(cursor);
-        if (debouncedQuery) setSearchProgress(matches.size);
+        if (debouncedQuery) {
+          setSearchProgress(matches.size);
+          // Show the first matches immediately. Later pages are coalesced so
+          // fast scans do not repeatedly sort and redraw a growing result set.
+          if (
+            cursor &&
+            matches.size > published &&
+            (!published || performance.now() - lastPublished >= 150)
+          ) {
+            loaded.current = true;
+            setEntries([...matches.values()]);
+            published = matches.size;
+            lastPublished = performance.now();
+          }
+        }
       } while (cursor);
       if (current()) {
         loaded.current = true;
@@ -772,12 +802,26 @@ export default function FileManager({
       }
       return false;
     } catch (failure) {
-      if (current()) setError(messageOf(failure));
+      if (current()) {
+        setError(messageOf(failure));
+        if (debouncedQuery) {
+          setEntries([]);
+          setSelected(new Set());
+        }
+      }
       return false;
     } finally {
       if (current()) setLoading(false);
     }
-  }, [path, api, canRead, requestedQuery, debouncedQuery, listScope]);
+  }, [
+    path,
+    api,
+    canRead,
+    requestedQuery,
+    debouncedQuery,
+    listScope,
+    transferKey,
+  ]);
 
   useEffect(() => {
     if (
@@ -1044,6 +1088,8 @@ export default function FileManager({
           source: files,
           destination: uploadPath,
           request: api,
+          maxFilesPerBatch:
+            uploadLimit.scope === transferKey ? uploadLimit.value : 20,
           onProgress: (progress) =>
             report({
               message: "Uploading files…",
@@ -1193,15 +1239,19 @@ export default function FileManager({
     }
   }
 
-  const filtered = entries
-    .slice()
-    .sort((a, b) =>
-      a.type === b.type
-        ? a.name.localeCompare(b.name) || a.path.localeCompare(b.path)
-        : a.type === "directory"
-          ? -1
-          : 1,
-    );
+  const filtered = useMemo(
+    () =>
+      entries
+        .slice()
+        .sort((a, b) =>
+          a.type === b.type
+            ? a.name.localeCompare(b.name) || a.path.localeCompare(b.path)
+            : a.type === "directory"
+              ? -1
+              : 1,
+        ),
+    [entries],
+  );
   const currentPage = Math.min(
     page,
     Math.max(1, Math.ceil(filtered.length / pageSize)),
@@ -1211,7 +1261,10 @@ export default function FileManager({
     currentPage * pageSize,
   );
   const segments = path.split("/").filter(Boolean);
-  const selectedEntries = entries.filter((entry) => selected.has(entry.path));
+  const selectedEntries = useMemo(
+    () => entries.filter((entry) => selected.has(entry.path)),
+    [entries, selected],
+  );
   const visibleSelectedCount = visible.filter((entry) =>
     selected.has(entry.path),
   ).length;
@@ -1227,9 +1280,13 @@ export default function FileManager({
       return next;
     });
   }
-  const totalSize = entries.reduce(
-    (sum, entry) => sum + (entry.type === "file" ? entry.size : 0),
-    0,
+  const totalSize = useMemo(
+    () =>
+      entries.reduce(
+        (sum, entry) => sum + (entry.type === "file" ? entry.size : 0),
+        0,
+      ),
+    [entries],
   );
   if (!canRead)
     return (
@@ -1496,7 +1553,9 @@ export default function FileManager({
                 {error
                   ? "Unavailable"
                   : loading
-                    ? "Loading…"
+                    ? requestedQuery
+                      ? `${searchProgress} matches · searching…`
+                      : "Loading…"
                     : `${entries.length} ${requestedQuery ? "matches" : "items"}`}
               </span>
             )}

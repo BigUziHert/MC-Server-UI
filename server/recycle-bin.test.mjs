@@ -1194,6 +1194,82 @@ test("interrupted cross-drive copying preserves originals and marks partial reco
   );
 });
 
+test("cross-drive copies overlap within a bound and drain failures before releasing recovery storage", async (t) => {
+  const f = await fixture(t);
+  const source = path.join(f.serverDir, "world");
+  await fs.mkdir(source);
+  const names = Array.from({ length: 12 }, (_, i) => `${i}.dat`);
+  await Promise.all(
+    names.map((name) => fs.writeFile(path.join(source, name), name)),
+  );
+  const entered = deferred(),
+    releaseFailure = deferred(),
+    releaseCopies = deferred();
+  let started = 0,
+    active = 0,
+    maximum = 0,
+    settled = false;
+  const bin = await f.boot({
+    fileSystem: crossVolume(source, {
+      copyFile: async (...args) => {
+        const ordinal = ++started;
+        maximum = Math.max(maximum, ++active);
+        if (started === 4) entered.resolve();
+        try {
+          if (ordinal === 1) {
+            await releaseFailure.promise;
+            throw new Error("fixture copy failure");
+          }
+          await releaseCopies.promise;
+          return await fs.copyFile(...args);
+        } finally {
+          active--;
+        }
+      },
+    }),
+  });
+  const pending = bin.recycle("world").then(
+    () => {
+      settled = true;
+    },
+    (cause) => {
+      settled = true;
+      return cause;
+    },
+  );
+  let timeout;
+  try {
+    await Promise.race([
+      entered.promise,
+      new Promise((_, reject) => {
+        timeout = setTimeout(
+          () => reject(new Error("Copies did not overlap")),
+          5000,
+        );
+      }),
+    ]);
+    releaseFailure.resolve();
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    assert.equal(settled, false, "failure must drain outstanding copies");
+    await assert.rejects(bin.recycle("world"), /current Recycle Bin operation/);
+    releaseCopies.resolve();
+    assert.match((await pending).message, /fixture copy failure/);
+    assert.equal(active, 0);
+    assert.equal(maximum, 4, "file copies must stay bounded");
+    assert.equal(started, 4, "failure must stop queued copies");
+    assert.deepEqual((await fs.readdir(source)).sort(), names.sort());
+    const [item] = await bin.list();
+    assert.equal(item.status, "incomplete");
+    await assert.rejects(bin.restore(item.id), /incomplete/);
+    await bin.deletePermanently(item.id);
+  } finally {
+    clearTimeout(timeout);
+    releaseFailure.resolve();
+    releaseCopies.resolve();
+    await pending;
+  }
+});
+
 for (const change of ["add", "edit-same-size-and-mtime"]) {
   test(`late ${change} during cross-drive commit preserves the changed source and verified recovery`, async (t) => {
     const f = await fixture(t);

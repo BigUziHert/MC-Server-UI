@@ -21,6 +21,27 @@ const inside = (parent, child) => {
 };
 const changed = () =>
   failure(409, "A selected file or folder changed during download. Try again.");
+const SCAN_CONCURRENCY = 16;
+// Minecraft packs and world data commonly contain already compressed formats.
+// Re-deflating these wastes CPU and delays the download without saving bandwidth.
+const STORED_EXTENSIONS = new Set([
+  ".jar",
+  ".zip",
+  ".gz",
+  ".tgz",
+  ".bz2",
+  ".xz",
+  ".7z",
+  ".rar",
+  ".png",
+  ".jpg",
+  ".jpeg",
+  ".webp",
+  ".ogg",
+  ".mp3",
+  ".mp4",
+  ".webm",
+]);
 
 // Validate and scan before sending attachment headers. Only entry metadata is
 // retained; file contents are opened lazily and streamed with backpressure.
@@ -34,27 +55,33 @@ export async function planFileDownload(root, requested, { safePath, signal }) {
     throw failure(400, "Choose files or folders to download.");
   root = await fs.realpath(root);
   const rootStat = await fs.lstat(root);
-  const selected = [];
-  for (const relative of paths) {
-    signal?.throwIfAborted();
-    const target = await safePath(root, relative);
-    const stat = await fs.lstat(target);
-    if (stat.isSymbolicLink() || (!stat.isDirectory() && !stat.isFile()))
-      throw failure(400, "Choose regular files or folders to download.");
-    if (
-      !selected.some((entry) => canonical(entry.target) === canonical(target))
-    )
-      selected.push({ target, stat });
+  const selected = new Map();
+  for (let offset = 0; offset < paths.length; offset += SCAN_CONCURRENCY) {
+    const outcomes = await Promise.allSettled(
+      paths.slice(offset, offset + SCAN_CONCURRENCY).map(async (relative) => {
+        signal?.throwIfAborted();
+        const target = await safePath(root, relative);
+        const stat = await fs.lstat(target);
+        if (stat.isSymbolicLink() || (!stat.isDirectory() && !stat.isFile()))
+          throw failure(400, "Choose regular files or folders to download.");
+        return { target, stat };
+      }),
+    );
+    for (const outcome of outcomes) {
+      if (outcome.status === "rejected") throw outcome.reason;
+      selected.set(canonical(outcome.value.target), outcome.value);
+    }
   }
-  const roots = selected.filter(
-    (entry) =>
-      !selected.some(
-        (other) =>
-          other !== entry &&
-          other.stat.isDirectory() &&
-          inside(other.target, entry.target),
-      ),
-  );
+  const roots = [...selected.values()].filter((entry) => {
+    let ancestor = path.dirname(entry.target);
+    while (inside(root, ancestor)) {
+      if (selected.get(canonical(ancestor))?.stat.isDirectory()) return false;
+      const next = path.dirname(ancestor);
+      if (next === ancestor) break;
+      ancestor = next;
+    }
+    return true;
+  });
   if (roots.length === 1 && roots[0].stat.isFile())
     return { filename: path.basename(roots[0].target), file: roots[0].target };
 
@@ -76,8 +103,10 @@ export async function planFileDownload(root, requested, { safePath, signal }) {
     return stat;
   };
   const entries = [];
-  const scan = async (target, stat) => {
+  const pending = [...roots];
+  const scan = async ({ target, stat }) => {
     signal?.throwIfAborted();
+    stat ??= await fs.lstat(target);
     // Links and devices are also hidden from the File Manager listing.
     if (stat.isSymbolicLink() || (!stat.isFile() && !stat.isDirectory()))
       return;
@@ -91,12 +120,20 @@ export async function planFileDownload(root, requested, { safePath, signal }) {
       );
     entries.push({ target, stat, name });
     if (stat.isDirectory())
-      for (const name of await fs.readdir(target)) {
-        const child = path.join(target, name);
-        await scan(child, await fs.lstat(child));
+      for (const child of await fs.readdir(target, { withFileTypes: true })) {
+        if (child.isFile() || child.isDirectory())
+          pending.push({ target: path.join(target, child.name) });
       }
   };
-  for (const entry of roots) await scan(entry.target, entry.stat);
+  // Bound concurrent metadata work. Streaming still opens just one file at a
+  // time and revalidates its identity and ancestry immediately around open().
+  while (pending.length) {
+    const outcomes = await Promise.allSettled(
+      pending.splice(-SCAN_CONCURRENCY).map(scan),
+    );
+    const rejected = outcomes.find((outcome) => outcome.status === "rejected");
+    if (rejected) throw rejected.reason;
+  }
   return {
     filename:
       roots.length === 1
@@ -130,7 +167,16 @@ export async function streamFileArchive(plan, destination, { signal } = {}) {
       }
       zip.addReadStreamLazy(
         name,
-        { mtime: stat.mtime, mode: stat.mode, size: stat.size },
+        {
+          mtime: stat.mtime,
+          mode: stat.mode,
+          size: stat.size,
+          compressionLevel: STORED_EXTENSIONS.has(
+            path.extname(name).toLowerCase(),
+          )
+            ? 0
+            : 1,
+        },
         (callback) => {
           void (async () => {
             let handle;
@@ -152,6 +198,7 @@ export async function streamFileArchive(plan, destination, { signal } = {}) {
                 throw changed();
               const source = handle.createReadStream({
                 autoClose: true,
+                highWaterMark: 256 * 1024,
                 ...(stat.size ? { end: stat.size - 1 } : {}),
                 signal,
               });

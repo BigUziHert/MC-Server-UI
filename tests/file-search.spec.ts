@@ -310,7 +310,7 @@ test("JSON, uppercase JSON, JSON5 and JSONC expose editors and preserve raw cont
   }
 });
 
-test("search waits for every continuation and discards late queries, partial failures and old-host results", async ({
+test("search shows first matches before completion and discards late queries, partial failures and old-host results", async ({
   page,
   files,
 }) => {
@@ -391,9 +391,9 @@ test("search waits for every continuation and discards late queries, partial fai
   await expect.poll(() => calls).toContain("pages:last-page");
   await expect(
     page.getByRole("button", { name: "deep/pages-first.txt", exact: true }),
-  ).toHaveCount(0);
+  ).toBeVisible();
   await expect(
-    page.getByText("1 matches found. Checking remaining folders…", {
+    page.getByText("1 matches · searching…", {
       exact: true,
     }),
   ).toBeVisible();

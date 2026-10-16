@@ -11,6 +11,8 @@ import { inspectInstalledMod } from "./launchpad-mod-metadata.mjs";
 import { updatedModDependencyWarnings } from "./launchpad-update-dependencies.mjs";
 import { createModRemoval } from "./launchpad-removal.mjs";
 import { createLaunchpadMetadataCache } from "./launchpad-metadata-cache.mjs";
+import { createLaunchpadCatalogCache } from "./launchpad-catalog-cache.mjs";
+import { parallelTransfers } from "./launchpad-transfers.mjs";
 import { recoverJarIdentity } from "./launchpad-jar-recovery.mjs";
 import { createVersionsService } from "./versions.mjs";
 import { cleanInstall, prepareCleanSettings } from "./clean-install.mjs";
@@ -317,6 +319,7 @@ export async function createLaunchpad(ctx) {
   const fallbackRequest = requestLimiter(6);
   const hashRequest = requestLimiter(4);
   const inventoryFlights = new Map();
+  const catalogCache = createLaunchpadCatalogCache();
   const remember = (cache, key, value) => {
     cache.delete(key);
     cache.set(key, value);
@@ -3559,35 +3562,57 @@ export async function createLaunchpad(ctx) {
           // every download retry; promotion checks again after downloads.
           await assertReviewedInventory(plan);
           let downloaded = 0;
-          for (const [index, file] of plan.files.entries()) {
-            controller.signal.throwIfAborted();
-            failedFile = file.path;
-            job.message = `Verifying ${file.path}`;
-            if (!file.stagedPath) {
-              phase = "download";
-              const destination = path.join(plan.stage, `download-${index}`);
-              await downloadVerified(file, destination, file.hosts, request, {
-                signal: controller.signal,
-                curseforgeKey: key,
-              });
-              file.stagedPath = destination;
-            }
-            phase = "verify";
-            const verified = await verifyStaged(
-              file,
-              plan.stage,
+          let transferFailure = null,
+            verifiedCount = 0;
+          try {
+            await parallelTransfers(
+              plan.files,
+              async (file, index, signal) => {
+                let filePhase = "verify";
+                try {
+                  signal.throwIfAborted();
+                  if (!file.stagedPath) {
+                    filePhase = "download";
+                    const destination = path.join(
+                      plan.stage,
+                      `download-${index}`,
+                    );
+                    await downloadVerified(
+                      file,
+                      destination,
+                      file.hosts,
+                      request,
+                      {
+                        signal,
+                        curseforgeKey: key,
+                      },
+                    );
+                    file.stagedPath = destination;
+                  }
+                  filePhase = "verify";
+                  const verified = await verifyStaged(file, plan.stage, signal);
+                  downloaded += verified.size;
+                  if (
+                    downloaded >
+                    (plan.input.type === "modpack" ? 4 : 2) * 1024 ** 3
+                  )
+                    throw error(
+                      400,
+                      `This installation exceeds the ${plan.input.type === "modpack" ? 4 : 2} GB total size limit.`,
+                    );
+                  file.sha512 = verified.sha512;
+                  job.message = `Verified ${++verifiedCount} of ${plan.files.length} files…`;
+                } catch (cause) {
+                  transferFailure ??= { path: file.path, phase: filePhase };
+                  throw cause;
+                }
+              },
               controller.signal,
             );
-            downloaded += verified.size;
-            if (
-              downloaded >
-              (plan.input.type === "modpack" ? 4 : 2) * 1024 ** 3
-            )
-              throw error(
-                400,
-                `This installation exceeds the ${plan.input.type === "modpack" ? 4 : 2} GB total size limit.`,
-              );
-            file.sha512 = verified.sha512;
+          } catch (cause) {
+            failedFile = transferFailure?.path;
+            phase = transferFailure?.phase ?? "verify";
+            throw cause;
           }
           controller.signal.throwIfAborted();
           phase = "promote";
@@ -3789,6 +3814,7 @@ export async function createLaunchpad(ctx) {
       updateCache.clear();
       versionCache.clear();
       updateFailures.clear();
+      catalogCache.clear();
       return config();
     },
     async search(input) {
@@ -3805,7 +3831,24 @@ export async function createLaunchpad(ctx) {
       )
         throw error(400, "Choose a sort order supported by this provider.");
       input.sort ||= undefined;
-      return found.search(input);
+      const cacheKey = JSON.stringify([
+        input.platform,
+        input.type,
+        input.query,
+        input.gameVersion,
+        input.loader,
+        input.sort,
+        input.offset,
+        input.limit,
+      ]);
+      return catalogCache.read(
+        cacheKey,
+        (signal) => found.search({ ...input, signal }),
+        {
+          signal: input.signal,
+          refresh: enabled(input.refresh),
+        },
+      );
     },
     async versions(input) {
       input = selection(input);
@@ -3924,6 +3967,7 @@ export async function createLaunchpad(ctx) {
         "Launchpad closed before installation finished. No pending downloads will be installed.",
       );
       lifetime.abort(stopped);
+      catalogCache.clear();
       activeController?.abort(stopped);
       await removal.close();
       await Promise.allSettled([...previews]);

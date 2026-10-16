@@ -18,9 +18,13 @@ import {
 } from "./connection.mjs";
 import { decodeIcon, readServerIcon, writeServerIcon } from "./server-icon.mjs";
 import { createRecycleBin, recycleStorageDirectories } from "./recycle-bin.mjs";
-import { copyServerFiles, uploadServerFiles } from "./file-transfer.mjs";
+import {
+  copyServerFiles,
+  uploadServerFiles,
+  MAX_UPLOAD_FILES_PER_BATCH,
+} from "./file-transfer.mjs";
 import { planFileDownload, streamFileArchive } from "./file-download.mjs";
-import { createFileSearch } from "./file-search.mjs";
+import { createFileSearch, listServerFiles } from "./file-search.mjs";
 import { createBackupArchive } from "./backup-archive.mjs";
 import {
   reconcileInterruptedRestores,
@@ -2966,69 +2970,46 @@ export async function createPanel(options = {}) {
     const query = req.query.search ?? "";
     if (typeof query !== "string" || query.length > 256 || query.includes("\0"))
       throw error(400, "Enter a filename search of up to 256 characters.");
-    if (query.trim()) {
-      const disconnected = new AbortController();
-      const cancel = () => {
-        if (!res.writableFinished) disconnected.abort();
-      };
-      req.once("aborted", cancel);
-      res.once("close", cancel);
-      try {
-        const result = await fileSearch.search({
-          path: relative,
-          search: query,
-          cursor: req.query.cursor,
-          signal: disconnected.signal,
-        });
-        res.set("Cache-Control", "private, no-store");
-        res.json(result);
-      } catch (cause) {
-        if (disconnected.signal.aborted) res.destroy();
-        else throw cause;
-      } finally {
-        req.off("aborted", cancel);
-        res.off("close", cancel);
-      }
-      return;
+    const disconnected = new AbortController();
+    const cancel = () => {
+      if (!res.writableFinished) disconnected.abort();
+    };
+    req.once("aborted", cancel);
+    res.once("close", cancel);
+    try {
+      const result = query.trim()
+        ? await fileSearch.search({
+            path: relative,
+            search: query,
+            cursor: req.query.cursor,
+            signal: disconnected.signal,
+          })
+        : await listServerFiles({
+            root: serverDir,
+            relative,
+            safePath,
+            signal: disconnected.signal,
+          });
+      res.set("Cache-Control", "private, no-store");
+      res.json({ ...result, uploadFilesPerBatch: MAX_UPLOAD_FILES_PER_BATCH });
+    } catch (cause) {
+      if (disconnected.signal.aborted) res.destroy();
+      else throw cause;
+    } finally {
+      req.off("aborted", cancel);
+      res.off("close", cancel);
     }
-    const target = await safePath(serverDir, relative);
-    const entries = [];
-    for (const item of await fs.readdir(target, { withFileTypes: true })) {
-      if (item.isSymbolicLink()) continue;
-      const stat = await fs
-        .lstat(path.join(target, item.name))
-        .catch((cause) => {
-          if (["ENOENT", "ENOTDIR"].includes(cause.code)) return null;
-          throw cause;
-        });
-      if (!stat || stat.isSymbolicLink()) continue;
-      entries.push({
-        name: item.name,
-        path: [relative, item.name].filter(Boolean).join("/"),
-        type: stat.isDirectory() ? "directory" : "file",
-        size: stat.isDirectory() ? 0 : stat.size,
-        modified: stat.mtime.toISOString(),
-      });
-    }
-    entries.sort((a, b) =>
-      a.type === b.type
-        ? a.name.localeCompare(b.name)
-        : a.type === "directory"
-          ? -1
-          : 1,
-    );
-    res.json({ path: relative, entries });
   });
   const upload = multer({
     dest: uploadDir,
     limits: {
       fileSize: 256 * 1024 * 1024,
-      files: 20,
+      files: MAX_UPLOAD_FILES_PER_BATCH,
       fields: 5,
       fieldSize: 128 * 1024,
     },
   });
-  const fileKind = async (relative, type = "file") => {
+  const worldDirectory = async () => {
     let world = "world";
     try {
       world =
@@ -3041,12 +3022,15 @@ export async function createPanel(options = {}) {
     } catch {
       /* Classification must not undo an otherwise successful file change. */
     }
-    return contentKind(relative, type, world);
+    return world;
   };
+  const fileKind = async (relative, type = "file") =>
+    contentKind(relative, type, await worldDirectory());
   const auditUploads = async (paths) => {
     const groups = new Map();
+    const world = await worldDirectory();
     for (const relative of paths) {
-      const kind = await fileKind(relative);
+      const kind = contentKind(relative, "file", world);
       if (!groups.has(kind)) groups.set(kind, []);
       groups.get(kind).push(relative);
     }
@@ -3061,7 +3045,7 @@ export async function createPanel(options = {}) {
   };
   app.post(
     "/api/files/upload",
-    upload.array("files", 20),
+    upload.array("files", MAX_UPLOAD_FILES_PER_BATCH),
     trackOperation(async (req, res) => {
       const files = req.files ?? [];
       const uploadedPaths = [],
@@ -3099,13 +3083,18 @@ export async function createPanel(options = {}) {
       } finally {
         // Finish bounded temp cleanup before acknowledging a batch, allowing the
         // next sequential batch to acquire the file lock immediately.
-        for (const file of files)
-          await fs.rm(file.path, { force: true }).catch(() => {});
+        for (let index = 0; index < files.length; index += 8)
+          await Promise.all(
+            files
+              .slice(index, index + 8)
+              .map((file) => fs.rm(file.path, { force: true }).catch(() => {})),
+          );
       }
       if (uploadFailure)
         res.status(uploadFailure.status).json({
           error: uploadFailure.error,
           uploaded: uploadedPaths.length,
+          uploadedPaths,
           directories: createdDirectories.length,
         });
       else res.status(201).json(result);

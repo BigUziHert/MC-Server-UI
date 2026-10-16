@@ -415,7 +415,7 @@ export default function Launchpad({
   const [status, setStatus] = useState<string | null>(null);
   const [statusStale, setStatusStale] = useState(false);
   const [query, setQuery] = useState("");
-  const filteredQuery = useDebouncedValue(query);
+  const filteredQuery = useDebouncedValue(query, 150);
   const [sort, setSort] = useState("downloads");
   const [installedSort, setInstalledSort] = useState<InstalledSort>("updates");
   const [installedOnly, setInstalledOnly] = useState(false);
@@ -798,6 +798,14 @@ export default function Launchpad({
       setResults(null);
       return;
     }
+    // Only typing waits for a pause. Paging, filter changes and refreshes can
+    // start immediately, without the former unconditional 300 ms timer.
+    if (query.trim() !== filteredQuery.trim()) {
+      setSearchLoading(true);
+      setSearchError("");
+      setResults(null);
+      return;
+    }
     const controller = new AbortController();
     const scope = JSON.stringify([
       platform,
@@ -815,29 +823,26 @@ export default function Launchpad({
     }
     setSearchLoading(true);
     setSearchError("");
-    const timer = window.setTimeout(() => {
-      const refresh = catalogRefresh.current;
-      catalogRefresh.current = false;
-      void api<SearchResult>(
-        `/launchpad/search?${queryString({ platform, type, query: query.trim(), gameVersion: gameVersion.trim(), loader, sort: catalogSort, offset, limit, ...(refresh ? { refresh: "true" } : {}) })}`,
-        { signal: controller.signal },
-      )
-        .then((next) => {
-          if (controller.signal.aborted) return;
-          if (next.offset !== offset) setOffset(next.offset);
-          else if (offset > 0 && offset >= next.total)
-            setOffset(Math.max(0, Math.ceil(next.total / limit) - 1) * limit);
-          else setResults(next);
-        })
-        .catch((cause) => {
-          if (!controller.signal.aborted) setSearchError(messageOf(cause));
-        })
-        .finally(() => {
-          if (!controller.signal.aborted) setSearchLoading(false);
-        });
-    }, 300);
+    const refresh = catalogRefresh.current;
+    catalogRefresh.current = false;
+    void api<SearchResult>(
+      `/launchpad/search?${queryString({ platform, type, query: query.trim(), gameVersion: gameVersion.trim(), loader, sort: catalogSort, offset, limit, ...(refresh ? { refresh: "true" } : {}) })}`,
+      { signal: controller.signal },
+    )
+      .then((next) => {
+        if (controller.signal.aborted) return;
+        if (next.offset !== offset) setOffset(next.offset);
+        else if (offset > 0 && offset >= next.total)
+          setOffset(Math.max(0, Math.ceil(next.total / limit) - 1) * limit);
+        else setResults(next);
+      })
+      .catch((cause) => {
+        if (!controller.signal.aborted) setSearchError(messageOf(cause));
+      })
+      .finally(() => {
+        if (!controller.signal.aborted) setSearchLoading(false);
+      });
     return () => {
-      window.clearTimeout(timer);
       controller.abort();
     };
   }, [
@@ -849,6 +854,7 @@ export default function Launchpad({
     platform,
     type,
     query,
+    filteredQuery,
     catalogSort,
     gameVersion,
     loader,

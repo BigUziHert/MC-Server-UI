@@ -1,5 +1,7 @@
-export const UPLOAD_FILES_PER_BATCH = 20;
+export const UPLOAD_FILES_PER_BATCH = 100;
 export const UPLOAD_FILE_SIZE_LIMIT = 256 * 1024 * 1024;
+const LEGACY_UPLOAD_FILES_PER_BATCH = 20;
+const COLLECTION_CONCURRENCY = 8;
 const BATCH_BYTES = 64 * 1024 * 1024;
 const FIELD_BYTES = 120 * 1024;
 const encoder = new TextEncoder();
@@ -150,11 +152,16 @@ export async function collectDroppedUpload(
   const fallbackFiles = Array.from(transfer.files || []);
   if (!roots.length) return collectSelectedUpload(fallbackFiles);
   const source: UploadSource = { files: [], directories: [] };
-  const emit = () =>
+  let lastProgress = -Infinity;
+  const emit = (force = false) => {
+    const now = performance.now();
+    if (!force && now - lastProgress < 50) return;
+    lastProgress = now;
     onProgress?.({
       files: source.files.length,
       directories: source.directories.length,
     });
+  };
   const pending: { entry: FileSystemEntry; path: string }[] = [];
   for (const root of roots) {
     if (root.entry) pending.push({ entry: root.entry, path: root.entry.name });
@@ -165,34 +172,51 @@ export async function collectDroppedUpload(
         "This browser could not read a dropped folder. Choose it with Upload folder instead.",
       );
   }
-  while (pending.length) {
-    signal?.throwIfAborted();
-    const { entry, path } = pending.pop()!;
-    relativePath(path);
-    if (entry.isFile) {
-      const file = await entryResult<File>(
-        (success, failure) =>
-          (entry as FileSystemFileEntry).file(success, failure),
-        signal,
+  const controller = new AbortController();
+  const readingSignal = signal
+    ? AbortSignal.any([signal, controller.signal])
+    : controller.signal;
+  try {
+    while (pending.length) {
+      readingSignal.throwIfAborted();
+      // Filesystem entry callbacks often cross a browser/OS boundary. Keep a
+      // bounded set in flight instead of paying that latency for every file.
+      const batch = pending.splice(-COLLECTION_CONCURRENCY);
+      await Promise.all(
+        batch.map(async ({ entry, path }) => {
+          relativePath(path);
+          if (entry.isFile) {
+            const file = await entryResult<File>(
+              (success, failure) =>
+                (entry as FileSystemFileEntry).file(success, failure),
+              readingSignal,
+            );
+            source.files.push({ file, path });
+          } else if (entry.isDirectory) {
+            source.directories.push(path);
+            const reader = (entry as FileSystemDirectoryEntry).createReader();
+            for (;;) {
+              const children = await entryResult<FileSystemEntry[]>(
+                (success, failure) => reader.readEntries(success, failure),
+                readingSignal,
+              );
+              if (!children.length) break;
+              for (const child of children)
+                pending.push({ entry: child, path: `${path}/${child.name}` });
+            }
+          } else throw new Error(`This browser could not read ${path}.`);
+          readingSignal.throwIfAborted();
+          emit();
+        }),
       );
-      source.files.push({ file, path });
-    } else if (entry.isDirectory) {
-      source.directories.push(path);
-      const reader = (entry as FileSystemDirectoryEntry).createReader();
-      for (;;) {
-        const children = await entryResult<FileSystemEntry[]>(
-          (success, failure) => reader.readEntries(success, failure),
-          signal,
-        );
-        if (!children.length) break;
-        for (const child of children)
-          pending.push({ entry: child, path: `${path}/${child.name}` });
-      }
-    } else throw new Error(`This browser could not read ${path}.`);
-    emit();
+    }
+    signal?.throwIfAborted();
+    emit(true);
+    return normalizedSource(source);
+  } finally {
+    // A failing reader must also release siblings that never call back.
+    controller.abort();
   }
-  signal?.throwIfAborted();
-  return normalizedSource(source);
 }
 
 function directoryBatches(directories: string[]) {
@@ -216,20 +240,25 @@ function directoryBatches(directories: string[]) {
   return batches;
 }
 
-function fileBatches(files: UploadFile[]) {
+function fileBatches(files: UploadFile[], maxFilesPerBatch: number) {
   const batches: UploadFile[][] = [];
   let batch: UploadFile[] = [];
   let bytes = 0;
+  let pathBytes = 2;
   for (const entry of files) {
+    const entryPathBytes = encoder.encode(JSON.stringify(entry.path)).length;
     if (
       batch.length &&
-      (batch.length >= UPLOAD_FILES_PER_BATCH ||
-        bytes + entry.file.size > BATCH_BYTES)
+      (batch.length >= maxFilesPerBatch ||
+        bytes + entry.file.size > BATCH_BYTES ||
+        pathBytes + entryPathBytes + 1 > FIELD_BYTES)
     ) {
       batches.push(batch);
       batch = [];
       bytes = 0;
+      pathBytes = 2;
     }
+    pathBytes += entryPathBytes + (batch.length ? 1 : 0);
     batch.push(entry);
     bytes += entry.file.size;
   }
@@ -244,12 +273,15 @@ export async function uploadInBatches({
   request,
   signal,
   onProgress,
+  maxFilesPerBatch = LEGACY_UPLOAD_FILES_PER_BATCH,
 }: {
   source: UploadSource;
   destination: string;
   request: UploadRequest;
   signal?: AbortSignal;
   onProgress?: (progress: UploadProgress) => void;
+  /** Use only the destination host's advertised limit; old hosts accept 20. */
+  maxFilesPerBatch?: number;
 }): Promise<UploadResult> {
   const progress: UploadProgress = {
     phase: "uploading",
@@ -297,7 +329,12 @@ export async function uploadInBatches({
       directories,
       files: [] as UploadFile[],
     })),
-    ...fileBatches(source.files).map((files) => ({
+    ...fileBatches(
+      source.files,
+      Number.isInteger(maxFilesPerBatch) && maxFilesPerBatch > 0
+        ? Math.min(maxFilesPerBatch, UPLOAD_FILES_PER_BATCH)
+        : LEGACY_UPLOAD_FILES_PER_BATCH,
+    ).map((files) => ({
       directories: [] as string[],
       files,
     })),
@@ -347,20 +384,35 @@ export async function uploadInBatches({
         status?: number;
         uploaded?: number;
         directories?: number;
+        uploadedPaths?: string[];
       };
+      const confirmedPaths = failure?.uploadedPaths;
+      const confirmedFiles = Array.isArray(confirmedPaths)
+        ? batch.files.filter(({ path }) =>
+            confirmedPaths.includes(
+              [destination, path].filter(Boolean).join("/"),
+            ),
+          )
+        : batch.files.slice(0, failure?.uploaded);
       if (
         !signal?.aborted &&
         failure?.status &&
         Number.isInteger(failure.uploaded) &&
         failure.uploaded! >= 0 &&
         failure.uploaded! <= batch.files.length &&
+        (confirmedPaths === undefined ||
+          (Array.isArray(confirmedPaths) &&
+            confirmedPaths.length === failure.uploaded &&
+            confirmedFiles.length === failure.uploaded &&
+            new Set(confirmedPaths).size === confirmedPaths.length)) &&
         Number.isInteger(failure.directories) &&
         failure.directories! >= 0
       ) {
         progress.uploadedFiles += failure.uploaded!;
-        progress.uploadedBytes += batch.files
-          .slice(0, failure.uploaded)
-          .reduce((total, entry) => total + entry.file.size, 0);
+        progress.uploadedBytes += confirmedFiles.reduce(
+          (total, entry) => total + entry.file.size,
+          0,
+        );
         progress.completedDirectories += Math.min(
           failure.directories!,
           batch.directories.length,

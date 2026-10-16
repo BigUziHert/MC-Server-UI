@@ -180,16 +180,16 @@ test("file audits distinguish plugin/datapack uploads, directory deletion, resto
   );
 });
 
-test("partial uploads audit the files that reached disk even when a later copy fails", async (t) => {
+test("partial uploads audit the files that reached disk even when another publication fails", async (t) => {
   const f = await fixture(t),
-    copy = fs.copyFile;
+    link = fs.link;
   t.mock.method(console, "error", () => {});
-  t.mock.method(fs, "copyFile", async (source, destination, ...args) => {
+  t.mock.method(fs, "link", async (source, destination, ...args) => {
     if (destination.endsWith(`${path.sep}failed.jar`))
-      throw Object.assign(new Error("fixture copy failure"), {
-        code: "EACCES",
+      throw Object.assign(new Error("fixture publication failure"), {
+        code: "ENOSPC",
       });
-    return copy(source, destination, ...args);
+    return link(source, destination, ...args);
   });
   assert.equal(
     (await f.upload("plugins", ["landed.jar", "failed.jar"])).status,

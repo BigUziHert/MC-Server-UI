@@ -5416,8 +5416,18 @@ test("Modrinth sorting is applied upstream before pagination and explicit sorts 
   assert.equal(requested.at(-1).index, "relevance");
   await f.service.search({ ...selection, query: "" });
   assert.equal(requested.at(-1).index, "downloads");
-  await f.service.search({ ...selection, query: "camera", sort: "" });
-  assert.equal(requested.at(-1).index, "relevance");
+  const count = requested.length;
+  const cached = await f.service.search({
+    ...selection,
+    query: "camera",
+    sort: "",
+  });
+  assert.equal(cached.projects[0].id, "relevance-99");
+  assert.equal(
+    requested.length,
+    count,
+    "equivalent default sorts reuse the catalog page",
+  );
 });
 
 test("CurseForge applies each supported sort to both upstream pages including alphabetical direction", async (t) => {
@@ -7098,6 +7108,102 @@ test("Launchpad reserves the shared runtime lock throughout downloads and preser
   assert.equal(completed.status, "completed", completed.error);
   assert.equal(locked, false);
 });
+
+for (const cancelled of [false, true])
+  test(`Launchpad stages four verified downloads concurrently before ${cancelled ? "cancellation" : "promotion"}`, async (t) => {
+    const f = await fixture(t);
+    await fs.unlink(path.join(f.serverDir, "mods/old.jar"));
+    let release,
+      entered,
+      started = 0,
+      inFlight = 0,
+      peak = 0;
+    const gate = new Promise((resolve) => {
+      release = resolve;
+    });
+    const firstWave = new Promise((resolve) => {
+      entered = resolve;
+    });
+    const files = Array.from({ length: 8 }, (_, index) => ({
+      path: `concurrent-${index}.jar`,
+      hashes: hashes(f.newer),
+      size: f.newer.length,
+      url: `https://cdn.modrinth.com/concurrent-${index}.jar`,
+    }));
+    const service = await f.boot({
+      fetch: async (_url, { signal }) => {
+        peak = Math.max(peak, ++inFlight);
+        if (++started === 4) entered();
+        try {
+          await new Promise((resolve, reject) => {
+            const abort = () => reject(signal.reason);
+            signal.addEventListener("abort", abort, { once: true });
+            gate.then(() => {
+              signal.removeEventListener("abort", abort);
+              resolve();
+            });
+            if (signal.aborted) abort();
+          });
+          return new Response(f.newer);
+        } finally {
+          inFlight--;
+        }
+      },
+      extraProviders: [
+        {
+          id: "concurrent",
+          name: "Concurrent",
+          types: ["mod"],
+          downloadHosts: ["cdn.modrinth.com"],
+          resolve: async () => ({
+            title: "Concurrent fixture",
+            versionName: "2",
+            dependencies: [],
+            files,
+          }),
+        },
+      ],
+    });
+    const plan = await service.preview({
+      ...selection,
+      platform: "concurrent",
+    });
+    const accepted = await service.install({
+      planId: plan.planId,
+      confirmed: true,
+    });
+    await firstWave;
+    assert.equal(started, 4);
+    assert.equal(peak, 4);
+    assert.deepEqual(
+      await fs.readdir(path.join(f.serverDir, "mods")),
+      [],
+      "nothing is promoted before every download verifies",
+    );
+    if (cancelled) await service.cancelInstall(accepted.job.id);
+    else release();
+    const result = await waitForJob(service, accepted.job.id);
+    release();
+    assert.equal(inFlight, 0);
+    if (cancelled) {
+      assert.equal(result.status, "failed");
+      assert.equal(result.cancelled, true);
+      assert.equal(started, 4);
+      assert.deepEqual(await fs.readdir(path.join(f.serverDir, "mods")), []);
+      await assert.rejects(
+        fs.stat(path.join(f.dataDir, "launchpad", plan.planId)),
+        { code: "ENOENT" },
+      );
+    } else {
+      assert.equal(result.status, "completed", result.error);
+      assert.equal(started, 8);
+      for (const file of files)
+        assert.deepEqual(
+          await fs.readFile(path.join(f.serverDir, "mods", file.path)),
+          f.newer,
+        );
+    }
+  });
 
 for (const operation of ["clear", "replace"])
   test(`receipt pruning cannot publish an old snapshot after ${operation} commits`, async (t) => {

@@ -221,6 +221,78 @@ test("folder ZIP downloads retain their root, nested empty folders, Unicode path
   assert.equal(entries.get("world/nested/empty/"), null);
 });
 
+test("archive planning overlaps bounded metadata reads for large selections", async (t) => {
+  const { serverDir } = await fixture(t);
+  const folder = path.join(serverDir, "many-files");
+  await fs.mkdir(folder);
+  await Promise.all(
+    Array.from({ length: 64 }, (_, index) =>
+      fs.writeFile(path.join(folder, `${index}.txt`), `${index}`),
+    ),
+  );
+  const original = fs.lstat;
+  let active = 0;
+  let maximum = 0;
+  const mocked = t.mock.method(fs, "lstat", async (...args) => {
+    if (path.dirname(args[0]) !== folder) return original(...args);
+    maximum = Math.max(maximum, ++active);
+    try {
+      await new Promise((resolve) => setImmediate(resolve));
+      return await original(...args);
+    } finally {
+      active--;
+    }
+  });
+  try {
+    const plan = await planFileDownload(serverDir, ["many-files"], {
+      safePath,
+    });
+    assert.equal(plan.entries.length, 65);
+    assert.ok(
+      maximum > 1,
+      "Independent file metadata must be read concurrently.",
+    );
+    assert.ok(maximum <= 16, "Metadata work must remain bounded.");
+    assert.equal(active, 0);
+  } finally {
+    mocked.mock.restore();
+  }
+});
+
+test("ZIPs store compressed assets directly while still compressing text", async (t) => {
+  const { serverDir, local } = await fixture(t);
+  await fs.mkdir(path.join(serverDir, "pack"));
+  const binary = randomBytes(64 * 1024);
+  const text = "setting=value\n".repeat(4096);
+  await fs.writeFile(path.join(serverDir, "pack", "mod.JAR"), binary);
+  await fs.writeFile(path.join(serverDir, "pack", "server.properties"), text);
+  const response = await local(download("pack"));
+  assert.equal(response.status, 200);
+  const entries = await archiveEntries(response.bytes);
+  assert.deepEqual(entries.get("pack/mod.JAR"), binary);
+  assert.equal(entries.get("pack/server.properties").toString(), text);
+  const archive = await new Promise((resolve, reject) =>
+    yauzl.fromBuffer(response.bytes, { lazyEntries: true }, (cause, zip) =>
+      cause ? reject(cause) : resolve(zip),
+    ),
+  );
+  const metadata = new Map();
+  await new Promise((resolve, reject) => {
+    archive.on("error", reject);
+    archive.on("end", resolve);
+    archive.on("entry", (entry) => {
+      metadata.set(entry.fileName, entry);
+      archive.readEntry();
+    });
+    archive.readEntry();
+  });
+  assert.equal(metadata.get("pack/mod.JAR").compressionMethod, 0);
+  assert.equal(metadata.get("pack/server.properties").compressionMethod, 8);
+  assert.ok(
+    metadata.get("pack/server.properties").compressedSize < text.length / 10,
+  );
+});
+
 test("selection ZIPs use their common parent and deduplicate duplicate or overlapping paths", async (t) => {
   const { serverDir, local } = await fixture(t);
   await fs.mkdir(path.join(serverDir, "config", "mods", "empty"), {

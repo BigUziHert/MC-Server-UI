@@ -9,6 +9,7 @@ import {
   collectSelectedUpload,
   uploadInBatches,
   UPLOAD_FILE_SIZE_LIMIT,
+  UPLOAD_FILES_PER_BATCH,
   type UploadProgress,
 } from "../src/file-uploads";
 
@@ -98,7 +99,7 @@ test("folder inputs retain webkitRelativePath and duplicate or unsafe targets fa
   expect(() => collectSelectedUpload([file, file])).toThrow("two files");
 });
 
-test("205 mods upload sequentially in batches of at most20 with metadata and confirmed progress", async () => {
+test("205 mods upload sequentially in batches of at most 20 with metadata and confirmed progress", async () => {
   const source = collectSelectedUpload(
     Array.from(
       { length: 205 },
@@ -148,6 +149,100 @@ test("205 mods upload sequentially in batches of at most20 with metadata and con
         !index || value.uploadedFiles >= progress[index - 1].uploadedFiles,
     ),
   ).toBe(true);
+});
+
+test("advertised upload capacity reduces 205 small files to three requests", async () => {
+  const source = collectSelectedUpload(
+    Array.from(
+      { length: 205 },
+      (_, index) => new File(["mod"], `${index}.jar`),
+    ),
+  );
+  const counts: number[] = [];
+  const result = await uploadInBatches({
+    source,
+    destination: "",
+    maxFilesPerBatch: UPLOAD_FILES_PER_BATCH,
+    request: async (_url, options) => {
+      const count = (options.body as FormData).getAll("files").length;
+      counts.push(count);
+      return { uploaded: count };
+    },
+  });
+  expect(counts).toEqual([100, 100, 5]);
+  expect(result.phase).toBe("completed");
+  expect(result.uploadedFiles).toBe(205);
+});
+
+test("larger upload batches still bound binary bytes and UTF-8 path metadata", async () => {
+  const parent = Array.from({ length: 20 }, () => "a".repeat(180)).join("/");
+  const files = Array.from({ length: 70 }, (_, index) => ({
+    file: new File(["x"], `${index}.txt`),
+    path: `${parent}/${index}.txt`,
+  }));
+  const fileBatches: number[] = [];
+  const result = await uploadInBatches({
+    source: { files, directories: [] },
+    destination: "",
+    maxFilesPerBatch: UPLOAD_FILES_PER_BATCH,
+    request: async (_url, options) => {
+      const body = options.body as FormData;
+      const count = body.getAll("files").length;
+      if (count) {
+        expect(
+          new TextEncoder().encode(body.get("paths") as string).length,
+        ).toBeLessThanOrEqual(120 * 1024);
+        fileBatches.push(count);
+      }
+      return { uploaded: count };
+    },
+  });
+  expect(result.phase).toBe("completed");
+  expect(fileBatches.length).toBeGreaterThan(1);
+  const large = Array.from({ length: 3 }, (_, index) => {
+    const file = new File(["small backing fixture"], `${index}.jar`);
+    Object.defineProperty(file, "size", { value: 40 * 1024 * 1024 });
+    return { file, path: file.name };
+  });
+  fileBatches.length = 0;
+  await uploadInBatches({
+    source: { files: large, directories: [] },
+    destination: "",
+    maxFilesPerBatch: UPLOAD_FILES_PER_BATCH,
+    request: async (_url, options) => {
+      const count = (options.body as FormData).getAll("files").length;
+      fileBatches.push(count);
+      return { uploaded: count };
+    },
+  });
+  expect(fileBatches).toEqual([1, 1, 1]);
+});
+
+test("folder collection overlaps bounded browser file reads and coalesces progress", async () => {
+  let active = 0;
+  let maximum = 0;
+  let progressEvents = 0;
+  const entries = Array.from({ length: 64 }, (_, index) => ({
+    name: `${index}.jar`,
+    isFile: true,
+    isDirectory: false,
+    file: (resolve: (file: File) => void) => {
+      maximum = Math.max(maximum, ++active);
+      setTimeout(() => {
+        active--;
+        resolve(new File([`${index}`], `${index}.jar`));
+      }, 5);
+    },
+  }));
+  const result = await collectDroppedUpload(transfer(entries), {
+    onProgress: () => progressEvents++,
+  });
+  expect(result.files).toHaveLength(64);
+  expect(new Set(result.files.map(({ path }) => path)).size).toBe(64);
+  expect(maximum).toBeGreaterThan(1);
+  expect(maximum).toBeLessThanOrEqual(16);
+  expect(active).toBe(0);
+  expect(progressEvents).toBeLessThan(64);
 });
 
 test("empty directory uploads are bounded separately and a too-large file prevents every mutation", async () => {
@@ -273,6 +368,30 @@ test("server-reported partial writes are counted and stop every later batch", as
   expect(requests).toBe(2);
 });
 
+test("partial parallel publications count bytes from confirmed paths instead of file order", async () => {
+  const source = collectSelectedUpload(
+    [1, 2, 3, 4].map(
+      (size, index) => new File(["x".repeat(size)], `${index}.jar`),
+    ),
+  );
+  const result = await uploadInBatches({
+    source,
+    destination: "mods",
+    maxFilesPerBatch: UPLOAD_FILES_PER_BATCH,
+    request: async () => {
+      throw Object.assign(new Error("Drive is full."), {
+        status: 500,
+        uploaded: 2,
+        directories: 0,
+        uploadedPaths: ["mods/3.jar", "mods/1.jar"],
+      });
+    },
+  });
+  expect(result.phase).toBe("failed");
+  expect(result.uploadedFiles).toBe(2);
+  expect(result.uploadedBytes).toBe(6);
+});
+
 async function uploadServer(request: APIRequestContext) {
   const fleet = await (await request.get("/api/servers")).json();
   const occupied = new Set(
@@ -291,7 +410,7 @@ async function uploadServer(request: APIRequestContext) {
   };
 }
 
-test("File Manager uploads205 mods in bounded requests to the selected server", async ({
+test("File Manager uploads 205 mods in bounded requests to the selected server", async ({
   page,
   request,
 }) => {
@@ -346,7 +465,7 @@ test("File Manager uploads205 mods in bounded requests to the selected server", 
         (window as typeof window & { uploadBatchSizes: number[] })
           .uploadBatchSizes,
     );
-    expect(batches).toEqual([...Array(10).fill(20), 5]);
+    expect(batches).toEqual([100, 100, 5]);
     for (const index of [0, 99, 204]) {
       const response = await request.get(
         `/api/files/download?path=mods/mod-${index.toString().padStart(3, "0")}.jar`,

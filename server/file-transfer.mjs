@@ -1,5 +1,51 @@
 import fs from "node:fs/promises";
+import { constants } from "node:fs";
 import path from "node:path";
+
+export const MAX_UPLOAD_FILES_PER_BATCH = 100;
+const UPLOAD_IO_CONCURRENCY = 8;
+
+async function eachUploadEntry(entries, visit) {
+  let next = 0;
+  let failed = false;
+  let firstError;
+  const worker = async () => {
+    while (!failed && next < entries.length) {
+      const index = next++;
+      try {
+        await visit(entries[index], index);
+      } catch (cause) {
+        if (!failed) firstError = cause;
+        failed = true;
+      }
+    }
+  };
+  // Drain in-flight work before reporting failure or cleaning temporary files.
+  await Promise.all(
+    Array.from(
+      { length: Math.min(UPLOAD_IO_CONCURRENCY, entries.length) },
+      worker,
+    ),
+  );
+  if (failed) throw firstError;
+}
+
+// A local upload already exists in the panel's private temporary directory.
+// Publishing a second link is atomic and exclusive, with no second full write.
+// Cross-volume and link-restricted filesystems retain the exclusive-copy path.
+async function publishUpload(io, temporary, destination) {
+  try {
+    await io.link(temporary, destination);
+  } catch (cause) {
+    if (
+      !["EXDEV", "ENOSYS", "ENOTSUP", "EOPNOTSUPP", "EPERM", "EACCES"].includes(
+        cause.code,
+      )
+    )
+      throw cause;
+    await io.copyFile(temporary, destination, constants.COPYFILE_EXCL);
+  }
+}
 
 const failure = (status, message) =>
   Object.assign(new Error(message), { status });
@@ -348,10 +394,20 @@ export async function uploadServerFiles({
   const resolve = await boundary(serverDir, safePath, io);
   if (!(await io.lstat(await resolve(directory))).isDirectory())
     throw failure(400, "Choose a directory to upload into.");
-  const suppliedPaths = arrayField(fields.paths, "file paths", 20);
+  const suppliedPaths = arrayField(
+    fields.paths,
+    "file paths",
+    MAX_UPLOAD_FILES_PER_BATCH,
+  );
   const suppliedDirectories =
     arrayField(fields.directories, "directories", 1000) ?? [];
-  const modified = arrayField(fields.modified, "modification times", 20);
+  const modified = arrayField(
+    fields.modified,
+    "modification times",
+    MAX_UPLOAD_FILES_PER_BATCH,
+  );
+  if (files.length > MAX_UPLOAD_FILES_PER_BATCH)
+    throw failure(400, "Upload fewer files in one batch.");
   if (
     (suppliedPaths && suppliedPaths.length !== files.length) ||
     (modified && modified.length !== files.length)
@@ -393,17 +449,18 @@ export async function uploadServerFiles({
     throw failure(409, "An uploaded file and folder have the same path.");
   const join = (relative) => [directory, relative].filter(Boolean).join("/");
   // Check the full batch before creating anything; writes still use exclusive opens.
-  for (const relative of names)
+  await eachUploadEntry(names, async (relative) => {
     if (await statOrNull(io, await resolve(join(relative))))
       throw failure(
         409,
         `“${relative}” already exists. Rename it before uploading.`,
       );
-  for (const relative of directories) {
+  });
+  await eachUploadEntry([...directories], async (relative) => {
     const existing = await statOrNull(io, await resolve(join(relative)));
     if (existing && !existing.isDirectory())
       throw failure(409, `“${relative}” already exists as a file.`);
-  }
+  });
   let createdDirectories = 0;
   for (const relative of [...directories].sort(
     (a, b) => a.split("/").length - b.split("/").length || a.localeCompare(b),
@@ -421,9 +478,9 @@ export async function uploadServerFiles({
         throw cause;
     }
   }
-  for (let i = 0; i < files.length; i++) {
+  await eachUploadEntry(files, async (file, i) => {
     const relative = join(names[i]);
-    await io.copyFile(files[i].path, await resolve(relative), 1);
+    await publishUpload(io, file.path, await resolve(relative));
     onUploaded?.(relative);
     if (modified)
       await io.utimes(
@@ -431,6 +488,6 @@ export async function uploadServerFiles({
         new Date(modified[i]),
         new Date(modified[i]),
       );
-  }
+  });
   return { uploaded: files.length, directories: createdDirectories };
 }
