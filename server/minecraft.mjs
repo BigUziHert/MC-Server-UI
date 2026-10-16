@@ -4,6 +4,7 @@ import { remotePrincipal } from "./remote-access.mjs";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { randomUUID, createHash } from "node:crypto";
+import { finished } from "node:stream/promises";
 import { cleanInstall, prepareCleanSettings } from "./clean-install.mjs";
 import { createVersionsService } from "./versions.mjs";
 import { createPropertiesService } from "./properties.mjs";
@@ -806,15 +807,39 @@ export async function createMinecraft(ctx) {
         res.json(await launchpad.settings(req.body)),
       ),
     );
-    app.post(
-      "/api/launchpad/preview",
-      endpoint(async (req, res) => res.json(await launchpad.preview(req.body))),
-    );
+    // A review only stages private files. Once its reader leaves, stop provider
+    // requests and drain preparation before removing staging. Install requests
+    // keep their separate durable job lifecycle and are never cancelled here.
+    const previewEndpoint = (method) =>
+      endpoint(async (req, res) => {
+        const controller = new AbortController();
+        const disconnected = () => {
+          if (!res.writableFinished) controller.abort();
+        };
+        res.once("close", disconnected);
+        let plan;
+        try {
+          plan = await launchpad[method]({
+            ...req.body,
+            signal: controller.signal,
+          });
+          if (controller.signal.aborted || res.destroyed) {
+            await launchpad.cancelPreview(plan.planId);
+            return;
+          }
+          res.json(plan);
+          await finished(res, { readable: false, cleanup: true });
+        } catch (cause) {
+          if (plan) await launchpad.cancelPreview(plan.planId);
+          if (!controller.signal.aborted) throw cause;
+        } finally {
+          res.off("close", disconnected);
+        }
+      });
+    app.post("/api/launchpad/preview", previewEndpoint("preview"));
     app.post(
       "/api/launchpad/updates/preview",
-      endpoint(async (req, res) =>
-        res.json(await launchpad.previewUpdates(req.body)),
-      ),
+      previewEndpoint("previewUpdates"),
     );
     app.post(
       "/api/launchpad/preview/:id/cancel",

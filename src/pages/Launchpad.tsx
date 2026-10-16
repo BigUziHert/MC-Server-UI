@@ -520,6 +520,7 @@ export default function Launchpad({
   const session = useRef(0);
   const operation = useRef(0);
   const pending = useRef(false);
+  const previewRequest = useRef<AbortController | null>(null);
   const dialog = useRef<HTMLDialogElement>(null);
   const settingsDialog = useRef<HTMLDialogElement>(null);
   const removalDialog = useRef<HTMLDialogElement>(null);
@@ -753,6 +754,7 @@ export default function Launchpad({
     return () => {
       session.current++;
       operation.current++;
+      previewRequest.current?.abort();
       manualCompletion.current?.(false);
       manualCompletion.current = null;
       window.clearInterval(timer);
@@ -1217,6 +1219,7 @@ export default function Launchpad({
   function chooseProject(project: Project, entry?: InstalledItem) {
     if (!allowChanges) return;
     operation.current++;
+    previewRequest.current?.abort();
     setDialogError("");
     setPlan(null);
     setCleanAccepted(false);
@@ -1235,6 +1238,7 @@ export default function Launchpad({
   function closeSelection() {
     if (busy === "install") return;
     operation.current++;
+    previewRequest.current?.abort();
     setSelection(null);
     setPlan(null);
     setCleanAccepted(false);
@@ -1359,6 +1363,18 @@ export default function Launchpad({
       }
     }
   }
+  function prepareReview(route: string, body: unknown) {
+    previewRequest.current?.abort();
+    const controller = new AbortController();
+    previewRequest.current = controller;
+    return api<Plan>(route, {
+      method: "POST",
+      body: JSON.stringify(body),
+      signal: controller.signal,
+    }).finally(() => {
+      if (previewRequest.current === controller) previewRequest.current = null;
+    });
+  }
   async function preview(event: FormEvent) {
     event.preventDefault();
     if (selection?.bulk) {
@@ -1391,7 +1407,7 @@ export default function Launchpad({
     setBusy("preview");
     setDialogError("");
     try {
-      const next = await post<Plan>("/launchpad/preview", {
+      const next = await prepareReview("/launchpad/preview", {
         platform: selection.project.platform,
         projectId: selection.project.id,
         versionId,
@@ -1560,7 +1576,7 @@ export default function Launchpad({
     setBusy("preview");
     pending.current = true;
     try {
-      const next = await post<Plan>("/launchpad/updates/preview", {
+      const next = await prepareReview("/launchpad/updates/preview", {
         type,
         gameVersion: contentGameVersion,
         loader: contentLoader,

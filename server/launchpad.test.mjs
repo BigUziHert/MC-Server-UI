@@ -7395,11 +7395,14 @@ async function dependencyUpdateFixture(
     addonId = "addon",
     retainedAddons = [],
     dependencyType = "required",
+    request: customRequest,
   } = {},
 ) {
   const identities = new Map();
   const f = await fixture(t, {
     request: async (url, init) => {
+      const custom = await customRequest?.(url, init);
+      if (custom) return custom;
       if (new URL(url).pathname === "/v2/version_files")
         return Response.json(
           Object.fromEntries(
@@ -7548,6 +7551,250 @@ async function dependencyUpdateFixture(
     },
   };
 }
+
+test("update review overlaps candidate downloads, preserves plan order and verifies SHA-1 plus SHA-512 in one read", async (t) => {
+  const started = Promise.withResolvers(),
+    releases = [Promise.withResolvers(), Promise.withResolvers()];
+  let calls = 0;
+  const f = await dependencyUpdateFixture(t, {
+    request: async (url) => {
+      const index = String(url).endsWith("/new.jar")
+        ? 0
+        : String(url).endsWith("/addon-new.jar")
+          ? 1
+          : -1;
+      if (index < 0) return;
+      if (++calls === 2) started.resolve();
+      await releases[index].promise;
+      return new Response(index ? f.addon2 : f.library2);
+    },
+  });
+  f.downloads.delete("https://cdn.modrinth.com/new.jar");
+  f.downloads.delete("https://cdn.modrinth.com/addon-new.jar");
+  f.versions.new.files[0].hashes = { sha1: hashes(f.library2).sha1 };
+  const open = fs.open;
+  let verificationReads = 0;
+  t.mock.method(fs, "open", async (target, mode, ...args) => {
+    if (
+      mode === "r" &&
+      /^update-dependency-\d+\.jar$/.test(path.basename(String(target)))
+    )
+      verificationReads++;
+    return open(target, mode, ...args);
+  });
+  const pending = f.service.preview(f.bulk);
+  await started.promise;
+  assert.equal(
+    calls,
+    2,
+    "both reviews download without waiting for the other's network response",
+  );
+  assert.deepEqual(
+    await fs.readFile(path.join(f.serverDir, "mods/old.jar")),
+    f.library1,
+  );
+  releases[1].resolve();
+  releases[0].resolve();
+  const plan = await pending;
+  assert.deepEqual(
+    plan.files.map((file) => file.path),
+    ["mods/new.jar", "mods/addon-new.jar"],
+  );
+  assert.equal(
+    verificationReads,
+    2,
+    "one complete read per staged candidate, including the SHA-1 provider artifact",
+  );
+  const job = await finish(f.service, { planId: plan.planId, confirmed: true });
+  assert.equal(job.status, "completed", job.error);
+  assert.equal(calls, 2, "installation reuses reviewed downloads");
+  t.diagnostic(
+    "Two candidate downloads overlap one network wait; SHA-1 candidate verification uses one disk pass instead of separate SHA-1 and SHA-512 reads.",
+  );
+});
+
+test("bulk review resolves independent roots in bounded waves without reordering its plan", async (t) => {
+  const f = await fixture(t);
+  f.setServer({ loader: "paper" });
+  await fs.mkdir(path.join(f.serverDir, "plugins"));
+  const gates = Array.from({ length: 8 }, () => Promise.withResolvers());
+  const waves = [Promise.withResolvers(), Promise.withResolvers()];
+  const receipts = [];
+  for (let index = 0; index < 8; index++) {
+    const data = bytes(`old plugin ${index}`),
+      relative = `plugins/root-${index}.jar`;
+    await fs.writeFile(path.join(f.serverDir, relative), data);
+    receipts.push({
+      path: relative,
+      sha512: hashes(data).sha512,
+      type: "plugin",
+      platform: "reviewfixture",
+      projectId: `root-${index}`,
+      versionId: "old",
+    });
+  }
+  await fs.writeFile(
+    path.join(f.dataDir, "launchpad/installed.json"),
+    JSON.stringify(receipts),
+  );
+  let started = 0,
+    active = 0,
+    peak = 0;
+  const service = await f.boot({
+    extraProviders: [
+      {
+        id: "reviewfixture",
+        name: "Review fixture",
+        types: ["plugin"],
+        downloadHosts: ["cdn.modrinth.com"],
+        resolve: async ({ projectId }) => {
+          const index = Number(projectId.slice(5));
+          peak = Math.max(peak, ++active);
+          if (++started % 4 === 0) waves[started / 4 - 1].resolve();
+          await gates[index].promise;
+          active--;
+          return {
+            title: projectId,
+            versionName: "2",
+            dependencies: [],
+            files: [
+              {
+                path: `next-${index}.jar`,
+                hashes: hashes(f.newer),
+                size: f.newer.length,
+                url: `https://cdn.modrinth.com/next-${index}.jar`,
+              },
+            ],
+          };
+        },
+      },
+    ],
+  });
+  const pending = service.previewUpdates({
+    type: "plugin",
+    loader: "paper",
+    gameVersion: "1.21.1",
+    updates: receipts.map((row) => ({
+      platform: row.platform,
+      projectId: row.projectId,
+      versionId: "new",
+      replacePath: row.path,
+    })),
+  });
+  for (let wave = 0; wave < 2; wave++) {
+    await waves[wave].promise;
+    assert.equal(started, (wave + 1) * 4);
+    for (let index = wave * 4 + 3; index >= wave * 4; index--)
+      gates[index].resolve();
+  }
+  const plan = await pending;
+  assert.equal(peak, 4);
+  assert.deepEqual(
+    plan.files.map((file) => file.path),
+    receipts.map((_, index) => `plugins/next-${index}.jar`),
+  );
+  t.diagnostic(
+    "8 independent catalog roots resolve in 2 latency waves instead of the previous 8, with deterministic review order.",
+  );
+});
+
+test("parallel update review still rejects installed bytes changed during candidate downloads", async (t) => {
+  const entered = Promise.withResolvers(),
+    release = Promise.withResolvers();
+  const f = await dependencyUpdateFixture(t, {
+    request: async (url) => {
+      if (!String(url).endsWith("/new.jar")) return;
+      entered.resolve();
+      await release.promise;
+      return new Response(f.library2);
+    },
+  });
+  f.downloads.delete("https://cdn.modrinth.com/new.jar");
+  const pending = f.service.preview(f.input);
+  const rejected = assert.rejects(pending, /changed since review/);
+  await entered.promise;
+  const target = path.join(f.serverDir, "mods/old.jar"),
+    before = await fs.stat(target);
+  const changed = Buffer.from(f.library1);
+  changed[changed.length - 1] ^= 1;
+  await fs.writeFile(target, changed);
+  await fs.utimes(target, before.atime, before.mtime);
+  release.resolve();
+  await rejected;
+  assert.deepEqual(
+    await fs.readFile(target),
+    changed,
+    "the rejected review never overwrites changed server content",
+  );
+});
+
+for (const cancelled of [false, true])
+  test(`a ${cancelled ? "cancelled" : "failed"} update review drains sibling work before deleting its stage`, async (t) => {
+    const entered = Promise.withResolvers(),
+      release = Promise.withResolvers();
+    const controller = new AbortController();
+    let started = 0,
+      settled = false;
+    const f = await dependencyUpdateFixture(t, {
+      request: async (url, { signal }) => {
+        const name = new URL(url).pathname;
+        if (!["/new.jar", "/addon-new.jar"].includes(name)) return;
+        if (++started === 2) entered.resolve();
+        await entered.promise;
+        if (name === "/new.jar") {
+          if (!cancelled)
+            throw Object.assign(new Error("candidate provider failed"), {
+              status: 503,
+            });
+          await new Promise((_resolve, reject) => {
+            signal.addEventListener("abort", () => reject(signal.reason), {
+              once: true,
+            });
+            if (signal.aborted) reject(signal.reason);
+          });
+        }
+        // Simulate provider cleanup that must drain even after cancellation.
+        await release.promise;
+        signal.throwIfAborted();
+        return new Response(f.addon2);
+      },
+    });
+    f.downloads.delete("https://cdn.modrinth.com/new.jar");
+    f.downloads.delete("https://cdn.modrinth.com/addon-new.jar");
+    const pending = f.service
+      .preview({ ...f.bulk, signal: controller.signal })
+      .finally(() => {
+        settled = true;
+      });
+    const rejected = assert.rejects(
+      pending,
+      cancelled ? /review cancelled/ : /candidate provider failed/,
+    );
+    await entered.promise;
+    if (cancelled) controller.abort(new Error("review cancelled"));
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(settled, false);
+    const stages = async () =>
+      (await fs.readdir(path.join(f.dataDir, "launchpad"))).filter((name) =>
+        /^[a-f0-9-]{36}$/.test(name),
+      );
+    assert.equal(
+      (await stages()).length,
+      1,
+      "the stage stays owned while another worker is active",
+    );
+    release.resolve();
+    await rejected;
+    assert.deepEqual(await stages(), []);
+    assert.deepEqual(
+      await fs.readFile(path.join(f.serverDir, "mods/old.jar")),
+      f.library1,
+    );
+    assert.deepEqual(
+      await fs.readFile(path.join(f.serverDir, "mods/addon.jar")),
+      f.addon1,
+    );
+  });
 
 async function moonlightUpdateFixture(t, options = {}) {
   return dependencyUpdateFixture(t, {

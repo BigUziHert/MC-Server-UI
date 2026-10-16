@@ -43,6 +43,7 @@ async function fixture(
     running = false,
     stage,
     persistMinecraftConfiguration,
+    extraProviders = [],
   } = {},
 ) {
   const temporary = await fs.realpath(os.tmpdir());
@@ -65,7 +66,7 @@ async function fixture(
     scheduler: false,
     useEnvironment: false,
     versionsService: service,
-    extraProviders: [],
+    extraProviders,
     publicAddress: { resolve: async () => null },
     telemetry: { reset() {}, sample: async () => null },
     persistMinecraftConfiguration,
@@ -144,6 +145,72 @@ async function fixture(
     },
   };
 }
+test("disconnecting an installation review aborts preparation and drains it before staging cleanup", async (t) => {
+  const entered = gate(),
+    aborted = gate(),
+    release = gate();
+  let stage;
+  const f = await fixture(t, {
+    extraProviders: [
+      {
+        id: "fixture",
+        name: "Fixture",
+        types: ["plugin"],
+        resolve: async (input) => {
+          stage = input.stage;
+          input.signal.addEventListener("abort", aborted.resolve, {
+            once: true,
+          });
+          entered.resolve();
+          await release.promise;
+          input.signal.throwIfAborted();
+          throw new Error("The abandoned review should have been cancelled.");
+        },
+      },
+    ],
+  });
+  const controller = new AbortController();
+  const request = f.request("/api/launchpad/preview", {
+    ...json("POST", {
+      platform: "fixture",
+      type: "plugin",
+      projectId: "project",
+      versionId: "new",
+      gameVersion: "1.21.1",
+      loader: "paper",
+    }),
+    signal: controller.signal,
+  });
+  const cancelled = assert.rejects(request, { name: "AbortError" });
+  try {
+    await Promise.race([
+      entered.promise,
+      request.then((response) => assert.fail(JSON.stringify(response))),
+    ]);
+    controller.abort();
+    await cancelled;
+    await aborted.promise;
+    assert.ok((await fs.stat(stage)).isDirectory());
+    release.resolve();
+    await eventually(async () => {
+      try {
+        await fs.stat(stage);
+        return false;
+      } catch (cause) {
+        if (cause.code === "ENOENT") return true;
+        throw cause;
+      }
+    });
+    assert.equal(
+      await fs.readFile(path.join(f.serverDir, "server.jar"), "utf8"),
+      "original JAR",
+    );
+  } finally {
+    controller.abort();
+    release.resolve();
+  }
+});
+
 async function makeStage({ stageDir }) {
   const output = path.join(stageDir, "server");
   await fs.mkdir(output);

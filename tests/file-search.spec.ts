@@ -310,6 +310,191 @@ test("JSON, uppercase JSON, JSON5 and JSONC expose editors and preserve raw cont
   }
 });
 
+test("editor Find navigates literal matches, scrolls, and never submits while searching", async ({
+  page,
+  request,
+  files,
+}) => {
+  const original = `[a.*] at the start\n${"ordinary line\n".repeat(90)}${" ".repeat(300)}[A.*] at the end\n`;
+  await create(request, files.id, "", "keyword-find.txt", "file", original);
+  await openFiles(page, files.id);
+  await page
+    .getByRole("button", { name: "Edit keyword-find.txt", exact: true })
+    .click();
+  const dialog = page.getByRole("dialog", {
+    name: "keyword-find.txt",
+    exact: true,
+  });
+  const editor = dialog.getByRole("textbox", {
+    name: "File contents",
+    exact: true,
+  });
+  const find = dialog.getByRole("textbox", {
+    name: "Find text in file",
+    exact: true,
+  });
+  const count = dialog.getByRole("status", {
+    name: "Find matches",
+    exact: true,
+  });
+  const writes: string[] = [];
+  page.on("request", (request) => {
+    if (
+      request.method() === "PUT" &&
+      new URL(request.url()).pathname === "/api/files/content"
+    )
+      writes.push(request.url());
+  });
+  await expect(editor).toHaveValue(original);
+  await editor.press("Control+f");
+  await expect(find).toBeFocused();
+  await find.fill("[a.*]");
+  await expect(count).toHaveText("1 of 2 matches");
+  await expect
+    .poll(() =>
+      editor.evaluate((node: HTMLTextAreaElement) => node.selectionStart),
+    )
+    .toBe(0);
+  await find.press("Enter");
+  await expect(count).toHaveText("2 of 2 matches");
+  await expect
+    .poll(() =>
+      editor.evaluate((node: HTMLTextAreaElement) => ({
+        selected: node.value.slice(node.selectionStart, node.selectionEnd),
+        vertical: node.scrollTop > 0,
+        horizontal: node.scrollLeft > 0,
+      })),
+    )
+    .toEqual({ selected: "[A.*]", vertical: true, horizontal: true });
+  await find.press("Shift+Enter");
+  await expect(count).toHaveText("1 of 2 matches");
+  await dialog
+    .getByRole("button", { name: "Previous match", exact: true })
+    .click();
+  await expect(count).toHaveText("2 of 2 matches");
+  await expect(editor).toBeFocused();
+  await dialog.getByRole("button", { name: "Next match", exact: true }).click();
+  await expect(count).toHaveText("1 of 2 matches");
+  await dialog.getByRole("button", { name: "Match case", exact: true }).click();
+  await expect(count).toHaveText("1 of 1 matches");
+  await find.fill("does not exist");
+  await expect(count).toHaveText("No matches");
+  await expect(
+    dialog.getByRole("button", { name: "Next match", exact: true }),
+  ).toBeDisabled();
+  await find.press("Enter");
+  await expect(editor).toHaveValue(original);
+  expect(writes).toEqual([]);
+  await find.press("Escape");
+  await expect(find).toHaveCount(0);
+  await expect(dialog).toBeVisible();
+  await expect(editor).toBeFocused();
+  await editor.press("Escape");
+  await expect(dialog).not.toBeVisible();
+
+  await page
+    .getByRole("button", { name: "Edit keyword-find.txt", exact: true })
+    .click();
+  await expect(editor).toHaveValue(original);
+  await editor.press("Meta+f");
+  await expect(find).toHaveValue("");
+  await expect(
+    dialog.getByRole("button", { name: "Match case", exact: true }),
+  ).toHaveAttribute("aria-pressed", "false");
+  await find.fill("[a.*]");
+  await expect(count).toHaveText("1 of 2 matches");
+  const edited = `${original}[a.*] appended\n`;
+  await editor.fill(edited);
+  await expect(count).toHaveText("1 of 3 matches");
+  await expect
+    .poll(() =>
+      editor.evaluate((node: HTMLTextAreaElement) => node.selectionStart),
+    )
+    .toBe(edited.length);
+  await editor.press("Escape");
+  expect(writes).toEqual([]);
+  await dialog
+    .getByRole("button", { name: "Save changes", exact: true })
+    .click();
+  await expect(dialog).not.toBeVisible();
+  expect(
+    (await (await contents(request, files.id, "keyword-find.txt")).json())
+      .content,
+  ).toBe(edited);
+  expect(writes).toHaveLength(1);
+});
+
+test("editor Find uses displayed offsets for CRLF and lone CR without changing saved line endings", async ({
+  page,
+  request,
+  files,
+}) => {
+  const original = `header\r\n${"ordinary line\r\n".repeat(70)}needle one\rsecond line\rneedle two\r\n`;
+  const displayed = original.replace(/\r\n?/g, "\n");
+  await create(request, files.id, "", "windows-lines.txt", "file", original);
+  await openFiles(page, files.id);
+  await page
+    .getByRole("button", { name: "Edit windows-lines.txt", exact: true })
+    .click();
+  const dialog = page.getByRole("dialog", {
+    name: "windows-lines.txt",
+    exact: true,
+  });
+  const editor = dialog.getByRole("textbox", {
+    name: "File contents",
+    exact: true,
+  });
+  await expect(editor).toHaveValue(displayed);
+  await dialog
+    .getByRole("button", { name: "Find in file", exact: true })
+    .click();
+  const find = dialog.getByRole("textbox", {
+    name: "Find text in file",
+    exact: true,
+  });
+  await find.fill("needle");
+  await expect(
+    dialog.getByRole("status", { name: "Find matches", exact: true }),
+  ).toHaveText("1 of 2 matches");
+  await expect
+    .poll(() =>
+      editor.evaluate((node: HTMLTextAreaElement) => ({
+        start: node.selectionStart,
+        selected: node.value.slice(node.selectionStart, node.selectionEnd),
+        scrolled: node.scrollTop > 0,
+      })),
+    )
+    .toEqual({
+      start: displayed.indexOf("needle"),
+      selected: "needle",
+      scrolled: true,
+    });
+  await find.press("Enter");
+  await expect
+    .poll(() =>
+      editor.evaluate((node: HTMLTextAreaElement) => ({
+        start: node.selectionStart,
+        selected: node.value.slice(node.selectionStart, node.selectionEnd),
+      })),
+    )
+    .toEqual({ start: displayed.lastIndexOf("needle"), selected: "needle" });
+  await find.press("Escape");
+  const save = page.waitForRequest(
+    (request) =>
+      request.method() === "PUT" &&
+      new URL(request.url()).pathname === "/api/files/content",
+  );
+  await dialog
+    .getByRole("button", { name: "Save changes", exact: true })
+    .click();
+  expect((await save).postDataJSON().content).toBe(original);
+  await expect(dialog).not.toBeVisible();
+  expect(
+    (await (await contents(request, files.id, "windows-lines.txt")).json())
+      .content,
+  ).toBe(original);
+});
+
 test("search shows first matches before completion and discards late queries, partial failures and old-host results", async ({
   page,
   files,
@@ -543,6 +728,34 @@ test("JSON5 and JSONC search results preserve browse-only and read-only permissi
         await expect(
           dialog.getByRole("button", { name: "Save changes", exact: true }),
         ).toBeDisabled();
+        await dialog
+          .getByRole("button", { name: "Find in file", exact: true })
+          .click();
+        const find = dialog.getByRole("textbox", {
+          name: "Find text in file",
+          exact: true,
+        });
+        await expect(find).toHaveValue("");
+        await find.fill("ENABLED");
+        await expect(
+          dialog.getByRole("status", { name: "Find matches", exact: true }),
+        ).toHaveText("1 of 1 matches");
+        await find.press("Enter");
+        await dialog
+          .getByRole("button", { name: "Next match", exact: true })
+          .click();
+        await expect
+          .poll(() =>
+            dialog
+              .getByRole("textbox", { name: "File contents" })
+              .evaluate((node: HTMLTextAreaElement) =>
+                node.value.slice(node.selectionStart, node.selectionEnd),
+              ),
+          )
+          .toBe("enabled");
+        await page.keyboard.press("Escape");
+        await expect(find).toHaveCount(0);
+        await expect(dialog).toBeVisible();
         await dialog
           .getByRole("button", { name: "Cancel", exact: true })
           .click();

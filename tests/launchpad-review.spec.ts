@@ -127,6 +127,84 @@ async function reviewInstallation(page: Page) {
   return page.getByRole("dialog", { name: "Review installation", exact: true });
 }
 
+for (const bulk of [false, true]) {
+  test(`closing a pending ${bulk ? "bulk update" : "installation"} review aborts preparation and permits a fresh review`, async ({
+    page,
+  }) => {
+    await catalog(page);
+    await page.route("**/api/launchpad/installed?**", (route) =>
+      route.fulfill({
+        json: { items: bulk ? [installed("Alpha")] : [], warnings: [] },
+      }),
+    );
+    await page.route("**/api/launchpad/preview/*/cancel", (route) =>
+      route.fulfill({ json: { cancelled: true } }),
+    );
+    const previewPath = bulk
+      ? "/api/launchpad/updates/preview"
+      : "/api/launchpad/preview";
+    await page.addInitScript((pathname) => {
+      const originalFetch = window.fetch.bind(window);
+      window.fetch = (input, init) => {
+        const url = input instanceof Request ? input.url : String(input);
+        if (new URL(url, location.href).pathname === pathname) {
+          const signal =
+            init?.signal ?? (input instanceof Request ? input.signal : null);
+          signal?.addEventListener(
+            "abort",
+            () => {
+              document.documentElement.dataset.reviewAborted = "true";
+            },
+            { once: true },
+          );
+        }
+        return originalFetch(input, init);
+      };
+    }, previewPath);
+    let held: Route | undefined;
+    let calls = 0;
+    await page.route(`**${previewPath}`, (route) => {
+      calls++;
+      if (calls === 1) held = route;
+      else return route.fulfill({ json: plan });
+    });
+    await page.goto("/#launchpad");
+    if (bulk)
+      await page
+        .getByRole("switch", { name: "Show installed content" })
+        .check();
+    const start = async () => {
+      if (bulk)
+        await page
+          .getByRole("button", { name: "Update all", exact: true })
+          .click();
+      else await reviewInstallation(page);
+    };
+    await start();
+    const dialog = page.getByRole("dialog", {
+      name: /^(?:Install content|Review installation)$/,
+    });
+    await expect(
+      dialog.getByRole("button", { name: "Preparing review...", exact: true }),
+    ).toBeDisabled();
+    await expect.poll(() => Boolean(held)).toBe(true);
+    await dialog.getByRole("button", { name: "Cancel", exact: true }).click();
+    await expect(dialog).not.toBeVisible();
+    await expect(page.locator("html")).toHaveAttribute(
+      "data-review-aborted",
+      "true",
+    );
+    await start();
+    await expect(
+      dialog.getByRole("button", { name: "Confirm installation", exact: true }),
+    ).toBeEnabled();
+    expect(calls).toBe(2);
+    await held!.abort().catch(() => {});
+    await expect(dialog.getByRole("alert")).toHaveCount(0);
+    await dialog.getByRole("button", { name: "Cancel", exact: true }).click();
+  });
+}
+
 for (const manual of [false, true]) {
   test(`accepted installation response loss recovers ${manual ? "with Refresh after a failed lookup" : "automatically"} and reaches its result`, async ({
     page,

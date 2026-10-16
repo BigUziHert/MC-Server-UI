@@ -1,0 +1,48 @@
+.file-editor-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+.file-editor-toolbar > label {
+  color: #b1b6ce;
+  font-size: 11px;
+}
+.file-editor-find {
+  display: grid;
+  gap: 7px;
+  padding: 10px;
+  background: #101016;
+  border: 1px solid var(--storage-border);
+  border-radius: 7px;
+}
+.file-editor-find-controls {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+.file-editor-find-controls > input {
+  flex: 1;
+  min-width: 0;
+}
+.file-editor-find-controls > button {
+  flex: 0 0 auto;
+}
+.file-editor-find-controls > [aria-pressed="true"] {
+  color: var(--storage-accent);
+  border-color: var(--storage-accent);
+}
+.file-editor-find-count {
+  color: var(--storage-muted);
+  font-size: 11px;
+  font-weight: 400;
+}
+@media (max-width: 500px) {
+  .file-editor-find-controls {
+    flex-wrap: wrap;
+  }
+  .file-editor-find-controls > input {
+    flex-basis: 100%;
+  }
+}

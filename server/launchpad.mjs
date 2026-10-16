@@ -12,7 +12,7 @@ import { updatedModDependencyWarnings } from "./launchpad-update-dependencies.mj
 import { createModRemoval } from "./launchpad-removal.mjs";
 import { createLaunchpadMetadataCache } from "./launchpad-metadata-cache.mjs";
 import { createLaunchpadCatalogCache } from "./launchpad-catalog-cache.mjs";
-import { parallelTransfers } from "./launchpad-transfers.mjs";
+import { mapReview, parallelTransfers } from "./launchpad-transfers.mjs";
 import { recoverJarIdentity } from "./launchpad-jar-recovery.mjs";
 import { createVersionsService } from "./versions.mjs";
 import { cleanInstall, prepareCleanSettings } from "./clean-install.mjs";
@@ -139,6 +139,14 @@ async function fileHash(
   signal,
   maximum = 512 * 1024 ** 2,
 ) {
+  return (await fileHashes(target, [algorithm], signal, maximum))[algorithm];
+}
+async function fileHashes(
+  target,
+  algorithms,
+  signal,
+  maximum = 512 * 1024 ** 2,
+) {
   signal?.throwIfAborted();
   const before = await fs.lstat(target);
   if (!before.isFile() || before.isSymbolicLink() || before.size > maximum)
@@ -147,7 +155,12 @@ async function fileHash(
       "Only regular files under 512 MB can be managed by Launchpad.",
     );
   const handle = await fs.open(target, "r");
-  const hash = createHash(algorithm);
+  const hashes = new Map(
+    [...new Set(algorithms)].map((algorithm) => [
+      algorithm,
+      createHash(algorithm),
+    ]),
+  );
   try {
     const opened = await handle.stat();
     if (opened.ino !== before.ino || opened.dev !== before.dev)
@@ -160,7 +173,7 @@ async function fileHash(
       signal,
     })) {
       signal?.throwIfAborted();
-      hash.update(chunk);
+      for (const hash of hashes.values()) hash.update(chunk);
     }
     const after = await handle.stat();
     if (after.size !== before.size || after.mtimeMs !== before.mtimeMs)
@@ -168,7 +181,9 @@ async function fileHash(
         409,
         "A file changed while it was being checked. Refresh and try again.",
       );
-    return hash.digest("hex");
+    return Object.fromEntries(
+      [...hashes].map(([algorithm, hash]) => [algorithm, hash.digest("hex")]),
+    );
   } finally {
     await handle.close();
   }
@@ -666,7 +681,7 @@ export async function createLaunchpad(ctx) {
       return true;
     return lower === "eula.txt";
   }
-  async function snapshotInventory(type) {
+  async function snapshotInventory(type, signal = lifetime.signal) {
     if (type === "modpack") return null;
     const folder = await destination(type);
     const directory = await safePath(serverDir, folder);
@@ -684,18 +699,22 @@ export async function createLaunchpad(ctx) {
         400,
         "This folder has over 1,000 packages. Use File Manager to narrow the installed collection.",
       );
-    const rows = [];
-    for (const name of packages) {
-      lifetime.signal.throwIfAborted();
-      const stat = await statOrNull(
-        await safePath(serverDir, `${folder}/${name}`),
-      );
-      rows.push([name, stat ? fileStamp(stat) : null]);
-    }
+    const rows = await mapReview(
+      packages,
+      async (name) => {
+        signal.throwIfAborted();
+        const stat = await statOrNull(
+          await safePath(serverDir, `${folder}/${name}`),
+        );
+        return [name, stat ? fileStamp(stat) : null];
+      },
+      signal,
+      16,
+    );
     return JSON.stringify([folder, rows]);
   }
-  async function assertReviewedInventory(plan) {
-    const current = await snapshotInventory(plan.input.type);
+  async function assertReviewedInventory(plan, signal = lifetime.signal) {
+    const current = await snapshotInventory(plan.input.type, signal);
     if (current !== plan.inventorySnapshot) {
       const [folder, entries] = JSON.parse(current);
       const [reviewedFolder, reviewedEntries] = JSON.parse(
@@ -2372,18 +2391,23 @@ export async function createLaunchpad(ctx) {
     const size = (await fs.lstat(target)).size;
     const [algorithm, expected] = strongestHash(file.hashes);
     const maximum = (archive ? 2 * 1024 : 512) * 1024 ** 2;
-    const actual = await fileHash(target, algorithm, signal, maximum);
-    if ((file.size != null && size !== file.size) || actual !== expected)
+    const hashes = await fileHashes(
+      target,
+      [algorithm, "sha512"],
+      signal,
+      maximum,
+    );
+    if (
+      (file.size != null && size !== file.size) ||
+      hashes[algorithm] !== expected
+    )
       throw error(
         502,
         "A staged download failed its size or checksum check. No server files were changed.",
       );
     return {
       size,
-      sha512:
-        algorithm === "sha512"
-          ? actual
-          : await fileHash(target, "sha512", signal, maximum),
+      sha512: hashes.sha512,
     };
   }
   async function unpackPack(result, input, stage) {
@@ -2674,23 +2698,31 @@ export async function createLaunchpad(ctx) {
     const inspect = async (source, row) => {
       try {
         return {
-          ...row,
-          ...(await inspectInstalledMod(source, {
-            loader: input.loader,
-            signal: input.signal,
-          })),
+          row: {
+            ...row,
+            ...(await inspectInstalledMod(source, {
+              loader: input.loader,
+              signal: input.signal,
+            })),
+          },
         };
       } catch (cause) {
         input.signal.throwIfAborted();
-        warnings.push(
-          `Dependency requirements in ${row.path} could not be verified: ${cause.message}`,
-        );
-        return row;
+        return {
+          row,
+          warning: `Dependency requirements in ${row.path} could not be verified: ${cause.message}`,
+        };
       }
     };
-    const before = [];
-    for (const row of local)
-      before.push(await inspect(await safePath(serverDir, row.path), row));
+    const inspected = await mapReview(
+      local,
+      async (row) => inspect(await safePath(serverDir, row.path), row),
+      input.signal,
+    );
+    const before = inspected.map((value) => value.row);
+    warnings.push(
+      ...inspected.flatMap((value) => (value.warning ? [value.warning] : [])),
+    );
     const knownProviders = new Set(before.flatMap((row) => row.provided ?? []));
     const affected = new Set(
       before
@@ -2701,23 +2733,35 @@ export async function createLaunchpad(ctx) {
     // New declarations in a combined dependent update must also be inspected.
     if (!affected.size) return;
     const after = before.filter((row) => !replaced.has(row.path));
+    if (
+      files.reduce((total, file) => total + (file.size ?? 0), 0) >
+      2 * 1024 ** 3
+    )
+      throw error(400, "This installation exceeds the 2 GB total size limit.");
     let downloaded = 0;
-    for (const [index, file] of files.entries()) {
-      if (!file.stagedPath) {
-        const source = path.join(stage, `update-dependency-${index}.jar`);
-        await downloadVerified(file, source, file.hosts, request, {
-          signal: input.signal,
-          curseforgeKey: key,
-        });
-        file.stagedPath = source;
-      }
-      const verified = await verifyStaged(file, stage, input.signal);
-      if ((downloaded += verified.size) > 2 * 1024 ** 3)
-        throw error(
-          400,
-          "This installation exceeds the 2 GB total size limit.",
-        );
-      const row = await inspect(file.stagedPath, file);
+    const candidates = await mapReview(
+      files,
+      async (file, index) => {
+        if (!file.stagedPath) {
+          const source = path.join(stage, `update-dependency-${index}.jar`);
+          await downloadVerified(file, source, file.hosts, request, {
+            signal: input.signal,
+            curseforgeKey: key,
+          });
+          file.stagedPath = source;
+        }
+        const verified = await verifyStaged(file, stage, input.signal);
+        if ((downloaded += verified.size) > 2 * 1024 ** 3)
+          throw error(
+            400,
+            "This installation exceeds the 2 GB total size limit.",
+          );
+        return inspect(file.stagedPath, file);
+      },
+      input.signal,
+    );
+    for (const { row, warning } of candidates) {
+      if (warning) warnings.push(warning);
       after.push(row);
       // Updating a dependent can tighten its requirements without changing
       // the provider. Check known local providers even if the catalog omitted
@@ -2803,14 +2847,16 @@ export async function createLaunchpad(ctx) {
     try {
       // Capture before identification: new paths must not silently expand an
       // approved replacement, even when another client uploads the same project.
-      const inventorySnapshot = await snapshotInventory(input.type);
+      const inventorySnapshot = await snapshotInventory(
+        input.type,
+        input.signal,
+      );
       const identified =
         input.type === "modpack"
           ? { items: [], warnings: [] }
           : await installed({ ...input, identityOnly: true });
       const local = identified.items;
-      const trees = [];
-      for (const [index, root] of roots.entries()) {
+      for (const root of roots) {
         if (
           bulk &&
           !local.some(
@@ -2824,20 +2870,26 @@ export async function createLaunchpad(ctx) {
             409,
             `The installed file ${root.replacePath} could not be verified as this project. ${identified.warnings.join(" ")} Refresh installed files.`,
           );
-        const rootStage = bulk ? path.join(stage, `item-${index}`) : stage;
-        if (bulk) await fs.mkdir(rootStage);
-        const tree = await resolveTree(root, rootStage, local);
-        if (bulk && tree.archive)
-          throw error(
-            400,
-            "Modpacks require their own clean installation review.",
-          );
-        trees.push(tree);
-        if (
-          trees.reduce((total, value) => total + value.files.length, 0) > 10000
-        )
-          throw error(400, "This update selection contains too many files.");
       }
+      let resolvedFileCount = 0;
+      const trees = await mapReview(
+        roots,
+        async (root, index) => {
+          const rootStage = bulk ? path.join(stage, `item-${index}`) : stage;
+          if (bulk) await fs.mkdir(rootStage);
+          const tree = await resolveTree(root, rootStage, local);
+          if (bulk && tree.archive)
+            throw error(
+              400,
+              "Modpacks require their own clean installation review.",
+            );
+          resolvedFileCount += tree.files.length;
+          if (resolvedFileCount > 10000)
+            throw error(400, "This update selection contains too many files.");
+          return tree;
+        },
+        input.signal,
+      );
       const result = trees[0];
       if (bulk) {
         const files = new Map(),
@@ -2920,8 +2972,6 @@ export async function createLaunchpad(ctx) {
           "This selection contains no supported server files or too many files.",
         );
       const paths = new Set();
-      const files = [];
-      const unchanged = [];
       for (const file of result.files) {
         file.path = safeInstallPath(file.path);
         const folded = file.path.toLowerCase();
@@ -2942,110 +2992,137 @@ export async function createLaunchpad(ctx) {
           strongestHash(file.hashes);
           checkedProviderUrl(file.url, file.hosts);
         }
-        if (input.type === "modpack") {
-          files.push({
-            ...file,
-            expected: null,
-            previous: null,
-            action: "install",
-          });
-          continue;
-        }
-        const matches = local.filter(
-          (item) =>
-            item.platform === file.platform &&
-            item.projectId === file.projectId,
-        );
-        if (matches.length > 1)
-          throw error(
-            409,
-            `Multiple installed files match this project: ${matches.map((item) => item.path).join(", ")}. Remove the duplicate before updating.`,
+      }
+      const compared = await mapReview(
+        result.files,
+        async (file) => {
+          if (input.type === "modpack") {
+            return {
+              file: {
+                ...file,
+                expected: null,
+                previous: null,
+                action: "install",
+              },
+            };
+          }
+          const matches = local.filter(
+            (item) =>
+              item.platform === file.platform &&
+              item.projectId === file.projectId,
           );
-        if (
-          matches[0] &&
-          result.recoveredDependencies.has(
-            `${file.platform}:${file.projectId}`,
-          ) &&
-          matches[0].versionId !== file.versionId
-        )
-          throw error(
-            409,
-            `${file.title} is already installed at a different version. This project's dependency link needs correction; Launchpad cannot safely replace the installed dependency automatically.`,
-          );
-        let oldPath = matches[0]?.path;
-        const selectedRoot = roots.find(
-          (root) =>
-            root.platform === file.platform &&
-            root.projectId === file.projectId,
-        );
-        if (selectedRoot?.replacePath) {
-          if (oldPath !== selectedRoot.replacePath)
+          if (matches.length > 1)
             throw error(
               409,
-              `The selected installed file could not be verified as this project. ${identified.warnings.length ? identified.warnings.join(" ") + " " : ""}Refresh installed files.`,
+              `Multiple installed files match this project: ${matches.map((item) => item.path).join(", ")}. Remove the duplicate before updating.`,
             );
-          oldPath = selectedRoot.replacePath;
-        }
-        const target = await safePath(serverDir, file.path);
-        const current = await statOrNull(target);
-        if (current && !current.isFile())
-          throw error(
-            409,
-            `The destination ${file.path} is not a regular file.`,
+          if (
+            matches[0] &&
+            result.recoveredDependencies.has(
+              `${file.platform}:${file.projectId}`,
+            ) &&
+            matches[0].versionId !== file.versionId
+          )
+            throw error(
+              409,
+              `${file.title} is already installed at a different version. This project's dependency link needs correction; Launchpad cannot safely replace the installed dependency automatically.`,
+            );
+          let oldPath = matches[0]?.path;
+          const selectedRoot = roots.find(
+            (root) =>
+              root.platform === file.platform &&
+              root.projectId === file.projectId,
           );
-        const expected = current ? await fileHash(target) : null;
-        let previous = null;
-        if (oldPath && oldPath !== file.path)
-          previous = {
-            path: oldPath,
-            sha512: await fileHash(await safePath(serverDir, oldPath)),
-          };
-        if (matches[0] && (previous?.sha512 ?? expected) !== matches[0].sha512)
-          throw error(
-            409,
-            "The installed file changed after identification. Refresh installed files and review the update again.",
-          );
-        // Compare bytes, not names or version labels. A verified package may
-        // have been renamed locally; keep it in place when the provider's
-        // destination is absent so the update cannot create a duplicate JAR.
-        const existingPath = previous && !current ? previous.path : file.path;
-        const existingHash = previous && !current ? previous.sha512 : expected;
-        if (existingHash && (!previous || !current)) {
+          if (selectedRoot?.replacePath) {
+            if (oldPath !== selectedRoot.replacePath)
+              throw error(
+                409,
+                `The selected installed file could not be verified as this project. ${identified.warnings.length ? identified.warnings.join(" ") + " " : ""}Refresh installed files.`,
+              );
+            oldPath = selectedRoot.replacePath;
+          }
+          const target = await safePath(serverDir, file.path);
+          const current = await statOrNull(target);
+          if (current && !current.isFile())
+            throw error(
+              409,
+              `The destination ${file.path} is not a regular file.`,
+            );
           const [algorithm, requiredHash] = strongestHash(file.hashes);
-          const actualHash =
-            algorithm === "sha512"
-              ? existingHash
-              : await fileHash(
-                  await safePath(serverDir, existingPath),
-                  algorithm,
-                );
-          if (actualHash === requiredHash) {
-            // Retain both the existing file and absent destination snapshots
-            // for the final pre-mutation check, even though neither is listed
-            // as a change or passed to the download/promotion loops.
-            unchanged.push({
+          const currentHashes = current
+            ? await fileHashes(target, ["sha512", algorithm], input.signal)
+            : null;
+          const expected = currentHashes?.sha512 ?? null;
+          let previous = null;
+          let previousHashes = null;
+          if (oldPath && oldPath !== file.path) {
+            previousHashes = await fileHashes(
+              await safePath(serverDir, oldPath),
+              ["sha512", algorithm],
+              input.signal,
+            );
+            previous = {
+              path: oldPath,
+              sha512: previousHashes.sha512,
+            };
+          }
+          if (
+            matches[0] &&
+            (previous?.sha512 ?? expected) !== matches[0].sha512
+          )
+            throw error(
+              409,
+              "The installed file changed after identification. Refresh installed files and review the update again.",
+            );
+          // Compare bytes, not names or version labels. A verified package may
+          // have been renamed locally; keep it in place when the provider's
+          // destination is absent so the update cannot create a duplicate JAR.
+          const existingPath = previous && !current ? previous.path : file.path;
+          const existingHash =
+            previous && !current ? previous.sha512 : expected;
+          if (existingHash && (!previous || !current)) {
+            const actualHash = (
+              previous && !current ? previousHashes : currentHashes
+            )[algorithm];
+            if (actualHash === requiredHash) {
+              // Retain both the existing file and absent destination snapshots
+              // for the final pre-mutation check, even though neither is listed
+              // as a change or passed to the download/promotion loops.
+              return {
+                unchanged: true,
+                file: {
+                  ...file,
+                  expected,
+                  previous,
+                  installedPath: existingPath,
+                  installedHash: existingHash,
+                },
+              };
+            }
+          }
+          if (file.preserveInstalled)
+            throw error(
+              409,
+              `${file.path} changed since its dependency requirements were checked. Review the installation again.`,
+            );
+          return {
+            file: {
               ...file,
+              author: file.author || matches[0]?.author,
               expected,
               previous,
-              installedPath: existingPath,
-              installedHash: existingHash,
-            });
-            continue;
-          }
-        }
-        if (file.preserveInstalled)
-          throw error(
-            409,
-            `${file.path} changed since its dependency requirements were checked. Review the installation again.`,
-          );
-        files.push({
-          ...file,
-          author: file.author || matches[0]?.author,
-          expected,
-          previous,
-          action: expected || previous ? "replace" : "install",
-        });
-      }
+              action: expected || previous ? "replace" : "install",
+            },
+          };
+        },
+        input.signal,
+      );
+      const files = compared
+        .filter((value) => !value.unchanged)
+        .map((value) => value.file);
+      const unchanged = compared
+        .filter((value) => value.unchanged)
+        .map((value) => value.file);
       result.files = [...files, ...unchanged];
       // Promotion recycles each original immediately before writing its new
       // file. An original claimed by another item must never remove an output
@@ -3073,7 +3150,7 @@ export async function createLaunchpad(ctx) {
         result.warnings,
       );
       await inspectUnavailableDependencies(result, input, stage);
-      await assertReviewedInventory({ input, inventorySnapshot });
+      await assertReviewedInventory({ input, inventorySnapshot }, input.signal);
       const expiresAt = new Date(Date.now() + 15 * 60 * 1000).toISOString();
       const plan = {
         id: planId,

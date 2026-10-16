@@ -42,6 +42,7 @@ import {
 import "./storage.css";
 import "./storage-dialog.css";
 import SearchField, { useDebouncedValue } from "../SearchField";
+import FileTextEditor, { type FileTextEditorHandle } from "../FileTextEditor";
 import RefreshButton from "../RefreshButton";
 import StatePanel from "../StatePanel";
 import Pagination from "../Pagination";
@@ -683,6 +684,7 @@ export default function FileManager({
   const requestId = useRef(0);
   const listRequest = useRef<AbortController | null>(null);
   const dialogRef = useRef<HTMLDialogElement>(null);
+  const textEditor = useRef<FileTextEditorHandle>(null);
   const focusSearchAfterClose = useRef(false);
   const dragDepth = useRef(0);
   const editRequestId = useRef(0);
@@ -1892,9 +1894,27 @@ export default function FileManager({
           className={`modal storage-modal storage-native-dialog ${dialog.type === "edit" ? "editor-modal" : ""}`}
           aria-labelledby="file-dialog-title"
           aria-describedby="file-dialog-description"
+          onKeyDownCapture={(event) => {
+            if (
+              (event.ctrlKey || event.metaKey) &&
+              !event.altKey &&
+              event.key.toLowerCase() === "f" &&
+              textEditor.current?.openFind()
+            ) {
+              event.preventDefault();
+              event.stopPropagation();
+            } else if (
+              event.key === "Escape" &&
+              textEditor.current?.closeFind()
+            ) {
+              event.preventDefault();
+              event.stopPropagation();
+            }
+          }}
           onCancel={(event) => {
             event.preventDefault();
-            if (!savingRef.current) closeDialog();
+            if (!textEditor.current?.closeFind() && !savingRef.current)
+              closeDialog();
           }}
           onMouseDown={(event) => {
             if (event.target !== event.currentTarget || savingRef.current)
@@ -1961,29 +1981,31 @@ export default function FileManager({
               </label>
             )}
             {(dialog.type === "edit" ||
-              (dialog.type === "create" && dialog.kind === "file")) && (
-              <label className="form-field">
-                {dialog.type === "edit"
-                  ? "File contents"
-                  : "Contents (optional)"}
-                {reading ? (
+              (dialog.type === "create" && dialog.kind === "file")) &&
+              (reading ? (
+                <div className="form-field">
+                  <span>File contents</span>
                   <div className="editor-loading">
                     <LoaderCircle size={18} className="spin" />
                     Reading file…
                   </div>
-                ) : (
-                  <textarea
-                    className="file-editor"
-                    readOnly={dialog.type === "edit" && !canUpdate}
-                    value={content}
-                    onChange={(event) => setContent(event.target.value)}
-                    spellCheck={false}
-                    disabled={saving}
-                    rows={dialog.type === "edit" ? 18 : 6}
-                  />
-                )}
-              </label>
-            )}
+                </div>
+              ) : (
+                <FileTextEditor
+                  key={dialog.type === "edit" ? dialog.entry.path : "new-file"}
+                  ref={textEditor}
+                  label={
+                    dialog.type === "edit"
+                      ? "File contents"
+                      : "Contents (optional)"
+                  }
+                  readOnly={dialog.type === "edit" && !canUpdate}
+                  value={content}
+                  onChange={setContent}
+                  disabled={saving}
+                  rows={dialog.type === "edit" ? 18 : 6}
+                />
+              ))}
             {dialog.type === "delete" && (
               <p className="delete-description">
                 Move <strong>/{dialog.entry.path}</strong>
