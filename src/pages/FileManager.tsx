@@ -1609,6 +1609,16 @@ export default function FileManager({
             </div>
           </div>
         </div>
+        {loading && requestedQuery && loaded.current && !error && (
+          <div
+            className="file-search-status"
+            role="status"
+            aria-label="File search progress"
+          >
+            <LoaderCircle size={14} className="spin" aria-hidden="true" />
+            <span>Searching remaining folders…</span>
+          </div>
+        )}
         {error && (
           <StatePanel
             variant="error"

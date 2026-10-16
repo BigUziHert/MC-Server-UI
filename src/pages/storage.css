@@ -84,6 +84,18 @@
   font-size: 11px;
   white-space: nowrap;
 }
+.file-search-status {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 0 23px 14px;
+  color: var(--storage-muted);
+  font-size: 12px;
+  line-height: 1.5;
+}
+.file-search-status svg {
+  flex-shrink: 0;
+}
 .file-table {
   table-layout: fixed;
   width: 100%;
