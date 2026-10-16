@@ -7523,35 +7523,26 @@ for (const compatible of [true, false])
       versionId: "addon2",
       replacePath: "mods/addon.jar",
     };
-    if (compatible) {
-      const plan = await f.service.preview(input);
-      assert.deepEqual(
-        plan.files.map((file) => file.path),
-        ["mods/addon-new.jar"],
-      );
-      const job = await finish(f.service, {
-        planId: plan.planId,
-        confirmed: true,
-      });
-      assert.equal(job.status, "completed", job.error);
-      assert.deepEqual(
-        await fs.readFile(path.join(f.serverDir, "mods/addon-new.jar")),
-        f.addon2,
-      );
-    } else {
-      await assert.rejects(
-        f.service.preview(input),
-        (cause) =>
-          cause.status === 409 &&
-          /amendments.*requires moonlight.*\[1\.21\.1-3\.8,\)/.test(
-            cause.message,
-          ),
-      );
-      assert.deepEqual(
-        await fs.readFile(path.join(f.serverDir, "mods/addon.jar")),
-        f.addon1,
-      );
-    }
+    const plan = await f.service.preview(input);
+    assert.equal(
+      plan.warnings.some((warning) =>
+        /amendments.*requires moonlight.*\[1\.21\.1-3\.8,\)/.test(warning),
+      ),
+      !compatible,
+    );
+    assert.deepEqual(
+      plan.files.map((file) => file.path),
+      ["mods/addon-new.jar"],
+    );
+    const job = await finish(f.service, {
+      planId: plan.planId,
+      confirmed: true,
+    });
+    assert.equal(job.status, "completed", job.error);
+    assert.deepEqual(
+      await fs.readFile(path.join(f.serverDir, "mods/addon-new.jar")),
+      f.addon2,
+    );
     for (const retained of [
       { path: "mods/old.jar", data: f.library1 },
       ...f.retained,
@@ -7569,7 +7560,7 @@ for (const compatible of [true, false])
   });
 
 for (const loader of ["forge", "neoforge", "fabric"])
-  test(`${loader} update rejects a retained addon's incompatible required library range`, async (t) => {
+  test(`${loader} update warns about a retained addon's incompatible required library range and allows installation`, async (t) => {
     const f = await dependencyUpdateFixture(t, {
       loader,
       ...(loader === "fabric" ? { range: ">=1.0 <2.0" } : {}),
@@ -7579,14 +7570,17 @@ for (const loader of ["forge", "neoforge", "fabric"])
       path: "mods/old.jar",
     });
     assert.equal(removal.blocked, true);
-    await assert.rejects(
-      f.service.preview(f.input),
-      (cause) =>
-        cause.status === 409 &&
-        /addon.*mods\/addon.jar.*requires corelib/.test(cause.message) &&
-        cause.message.includes(
-          loader === "fabric" ? ">=1.0 <2.0" : "[1.0,2.0)",
-        ),
+    const plan = await f.service.preview(f.input);
+    assert.ok(
+      plan.warnings.some(
+        (warning) =>
+          /addon.*mods\/addon.jar.*requires corelib/.test(warning) &&
+          warning.includes(loader === "fabric" ? ">=1.0 <2.0" : "[1.0,2.0)"),
+      ),
+    );
+    assert.match(
+      plan.warnings.join(" "),
+      /install anyway.*server may fail to start/,
     );
     assert.deepEqual(
       await fs.readFile(path.join(f.serverDir, "mods", "old.jar")),
@@ -7600,6 +7594,19 @@ for (const loader of ["forge", "neoforge", "fabric"])
       "addon.jar",
       "old.jar",
     ]);
+    const job = await finish(f.service, {
+      planId: plan.planId,
+      confirmed: true,
+    });
+    assert.equal(job.status, "completed", job.error);
+    assert.deepEqual(
+      await fs.readFile(path.join(f.serverDir, "mods", "new.jar")),
+      f.library2,
+    );
+    assert.deepEqual(
+      await fs.readFile(path.join(f.serverDir, "mods", "addon.jar")),
+      f.addon1,
+    );
   });
 
 test("combined updates use the resulting dependent requirements and retain checksum-verified downloads", async (t) => {
@@ -7635,12 +7642,10 @@ test("combined updates use the resulting dependent requirements and retain check
   );
 });
 
-test("combined updates reject incompatible new dependent declarations", async (t) => {
+test("combined updates warn about incompatible new dependent declarations and allow installation", async (t) => {
   const f = await dependencyUpdateFixture(t, { nextRange: "[3.0,4.0)" });
-  await assert.rejects(
-    f.service.preview(f.bulk),
-    /addon.*requires corelib.*\[3.0,4.0\)/,
-  );
+  const plan = await f.service.preview(f.bulk);
+  assert.match(plan.warnings.join(" "), /addon.*requires corelib.*\[3.0,4.0\)/);
   assert.deepEqual(
     await fs.readFile(path.join(f.serverDir, "mods", "old.jar")),
     f.library1,
@@ -7649,6 +7654,16 @@ test("combined updates reject incompatible new dependent declarations", async (t
     await fs.readFile(path.join(f.serverDir, "mods", "addon.jar")),
     f.addon1,
   );
+  const job = await finish(f.service, { planId: plan.planId, confirmed: true });
+  assert.equal(job.status, "completed", job.error);
+  for (const [filename, data] of [
+    ["new.jar", f.library2],
+    ["addon-new.jar", f.addon2],
+  ])
+    assert.deepEqual(
+      await fs.readFile(path.join(f.serverDir, "mods", filename)),
+      data,
+    );
 });
 
 test("combined updates also check newly introduced dependent requirements", async (t) => {
@@ -7656,10 +7671,8 @@ test("combined updates also check newly introduced dependent requirements", asyn
     range: null,
     nextRange: "[3.0,4.0)",
   });
-  await assert.rejects(
-    f.service.preview(f.bulk),
-    /addon.*requires corelib.*\[3.0,4.0\)/,
-  );
+  const plan = await f.service.preview(f.bulk);
+  assert.match(plan.warnings.join(" "), /addon.*requires corelib.*\[3.0,4.0\)/);
 });
 
 test("a compatible library update keeps the retained dependent's exact path and bytes", async (t) => {
@@ -7694,38 +7707,30 @@ for (const compatible of [false, true])
       versionId: "addon2",
       replacePath: "mods/addon.jar",
     };
-    if (compatible) {
-      const plan = await f.service.preview(input);
-      assert.deepEqual(
-        plan.files.map((file) => file.path),
-        ["mods/addon-new.jar"],
-      );
-      const job = await finish(f.service, {
-        planId: plan.planId,
-        confirmed: true,
-      });
-      assert.equal(job.status, "completed", job.error);
-      assert.deepEqual(
-        await fs.readFile(path.join(f.serverDir, "mods", "addon-new.jar")),
-        f.addon2,
-      );
-    } else {
-      await assert.rejects(
-        f.service.preview(input),
-        /addon.*requires corelib.*\[2.0,3.0\)/,
-      );
-      assert.deepEqual(
-        await fs.readFile(path.join(f.serverDir, "mods", "addon.jar")),
-        f.addon1,
-      );
-      assert.equal(
-        await fs.stat(path.join(f.serverDir, "mods", "addon-new.jar")).then(
-          () => true,
-          () => false,
-        ),
-        false,
-      );
-    }
+    const plan = await f.service.preview(input);
+    assert.equal(
+      plan.warnings.some((warning) =>
+        /addon.*requires corelib.*\[2.0,3.0\)/.test(warning),
+      ),
+      !compatible,
+    );
+    assert.deepEqual(
+      plan.files.map((file) => file.path),
+      ["mods/addon-new.jar"],
+    );
+    assert.deepEqual(
+      await fs.readFile(path.join(f.serverDir, "mods", "addon.jar")),
+      f.addon1,
+    );
+    const job = await finish(f.service, {
+      planId: plan.planId,
+      confirmed: true,
+    });
+    assert.equal(job.status, "completed", job.error);
+    assert.deepEqual(
+      await fs.readFile(path.join(f.serverDir, "mods", "addon-new.jar")),
+      f.addon2,
+    );
     assert.deepEqual(
       await fs.readFile(path.join(f.serverDir, "mods", "old.jar")),
       f.library1,

@@ -3597,6 +3597,123 @@ test("Launchpad lists every affected file and reason beyond the current installe
   });
 });
 
+test("Launchpad allows confirming a Supplementaries update after a dependency compatibility warning", async ({
+  page,
+  serverId,
+}) => {
+  await mockInstalledPage(page);
+  const version = {
+    id: "supplementaries-new",
+    name: "supplementaries-1.21.1-4.0.2-neoforge",
+    version: "1.21.1-4.0.2",
+    gameVersions: ["1.21.1"],
+    loaders: ["neoforge"],
+    publishedAt: "2026-10-16T00:00:00Z",
+    downloadable: true,
+  };
+  const oldPath = "mods/supplementaries-1.21.1-3.9.9-neoforge.jar";
+  const newPath = "mods/supplementaries-1.21.1-4.0.2-neoforge.jar";
+  await page.route("**/api/launchpad/installed?**", (route) =>
+    route.fulfill({
+      json: {
+        items: [
+          {
+            path: oldPath,
+            name: oldPath.split("/").pop(),
+            title: "Supplementaries",
+            size: 1024,
+            platform: "modrinth",
+            projectId: "supplementaries",
+            versionId: "supplementaries-old",
+            updateCheck: "checked",
+            update: version,
+          },
+        ],
+        warnings: [],
+      },
+    }),
+  );
+  await page.route("**/api/launchpad/versions?**", (route) =>
+    route.fulfill({ json: { versions: [version] } }),
+  );
+  const warning =
+    'Dependency compatibility could not be verified: Supplementaries requires moonlight "[1.21.1-3.8,)". The resulting installed version is 1.21.1-3.7.2. You can continue, but the server may fail to start or mods may not work correctly.';
+  await page.route("**/api/launchpad/preview", (route) => {
+    expect(route.request().headers()["x-server-id"]).toBe(serverId);
+    expect(route.request().postDataJSON()).toMatchObject({
+      projectId: "supplementaries",
+      versionId: version.id,
+      loader: "neoforge",
+      replacePath: oldPath,
+    });
+    return route.fulfill({
+      json: {
+        planId: "supplementaries-review",
+        title: "Supplementaries",
+        versionName: version.version,
+        files: [
+          {
+            path: newPath,
+            previousPath: oldPath,
+            size: 2048,
+            action: "replace",
+          },
+        ],
+        warnings: [warning],
+        expiresAt: "2099-01-01T00:00:00Z",
+      },
+    });
+  });
+  const installations: unknown[] = [];
+  await page.route("**/api/launchpad/install", (route) => {
+    expect(route.request().headers()["x-server-id"]).toBe(serverId);
+    installations.push(route.request().postDataJSON());
+    return route.fulfill({
+      json: {
+        job: {
+          id: "supplementaries-job",
+          planId: "supplementaries-review",
+          status: "completed",
+          message: "Supplementaries updated.",
+          completed: 1,
+          total: 1,
+        },
+      },
+    });
+  });
+  await page.goto("/#launchpad");
+  await page.getByRole("switch", { name: "Show installed content" }).check();
+  await page
+    .getByRole("button", { name: "Update Supplementaries", exact: true })
+    .click();
+  await page
+    .getByRole("dialog")
+    .getByRole("button", { name: "Review installation", exact: true })
+    .click();
+  const dialog = page.getByRole("dialog", {
+    name: "Review installation",
+    exact: true,
+  });
+  await expect(dialog.getByText(warning, { exact: true })).toBeVisible();
+  await expect(
+    dialog.getByRole("list", { name: "Installation files", exact: true }),
+  ).toContainText(newPath);
+  const confirm = dialog.getByRole("button", {
+    name: "Confirm installation",
+    exact: true,
+  });
+  await expect(confirm).toBeEnabled();
+  expect(installations).toHaveLength(0);
+  await confirm.click();
+  await expect(dialog).not.toBeVisible();
+  expect(installations).toEqual([
+    { planId: "supplementaries-review", confirmed: true },
+  ]);
+  await expect(
+    page.getByRole("status", { name: "Installation status", exact: true }),
+  ).toContainText("Supplementaries updated.");
+});
+
 test("Launchpad requires an explicit Install anyway choice for unchecked requirements", async ({
   page,
   serverId,

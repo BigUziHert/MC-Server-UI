@@ -1,5 +1,4 @@
 import { installedModVersionSatisfies } from "./launchpad-dependency-ranges.mjs";
-import { launchpadError } from "./launchpad-network.mjs";
 
 // Fabric allows numeric versions with any number of components. Keep this
 // proof deliberately narrow: qualifiers and unfamiliar loader syntax cannot
@@ -72,9 +71,10 @@ export function updateDependencySatisfies(version, range, loader) {
     });
 }
 
-export function assertUpdatedModDependencies(before, after, affected, loader) {
+export function updatedModDependencyWarnings(before, after, affected, loader) {
   const providers = new Map(),
-    requirements = new Map();
+    requirements = new Map(),
+    warnings = [];
   for (const row of after) {
     for (const value of row.providers ?? []) {
       if (!providers.has(value.id)) providers.set(value.id, []);
@@ -114,9 +114,9 @@ export function assertUpdatedModDependencies(before, after, affected, loader) {
       ({ row, range }) =>
         `${row.title || row.path} (${row.path}) requires ${id} ${range === undefined ? "with an unverified version requirement" : JSON.stringify(range)}`,
     );
-    throw launchpadError(
-      409,
-      `These updates cannot satisfy required mod dependencies: ${details.join("; ")}. The resulting installed versions are ${versions.map((version) => version ?? "unknown").join(", ") || "missing"}. Choose compatible updates and review again.`,
+    warnings.push(
+      `These updates may not satisfy required mod dependencies: ${details.join("; ")}. The resulting installed versions of ${id} are ${versions.map((version) => version ?? "unknown").join(", ") || "missing"}. You can install anyway, but the server may fail to start or mods may not work correctly.`,
     );
   }
+  return warnings;
 }

@@ -8,7 +8,7 @@ import { safeInstallPath, unpackProviderZip } from "./launchpad-archives.mjs";
 import { inspectBundledDependencies } from "./launchpad-bundled.mjs";
 import { installedDependencySatisfies } from "./launchpad-dependency-ranges.mjs";
 import { inspectInstalledMod } from "./launchpad-mod-metadata.mjs";
-import { assertUpdatedModDependencies } from "./launchpad-update-dependencies.mjs";
+import { updatedModDependencyWarnings } from "./launchpad-update-dependencies.mjs";
 import { createModRemoval } from "./launchpad-removal.mjs";
 import { createLaunchpadMetadataCache } from "./launchpad-metadata-cache.mjs";
 import { recoverJarIdentity } from "./launchpad-jar-recovery.mjs";
@@ -2651,7 +2651,7 @@ export async function createLaunchpad(ctx) {
     } else throw error(400, "This provider's archive format is unsupported.");
     return { files, warnings, loaderInstall };
   }
-  async function validateUpdatedDependencies(
+  async function reviewUpdatedDependencies(
     input,
     stage,
     local,
@@ -2694,7 +2694,7 @@ export async function createLaunchpad(ctx) {
         .filter((row) => replaced.has(row.path))
         .flatMap((row) => row.provided ?? []),
     );
-    // Unrelated, already missing requirements do not become new update guards.
+    // Unrelated, already missing requirements do not become new update warnings.
     // New declarations in a combined dependent update must also be inspected.
     if (!affected.size) return;
     const after = before.filter((row) => !replaced.has(row.path));
@@ -2722,7 +2722,9 @@ export async function createLaunchpad(ctx) {
       for (const id of row.required ?? [])
         if (knownProviders.has(id)) affected.add(id);
     }
-    assertUpdatedModDependencies(before, after, affected, input.loader);
+    warnings.push(
+      ...updatedModDependencyWarnings(before, after, affected, input.loader),
+    );
   }
   function preview(raw) {
     const task = preparePreview(raw);
@@ -3060,7 +3062,7 @@ export async function createLaunchpad(ctx) {
             );
           claimedPaths.set(folded, file);
         }
-      await validateUpdatedDependencies(
+      await reviewUpdatedDependencies(
         input,
         stage,
         local,

@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import {
-  assertUpdatedModDependencies,
+  updatedModDependencyWarnings,
   updateDependencySatisfies,
 } from "./launchpad-update-dependencies.mjs";
 
@@ -16,7 +16,7 @@ const dependent = (range) => ({
   requirements: [{ id: "library", range }],
 });
 const check = (before, after, loader = "neoforge") =>
-  assertUpdatedModDependencies(before, after, new Set(["library"]), loader);
+  updatedModDependencyWarnings(before, after, new Set(["library"]), loader);
 
 test("dependency update proof supports loader-specific ranges and rejects unknown expressions", () => {
   for (const [version, range, loader, expected] of [
@@ -52,32 +52,32 @@ test("dependency update proof supports loader-specific ranges and rejects unknow
     );
 });
 
-test("an alternate bundled provider must satisfy all retained required ranges", () => {
+test("an alternate bundled provider warns unless it satisfies all retained required ranges", () => {
   const addon = dependent("[1,2)"),
     old = provider("1"),
     replacement = provider("2");
-  assert.throws(
-    () => check([addon, old], [addon, replacement]),
+  assert.match(
+    check([addon, old], [addon, replacement])[0],
     /Addon.*library.*\[1,2\)/,
   );
-  assert.throws(
-    () => check([addon, old, replacement], [addon, replacement]),
+  assert.match(
+    check([addon, old, replacement], [addon, replacement])[0],
     /Addon.*library/,
   );
-  assert.throws(() => check([addon, old], [addon]), /missing/);
-  assert.doesNotThrow(() =>
+  assert.match(check([addon, old], [addon])[0], /missing/);
+  assert.deepEqual(
     check(
       [addon, old],
       [addon, replacement, provider("1.5", "mods/bundle.jar")],
     ),
+    [],
   );
   const second = { ...dependent("[2,3)"), path: "mods/second-addon.jar" };
-  assert.throws(
-    () =>
-      check(
-        [addon, second, old],
-        [addon, second, replacement, provider("1.5", "mods/bundle.jar")],
-      ),
+  assert.match(
+    check(
+      [addon, second, old],
+      [addon, second, replacement, provider("1.5", "mods/bundle.jar")],
+    )[0],
     /required mod dependencies/,
   );
 });
@@ -85,17 +85,70 @@ test("an alternate bundled provider must satisfy all retained required ranges", 
 test("unknown ranges only preserve an unchanged dependent's known provider version", () => {
   const addon = dependent("unsupported range"),
     old = provider("1.1-beta");
-  assert.doesNotThrow(() => check([addon, old], [addon, provider("1.1-beta")]));
-  assert.throws(
-    () => check([addon, old], [addon, provider("1.2-beta")]),
+  assert.deepEqual(check([addon, old], [addon, provider("1.1-beta")]), []);
+  assert.match(
+    check([addon, old], [addon, provider("1.2-beta")])[0],
     /requires library/,
   );
-  assert.throws(
-    () => check([addon, old], [{ ...addon }, provider("1.1-beta")]),
+  assert.match(
+    check([addon, old], [{ ...addon }, provider("1.1-beta")])[0],
     /requires library/,
   );
-  assert.throws(
-    () => check([addon, provider(undefined)], [addon, provider(undefined)]),
+  assert.match(
+    check([addon, provider(undefined)], [addon, provider(undefined)])[0],
     /requires library/,
+  );
+});
+
+test("dependency conflicts return actionable warnings for every affected dependency", () => {
+  const addon = {
+    path: "mods/addon.jar",
+    title: "Addon",
+    required: ["library", "helper"],
+    requirements: [{ id: "library", range: "[1,2)" }, { id: "helper" }],
+  };
+  const warnings = updatedModDependencyWarnings(
+    [addon, provider("1")],
+    [addon, provider("2")],
+    new Set(["library", "helper"]),
+    "neoforge",
+  );
+  assert.deepEqual(warnings, [
+    'These updates may not satisfy required mod dependencies: Addon (mods/addon.jar) requires library "[1,2)". The resulting installed versions of library are 2. You can install anyway, but the server may fail to start or mods may not work correctly.',
+    "These updates may not satisfy required mod dependencies: Addon (mods/addon.jar) requires helper with an unverified version requirement. The resulting installed versions of helper are missing. You can install anyway, but the server may fail to start or mods may not work correctly.",
+  ]);
+});
+
+test("the Supplementaries update accepts Moonlight satisfying all three installed mod ranges", () => {
+  const addons = [
+    [
+      "Amendments",
+      "mods/amendments-1.21-2.1.11-neoforge.jar",
+      "[1.21.1-3.1.0c,)",
+    ],
+    ["Vista", "mods/vista-1.21.1-5.5.7-neoforge.jar", "[1.21-3.4.0,)"],
+    [
+      "Supplementaries",
+      "mods/supplementaries-1.21.1-4.0.2-neoforge.jar",
+      "[1.21.1-3.6.4,]",
+    ],
+  ].map(([title, path, range]) => ({
+    title,
+    path,
+    required: ["moonlight"],
+    requirements: [{ id: "moonlight", range }],
+  }));
+  const moonlight = (version) => ({
+    path: "mods/moonlight.jar",
+    providers: [{ id: "moonlight", version }],
+  });
+  assert.deepEqual(
+    updatedModDependencyWarnings(
+      [...addons, moonlight("1.21.1-3.7.1")],
+      [...addons, moonlight("1.21.1-3.7.2")],
+      new Set(["moonlight"]),
+      "neoforge",
+    ),
+    [],
   );
 });
