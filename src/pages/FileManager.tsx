@@ -669,6 +669,8 @@ export default function FileManager({
   const [readFailed, setReadFailed] = useState(false);
   const [dialogError, setDialogError] = useState("");
   const [selected, setSelected] = useState<Set<string>>(new Set());
+  const pendingReveal = useRef<{ scope: string; path: string } | null>(null);
+  const revealedRow = useRef<HTMLTableRowElement>(null);
   const moveKey = `${sessionScope}:${scopeKey}:moves`;
   const moveBatch = useSyncExternalStore(
     subscribeMoves,
@@ -970,8 +972,17 @@ export default function FileManager({
     };
   }, [dialog]);
 
-  function navigate(next: string) {
-    if (savingRef.current || next === path) return;
+  function navigate(next: string, revealPath?: string) {
+    if (savingRef.current || (next === path && !revealPath)) return;
+    pendingReveal.current = revealPath
+      ? {
+          scope: JSON.stringify([
+            JSON.stringify([sessionScope, scopeKey, next]),
+            "",
+          ]),
+          path: revealPath,
+        }
+      : null;
     setSelected(new Set());
     setQuery("");
     setEntries([]);
@@ -1254,6 +1265,46 @@ export default function FileManager({
         ),
     [entries],
   );
+  useEffect(() => {
+    const reveal = pendingReveal.current;
+    if (!reveal) return;
+    if (reveal.scope !== listScope || showingBin || !canRead) {
+      pendingReveal.current = null;
+      return;
+    }
+    if (loading || listing.scope !== listScope) return;
+    const index = filtered.findIndex((entry) => entry.path === reveal.path);
+    if (index < 0) {
+      pendingReveal.current = null;
+      return;
+    }
+    const targetPage = Math.floor(index / pageSize) + 1;
+    if (
+      page !== targetPage ||
+      selected.size !== 1 ||
+      !selected.has(reveal.path)
+    ) {
+      setSelected(new Set([reveal.path]));
+      setPage(targetPage);
+      return;
+    }
+    revealedRow.current?.scrollIntoView({
+      behavior: "instant",
+      block: "center",
+      inline: "nearest",
+    });
+    pendingReveal.current = null;
+  }, [
+    filtered,
+    listScope,
+    listing.scope,
+    loading,
+    page,
+    pageSize,
+    selected,
+    showingBin,
+    canRead,
+  ]);
   const currentPage = Math.min(
     page,
     Math.max(1, Math.ceil(filtered.length / pageSize)),
@@ -1731,6 +1782,12 @@ export default function FileManager({
                 {visible.map((entry) => (
                   <tr
                     key={entry.path}
+                    ref={
+                      pendingReveal.current?.scope === listScope &&
+                      pendingReveal.current.path === entry.path
+                        ? revealedRow
+                        : undefined
+                    }
                     className={
                       selected.has(entry.path) ? "file-row-selected" : undefined
                     }
@@ -1747,8 +1804,19 @@ export default function FileManager({
                         />
                         <button
                           className={`file-name ${entry.type === "directory" ? "directory" : ""}`}
-                          onClick={() => void openEntry(entry)}
-                          disabled={entry.type === "file" && !canContent}
+                          onClick={() => {
+                            if (requestedQuery && entry.type === "file")
+                              navigate(
+                                entry.path.split("/").slice(0, -1).join("/"),
+                                entry.path,
+                              );
+                            else void openEntry(entry);
+                          }}
+                          disabled={
+                            entry.type === "file" &&
+                            !requestedQuery &&
+                            !canContent
+                          }
                           title={entry.path}
                           aria-label={requestedQuery ? entry.path : undefined}
                         >

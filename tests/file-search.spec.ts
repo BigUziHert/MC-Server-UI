@@ -148,6 +148,7 @@ test("root search shows nested duplicate paths and edits, downloads, copies and 
     .getByRole("button", { name: "Save changes", exact: true })
     .click();
   await expect(editor).not.toBeVisible();
+  await expect(search(page)).toHaveValue("TeSt");
   expect(
     (await (await contents(request, files.id, config)).json()).content,
   ).toBe('{"source":"config"}\n');
@@ -204,6 +205,101 @@ test("root search shows nested duplicate paths and edits, downloads, copies and 
     path: testInfo.outputPath("nested-search-mobile.png"),
     fullPage: true,
   });
+});
+
+test("clicking a search result reveals, selects and scrolls to the exact file on its destination page", async ({
+  page,
+  request,
+  files,
+}) => {
+  await create(request, files.id, "", "sample.bin", "file");
+  for (let index = 0; index < 44; index++)
+    await create(
+      request,
+      files.id,
+      "config/deep",
+      `before-${String(index).padStart(2, "0")}.txt`,
+      "file",
+    );
+  await page.setViewportSize({ width: 1280, height: 480 });
+  await openFiles(page, files.id);
+  await search(page).fill("test.json");
+  await page
+    .getByRole("checkbox", { name: "Select mods/test.json", exact: true })
+    .check();
+  await page
+    .getByRole("button", { name: "config/deep/test.json", exact: true })
+    .click();
+  await expect(search(page)).toHaveValue("");
+  await expect(
+    page.getByRole("navigation", { name: "File path" }),
+  ).toContainText("config");
+  await expect(
+    page
+      .getByRole("navigation", { name: "File path" })
+      .getByRole("button", { name: "deep", exact: true }),
+  ).toHaveAttribute("aria-current", "location");
+  await expect(page.getByLabel("files pagination")).toContainText(
+    "26–45 of 45 files",
+  );
+  await expect(
+    page.getByRole("checkbox", { name: "Select test.json", exact: true }),
+  ).toBeChecked();
+  await expect(page.locator(".file-row-selected")).toHaveCount(1);
+  await expect(page.locator(".file-row-selected")).toBeInViewport({ ratio: 1 });
+  await expect(selection(page)).toContainText("1 selected");
+  await expect(selection(page)).not.toContainText("outside this page");
+  await expect(
+    page.getByRole("dialog", { name: "test.json", exact: true }),
+  ).toHaveCount(0);
+
+  await search(page).fill("test.json");
+  await page
+    .getByRole("button", { name: "config/deep/test.json", exact: true })
+    .click();
+  await expect(search(page)).toHaveValue("");
+  await expect(page.getByLabel("files pagination")).toContainText(
+    "26–45 of 45 files",
+  );
+  await expect(
+    page.getByRole("checkbox", { name: "Select test.json", exact: true }),
+  ).toBeChecked();
+  await expect(selection(page)).toContainText("1 selected");
+  await expect(page.locator(".file-row-selected")).toBeInViewport({ ratio: 1 });
+
+  await page.getByRole("button", { name: "Server root", exact: true }).click();
+  await search(page).fill("test.json");
+  await page
+    .getByRole("button", { name: "mods/test.json", exact: true })
+    .click();
+  await expect(search(page)).toHaveValue("");
+  await expect(
+    page
+      .getByRole("navigation", { name: "File path" })
+      .getByRole("button", { name: "mods", exact: true }),
+  ).toHaveAttribute("aria-current", "location");
+  await expect(
+    page.getByRole("checkbox", { name: "Select test.json", exact: true }),
+  ).toBeChecked();
+  await expect(selection(page)).toContainText("1 selected");
+  await expect(
+    page.getByRole("dialog", { name: "test.json", exact: true }),
+  ).toHaveCount(0);
+
+  await page.getByRole("button", { name: "Server root", exact: true }).click();
+  await search(page).fill("sample.bin");
+  await page.getByRole("button", { name: "sample.bin", exact: true }).click();
+  await expect(search(page)).toHaveValue("");
+  await expect(
+    page.getByRole("navigation", { name: "File path" }).getByRole("button"),
+  ).toHaveCount(1);
+  await expect(
+    page.getByRole("checkbox", { name: "Select sample.bin", exact: true }),
+  ).toBeChecked();
+  await expect(
+    page.getByRole("checkbox", { name: "Select mods", exact: true }),
+  ).not.toBeChecked();
+  await expect(selection(page)).toContainText("1 selected");
 });
 
 test("search stays under the current folder, paginates every match and clears on query, folder and server changes", async ({
@@ -698,11 +794,12 @@ test("JSON5 and JSONC search results preserve browse-only and read-only permissi
     });
     if (canContent) await expect(selectFolder).toBeEnabled();
     else await expect(selectFolder).toBeDisabled();
-    await search(page).fill("settings.json");
     for (const extension of ["json5", "jsonc"]) {
+      await search(page).fill("settings.json");
       const path = `config/settings.${extension}`;
       const file = page.getByRole("button", { name: path, exact: true });
       await expect(file).toBeVisible();
+      await expect(file).toBeEnabled();
       await expect(
         page.getByRole("button", { name: `Edit ${path}`, exact: true }),
       ).toHaveCount(0);
@@ -710,7 +807,6 @@ test("JSON5 and JSONC search results preserve browse-only and read-only permissi
         page.getByRole("button", { name: `Delete ${path}`, exact: true }),
       ).toBeDisabled();
       if (!canContent) {
-        await expect(file).toBeDisabled();
         await expect(
           page.getByRole("button", { name: `Download ${path}`, exact: true }),
         ).toHaveCount(0);
@@ -759,7 +855,25 @@ test("JSON5 and JSONC search results preserve browse-only and read-only permissi
         await dialog
           .getByRole("button", { name: "Cancel", exact: true })
           .click();
+        await expect(search(page)).toHaveValue("settings.json");
       }
+      await file.click();
+      await expect(search(page)).toHaveValue("");
+      await expect(
+        page
+          .getByRole("navigation", { name: "File path" })
+          .getByRole("button", { name: "config", exact: true }),
+      ).toHaveAttribute("aria-current", "location");
+      await expect(
+        page.getByRole("checkbox", {
+          name: `Select settings.${extension}`,
+          exact: true,
+        }),
+      ).toBeChecked();
+      await expect(selection(page)).toContainText("1 selected");
+      await page
+        .getByRole("button", { name: "Server root", exact: true })
+        .click();
     }
   }
   expect(writes).toEqual([]);
