@@ -33,8 +33,9 @@ type Fixture = {
 // separate, narrowly prefixed temporary root and validates it before cleanup.
 async function removeFixtureStorage(directory: string) {
   const root = path.resolve(directory);
+  const temporary = await realpath(tmpdir());
   if (
-    path.dirname(root).toLowerCase() !== path.resolve(tmpdir()).toLowerCase() ||
+    path.dirname(root).toLowerCase() !== temporary.toLowerCase() ||
     !path.basename(root).startsWith("mc-panel-e2e-backups-") ||
     (await lstat(root)).isSymbolicLink() ||
     (await realpath(root)).toLowerCase() !== root.toLowerCase()
@@ -63,8 +64,12 @@ const test = base.extend<{ backups: Fixture }>({
     const headers = { "X-Server-Id": server.id };
     let externalRoot: string | undefined;
     try {
-      externalRoot = await mkdtemp(
-        path.join(tmpdir(), "mc-panel-e2e-backups-"),
+      // Windows runners may expose TEMP through an 8.3 alias or junction.
+      // Pass the actual folder to the same strict browser/API path validation
+      // used in production, and use that canonical parent for cleanup too.
+      const temporary = await realpath(tmpdir());
+      externalRoot = await realpath(
+        await mkdtemp(path.join(temporary, "mc-panel-e2e-backups-")),
       );
       await stopTestServer(request, server.id);
       const response = await request.post("/api/backups", {
