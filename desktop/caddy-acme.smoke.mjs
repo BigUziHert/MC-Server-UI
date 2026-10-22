@@ -74,6 +74,45 @@ async function waitFor(operation, timeout = 45000) {
     `${last?.message || "ACME fixture timed out"}\n${processes.map((entry) => entry.log).join("\n")}`,
   );
 }
+function probeAcmeDirectory(directory, ca) {
+  return new Promise((resolve, reject) => {
+    const req = https.get(
+      directory,
+      { ca, agent: false, signal: AbortSignal.timeout(2000) },
+      (res) => {
+        res.on("error", reject);
+        if (res.statusCode !== 200) {
+          res.resume();
+          reject(new Error(`ACME directory returned HTTP ${res.statusCode}`));
+          return;
+        }
+        let body = "";
+        res.setEncoding("utf8");
+        res.on("data", (chunk) => {
+          body += chunk;
+          if (body.length > 16_384)
+            res.destroy(new Error("ACME directory response is too large"));
+        });
+        res.on("end", () => {
+          try {
+            const result = JSON.parse(body);
+            for (const field of ["newNonce", "newAccount", "newOrder"]) {
+              assert.equal(typeof result[field], "string");
+              assert.equal(
+                new URL(result[field]).origin,
+                new URL(directory).origin,
+              );
+            }
+            resolve(result);
+          } catch (cause) {
+            reject(cause);
+          }
+        });
+      },
+    );
+    req.on("error", reject);
+  });
+}
 try {
   await reserve(443); // Fail clearly if a real local HTTPS service owns this port.
   const caPort = await reserve();
@@ -141,6 +180,11 @@ try {
     ),
   );
   const localDirectory = `https://127.0.0.1:${caPort}/acme/local/directory`;
+  // PKI files appear before Caddy's HTTPS listener is ready. Starting the
+  // issuer at that point can enter ACME's 60-second retry delay on a slow CI
+  // machine. Wait for the real directory with normal TLS/hostname validation
+  // against this fixture's endpoint certificate before starting the client.
+  await waitFor(() => probeAcmeDirectory(localDirectory, endpoint.cert));
   const config = createCaddyConfig({
     publicUrl: "https://127.0.0.1",
     upstreamPort: upstream.address().port,
