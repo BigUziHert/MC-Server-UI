@@ -5,7 +5,7 @@ import path from "node:path";
 import os from "node:os";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
-import { createFleet, createPanel, nextRunFor } from "./index.mjs";
+import { createFleet, createPanel } from "./index.mjs";
 import { createBackupArchive } from "./backup-archive.mjs";
 import { reconcileInterruptedRestores } from "./backup-restore.mjs";
 
@@ -336,44 +336,25 @@ test("a crash after output open but before recording its identity preserves and 
   }
 });
 
-test("daily and weekly DST recurrences always reconstruct configured wall time", () => {
-  const previous = process.env.TZ;
-  process.env.TZ = "America/Winnipeg";
-  try {
-    const daily = { enabled: true, type: "daily", time: "02:30" };
-    assert.equal(
-      nextRunFor(daily, new Date("2027-03-14T07:00:00Z")),
-      "2027-03-14T08:30:00.000Z",
-    );
-    assert.equal(
-      nextRunFor(daily, new Date("2027-03-14T08:30:01Z")),
-      "2027-03-15T07:30:00.000Z",
-    );
-    assert.equal(
-      nextRunFor(
-        { ...daily, type: "weekly", dayOfWeek: 0 },
-        new Date("2027-03-14T08:30:01Z"),
-      ),
-      "2027-03-21T07:30:00.000Z",
-    );
-    const fall = { ...daily, time: "01:30" };
-    assert.equal(
-      nextRunFor(fall, new Date("2027-11-07T05:00:00Z")),
-      "2027-11-07T06:30:00.000Z",
-    );
-    assert.equal(
-      nextRunFor(fall, new Date("2027-11-07T06:30:01Z")),
-      "2027-11-08T07:30:00.000Z",
-    );
-    assert.equal(
-      nextRunFor(
-        { ...fall, type: "weekly", dayOfWeek: 0 },
-        new Date("2027-11-07T06:30:01Z"),
-      ),
-      "2027-11-14T07:30:00.000Z",
-    );
-  } finally {
-    if (previous === undefined) delete process.env.TZ;
-    else process.env.TZ = previous;
-  }
+test("daily and weekly DST recurrences always reconstruct configured wall time", async () => {
+  // Establish the test timezone before Node initializes Date/Intl. Mutating TZ
+  // after the recovery tests have used both APIs couples this case to Windows'
+  // existing timezone caches and the host's timezone.
+  const child = spawn(
+    process.execPath,
+    [fileURLToPath(new URL("./fixtures/backup-dst.mjs", import.meta.url))],
+    {
+      env: { ...process.env, TZ: "America/Winnipeg" },
+      windowsHide: true,
+      stdio: ["ignore", "pipe", "pipe"],
+    },
+  );
+  let output = "";
+  child.stdout.on("data", (chunk) => (output += chunk));
+  child.stderr.on("data", (chunk) => (output += chunk));
+  const code = await new Promise((resolve, reject) => {
+    child.once("close", resolve);
+    child.once("error", reject);
+  });
+  assert.equal(code, 0, output);
 });
