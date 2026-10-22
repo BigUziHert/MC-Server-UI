@@ -297,6 +297,17 @@ async function workspace(
           nextRun: null,
         },
       },
+      ...(local && !proxy
+        ? {
+            "/api/backups/location": {
+              directory: "C:\\MC Panel\\Shared world\\backups",
+              defaultDirectory: "C:\\MC Panel\\Shared world\\backups",
+              available: true,
+              canChange: true,
+              job: null,
+            },
+          }
+        : {}),
       "/api/audit": {
         entries: [
           {
@@ -686,6 +697,8 @@ for (const viewport of [
       }
       expect(local.unexpected).toEqual([]);
       expect(remote.unexpected).toEqual([]);
+      expect(local.requests).toContain("/api/backups/location");
+      expect(remote.requests).not.toContain("/api/backups/location");
       expect(remote.requests).not.toContain("/api/panel-users");
       await testInfo.attach("page-geometry.json", {
         body: JSON.stringify(snapshots, null, 2),
