@@ -7,7 +7,7 @@ import {
   LoaderCircle,
   X,
 } from "lucide-react";
-import { usePanelApi, messageOf } from "./api";
+import { usePanelApi, useServerApi, messageOf } from "./api";
 import "./host-directory-picker.css";
 
 type Listing = {
@@ -26,12 +26,18 @@ export default function HostDirectoryPicker({
   onClose,
 }: {
   initialDirectory: string;
-  purpose?: "installation" | "import";
+  purpose?: "installation" | "import" | "backup";
   remoteHost?: string;
   onSelect: (directory: string) => void;
   onClose: () => void;
 }) {
-  const { api } = usePanelApi();
+  const panelApi = usePanelApi();
+  const serverApi = useServerApi();
+  const api = purpose === "backup" ? serverApi.api : panelApi.api;
+  const directoryEndpoint =
+    purpose === "backup"
+      ? "/backups/location/directories"
+      : "/server-setup/directories";
   const [target, setTarget] = useState<string | null>(
     initialDirectory.trim() || null,
   );
@@ -53,7 +59,7 @@ export default function HostDirectoryPicker({
     const current = () =>
       !controller.signal.aborted && generation === navigation.current;
     void api<Listing>(
-      `/server-setup/directories${target ? `?${new URLSearchParams({ directory: target })}` : ""}`,
+      `${directoryEndpoint}${target ? `?${new URLSearchParams({ directory: target })}` : ""}`,
       {
         signal: AbortSignal.any([
           controller.signal,
@@ -74,7 +80,7 @@ export default function HostDirectoryPicker({
         if (current()) setLoading(false);
       });
     return () => controller.abort();
-  }, [api, target, refresh]);
+  }, [api, directoryEndpoint, target, refresh]);
   const navigate = (directory: string | null) => {
     // Invalidate the displayed folder in the same event as navigation. A
     // passive-effect reset leaves its name input usable briefly and can erase
@@ -119,7 +125,9 @@ export default function HostDirectoryPicker({
           <h3 id="host-folder-title" ref={heading} tabIndex={-1}>
             {purpose === "import"
               ? "Choose server folder"
-              : "Choose installation folder"}
+              : purpose === "backup"
+                ? "Choose backup folder"
+                : "Choose installation folder"}
           </h3>
           <p>
             {remoteHost
@@ -231,7 +239,7 @@ export default function HostDirectoryPicker({
       )}
       {listing?.directory && !loading && !error && (
         <>
-          {purpose === "installation" && (
+          {purpose !== "import" && (
             <>
               <label className="host-folder-address" htmlFor="host-new-folder">
                 New folder name (optional)
@@ -258,7 +266,9 @@ export default function HostDirectoryPicker({
           <p className="host-folder-note">
             {purpose === "import"
               ? "Choose the existing folder containing your server launcher and world. Selecting it does not change its files."
-              : "The installation folder must be empty. A new folder is created only after you confirm installation."}
+              : purpose === "backup"
+                ? "Choose an empty folder outside your Minecraft server folder. A new folder is created when you confirm the move."
+                : "The installation folder must be empty. A new folder is created only after you confirm installation."}
           </p>
         </>
       )}

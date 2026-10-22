@@ -33,6 +33,7 @@ import RefreshButton from "../RefreshButton";
 import StatePanel from "../StatePanel";
 import Switch from "../Switch";
 import DownloadButton from "../DownloadButton";
+import BackupLocation, { type BackupLocationState } from "../BackupLocation";
 
 type Backup = {
   id: string;
@@ -239,7 +240,16 @@ export default function Backups({
     permissions === undefined || permissions.includes("backup.download");
   const canRestore =
     permissions === undefined || permissions.includes("backup.restore");
-  const { api, downloadUrl } = useServerApi();
+  const { api, downloadUrl, scopeKey } = useServerApi();
+  const [locationState, setLocationState] = useState<BackupLocationState>({
+    moving: false,
+    available: true,
+  });
+  const storageBlocked = locationState.moving || !locationState.available;
+  const acceptLocationState = useCallback(
+    (state: BackupLocationState) => setLocationState(state),
+    [],
+  );
   const [backups, setBackups] = useState<Backup[]>([]);
   const [schedule, setSchedule] = useState<Schedule>(defaults);
   const [savedSchedule, setSavedSchedule] = useState<Schedule>(defaults);
@@ -282,6 +292,9 @@ export default function Backups({
   const currentDialog = useRef(dialog);
   currentDialog.current = dialog;
   const reloadRef = useRef<() => Promise<boolean>>(async () => false);
+  const reloadAfterMove = useCallback(() => {
+    void reloadRef.current();
+  }, []);
   busyRef.current = busy;
 
   const acceptJob = useCallback(
@@ -389,6 +402,7 @@ export default function Backups({
     startingRef.current = false;
     setCancelling(false);
     setJobError("");
+    setLocationState({ moving: false, available: true });
     dialogVersion.current++;
     setSchedule(defaults);
     scheduleDraft.current = defaults;
@@ -442,6 +456,7 @@ export default function Backups({
     setDialog(null);
   }
   function openCreate() {
+    if (storageBlocked) return;
     dialogVersion.current++;
     createDialogVersion.current =
       isActiveJob(jobRef.current) || startingRef.current
@@ -533,6 +548,7 @@ export default function Backups({
     if (
       !dialog ||
       busyRef.current ||
+      storageBlocked ||
       (dialog === "create"
         ? !canCreate
         : "restore" in dialog
@@ -664,7 +680,7 @@ export default function Backups({
   }
 
   function confirmDelete(targets: Backup[], bulk = false) {
-    if (!canDelete) return;
+    if (!canDelete || storageBlocked) return;
     dialogVersion.current++;
     setDialogError("");
     setDeleteErrors([]);
@@ -672,7 +688,7 @@ export default function Backups({
   }
 
   async function confirmRestore(backup: Backup) {
-    if (!canRestore || busyRef.current) return;
+    if (!canRestore || busyRef.current || storageBlocked) return;
     const token = generation.current;
     const version = ++dialogVersion.current;
     restoreRequestId.current = crypto.randomUUID();
@@ -733,7 +749,7 @@ export default function Backups({
         </div>
         <button
           className="btn primary"
-          disabled={!canCreate || loading || !!error || busy}
+          disabled={!canCreate || loading || !!error || busy || storageBlocked}
           onClick={openCreate}
         >
           <Plus size={17} />
@@ -838,7 +854,7 @@ export default function Backups({
                       ref={(element) => {
                         if (element) element.indeterminate = someSelected;
                       }}
-                      disabled={!canDelete || busy}
+                      disabled={!canDelete || busy || storageBlocked}
                       onChange={(event) =>
                         setSelected(
                           event.target.checked
@@ -855,7 +871,10 @@ export default function Backups({
                   <button
                     className="btn small danger"
                     disabled={
-                      !canDelete || busy || selectedBackups.length === 0
+                      !canDelete ||
+                      busy ||
+                      storageBlocked ||
+                      selectedBackups.length === 0
                     }
                     onClick={() => confirmDelete(selectedBackups, true)}
                   >
@@ -873,7 +892,7 @@ export default function Backups({
                   action={
                     <button
                       className="btn"
-                      disabled={!canCreate}
+                      disabled={!canCreate || storageBlocked}
                       onClick={openCreate}
                     >
                       <Plus size={15} />
@@ -899,7 +918,7 @@ export default function Backups({
                           className="backup-checkbox"
                           aria-label={`Select backup ${backup.name}`}
                           checked={selected.has(backup.id)}
-                          disabled={!canDelete || busy}
+                          disabled={!canDelete || busy || storageBlocked}
                           onChange={(event) => {
                             const checked = event.target.checked;
                             setSelected((current) => {
@@ -970,7 +989,9 @@ export default function Backups({
                               type="button"
                               aria-label={`Restore backup ${backup.name}`}
                               title="Restore server to this backup"
-                              disabled={busy || starting || activeJob}
+                              disabled={
+                                busy || starting || activeJob || storageBlocked
+                              }
                               onClick={() => void confirmRestore(backup)}
                             >
                               <RotateCcw size={16} />
@@ -979,6 +1000,7 @@ export default function Backups({
                           {canDownload && (
                             <DownloadButton
                               className="btn icon"
+                              disabled={storageBlocked}
                               onError={(message) => notify(message, true)}
                               href={downloadUrl(
                                 `/backups/${encodeURIComponent(backup.id)}/download`,
@@ -993,7 +1015,7 @@ export default function Backups({
                             className="btn icon delete-action"
                             aria-label={`Delete backup ${backup.name}`}
                             title="Move backup to Recycle Bin"
-                            disabled={!canDelete || busy}
+                            disabled={!canDelete || busy || storageBlocked}
                             onClick={() => confirmDelete([backup])}
                           >
                             <Trash2 size={15} />
@@ -1013,6 +1035,15 @@ export default function Backups({
             </section>
 
             <aside className="backup-schedule-column">
+              {permissions === undefined && (
+                <BackupLocation
+                  key={scopeKey}
+                  notify={notify}
+                  serverBusy={busy || starting || activeJob}
+                  onStateChange={acceptLocationState}
+                  onSettled={reloadAfterMove}
+                />
+              )}
               <section className="panel backup-schedule">
                 <div className="storage-section-heading">
                   <div>
@@ -1437,6 +1468,7 @@ export default function Backups({
                 className={`btn ${dialog === "create" ? "primary" : "danger"}`}
                 disabled={
                   busy ||
+                  storageBlocked ||
                   (dialog === "create"
                     ? !canCreate ||
                       starting ||

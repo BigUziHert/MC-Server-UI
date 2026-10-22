@@ -99,6 +99,7 @@ export async function createRecycleBin({
   dataDir,
   serverDir,
   backupDir,
+  resolveBackupDirectory,
   safePath,
   preferSiblingStorage = false,
   fileSystem = fs,
@@ -131,15 +132,21 @@ export async function createRecycleBin({
     await assertServerRoot();
     return target;
   };
-  const backupRoot = backupDir ? await io.realpath(backupDir) : null;
-  const backupRootStat = backupDir ? await io.lstat(backupDir) : null;
+  const backupRoot =
+    backupDir && !resolveBackupDirectory ? await io.realpath(backupDir) : null;
+  const backupRootStat =
+    backupDir && !resolveBackupDirectory ? await io.lstat(backupDir) : null;
   const backupPath = async (relative) => {
-    if (!backupDir || !/^backups\/[a-f0-9-]{36}\.tar\.gz$/i.test(relative))
+    if (
+      (!backupDir && !resolveBackupDirectory) ||
+      !/^backups\/[a-f0-9-]{36}\.tar\.gz$/i.test(relative)
+    )
       throw error(
         409,
         "The backup recovery path is invalid. Its archive has been retained.",
       );
     const assertRoot = async () => {
+      if (resolveBackupDirectory) return resolveBackupDirectory();
       const checked = await safePath(dataDir, "backups");
       const stat = await io.lstat(checked);
       if (
@@ -155,8 +162,8 @@ export async function createRecycleBin({
           "The backup folder changed. Recovery archives have been retained; restore the original folder and restart the panel.",
         );
     };
-    await assertRoot();
-    const target = await safePath(backupDir, relative.slice("backups/".length));
+    const directory = (await assertRoot()) ?? backupDir;
+    const target = await safePath(directory, relative.slice("backups/".length));
     await assertRoot();
     return target;
   };

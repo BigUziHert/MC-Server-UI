@@ -265,6 +265,10 @@ Modpack replacement moves old files into Recycle Bin. **Create a backup first** 
 
 ## Backup scheduling and data
 
+The local panel owner can choose a separate backup drive or folder for each server from **Backups → Backup location → Change location**. Enter an absolute path or use **Browse folders** to select a drive and folder on the computer hosting that server. Choose a dedicated empty folder outside Minecraft files and panel storage. Review the destination, backup count, and total size, then choose **Move backups**. Both manual and automatic backups use the saved location; Minecraft files and the backup schedule stay in place. **Use default folder** moves the archives back through the same review and verification process.
+
+Moving backups runs in the background and shows progress. Archives are copied and verified before the saved location changes or the original copies are removed. Backup history, downloads, restores, retention, and restoring deleted backups from the Recycle Bin continue to use the same backup records. Refreshing the page reconnects to the move, and startup reconciles an interrupted move. Wait for an active backup, restore, or file operation to finish before changing the location. If the selected folder or drive becomes unavailable, the panel reports the problem and preserves the configured location instead of silently saving backups elsewhere. Reconnect the original drive before retrying. Remote subusers cannot browse or change backup storage locations.
+
 Schedules use the **API host's local timezone**, included in the API response and schedule interface. Each server's scheduler checks every 15 seconds and persists its next deadline in that server's `panel.json`. Keep the API running for jobs to execute. After downtime, one overdue job runs per server on the next check; missed intervals are not replayed in a burst.
 
 Daily and weekly schedules return to their configured wall-clock time after a daylight-saving transition. A time skipped by the spring transition moves forward by the gap for that occurrence; a repeated fall time uses its first occurrence.
@@ -279,7 +283,7 @@ Backup creation runs in the background and shows its current stage, files proces
 
 API clients can start an asynchronous backup with `POST /api/backups/jobs`, poll `GET /api/backups/jobs/:id`, and cancel it with `POST /api/backups/jobs/:id/cancel`. `GET /api/backups` includes the latest job. These endpoints use the same server selector as other APIs; reading progress requires `backup.read`, while starting and cancelling require `backup.create`. The original `POST /api/backups` endpoint still waits for completion and returns the completed archive for existing clients. `POST /api/backups/:id/restore` with `{ "confirm": true }` replaces the selected stopped server’s files from an existing backup and requires `backup.restore`.
 
-Storage layout (all ignored by Git):
+Default storage layout (all ignored by Git; a custom backup location stores archives in the selected folder):
 
 ```text
 data/

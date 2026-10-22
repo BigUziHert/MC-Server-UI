@@ -95,7 +95,24 @@ export async function stopTestServer(request: APIRequestContext, id: string) {
 
 export async function removeTestServer(request: APIRequestContext, id: string) {
   await stopTestServer(request, id);
-  expect(
-    (await request.delete(`/api/servers/${encodeURIComponent(id)}`)).ok(),
-  ).toBe(true);
+  let result: { status: number; body: string } | undefined;
+  // The UI can observe an operation's completed result before its final audit
+  // write leaves the shutdown barrier. Only retry this explicit busy response;
+  // other errors must still fail teardown with the server's explanation.
+  await expect
+    .poll(
+      async () => {
+        const response = await request.delete(
+          `/api/servers/${encodeURIComponent(id)}`,
+        );
+        result = { status: response.status(), body: await response.text() };
+        return result.status === 409 &&
+          result.body.includes("Wait for this server's current operation")
+          ? "busy"
+          : "finished";
+      },
+      { timeout: 10_000, intervals: [100, 250, 500] },
+    )
+    .toBe("finished");
+  expect(result?.status, result?.body).toBe(200);
 }

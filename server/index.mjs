@@ -27,6 +27,11 @@ import { planFileDownload, streamFileArchive } from "./file-download.mjs";
 import { createFileSearch, listServerFiles } from "./file-search.mjs";
 import { createBackupArchive } from "./backup-archive.mjs";
 import {
+  createBackupLocation,
+  backupStorageDirectories,
+} from "./backup-location.mjs";
+import { createHostDirectoryBrowser } from "./host-directories.mjs";
+import {
   reconcileInterruptedRestores,
   restoreBackupArchive,
 } from "./backup-restore.mjs";
@@ -612,7 +617,8 @@ export async function createPanel(options = {}) {
     ...(options.restoreRecovery ?? []),
     ...(await reconcileInterruptedRestores(serverDir)),
   ];
-  const backupDir = await safePath(dataDir, "backups");
+  const defaultBackupDir = await safePath(dataDir, "backups");
+  let backupDir = defaultBackupDir;
   const backupJournalDir = await safePath(dataDir, "backup-jobs");
   const uploadDir = await safePath(dataDir, "uploads");
   const statePath = await safePath(dataDir, "panel.json");
@@ -621,19 +627,30 @@ export async function createPanel(options = {}) {
   for (const dir of [
     dataDir,
     ...(options.existingServerDir ? [] : [serverDir]),
-    backupDir,
     backupJournalDir,
     uploadDir,
   ])
     await fs.mkdir(dir, { recursive: true });
+  const backupLocation = await createBackupLocation({
+    dataDir,
+    defaultDirectory: defaultBackupDir,
+    defaultAncestors: options.backupDefaultAncestors ?? [],
+    forbiddenDirectories: async () => [
+      dataDir,
+      serverDir,
+      ...(await recycleStorageDirectories(dataDir, serverDir)),
+      ...((await options.backupForbiddenDirectories?.()) ?? []),
+    ],
+    onDirectory: (directory) => {
+      backupDir = directory;
+    },
+    hooks: options.backupLocationHooks,
+  });
   const restoreReceipts = await createOperationReceipts(
     await safePath(dataDir, "restore-receipts"),
     safePath,
   );
-  const relativeBackup = path.relative(
-    await fs.realpath(serverDir),
-    await fs.realpath(backupDir),
-  );
+  const relativeBackup = path.relative(await fs.realpath(serverDir), backupDir);
   if (
     !path.isAbsolute(relativeBackup) &&
     relativeBackup !== ".." &&
@@ -646,6 +663,7 @@ export async function createPanel(options = {}) {
     dataDir,
     serverDir,
     backupDir,
+    resolveBackupDirectory: () => backupLocation.assertAvailable(),
     safePath,
     preferSiblingStorage: true,
   });
@@ -729,23 +747,26 @@ export async function createPanel(options = {}) {
   };
   for (const detail of restoreRecovery)
     await audit("backup", "Interrupted restore recovered", detail);
-  await reconcileBackupCreations({
-    directory: backupJournalDir,
-    backupDir,
-    commit: async (item, job, detail) => {
-      if (item && !state.backups.some((entry) => entry.id === item.id))
-        state.backups.unshift(item);
-      state.lastBackupJob = job;
-      await audit("backup", "Interrupted backup recovered", detail);
-    },
-  });
+  if ((await backupLocation.status()).available)
+    await reconcileBackupCreations({
+      directory: backupJournalDir,
+      backupDir,
+      commit: async (item, job, detail) => {
+        if (item && !state.backups.some((entry) => entry.id === item.id))
+          state.backups.unshift(item);
+        state.lastBackupJob = job;
+        await audit("backup", "Interrupted backup recovered", detail);
+      },
+    });
   // A crash can occur after an archive enters the journal but before its active
   // history is saved. Recovery records remain authoritative for missing files.
   const recycledBackups = (await recycleBin.list()).filter(
     (item) => item.kind === "backup" && item.status === "ready",
   );
   const removedBackupIds = new Set();
-  for (const item of recycledBackups) {
+  for (const item of (await backupLocation.status()).available
+    ? recycledBackups
+    : []) {
     if (!(await exists(await safePath(backupDir, `${item.backup.id}.tar.gz`))))
       removedBackupIds.add(item.backup.id);
   }
@@ -1535,6 +1556,8 @@ export async function createPanel(options = {}) {
   }
 
   let backupBusy = false;
+  let backupLocationBusy = false;
+  let backupDownloads = 0;
   let activeMutations = 0;
   let recycleBusy = false;
   let minecraftBusy = false;
@@ -1818,6 +1841,7 @@ export async function createPanel(options = {}) {
     let historySaved = false;
     let cleanupComplete = true;
     try {
+      await backupLocation.assertAvailable();
       await persistJournal(journal, transaction);
       signal.throwIfAborted();
       if (liveChild) {
@@ -2051,6 +2075,16 @@ export async function createPanel(options = {}) {
     next();
   });
   app.use(express.json({ limit: "2mb" }));
+  app.use("/api/backups/location", (req, _res, next) => {
+    if (req[remotePrincipal])
+      return next(
+        error(
+          403,
+          "Only the local panel owner can view or change backup locations.",
+        ),
+      );
+    next();
+  });
   app.use((req, res, next) => {
     const protectedMutation =
       !["GET", "HEAD", "OPTIONS"].includes(req.method) &&
@@ -3531,6 +3565,100 @@ export async function createPanel(options = {}) {
     ...state.schedule,
     revision: scheduleRevision(),
   });
+  const browseBackupDirectories = createHostDirectoryBrowser();
+  app.get(
+    "/api/backups/location",
+    trackOperation(async (_req, res) => {
+      res.json(await backupLocation.status());
+    }),
+  );
+  app.get(
+    "/api/backups/location/directories",
+    trackOperation(async (req, res) => {
+      const controller = new AbortController();
+      const cancel = () => controller.abort();
+      req.once("aborted", cancel);
+      res.once("close", cancel);
+      try {
+        res.json(
+          await browseBackupDirectories(req.query.directory, controller.signal),
+        );
+      } finally {
+        req.off("aborted", cancel);
+        res.off("close", cancel);
+      }
+    }),
+  );
+  app.post(
+    "/api/backups/location/preview",
+    trackOperation(async (req, res) => {
+      options.assertBackupLocationChange?.();
+      if (
+        backupBusy ||
+        minecraftBusy ||
+        configBusy ||
+        activeMutations ||
+        backupDownloads
+      )
+        throw error(
+          409,
+          "Wait for the current backup, restore, download, or file operation to finish before changing the backup location.",
+        );
+      res.json(await backupLocation.preview(req.body?.directory));
+    }),
+  );
+  app.post(
+    "/api/backups/location/jobs",
+    trackOperation(async (req, res) => {
+      options.assertBackupLocationChange?.();
+      if (req.body?.confirm !== true || typeof req.body?.revision !== "string")
+        throw error(
+          400,
+          "Review and confirm the backup location before moving backups.",
+        );
+      if (
+        backupBusy ||
+        minecraftBusy ||
+        configBusy ||
+        activeMutations ||
+        backupDownloads
+      )
+        throw error(
+          409,
+          "Wait for the current backup, restore, download, or file operation to finish before changing the backup location.",
+        );
+      backupBusy = true;
+      backupLocationBusy = true;
+      try {
+        const { job, promise } = backupLocation.begin(
+          req.body.directory,
+          req.body.revision,
+        );
+        void trackTask(async () => {
+          try {
+            await promise;
+          } finally {
+            backupBusy = false;
+            backupLocationBusy = false;
+          }
+          await audit(
+            "backup",
+            job.status === "completed"
+              ? "Backup location changed"
+              : "Backup location change failed",
+            job.error ?? `Backups stored in ${backupDir}.`,
+          );
+        }).catch((cause) =>
+          append(`[Panel] Backup location: ${cause.message}`, "error"),
+        );
+        res.status(202).json({ job });
+      } catch (cause) {
+        backupBusy = false;
+        backupLocationBusy = false;
+        throw cause;
+      }
+    }),
+  );
   app.get("/api/backups", (_req, res) =>
     res.json({
       backups: state.backups,
@@ -3639,13 +3767,30 @@ export async function createPanel(options = {}) {
     if (!item) throw error(404, "Record not found.");
     return item;
   };
-  app.get("/api/backups/:id/download", (req, res) => {
-    const item = getItem(state.backups, req.params.id);
-    res.download(
-      path.join(backupDir, `${item.id}.tar.gz`),
-      `${item.name}.tar.gz`,
-    );
-  });
+  app.get(
+    "/api/backups/:id/download",
+    trackOperation(async (req, res) => {
+      if (backupLocationBusy)
+        throw error(
+          409,
+          "Wait for the backup location change to finish before downloading backups.",
+        );
+      backupDownloads++;
+      try {
+        await backupLocation.assertAvailable();
+        const item = getItem(state.backups, req.params.id);
+        await new Promise((resolve, reject) =>
+          res.download(
+            path.join(backupDir, `${item.id}.tar.gz`),
+            `${item.name}.tar.gz`,
+            (cause) => (cause ? reject(cause) : resolve()),
+          ),
+        );
+      } finally {
+        backupDownloads--;
+      }
+    }),
+  );
   app.post(
     "/api/backups/:id/restore",
     trackOperation(async (req, res) => {
@@ -3667,6 +3812,7 @@ export async function createPanel(options = {}) {
           if (status !== "offline")
             throw error(409, "Stop the server before restoring a backup.");
           return withMinecraftMutation(async () => {
+            await backupLocation.assertAvailable();
             const item = getItem(state.backups, req.params.id);
             const archive = await safePath(backupDir, `${item.id}.tar.gz`);
             if (!(await exists(archive)))
@@ -4076,6 +4222,7 @@ export async function createPanel(options = {}) {
     dataDir,
     serverDir,
     recycleDirectories: recycleBin.directories,
+    backupDirectories: () => backupLocation.reservedDirectories(),
     tick,
     descriptor,
     iconDataUrl: () =>
@@ -4362,6 +4509,17 @@ export async function createFleet(options = {}) {
         .flatMap((entry) => [entry.serverDir, entry.dataDir]),
       ...(
         await Promise.all(
+          registry.servers
+            .filter((entry) => entry.id !== exceptId)
+            .map(
+              async (entry) =>
+                runtimes.get(entry.id)?.backupDirectories?.() ??
+                (await backupStorageDirectories(entry.dataDir)),
+            ),
+        )
+      ).flat(),
+      ...(
+        await Promise.all(
           registry.servers.map(async (entry) => {
             const directories = await recycleStorageDirectories(
               entry.dataDir,
@@ -4536,6 +4694,20 @@ export async function createFleet(options = {}) {
     }
     const runtime = await createPanel({
       ...entry,
+      backupDefaultAncestors: [dataDir],
+      assertBackupLocationChange: () => {
+        if (fleetMutationsPending)
+          throw error(
+            409,
+            "Wait for the server setup or settings change to finish before moving backups.",
+          );
+      },
+      backupForbiddenDirectories: async () => [
+        ...(await installationOptions(entry.id)).forbiddenDirectories,
+        ...registry.servers
+          .filter((item) => item.id !== entry.id)
+          .flatMap((item) => [item.serverDir, item.dataDir]),
+      ],
       restoreRecovery,
       memoryLimit: entry.memoryLimitMB,
       useEnvironment: false,

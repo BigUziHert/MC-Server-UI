@@ -177,6 +177,55 @@ test("remote gateway never grants owner access, even with forged headers or a lo
   );
 });
 
+test("backup storage selection stays owner-only even with all backup grants", async (t) => {
+  const { local, guest, invite, root } = await fixture(t);
+  const { asUser } = await invite([
+    "backup.read",
+    "backup.create",
+    "backup.update",
+    "backup.download",
+    "backup.restore",
+    "backup.delete",
+    "file.read",
+    "file.update",
+    "server.update",
+  ]);
+  const before = await local("/api/backups/location");
+  assert.equal(before.status, 200);
+  assert.equal(before.body.canChange, true);
+  const routes = [
+    ["GET", "/api/backups/location"],
+    ["GET", "/api/backups/location/directories"],
+    ["POST", "/api/backups/location/preview"],
+    ["POST", "/api/backups/location/jobs"],
+  ];
+  for (const [method, route] of routes) {
+    const options = {
+      method,
+      ...(method === "POST"
+        ? json(method, {
+            directory: path.join(root, "untrusted-destination"),
+            confirm: true,
+            revision: before.body.revision,
+          })
+        : {}),
+    };
+    assert.equal((await guest(route, options)).status, 401, route);
+    const denied = await asUser(route, options);
+    assert.equal(denied.status, 403, route);
+    assert.equal(Object.hasOwn(denied.body, "directory"), false);
+    assert.equal(Object.hasOwn(denied.body, "folders"), false);
+  }
+  assert.equal((await asUser("/api/backups")).status, 200);
+  assert.equal(
+    (await local("/api/backups/location")).body.directory,
+    before.body.directory,
+  );
+  await assert.rejects(fs.stat(path.join(root, "untrusted-destination")), {
+    code: "ENOENT",
+  });
+});
+
 test("host folder browsing is local-only even for an authenticated user with file access", async (t) => {
   const { local, guest, invite, root } = await fixture(t);
   const directory = await fs.realpath(root);

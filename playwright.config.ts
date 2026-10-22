@@ -46,6 +46,7 @@ export default defineConfig({
     "server-customization.spec.ts",
     "console-controls.spec.ts",
     "backup-selection.spec.ts",
+    "backup-location.spec.ts",
     "players-history.spec.ts",
     "recycle-bin.spec.ts",
     "server-removal.spec.ts",
