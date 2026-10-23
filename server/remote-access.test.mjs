@@ -12,7 +12,11 @@ import { processStartup } from "../tests/fixtures/process-options.mjs";
 const origin = "https://panel.example.test";
 const json = (method, body) => ({ method, body: JSON.stringify(body) });
 async function fixture(t, { nestedData = false } = {}) {
-  const root = await fs.mkdtemp(path.join(os.tmpdir(), "mc-remote-access-"));
+  // CI may expose TEMP through a junction; exercise storage containment with
+  // actual host paths instead of failing the separate link-path validation.
+  const root = await fs.realpath(
+    await fs.mkdtemp(path.join(os.tmpdir(), "mc-remote-access-")),
+  );
   const fleet = await createFleet({
     dataDir: nestedData ? path.join(root, "panel") : root,
     useEnvironment: false,
@@ -73,7 +77,7 @@ async function fixture(t, { nestedData = false } = {}) {
       listener.closeAllConnections();
       await new Promise((resolve) => listener.close(resolve));
     }
-    assert.equal(path.dirname(root), path.resolve(os.tmpdir()));
+    assert.equal(path.dirname(root), await fs.realpath(os.tmpdir()));
     assert.ok(path.basename(root).startsWith("mc-remote-access-"));
     await fs.rm(root, { recursive: true, force: true });
   });

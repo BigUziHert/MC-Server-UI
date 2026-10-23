@@ -841,24 +841,31 @@ test("failed acknowledgement persistence keeps the terminal backup visible for r
   );
   assert.equal(created.status, 201);
   const id = created.body.id;
-  const statePath = path.join(panel.dataDir, "panel.json");
+  // safePath resolves the real data directory, including Windows short TEMP
+  // aliases. Match that canonical target so the failure is always injected.
+  const statePath = path.join(await fs.realpath(panel.dataDir), "panel.json");
   const rename = fs.rename.bind(fs);
   let fail = true;
+  let injectedFailures = 0;
   t.mock.method(fs, "rename", async (source, target) => {
-    if (target === statePath && fail)
+    if (target === statePath && fail) {
+      injectedFailures++;
       throw Object.assign(new Error("Injected state persistence failure"), {
         code: "EACCES",
       });
+    }
     return rename(source, target);
   });
   const dismiss = () =>
     panel.request(`/api/backups/jobs/${id}/dismiss`, json("POST", {}));
   assert.equal((await dismiss()).status, 500);
+  assert.equal(injectedFailures, 1, "The panel state write must be rejected.");
   assert.equal((await panel.request("/api/backups")).body.job.id, id);
   const stored = JSON.parse(await fs.readFile(statePath, "utf8"));
   assert.deepEqual(stored.dismissedBackupJobs, []);
   fail = false;
   assert.equal((await dismiss()).status, 200);
+  assert.equal(injectedFailures, 1);
   assert.equal((await panel.request("/api/backups")).body.job, null);
   assert.equal((await panel.request("/api/backups")).body.backups[0].id, id);
 });
