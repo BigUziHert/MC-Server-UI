@@ -336,6 +336,111 @@ test("a crash after output open but before recording its identity preserves and 
   }
 });
 
+test("dismissed completed backups preserve their archive and restore history across restart", async (t) => {
+  const context = await fixture(t);
+  let panel = await boot(context);
+  try {
+    const created = await panel.request("/api/backups", "POST", {
+      name: "Keep the archive, clear the notice",
+    });
+    assert.equal(created.status, 201);
+    const id = created.body.id;
+    const archive = path.join(context.dataDir, "backups", `${id}.tar.gz`);
+    const bytes = await fs.readFile(archive);
+    const before = await panel.overview();
+    const audit = await panel.request("/api/audit");
+    const dismissed = await panel.request(
+      `/api/backups/jobs/${id}/dismiss`,
+      "POST",
+      {},
+    );
+    assert.equal(dismissed.status, 200);
+    assert.equal(dismissed.body.job.dismissed, true);
+    assert.equal((await panel.overview()).job, null);
+    await panel.close();
+    panel = await boot(context);
+    const after = await panel.overview();
+    assert.equal(after.job, null);
+    assert.deepEqual(after.backups, before.backups);
+    assert.deepEqual((await panel.request("/api/audit")).body, audit.body);
+    assert.deepEqual(await fs.readFile(archive), bytes);
+    const record = await panel.request(`/api/backups/jobs/${id}`);
+    assert.equal(record.body.job.status, "completed");
+    assert.equal(record.body.job.dismissed, true);
+    // The normal restore path still resolves the preserved history and archive.
+    const restored = await panel.request(`/api/backups/${id}/restore`, "POST", {
+      confirm: true,
+    });
+    assert.equal(restored.status, 200, JSON.stringify(restored.body));
+  } finally {
+    await panel.close();
+  }
+});
+
+test("dismissal survives recovery replay without deleting journals, files, audit, or a newer job", async (t) => {
+  const context = await fixture(t);
+  await crash("backup-open", context);
+  const backupDir = path.join(context.dataDir, "backups");
+  const journalDir = path.join(context.dataDir, "backup-jobs");
+  const partialName = (await fs.readdir(backupDir))[0];
+  const journalName = (await fs.readdir(journalDir))[0];
+  const partial = path.join(backupDir, partialName);
+  const journal = path.join(journalDir, journalName);
+  const partialBytes = await fs.readFile(partial);
+  const journalBytes = await fs.readFile(journal);
+  let panel = await boot(context);
+  try {
+    const failed = (await panel.overview()).job;
+    assert.equal(failed.status, "failed");
+    assert.match(failed.error, /preserved for recovery/);
+    const audit = (await panel.request("/api/audit")).body.entries;
+    const dismissed = await panel.request(
+      `/api/backups/jobs/${failed.id}/dismiss`,
+      "POST",
+      {},
+    );
+    assert.equal(dismissed.status, 200);
+    assert.equal((await panel.overview()).job, null);
+    assert.deepEqual(await fs.readFile(journal), journalBytes);
+    assert.deepEqual(await fs.readFile(partial), partialBytes);
+    assert.deepEqual((await panel.request("/api/audit")).body.entries, audit);
+    await panel.close();
+    panel = await boot(context);
+    assert.equal((await panel.overview()).job, null);
+    const recovered = await panel.request(`/api/backups/jobs/${failed.id}`);
+    assert.equal(recovered.body.job.dismissed, true);
+    assert.match(recovered.body.job.error, /preserved for recovery/);
+    assert.deepEqual(await fs.readFile(journal), journalBytes);
+    assert.deepEqual(await fs.readFile(partial), partialBytes);
+    const entries = (await panel.request("/api/audit")).body.entries;
+    assert.ok(entries.length > audit.length);
+    assert.ok(
+      audit.every((entry) => entries.some((item) => item.id === entry.id)),
+    );
+
+    const created = await panel.request("/api/backups", "POST", {
+      name: "Newer result",
+    });
+    assert.equal(created.status, 201);
+    await panel.close();
+    panel = await boot(context);
+    assert.equal((await panel.overview()).job.id, created.body.id);
+    assert.equal((await panel.overview()).backups.length, 1);
+    assert.deepEqual(await fs.readFile(journal), journalBytes);
+
+    // Resolving the ambiguous partial allows ordinary recovery to finish. Its
+    // prior dismissal must not skip that recovery or revive its old banner.
+    await panel.close();
+    await fs.rm(partial);
+    panel = await boot(context);
+    assert.equal((await panel.overview()).job.id, created.body.id);
+    await assert.rejects(fs.stat(journal), { code: "ENOENT" });
+    assert.equal((await panel.overview()).backups.length, 1);
+  } finally {
+    await panel.close();
+  }
+});
+
 test("daily and weekly DST recurrences always reconstruct configured wall time", async () => {
   // Establish the test timezone before Node initializes Date/Intl. Mutating TZ
   // after the recovery tests have used both APIs couples this case to Windows'

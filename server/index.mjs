@@ -119,7 +119,7 @@ const userWithPermissions = (user) => ({
         // Existing role-only records retain their old grants. New permissions
         // require an explicit owner action, including selecting a role preset.
         permissionsCatalog.roleDefaults[user.role]?.filter(
-          (id) => id !== "server.update",
+          (id) => !["server.update", "backup.location"].includes(id),
         ) ??
         []
       ).filter((permission) => permissionIds.has(permission)),
@@ -677,6 +677,9 @@ export async function createPanel(options = {}) {
   };
   if (await exists(statePath))
     state = { ...state, ...JSON.parse(await fs.readFile(statePath, "utf8")) };
+  state.dismissedBackupJobs = Array.isArray(state.dismissedBackupJobs)
+    ? state.dismissedBackupJobs.filter((id) => typeof id === "string")
+    : [];
   state.users = state.users.map(userWithPermissions);
   state.iconPreference =
     state.iconPreference === "default" ? "default" : "server";
@@ -754,7 +757,13 @@ export async function createPanel(options = {}) {
       commit: async (item, job, detail) => {
         if (item && !state.backups.some((entry) => entry.id === item.id))
           state.backups.unshift(item);
-        state.lastBackupJob = job;
+        // Dismissal acknowledges the notification, never the recovery record.
+        // An unresolved older journal must not replace a newer visible job.
+        if (
+          !state.dismissedBackupJobs.includes(job.id) ||
+          state.lastBackupJob?.id === job.id
+        )
+          state.lastBackupJob = job;
         await audit("backup", "Interrupted backup recovered", detail);
       },
     });
@@ -2076,11 +2085,19 @@ export async function createPanel(options = {}) {
   });
   app.use(express.json({ limit: "2mb" }));
   app.use("/api/backups/location", (req, _res, next) => {
-    if (req[remotePrincipal])
+    const principal = req[remotePrincipal];
+    if (!principal) return next();
+    const user = currentAccessUser(principal);
+    const permissions = user ? userWithPermissions(user).permissions : [];
+    if (
+      ["server.view", "backup.read", "backup.location"].some(
+        (permission) => !permissions.includes(permission),
+      )
+    )
       return next(
         error(
           403,
-          "Only the local panel owner can view or change backup locations.",
+          "You need View backups and Change backup location permissions for this server.",
         ),
       );
     next();
@@ -3664,7 +3681,9 @@ export async function createPanel(options = {}) {
       backups: state.backups,
       schedule: presentedSchedule(),
       timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
-      job: latestBackupJob,
+      job: state.dismissedBackupJobs.includes(latestBackupJob?.id)
+        ? null
+        : latestBackupJob,
     }),
   );
   const backupFailureAudit = (cause) =>
@@ -3694,8 +3713,34 @@ export async function createPanel(options = {}) {
   app.get("/api/backups/jobs/:id", (req, res) => {
     const job = backupJobs.get(req.params.id);
     if (!job) throw error(404, "Backup operation not found.");
-    res.json({ job });
+    res.json({
+      job: state.dismissedBackupJobs.includes(job.id)
+        ? { ...job, dismissed: true }
+        : job,
+    });
   });
+  app.post(
+    "/api/backups/jobs/:id/dismiss",
+    trackOperation(async (req, res) => {
+      const job = backupJobs.get(req.params.id);
+      if (!job) throw error(404, "Backup operation not found.");
+      if (!["completed", "cancelled", "failed"].includes(job.status))
+        throw error(
+          409,
+          "Wait for this backup to finish before dismissing it.",
+        );
+      // Commit the acknowledgement before hiding it. Keep job IDs separately
+      // from the latest result so recovery can replay an older journal without
+      // showing its acknowledged notification again or losing any archives.
+      await queueSave(async () => {
+        if (state.dismissedBackupJobs.includes(job.id)) return;
+        const dismissedBackupJobs = [...state.dismissedBackupJobs, job.id];
+        await writeState({ ...state, dismissedBackupJobs });
+        state.dismissedBackupJobs = dismissedBackupJobs;
+      });
+      res.json({ job: { ...job, dismissed: true } });
+    }),
+  );
   app.post(
     "/api/backups/jobs/:id/cancel",
     trackOperation(async (req, res) => {

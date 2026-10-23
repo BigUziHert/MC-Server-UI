@@ -136,6 +136,12 @@ export function requiredPermissions(req) {
     )
       return ["file.read", "backup.read"];
     if (route === "/api/backups") return ["backup.read"];
+    if (
+      ["/api/backups/location", "/api/backups/location/directories"].includes(
+        route,
+      )
+    )
+      return ["backup.read", "backup.location"];
     if (/^\/api\/backups\/jobs\/[^/]+$/.test(route)) return ["backup.read"];
     if (/^\/api\/backups\/[^/]+\/download$/.test(route))
       return ["backup.download"];
@@ -186,11 +192,17 @@ export function requiredPermissions(req) {
     if (/^\/api\/files\/recycle-bin\/[^/]+\/restore$/.test(route))
       return ["file.create", "backup.create"];
     if (route === "/api/backups") return ["backup.create"];
+    if (
+      ["/api/backups/location/preview", "/api/backups/location/jobs"].includes(
+        route,
+      )
+    )
+      return ["backup.read", "backup.location"];
     if (/^\/api\/backups\/[^/]+\/restore$/.test(route))
       return ["backup.restore"];
     if (
       route === "/api/backups/jobs" ||
-      /^\/api\/backups\/jobs\/[^/]+\/cancel$/.test(route)
+      /^\/api\/backups\/jobs\/[^/]+\/(?:cancel|dismiss)$/.test(route)
     )
       return ["backup.create"];
     if (

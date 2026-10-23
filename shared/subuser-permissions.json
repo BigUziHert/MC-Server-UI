@@ -145,6 +145,11 @@
           "id": "backup.update",
           "label": "Manage backup schedules",
           "description": "Change automatic backup timing and retention."
+        },
+        {
+          "id": "backup.location",
+          "label": "Change backup location",
+          "description": "Browse folders on the computer hosting this server and move this server's backup archives to another disk or folder. Requires View backups."
         }
       ]
     },
@@ -184,6 +189,7 @@
       "backup.restore",
       "backup.delete",
       "backup.update",
+      "backup.location",
       "audit.read"
     ],
     "operator": [

@@ -340,7 +340,10 @@ export default function BackupLocation({
         </h2>
       </div>
       <div className="backup-location-body">
-        <p>Manual and automatic backups for this server are saved here.</p>
+        <p>
+          Saved on the computer hosting this server. Manual and automatic
+          backups use this folder.
+        </p>
         {location ? (
           <div className="backup-location-path">
             <Folder size={16} />
@@ -392,7 +395,7 @@ export default function BackupLocation({
         )}
         {location && !location.canChange && (
           <p className="backup-location-hint">
-            Only the host administrator can change this folder.
+            Your account cannot change this server's backup location.
           </p>
         )}
       </div>
@@ -425,8 +428,8 @@ export default function BackupLocation({
                   Change backup location
                 </h2>
                 <p id="backup-location-dialog-description">
-                  Choose where this server keeps its manual and automatic
-                  backups.
+                  Choose a folder on the computer hosting this server for its
+                  manual and automatic backups.
                 </p>
               </div>
               <button
@@ -523,8 +526,9 @@ export default function BackupLocation({
                 )}
                 <p className="backup-location-explanation">
                   Choose an empty folder outside the Minecraft server folder.
-                  You can choose another disk or create a folder in the browser.
-                  Existing backups move with this setting.
+                  You can choose another disk on that computer or create a
+                  folder in the browser. Existing backups move with this
+                  setting.
                 </p>
                 {location?.job?.status === "failed" && (
                   <LocationProgress job={location.job} starting={false} />

@@ -488,7 +488,183 @@ test("an unavailable backup drive shows the problem and disables archive operati
     ).toBeDisabled();
 });
 
-test("a shared administrator cannot browse or change host backup storage", async ({
+async function sharedBackupSession(
+  page: Page,
+  fixture: Fixture,
+  currentPermissions: () => string[],
+) {
+  const storageRequests: { method: string; path: string; serverId: string }[] =
+    [];
+  await page.addInitScript(() =>
+    localStorage.setItem("mc-panel.session.v1", "b".repeat(43)),
+  );
+  // UI uses a shared account; filesystem operations stay inside the isolated
+  // test host. Real bearer authorization is covered by remote-access tests.
+  await page.route("**/api/**", async (route) => {
+    const request = route.request();
+    const headers = { ...request.headers() };
+    if (new URL(request.url()).pathname.startsWith("/api/backups/location")) {
+      storageRequests.push({
+        method: request.method(),
+        path: new URL(request.url()).pathname,
+        serverId: headers["x-server-id"],
+      });
+      if (!currentPermissions().includes("backup.location"))
+        return route.fulfill({
+          status: 403,
+          json: { error: "Backup location access was revoked." },
+        });
+    }
+    delete headers.authorization;
+    await route.fulfill({ response: await route.fetch({ headers }) });
+  });
+  await page.route("**/api/access/session", (route) =>
+    route.fulfill({
+      json: {
+        role: "subuser",
+        email: "backup-admin@example.test",
+        userId: "backup-admin",
+        serverId: fixture.id,
+        permissions: currentPermissions(),
+      },
+    }),
+  );
+  await page.route("**/api/servers", async (route) => {
+    const headers = { ...route.request().headers() };
+    delete headers.authorization;
+    const response = await route.fetch({ headers });
+    const fleet = await response.json();
+    await route.fulfill({
+      response,
+      json: {
+        ...fleet,
+        defaultServerId: fixture.id,
+        servers: fleet.servers
+          .filter((item: { id: string }) => item.id === fixture.id)
+          .map((item: object) => ({
+            ...item,
+            accessPermissions: currentPermissions(),
+          })),
+      },
+    });
+  });
+  return storageRequests;
+}
+
+test("an explicitly authorized shared account browses the host and moves its backups", async ({
+  page,
+  request,
+  backups,
+}, testInfo) => {
+  const requests = await sharedBackupSession(page, backups, () => [
+    "server.view",
+    "backup.read",
+    "backup.location",
+  ]);
+  await page.goto("/#backups");
+  await expect(
+    page.getByRole("button", { name: "Dismiss backup status", exact: true }),
+  ).toHaveCount(0);
+  await page
+    .getByRole("button", { name: "Change location", exact: true })
+    .click();
+  const dialog = changeDialog(page);
+  await expect(dialog).toContainText("computer hosting this server");
+  await dialog
+    .getByRole("button", { name: "Browse folders", exact: true })
+    .click();
+  const picker = dialog.getByRole("region", {
+    name: "Choose backup folder",
+    exact: true,
+  });
+  await picker
+    .getByLabel("Folder path", { exact: true })
+    .fill(path.dirname(backups.destination));
+  await picker.getByRole("button", { name: "Open", exact: true }).click();
+  await picker
+    .getByLabel("New folder name (optional)", { exact: true })
+    .fill(path.basename(backups.destination));
+  await picker
+    .getByRole("button", { name: "Use new folder", exact: true })
+    .click();
+  await dialog
+    .getByRole("button", { name: "Review move", exact: true })
+    .click();
+  await expect(dialog).toContainText(backups.destination);
+  await expect(dialog).toContainText("1 backup");
+  await page.screenshot({
+    path: testInfo.outputPath("remote-backup-location-review.png"),
+    fullPage: true,
+  });
+  await dialog
+    .getByRole("button", { name: "Move backups", exact: true })
+    .click();
+  await expect
+    .poll(async () => (await location(request, backups.id)).job?.status)
+    .toBe("completed");
+  await expect(dialog).not.toBeVisible();
+  expect((await location(request, backups.id)).directory).toBe(
+    backups.destination,
+  );
+  expect(
+    (
+      await readFile(
+        path.join(backups.destination, `${backups.backup.id}.tar.gz`),
+      )
+    ).length,
+  ).toBeGreaterThan(0);
+  expect(requests.some((item) => item.path.endsWith("/directories"))).toBe(
+    true,
+  );
+  expect(
+    requests.filter((item) => item.method === "POST").map((item) => item.path),
+  ).toEqual(["/api/backups/location/preview", "/api/backups/location/jobs"]);
+  expect(requests.every((item) => item.serverId === backups.id)).toBe(true);
+});
+
+test("revoking remote backup location access blocks a reviewed move and hides the control", async ({
+  page,
+  request,
+  backups,
+}) => {
+  let permissions = ["server.view", "backup.read", "backup.location"];
+  await sharedBackupSession(page, backups, () => permissions);
+  const initial = await location(request, backups.id);
+  await page.goto("/#backups");
+  await page
+    .getByRole("button", { name: "Change location", exact: true })
+    .click();
+  const dialog = changeDialog(page);
+  await dialog
+    .getByLabel("Backup folder", { exact: true })
+    .fill(backups.destination);
+  await dialog
+    .getByRole("button", { name: "Review move", exact: true })
+    .click();
+  await expect(
+    dialog.getByRole("button", { name: "Move backups", exact: true }),
+  ).toBeEnabled();
+  permissions = ["server.view", "backup.read"];
+  await dialog
+    .getByRole("button", { name: "Move backups", exact: true })
+    .click();
+  await expect(dialog).not.toBeVisible();
+  expect((await location(request, backups.id)).directory).toBe(
+    initial.directory,
+  );
+  await page.reload();
+  await expect(
+    page.getByRole("heading", { name: "Backups", exact: true }),
+  ).toBeVisible();
+  await expect(
+    page.getByRole("heading", { name: "Backup location", exact: true }),
+  ).toHaveCount(0);
+  await expect(
+    page.getByRole("button", { name: "Change location", exact: true }),
+  ).toHaveCount(0);
+});
+
+test("ordinary backup permissions cannot browse or change host backup storage", async ({
   page,
   backups,
 }) => {
@@ -542,7 +718,7 @@ test("a shared administrator cannot browse or change host backup storage", async
     storageRequests.push(route.request().url());
     return route.fulfill({
       status: 403,
-      json: { error: "Only the panel owner can change backup storage." },
+      json: { error: "Change backup location permission is required." },
     });
   });
   await page.goto("/#backups");
@@ -554,6 +730,9 @@ test("a shared administrator cannot browse or change host backup storage", async
       name: `Download backup ${backups.backup.name}`,
       exact: true,
     }),
+  ).toBeVisible();
+  await expect(
+    page.getByRole("button", { name: "Dismiss backup status", exact: true }),
   ).toBeVisible();
   await expect(
     page.getByRole("heading", { name: "Backup location", exact: true }),

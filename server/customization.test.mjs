@@ -704,7 +704,7 @@ test("granular permissions validate, deduplicate, remain scoped, and persist edi
   );
 });
 
-test("legacy role-only subusers keep old defaults without gaining new settings access after restart", async (t) => {
+test("legacy role-only subusers keep old defaults without gaining settings or backup location access after restart", async (t) => {
   const { boot } = await fixture(t);
   const panel = await boot();
   const id = await panel.create();
@@ -716,6 +716,10 @@ test("legacy role-only subusers keep old defaults without gaining new settings a
     );
     assert.equal(created.status, 201);
     assert.deepEqual(created.body.permissions, catalog.roleDefaults[role]);
+    assert.equal(
+      created.body.permissions.includes("backup.location"),
+      role === "admin",
+    );
   }
   const statePath = path.join(panel.runtimes.get(id).dataDir, "panel.json");
   await panel.close();
@@ -727,7 +731,9 @@ test("legacy role-only subusers keep old defaults without gaining new settings a
   for (const user of users)
     assert.deepEqual(
       user.permissions,
-      catalog.roleDefaults[user.role].filter((id) => id !== "server.update"),
+      catalog.roleDefaults[user.role].filter(
+        (id) => !["server.update", "backup.location"].includes(id),
+      ),
     );
   const edited = await restarted.request(
     `/api/subusers/${users[0].id}`,

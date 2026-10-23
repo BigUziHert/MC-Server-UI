@@ -118,7 +118,7 @@ function permissionsFor(user: Subuser) {
   const defaults =
     catalog.roleDefaults[
       user.role as keyof typeof catalog.roleDefaults
-    ]?.filter((id) => id !== "server.update") ?? [];
+    ]?.filter((id) => !["server.update", "backup.location"].includes(id)) ?? [];
   const selected = new Set(user.permissions ?? defaults);
   return permissionIds.filter((permission) => selected.has(permission));
 }

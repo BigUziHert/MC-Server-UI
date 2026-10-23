@@ -78,9 +78,14 @@ type BackupJob = {
   updatedAt: string;
   error?: string;
   cancellable: boolean;
+  dismissed?: boolean;
 };
 const isActiveJob = (job: BackupJob | null) =>
   job?.status === "running" || job?.status === "cancelling";
+const isTerminalJob = (job: BackupJob | null) =>
+  job?.status === "completed" ||
+  job?.status === "cancelled" ||
+  job?.status === "failed";
 
 function BackupProgress({
   job,
@@ -88,7 +93,11 @@ function BackupProgress({
   error,
   cancelling,
   canCancel,
+  dismissing,
+  dismissError,
+  canDismiss,
   onCancel,
+  onDismiss,
   onRetry,
 }: {
   job: BackupJob | null;
@@ -96,7 +105,11 @@ function BackupProgress({
   error: string;
   cancelling: boolean;
   canCancel: boolean;
+  dismissing: boolean;
+  dismissError: string;
+  canDismiss: boolean;
   onCancel: () => void;
+  onDismiss: () => void;
   onRetry: () => void;
 }) {
   const active = isActiveJob(job);
@@ -138,6 +151,22 @@ function BackupProgress({
       <div className="backup-job-heading">
         <strong role="status">{title}</strong>
         {active && !error && percent !== undefined && <span>{percent}%</span>}
+        {canDismiss && isTerminalJob(job) && !starting && !error && (
+          <button
+            type="button"
+            className="btn icon"
+            aria-label="Dismiss backup status"
+            title="Dismiss backup status"
+            disabled={dismissing}
+            onClick={onDismiss}
+          >
+            {dismissing ? (
+              <LoaderCircle size={16} className="spin" />
+            ) : (
+              <X size={16} />
+            )}
+          </button>
+        )}
       </div>
       {job && <p>{job.name}</p>}
       {(active || starting) && (
@@ -169,6 +198,11 @@ function BackupProgress({
       {(error || (job?.status === "failed" && job.error)) && (
         <p className="storage-form-error" role="alert">
           {error || job?.error}
+        </p>
+      )}
+      {dismissError && (
+        <p className="storage-form-error" role="alert">
+          {dismissError}
         </p>
       )}
       <div className="backup-job-actions">
@@ -240,6 +274,8 @@ export default function Backups({
     permissions === undefined || permissions.includes("backup.download");
   const canRestore =
     permissions === undefined || permissions.includes("backup.restore");
+  const canChangeLocation =
+    permissions === undefined || permissions.includes("backup.location");
   const { api, downloadUrl, scopeKey } = useServerApi();
   const [locationState, setLocationState] = useState<BackupLocationState>({
     moving: false,
@@ -250,6 +286,10 @@ export default function Backups({
     (state: BackupLocationState) => setLocationState(state),
     [],
   );
+  useEffect(() => {
+    if (!canRead || !canChangeLocation)
+      setLocationState({ moving: false, available: true });
+  }, [canRead, canChangeLocation]);
   const [backups, setBackups] = useState<Backup[]>([]);
   const [schedule, setSchedule] = useState<Schedule>(defaults);
   const [savedSchedule, setSavedSchedule] = useState<Schedule>(defaults);
@@ -267,6 +307,8 @@ export default function Backups({
   const [starting, setStarting] = useState(false);
   const [cancelling, setCancelling] = useState(false);
   const [jobError, setJobError] = useState("");
+  const [dismissingId, setDismissingId] = useState<string | null>(null);
+  const [dismissError, setDismissError] = useState("");
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [dialog, setDialog] = useState<
     "create" | DeleteDialog | RestoreDialog | null
@@ -286,6 +328,7 @@ export default function Backups({
   const jobRef = useRef<BackupJob | null>(null);
   const startingRef = useRef(false);
   const jobRevision = useRef(0);
+  const dismissal = useRef<{ id: string; generation: number } | null>(null);
   const dialogVersion = useRef(0);
   const createDialogVersion = useRef<number | null>(null);
   const restoreRequestId = useRef<string | null>(null);
@@ -300,6 +343,10 @@ export default function Backups({
   const acceptJob = useCallback(
     (updated: BackupJob | null, startedHere = false) => {
       const previous = jobRef.current;
+      if (updated?.dismissed && isTerminalJob(updated)) {
+        if (previous?.id !== updated.id) return;
+        updated = null;
+      }
       if (
         updated &&
         previous?.id === updated.id &&
@@ -311,6 +358,7 @@ export default function Backups({
       jobRef.current = updated;
       setJob(updated);
       setJobError("");
+      if (updated?.id !== previous?.id) setDismissError("");
       if (
         updated &&
         (startedHere ||
@@ -402,6 +450,9 @@ export default function Backups({
     startingRef.current = false;
     setCancelling(false);
     setJobError("");
+    dismissal.current = null;
+    setDismissingId(null);
+    setDismissError("");
     setLocationState({ moving: false, available: true });
     dialogVersion.current++;
     setSchedule(defaults);
@@ -495,6 +546,60 @@ export default function Backups({
       if (token === generation.current) setCancelling(false);
     }
   }
+  async function dismissBackup() {
+    const pending = jobRef.current;
+    if (
+      !canCreate ||
+      !pending ||
+      !isTerminalJob(pending) ||
+      startingRef.current ||
+      jobError ||
+      dismissal.current?.id === pending.id
+    )
+      return;
+    const request = { id: pending.id, generation: generation.current };
+    dismissal.current = request;
+    jobRevision.current++;
+    setDismissingId(pending.id);
+    setDismissError("");
+    const stillCurrent = () =>
+      request.generation === generation.current &&
+      jobRef.current?.id === request.id &&
+      isTerminalJob(jobRef.current) &&
+      !startingRef.current;
+    try {
+      await api(`/backups/jobs/${encodeURIComponent(pending.id)}/dismiss`, {
+        method: "POST",
+        body: "{}",
+        signal: AbortSignal.timeout(10_000),
+      });
+      if (stillCurrent()) {
+        // Ignore status/list responses requested before this dismissal finished.
+        jobRevision.current++;
+        acceptJob(null);
+        if (
+          document.activeElement?.getAttribute("aria-label") ===
+          "Dismiss backup status"
+        ) {
+          if (currentDialog.current === "create")
+            dialogRef.current
+              ?.querySelector<HTMLInputElement>("input")
+              ?.focus();
+          else if (!currentDialog.current) headingRef.current?.focus();
+        }
+      }
+    } catch (failure) {
+      if (stillCurrent())
+        setDismissError(
+          `Could not dismiss backup status. ${messageOf(failure)}`,
+        );
+    } finally {
+      if (dismissal.current === request) {
+        dismissal.current = null;
+        setDismissingId(null);
+      }
+    }
+  }
   useEffect(() => {
     if (!dialog) return;
     const previous = document.activeElement as HTMLElement | null;
@@ -569,6 +674,7 @@ export default function Backups({
       jobRef.current = null;
       setJob(null);
       setJobError("");
+      setDismissError("");
       setDialogError("");
       jobRevision.current++;
       createDialogVersion.current = dialogVersion.current;
@@ -727,7 +833,11 @@ export default function Backups({
       error={jobError}
       cancelling={cancelling}
       canCancel={canCreate}
+      dismissing={dismissingId === job?.id}
+      dismissError={dismissError}
+      canDismiss={canCreate}
       onCancel={() => void cancelBackup()}
+      onDismiss={() => void dismissBackup()}
       onRetry={() => void refreshJob()}
     />
   );
@@ -1035,7 +1145,7 @@ export default function Backups({
             </section>
 
             <aside className="backup-schedule-column">
-              {permissions === undefined && (
+              {canRead && canChangeLocation && (
                 <BackupLocation
                   key={scopeKey}
                   notify={notify}

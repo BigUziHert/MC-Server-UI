@@ -645,6 +645,16 @@ test("backup jobs remain scoped to their selected fleet server", async (t) => {
     404,
   );
   assert.equal(
+    (
+      await panel.request(
+        `/api/backups/jobs/${id}/dismiss`,
+        json("POST", {}),
+        secondId,
+      )
+    ).status,
+    404,
+  );
+  assert.equal(
     (await panel.request(`/api/backups/jobs/${id}`, {}, firstId)).body.job
       .status,
     "running",
@@ -741,9 +751,114 @@ test("remote backup job routes require backup read or create permission", () => 
     ["GET", "/api/backups/jobs/example-id", ["backup.read"]],
     ["POST", "/api/backups/jobs", ["backup.create"]],
     ["POST", "/api/backups/jobs/example-id/cancel", ["backup.create"]],
+    ["POST", "/api/backups/jobs/example-id/dismiss", ["backup.create"]],
   ])
     assert.deepEqual(
       requiredPermissions({ method, path: route, query: {} }),
       expected,
     );
+});
+
+test("backup dismissal rejects active work and acknowledges only the requested terminal job", async (t) => {
+  const java = controlledJava();
+  const panel = await fixture(t, {
+    spawnServer: java.spawnServer,
+    backupFlushTimeoutMs: 60_000,
+    beforeClose: java.release,
+  });
+  await startJava(panel);
+  java.holdSaveOn();
+  const first = await panel.request(
+    "/api/backups/jobs",
+    json("POST", { name: "Acknowledged cancellation" }),
+  );
+  assert.equal(first.status, 202);
+  const id = first.body.job.id;
+  const dismiss = () =>
+    panel.request(`/api/backups/jobs/${id}/dismiss`, json("POST", {}));
+  await jobState(panel.request, id, (job) => job.phase === "saving");
+  assert.equal((await dismiss()).status, 409);
+  assert.equal((await panel.request("/api/backups")).body.job.id, id);
+  assert.equal(
+    (await panel.request(`/api/backups/jobs/${id}/cancel`, json("POST", {})))
+      .status,
+    202,
+  );
+  await until(() => java.commands.includes("save-on"), "Resume saves");
+  assert.equal((await dismiss()).status, 409);
+  java.releaseSaveOn();
+  await jobState(panel.request, id, (job) => job.status === "cancelled");
+  const result = await dismiss();
+  assert.equal(result.status, 200);
+  assert.equal(result.body.job.id, id);
+  assert.equal(result.body.job.dismissed, true);
+  assert.equal((await panel.request("/api/backups")).body.job, null);
+  const stored = JSON.parse(
+    await fs.readFile(path.join(panel.dataDir, "panel.json"), "utf8"),
+  );
+  assert.deepEqual(stored.dismissedBackupJobs, [id]);
+  assert.equal(stored.lastBackupJob.id, id);
+  assert.equal(stored.lastBackupJob.status, "cancelled");
+
+  const next = await panel.request(
+    "/api/backups/jobs",
+    json("POST", { name: "Newer backup remains visible" }),
+  );
+  assert.equal(next.status, 202);
+  await jobState(
+    panel.request,
+    next.body.job.id,
+    (job) => job.phase === "saving",
+  );
+  assert.equal((await dismiss()).status, 200);
+  assert.equal(
+    (await panel.request("/api/backups")).body.job.id,
+    next.body.job.id,
+  );
+  assert.equal(
+    (await panel.request("/api/backups/jobs/unknown/dismiss", json("POST", {})))
+      .status,
+    404,
+  );
+  java.confirmSave();
+  await jobState(
+    panel.request,
+    next.body.job.id,
+    (job) => job.status === "completed",
+  );
+  assert.equal((await dismiss()).status, 200);
+  assert.equal(
+    (await panel.request("/api/backups")).body.job.id,
+    next.body.job.id,
+  );
+});
+
+test("failed acknowledgement persistence keeps the terminal backup visible for retry", async (t) => {
+  const panel = await fixture(t);
+  const created = await panel.request(
+    "/api/backups",
+    json("POST", { name: "Acknowledgement retry" }),
+  );
+  assert.equal(created.status, 201);
+  const id = created.body.id;
+  const statePath = path.join(panel.dataDir, "panel.json");
+  const rename = fs.rename.bind(fs);
+  let fail = true;
+  t.mock.method(fs, "rename", async (source, target) => {
+    if (target === statePath && fail)
+      throw Object.assign(new Error("Injected state persistence failure"), {
+        code: "EACCES",
+      });
+    return rename(source, target);
+  });
+  const dismiss = () =>
+    panel.request(`/api/backups/jobs/${id}/dismiss`, json("POST", {}));
+  assert.equal((await dismiss()).status, 500);
+  assert.equal((await panel.request("/api/backups")).body.job.id, id);
+  const stored = JSON.parse(await fs.readFile(statePath, "utf8"));
+  assert.deepEqual(stored.dismissedBackupJobs, []);
+  fail = false;
+  assert.equal((await dismiss()).status, 200);
+  assert.equal((await panel.request("/api/backups")).body.job, null);
+  assert.equal((await panel.request("/api/backups")).body.backups[0].id, id);
 });

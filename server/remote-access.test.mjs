@@ -11,10 +11,10 @@ import { processStartup } from "../tests/fixtures/process-options.mjs";
 
 const origin = "https://panel.example.test";
 const json = (method, body) => ({ method, body: JSON.stringify(body) });
-async function fixture(t) {
+async function fixture(t, { nestedData = false } = {}) {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "mc-remote-access-"));
   const fleet = await createFleet({
-    dataDir: root,
+    dataDir: nestedData ? path.join(root, "panel") : root,
     useEnvironment: false,
     createDefaultServer: true,
     scheduler: false,
@@ -177,7 +177,7 @@ test("remote gateway never grants owner access, even with forged headers or a lo
   );
 });
 
-test("backup storage selection stays owner-only even with all backup grants", async (t) => {
+test("backup storage selection requires its explicit grant even with all existing backup grants", async (t) => {
   const { local, guest, invite, root } = await fixture(t);
   const { asUser } = await invite([
     "backup.read",
@@ -224,6 +224,224 @@ test("backup storage selection stays owner-only even with all backup grants", as
   await assert.rejects(fs.stat(path.join(root, "untrusted-destination")), {
     code: "ENOENT",
   });
+  const withoutRead = await invite(["backup.location"], "no-read@example.test");
+  for (const [method, route] of routes)
+    assert.equal(
+      (await withoutRead.asUser(route, { method })).status,
+      403,
+      route,
+    );
+});
+
+test("explicit backup location access browses host folders and moves only the selected server's archives", async (t) => {
+  const { local, invite, root, id, fleet } = await fixture(t, {
+    nestedData: true,
+  });
+  const first = await invite(["backup.read"]);
+  const created = await local(
+    "/api/servers",
+    json("POST", { name: "Archive location target", port: 25566 }),
+  );
+  assert.equal(created.status, 201, JSON.stringify(created.body));
+  const secondId = created.body.server.id;
+  const second = await invite(
+    ["backup.read", "backup.location"],
+    "sister@example.test",
+    secondId,
+    "Another-test-password!",
+    first.cookie,
+  );
+  const scoped = (options = {}) => ({
+    ...options,
+    headers: { "X-Server-Id": secondId, ...options.headers },
+  });
+  const firstLocation = (await local("/api/backups/location")).body;
+  const secondLocation = (
+    await second.asUser("/api/backups/location", scoped())
+  ).body;
+  assert.equal(secondLocation.canChange, true);
+  assert.notEqual(secondLocation.directory, firstLocation.directory);
+  const firstBackup = await local(
+    "/api/backups",
+    json("POST", { name: "First server archive" }),
+  );
+  const secondBackup = await local(
+    "/api/backups",
+    scoped(json("POST", { name: "Second server archive" })),
+  );
+  assert.equal(firstBackup.status, 201, JSON.stringify(firstBackup.body));
+  assert.equal(secondBackup.status, 201, JSON.stringify(secondBackup.body));
+  const archive = `${secondBackup.body.id}.tar.gz`;
+  const original = await fs.readFile(
+    path.join(secondLocation.directory, archive),
+  );
+  const directory = await fs.realpath(root);
+  const listed = await second.asUser(
+    `/api/backups/location/directories?${new URLSearchParams({ directory })}`,
+    scoped(),
+  );
+  assert.equal(listed.status, 200, JSON.stringify(listed.body));
+  assert.equal(listed.body.directory, directory);
+  assert.ok(listed.body.folders.some((folder) => folder.name === "panel"));
+  assert.equal(
+    (await second.asUser("/api/server-setup/directories", scoped())).status,
+    403,
+    "Backup storage access does not grant server provisioning.",
+  );
+  for (const target of [
+    firstLocation.directory,
+    fleet.runtimes.get(id).serverDir,
+    path.join(root, "panel", "not-for-backups"),
+  ]) {
+    const denied = await second.asUser(
+      "/api/backups/location/preview",
+      scoped(json("POST", { directory: target })),
+    );
+    assert.equal(denied.status, 409, JSON.stringify(denied.body));
+  }
+  const destination = path.join(directory, "second-server-archives");
+  const preview = await second.asUser(
+    "/api/backups/location/preview",
+    scoped(json("POST", { directory: destination })),
+  );
+  assert.equal(preview.status, 200, JSON.stringify(preview.body));
+  assert.equal(preview.body.backupCount, 1);
+  const move = json("POST", { ...preview.body, confirm: true });
+  for (const [route, options] of [
+    ["/api/backups/location", {}],
+    ["/api/backups/location/directories", {}],
+    ["/api/backups/location/preview", json("POST", { directory: destination })],
+    ["/api/backups/location/jobs", move],
+  ]) {
+    const denied = await second.asUser(route, {
+      ...options,
+      headers: { "X-Server-Id": id },
+    });
+    assert.equal(denied.status, 403, route);
+  }
+  const accepted = await second.asUser(
+    "/api/backups/location/jobs",
+    scoped(move),
+  );
+  assert.equal(accepted.status, 202, JSON.stringify(accepted.body));
+  let status;
+  for (let attempt = 0; attempt < 300; attempt++) {
+    status = await second.asUser("/api/backups/location", scoped());
+    assert.equal(status.status, 200, JSON.stringify(status.body));
+    if (status.body.job?.status !== "running") break;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  assert.equal(status.body.job.status, "completed", status.body.job.error);
+  assert.equal(status.body.directory, destination);
+  assert.deepEqual(
+    await fs.readFile(path.join(destination, archive)),
+    original,
+  );
+  await assert.rejects(fs.stat(path.join(secondLocation.directory, archive)), {
+    code: "ENOENT",
+  });
+  assert.equal(
+    (await local("/api/backups/location")).body.directory,
+    firstLocation.directory,
+  );
+  assert.ok(
+    (
+      await fs.stat(
+        path.join(firstLocation.directory, `${firstBackup.body.id}.tar.gz`),
+      )
+    ).isFile(),
+  );
+  assert.equal(
+    (await second.asUser("/api/backups", scoped())).body.backups[0].id,
+    secondBackup.body.id,
+  );
+});
+
+test("revoking backup location access blocks an already reviewed move and all further folder access", async (t) => {
+  const { local, invite, root } = await fixture(t, { nestedData: true });
+  const permissions = ["server.view", "backup.read", "backup.location"];
+  const { asUser, user } = await invite(permissions);
+  const directory = path.join(await fs.realpath(root), "revoked-archives");
+  const preview = await asUser(
+    "/api/backups/location/preview",
+    json("POST", { directory }),
+  );
+  assert.equal(preview.status, 200, JSON.stringify(preview.body));
+  const original = (await local("/api/backups/location")).body.directory;
+  assert.equal(
+    (
+      await local(
+        `/api/subusers/${user.id}`,
+        json("PATCH", { permissions: ["server.view", "backup.read"] }),
+      )
+    ).status,
+    200,
+  );
+  for (const [route, options] of [
+    ["/api/backups/location", {}],
+    ["/api/backups/location/directories", {}],
+    ["/api/backups/location/preview", json("POST", { directory })],
+    [
+      "/api/backups/location/jobs",
+      json("POST", { ...preview.body, confirm: true }),
+    ],
+  ])
+    assert.equal((await asUser(route, options)).status, 403, route);
+  assert.equal((await asUser("/api/backups")).status, 200);
+  assert.equal((await local("/api/backups/location")).body.directory, original);
+  await assert.rejects(fs.stat(directory), { code: "ENOENT" });
+});
+
+test("remote user managers cannot grant themselves or other users backup location access they do not hold", async (t) => {
+  const { local, invite } = await fixture(t);
+  const permissions = [
+    "server.view",
+    "backup.read",
+    "user.create",
+    "user.update",
+  ];
+  const { asUser, user } = await invite(permissions);
+  const target = await local(
+    "/api/subusers",
+    json("POST", {
+      email: "target@example.test",
+      permissions: ["server.view"],
+    }),
+  );
+  assert.equal(target.status, 201);
+  const elevated = [...permissions, "backup.location"];
+  for (const targetId of [user.id, target.body.id])
+    assert.equal(
+      (
+        await asUser(
+          `/api/subusers/${targetId}`,
+          json("PATCH", { permissions: elevated }),
+        )
+      ).status,
+      403,
+    );
+  assert.equal(
+    (
+      await asUser(
+        "/api/subusers",
+        json("POST", {
+          email: "escalation@example.test",
+          permissions: elevated,
+        }),
+      )
+    ).status,
+    403,
+  );
+  assert.equal(
+    (
+      await asUser(
+        "/api/subusers",
+        json("POST", { email: "role-escalation@example.test", role: "admin" }),
+      )
+    ).status,
+    403,
+  );
+  assert.equal((await asUser("/api/backups/location")).status, 403);
 });
 
 test("host folder browsing is local-only even for an authenticated user with file access", async (t) => {

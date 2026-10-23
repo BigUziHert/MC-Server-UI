@@ -387,6 +387,8 @@ const progressJob = () => ({
   startedAt: new Date().toISOString(),
   updatedAt: new Date().toISOString(),
   cancellable: true,
+  dismissed: false,
+  error: undefined as string | undefined,
 });
 async function mockProgress(page: Page, serverId: string, initial = true) {
   const state = {
@@ -394,6 +396,7 @@ async function mockProgress(page: Page, serverId: string, initial = true) {
     started: initial,
     failStatus: false,
     cancelCalls: 0,
+    dismissCalls: 0,
   };
   await page.route("**/api/backups", async (route) => {
     if (route.request().method() !== "GET") return route.continue();
@@ -406,6 +409,13 @@ async function mockProgress(page: Page, serverId: string, initial = true) {
     await route.fulfill({ response, json: result });
   });
   await page.route("**/api/backups/jobs/**", async (route) => {
+    if (route.request().url().endsWith("/dismiss")) {
+      state.dismissCalls++;
+      state.started = false;
+      return route.fulfill({
+        json: { job: { ...state.job, dismissed: true } },
+      });
+    }
     if (route.request().url().endsWith("/cancel")) {
       state.cancelCalls++;
       state.job = {
@@ -425,6 +435,292 @@ async function mockProgress(page: Page, serverId: string, initial = true) {
   });
   return state;
 }
+
+test("dismissing completed backup status persists after reload and preserves its archive", async ({
+  page,
+  request,
+  backups,
+}) => {
+  const headers = { "X-Server-Id": backups.id };
+  const response = await request.post("/api/backups/jobs", {
+    headers,
+    data: { name: "Dismissed completed backup" },
+  });
+  expect(response.status()).toBe(202);
+  const { job } = await response.json();
+  await expect
+    .poll(async () => {
+      const result = await request.get(`/api/backups/jobs/${job.id}`, {
+        headers,
+      });
+      return (await result.json()).job.status;
+    })
+    .toBe("completed");
+  const before = await backupNames(request, backups);
+  await openBackups(page, backups);
+  const progress = page.getByRole("region", {
+    name: "Backup progress",
+    exact: true,
+  });
+  await expect(progress).toContainText("Backup completed");
+  await progress.getByRole("button", { name: "Dismiss backup status" }).click();
+  await expect(progress).toHaveCount(0);
+  expect(
+    (await (await request.get("/api/backups", { headers })).json()).job,
+  ).toBeNull();
+  expect(await backupNames(request, backups)).toEqual(before);
+  await page.reload();
+  await expect(
+    page.getByRole("button", {
+      name: "Download backup Dismissed completed backup",
+      exact: true,
+    }),
+  ).toBeVisible();
+  await expect(progress).toHaveCount(0);
+});
+
+test("failed backup status can be dismissed with retryable errors and a busy indicator", async ({
+  page,
+  backups,
+}, testInfo) => {
+  const state = await mockProgress(page, backups.id);
+  state.job = {
+    ...state.job,
+    status: "failed",
+    cancellable: false,
+    error:
+      "The backup was interrupted before publication. No completed archive was retained.",
+  };
+  let release!: () => void;
+  const pending = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  let attempts = 0;
+  await page.route("**/api/backups/jobs/*/dismiss", async (route) => {
+    attempts++;
+    if (attempts > 1) return route.fallback();
+    expect(route.request().headers()["x-server-id"]).toBe(backups.id);
+    await pending;
+    return route.fulfill({
+      status: 503,
+      json: { error: "Connection interrupted" },
+    });
+  });
+  await openBackups(page, backups);
+  const progress = page.getByRole("region", {
+    name: "Backup progress",
+    exact: true,
+  });
+  const dismiss = progress.getByRole("button", {
+    name: "Dismiss backup status",
+  });
+  await expect(progress).toContainText("Backup failed");
+  await page.screenshot({
+    path: testInfo.outputPath("backup-failed-dismiss-desktop.png"),
+    fullPage: true,
+  });
+  await page.setViewportSize({ width: 390, height: 844 });
+  await expect(dismiss).toBeVisible();
+  expect(
+    await page.evaluate(
+      () => document.documentElement.scrollWidth - window.innerWidth,
+    ),
+  ).toBeLessThanOrEqual(1);
+  await page.screenshot({
+    path: testInfo.outputPath("backup-failed-dismiss-mobile.png"),
+    fullPage: true,
+  });
+  await dismiss.click();
+  await expect(dismiss).toBeDisabled();
+  release();
+  await expect(progress).toContainText(
+    "Could not dismiss backup status. Connection interrupted",
+  );
+  await expect(progress).toContainText("No completed archive was retained.");
+  await expect(dismiss).toBeEnabled();
+  await dismiss.click();
+  await expect(progress).toHaveCount(0);
+  expect(attempts).toBe(2);
+  await page.reload();
+  await expect(
+    page.getByRole("heading", { name: "Backups", exact: true }),
+  ).toBeVisible();
+  await expect(progress).toHaveCount(0);
+});
+
+test("a stale backup list cannot restore a dismissed cancelled status", async ({
+  page,
+  backups,
+}) => {
+  const state = await mockProgress(page, backups.id);
+  state.job = { ...state.job, status: "cancelled", cancellable: false };
+  await openBackups(page, backups);
+  const progress = page.getByRole("region", {
+    name: "Backup progress",
+    exact: true,
+  });
+  await expect(progress).toContainText("Backup cancelled");
+  let release!: () => void;
+  const pending = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  let readStarted!: () => void;
+  const started = new Promise<void>((resolve) => {
+    readStarted = resolve;
+  });
+  await page.route(
+    "**/api/backups",
+    async (route) => {
+      const response = await route.fetch();
+      const result = await response.json();
+      result.job = { ...state.job };
+      readStarted();
+      await pending;
+      await route.fulfill({ response, json: result });
+    },
+    { times: 1 },
+  );
+  await page
+    .getByRole("button", { name: "Refresh backups", exact: true })
+    .click();
+  await started;
+  await progress.getByRole("button", { name: "Dismiss backup status" }).click();
+  await expect(progress).toHaveCount(0);
+  const response = page.waitForResponse("**/api/backups");
+  release();
+  await response;
+  await expect(
+    page.getByRole("button", { name: "Refresh backups", exact: true }),
+  ).toBeEnabled();
+  await expect(progress).toHaveCount(0);
+});
+
+test("a late backup dismissal cannot hide a newer running backup", async ({
+  page,
+  backups,
+}) => {
+  const state = await mockProgress(page, backups.id);
+  state.job = { ...state.job, status: "failed", cancellable: false };
+  const previous = { ...state.job };
+  let release!: () => void;
+  const pending = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  await page.route("**/api/backups/jobs/*/dismiss", async (route) => {
+    await pending;
+    await route.fulfill({ json: { job: { ...previous, dismissed: true } } });
+  });
+  await page.route("**/api/backups/jobs", async (route) => {
+    state.job = { ...progressJob(), id: "newer-backup", name: "Newer backup" };
+    await route.fulfill({ status: 202, json: { job: state.job } });
+  });
+  await openBackups(page, backups);
+  await page.getByRole("button", { name: "Dismiss backup status" }).click();
+  await expect(
+    page.getByRole("button", { name: "Dismiss backup status" }),
+  ).toBeDisabled();
+  await page
+    .getByRole("button", { name: "Create backup", exact: true })
+    .click();
+  const dialog = page.getByRole("dialog", {
+    name: "Create a backup",
+    exact: true,
+  });
+  await dialog
+    .getByRole("button", { name: "Create backup", exact: true })
+    .click();
+  await expect(dialog).toContainText("Newer backup");
+  const response = page.waitForResponse("**/api/backups/jobs/*/dismiss");
+  release();
+  await response;
+  await expect(dialog).toContainText("Newer backup");
+  await expect(dialog).toContainText("25%");
+  await expect(
+    dialog.getByRole("button", { name: "Dismiss backup status" }),
+  ).toHaveCount(0);
+});
+
+test("a late backup dismissal cannot clear the newly selected server status", async ({
+  page,
+  backups,
+}) => {
+  const state = await mockProgress(page, backups.id);
+  state.job = { ...state.job, status: "failed", cancellable: false };
+  let release!: () => void;
+  const pending = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  await page.route("**/api/backups/jobs/*/dismiss", async (route) => {
+    await pending;
+    state.started = false;
+    await route.fulfill({ json: { job: { ...state.job, dismissed: true } } });
+  });
+  await page.route("**/api/backups", async (route) => {
+    if (route.request().headers()["x-server-id"] !== backups.otherServerId)
+      return route.fallback();
+    const response = await route.fetch();
+    await route.fulfill({
+      response,
+      json: {
+        ...(await response.json()),
+        job: {
+          ...progressJob(),
+          id: "other-server-job",
+          name: "Other server backup",
+          status: "completed",
+          cancellable: false,
+        },
+      },
+    });
+  });
+  await openBackups(page, backups);
+  await page.getByRole("button", { name: "Dismiss backup status" }).click();
+  await expect(
+    page.getByRole("button", { name: "Dismiss backup status" }),
+  ).toBeDisabled();
+  await selectServer(page, backups.otherServerId);
+  const progress = page.getByRole("region", {
+    name: "Backup progress",
+    exact: true,
+  });
+  await expect(progress).toContainText("Other server backup");
+  const response = page.waitForResponse("**/api/backups/jobs/*/dismiss");
+  release();
+  await response;
+  await expect(progress).toContainText("Other server backup");
+  await expect(
+    progress.getByRole("button", { name: "Dismiss backup status" }),
+  ).toBeEnabled();
+});
+
+test("an unconfirmed backup start never offers dismissal", async ({
+  page,
+  backups,
+}) => {
+  await mockProgress(page, backups.id, false);
+  await openBackups(page, backups);
+  await page.route("**/api/backups/jobs", (route) => route.abort("failed"));
+  await page.route("**/api/backups", (route) =>
+    route.fulfill({ status: 503, json: { error: "Connection interrupted" } }),
+  );
+  await page
+    .getByRole("button", { name: "Create backup", exact: true })
+    .click();
+  const dialog = page.getByRole("dialog", {
+    name: "Create a backup",
+    exact: true,
+  });
+  await dialog
+    .getByRole("button", { name: "Create backup", exact: true })
+    .click();
+  await expect(dialog).toContainText("Backup start could not be confirmed");
+  await expect(
+    dialog.getByRole("button", { name: "Retry status", exact: true }),
+  ).toBeVisible();
+  await expect(
+    dialog.getByRole("button", { name: "Dismiss backup status" }),
+  ).toHaveCount(0);
+});
 
 test("backup dialogs retain native focus and can close while a backup starts", async ({
   page,
@@ -484,6 +780,9 @@ test("backup dialogs retain native focus and can close while a backup starts", a
     dialog.getByRole("button", { name: "Starting backup…", exact: true }),
   ).toBeDisabled();
   await expect(
+    dialog.getByRole("button", { name: "Dismiss backup status" }),
+  ).toHaveCount(0);
+  await expect(
     dialog.getByRole("button", { name: "Close", exact: true }),
   ).toBeEnabled();
   await page.keyboard.press("Escape");
@@ -517,6 +816,9 @@ test("backup progress survives close, reload and server switching, and cancellat
     exact: true,
   });
   await expect(progress).toContainText("25%");
+  await expect(
+    progress.getByRole("button", { name: "Dismiss backup status" }),
+  ).toHaveCount(0);
   await expect(progress).toContainText("1.0 KB of 4.0 KB");
   await page.screenshot({
     path: testInfo.outputPath("backup-progress-desktop.png"),
@@ -554,6 +856,9 @@ test("backup progress survives close, reload and server switching, and cancellat
     .getByRole("button", { name: "Cancel backup", exact: true })
     .click();
   await expect(dialog).toContainText("Cancelling backup…");
+  await expect(
+    dialog.getByRole("button", { name: "Dismiss backup status" }),
+  ).toHaveCount(0);
   await expect(dialog).not.toContainText("Backup cancelled");
   await dialog.getByRole("button", { name: "Close", exact: true }).click();
   await expect(progress).toContainText("Cancelling backup…");
