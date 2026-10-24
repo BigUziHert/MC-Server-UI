@@ -442,9 +442,9 @@ test("dismissal survives recovery replay without deleting journals, files, audit
 });
 
 test("daily and weekly DST recurrences always reconstruct configured wall time", async () => {
-  // Establish the test timezone before Node initializes Date/Intl. Mutating TZ
-  // after the recovery tests have used both APIs couples this case to Windows'
-  // existing timezone caches and the host's timezone.
+  // Isolate the fixture timezone from the recovery tests and host settings.
+  // The fixture uses historical DST transitions so updated timezone databases
+  // do not change the wall-clock cases it exercises.
   const child = spawn(
     process.execPath,
     [fileURLToPath(new URL("./fixtures/backup-dst.mjs", import.meta.url))],
