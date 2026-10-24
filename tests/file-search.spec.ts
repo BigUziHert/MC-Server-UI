@@ -446,6 +446,12 @@ test("editor Find navigates literal matches, scrolls, and never submits while se
   await expect(find).toBeFocused();
   await find.fill("[a.*]");
   await expect(count).toHaveText("1 of 2 matches");
+  await expect(dialog.locator(".file-editor-highlight.is-current")).toHaveCount(
+    1,
+  );
+  await expect(
+    dialog.locator(".file-editor-match-marker.is-current"),
+  ).toHaveCount(1);
   await expect
     .poll(() =>
       editor.evaluate((node: HTMLTextAreaElement) => node.selectionStart),
@@ -473,8 +479,11 @@ test("editor Find navigates literal matches, scrolls, and never submits while se
   await expect(count).toHaveText("1 of 2 matches");
   await dialog.getByRole("button", { name: "Match case", exact: true }).click();
   await expect(count).toHaveText("1 of 1 matches");
+  await expect(dialog.locator(".file-editor-highlight")).toHaveCount(1);
   await find.fill("does not exist");
   await expect(count).toHaveText("No matches");
+  await expect(dialog.locator(".file-editor-highlight")).toHaveCount(0);
+  await expect(dialog.locator(".file-editor-match-marker")).toHaveCount(0);
   await expect(
     dialog.getByRole("button", { name: "Next match", exact: true }),
   ).toBeDisabled();
@@ -483,6 +492,8 @@ test("editor Find navigates literal matches, scrolls, and never submits while se
   expect(writes).toEqual([]);
   await find.press("Escape");
   await expect(find).toHaveCount(0);
+  await expect(dialog.locator(".file-editor-highlight")).toHaveCount(0);
+  await expect(dialog.locator(".file-editor-match-marker")).toHaveCount(0);
   await expect(dialog).toBeVisible();
   await expect(editor).toBeFocused();
   await editor.press("Escape");
@@ -565,6 +576,9 @@ test("editor Find uses displayed offsets for CRLF and lone CR without changing s
       selected: "needle",
       scrolled: true,
     });
+  await expect(
+    dialog.locator(".file-editor-highlight.is-current"),
+  ).toHaveAttribute("data-match-index", "0");
   await find.press("Enter");
   await expect
     .poll(() =>
@@ -574,6 +588,9 @@ test("editor Find uses displayed offsets for CRLF and lone CR without changing s
       })),
     )
     .toEqual({ start: displayed.lastIndexOf("needle"), selected: "needle" });
+  await expect(
+    dialog.locator(".file-editor-highlight.is-current"),
+  ).toHaveAttribute("data-match-index", "1");
   await find.press("Escape");
   const save = page.waitForRequest(
     (request) =>
@@ -589,6 +606,276 @@ test("editor Find uses displayed offsets for CRLF and lone CR without changing s
     (await (await contents(request, files.id, "windows-lines.txt")).json())
       .content,
   ).toBe(original);
+});
+
+test("editor Find highlights visible words and shows their positions beside the scrollbar", async ({
+  page,
+  request,
+  files,
+}, testInfo) => {
+  const original = `health first\n\t  health second\nHealth third\n${"ordinary line\n".repeat(70)}${" ".repeat(240)}health last\n`;
+  await create(request, files.id, "", "find-highlights.txt", "file", original);
+  await openFiles(page, files.id);
+  await page
+    .getByRole("button", { name: "Edit find-highlights.txt", exact: true })
+    .click();
+  const dialog = page.getByRole("dialog", {
+    name: "find-highlights.txt",
+    exact: true,
+  });
+  const editor = dialog.getByRole("textbox", {
+    name: "File contents",
+    exact: true,
+  });
+  await editor.press("Control+f");
+  const find = dialog.getByRole("textbox", {
+    name: "Find text in file",
+    exact: true,
+  });
+  const count = dialog.getByRole("status", {
+    name: "Find matches",
+    exact: true,
+  });
+  const highlights = dialog.locator(".file-editor-highlight");
+  const active = dialog.locator(".file-editor-highlight.is-current");
+  const markers = dialog.locator(".file-editor-match-marker");
+  const currentMarker = dialog.locator(".file-editor-match-marker.is-current");
+  await find.fill("health");
+  await expect(count).toHaveText("1 of 4 matches");
+  await expect(find).toBeFocused();
+  await expect(active).toHaveCount(1);
+  await expect(active).toHaveAttribute("data-match-index", "0");
+  await expect(currentMarker).toHaveCount(1);
+  const firstMarker = await currentMarker.boundingBox();
+
+  const viewport = await editor.boundingBox();
+  expect(viewport).not.toBeNull();
+  const visible = await highlights.evaluateAll(
+    (nodes, viewport) =>
+      nodes.flatMap((node) => {
+        const bounds = node.getBoundingClientRect();
+        if (
+          bounds.bottom <= viewport.y ||
+          bounds.top >= viewport.y + viewport.height
+        )
+          return [];
+        return [
+          {
+            background: getComputedStyle(node).backgroundColor,
+            x: bounds.x,
+            y: bounds.y,
+          },
+        ];
+      }),
+    viewport!,
+  );
+  expect(visible).toHaveLength(3);
+  for (const match of visible) {
+    const [red, green, blue] = match.background.match(/[\d.]+/g)!.map(Number);
+    expect(red).toBeGreaterThan(200);
+    expect(green).toBeGreaterThan(150);
+    expect(blue).toBeLessThan(100);
+  }
+  expect(visible[1].x).toBeGreaterThan(visible[0].x);
+  expect(visible[2].x).toBeCloseTo(visible[0].x, 0);
+  await dialog.screenshot({
+    path: testInfo.outputPath("find-highlights-desktop.png"),
+  });
+
+  // A native textarea resize changes its inline height. The marker rail must
+  // resize with it while the highlight stays aligned to the same text line.
+  const originalActive = await active.boundingBox();
+  const relativeTop = originalActive!.y - viewport!.y;
+  await editor.evaluate((node, height) => {
+    node.style.height = `${height - 75}px`;
+  }, viewport!.height);
+  await expect
+    .poll(async () => (await editor.boundingBox())!.height)
+    .toBeLessThan(viewport!.height - 50);
+  await expect
+    .poll(async () => {
+      const rail = await dialog
+        .locator(".file-editor-match-rail")
+        .boundingBox();
+      const height = await editor.evaluate((node) => node.clientHeight);
+      return Math.round(rail!.height - height);
+    })
+    .toBe(0);
+  await expect
+    .poll(async () => {
+      const mark = await active.boundingBox();
+      const area = await editor.boundingBox();
+      return Math.round(mark!.y - area!.y - relativeTop);
+    })
+    .toBe(0);
+  await editor.evaluate((node) => {
+    node.style.height = "";
+  });
+  await expect
+    .poll(async () => (await editor.boundingBox())!.height)
+    .toBeCloseTo(viewport!.height, 0);
+  await expect
+    .poll(async () => {
+      const third = await dialog
+        .locator('.file-editor-highlight[data-match-index="2"]')
+        .boundingBox();
+      return Math.round(third!.y - visible[2].y);
+    })
+    .toBe(0);
+
+  // Ordinary textarea scrolling must move the highlights by exactly the same
+  // amount without advancing the current Find match or changing its focus.
+  const thirdBefore = visible[2].y;
+  const scrolled = await editor.evaluate((node: HTMLTextAreaElement) => {
+    const before = node.scrollTop;
+    node.scrollTop += 12;
+    return node.scrollTop - before;
+  });
+  await expect
+    .poll(async () => {
+      const third = await dialog
+        .locator('.file-editor-highlight[data-match-index="2"]')
+        .boundingBox();
+      return third ? Math.round(third.y - thirdBefore) : null;
+    })
+    .toBe(-scrolled);
+  await expect(count).toHaveText("1 of 4 matches");
+  await expect(find).toBeFocused();
+
+  const positions = await markers.evaluateAll((nodes) =>
+    nodes.map((node) => node.getBoundingClientRect().top),
+  );
+  expect(Math.max(...positions) - Math.min(...positions)).toBeGreaterThan(
+    viewport!.height * 0.8,
+  );
+  await dialog
+    .getByRole("button", { name: "Previous match", exact: true })
+    .click();
+  await expect(count).toHaveText("4 of 4 matches");
+  await expect(active).toHaveAttribute("data-match-index", "3");
+  const lastMarker = await currentMarker.boundingBox();
+  expect(lastMarker!.y - firstMarker!.y).toBeGreaterThan(
+    viewport!.height * 0.8,
+  );
+  await expect
+    .poll(() =>
+      editor.evaluate((node: HTMLTextAreaElement) => ({
+        selected: node.value.slice(node.selectionStart, node.selectionEnd),
+        scrolledDown: node.scrollTop > 0,
+        scrolledAcross: node.scrollLeft > 0,
+      })),
+    )
+    .toEqual({ selected: "health", scrolledDown: true, scrolledAcross: true });
+  const selectedBox = await active.boundingBox();
+  const editorBox = await editor.boundingBox();
+  expect(selectedBox!.x).toBeGreaterThanOrEqual(editorBox!.x);
+  expect(selectedBox!.x + selectedBox!.width).toBeLessThanOrEqual(
+    editorBox!.x + editorBox!.width,
+  );
+  expect(selectedBox!.y).toBeGreaterThanOrEqual(editorBox!.y);
+  expect(selectedBox!.y + selectedBox!.height).toBeLessThanOrEqual(
+    editorBox!.y + editorBox!.height,
+  );
+
+  await page.setViewportSize({ width: 390, height: 844 });
+  await dialog.getByRole("button", { name: "Next match", exact: true }).click();
+  await expect(count).toHaveText("1 of 4 matches");
+  await expect(active).toHaveAttribute("data-match-index", "0");
+  await dialog.screenshot({
+    path: testInfo.outputPath("find-highlights-mobile.png"),
+  });
+  expect(
+    await page.evaluate(() => document.documentElement.scrollWidth),
+  ).toBeLessThanOrEqual(390);
+
+  await find.fill("missing keyword");
+  await expect(count).toHaveText("No matches");
+  await expect(highlights).toHaveCount(0);
+  await expect(markers).toHaveCount(0);
+  await find.fill("health");
+  await expect(count).toHaveText("1 of 4 matches");
+  await find.press("Escape");
+  await expect(highlights).toHaveCount(0);
+  await expect(markers).toHaveCount(0);
+  await expect(editor).toHaveValue(original);
+});
+
+test("editor Find handles a dense megabyte line without creating a match element for every character", async ({
+  page,
+  request,
+  files,
+}) => {
+  const length = 1_000_000;
+  const prefix = "😀 é漢 ";
+  const text = `${prefix}${"a".repeat(length)}`;
+  await create(request, files.id, "", "dense-find.txt", "file", text);
+  await openFiles(page, files.id);
+  await page
+    .getByRole("button", { name: "Edit dense-find.txt", exact: true })
+    .click();
+  const dialog = page.getByRole("dialog", {
+    name: "dense-find.txt",
+    exact: true,
+  });
+  const editor = dialog.getByRole("textbox", {
+    name: "File contents",
+    exact: true,
+  });
+  await editor.press("Control+f");
+  const find = dialog.getByRole("textbox", {
+    name: "Find text in file",
+    exact: true,
+  });
+  const count = dialog.getByRole("status", {
+    name: "Find matches",
+    exact: true,
+  });
+  const visuals = dialog.locator(
+    ".file-editor-highlight, .file-editor-match-marker",
+  );
+  const active = dialog.locator(".file-editor-highlight.is-current");
+  await find.fill("a");
+  await expect(count).toHaveText(`1 of ${length} matches`);
+  await expect(active).toHaveAttribute("data-match-index", "0");
+  expect(await visuals.count()).toBeLessThan(1000);
+
+  // End navigation should keep the native editor usable even when the search
+  // has a million results, without relying on a machine-dependent time limit.
+  await editor.press("Control+End");
+  await expect
+    .poll(() =>
+      editor.evaluate((node: HTMLTextAreaElement) => node.selectionStart),
+    )
+    .toBe(text.length);
+  await expect
+    .poll(() => editor.evaluate((node: HTMLTextAreaElement) => node.scrollLeft))
+    .toBeGreaterThan(0);
+  expect(await visuals.count()).toBeLessThan(1000);
+  await find.focus();
+  await find.press("Shift+Enter");
+  await expect(count).toHaveText(`${length} of ${length} matches`);
+  await expect(active).toHaveAttribute("data-match-index", `${length - 1}`);
+  await expect
+    .poll(() =>
+      editor.evaluate((node: HTMLTextAreaElement) => ({
+        start: node.selectionStart,
+        end: node.selectionEnd,
+      })),
+    )
+    .toEqual({ start: text.length - 1, end: text.length });
+  expect(await visuals.count()).toBeLessThan(1000);
+  await expect(find).toBeFocused();
+
+  await find.press("Enter");
+  await expect(count).toHaveText(`1 of ${length} matches`);
+  await expect(active).toHaveAttribute("data-match-index", "0");
+  await expect
+    .poll(() => editor.evaluate((node: HTMLTextAreaElement) => node.scrollLeft))
+    .toBe(0);
+  expect(await visuals.count()).toBeLessThan(1000);
+  await find.press("Escape");
+  await expect(visuals).toHaveCount(0);
+  expect(await editor.inputValue()).toHaveLength(text.length);
 });
 
 test("search shows first matches before completion and discards late queries, partial failures and old-host results", async ({
@@ -836,6 +1123,12 @@ test("JSON5 and JSONC search results preserve browse-only and read-only permissi
         await expect(
           dialog.getByRole("status", { name: "Find matches", exact: true }),
         ).toHaveText("1 of 1 matches");
+        await expect(
+          dialog.locator(".file-editor-highlight.is-current"),
+        ).toHaveCount(1);
+        await expect(
+          dialog.locator(".file-editor-match-marker.is-current"),
+        ).toHaveCount(1);
         await find.press("Enter");
         await dialog
           .getByRole("button", { name: "Next match", exact: true })

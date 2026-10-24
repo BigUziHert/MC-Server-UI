@@ -38,6 +38,60 @@
   font-size: 11px;
   font-weight: 400;
 }
+.file-editor-surface {
+  position: relative;
+  min-width: 0;
+}
+.file-editor-surface.find-open {
+  padding-right: 10px;
+}
+.file-editor-surface > .file-editor {
+  display: block;
+  font-kerning: none;
+  font-variant-ligatures: none;
+}
+.has-find-highlights > .file-editor::selection {
+  background: #ffd000;
+  color: #101016;
+}
+.file-editor-highlights {
+  position: absolute;
+  overflow: hidden;
+  pointer-events: none;
+  border-radius: 5px;
+}
+.file-editor-highlight {
+  position: absolute;
+  background: #ffd00040;
+  border-radius: 2px;
+}
+.file-editor-highlight.is-current {
+  background: #ffd00055;
+  box-shadow: inset 0 0 0 1px #ffe16b;
+}
+.file-editor-match-rail {
+  position: absolute;
+  right: 0;
+  width: 8px;
+  overflow: hidden;
+  pointer-events: none;
+  background: #101016;
+  border-radius: 3px;
+}
+.file-editor-match-marker {
+  position: absolute;
+  left: 1px;
+  right: 1px;
+  height: 3px;
+  background: #ffd000;
+}
+.file-editor-match-marker.is-current {
+  left: 0;
+  right: 0;
+  height: 4px;
+  background: #fff1a3;
+  box-shadow: 0 0 0 1px #b88b00;
+}
 @media (max-width: 500px) {
   .file-editor-find-controls {
     flex-wrap: wrap;

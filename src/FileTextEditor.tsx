@@ -11,6 +11,7 @@ import {
 } from "react";
 import { ArrowDown, ArrowUp, Search, X } from "lucide-react";
 import { findTextMatches, lineAtOffset } from "./file-text-search";
+import FileFindHighlights from "./FileFindHighlights";
 import "./file-text-editor.css";
 
 export type FileTextEditorHandle = {
@@ -61,6 +62,7 @@ const FileTextEditor = forwardRef<
     [open, deferredValue],
   );
   const current = Math.max(0, Math.min(index, matches.length - 1));
+  const highlighting = open && !searching && matches.length > 0;
 
   const reveal = useCallback(
     (next: number, focus = false) => {
@@ -241,22 +243,36 @@ const FileTextEditor = forwardRef<
           </span>
         </div>
       )}
-      <textarea
-        ref={editor}
-        id={id}
-        className="file-editor"
-        readOnly={readOnly}
-        value={value}
-        onChange={(event) => {
-          // Editing must keep its caret; navigation resumes when Find is used.
-          autoSelect.current = false;
-          onChange(event.target.value);
-        }}
-        spellCheck={false}
-        wrap="off"
-        disabled={disabled}
-        rows={rows}
-      />
+      <div
+        className={`file-editor-surface${open ? " find-open" : ""}${highlighting ? " has-find-highlights" : ""}`}
+      >
+        <textarea
+          ref={editor}
+          id={id}
+          className="file-editor"
+          readOnly={readOnly}
+          value={value}
+          onChange={(event) => {
+            // Editing must keep its caret; navigation resumes when Find is used.
+            autoSelect.current = false;
+            onChange(event.target.value);
+          }}
+          spellCheck={false}
+          wrap="off"
+          disabled={disabled}
+          rows={rows}
+        />
+        {highlighting && (
+          <FileFindHighlights
+            editor={editor}
+            text={displayValue}
+            queryLength={query.length}
+            matches={matches}
+            newlines={newlines}
+            current={current}
+          />
+        )}
+      </div>
     </div>
   );
 });
