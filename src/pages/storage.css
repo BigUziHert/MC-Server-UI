@@ -99,14 +99,18 @@
 .file-table {
   table-layout: fixed;
   width: 100%;
+  min-width: 820px;
 }
 .file-table th:first-child {
-  width: 53%;
+  width: 39%;
 }
 .file-table th:nth-child(2) {
-  width: 13%;
+  width: 11%;
 }
 .file-table th:nth-child(3) {
+  width: 16%;
+}
+.file-table th:nth-child(4) {
   width: 19%;
 }
 .file-table th:last-child {
@@ -126,6 +130,45 @@
 }
 .file-table tbody tr:hover {
   background: #20212b;
+}
+.file-column-heading {
+  display: flex;
+  align-items: center;
+  gap: 13px;
+}
+.file-sort-button {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  flex: 1;
+  min-width: 0;
+  min-height: 28px;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: inherit;
+  font: inherit;
+  letter-spacing: inherit;
+  text-transform: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.file-sort-button svg {
+  flex-shrink: 0;
+  opacity: 0.5;
+}
+.file-sort-button:hover,
+.file-sort-button:focus-visible,
+.file-table th[aria-sort] .file-sort-button {
+  color: var(--storage-accent);
+}
+.file-table th[aria-sort] .file-sort-button svg {
+  opacity: 1;
+}
+.file-type {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 .file-name {
   display: flex;
@@ -853,12 +896,6 @@
     width: 35px;
     height: 39px;
   }
-  .file-table th:first-child {
-    width: 47%;
-  }
-  .file-table th:last-child {
-    width: 21%;
-  }
 }
 @media (max-width: 900px) {
   .backups-layout {
@@ -925,19 +962,6 @@
   .backup-stat-icon {
     width: 40px;
     height: 40px;
-  }
-  .file-table th:first-child {
-    width: 55%;
-  }
-  .file-table th:nth-child(2) {
-    width: 17%;
-  }
-  .file-table th:nth-child(3),
-  .file-table td:nth-child(3) {
-    display: none;
-  }
-  .file-table th:last-child {
-    width: 28%;
   }
   .file-table td,
   .file-table th {

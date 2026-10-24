@@ -26,6 +26,7 @@ export default defineConfig({
     "panel-settings.spec.ts",
     "updates.spec.ts",
     "file-selection.spec.ts",
+    "file-sorting.spec.ts",
     "file-search.spec.ts",
     "file-uploads.spec.ts",
     "file-transfer-resilience.spec.ts",

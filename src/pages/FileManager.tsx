@@ -7,9 +7,13 @@ import {
   useState,
   useSyncExternalStore,
   type FormEvent,
+  type ReactNode,
 } from "react";
 import { SessionScopeContext } from "../session-scope";
 import {
+  ArrowDown,
+  ArrowUp,
+  ArrowUpDown,
   ChevronRight,
   Copy,
   ClipboardPaste,
@@ -151,6 +155,78 @@ type Entry = {
   size: number;
   modified: string;
 };
+type FileSortKey = "name" | "size" | "type" | "modified";
+type FileSort = {
+  key: FileSortKey;
+  direction: "ascending" | "descending";
+};
+const fileNameOrder = new Intl.Collator(undefined, {
+  numeric: true,
+  sensitivity: "base",
+});
+
+function fileType(entry: Entry) {
+  if (entry.type === "directory") return "File folder";
+  const dot = entry.name.lastIndexOf(".");
+  return dot > 0 && dot < entry.name.length - 1
+    ? `${entry.name.slice(dot + 1).toUpperCase()} file`
+    : "File";
+}
+
+function compareFiles(a: Entry, b: Entry, sort: FileSort) {
+  // Keep folders above files in both directions, like a file explorer.
+  if (a.type !== b.type) return a.type === "directory" ? -1 : 1;
+  let compared = 0;
+  if (sort.key === "size") compared = a.size - b.size;
+  if (sort.key === "type")
+    compared = fileNameOrder.compare(fileType(a), fileType(b));
+  if (sort.key === "modified")
+    compared = (Date.parse(a.modified) || 0) - (Date.parse(b.modified) || 0);
+  const order =
+    compared ||
+    fileNameOrder.compare(a.name, b.name) ||
+    fileNameOrder.compare(a.path, b.path) ||
+    a.path.localeCompare(b.path);
+  return sort.direction === "ascending" ? order : -order;
+}
+
+function FileSortHeader({
+  column,
+  label,
+  sort,
+  onSort,
+  children,
+}: {
+  column: FileSortKey;
+  label: string;
+  sort: FileSort;
+  onSort: (column: FileSortKey) => void;
+  children?: ReactNode;
+}) {
+  const active = sort.key === column;
+  const Icon = active
+    ? sort.direction === "ascending"
+      ? ArrowUp
+      : ArrowDown
+    : ArrowUpDown;
+  return (
+    <th scope="col" aria-sort={active ? sort.direction : undefined}>
+      <div className="file-column-heading">
+        {children}
+        <button
+          type="button"
+          className="file-sort-button"
+          onClick={() => onSort(column)}
+          title={`Sort by ${label.toLowerCase()} ${active && sort.direction === "ascending" ? "descending" : "ascending"}`}
+        >
+          <span>{label}</span>
+          <Icon size={13} aria-hidden="true" />
+        </button>
+      </div>
+    </th>
+  );
+}
+
 type FileResult = {
   path: string;
   entries: Entry[];
@@ -646,6 +722,20 @@ export default function FileManager({
   activeListScope.current = listScope;
   const [page, setPage] = useState(1),
     [pageSize, setPageSize] = useState(25);
+  const [sort, setSort] = useState<FileSort>({
+    key: "name",
+    direction: "ascending",
+  });
+  function sortBy(key: FileSortKey) {
+    setSort((previous) => ({
+      key,
+      direction:
+        previous.key === key && previous.direction === "ascending"
+          ? "descending"
+          : "ascending",
+    }));
+    setPage(1);
+  }
   const loaded = useRef(false);
   useEffect(() => setPage(1), [debouncedQuery, pageSize, path]);
   const [loading, setLoading] = useState(true);
@@ -1253,17 +1343,8 @@ export default function FileManager({
   }
 
   const filtered = useMemo(
-    () =>
-      entries
-        .slice()
-        .sort((a, b) =>
-          a.type === b.type
-            ? a.name.localeCompare(b.name) || a.path.localeCompare(b.path)
-            : a.type === "directory"
-              ? -1
-              : 1,
-        ),
-    [entries],
+    () => entries.slice().sort((a, b) => compareFiles(a, b, sort)),
+    [entries, sort],
   );
   useEffect(() => {
     const reveal = pendingReveal.current;
@@ -1695,53 +1776,67 @@ export default function FileManager({
             }
           />
         ) : (
-          <div className="table-wrap">
+          <div className="table-wrap file-table-wrap">
             <table className="data-table file-table">
-              {visible.length > 0 && (
-                <thead>
-                  <tr>
-                    <th scope="col">
-                      <div className="file-selection-name">
-                        <input
-                          className="file-selection-checkbox"
-                          type="checkbox"
-                          aria-label="Select all visible files and folders"
-                          checked={allVisibleSelected}
-                          aria-checked={
-                            visibleSelectedCount > 0 && !allVisibleSelected
-                              ? "mixed"
-                              : allVisibleSelected
-                          }
-                          ref={(input) => {
-                            if (input)
-                              input.indeterminate =
-                                visibleSelectedCount > 0 && !allVisibleSelected;
-                          }}
-                          disabled={
-                            (!canDelete && !canContent) ||
-                            !visible.length ||
-                            saving
-                          }
-                          onChange={toggleVisibleSelection}
-                        />
-                        <span>Name</span>
-                      </div>
-                    </th>
-                    <th scope="col">Size</th>
-                    <th scope="col">Last modified</th>
-                    <th scope="col">
-                      <span className="storage-sr-only">Actions</span>
-                    </th>
-                  </tr>
-                </thead>
-              )}
+              <thead>
+                <tr>
+                  <FileSortHeader
+                    column="name"
+                    label="Name"
+                    sort={sort}
+                    onSort={sortBy}
+                  >
+                    <input
+                      className="file-selection-checkbox"
+                      type="checkbox"
+                      aria-label="Select all visible files and folders"
+                      checked={allVisibleSelected}
+                      aria-checked={
+                        visibleSelectedCount > 0 && !allVisibleSelected
+                          ? "mixed"
+                          : allVisibleSelected
+                      }
+                      ref={(input) => {
+                        if (input)
+                          input.indeterminate =
+                            visibleSelectedCount > 0 && !allVisibleSelected;
+                      }}
+                      disabled={
+                        (!canDelete && !canContent) || !visible.length || saving
+                      }
+                      onChange={toggleVisibleSelection}
+                    />
+                  </FileSortHeader>
+                  <FileSortHeader
+                    column="size"
+                    label="Size"
+                    sort={sort}
+                    onSort={sortBy}
+                  />
+                  <FileSortHeader
+                    column="type"
+                    label="Type"
+                    sort={sort}
+                    onSort={sortBy}
+                  />
+                  <FileSortHeader
+                    column="modified"
+                    label="Date modified"
+                    sort={sort}
+                    onSort={sortBy}
+                  />
+                  <th scope="col">
+                    <span className="storage-sr-only">Actions</span>
+                  </th>
+                </tr>
+              </thead>
               <tbody>
                 {!path && !requestedQuery && canBin && (
                   <tr
                     className="recycle-bin-entry"
                     aria-label="Protected Recycle Bin"
                   >
-                    <td colSpan={4}>
+                    <td colSpan={5}>
                       <div className="recycle-bin-entry-content">
                         <LockKeyhole size={16} aria-label="Protected folder" />
                         <button
@@ -1765,7 +1860,7 @@ export default function FileManager({
                 )}
                 {path && !requestedQuery && (
                   <tr className="parent-directory">
-                    <td colSpan={4}>
+                    <td colSpan={5}>
                       <button
                         className="file-name"
                         onClick={() =>
@@ -1846,6 +1941,9 @@ export default function FileManager({
                       {entry.type === "directory"
                         ? "—"
                         : formatBytes(entry.size)}
+                    </td>
+                    <td className="muted file-type" title={fileType(entry)}>
+                      {fileType(entry)}
                     </td>
                     <td
                       className="muted"
