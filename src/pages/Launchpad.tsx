@@ -85,6 +85,8 @@ type Project = {
   downloads?: number;
   author?: string;
   url?: string;
+  releasedAt?: string;
+  updatedAt?: string;
 };
 type InstalledItem = {
   path: string;
@@ -265,18 +267,6 @@ const kinds = [
   { id: "plugin", label: "Plugins", icon: Package },
 ] as const;
 const rowsOptions = [5, 10, 25, 50, 75, 100];
-const catalogSortChoices = [
-  { id: "featured", label: "Featured" },
-  { id: "relevance", label: "Relevancy" },
-  { id: "popular", label: "Popularity" },
-  { id: "updated", label: "Latest Update" },
-  { id: "newest", label: "Release Date" },
-  { id: "downloads", label: "Total Downloads" },
-  { id: "category", label: "Main Category" },
-  { id: "gameVersion", label: "Game Version" },
-  { id: "name", label: "Name" },
-  { id: "author", label: "Author" },
-];
 const installedSortOptions = [
   { id: "name", label: "Name" },
   { id: "author", label: "Author" },
@@ -726,9 +716,6 @@ export default function Launchpad({
   const source = config?.platforms.find((item) => item.id === platform);
   const inventoryReady = Boolean(config);
   const sortOptions = source?.sortOptions ?? [];
-  const displayedSortOptions = ["modrinth", "curseforge"].includes(platform)
-    ? catalogSortChoices
-    : sortOptions;
   const catalogSort = sortOptions.some((item) => item.id === sort)
     ? sort
     : (sortOptions[0]?.id ?? "");
@@ -2151,6 +2138,43 @@ export default function Launchpad({
     );
   }
 
+  function columnHeading(
+    id: InstalledSort,
+    label: string,
+    column: string,
+    catalogId = id as string,
+  ) {
+    if (installedOnly) return installedHeading(id, label, column);
+    if (!sortOptions.some((option) => option.id === catalogId))
+      return <span className={`launchpad-column-${column}`}>{label}</span>;
+    const selected = catalogSort === catalogId;
+    const ascending = ["name", "author", "category"].includes(catalogId);
+    return (
+      <button
+        type="button"
+        className={`launchpad-column-heading launchpad-column-${column}`}
+        aria-label={`Sort by ${label}`}
+        aria-pressed={selected}
+        title={`Sort ${label.toLowerCase()} ${ascending ? "ascending" : "descending"}`}
+        onClick={() => {
+          setSort(catalogId);
+          setOffset(0);
+        }}
+      >
+        {label}
+        {selected ? (
+          ascending ? (
+            <ArrowUp size={13} />
+          ) : (
+            <ArrowDown size={13} />
+          )
+        ) : (
+          <ArrowUpDown size={13} />
+        )}
+      </button>
+    );
+  }
+
   if (!config)
     return (
       <div className="management-page launchpad-page">
@@ -2441,7 +2465,7 @@ export default function Launchpad({
               )}
             </button>
           </div>
-        ) : sortOptions.length > 0 ? (
+        ) : sortOptions.length > 0 && source?.available && supported ? (
           <label className="launchpad-sort">
             Sort by
             <select
@@ -2452,19 +2476,8 @@ export default function Launchpad({
                 setOffset(0);
               }}
             >
-              {displayedSortOptions.map((item) => (
-                <option
-                  key={item.id}
-                  value={item.id}
-                  disabled={
-                    !sortOptions.some((supported) => supported.id === item.id)
-                  }
-                  title={
-                    sortOptions.some((supported) => supported.id === item.id)
-                      ? undefined
-                      : `Not available from ${source?.name ?? "this platform"}`
-                  }
-                >
+              {sortOptions.map((item) => (
+                <option key={item.id} value={item.id}>
                   {item.label}
                 </option>
               ))}
@@ -2472,16 +2485,22 @@ export default function Launchpad({
           </label>
         ) : null}
         <div className="launchpad-toolbar-actions">
-          {type === "mod" && (
-            <LaunchpadCategoryFilters
-              selected={categoryKey ? categoryKey.split(",") : []}
-              platform={installedOnly ? undefined : platform}
-              onChange={(next) => {
-                setCategories(next);
-                setOffset(0);
-              }}
-            />
-          )}
+          {type === "mod" &&
+            (installedOnly ||
+              (source?.available &&
+                supported &&
+                allModCategories.some((category) =>
+                  supportsCategory(category.id, platform),
+                ))) && (
+              <LaunchpadCategoryFilters
+                selected={categoryKey ? categoryKey.split(",") : []}
+                platform={installedOnly ? undefined : platform}
+                onChange={(next) => {
+                  setCategories(next);
+                  setOffset(0);
+                }}
+              />
+            )}
           {installedOnly && type !== "modpack" && allowChanges && (
             <button
               className="btn primary"
@@ -2819,34 +2838,39 @@ export default function Launchpad({
               {installedOnly && <span> · Updates always appear first.</span>}
             </div>
             <div
-              className={
+              className={`launchpad-installed-list${type === "mod" ? " has-active" : ""}`}
+              tabIndex={0}
+              role="region"
+              aria-label={
                 installedOnly
-                  ? `launchpad-installed-list${type === "mod" ? " has-active" : ""}`
-                  : "launchpad-project-list"
+                  ? "Installed content list"
+                  : "Catalog content list"
               }
-              tabIndex={installedOnly ? 0 : undefined}
-              role={installedOnly ? "region" : undefined}
-              aria-label={installedOnly ? "Installed content list" : undefined}
             >
-              {installedOnly && (
-                <div
-                  className="launchpad-installed-header"
-                  role="group"
-                  aria-label="Sort installed content columns"
-                >
-                  {installedHeading("name", "Name", "name")}
-                  <span className="launchpad-column-action">Action</span>
-                  {installedHeading("author", "Author", "author")}
-                  {type === "mod" &&
-                    installedHeading("active", "Active", "active")}
-                  <span className="launchpad-column-remove">Remove</span>
-                  {installedHeading("added", "Date added", "added")}
-                  {installedHeading("modified", "Date modified", "modified")}
-                </div>
-              )}
+              <div
+                className="launchpad-installed-header"
+                role="group"
+                aria-label={
+                  installedOnly
+                    ? "Sort installed content columns"
+                    : "Sort catalog content columns"
+                }
+              >
+                {columnHeading("name", "Name", "name")}
+                <span className="launchpad-column-action">Action</span>
+                {columnHeading("author", "Author", "author")}
+                {type === "mod" && columnHeading("active", "Active", "active")}
+                {columnHeading("added", "Date added", "added", "newest")}
+                {columnHeading(
+                  "modified",
+                  "Date modified",
+                  "modified",
+                  "updated",
+                )}
+              </div>
               {visibleProjects.map(({ project, entry }) => (
                 <article
-                  className={`panel launchpad-project${installedOnly ? " launchpad-installed-row" : ""}`}
+                  className="panel launchpad-project launchpad-installed-row"
                   key={entry?.path ?? `${project.platform}:${project.id}`}
                   aria-label={project.title}
                 >
@@ -2915,19 +2939,9 @@ export default function Launchpad({
                             downloads
                           </span>
                         )}
-                        {!installedOnly && project.author && (
-                          <span>By {project.author}</span>
-                        )}
                         {entry?.versionName && (
                           <span>Installed: {entry.versionName}</span>
                         )}
-                        {entry?.update && (
-                          <span>
-                            Available:{" "}
-                            {entry.update.version || entry.update.name}
-                          </span>
-                        )}
-                        {entry && <span>{formatBytes(entry.size)}</span>}
                         {entry &&
                           updateCheckLabel(
                             entry,
@@ -2961,48 +2975,52 @@ export default function Launchpad({
                         )}
                     </div>
                   </div>
-                  {installedOnly && (
-                    <div className="launchpad-installed-author">
-                      {project.author ? (
-                        <span>By {project.author}</span>
-                      ) : (
-                        <span className="launchpad-unknown-author">
-                          Unknown
-                        </span>
-                      )}
-                    </div>
-                  )}
+                  <div className="launchpad-installed-author">
+                    {project.author ? (
+                      <span>By {project.author}</span>
+                    ) : (
+                      <span className="launchpad-unknown-author">Unknown</span>
+                    )}
+                  </div>
                   <div className="launchpad-project-action">
                     {(!entry || (entry.platform && entry.projectId)) && (
-                      <button
-                        className={`btn launchpad-version-action ${entry && !entry.update ? "" : "primary"}`}
-                        aria-label={`${entry?.update ? "Update" : entry ? "Choose version for" : "Install"} ${project.title}`}
-                        disabled={
-                          !allowChanges ||
-                          working ||
-                          Boolean(busy) ||
-                          Boolean(entry && pendingPaths.has(entry.path)) ||
-                          !config.platforms.find(
-                            (item) => item.id === project.platform,
-                          )?.available
-                        }
-                        onClick={() => chooseProject(project, entry)}
-                      >
-                        {entry?.update ? (
-                          <RefreshCw size={15} />
-                        ) : (
-                          <Download size={15} />
+                      <div className="launchpad-version-action">
+                        <button
+                          className={`btn ${entry && !entry.update ? "" : "primary"}`}
+                          aria-label={`${entry?.update ? "Update" : entry ? "Choose version for" : "Install"} ${project.title}`}
+                          disabled={
+                            !allowChanges ||
+                            working ||
+                            Boolean(busy) ||
+                            Boolean(entry && pendingPaths.has(entry.path)) ||
+                            !config.platforms.find(
+                              (item) => item.id === project.platform,
+                            )?.available
+                          }
+                          onClick={() => chooseProject(project, entry)}
+                        >
+                          {entry?.update ? (
+                            <RefreshCw size={15} />
+                          ) : (
+                            <Download size={15} />
+                          )}
+                          {entry?.update
+                            ? "Update"
+                            : entry
+                              ? "Versions"
+                              : "Install"}
+                        </button>
+                        {entry?.update && (
+                          <div className="launchpad-available-version">
+                            Available:{" "}
+                            {entry.update.version || entry.update.name}
+                          </div>
                         )}
-                        {entry?.update
-                          ? "Update"
-                          : entry
-                            ? "Versions"
-                            : "Install"}
-                      </button>
+                      </div>
                     )}
                     {entry && type !== "modpack" && (
                       <>
-                        {installedOnly && type === "mod" && (
+                        {type === "mod" && (
                           <Switch
                             className="launchpad-active"
                             aria-label={`Active: ${project.title}`}
@@ -3043,15 +3061,26 @@ export default function Launchpad({
                         </button>
                       </>
                     )}
-                    {installedOnly && entry && (
-                      <>
-                        <InstalledDate value={entry.addedAt} kind="added" />
-                        <InstalledDate
-                          value={entry.modifiedAt}
-                          kind="modified"
-                        />
-                      </>
+                    {type === "mod" && !entry && (
+                      <span
+                        className="launchpad-active launchpad-empty-cell"
+                        aria-label="Not installed"
+                      >
+                        —
+                      </span>
                     )}
+                    <InstalledDate
+                      value={
+                        installedOnly ? entry?.addedAt : project.releasedAt
+                      }
+                      kind="added"
+                    />
+                    <InstalledDate
+                      value={
+                        installedOnly ? entry?.modifiedAt : project.updatedAt
+                      }
+                      kind="modified"
+                    />
                   </div>
                 </article>
               ))}

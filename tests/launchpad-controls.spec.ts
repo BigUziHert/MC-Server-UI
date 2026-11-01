@@ -44,6 +44,13 @@ const sorts = [
   { id: "name", label: "Name" },
   { id: "author", label: "Author" },
 ];
+const modrinthSorts = [
+  { id: "downloads", label: "Total Downloads" },
+  { id: "relevance", label: "Relevancy" },
+  { id: "popular", label: "Popularity" },
+  { id: "updated", label: "Latest Update" },
+  { id: "newest", label: "Release Date" },
+];
 const version = {
   id: "new",
   name: "New release",
@@ -74,17 +81,18 @@ async function catalog(
   page: Page,
   job?: Record<string, unknown>,
   type = "mod",
+  platform = "curseforge",
 ) {
   await page.route(/\/api\/launchpad(?:\?.*)?$/, (route) =>
     route.fulfill({
       json: {
         platforms: [
           {
-            id: "curseforge",
-            name: "CurseForge",
+            id: platform,
+            name: platform === "modrinth" ? "Modrinth" : "CurseForge",
             available: true,
             types: [type],
-            sortOptions: sorts,
+            sortOptions: platform === "modrinth" ? modrinthSorts : sorts,
           },
         ],
         status: "offline",
@@ -642,16 +650,314 @@ test("catalog exposes supported CurseForge sort choices and sends the selected o
   });
   await page.goto("/#launchpad");
   const sort = page.getByLabel("Sort Launchpad", { exact: true });
-  await expect(sort.locator("option:not([disabled])")).toHaveText(
+  await expect(sort.locator("option")).toHaveText(
     sorts.map(({ label }) => label),
   );
+  await expect(sort.locator("option:disabled")).toHaveCount(0);
   await expect(
     sort.getByRole("option", { name: "Relevancy", exact: true }),
-  ).toHaveAttribute("disabled", "");
+  ).toHaveCount(0);
   for (const { id } of sorts) {
     await sort.selectOption(id);
     await expect.poll(() => searches.at(-1)?.searchParams.get("sort")).toBe(id);
   }
+});
+
+test("Modrinth shows only supported catalog sorts, headers and category children", async ({
+  page,
+}) => {
+  await catalog(page, undefined, "mod", "modrinth");
+  const searches: URL[] = [];
+  await page.route("**/api/launchpad/search?**", (route) => {
+    const url = new URL(route.request().url());
+    searches.push(url);
+    const offset = Number(url.searchParams.get("offset"));
+    const limit = Number(url.searchParams.get("limit"));
+    return route.fulfill({
+      json: {
+        projects: Array.from(
+          { length: Math.min(limit, 23 - offset) },
+          (_, index) => ({
+            id: `result-${offset + index}`,
+            platform: "modrinth",
+            title: `Result ${offset + index + 1}`,
+            description: "Provider-backed catalog result",
+          }),
+        ),
+        total: 23,
+        offset,
+        limit,
+      },
+    });
+  });
+  await page.goto("/#launchpad");
+  const sort = page.getByLabel("Sort Launchpad", { exact: true });
+  await expect(sort.locator("option")).toHaveText(
+    modrinthSorts.map(({ label }) => label),
+  );
+  await expect(sort.locator("option:disabled")).toHaveCount(0);
+  const header = page.getByRole("group", {
+    name: "Sort catalog content columns",
+  });
+  await expect(header.getByRole("button")).toHaveText([
+    "Date added",
+    "Date modified",
+  ]);
+  await expect(
+    header.getByRole("button", { name: "Sort by Name", exact: true }),
+  ).toHaveCount(0);
+  await expect(
+    header.getByRole("button", { name: "Sort by Author", exact: true }),
+  ).toHaveCount(0);
+  await expect(
+    header.getByRole("button", { name: "Sort by Active", exact: true }),
+  ).toHaveCount(0);
+  await page
+    .getByRole("button", { name: "Next Launchpad page", exact: true })
+    .click();
+  await expect
+    .poll(() => searches.at(-1)?.searchParams.get("offset"))
+    .toBe("10");
+  await header
+    .getByRole("button", { name: "Sort by Date added", exact: true })
+    .click();
+  await expect
+    .poll(() => Object.fromEntries(searches.at(-1)?.searchParams ?? []))
+    .toMatchObject({ sort: "newest", offset: "0" });
+  await expect(sort).toHaveValue("newest");
+  await header
+    .getByRole("button", { name: "Sort by Date modified", exact: true })
+    .click();
+  await expect
+    .poll(() => searches.at(-1)?.searchParams.get("sort"))
+    .toBe("updated");
+  await page.getByRole("button", { name: /^Filters/ }).click();
+  const filters = page.getByRole("region", { name: "Category filters" });
+  await expect(
+    filters.getByRole("checkbox", { name: "Addons", exact: true }),
+  ).toHaveCount(0);
+  await expect(
+    filters.getByRole("checkbox", { name: "Bug Fixes", exact: true }),
+  ).toHaveCount(0);
+  await expect(
+    filters.getByRole("checkbox", { name: "Technology", exact: true }),
+  ).toBeEnabled();
+  await filters
+    .getByRole("button", { name: "Expand Technology", exact: true })
+    .click();
+  await expect(
+    filters.getByRole("checkbox", { name: "Automation", exact: true }),
+  ).toHaveCount(0);
+  await expect(
+    filters.getByRole("checkbox", { name: "Energy", exact: true }),
+  ).toHaveCount(0);
+  await expect(
+    filters.getByRole("checkbox", { name: "Player Transport", exact: true }),
+  ).toBeEnabled();
+  await filters
+    .getByRole("button", { name: "Expand World Gen", exact: true })
+    .click();
+  await expect(
+    filters.getByRole("checkbox", { name: "Biomes", exact: true }),
+  ).toHaveCount(0);
+  await expect(
+    filters.getByRole("checkbox", { name: "Structures", exact: true }),
+  ).toHaveCount(0);
+  await expect(
+    filters.getByRole("checkbox", { name: "Mobs", exact: true }),
+  ).toBeEnabled();
+  await expect(filters.locator("input:disabled")).toHaveCount(0);
+  await filters
+    .getByRole("checkbox", { name: "Player Transport", exact: true })
+    .check();
+  await expect
+    .poll(() => searches.at(-1)?.searchParams.get("categories"))
+    .toBe("player-transport");
+  await filters.getByRole("checkbox", { name: "Mobs", exact: true }).check();
+  await expect
+    .poll(() =>
+      searches.at(-1)?.searchParams.get("categories")?.split(",").sort(),
+    )
+    .toEqual(["mobs", "player-transport"]);
+});
+
+test("catalog and installed rows share columns with compact headers and update versions below their action", async ({
+  page,
+}, testInfo) => {
+  await page.setViewportSize({ width: 1920, height: 1080 });
+  await catalog(page);
+  const entry = { ...installed("Alpha", true, true), author: "Mod Maker" };
+  const published = "2025-12-01T12:00:00.000Z";
+  const updated = "2026-10-30T16:00:00.000Z";
+  const searches: URL[] = [];
+  await page.route("**/api/launchpad/installed?**", (route) =>
+    route.fulfill({ json: { items: [entry], warnings: [] } }),
+  );
+  await page.route("**/api/launchpad/search?**", (route) => {
+    const url = new URL(route.request().url());
+    searches.push(url);
+    return route.fulfill({
+      json: {
+        projects: [
+          {
+            id: "Zulu",
+            platform: "curseforge",
+            title: "Zulu",
+            description: "Uninstalled project",
+            author: "Another Author",
+            releasedAt: published,
+            updatedAt: updated,
+          },
+          {
+            id: "Alpha",
+            platform: "curseforge",
+            title: "Alpha",
+            description: "Installed project",
+            author: "Mod Maker",
+            releasedAt: published,
+            updatedAt: updated,
+          },
+        ],
+        total: 2,
+        offset: 0,
+        limit: 10,
+      },
+    });
+  });
+  await page.goto("/#launchpad");
+  const header = page.getByRole("group", {
+    name: "Sort catalog content columns",
+  });
+  const row = page.getByRole("article", { name: "Alpha", exact: true });
+  await expect(header).toBeVisible();
+  await expect(header.getByText("Remove", { exact: true })).toHaveCount(0);
+  await expect(header.getByRole("button")).toHaveText([
+    "Name",
+    "Author",
+    "Date added",
+    "Date modified",
+  ]);
+  await expect(
+    row.getByRole("switch", { name: "Active: Alpha", exact: true }),
+  ).toBeChecked();
+  await expect(
+    page
+      .getByRole("article", { name: "Zulu", exact: true })
+      .getByRole("switch"),
+  ).toHaveCount(0);
+  await expect(
+    row.getByRole("button", { name: "Remove Alpha", exact: true }),
+  ).toBeVisible();
+  await expect(row.getByText("100 B", { exact: true })).toHaveCount(0);
+  await expect(row.locator(".launchpad-project-meta")).not.toContainText(
+    "Available:",
+  );
+  const action = row.locator(".launchpad-version-action");
+  const updateButton = action.getByRole("button", {
+    name: "Update Alpha",
+    exact: true,
+  });
+  const available = action.getByText("Available: 2.0", { exact: true });
+  await expect(updateButton).toBeVisible();
+  await expect(available).toBeVisible();
+  const buttonBounds = await updateButton.boundingBox();
+  const versionBounds = await available.boundingBox();
+  expect(versionBounds!.y).toBeGreaterThanOrEqual(
+    buttonBounds!.y + buttonBounds!.height,
+  );
+  await expect(row.locator(`time[datetime="${published}"]`)).toBeVisible();
+  await expect(row.locator(`time[datetime="${updated}"]`)).toBeVisible();
+  const catalogColumns = await header.evaluate(
+    (element) => getComputedStyle(element).gridTemplateColumns,
+  );
+  await expect(row).toHaveCSS("grid-template-columns", catalogColumns);
+  const assertTightArrows = async (mode: "catalog" | "installed") => {
+    const gaps = await page
+      .getByRole("group", { name: `Sort ${mode} content columns` })
+      .getByRole("button")
+      .evaluateAll((buttons) =>
+        buttons.map((button) => {
+          const text = Array.from(button.childNodes).find(
+            (node) =>
+              node.nodeType === Node.TEXT_NODE && node.textContent?.trim(),
+          );
+          const icon = button.querySelector("svg");
+          if (!text || !icon) return Number.NaN;
+          const range = document.createRange();
+          range.selectNode(text);
+          return (
+            icon.getBoundingClientRect().left -
+            range.getBoundingClientRect().right
+          );
+        }),
+      );
+    expect(gaps.length).toBeGreaterThan(0);
+    for (const gap of gaps) {
+      expect(gap).toBeGreaterThanOrEqual(3);
+      expect(gap).toBeLessThanOrEqual(10);
+    }
+  };
+  await assertTightArrows("catalog");
+  await header
+    .getByRole("button", { name: "Sort by Name", exact: true })
+    .click();
+  await expect
+    .poll(() => searches.at(-1)?.searchParams.get("sort"))
+    .toBe("name");
+  await expect(
+    page.getByRole("article").getByRole("heading", { level: 3 }),
+  ).toHaveText(["Zulu", "Alpha"]);
+  await page.screenshot({
+    path: testInfo.outputPath("catalog-cleanup-desktop.png"),
+    fullPage: true,
+  });
+  await page.setViewportSize({ width: 390, height: 844 });
+  await expect
+    .poll(() =>
+      page.evaluate(() => document.documentElement.scrollWidth - innerWidth),
+    )
+    .toBeLessThanOrEqual(0);
+  await page.screenshot({
+    path: testInfo.outputPath("catalog-cleanup-mobile.png"),
+    fullPage: true,
+  });
+  await page.setViewportSize({ width: 1920, height: 1080 });
+  await page.getByRole("switch", { name: "Show installed content" }).check();
+  const installedHeader = page.getByRole("group", {
+    name: "Sort installed content columns",
+  });
+  await expect(installedHeader).toHaveCSS(
+    "grid-template-columns",
+    catalogColumns,
+  );
+  await expect(row).toHaveCSS("grid-template-columns", catalogColumns);
+  await expect(
+    installedHeader.getByText("Remove", { exact: true }),
+  ).toHaveCount(0);
+  await expect(row.getByText("100 B", { exact: true })).toHaveCount(0);
+  await expect(row.locator(".launchpad-project-meta")).not.toContainText(
+    "Available:",
+  );
+  await expect(available).toBeVisible();
+  await expect(row.locator(`time[datetime="${entry.addedAt}"]`)).toBeVisible();
+  await expect(
+    row.locator(`time[datetime="${entry.modifiedAt}"]`),
+  ).toBeVisible();
+  await assertTightArrows("installed");
+  await page.screenshot({
+    path: testInfo.outputPath("installed-cleanup-desktop.png"),
+    fullPage: true,
+  });
+  await page.setViewportSize({ width: 390, height: 844 });
+  await expect
+    .poll(() =>
+      page.evaluate(() => document.documentElement.scrollWidth - innerWidth),
+    )
+    .toBeLessThanOrEqual(0);
+  await page.screenshot({
+    path: testInfo.outputPath("installed-cleanup-mobile.png"),
+    fullPage: true,
+  });
 });
 
 test("category filters expose Technology and World Gen children and reset catalog pagination", async ({

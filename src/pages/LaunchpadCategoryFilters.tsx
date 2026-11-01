@@ -18,6 +18,15 @@ export default function LaunchpadCategoryFilters({
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
   const root = useRef<HTMLDivElement>(null);
   const trigger = useRef<HTMLButtonElement>(null);
+  const availableCategories = modCategories
+    .map((category) => ({
+      ...category,
+      supported: !platform || supportsCategory(category.id, platform),
+      children: category.children?.filter(
+        (child) => !platform || supportsCategory(child.id, platform),
+      ),
+    }))
+    .filter((category) => category.supported || category.children?.length);
   useEffect(() => {
     if (!open) return;
     const outside = (event: PointerEvent) => {
@@ -37,21 +46,16 @@ export default function LaunchpadCategoryFilters({
     };
   }, [open]);
   function row(category: { id: string; label: string }, child = false) {
-    const supported = !platform || supportsCategory(category.id, platform);
     const checked = selected.includes(category.id);
     return (
       <label
         className={`launchpad-category-choice${child ? " child" : ""}`}
-        title={
-          !supported
-            ? "This category is not available on this platform."
-            : category.label
-        }
+        title={category.label}
       >
         <input
           type="checkbox"
           checked={checked}
-          disabled={!supported || (!checked && selected.length >= 10)}
+          disabled={!checked && selected.length >= 10}
           onChange={() =>
             onChange(
               checked
@@ -108,10 +112,16 @@ export default function LaunchpadCategoryFilters({
           </div>
           <p>Match any selected category.</p>
           <div className="launchpad-category-list">
-            {modCategories.map((category) => (
+            {availableCategories.map((category) => (
               <div key={category.id}>
                 <div className="launchpad-category-row">
-                  {row(category)}
+                  {category.supported ? (
+                    row(category)
+                  ) : (
+                    <span className="launchpad-category-choice">
+                      {category.label}
+                    </span>
+                  )}
                   {category.children?.length ? (
                     <button
                       className="btn icon"
@@ -142,9 +152,6 @@ export default function LaunchpadCategoryFilters({
               </div>
             ))}
           </div>
-          {platform && platform !== "curseforge" && (
-            <p>Unavailable categories are dimmed for this platform.</p>
-          )}
           {selected.length >= 10 && <p>Up to 10 categories can be selected.</p>}
         </section>
       )}

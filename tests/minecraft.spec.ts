@@ -1943,15 +1943,13 @@ test("Launchpad catalog sorting sends scoped choices and resets pagination with 
   );
   await page.getByLabel("Platform", { exact: true }).selectOption("curseforge");
   await expect(sort).toHaveValue("popular");
-  await expect(sort.locator("option:enabled")).toHaveText([
-    "Popularity",
-    "Total Downloads",
-    "Name",
+  await expect(sort.locator("option")).toHaveText([
+    "Most popular",
+    "Most downloaded",
+    "Name (A–Z)",
   ]);
-  await expect(sort.locator('option[value="relevance"]')).toHaveAttribute(
-    "disabled",
-    "",
-  );
+  await expect(sort.locator('option[value="relevance"]')).toHaveCount(0);
+  await expect(sort.locator("option:disabled")).toHaveCount(0);
   await expect.poll(lastSearch).toMatchObject({
     platform: "curseforge",
     sort: "popular",

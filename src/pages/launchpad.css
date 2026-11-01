@@ -293,8 +293,8 @@
 .launchpad-column-heading {
   display: flex;
   align-items: center;
-  justify-content: space-between;
-  gap: 8px;
+  justify-content: flex-start;
+  gap: 6px;
   padding: 4px 0;
   background: transparent;
   color: inherit;
@@ -372,6 +372,20 @@
 .launchpad-installed-row .launchpad-project-action .btn {
   min-width: 0;
   width: 100%;
+}
+.launchpad-version-action {
+  display: grid;
+  gap: 7px;
+  min-width: 0;
+}
+.launchpad-available-version {
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+.launchpad-empty-cell {
+  color: var(--muted);
 }
 .launchpad-installed-author {
   color: var(--muted);
