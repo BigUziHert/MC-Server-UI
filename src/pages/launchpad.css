@@ -106,6 +106,7 @@
 }
 .launchpad-result-count {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   gap: 9px;
   color: var(--muted);
@@ -129,6 +130,25 @@
   padding: 20px;
   border-left: 3px solid var(--border);
   min-width: 0;
+}
+.launchpad-project-list {
+  display: grid;
+  gap: 12px;
+  min-width: 0;
+}
+.launchpad-project-main {
+  display: contents;
+}
+.launchpad-sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+  border: 0;
 }
 .launchpad-project-icon {
   display: grid;
@@ -221,27 +241,157 @@
   min-width: 0;
 }
 .launchpad-active {
-  flex-direction: column-reverse;
-  gap: 7px;
-  min-width: 52px;
-  align-self: flex-end;
-  padding: 0 4px 7px;
-  font-size: 11px;
+  justify-self: center;
+}
+.launchpad-active > span:last-child {
+  display: none;
 }
 .launchpad-active .shared-switch-track {
   flex: none;
 }
-.launchpad-modified {
+.launchpad-installed-list {
+  --installed-columns: minmax(280px, 1fr) 104px minmax(120px, 0.35fr) 80px 130px
+    130px;
+  --installed-areas: "name action author remove added modified";
+  min-width: 0;
+  max-width: 100%;
+  overflow-x: auto;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--panel);
+}
+.launchpad-installed-list.has-active {
+  --installed-columns: minmax(280px, 1fr) 104px minmax(120px, 0.35fr) 60px 80px
+    130px 130px;
+  --installed-areas: "name action author active remove added modified";
+}
+.launchpad-installed-list:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 3px;
+}
+.launchpad-installed-header,
+.launchpad-installed-list .launchpad-installed-row {
+  display: grid;
+  grid-template-columns: var(--installed-columns);
+  grid-template-areas: var(--installed-areas);
+  align-items: center;
+  column-gap: 16px;
+  min-width: 960px;
+  padding: 16px;
+}
+.launchpad-installed-list.has-active .launchpad-installed-header,
+.launchpad-installed-list.has-active .launchpad-installed-row {
+  min-width: 1036px;
+}
+.launchpad-installed-header {
+  background: #292a35;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 600;
+  padding-block: 12px;
+}
+.launchpad-column-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 4px 0;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+  font: inherit;
+  text-align: left;
+  white-space: nowrap;
+}
+.launchpad-column-heading:hover,
+.launchpad-column-heading[aria-pressed="true"] {
+  color: var(--accent);
+}
+.launchpad-column-heading:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 3px;
+}
+.launchpad-column-heading svg {
+  flex: 0 0 auto;
+}
+.launchpad-column-name,
+.launchpad-installed-row .launchpad-project-main {
+  grid-area: name;
+}
+.launchpad-column-action,
+.launchpad-installed-row .launchpad-version-action {
+  grid-area: action;
+}
+.launchpad-column-author,
+.launchpad-installed-author {
+  grid-area: author;
+}
+.launchpad-column-active,
+.launchpad-installed-row .launchpad-active {
+  grid-area: active;
+}
+.launchpad-column-remove,
+.launchpad-installed-row .launchpad-remove {
+  grid-area: remove;
+}
+.launchpad-column-added,
+.launchpad-date-added {
+  grid-area: added;
+}
+.launchpad-column-modified,
+.launchpad-date-modified {
+  grid-area: modified;
+}
+.launchpad-installed-list .launchpad-installed-row {
+  border: 0;
+  border-top: 1px solid var(--border);
+  border-radius: 0;
+  background: transparent;
+  overflow: visible;
+}
+.launchpad-installed-row .launchpad-project-main {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  min-width: 0;
+}
+.launchpad-installed-row .launchpad-project-icon {
+  width: 44px;
+  height: 44px;
+  flex-basis: 44px;
+}
+.launchpad-installed-row .launchpad-project-title h3 {
+  font-size: 13px;
+}
+.launchpad-installed-row .launchpad-project-body p {
+  margin: 5px 0 8px;
+}
+.launchpad-installed-row .launchpad-project-action {
+  display: contents;
+}
+.launchpad-installed-row .launchpad-project-action .btn {
+  min-width: 0;
+  width: 100%;
+}
+.launchpad-installed-author {
+  color: var(--muted);
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+.launchpad-installed-date {
+  position: relative;
+  color: var(--muted);
+  font-size: 11px;
+}
+.launchpad-installed-date time {
   display: grid;
   gap: 5px;
-  align-self: flex-end;
-  padding: 0 0 4px 5px;
-  font-size: 11px;
-  color: var(--muted);
-}
-.launchpad-modified time {
-  color: var(--text);
   white-space: nowrap;
+  color: var(--text);
+}
+.launchpad-installed-date small {
+  color: var(--muted);
+  font-size: inherit;
 }
 .launchpad-category-filters {
   position: static;
@@ -689,10 +839,6 @@
   .launchpad-category-panel {
     right: auto;
     left: 0;
-  }
-  .launchpad-modified {
-    width: 100%;
-    padding-top: 4px;
   }
   .launchpad-error,
   .launchpad-inline-notice {

@@ -71,6 +71,17 @@ const fileStamp = (stat) =>
     stat.ctimeMs,
     stat.birthtimeMs,
   ].join(":");
+// Creation time tracks this local file, including manually added mods. Some
+// filesystems do not expose birthtime; use their modification time as a fallback.
+const fileAddedAt = (stat) => {
+  const milliseconds =
+    Number.isFinite(stat?.birthtimeMs) && stat.birthtimeMs > 0
+      ? stat.birthtimeMs
+      : stat?.mtimeMs;
+  return Number.isFinite(milliseconds)
+    ? new Date(milliseconds).toISOString()
+    : undefined;
+};
 function abortable(work, signal) {
   if (!signal) return work;
   return new Promise((resolve, reject) => {
@@ -511,6 +522,7 @@ export async function createLaunchpad(ctx) {
   const activation = createModActivation({
     serverDir,
     safePath,
+    fileAddedAt,
     getServer,
     withMinecraftMutation,
     signal: lifetime.signal,
@@ -896,6 +908,7 @@ export async function createLaunchpad(ctx) {
               ? { active: !/\.disabled$/i.test(file.name) }
               : {}),
             modifiedAt: stat?.mtime.toISOString(),
+            addedAt: fileAddedAt(stat),
           };
           return;
         }
@@ -924,6 +937,7 @@ export async function createLaunchpad(ctx) {
             ? { active: !/\.disabled$/i.test(file.name) }
             : {}),
           modifiedAt: stat.mtime.toISOString(),
+          addedAt: fileAddedAt(stat),
         };
       },
       signal,
@@ -1445,7 +1459,11 @@ export async function createLaunchpad(ctx) {
       input.type === "modpack"
         ? receipts
             .filter((item) => item.type === "modpack" && item.pack)
-            .map((item) => ({ ...item, name: item.title }))
+            .map((item) => ({
+              ...item,
+              name: item.title,
+              addedAt: item.installedAt,
+            }))
         : await scan(
             input.type,
             input.signal,

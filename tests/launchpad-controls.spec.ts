@@ -64,12 +64,17 @@ const installed = (title: string, active = true, update = false) => ({
   versionId: "old",
   versionName: "1.0",
   active,
+  addedAt: "2026-10-20T12:00:00.000Z",
   modifiedAt: "2026-10-31T17:25:00.000Z",
   update: update ? version : null,
   updateCheck: "checked",
 });
 
-async function catalog(page: Page, job?: Record<string, unknown>) {
+async function catalog(
+  page: Page,
+  job?: Record<string, unknown>,
+  type = "mod",
+) {
   await page.route(/\/api\/launchpad(?:\?.*)?$/, (route) =>
     route.fulfill({
       json: {
@@ -78,7 +83,7 @@ async function catalog(page: Page, job?: Record<string, unknown>) {
             id: "curseforge",
             name: "CurseForge",
             available: true,
-            types: ["mod"],
+            types: [type],
             sortOptions: sorts,
           },
         ],
@@ -242,17 +247,23 @@ test("installed mod controls display file modification time and toggle activity 
   const row = page.getByRole("article", { name: "Example", exact: true });
   const active = row.getByRole("switch");
   await expect(active).toBeChecked();
-  await expect(row).toContainText(/Date modified/i);
-  await expect(row.locator("time")).toHaveAttribute(
-    "datetime",
-    item.modifiedAt,
-  );
+  await expect(
+    page.getByRole("button", { name: "Sort by Date modified", exact: true }),
+  ).toBeVisible();
+  await expect(row.locator(`time[datetime="${item.addedAt}"]`)).toBeVisible();
+  await expect(
+    row.locator(`time[datetime="${item.modifiedAt}"]`),
+  ).toHaveAttribute("datetime", item.modifiedAt);
   await active.click();
   await expect(active).not.toBeChecked();
   await expect(row).toContainText("mods/Example.jar.disabled");
   await active.click();
   await expect(active).toBeChecked();
   await expect(row).toContainText("mods/Example.jar");
+  await expect(row.locator(`time[datetime="${item.addedAt}"]`)).toBeVisible();
+  await expect(
+    row.locator(`time[datetime="${item.modifiedAt}"]`),
+  ).toBeVisible();
   expect(requests).toEqual([
     { path: "mods/Example.jar", active: false },
     { path: "mods/Example.jar.disabled", active: true },
@@ -265,23 +276,81 @@ test("installed mod controls display file modification time and toggle activity 
   await page.setViewportSize({ width: 390, height: 844 });
   await expect
     .poll(() =>
-      page.evaluate(() => document.documentElement.scrollWidth <= innerWidth),
+      page.evaluate(() => document.documentElement.scrollWidth - innerWidth),
     )
-    .toBe(true);
+    .toBeLessThanOrEqual(0);
   await page.screenshot({
     path: testInfo.outputPath("installed-mobile.png"),
     fullPage: true,
   });
 });
 
-test("installed sorting keeps Updates first first and sorts active mods before disabled mods", async ({
+test("installed modpacks display both shared date columns", async ({
   page,
 }) => {
+  await catalog(page, undefined, "modpack");
+  const pack = {
+    ...installed("Example Pack"),
+    path: ".launchpad/modpack",
+    name: "Example Pack",
+  };
+  await page.route("**/api/launchpad/installed?**", (route) =>
+    route.fulfill({ json: { items: [pack], warnings: [] } }),
+  );
+  await page.goto("/#launchpad");
+  await page.getByRole("switch", { name: "Show installed content" }).check();
+  const row = page.getByRole("article", { name: "Example Pack", exact: true });
+  await expect(
+    page.getByRole("button", { name: "Sort by Date added", exact: true }),
+  ).toBeVisible();
+  await expect(
+    page.getByRole("button", { name: "Sort by Date modified", exact: true }),
+  ).toBeVisible();
+  await expect(row.locator(`time[datetime="${pack.addedAt}"]`)).toBeVisible();
+  await expect(
+    row.locator(`time[datetime="${pack.modifiedAt}"]`),
+  ).toBeVisible();
+  await expect(row.getByRole("switch")).toHaveCount(0);
+});
+
+test("installed column headers reverse sorting while updates stay first across pages", async ({
+  page,
+  serverId,
+}, testInfo) => {
   await catalog(page);
+  await page.addInitScript((id) => {
+    sessionStorage.setItem(
+      `mc-panel.launchpad.view.${id}`,
+      JSON.stringify({
+        type: "mod",
+        installedOnly: true,
+        installedSort: "updates",
+      }),
+    );
+  }, serverId);
+  const item = (
+    title: string,
+    active: boolean,
+    update: boolean,
+    author: string,
+    day: number,
+  ) => ({
+    ...installed(title, active, update),
+    author,
+    addedAt: `2026-10-${String(day).padStart(2, "0")}T12:00:00.000Z`,
+  });
   await page.route("**/api/launchpad/installed?**", (route) =>
     route.fulfill({
       json: {
-        items: [installed("Alpha", false, true), installed("Zulu")],
+        items: [
+          item("Cedar", false, true, "Delta", 3),
+          item("Bravo", true, false, "Charlie", 4),
+          item("Alpha", true, true, "Zeta", 1),
+          item("Echo", false, false, "Alpha", 5),
+          item("Zulu", true, true, "Beta", 2),
+          item("Delta", true, false, "Echo", 6),
+          item("Foxtrot", false, false, "Foxtrot", 7),
+        ],
         warnings: [],
       },
     }),
@@ -289,11 +358,244 @@ test("installed sorting keeps Updates first first and sorts active mods before d
   await page.goto("/#launchpad");
   await page.getByRole("switch", { name: "Show installed content" }).check();
   const sort = page.getByLabel("Sort installed content", { exact: true });
-  await expect(sort.locator("option").first()).toHaveText(/Updates first/i);
-  await expect(sort).toHaveValue("updates");
-  await expect(page.getByRole("article").first()).toHaveAccessibleName("Alpha");
-  await sort.selectOption({ label: "Active" });
-  await expect(page.getByRole("article").first()).toHaveAccessibleName("Zulu");
+  await expect(sort.locator('option[value="updates"]')).toHaveCount(0);
+  await expect(sort).toHaveValue("name");
+  const headers = page.getByRole("group", {
+    name: "Sort installed content columns",
+  });
+  const name = headers.getByRole("button", {
+    name: "Sort by Name",
+    exact: true,
+  });
+  const author = headers.getByRole("button", {
+    name: "Sort by Author",
+    exact: true,
+  });
+  const active = headers.getByRole("button", {
+    name: "Sort by Active",
+    exact: true,
+  });
+  const added = headers.getByRole("button", {
+    name: "Sort by Date added",
+    exact: true,
+  });
+  await expect(name).toHaveAttribute("aria-pressed", "true");
+  await expect(name).toHaveAttribute(
+    "aria-description",
+    "Ascending. Updates always appear first.",
+  );
+  await expect(
+    page.getByRole("article").getByText("Active", { exact: true }),
+  ).toHaveCount(0);
+  await page
+    .getByLabel("Launchpad rows per page", { exact: true })
+    .selectOption("5");
+  const names = page.getByRole("article").getByRole("heading", { level: 3 });
+  const pagination = page.getByRole("status", { name: "Launchpad page" });
+  const next = page.getByRole("button", {
+    name: "Next Launchpad page",
+    exact: true,
+  });
+  async function checkOrder(expected: string[]) {
+    await expect(pagination).toHaveText("Page 1 of 2");
+    await expect(names).toHaveText(expected.slice(0, 5));
+    await expect(
+      page.getByRole("article").getByRole("button", { name: /^Update / }),
+    ).toHaveCount(3);
+    await next.click();
+    await expect(pagination).toHaveText("Page 2 of 2");
+    await expect(names).toHaveText(expected.slice(5));
+    await expect(
+      page.getByRole("article").getByRole("button", { name: /^Update / }),
+    ).toHaveCount(0);
+  }
+  await checkOrder([
+    "Alpha",
+    "Cedar",
+    "Zulu",
+    "Bravo",
+    "Delta",
+    "Echo",
+    "Foxtrot",
+  ]);
+  await name.click();
+  await expect(name).toHaveAttribute(
+    "aria-description",
+    "Descending. Updates always appear first.",
+  );
+  await checkOrder([
+    "Zulu",
+    "Cedar",
+    "Alpha",
+    "Foxtrot",
+    "Echo",
+    "Delta",
+    "Bravo",
+  ]);
+  await name.click();
+  await expect(name).toHaveAttribute(
+    "aria-description",
+    "Ascending. Updates always appear first.",
+  );
+  await checkOrder([
+    "Alpha",
+    "Cedar",
+    "Zulu",
+    "Bravo",
+    "Delta",
+    "Echo",
+    "Foxtrot",
+  ]);
+  await author.click();
+  await expect(sort).toHaveValue("author");
+  await expect(author).toHaveAttribute(
+    "aria-description",
+    "Ascending. Updates always appear first.",
+  );
+  await checkOrder([
+    "Zulu",
+    "Cedar",
+    "Alpha",
+    "Echo",
+    "Bravo",
+    "Delta",
+    "Foxtrot",
+  ]);
+  await author.click();
+  await expect(author).toHaveAttribute(
+    "aria-description",
+    "Descending. Updates always appear first.",
+  );
+  await checkOrder([
+    "Alpha",
+    "Cedar",
+    "Zulu",
+    "Foxtrot",
+    "Delta",
+    "Bravo",
+    "Echo",
+  ]);
+  await active.click();
+  await expect(sort).toHaveValue("active");
+  await expect(active).toHaveAttribute(
+    "aria-description",
+    "Descending. Updates always appear first.",
+  );
+  await checkOrder([
+    "Alpha",
+    "Zulu",
+    "Cedar",
+    "Bravo",
+    "Delta",
+    "Echo",
+    "Foxtrot",
+  ]);
+  await active.click();
+  await expect(active).toHaveAttribute(
+    "aria-description",
+    "Ascending. Updates always appear first.",
+  );
+  await checkOrder([
+    "Cedar",
+    "Alpha",
+    "Zulu",
+    "Echo",
+    "Foxtrot",
+    "Bravo",
+    "Delta",
+  ]);
+  await added.click();
+  await expect(sort).toHaveValue("added");
+  await expect(added).toHaveAttribute(
+    "aria-description",
+    "Descending. Updates always appear first.",
+  );
+  await checkOrder([
+    "Cedar",
+    "Zulu",
+    "Alpha",
+    "Foxtrot",
+    "Delta",
+    "Echo",
+    "Bravo",
+  ]);
+  await added.click();
+  await expect(added).toHaveAttribute(
+    "aria-description",
+    "Ascending. Updates always appear first.",
+  );
+  await checkOrder([
+    "Alpha",
+    "Zulu",
+    "Cedar",
+    "Bravo",
+    "Echo",
+    "Delta",
+    "Foxtrot",
+  ]);
+  for (const value of await sort
+    .locator("option")
+    .evaluateAll((options) =>
+      options.map((option) => (option as HTMLOptionElement).value),
+    )) {
+    await sort.selectOption(value);
+    await expect(pagination).toHaveText("Page 1 of 2");
+    await expect
+      .poll(async () => (await names.allTextContents()).slice(0, 3).sort())
+      .toEqual(["Alpha", "Cedar", "Zulu"]);
+  }
+  await sort.selectOption("name");
+  await author.click();
+  await author.click();
+  await page.getByRole("link", { name: "Console", exact: true }).click();
+  await page.getByRole("link", { name: "Launchpad", exact: true }).click();
+  await expect(author).toHaveAttribute(
+    "aria-description",
+    "Descending. Updates always appear first.",
+  );
+  await expect(names).toHaveText([
+    "Alpha",
+    "Cedar",
+    "Zulu",
+    "Foxtrot",
+    "Delta",
+  ]);
+  await page.setViewportSize({ width: 1440, height: 960 });
+  await page.screenshot({
+    path: testInfo.outputPath("installed-columns-desktop.png"),
+    fullPage: true,
+  });
+  await page.setViewportSize({ width: 1920, height: 1080 });
+  await page.screenshot({
+    path: testInfo.outputPath("installed-columns-wide.png"),
+    fullPage: true,
+  });
+  await page.setViewportSize({ width: 390, height: 844 });
+  await expect
+    .poll(() =>
+      page.evaluate(() => document.documentElement.scrollWidth - innerWidth),
+    )
+    .toBeLessThanOrEqual(0);
+  await page.screenshot({
+    path: testInfo.outputPath("installed-columns-mobile.png"),
+    fullPage: true,
+  });
+  await added.click();
+  await expect(added).toHaveAttribute(
+    "aria-description",
+    "Descending. Updates always appear first.",
+  );
+  await expect(names).toHaveText([
+    "Cedar",
+    "Zulu",
+    "Alpha",
+    "Foxtrot",
+    "Delta",
+  ]);
+  await page.screenshot({
+    path: testInfo.outputPath("installed-columns-mobile-dates.png"),
+    fullPage: true,
+  });
 });
 
 test("a failed activation request leaves the mod's existing state visible", async ({
@@ -476,7 +778,7 @@ test("category filters expose Technology and World Gen children and reset catalo
   });
 });
 
-test("installed category filters include matching descendants and preserve Updates first", async ({
+test("installed category filters include matching descendants and preserve the selected sort", async ({
   page,
 }) => {
   await catalog(page);
@@ -506,5 +808,5 @@ test("installed category filters include matching descendants and preserve Updat
   );
   await expect(
     page.getByLabel("Sort installed content", { exact: true }),
-  ).toHaveValue("updates");
+  ).toHaveValue("name");
 });

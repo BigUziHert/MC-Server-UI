@@ -9,6 +9,9 @@ import {
 import {
   AlertCircle,
   ArrowRight,
+  ArrowUp,
+  ArrowDown,
+  ArrowUpDown,
   Check,
   Download,
   FileCode2,
@@ -101,6 +104,7 @@ type InstalledItem = {
   updateIssue?: string;
   active?: boolean;
   modifiedAt?: string;
+  addedAt?: string;
   categories?: string[];
   mainCategory?: string;
   downloads?: number;
@@ -274,8 +278,12 @@ const catalogSortChoices = [
   { id: "author", label: "Author" },
 ];
 const installedSortOptions = [
-  { id: "updates", label: "Updates first" },
+  { id: "name", label: "Name" },
+  { id: "author", label: "Author" },
   { id: "active", label: "Active" },
+  { id: "added", label: "Date added" },
+  { id: "modified", label: "Date modified" },
+  { id: "size", label: "Size" },
   { id: "featured", label: "Featured" },
   { id: "relevance", label: "Relevancy" },
   { id: "popular", label: "Popularity" },
@@ -284,12 +292,11 @@ const installedSortOptions = [
   { id: "downloads", label: "Total Downloads" },
   { id: "category", label: "Main Category" },
   { id: "gameVersion", label: "Game Version" },
-  { id: "name", label: "Name (A–Z)" },
-  { id: "size", label: "Size (largest first)" },
-  { id: "author", label: "Mod author (A–Z)" },
-  { id: "modified", label: "Date modified (newest first)" },
 ] as const;
 type InstalledSort = (typeof installedSortOptions)[number]["id"];
+type SortDirection = "asc" | "desc";
+const defaultInstalledDirection = (sort: InstalledSort): SortDirection =>
+  ["name", "author", "category"].includes(sort) ? "asc" : "desc";
 
 // Retain dismissals across page navigation, including a slow or offline remote
 // panel. Scope them to the server/account rather than hiding another panel's job.
@@ -310,6 +317,7 @@ type SavedView = {
   installedOnly?: boolean;
   sort?: string;
   installedSort?: InstalledSort;
+  installedDirection?: SortDirection;
   categories?: string[];
 };
 function readSavedView(key: string): SavedView {
@@ -342,6 +350,11 @@ function readSavedView(key: string): SavedView {
       )
         ? (values.installedSort as InstalledSort)
         : undefined,
+      installedDirection:
+        values.installedDirection === "asc" ||
+        values.installedDirection === "desc"
+          ? values.installedDirection
+          : undefined,
       categories: Array.isArray(values.categories)
         ? values.categories
             .filter(
@@ -360,6 +373,7 @@ function compareInstalled(
   a: InstalledItem,
   b: InstalledItem,
   sort: InstalledSort,
+  direction: SortDirection,
   query = "",
 ) {
   const alphabetical = (left: string, right: string) =>
@@ -367,16 +381,30 @@ function compareInstalled(
       sensitivity: "base",
       numeric: true,
     });
+  // Updates are a permanent first group. Direction only changes order inside
+  // each group, across the entire inventory before pagination.
+  const updates = Number(Boolean(b.update)) - Number(Boolean(a.update));
+  if (updates) return updates;
   let order = 0;
-  const date = (value?: string) => Date.parse(value ?? "") || 0;
+  const sign = direction === "asc" ? 1 : -1;
+  const date = (value?: string) =>
+    Number.isFinite(Date.parse(value ?? "")) ? Date.parse(value!) : undefined;
   const text = (left = "", right = "") =>
-    Number(!left) - Number(!right) || alphabetical(left, right);
-  if (sort === "updates") {
-    order = Number(Boolean(b.update)) - Number(Boolean(a.update));
+    Number(!left) - Number(!right) || sign * alphabetical(left, right);
+  const number = (left?: number, right?: number) => {
+    const missingLeft = !Number.isFinite(left),
+      missingRight = !Number.isFinite(right);
+    return (
+      Number(missingLeft) - Number(missingRight) ||
+      (missingLeft ? 0 : sign * (left! - right!))
+    );
+  };
+  if (sort === "name") {
+    order = text(a.title?.trim() || a.name, b.title?.trim() || b.name);
   } else if (sort === "active") {
-    order = Number(b.active !== false) - Number(a.active !== false);
+    order = number(Number(a.active !== false), Number(b.active !== false));
   } else if (sort === "featured") {
-    order = Number(Boolean(b.featured)) - Number(Boolean(a.featured));
+    order = number(Number(Boolean(a.featured)), Number(Boolean(b.featured)));
   } else if (sort === "relevance" && query) {
     const score = (item: InstalledItem) => {
       const title = (item.title || item.name).toLowerCase();
@@ -388,21 +416,26 @@ function compareInstalled(
             ? 1
             : 0;
     };
-    order = score(b) - score(a);
+    order = number(score(a), score(b));
   } else if (sort === "downloads" || sort === "popular") {
     const score = (item: InstalledItem) =>
-      sort === "popular"
-        ? (item.follows ?? item.downloads ?? -1)
-        : (item.downloads ?? -1);
-    order = score(b) - score(a);
-  } else if (sort === "updated" || sort === "newest" || sort === "modified") {
+      sort === "popular" ? (item.follows ?? item.downloads) : item.downloads;
+    order = number(score(a), score(b));
+  } else if (
+    sort === "updated" ||
+    sort === "newest" ||
+    sort === "modified" ||
+    sort === "added"
+  ) {
     const key =
       sort === "updated"
         ? "updatedAt"
         : sort === "newest"
           ? "releasedAt"
-          : "modifiedAt";
-    order = date(b[key]) - date(a[key]);
+          : sort === "added"
+            ? "addedAt"
+            : "modifiedAt";
+    order = number(date(a[key]), date(b[key]));
   } else if (sort === "category") {
     const category = (item: InstalledItem) =>
       allModCategories.find((category) => category.id === item.mainCategory)
@@ -413,15 +446,15 @@ function compareInstalled(
       [...(item.gameVersions ?? [])].sort(alphabetical).at(-1) ?? "";
     const left = latest(a),
       right = latest(b);
-    order = Number(!left) - Number(!right) || alphabetical(right, left);
+    order = text(left, right);
   } else if (sort === "size") {
     const size = (item: InstalledItem) =>
-      Number.isFinite(item.size) && item.size >= 0 ? item.size : -1;
-    order = size(b) - size(a);
+      Number.isFinite(item.size) && item.size >= 0 ? item.size : undefined;
+    order = number(size(a), size(b));
   } else if (sort === "author") {
     const left = a.author?.trim() ?? "";
     const right = b.author?.trim() ?? "";
-    order = Number(!left) - Number(!right) || alphabetical(left, right);
+    order = text(left, right);
   }
   return (
     order ||
@@ -481,6 +514,42 @@ const queryString = (values: Record<string, string | number | undefined>) => {
     if (value !== undefined && value !== "") params.set(key, String(value));
   return params.toString();
 };
+function InstalledDate({
+  value,
+  kind,
+}: {
+  value?: string;
+  kind: "added" | "modified";
+}) {
+  const date = value ? new Date(value) : null;
+  return (
+    <div className={`launchpad-installed-date launchpad-date-${kind}`}>
+      <span className="launchpad-sr-only">
+        {kind === "added" ? "Date added: " : "Date modified: "}
+      </span>
+      {date && Number.isFinite(date.getTime()) ? (
+        <time dateTime={value} title={date.toLocaleString()}>
+          <span>
+            {date.toLocaleDateString(undefined, {
+              year: "numeric",
+              month: "short",
+              day: "numeric",
+            })}
+          </span>
+          <small>
+            {date.toLocaleTimeString(undefined, {
+              hour: "numeric",
+              minute: "2-digit",
+            })}
+          </small>
+        </time>
+      ) : (
+        <span>Unavailable</span>
+      )}
+    </div>
+  );
+}
+
 export function ProjectIcon({ url }: { url?: string | null }) {
   const [failed, setFailed] = useState<string | null>(null);
   const safe = url && /^https:\/\//i.test(url) ? url : null;
@@ -530,7 +599,9 @@ export default function Launchpad({
   const [query, setQuery] = useState("");
   const filteredQuery = useDebouncedValue(query, 150);
   const [sort, setSort] = useState("downloads");
-  const [installedSort, setInstalledSort] = useState<InstalledSort>("updates");
+  const [installedSort, setInstalledSort] = useState<InstalledSort>("name");
+  const [installedDirection, setInstalledDirection] =
+    useState<SortDirection>("asc");
   const [installedOnly, setInstalledOnly] = useState(false);
   const [categories, setCategories] = useState<string[]>([]);
   const categoryKey =
@@ -769,7 +840,11 @@ export default function Launchpad({
               ? saved.sort!
               : (first?.sortOptions?.[0]?.id ?? "downloads"),
           );
-          setInstalledSort(saved.installedSort ?? "updates");
+          setInstalledSort(saved.installedSort ?? "name");
+          setInstalledDirection(
+            saved.installedDirection ??
+              defaultInstalledDirection(saved.installedSort ?? "name"),
+          );
           setCategories(saved.categories ?? []);
           setViewReady(viewKey);
         }
@@ -905,7 +980,8 @@ export default function Launchpad({
     setApiKey("");
     setQuery("");
     setSort("downloads");
-    setInstalledSort("updates");
+    setInstalledSort("name");
+    setInstalledDirection("asc");
     setOffset(0);
     setInstalledOnly(false);
     setCategories([]);
@@ -954,6 +1030,7 @@ export default function Launchpad({
           installedOnly,
           sort,
           installedSort,
+          installedDirection,
           categories,
         }),
         "session",
@@ -972,6 +1049,7 @@ export default function Launchpad({
     installedOnly,
     sort,
     installedSort,
+    installedDirection,
     categories,
   ]);
 
@@ -1888,6 +1966,7 @@ export default function Launchpad({
         path: string;
         active: boolean;
         modifiedAt: string;
+        addedAt: string;
       }>("/launchpad/active", { path: entry.path, active });
       if (currentSession !== session.current) return;
       const previous = inventoryCache.current.get("mod");
@@ -1952,7 +2031,13 @@ export default function Launchpad({
         matchesCategories(entry.categories, categoryKey.split(",")),
     )
     .sort((a, b) =>
-      compareInstalled(a, b, installedSort, filteredQuery.trim().toLowerCase()),
+      compareInstalled(
+        a,
+        b,
+        installedSort,
+        installedDirection,
+        filteredQuery.trim().toLowerCase(),
+      ),
     );
   const total = installedOnly ? entries.length : (results?.total ?? 0);
   const currentOffset = Math.min(
@@ -2026,6 +2111,45 @@ export default function Launchpad({
         .filter(Boolean),
     ),
   ];
+
+  function installedHeading(id: InstalledSort, label: string, column: string) {
+    const selected = installedSort === id;
+    const nextDirection = selected
+      ? installedDirection === "asc"
+        ? "desc"
+        : "asc"
+      : defaultInstalledDirection(id);
+    return (
+      <button
+        type="button"
+        className={`launchpad-column-heading launchpad-column-${column}`}
+        aria-label={`Sort by ${label}`}
+        aria-pressed={selected}
+        aria-description={
+          selected
+            ? `${installedDirection === "asc" ? "Ascending" : "Descending"}. Updates always appear first.`
+            : "Updates always appear first."
+        }
+        title={`Sort ${label.toLowerCase()} ${nextDirection === "asc" ? "ascending" : "descending"}`}
+        onClick={() => {
+          setInstalledSort(id);
+          setInstalledDirection(nextDirection);
+          setOffset(0);
+        }}
+      >
+        {label}
+        {selected ? (
+          installedDirection === "asc" ? (
+            <ArrowUp size={13} />
+          ) : (
+            <ArrowDown size={13} />
+          )
+        ) : (
+          <ArrowUpDown size={13} />
+        )}
+      </button>
+    );
+  }
 
   if (!config)
     return (
@@ -2272,13 +2396,19 @@ export default function Launchpad({
           }}
         />
         {installedOnly ? (
-          <label className="launchpad-sort">
-            Sort by
+          <div className="launchpad-sort">
+            <label htmlFor="launchpad-installed-sort">Sort by</label>
             <select
+              id="launchpad-installed-sort"
               aria-label="Sort installed content"
               value={installedSort}
               onChange={(event) => {
                 setInstalledSort(event.target.value as InstalledSort);
+                setInstalledDirection(
+                  defaultInstalledDirection(
+                    event.target.value as InstalledSort,
+                  ),
+                );
                 setOffset(0);
               }}
             >
@@ -2288,7 +2418,29 @@ export default function Launchpad({
                 </option>
               ))}
             </select>
-          </label>
+            <button
+              type="button"
+              className="btn icon"
+              aria-label="Reverse installed sort order"
+              title={
+                installedDirection === "asc"
+                  ? "Ascending — click for descending"
+                  : "Descending — click for ascending"
+              }
+              onClick={() => {
+                setInstalledDirection((current) =>
+                  current === "asc" ? "desc" : "asc",
+                );
+                setOffset(0);
+              }}
+            >
+              {installedDirection === "asc" ? (
+                <ArrowUp size={14} />
+              ) : (
+                <ArrowDown size={14} />
+              )}
+            </button>
+          </div>
         ) : sortOptions.length > 0 ? (
           <label className="launchpad-sort">
             Sort by
@@ -2664,218 +2816,246 @@ export default function Launchpad({
               {installedOnly ? "installed items" : "projects"}
               {listedGameVersion ? ` · Minecraft ${listedGameVersion}` : ""}
               {listedLoader ? ` · ${loaderName(listedLoader)}` : ""}
+              {installedOnly && <span> · Updates always appear first.</span>}
             </div>
-            {visibleProjects.map(({ project, entry }) => (
-              <article
-                className="panel launchpad-project"
-                key={entry?.path ?? `${project.platform}:${project.id}`}
-                aria-label={project.title}
-              >
-                <ProjectIcon url={project.iconUrl} />
-                <div className="launchpad-project-body">
-                  <div className="launchpad-project-title">
-                    <h3>{project.title}</h3>
-                    {project.url && /^https:\/\//i.test(project.url) && (
-                      <a
-                        className="launchpad-project-link"
-                        href={project.url}
-                        target="_blank"
-                        rel="noopener noreferrer"
-                        aria-label={`Open ${project.title} project page`}
-                        title="Open project page"
-                      >
-                        <ExternalLink size={14} />
-                      </a>
-                    )}
-                    {entry && (
-                      <span className="launchpad-badge">
-                        {entry.platform && entry.projectId
-                          ? "Installed"
-                          : "Unidentified file"}
-                      </span>
-                    )}
-                    {entry?.update && (
-                      <span className="launchpad-badge update">
-                        Update available
-                      </span>
-                    )}
-                    {entry?.active === false && type === "mod" && (
-                      <span className="launchpad-badge">Disabled</span>
-                    )}
-                    {installedOnly && entry?.platform && (
-                      <span className="launchpad-badge">
-                        {config.platforms.find(
-                          (item) => item.id === entry.platform,
-                        )?.name ?? entry.platform}
-                      </span>
-                    )}
-                    {entry &&
-                      duplicateProjects.has(
-                        `${entry.platform}:${entry.projectId}`,
-                      ) && (
-                        <span className="launchpad-badge update">
-                          Duplicate — remove one
-                        </span>
-                      )}
-                    {entry && pendingPaths.has(entry.path) && (
-                      <span className="launchpad-badge">Refreshing file…</span>
-                    )}
-                  </div>
-                  <p>{project.description || "No description provided."}</p>
-                  <div className="launchpad-project-meta">
-                    {typeof project.downloads === "number" && (
-                      <span>
-                        <Download size={13} />
-                        {new Intl.NumberFormat(undefined, {
-                          notation: "compact",
-                          maximumFractionDigits: 1,
-                        }).format(project.downloads)}{" "}
-                        downloads
-                      </span>
-                    )}
-                    {project.author && <span>By {project.author}</span>}
-                    {entry?.versionName && (
-                      <span>Installed: {entry.versionName}</span>
-                    )}
-                    {entry?.update && (
-                      <span>
-                        Available: {entry.update.version || entry.update.name}
-                      </span>
-                    )}
-                    {entry && <span>{formatBytes(entry.size)}</span>}
-                    {entry &&
-                      updateCheckLabel(
-                        entry,
-                        updateFiltersReady,
-                        scanRefreshing,
-                      ) && (
-                        <span>
-                          {updateCheckLabel(
+            <div
+              className={
+                installedOnly
+                  ? `launchpad-installed-list${type === "mod" ? " has-active" : ""}`
+                  : "launchpad-project-list"
+              }
+              tabIndex={installedOnly ? 0 : undefined}
+              role={installedOnly ? "region" : undefined}
+              aria-label={installedOnly ? "Installed content list" : undefined}
+            >
+              {installedOnly && (
+                <div
+                  className="launchpad-installed-header"
+                  role="group"
+                  aria-label="Sort installed content columns"
+                >
+                  {installedHeading("name", "Name", "name")}
+                  <span className="launchpad-column-action">Action</span>
+                  {installedHeading("author", "Author", "author")}
+                  {type === "mod" &&
+                    installedHeading("active", "Active", "active")}
+                  <span className="launchpad-column-remove">Remove</span>
+                  {installedHeading("added", "Date added", "added")}
+                  {installedHeading("modified", "Date modified", "modified")}
+                </div>
+              )}
+              {visibleProjects.map(({ project, entry }) => (
+                <article
+                  className={`panel launchpad-project${installedOnly ? " launchpad-installed-row" : ""}`}
+                  key={entry?.path ?? `${project.platform}:${project.id}`}
+                  aria-label={project.title}
+                >
+                  <div className="launchpad-project-main">
+                    <ProjectIcon url={project.iconUrl} />
+                    <div className="launchpad-project-body">
+                      <div className="launchpad-project-title">
+                        <h3>{project.title}</h3>
+                        {project.url && /^https:\/\//i.test(project.url) && (
+                          <a
+                            className="launchpad-project-link"
+                            href={project.url}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            aria-label={`Open ${project.title} project page`}
+                            title="Open project page"
+                          >
+                            <ExternalLink size={14} />
+                          </a>
+                        )}
+                        {entry && (
+                          <span className="launchpad-badge">
+                            {entry.platform && entry.projectId
+                              ? "Installed"
+                              : "Unidentified file"}
+                          </span>
+                        )}
+                        {entry?.update && (
+                          <span className="launchpad-badge update">
+                            Update available
+                          </span>
+                        )}
+                        {entry?.active === false && type === "mod" && (
+                          <span className="launchpad-badge">Disabled</span>
+                        )}
+                        {installedOnly && entry?.platform && (
+                          <span className="launchpad-badge">
+                            {config.platforms.find(
+                              (item) => item.id === entry.platform,
+                            )?.name ?? entry.platform}
+                          </span>
+                        )}
+                        {entry &&
+                          duplicateProjects.has(
+                            `${entry.platform}:${entry.projectId}`,
+                          ) && (
+                            <span className="launchpad-badge update">
+                              Duplicate — remove one
+                            </span>
+                          )}
+                        {entry && pendingPaths.has(entry.path) && (
+                          <span className="launchpad-badge">
+                            Refreshing file…
+                          </span>
+                        )}
+                      </div>
+                      <p>{project.description || "No description provided."}</p>
+                      <div className="launchpad-project-meta">
+                        {typeof project.downloads === "number" && (
+                          <span>
+                            <Download size={13} />
+                            {new Intl.NumberFormat(undefined, {
+                              notation: "compact",
+                              maximumFractionDigits: 1,
+                            }).format(project.downloads)}{" "}
+                            downloads
+                          </span>
+                        )}
+                        {!installedOnly && project.author && (
+                          <span>By {project.author}</span>
+                        )}
+                        {entry?.versionName && (
+                          <span>Installed: {entry.versionName}</span>
+                        )}
+                        {entry?.update && (
+                          <span>
+                            Available:{" "}
+                            {entry.update.version || entry.update.name}
+                          </span>
+                        )}
+                        {entry && <span>{formatBytes(entry.size)}</span>}
+                        {entry &&
+                          updateCheckLabel(
                             entry,
                             updateFiltersReady,
                             scanRefreshing,
+                          ) && (
+                            <span>
+                              {updateCheckLabel(
+                                entry,
+                                updateFiltersReady,
+                                scanRefreshing,
+                              )}
+                            </span>
                           )}
+                        {!entry?.platform && entry && (
+                          <span>
+                            {scanRefreshing
+                              ? "Checking this file’s project details..."
+                              : "Could not identify this file for automatic updates."}
+                          </span>
+                        )}
+                      </div>
+                      {entry?.updateIssue &&
+                        entry.platform &&
+                        entry.projectId &&
+                        entry.updateCheck === "unavailable" &&
+                        updateFiltersReady && (
+                          <div className="launchpad-project-issue">
+                            {entry.updateIssue}
+                          </div>
+                        )}
+                    </div>
+                  </div>
+                  {installedOnly && (
+                    <div className="launchpad-installed-author">
+                      {project.author ? (
+                        <span>By {project.author}</span>
+                      ) : (
+                        <span className="launchpad-unknown-author">
+                          Unknown
                         </span>
                       )}
-                    {!entry?.platform && entry && (
-                      <span>
-                        {scanRefreshing
-                          ? "Checking this file’s project details..."
-                          : "Could not identify this file for automatic updates."}
-                      </span>
-                    )}
-                  </div>
-                  {entry?.updateIssue &&
-                    entry.platform &&
-                    entry.projectId &&
-                    entry.updateCheck === "unavailable" &&
-                    updateFiltersReady && (
-                      <div className="launchpad-project-issue">
-                        {entry.updateIssue}
-                      </div>
-                    )}
-                </div>
-                <div className="launchpad-project-action">
-                  {(!entry || (entry.platform && entry.projectId)) && (
-                    <button
-                      className={`btn ${entry && !entry.update ? "" : "primary"}`}
-                      aria-label={`${entry?.update ? "Update" : entry ? "Choose version for" : "Install"} ${project.title}`}
-                      disabled={
-                        !allowChanges ||
-                        working ||
-                        Boolean(busy) ||
-                        Boolean(entry && pendingPaths.has(entry.path)) ||
-                        !config.platforms.find(
-                          (item) => item.id === project.platform,
-                        )?.available
-                      }
-                      onClick={() => chooseProject(project, entry)}
-                    >
-                      {entry?.update ? (
-                        <RefreshCw size={15} />
-                      ) : (
-                        <Download size={15} />
-                      )}
-                      {entry?.update
-                        ? "Update"
-                        : entry
-                          ? "Versions"
-                          : "Install"}
-                    </button>
+                    </div>
                   )}
-                  {entry && type !== "modpack" && (
-                    <>
-                      {installedOnly && type === "mod" && (
-                        <Switch
-                          className="launchpad-active"
-                          aria-label={`Active: ${project.title}`}
-                          label="Active"
-                          checked={entry.active !== false}
+                  <div className="launchpad-project-action">
+                    {(!entry || (entry.platform && entry.projectId)) && (
+                      <button
+                        className={`btn launchpad-version-action ${entry && !entry.update ? "" : "primary"}`}
+                        aria-label={`${entry?.update ? "Update" : entry ? "Choose version for" : "Install"} ${project.title}`}
+                        disabled={
+                          !allowChanges ||
+                          working ||
+                          Boolean(busy) ||
+                          Boolean(entry && pendingPaths.has(entry.path)) ||
+                          !config.platforms.find(
+                            (item) => item.id === project.platform,
+                          )?.available
+                        }
+                        onClick={() => chooseProject(project, entry)}
+                      >
+                        {entry?.update ? (
+                          <RefreshCw size={15} />
+                        ) : (
+                          <Download size={15} />
+                        )}
+                        {entry?.update
+                          ? "Update"
+                          : entry
+                            ? "Versions"
+                            : "Install"}
+                      </button>
+                    )}
+                    {entry && type !== "modpack" && (
+                      <>
+                        {installedOnly && type === "mod" && (
+                          <Switch
+                            className="launchpad-active"
+                            aria-label={`Active: ${project.title}`}
+                            label={null}
+                            checked={entry.active !== false}
+                            disabled={
+                              !canInstall ||
+                              Boolean(busy) ||
+                              pendingPaths.has(entry.path)
+                            }
+                            title={
+                              status !== "offline"
+                                ? "Stop the server before enabling or disabling mods."
+                                : `${entry.active === false ? "Enable" : "Disable"} ${project.title}`
+                            }
+                            onCheckedChange={(active) =>
+                              void setModActive(entry, active)
+                            }
+                          />
+                        )}
+                        <button
+                          type="button"
+                          className="btn launchpad-remove"
+                          aria-label={`Remove ${project.title}`}
+                          title={
+                            status !== "offline"
+                              ? `Stop the server before removing ${contentName}s.`
+                              : `Review ${contentName} removal`
+                          }
                           disabled={
                             !canInstall ||
                             Boolean(busy) ||
                             pendingPaths.has(entry.path)
                           }
-                          title={
-                            status !== "offline"
-                              ? "Stop the server before enabling or disabling mods."
-                              : `${entry.active === false ? "Enable" : "Disable"} ${project.title}`
-                          }
-                          onCheckedChange={(active) =>
-                            void setModActive(entry, active)
-                          }
+                          onClick={() => void reviewRemoval(entry)}
+                        >
+                          <Trash2 size={14} /> Remove
+                        </button>
+                      </>
+                    )}
+                    {installedOnly && entry && (
+                      <>
+                        <InstalledDate value={entry.addedAt} kind="added" />
+                        <InstalledDate
+                          value={entry.modifiedAt}
+                          kind="modified"
                         />
-                      )}
-                      <button
-                        type="button"
-                        className="btn launchpad-remove"
-                        aria-label={`Remove ${project.title}`}
-                        title={
-                          status !== "offline"
-                            ? `Stop the server before removing ${contentName}s.`
-                            : `Review ${contentName} removal`
-                        }
-                        disabled={
-                          !canInstall ||
-                          Boolean(busy) ||
-                          pendingPaths.has(entry.path)
-                        }
-                        onClick={() => void reviewRemoval(entry)}
-                      >
-                        <Trash2 size={14} /> Remove
-                      </button>
-                      {installedOnly && (
-                        <div className="launchpad-modified">
-                          <span>Date modified</span>
-                          {entry.modifiedAt &&
-                          Number.isFinite(Date.parse(entry.modifiedAt)) ? (
-                            <time
-                              dateTime={entry.modifiedAt}
-                              title={new Date(
-                                entry.modifiedAt,
-                              ).toLocaleString()}
-                            >
-                              {new Date(entry.modifiedAt).toLocaleString(
-                                undefined,
-                                {
-                                  year: "numeric",
-                                  month: "short",
-                                  day: "numeric",
-                                  hour: "numeric",
-                                  minute: "2-digit",
-                                },
-                              )}
-                            </time>
-                          ) : (
-                            <span>Unavailable</span>
-                          )}
-                        </div>
-                      )}
-                    </>
-                  )}
-                </div>
-              </article>
-            ))}
+                      </>
+                    )}
+                  </div>
+                </article>
+              ))}
+            </div>
           </>
         )}
       </section>

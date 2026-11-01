@@ -2050,7 +2050,7 @@ test("Launchpad installed updates sort before pagination and keep priority when 
   );
   await expect(
     page.getByLabel("Sort installed content", { exact: true }),
-  ).toHaveValue("updates");
+  ).toHaveValue("name");
   await page
     .getByLabel("Launchpad rows per page", { exact: true })
     .selectOption("5");
@@ -2227,23 +2227,8 @@ test("Launchpad installed sorts order the entire list before paging and retain i
   });
   await installedToggle.check();
   const sort = page.getByLabel("Sort installed content", { exact: true });
-  await expect(sort).toHaveValue("updates");
-  await expect(sort.locator("option")).toHaveText([
-    "Updates first",
-    "Active",
-    "Featured",
-    "Relevancy",
-    "Popularity",
-    "Latest Update",
-    "Release Date",
-    "Total Downloads",
-    "Main Category",
-    "Game Version",
-    "Name (A–Z)",
-    "Size (largest first)",
-    "Mod author (A–Z)",
-    "Date modified (newest first)",
-  ]);
+  await expect(sort).toHaveValue("name");
+  await expect(sort.locator('option[value="updates"]')).toHaveCount(0);
   await page
     .getByLabel("Launchpad rows per page", { exact: true })
     .selectOption("5");
@@ -2255,42 +2240,28 @@ test("Launchpad installed sorts order the entire list before paging and retain i
   });
   const orders = [
     {
-      sort: "updates",
-      paths: [
-        "alpha2",
-        "omega",
-        "zulu",
-        "alpha1",
-        "alpha10",
-        "beta",
-        "delta",
-        "echo",
-        "twin-a",
-        "twin-z",
-        "unknown-a",
-        "unknown-b",
-      ],
-    },
-    {
       sort: "name",
       paths: [
-        "alpha1",
         "alpha2",
+        "omega",
+        "zulu",
+        "alpha1",
         "alpha10",
         "beta",
         "delta",
         "echo",
-        "omega",
         "twin-a",
         "twin-z",
         "unknown-a",
         "unknown-b",
-        "zulu",
       ],
     },
     {
       sort: "size",
       paths: [
+        "alpha2",
+        "omega",
+        "zulu",
         "beta",
         "unknown-a",
         "unknown-b",
@@ -2299,21 +2270,18 @@ test("Launchpad installed sorts order the entire list before paging and retain i
         "twin-a",
         "twin-z",
         "delta",
-        "alpha2",
         "alpha10",
-        "omega",
-        "zulu",
       ],
     },
     {
       sort: "author",
       paths: [
-        "beta",
         "zulu",
         "alpha2",
+        "omega",
+        "beta",
         "alpha10",
         "delta",
-        "omega",
         "echo",
         "twin-a",
         "twin-z",
@@ -2344,7 +2312,7 @@ test("Launchpad installed sorts order the entire list before paging and retain i
   await expect(sort).toHaveValue("author");
   await expect(pagination).toHaveText("Page 1 of 3");
   await expect(paths).toHaveText(
-    orders[3].paths.slice(0, 5).map((name) => `mods/${name}.jar`),
+    orders[2].paths.slice(0, 5).map((name) => `mods/${name}.jar`),
   );
   await page.screenshot({
     path: testInfo.outputPath("installed-author-sort-desktop.png"),
@@ -2360,7 +2328,7 @@ test("Launchpad installed sorts order the entire list before paging and retain i
   await installedToggle.check();
   await expect(sort).toHaveValue("name");
   await expect(paths).toHaveText(
-    orders[1].paths.slice(0, 5).map((name) => `mods/${name}.jar`),
+    orders[0].paths.slice(0, 5).map((name) => `mods/${name}.jar`),
   );
   await sort.selectOption("author");
   await next.click();

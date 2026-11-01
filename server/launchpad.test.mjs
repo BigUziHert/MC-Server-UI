@@ -8196,7 +8196,7 @@ test("update dependency inspection rejects a failed candidate checksum before ch
   );
 });
 
-test("mod activation preserves bytes, modified date, and installed identity across restart", async (t) => {
+test("mod activation preserves bytes, added and modified dates, and installed identity across restart", async (t) => {
   const f = await fixture(t);
   const original = path.join(f.serverDir, "mods/old.jar");
   await fs.utimes(
@@ -8207,12 +8207,22 @@ test("mod activation preserves bytes, modified date, and installed identity acro
   const before = await f.service.installed({ ...selection, local: true });
   assert.equal(before.items[0].active, true);
   assert.equal(before.items[0].modifiedAt, "2025-03-04T05:06:07.000Z");
+  const originalStat = await fs.lstat(original);
+  assert.equal(
+    before.items[0].addedAt,
+    new Date(
+      originalStat.birthtimeMs > 0
+        ? originalStat.birthtimeMs
+        : originalStat.mtimeMs,
+    ).toISOString(),
+  );
   const disabled = await f.service.setActive({
     path: "mods/old.jar",
     active: false,
   });
   assert.equal(disabled.path, "mods/old.jar.disabled");
   assert.equal(disabled.modifiedAt, before.items[0].modifiedAt);
+  assert.equal(disabled.addedAt, before.items[0].addedAt);
   await assert.rejects(fs.stat(original), { code: "ENOENT" });
   assert.deepEqual(await fs.readFile(`${original}.disabled`), f.old);
   const service = await f.boot();
@@ -8220,14 +8230,43 @@ test("mod activation preserves bytes, modified date, and installed identity acro
   assert.equal(inventory.items[0].path, "mods/old.jar.disabled");
   assert.equal(inventory.items[0].active, false);
   assert.equal(inventory.items[0].projectId, "project");
+  assert.equal(inventory.items[0].addedAt, before.items[0].addedAt);
   const enabled = await service.setActive({
     path: disabled.path,
     active: true,
   });
   assert.equal(enabled.path, "mods/old.jar");
   assert.equal(enabled.active, true);
+  assert.equal(enabled.addedAt, before.items[0].addedAt);
   assert.deepEqual(await fs.readFile(original), f.old);
   await assert.rejects(fs.stat(`${original}.disabled`), { code: "ENOENT" });
+});
+
+test("installed files fall back to modified date when birthtime is unavailable", async (t) => {
+  const f = await fixture(t);
+  const target = path.join(f.serverDir, "mods/old.jar");
+  await fs.utimes(
+    target,
+    new Date("2025-04-05T06:07:08Z"),
+    new Date("2025-04-05T06:07:08Z"),
+  );
+  const lstat = fs.lstat;
+  fs.lstat = async (value, ...args) => {
+    const stat = await lstat(value, ...args);
+    if (value === target) stat.birthtimeMs = 0;
+    return stat;
+  };
+  try {
+    const inventory = await f.service.installed({
+      ...selection,
+      local: true,
+      quick: true,
+    });
+    assert.equal(inventory.items[0].addedAt, "2025-04-05T06:07:08.000Z");
+    assert.equal(inventory.items[0].modifiedAt, inventory.items[0].addedAt);
+  } finally {
+    fs.lstat = lstat;
+  }
 });
 
 test("mod activation refuses running servers, invalid targets, and filename collisions", async (t) => {
