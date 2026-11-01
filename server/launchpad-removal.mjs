@@ -51,7 +51,12 @@ export function createModRemoval(ctx) {
         throw cause;
       });
     const candidates = entries.filter((entry) =>
-      (type === "datapack" ? /\.zip$/i : /\.jar$/i).test(entry.name),
+      (type === "datapack"
+        ? /\.zip$/i
+        : type === "mod"
+          ? /\.jar(?:\.disabled)?$/i
+          : /\.jar$/i
+      ).test(entry.name),
     );
     if (candidates.length > 1000)
       throw error(
@@ -83,7 +88,7 @@ export function createModRemoval(ctx) {
         sha512,
         stamp,
       };
-      if (inspect && type === "mod") {
+      if (inspect && type === "mod" && !/\.disabled$/i.test(entry.name)) {
         try {
           const key = `${loader}:${relative}:${stamp}`;
           let cached = metadata.get(key);
@@ -140,7 +145,13 @@ export function createModRemoval(ctx) {
           !input.path.startsWith(`${folder}/`) ||
           input.path.slice(folder.length + 1).includes("/") ||
           input.path.includes("\\") ||
-          !(type === "datapack" ? /\.zip$/i : /\.jar$/i).test(input.path)
+          !(
+            type === "datapack"
+              ? /\.zip$/i
+              : type === "mod"
+                ? /\.jar(?:\.disabled)?$/i
+                : /\.jar$/i
+          ).test(input.path)
         )
           throw error(400, `Choose an installed ${type} to remove.`);
         const rows = await inventory(

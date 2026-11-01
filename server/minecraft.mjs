@@ -893,6 +893,12 @@ export async function createMinecraft(ctx) {
       endpoint(async (req, res) => res.json(await launchpad.remove(req.body))),
     );
     app.post(
+      "/api/launchpad/active",
+      endpoint(async (req, res) =>
+        res.json(await launchpad.setActive(req.body)),
+      ),
+    );
+    app.post(
       "/api/launchpad/install",
       endpoint(async (req, res) =>
         res.status(202).json(await launchpad.install(req.body)),

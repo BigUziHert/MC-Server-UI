@@ -64,11 +64,13 @@ files:
   - server/launchpad-update-dependencies.mjs
   - server/launchpad-mod-metadata.mjs
   - server/launchpad-removal.mjs
+  - server/launchpad-activation.mjs
   - server/launchpad-providers.mjs
   - server/launchpad-extra.mjs
   - shared/subuser-permissions.json
   - shared/panel-connection.mjs
   - shared/launchpad-project.mjs
+  - shared/launchpad-categories.mjs
   - desktop/main.mjs
   - desktop/runtime.mjs
   - desktop/updates.mjs

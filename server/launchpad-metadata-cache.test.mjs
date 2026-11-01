@@ -35,6 +35,38 @@ const cacheOptions = (root, extra = {}) => ({
   ...extra,
 });
 
+test("metadata cache retains bounded taxonomy and sort metadata without unsafe fields", async (t) => {
+  const root = await temporary(t);
+  const cache = await createLaunchpadMetadataCache(cacheOptions(root));
+  cache.rememberProject(
+    "modrinth",
+    "project",
+    {
+      title: "Display",
+      categories: ["technology", "automation", "unknown"],
+      mainCategory: "technology",
+      downloads: 123,
+      follows: 45,
+      featured: true,
+      updatedAt: "2026-01-02",
+      releasedAt: "2025-01-01",
+      gameVersions: ["1.21.1", "1.21.1", "private-path"],
+    },
+    Date.now(),
+  );
+  await cache.close();
+  const reopened = await createLaunchpadMetadataCache(cacheOptions(root));
+  const saved = reopened.project("modrinth", "project").value;
+  assert.deepEqual(saved.categories, ["technology", "automation"]);
+  assert.equal(saved.mainCategory, "technology");
+  assert.equal(saved.downloads, 123);
+  assert.equal(saved.follows, 45);
+  assert.equal(saved.featured, true);
+  assert.equal(saved.updatedAt, "2026-01-02T00:00:00.000Z");
+  assert.deepEqual(saved.gameVersions, ["1.21.1"]);
+  await reopened.close();
+});
+
 test("CurseForge disposable metadata is purged at startup and never written back", async (t) => {
   const root = await temporary(t);
   const foreign = {

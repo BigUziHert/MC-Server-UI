@@ -1943,11 +1943,15 @@ test("Launchpad catalog sorting sends scoped choices and resets pagination with 
   );
   await page.getByLabel("Platform", { exact: true }).selectOption("curseforge");
   await expect(sort).toHaveValue("popular");
-  await expect(sort.locator("option")).toHaveText([
-    "Most popular",
-    "Most downloaded",
-    "Name (A–Z)",
+  await expect(sort.locator("option:enabled")).toHaveText([
+    "Popularity",
+    "Total Downloads",
+    "Name",
   ]);
+  await expect(sort.locator('option[value="relevance"]')).toHaveAttribute(
+    "disabled",
+    "",
+  );
   await expect.poll(lastSearch).toMatchObject({
     platform: "curseforge",
     sort: "popular",
@@ -2226,9 +2230,19 @@ test("Launchpad installed sorts order the entire list before paging and retain i
   await expect(sort).toHaveValue("updates");
   await expect(sort.locator("option")).toHaveText([
     "Updates first",
+    "Active",
+    "Featured",
+    "Relevancy",
+    "Popularity",
+    "Latest Update",
+    "Release Date",
+    "Total Downloads",
+    "Main Category",
+    "Game Version",
     "Name (A–Z)",
     "Size (largest first)",
     "Mod author (A–Z)",
+    "Date modified (newest first)",
   ]);
   await page
     .getByLabel("Launchpad rows per page", { exact: true })

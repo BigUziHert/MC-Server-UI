@@ -47,6 +47,9 @@
   border-color: var(--accent);
   background: #ffd00005;
 }
+.launchpad-toolbar.panel {
+  overflow: visible;
+}
 .launchpad-toolbar {
   display: flex;
   align-items: center;
@@ -59,9 +62,12 @@
   min-width: 170px;
 }
 .launchpad-toolbar-actions {
+  position: relative;
   display: flex;
   align-items: center;
-  flex: 0 0 auto;
+  flex: 0 1 auto;
+  flex-wrap: wrap;
+  max-width: 100%;
   gap: 12px;
   white-space: nowrap;
   font-size: 12px;
@@ -205,13 +211,102 @@
   flex-wrap: wrap;
   align-items: flex-end;
   justify-content: flex-end;
-  flex-shrink: 0;
+  flex-shrink: 1;
+  max-width: 50%;
 }
 .launchpad-project-action .btn {
   min-width: 112px;
 }
 .launchpad-project-action .launchpad-remove {
   min-width: 0;
+}
+.launchpad-active {
+  flex-direction: column-reverse;
+  gap: 7px;
+  min-width: 52px;
+  align-self: flex-end;
+  padding: 0 4px 7px;
+  font-size: 11px;
+}
+.launchpad-active .shared-switch-track {
+  flex: none;
+}
+.launchpad-modified {
+  display: grid;
+  gap: 5px;
+  align-self: flex-end;
+  padding: 0 0 4px 5px;
+  font-size: 11px;
+  color: var(--muted);
+}
+.launchpad-modified time {
+  color: var(--text);
+  white-space: nowrap;
+}
+.launchpad-category-filters {
+  position: static;
+}
+.launchpad-filter-selected {
+  color: var(--accent);
+}
+.launchpad-category-panel {
+  position: absolute;
+  z-index: 15;
+  right: 0;
+  top: calc(100% + 8px);
+  width: min(340px, calc(100vw - 48px));
+  padding: 14px;
+  box-shadow: 0 12px 32px #0006;
+  white-space: normal;
+}
+.launchpad-category-heading,
+.launchpad-category-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.launchpad-category-heading strong {
+  flex: 1;
+}
+.launchpad-category-panel p {
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.5;
+  margin: 10px 0;
+}
+.launchpad-category-list {
+  max-height: min(540px, 55vh);
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+.launchpad-category-choice {
+  display: flex;
+  flex: 1;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+  padding: 8px 2px;
+  font-size: 12px;
+  cursor: pointer;
+  line-height: 1.4;
+}
+.launchpad-category-choice.child {
+  padding-left: 20px;
+}
+.launchpad-category-choice:has(input:disabled) {
+  color: var(--muted);
+  cursor: default;
+}
+.launchpad-category-choice input {
+  flex: 0 0 15px;
+  width: 15px;
+  height: 15px;
+  margin: 0;
+  accent-color: var(--accent);
+}
+.launchpad-category-row .btn.icon {
+  padding: 5px;
+  min-height: 28px;
 }
 .launchpad-removal-dependencies {
   color: var(--muted);
@@ -537,6 +632,7 @@
   }
   .launchpad-project-action {
     width: 100%;
+    max-width: none;
     padding-left: 94px;
   }
 }
@@ -589,6 +685,14 @@
   }
   .launchpad-project-action .btn {
     width: 100%;
+  }
+  .launchpad-category-panel {
+    right: auto;
+    left: 0;
+  }
+  .launchpad-modified {
+    width: 100%;
+    padding-top: 4px;
   }
   .launchpad-error,
   .launchpad-inline-notice {

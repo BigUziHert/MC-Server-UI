@@ -5288,18 +5288,28 @@ test("Launchpad advertises only supported provider sorts and rejects unsupported
   assert.deepEqual(
     config.platforms.find((value) => value.id === "modrinth").sortOptions,
     [
-      { id: "downloads", label: "Most downloaded" },
-      { id: "relevance", label: "Relevance" },
-      { id: "popular", label: "Most followed" },
-      { id: "updated", label: "Recently updated" },
-      { id: "newest", label: "Newest" },
+      { id: "downloads", label: "Total Downloads" },
+      { id: "relevance", label: "Relevancy" },
+      { id: "popular", label: "Popularity" },
+      { id: "updated", label: "Latest Update" },
+      { id: "newest", label: "Release Date" },
     ],
   );
   assert.deepEqual(
     config.platforms
       .find((value) => value.id === "curseforge")
       .sortOptions.map((value) => value.id),
-    ["popular", "downloads", "updated", "newest", "name"],
+    [
+      "featured",
+      "popular",
+      "updated",
+      "newest",
+      "downloads",
+      "category",
+      "gameVersion",
+      "name",
+      "author",
+    ],
   );
   let requests = f.requests.length;
   for (const sort of ["name", "random", null, [], {}, 1, "downloads&offset=0"])
@@ -5356,6 +5366,69 @@ test("Launchpad advertises only supported provider sorts and rejects unsupported
     }),
     { status: 400 },
   );
+});
+
+test("Launchpad validates category filters and isolates cached catalog pages by canonical selections", async (t) => {
+  const pages = [];
+  const f = await fixture(t, {
+    request: async (url) => {
+      const address = new URL(url);
+      if (address.pathname !== "/v2/search") return;
+      pages.push(Object.fromEntries(address.searchParams));
+      return Response.json({ hits: [], total_hits: 0, offset: 0, limit: 20 });
+    },
+  });
+  for (const categories of [
+    null,
+    {},
+    "missing",
+    "magic,,technology",
+    Array(11).fill("magic"),
+  ])
+    await assert.rejects(f.service.search({ ...selection, categories }), {
+      status: 400,
+    });
+  await assert.rejects(
+    f.service.search({ ...selection, type: "modpack", categories: "magic" }),
+    { status: 400 },
+  );
+  await assert.rejects(
+    f.service.search({ ...selection, categories: "automation" }),
+    { status: 400 },
+  );
+  assert.equal(pages.length, 0);
+  await f.service.search({
+    ...selection,
+    categories: "technology,magic",
+    limit: 20,
+  });
+  assert.deepEqual(JSON.parse(pages[0].facets).at(-1), [
+    "categories:magic",
+    "categories:technology",
+  ]);
+  await f.service.search({
+    ...selection,
+    categories: "magic,technology",
+    limit: 20,
+  });
+  assert.equal(
+    pages.length,
+    1,
+    "equivalent category selections share a cache entry",
+  );
+  await f.service.search({ ...selection, categories: "technology", limit: 20 });
+  assert.equal(
+    pages.length,
+    2,
+    "different filters do not reuse unrelated cached pages",
+  );
+  await f.service.search({
+    ...selection,
+    categories: "technology",
+    limit: 20,
+    refresh: true,
+  });
+  assert.equal(pages.length, 3);
 });
 
 test("Modrinth sorting is applied upstream before pagination and explicit sorts override query relevance", async (t) => {
@@ -5457,11 +5530,15 @@ test("CurseForge applies each supported sort to both upstream pages including al
   });
   await f.service.settings({ curseforgeApiKey: "fixture-key" });
   for (const [sort, field, order] of [
+    ["featured", 1, "desc"],
     ["popular", 2, "desc"],
     ["downloads", 6, "desc"],
     ["updated", 3, "desc"],
     ["newest", 11, "desc"],
     ["name", 4, "asc"],
+    ["author", 5, "asc"],
+    ["category", 7, "asc"],
+    ["gameVersion", 8, "desc"],
     [undefined, 2, "desc"],
   ]) {
     pages.length = 0;
@@ -8116,5 +8193,176 @@ test("update dependency inspection rejects a failed candidate checksum before ch
   assert.deepEqual(
     await fs.readFile(path.join(f.serverDir, "mods", "old.jar")),
     f.library1,
+  );
+});
+
+test("mod activation preserves bytes, modified date, and installed identity across restart", async (t) => {
+  const f = await fixture(t);
+  const original = path.join(f.serverDir, "mods/old.jar");
+  await fs.utimes(
+    original,
+    new Date("2025-03-04T05:06:07Z"),
+    new Date("2025-03-04T05:06:07Z"),
+  );
+  const before = await f.service.installed({ ...selection, local: true });
+  assert.equal(before.items[0].active, true);
+  assert.equal(before.items[0].modifiedAt, "2025-03-04T05:06:07.000Z");
+  const disabled = await f.service.setActive({
+    path: "mods/old.jar",
+    active: false,
+  });
+  assert.equal(disabled.path, "mods/old.jar.disabled");
+  assert.equal(disabled.modifiedAt, before.items[0].modifiedAt);
+  await assert.rejects(fs.stat(original), { code: "ENOENT" });
+  assert.deepEqual(await fs.readFile(`${original}.disabled`), f.old);
+  const service = await f.boot();
+  const inventory = await service.installed(selection);
+  assert.equal(inventory.items[0].path, "mods/old.jar.disabled");
+  assert.equal(inventory.items[0].active, false);
+  assert.equal(inventory.items[0].projectId, "project");
+  const enabled = await service.setActive({
+    path: disabled.path,
+    active: true,
+  });
+  assert.equal(enabled.path, "mods/old.jar");
+  assert.equal(enabled.active, true);
+  assert.deepEqual(await fs.readFile(original), f.old);
+  await assert.rejects(fs.stat(`${original}.disabled`), { code: "ENOENT" });
+});
+
+test("mod activation refuses running servers, invalid targets, and filename collisions", async (t) => {
+  const f = await fixture(t);
+  for (const invalid of [
+    "../old.jar",
+    "plugins/old.jar",
+    "mods/a/b.jar",
+    "mods/old.txt",
+    "mods\\old.jar",
+    "mods/old.jar.disabled.disabled",
+  ])
+    await assert.rejects(
+      f.service.setActive({ path: invalid, active: false }),
+      { status: 400 },
+    );
+  await assert.rejects(
+    f.service.setActive({ path: "mods/old.jar", active: "false" }),
+    { status: 400 },
+  );
+  f.setServer({ status: "online" });
+  await assert.rejects(
+    f.service.setActive({ path: "mods/old.jar", active: false }),
+    /Stop the server/,
+  );
+  f.setServer({ status: "offline" });
+  const other = bytes("different disabled copy");
+  await fs.writeFile(path.join(f.serverDir, "mods/old.jar.disabled"), other);
+  await assert.rejects(
+    f.service.setActive({ path: "mods/old.jar", active: false }),
+    /already exists/,
+  );
+  assert.deepEqual(
+    await fs.readFile(path.join(f.serverDir, "mods/old.jar")),
+    f.old,
+  );
+  assert.deepEqual(
+    await fs.readFile(path.join(f.serverDir, "mods/old.jar.disabled")),
+    other,
+  );
+});
+
+test("disabled mods stay disabled through bulk updates and can be removed", async (t) => {
+  const f = await fixture(t);
+  await f.service.setActive({ path: "mods/old.jar", active: false });
+  const plan = await f.service.previewUpdates({
+    ...selection,
+    updates: [
+      {
+        platform: "modrinth",
+        projectId: "project",
+        versionId: "new",
+        replacePath: "mods/old.jar.disabled",
+      },
+    ],
+  });
+  assert.deepEqual(
+    plan.files.map((file) => file.path),
+    ["mods/new.jar.disabled"],
+  );
+  const job = await finish(f.service, { planId: plan.planId, confirmed: true });
+  assert.equal(job.status, "completed", job.error);
+  assert.deepEqual(
+    await fs.readFile(path.join(f.serverDir, "mods/new.jar.disabled")),
+    f.newer,
+  );
+  await assert.rejects(fs.stat(path.join(f.serverDir, "mods/new.jar")), {
+    code: "ENOENT",
+  });
+  const inventory = await f.service.installed({ ...selection, local: true });
+  assert.equal(inventory.items[0].active, false);
+  assert.equal(inventory.items[0].versionId, "new");
+  const removal = await f.service.removalPreview({
+    type: "mod",
+    path: "mods/new.jar.disabled",
+  });
+  assert.equal(removal.blocked, false);
+  await f.service.remove({ planId: removal.planId, confirmed: true });
+  assert.equal(
+    (await f.service.installed({ ...selection, local: true })).items.length,
+    0,
+  );
+});
+
+test("changing active state invalidates a reviewed installation", async (t) => {
+  const f = await fixture(t);
+  const plan = await f.service.preview({
+    ...selection,
+    replacePath: "mods/old.jar",
+  });
+  await f.service.setActive({ path: "mods/old.jar", active: false });
+  const job = await finish(f.service, { planId: plan.planId, confirmed: true });
+  assert.equal(job.status, "failed");
+  assert.match(job.error, /changed since review/);
+  assert.deepEqual(
+    await fs.readFile(path.join(f.serverDir, "mods/old.jar.disabled")),
+    f.old,
+  );
+  await assert.rejects(fs.stat(path.join(f.serverDir, "mods/new.jar")), {
+    code: "ENOENT",
+  });
+});
+
+test("failed activation receipt persistence restores the original filename and receipt", async (t) => {
+  const f = await fixture(t);
+  const receipt = {
+    path: "mods/old.jar",
+    sha512: hashes(f.old).sha512,
+    platform: "modrinth",
+    projectId: "project",
+    versionId: "old",
+    type: "mod",
+  };
+  await f.service.restoreInstalled([receipt]);
+  const rename = fs.rename;
+  fs.rename = async (from, to) => {
+    if (to === path.join(f.dataDir, "launchpad/installed.json"))
+      throw new Error("fixture receipt write failure");
+    return rename(from, to);
+  };
+  try {
+    await assert.rejects(
+      f.service.setActive({ path: "mods/old.jar", active: false }),
+      /fixture receipt write failure/,
+    );
+  } finally {
+    fs.rename = rename;
+  }
+  assert.deepEqual(f.service.snapshotInstalled(), [receipt]);
+  assert.deepEqual(
+    await fs.readFile(path.join(f.serverDir, "mods/old.jar")),
+    f.old,
+  );
+  await assert.rejects(
+    fs.stat(path.join(f.serverDir, "mods/old.jar.disabled")),
+    { code: "ENOENT" },
   );
 });

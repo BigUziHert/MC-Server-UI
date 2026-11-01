@@ -7,6 +7,15 @@ import {
 import { safeInstallPath } from "./launchpad-archives.mjs";
 import { createInstalledIdentification } from "./launchpad-identification.mjs";
 import { createModrinthRecovery } from "./launchpad-recovery.mjs";
+import {
+  allModCategories,
+  categoryIds,
+  curseforgeCategoryId,
+  modrinthCategoryFacets,
+  normalizeCurseforgeCategories,
+  normalizeModrinthCategories,
+  supportsCategory,
+} from "../shared/launchpad-categories.mjs";
 
 const mr = "https://api.modrinth.com/v2";
 const cf = "https://api.curseforge.com/v1";
@@ -67,6 +76,63 @@ const projectAuthors = (project) =>
       ? project.authors.map((author) => author?.name)
       : [],
   );
+const catalogDate = (value) =>
+  typeof value === "string" && Number.isFinite(Date.parse(value))
+    ? new Date(value).toISOString()
+    : undefined;
+function catalogFields(project, platform) {
+  const fields = {};
+  if (Array.isArray(project.categories)) {
+    fields.categories =
+      platform === "modrinth"
+        ? normalizeModrinthCategories(project.categories)
+        : normalizeCurseforgeCategories(project.categories);
+    const primary =
+      platform === "curseforge"
+        ? curseforgeCategoryId(
+            project.categories.find(
+              (row) => row.id === project.primaryCategoryId,
+            ),
+          )
+        : fields.categories[0];
+    if (primary) fields.mainCategory = primary;
+  }
+  const downloads =
+    platform === "modrinth" ? project.downloads : project.downloadCount;
+  if (Number.isFinite(downloads) && downloads >= 0)
+    fields.downloads = downloads;
+  if (
+    Number.isFinite(project.followers ?? project.follows) &&
+    (project.followers ?? project.follows) >= 0
+  )
+    fields.follows = project.followers ?? project.follows;
+  if (typeof project.isFeatured === "boolean")
+    fields.featured = project.isFeatured;
+  const updatedAt = catalogDate(
+    project.updated ?? project.date_modified ?? project.dateModified,
+  );
+  const releasedAt = catalogDate(
+    project.published ??
+      project.date_created ??
+      project.dateReleased ??
+      project.dateCreated,
+  );
+  if (updatedAt) fields.updatedAt = updatedAt;
+  if (releasedAt) fields.releasedAt = releasedAt;
+  const versions =
+    project.game_versions ??
+    project.versions ??
+    project.latestFilesIndexes?.map((file) => file.gameVersion);
+  if (Array.isArray(versions))
+    fields.gameVersions = [
+      ...new Set(
+        versions.filter(
+          (value) => typeof value === "string" && /^\d+(?:\.\d+)+$/.test(value),
+        ),
+      ),
+    ];
+  return fields;
+}
 function teamAuthors(members) {
   const accepted = members.filter((member) => member.accepted === true);
   const owners = accepted.filter(
@@ -860,26 +926,34 @@ const cfLoaders = { forge: 1, fabric: 4, quilt: 5, neoforge: 6 };
 // Provider sorting is sent with the upstream request, before its pagination.
 // https://docs.modrinth.com/api/operations/searchprojects/
 const mrSortOptions = [
-  { id: "downloads", label: "Most downloaded" },
-  { id: "relevance", label: "Relevance" },
-  { id: "popular", label: "Most followed" },
-  { id: "updated", label: "Recently updated" },
-  { id: "newest", label: "Newest" },
+  { id: "downloads", label: "Total Downloads" },
+  { id: "relevance", label: "Relevancy" },
+  { id: "popular", label: "Popularity" },
+  { id: "updated", label: "Latest Update" },
+  { id: "newest", label: "Release Date" },
 ];
 // https://docs.curseforge.com/rest-api/#modssearchsortfield
 const cfSortOptions = [
-  { id: "popular", label: "Most popular" },
-  { id: "downloads", label: "Most downloaded" },
-  { id: "updated", label: "Recently updated" },
-  { id: "newest", label: "Newest" },
-  { id: "name", label: "Name (A–Z)" },
+  { id: "featured", label: "Featured" },
+  { id: "popular", label: "Popularity" },
+  { id: "updated", label: "Latest Update" },
+  { id: "newest", label: "Release Date" },
+  { id: "downloads", label: "Total Downloads" },
+  { id: "category", label: "Main Category" },
+  { id: "gameVersion", label: "Game Version" },
+  { id: "name", label: "Name" },
+  { id: "author", label: "Author" },
 ];
 const cfSortFields = {
+  featured: 1,
   popular: 2,
   downloads: 6,
   updated: 3,
   newest: 11,
   name: 4,
+  author: 5,
+  category: 7,
+  gameVersion: 8,
 };
 function cfVersion(value, type) {
   const versions = value.gameVersions ?? [];
@@ -1011,6 +1085,7 @@ export function createCoreProviders({
       url: `https://modrinth.com/project/${enc(project.slug ?? project.id)}`,
       iconUrl: iconUrl(project.icon_url),
       teamId: project.team,
+      ...catalogFields(project, "modrinth"),
     }),
   );
   // /teams returns members for multiple teams; associate by team_id rather
@@ -1093,6 +1168,7 @@ export function createCoreProviders({
             url: iconUrl(project.links?.websiteUrl),
             iconUrl: iconUrl(project.logo?.thumbnailUrl ?? project.logo?.url),
             author: projectAuthors(project),
+            ...catalogFields(project, "curseforge"),
           }
         : undefined,
   );
@@ -1122,6 +1198,48 @@ export function createCoreProviders({
         `CurseForge does not expose a supported ${type} catalog for this game.`,
       );
     return category.id;
+  }
+  let modCategoryLookup;
+  async function cfCategoryIds(selected, signal) {
+    if (!selected.length) return [];
+    modCategoryLookup ??= (async () => {
+      const classId = await cfClass("mod");
+      const result = await curseJson(
+        `/categories?${new URLSearchParams({ gameId: "432", classId: String(classId) })}`,
+        {
+          signal: lookupSignal(AbortSignal.timeout(8000)),
+        },
+      );
+      if (!Array.isArray(result.data))
+        throw launchpadError(
+          502,
+          "CurseForge returned invalid mod categories.",
+        );
+      return new Map(
+        result.data
+          .filter(
+            (row) =>
+              Number.isSafeInteger(row.id) &&
+              row.id > 0 &&
+              (row.classId == null || row.classId === classId),
+          )
+          .map((row) => [curseforgeCategoryId(row), row.id])
+          .filter(([key]) => key),
+      );
+    })().catch((cause) => {
+      modCategoryLookup = undefined;
+      throw cause;
+    });
+    const available = await modCategoryLookup;
+    signal?.throwIfAborted();
+    return selected.map((selectedId) => {
+      if (!available.has(selectedId))
+        throw launchpadError(
+          400,
+          `CurseForge does not currently expose the ${allModCategories.find((row) => row.id === selectedId)?.label ?? selectedId} category.`,
+        );
+      return available.get(selectedId);
+    });
   }
   const cfFiles = async (input) => {
     const result = [];
@@ -1183,6 +1301,12 @@ export function createCoreProviders({
           items,
         ),
       async search(input) {
+        const selected = categoryIds(input.categories);
+        if (selected.some((id) => !supportsCategory(id, "modrinth")))
+          throw launchpadError(
+            400,
+            "Modrinth does not expose one of the selected categories. Choose an available category or switch to CurseForge.",
+          );
         const facets = [
           [`all_project_types:${input.type}`],
           ["server_side!=unsupported"],
@@ -1192,6 +1316,7 @@ export function createCoreProviders({
           facets.push(
             compatibleLoaders(input).map((loader) => `categories:${loader}`),
           );
+        if (selected.length) facets.push(modrinthCategoryFacets(selected));
         const query = new URLSearchParams({
           query: input.query,
           facets: JSON.stringify(facets),
@@ -1216,6 +1341,7 @@ export function createCoreProviders({
             downloads: value.downloads,
             author: value.author,
             url: `https://modrinth.com/${input.type}/${value.slug ?? value.project_id}`,
+            ...catalogFields(value, "modrinth"),
           })),
           total: result.total_hits,
           offset: result.offset,
@@ -1419,7 +1545,8 @@ export function createCoreProviders({
         // These are discovery hints, never identities. The caller must verify
         // the downloaded artifact and compare every archive member before use.
         try {
-          if (typeof name !== "string" || !/\.jar$/i.test(name)) return [];
+          if (typeof name !== "string" || !/\.jar(?:\.disabled)?$/i.test(name))
+            return [];
           fileName(name);
         } catch {
           return [];
@@ -1432,7 +1559,7 @@ export function createCoreProviders({
           !title.includes("${")
             ? title.trim()
             : name
-                .replace(/\.jar$/i, "")
+                .replace(/\.jar(?:\.disabled)?$/i, "")
                 .replace(/[-_ .]+v?\d.*$/i, "")
                 .replace(/[-_]+/g, " ")
                 .trim();
@@ -1600,8 +1727,15 @@ export function createCoreProviders({
           index: String(input.offset),
           pageSize: String(Math.min(reachable, 50)),
           sortField: String(cfSortFields[input.sort || "popular"]),
-          sortOrder: input.sort === "name" ? "asc" : "desc",
+          sortOrder: ["name", "author", "category"].includes(input.sort)
+            ? "asc"
+            : "desc",
         });
+        const selected = await cfCategoryIds(
+          categoryIds(input.categories),
+          input.signal,
+        );
+        if (selected.length) query.set("categoryIds", JSON.stringify(selected));
         if (input.gameVersion) query.set("gameVersion", input.gameVersion);
         if (cfLoaders[input.loader])
           query.set("modLoaderType", String(cfLoaders[input.loader]));
@@ -1626,6 +1760,7 @@ export function createCoreProviders({
             downloads: value.downloadCount,
             author: value.authors?.map((author) => author.name).join(", "),
             url: iconUrl(value.links?.websiteUrl),
+            ...catalogFields(value, "curseforge"),
           })),
           total: Math.min(
             10000,

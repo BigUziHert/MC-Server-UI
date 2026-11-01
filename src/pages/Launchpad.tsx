@@ -44,6 +44,12 @@ import {
   remoteLaunchpadViewKey,
 } from "../preferences";
 import { projectPageUrl } from "../../shared/launchpad-project.mjs";
+import {
+  allModCategories,
+  matchesCategories,
+  supportsCategory,
+} from "../../shared/launchpad-categories.mjs";
+import LaunchpadCategoryFilters from "./LaunchpadCategoryFilters";
 import "./management.css";
 import "./launchpad.css";
 
@@ -93,6 +99,16 @@ type InstalledItem = {
   url?: string;
   updateCheck?: "checked" | "unavailable" | "pending";
   updateIssue?: string;
+  active?: boolean;
+  modifiedAt?: string;
+  categories?: string[];
+  mainCategory?: string;
+  downloads?: number;
+  follows?: number;
+  featured?: boolean;
+  updatedAt?: string;
+  releasedAt?: string;
+  gameVersions?: string[];
 };
 type Job = {
   id: string;
@@ -175,6 +191,14 @@ function mergeLocalInventory(
         update: old.update !== undefined ? old.update : item.update,
         updateCheck: old.updateCheck ?? item.updateCheck,
         updateIssue: old.updateIssue ?? item.updateIssue,
+        categories: old.categories ?? item.categories,
+        mainCategory: old.mainCategory ?? item.mainCategory,
+        downloads: old.downloads ?? item.downloads,
+        follows: old.follows ?? item.follows,
+        featured: old.featured ?? item.featured,
+        updatedAt: old.updatedAt ?? item.updatedAt,
+        releasedAt: old.releasedAt ?? item.releasedAt,
+        gameVersions: old.gameVersions ?? item.gameVersions,
       };
     }),
   };
@@ -237,13 +261,47 @@ const kinds = [
   { id: "plugin", label: "Plugins", icon: Package },
 ] as const;
 const rowsOptions = [5, 10, 25, 50, 75, 100];
+const catalogSortChoices = [
+  { id: "featured", label: "Featured" },
+  { id: "relevance", label: "Relevancy" },
+  { id: "popular", label: "Popularity" },
+  { id: "updated", label: "Latest Update" },
+  { id: "newest", label: "Release Date" },
+  { id: "downloads", label: "Total Downloads" },
+  { id: "category", label: "Main Category" },
+  { id: "gameVersion", label: "Game Version" },
+  { id: "name", label: "Name" },
+  { id: "author", label: "Author" },
+];
 const installedSortOptions = [
   { id: "updates", label: "Updates first" },
+  { id: "active", label: "Active" },
+  { id: "featured", label: "Featured" },
+  { id: "relevance", label: "Relevancy" },
+  { id: "popular", label: "Popularity" },
+  { id: "updated", label: "Latest Update" },
+  { id: "newest", label: "Release Date" },
+  { id: "downloads", label: "Total Downloads" },
+  { id: "category", label: "Main Category" },
+  { id: "gameVersion", label: "Game Version" },
   { id: "name", label: "Name (A–Z)" },
   { id: "size", label: "Size (largest first)" },
   { id: "author", label: "Mod author (A–Z)" },
+  { id: "modified", label: "Date modified (newest first)" },
 ] as const;
 type InstalledSort = (typeof installedSortOptions)[number]["id"];
+
+// Retain dismissals across page navigation, including a slow or offline remote
+// panel. Scope them to the server/account rather than hiding another panel's job.
+const dismissedJobs = new Map<string, Set<string>>();
+function rememberDismissedJob(scope: string, id: string) {
+  const ids = dismissedJobs.get(scope) ?? new Set<string>();
+  ids.add(id);
+  while (ids.size > 50) ids.delete(ids.values().next().value!);
+  dismissedJobs.set(scope, ids);
+  while (dismissedJobs.size > 100)
+    dismissedJobs.delete(dismissedJobs.keys().next().value!);
+}
 type SavedView = {
   platform?: string;
   type?: ContentType;
@@ -252,6 +310,7 @@ type SavedView = {
   installedOnly?: boolean;
   sort?: string;
   installedSort?: InstalledSort;
+  categories?: string[];
 };
 function readSavedView(key: string): SavedView {
   try {
@@ -283,6 +342,15 @@ function readSavedView(key: string): SavedView {
       )
         ? (values.installedSort as InstalledSort)
         : undefined,
+      categories: Array.isArray(values.categories)
+        ? values.categories
+            .filter(
+              (value): value is string =>
+                typeof value === "string" &&
+                allModCategories.some((item) => item.id === value),
+            )
+            .slice(0, 10)
+        : undefined,
     };
   } catch {
     return {};
@@ -292,6 +360,7 @@ function compareInstalled(
   a: InstalledItem,
   b: InstalledItem,
   sort: InstalledSort,
+  query = "",
 ) {
   const alphabetical = (left: string, right: string) =>
     left.localeCompare(right, undefined, {
@@ -299,8 +368,52 @@ function compareInstalled(
       numeric: true,
     });
   let order = 0;
+  const date = (value?: string) => Date.parse(value ?? "") || 0;
+  const text = (left = "", right = "") =>
+    Number(!left) - Number(!right) || alphabetical(left, right);
   if (sort === "updates") {
     order = Number(Boolean(b.update)) - Number(Boolean(a.update));
+  } else if (sort === "active") {
+    order = Number(b.active !== false) - Number(a.active !== false);
+  } else if (sort === "featured") {
+    order = Number(Boolean(b.featured)) - Number(Boolean(a.featured));
+  } else if (sort === "relevance" && query) {
+    const score = (item: InstalledItem) => {
+      const title = (item.title || item.name).toLowerCase();
+      return title === query
+        ? 3
+        : title.startsWith(query)
+          ? 2
+          : title.includes(query)
+            ? 1
+            : 0;
+    };
+    order = score(b) - score(a);
+  } else if (sort === "downloads" || sort === "popular") {
+    const score = (item: InstalledItem) =>
+      sort === "popular"
+        ? (item.follows ?? item.downloads ?? -1)
+        : (item.downloads ?? -1);
+    order = score(b) - score(a);
+  } else if (sort === "updated" || sort === "newest" || sort === "modified") {
+    const key =
+      sort === "updated"
+        ? "updatedAt"
+        : sort === "newest"
+          ? "releasedAt"
+          : "modifiedAt";
+    order = date(b[key]) - date(a[key]);
+  } else if (sort === "category") {
+    const category = (item: InstalledItem) =>
+      allModCategories.find((category) => category.id === item.mainCategory)
+        ?.label ?? item.mainCategory;
+    order = text(category(a), category(b));
+  } else if (sort === "gameVersion") {
+    const latest = (item: InstalledItem) =>
+      [...(item.gameVersions ?? [])].sort(alphabetical).at(-1) ?? "";
+    const left = latest(a),
+      right = latest(b);
+    order = Number(!left) - Number(!right) || alphabetical(right, left);
   } else if (sort === "size") {
     const size = (item: InstalledItem) =>
       Number.isFinite(item.size) && item.size >= 0 ? item.size : -1;
@@ -419,6 +532,13 @@ export default function Launchpad({
   const [sort, setSort] = useState("downloads");
   const [installedSort, setInstalledSort] = useState<InstalledSort>("updates");
   const [installedOnly, setInstalledOnly] = useState(false);
+  const [categories, setCategories] = useState<string[]>([]);
+  const categoryKey =
+    type === "mod"
+      ? categories
+          .filter((id) => installedOnly || supportsCategory(id, platform))
+          .join(",")
+      : "";
   const [offset, setOffset] = useState(0);
   const [limit, setLimit] = useState(() => {
     try {
@@ -505,7 +625,13 @@ export default function Launchpad({
   const [removalError, setRemovalError] = useState("");
   const [removalAcknowledged, setRemovalAcknowledged] = useState(false);
   const [busy, setBusy] = useState<
-    "preview" | "install" | "settings" | "removal-preview" | "remove" | null
+    | "preview"
+    | "install"
+    | "settings"
+    | "removal-preview"
+    | "remove"
+    | "active"
+    | null
   >(null);
   const [job, setJob] = useState<Job | null>(null);
   const [jobError, setJobError] = useState("");
@@ -525,9 +651,13 @@ export default function Launchpad({
   const settingsDialog = useRef<HTMLDialogElement>(null);
   const removalDialog = useRef<HTMLDialogElement>(null);
   const tabs = useRef<HTMLDivElement>(null);
+  const completedJob = useRef<{ scope: string; id: string } | null>(null);
   const source = config?.platforms.find((item) => item.id === platform);
   const inventoryReady = Boolean(config);
   const sortOptions = source?.sortOptions ?? [];
+  const displayedSortOptions = ["modrinth", "curseforge"].includes(platform)
+    ? catalogSortChoices
+    : sortOptions;
   const catalogSort = sortOptions.some((item) => item.id === sort)
     ? sort
     : (sortOptions[0]?.id ?? "");
@@ -542,6 +672,8 @@ export default function Launchpad({
   );
   const canRecover = allowChanges && status === "offline" && !working;
   const canInstall = canRecover && !job?.recoveryRequired;
+  const canDismissJob =
+    permissions === undefined || permissions.includes("file.update");
   const contentName =
     type === "plugin" ? "plugin" : type === "datapack" ? "datapack" : "mod";
   const minecraftVersions = [
@@ -584,7 +716,11 @@ export default function Launchpad({
           (next.job || initial)
         ) {
           jobEpoch.current++;
-          setJob(next.job ?? null);
+          setJob(
+            next.job && !dismissedJobs.get(viewKey)?.has(next.job.id)
+              ? next.job
+              : null,
+          );
           setJobError("");
         }
         if (initial) {
@@ -634,6 +770,7 @@ export default function Launchpad({
               : (first?.sortOptions?.[0]?.id ?? "downloads"),
           );
           setInstalledSort(saved.installedSort ?? "updates");
+          setCategories(saved.categories ?? []);
           setViewReady(viewKey);
         }
         return true;
@@ -671,6 +808,48 @@ export default function Launchpad({
     await loadConfig();
     if (currentSession === session.current) reloadContent();
   }, [loadConfig, reloadContent]);
+
+  const dismissCompletedJob = useCallback(
+    (id: string) => {
+      rememberDismissedJob(viewKey, id);
+      if (canDismissJob) {
+        void api(`/launchpad/jobs/${encodeURIComponent(id)}/dismiss`, {
+          method: "POST",
+          keepalive: true,
+        }).catch(() => {});
+      }
+    },
+    [api, canDismissJob, viewKey],
+  );
+
+  useEffect(() => {
+    completedJob.current =
+      job?.status === "completed" && !job.recoveryRequired
+        ? { scope: viewKey, id: job.id }
+        : null;
+    if (!completedJob.current) return;
+    const id = completedJob.current.id;
+    const timer = window.setTimeout(() => {
+      dismissCompletedJob(id);
+      jobEpoch.current++;
+      setJob((current) => (current?.id === id ? null : current));
+    }, 10_000);
+    return () => window.clearTimeout(timer);
+  }, [
+    job?.id,
+    job?.status,
+    job?.recoveryRequired,
+    viewKey,
+    dismissCompletedJob,
+  ]);
+
+  useEffect(
+    () => () => {
+      const last = completedJob.current;
+      if (last?.scope === viewKey) dismissCompletedJob(last.id);
+    },
+    [viewKey, dismissCompletedJob],
+  );
 
   // Reviews reserve staged files. Release them on Back, close, server change,
   // or unmount; an accepted job owns its staging until it finishes.
@@ -729,6 +908,7 @@ export default function Launchpad({
     setInstalledSort("updates");
     setOffset(0);
     setInstalledOnly(false);
+    setCategories([]);
     setBusy(null);
     pending.current = false;
     void loadConfig(true);
@@ -774,6 +954,7 @@ export default function Launchpad({
           installedOnly,
           sort,
           installedSort,
+          categories,
         }),
         "session",
       );
@@ -791,6 +972,7 @@ export default function Launchpad({
     installedOnly,
     sort,
     installedSort,
+    categories,
   ]);
 
   useEffect(() => {
@@ -816,6 +998,7 @@ export default function Launchpad({
       gameVersion.trim(),
       loader,
       catalogSort,
+      categoryKey,
       offset,
       limit,
     ]);
@@ -828,7 +1011,7 @@ export default function Launchpad({
     const refresh = catalogRefresh.current;
     catalogRefresh.current = false;
     void api<SearchResult>(
-      `/launchpad/search?${queryString({ platform, type, query: query.trim(), gameVersion: gameVersion.trim(), loader, sort: catalogSort, offset, limit, ...(refresh ? { refresh: "true" } : {}) })}`,
+      `/launchpad/search?${queryString({ platform, type, query: query.trim(), gameVersion: gameVersion.trim(), loader, sort: catalogSort, ...(categoryKey ? { categories: categoryKey } : {}), offset, limit, ...(refresh ? { refresh: "true" } : {}) })}`,
       { signal: controller.signal },
     )
       .then((next) => {
@@ -858,6 +1041,7 @@ export default function Launchpad({
     query,
     filteredQuery,
     catalogSort,
+    categoryKey,
     gameVersion,
     loader,
     offset,
@@ -1694,8 +1878,58 @@ export default function Launchpad({
       }
     }
   }
+  async function setModActive(entry: InstalledItem, active: boolean) {
+    if (pending.current || !canInstall || type !== "mod") return;
+    const currentSession = session.current;
+    pending.current = true;
+    setBusy("active");
+    try {
+      const result = await post<{
+        path: string;
+        active: boolean;
+        modifiedAt: string;
+      }>("/launchpad/active", { path: entry.path, active });
+      if (currentSession !== session.current) return;
+      const previous = inventoryCache.current.get("mod");
+      if (previous?.api === api) {
+        const next = {
+          ...previous,
+          result: {
+            ...previous.result,
+            items: previous.result.items.map((item) =>
+              item.path === entry.path
+                ? {
+                    ...item,
+                    ...result,
+                    name: result.path.split("/").at(-1) || item.name,
+                  }
+                : item,
+            ),
+          },
+        };
+        inventoryCache.current.set("mod", next);
+        if (inventoryRef.current?.type === "mod") {
+          scanEpoch.current++;
+          inventoryRef.current = next;
+          setInventory(next);
+        }
+      }
+      reloadContent();
+      notify(
+        `${entry.title || entry.name} ${active ? "enabled" : "disabled"}.`,
+      );
+    } catch (cause) {
+      if (currentSession === session.current) notify(messageOf(cause), true);
+    } finally {
+      if (currentSession === session.current) {
+        pending.current = false;
+        setBusy(null);
+      }
+    }
+  }
   function changeType(next: ContentType) {
     setType(next);
+    setCategories([]);
     setLoader((current) =>
       loadersFor(next).includes(current)
         ? current
@@ -1712,7 +1946,14 @@ export default function Launchpad({
         .toLowerCase()
         .includes(filteredQuery.trim().toLowerCase()),
     )
-    .sort((a, b) => compareInstalled(a, b, installedSort));
+    .filter(
+      (entry) =>
+        !categoryKey ||
+        matchesCategories(entry.categories, categoryKey.split(",")),
+    )
+    .sort((a, b) =>
+      compareInstalled(a, b, installedSort, filteredQuery.trim().toLowerCase()),
+    );
   const total = installedOnly ? entries.length : (results?.total ?? 0);
   const currentOffset = Math.min(
     offset,
@@ -2059,8 +2300,19 @@ export default function Launchpad({
                 setOffset(0);
               }}
             >
-              {sortOptions.map((item) => (
-                <option key={item.id} value={item.id}>
+              {displayedSortOptions.map((item) => (
+                <option
+                  key={item.id}
+                  value={item.id}
+                  disabled={
+                    !sortOptions.some((supported) => supported.id === item.id)
+                  }
+                  title={
+                    sortOptions.some((supported) => supported.id === item.id)
+                      ? undefined
+                      : `Not available from ${source?.name ?? "this platform"}`
+                  }
+                >
                   {item.label}
                 </option>
               ))}
@@ -2068,6 +2320,16 @@ export default function Launchpad({
           </label>
         ) : null}
         <div className="launchpad-toolbar-actions">
+          {type === "mod" && (
+            <LaunchpadCategoryFilters
+              selected={categoryKey ? categoryKey.split(",") : []}
+              platform={installedOnly ? undefined : platform}
+              onChange={(next) => {
+                setCategories(next);
+                setOffset(0);
+              }}
+            />
+          )}
           {installedOnly && type !== "modpack" && allowChanges && (
             <button
               className="btn primary"
@@ -2185,6 +2447,7 @@ export default function Launchpad({
                       .then(() => {
                         if (currentSession === session.current) {
                           jobEpoch.current++;
+                          rememberDismissedJob(viewKey, job.id);
                           setJob((current) =>
                             current?.id === job.id ? null : current,
                           );
@@ -2436,6 +2699,9 @@ export default function Launchpad({
                         Update available
                       </span>
                     )}
+                    {entry?.active === false && type === "mod" && (
+                      <span className="launchpad-badge">Disabled</span>
+                    )}
                     {installedOnly && entry?.platform && (
                       <span className="launchpad-badge">
                         {config.platforms.find(
@@ -2538,24 +2804,74 @@ export default function Launchpad({
                     </button>
                   )}
                   {entry && type !== "modpack" && (
-                    <button
-                      type="button"
-                      className="btn launchpad-remove"
-                      aria-label={`Remove ${project.title}`}
-                      title={
-                        status !== "offline"
-                          ? `Stop the server before removing ${contentName}s.`
-                          : `Review ${contentName} removal`
-                      }
-                      disabled={
-                        !canInstall ||
-                        Boolean(busy) ||
-                        pendingPaths.has(entry.path)
-                      }
-                      onClick={() => void reviewRemoval(entry)}
-                    >
-                      <Trash2 size={14} /> Remove
-                    </button>
+                    <>
+                      {installedOnly && type === "mod" && (
+                        <Switch
+                          className="launchpad-active"
+                          aria-label={`Active: ${project.title}`}
+                          label="Active"
+                          checked={entry.active !== false}
+                          disabled={
+                            !canInstall ||
+                            Boolean(busy) ||
+                            pendingPaths.has(entry.path)
+                          }
+                          title={
+                            status !== "offline"
+                              ? "Stop the server before enabling or disabling mods."
+                              : `${entry.active === false ? "Enable" : "Disable"} ${project.title}`
+                          }
+                          onCheckedChange={(active) =>
+                            void setModActive(entry, active)
+                          }
+                        />
+                      )}
+                      <button
+                        type="button"
+                        className="btn launchpad-remove"
+                        aria-label={`Remove ${project.title}`}
+                        title={
+                          status !== "offline"
+                            ? `Stop the server before removing ${contentName}s.`
+                            : `Review ${contentName} removal`
+                        }
+                        disabled={
+                          !canInstall ||
+                          Boolean(busy) ||
+                          pendingPaths.has(entry.path)
+                        }
+                        onClick={() => void reviewRemoval(entry)}
+                      >
+                        <Trash2 size={14} /> Remove
+                      </button>
+                      {installedOnly && (
+                        <div className="launchpad-modified">
+                          <span>Date modified</span>
+                          {entry.modifiedAt &&
+                          Number.isFinite(Date.parse(entry.modifiedAt)) ? (
+                            <time
+                              dateTime={entry.modifiedAt}
+                              title={new Date(
+                                entry.modifiedAt,
+                              ).toLocaleString()}
+                            >
+                              {new Date(entry.modifiedAt).toLocaleString(
+                                undefined,
+                                {
+                                  year: "numeric",
+                                  month: "short",
+                                  day: "numeric",
+                                  hour: "numeric",
+                                  minute: "2-digit",
+                                },
+                              )}
+                            </time>
+                          ) : (
+                            <span>Unavailable</span>
+                          )}
+                        </div>
+                      )}
+                    </>
                   )}
                 </div>
               </article>

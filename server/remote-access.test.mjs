@@ -1129,6 +1129,7 @@ test("remote route permissions fail closed for unassigned routes and distinguish
       "/api/launchpad/install",
       "/api/launchpad/preview",
       "/api/launchpad/remove",
+      "/api/launchpad/active",
     ].map((path) => [
       "POST",
       path,
@@ -1199,6 +1200,7 @@ test("the shared panel exposes standard pages within the user's file and console
     "/api/versions/install",
     "/api/launchpad/preview",
     "/api/launchpad/remove",
+    "/api/launchpad/active",
   ])
     assert.equal((await asUser(route, json("POST", {}))).status, 403, route);
   assert.equal(

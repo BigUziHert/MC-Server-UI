@@ -10,6 +10,8 @@ import { installedDependencySatisfies } from "./launchpad-dependency-ranges.mjs"
 import { inspectInstalledMod } from "./launchpad-mod-metadata.mjs";
 import { updatedModDependencyWarnings } from "./launchpad-update-dependencies.mjs";
 import { createModRemoval } from "./launchpad-removal.mjs";
+import { createModActivation } from "./launchpad-activation.mjs";
+import { categoryIds } from "../shared/launchpad-categories.mjs";
 import { createLaunchpadMetadataCache } from "./launchpad-metadata-cache.mjs";
 import { createLaunchpadCatalogCache } from "./launchpad-catalog-cache.mjs";
 import { mapReview, parallelTransfers } from "./launchpad-transfers.mjs";
@@ -38,6 +40,10 @@ const sorts = new Set([
   "updated",
   "newest",
   "name",
+  "featured",
+  "category",
+  "gameVersion",
+  "author",
 ]);
 const loaders = [
   "fabric",
@@ -353,6 +359,14 @@ export async function createLaunchpad(ctx) {
         "url",
         "identityMethod",
         "canonicalSha512",
+        "categories",
+        "mainCategory",
+        "downloads",
+        "follows",
+        "featured",
+        "updatedAt",
+        "releasedAt",
+        "gameVersions",
       ]
         .filter((key) => item[key] !== undefined)
         .map((key) => [key, item[key]]),
@@ -447,7 +461,9 @@ export async function createLaunchpad(ctx) {
   });
   let reportedBusy = false;
   const notifyBusy = () => {
-    const busy = Boolean(active || preparingInstall || removal.busy);
+    const busy = Boolean(
+      active || preparingInstall || removal.busy || activation.busy,
+    );
     if (busy !== reportedBusy) {
       reportedBusy = busy;
       ctx.onBusyChange?.(busy);
@@ -463,7 +479,7 @@ export async function createLaunchpad(ctx) {
     restore,
     withMinecraftMutation,
     signal: lifetime.signal,
-    isBusy: () => Boolean(active || preparingInstall),
+    isBusy: () => Boolean(active || preparingInstall || activation.busy),
     onBusyChange: notifyBusy,
     async onRemoved(relative, type) {
       const previous = receipts;
@@ -489,6 +505,42 @@ export async function createLaunchpad(ctx) {
         );
       } catch {
         // Audit storage failure must not undo a completed, recoverable removal.
+      }
+    },
+  });
+  const activation = createModActivation({
+    serverDir,
+    safePath,
+    getServer,
+    withMinecraftMutation,
+    signal: lifetime.signal,
+    isBusy: () => Boolean(active || preparingInstall || removal.busy),
+    isRecoveryRequired: () => recoveryRequired,
+    onBusyChange: notifyBusy,
+    async onChanged(previousPath, nextPath, isActive) {
+      const previous = receipts;
+      replaceReceipts(
+        receipts.map((item) =>
+          item.path === previousPath ? { ...item, path: nextPath } : item,
+        ),
+      );
+      try {
+        await saveReceipts();
+      } catch (cause) {
+        replaceReceipts(previous);
+        throw cause;
+      }
+      fileCache.delete(previousPath);
+      fileCache.delete(nextPath);
+      backgroundChecks.clear();
+      removal.invalidate();
+      try {
+        await ctx.audit?.(
+          isActive ? "Mod enabled" : "Mod disabled",
+          `${previousPath} renamed to ${nextPath}.`,
+        );
+      } catch {
+        // An audit storage failure must not undo a completed state change.
       }
     },
   });
@@ -691,7 +743,12 @@ export async function createLaunchpad(ctx) {
     });
     const packages = entries
       .filter((name) =>
-        (type === "datapack" ? /\.zip$/i : /\.jar$/i).test(name),
+        (type === "datapack"
+          ? /\.zip$/i
+          : type === "mod"
+            ? /\.jar(?:\.disabled)?$/i
+            : /\.jar$/i
+        ).test(name),
       )
       .sort();
     if (packages.length > 1000)
@@ -752,7 +809,12 @@ export async function createLaunchpad(ctx) {
       (entry) =>
         entry.isFile() &&
         !entry.isSymbolicLink() &&
-        (type === "datapack" ? /\.zip$/i : /\.jar$/i).test(entry.name),
+        (type === "datapack"
+          ? /\.zip$/i
+          : type === "mod"
+            ? /\.jar(?:\.disabled)?$/i
+            : /\.jar$/i
+        ).test(entry.name),
     );
     if (files.length > 1000)
       throw error(
@@ -830,6 +892,10 @@ export async function createLaunchpad(ctx) {
             name: file.name,
             size: stat?.size ?? 0,
             platform: null,
+            ...(type === "mod"
+              ? { active: !/\.disabled$/i.test(file.name) }
+              : {}),
+            modifiedAt: stat?.mtime.toISOString(),
           };
           return;
         }
@@ -854,6 +920,10 @@ export async function createLaunchpad(ctx) {
             Object.entries(receipt ?? {}).filter(([, value]) => value != null),
           ),
           ...(known?.platform ? known : {}),
+          ...(type === "mod"
+            ? { active: !/\.disabled$/i.test(file.name) }
+            : {}),
+          modifiedAt: stat.mtime.toISOString(),
         };
       },
       signal,
@@ -870,6 +940,7 @@ export async function createLaunchpad(ctx) {
       active ||
       preparingInstall ||
       removal.busy ||
+      activation.busy ||
       ctx.isContentMutationActive?.();
     if (mutating()) return;
     const snapshot = receipts,
@@ -916,6 +987,17 @@ export async function createLaunchpad(ctx) {
       if (projectUrl(project?.url)) item[urlField] = projectUrl(project.url);
       if (typeof project?.author === "string" && project.author.trim())
         item.author = project.author;
+      for (const field of [
+        "categories",
+        "mainCategory",
+        "downloads",
+        "follows",
+        "featured",
+        "updatedAt",
+        "releasedAt",
+        "gameVersions",
+      ])
+        if (project?.[field] !== undefined) item[field] = project[field];
     };
     for (const item of items) {
       const url = projectPageUrl({ ...item, url: item[urlField] });
@@ -1849,6 +1931,12 @@ export async function createLaunchpad(ctx) {
     };
   }
   async function resolveTree(input, stage, local) {
+    const rootIsActive = !local.some(
+      (item) =>
+        item.platform === input.platform &&
+        item.projectId === input.projectId &&
+        item.active === false,
+    );
     const files = [],
       warnings = [],
       unavailableDependencies = [],
@@ -2033,6 +2121,19 @@ export async function createLaunchpad(ctx) {
             );
         }
         const key = `${value.platform}:${value.projectId}`;
+        if (depth && rootIsActive) {
+          const inactive = local.find(
+            (item) =>
+              item.platform === value.platform &&
+              item.projectId === value.projectId &&
+              item.active === false,
+          );
+          if (inactive)
+            throw error(
+              409,
+              `${inactive.title || inactive.path} is disabled but is required by ${requiredBy || "this mod"}. Enable it before reviewing this installation.`,
+            );
+        }
         if (
           visited.get(key) === String(value.versionId) &&
           !preservedDependencies.has(key)
@@ -2715,7 +2816,7 @@ export async function createLaunchpad(ctx) {
       }
     };
     const inspected = await mapReview(
-      local,
+      local.filter((row) => row.active !== false),
       async (row) => inspect(await safePath(serverDir, row.path), row),
       input.signal,
     );
@@ -2740,7 +2841,7 @@ export async function createLaunchpad(ctx) {
       throw error(400, "This installation exceeds the 2 GB total size limit.");
     let downloaded = 0;
     const candidates = await mapReview(
-      files,
+      files.filter((file) => !/\.disabled$/i.test(file.path)),
       async (file, index) => {
         if (!file.stagedPath) {
           const source = path.join(stage, `update-dependency-${index}.jar`);
@@ -2784,7 +2885,7 @@ export async function createLaunchpad(ctx) {
   }
   async function preparePreview(raw) {
     if (closing) throw error(503, "Launchpad is shutting down.");
-    if (active || preparingInstall || removal.busy)
+    if (active || preparingInstall || removal.busy || activation.busy)
       throw error(
         409,
         "Wait for the current Launchpad installation to finish.",
@@ -3041,6 +3142,13 @@ export async function createLaunchpad(ctx) {
               );
             oldPath = selectedRoot.replacePath;
           }
+          // Updating an inactive mod keeps the new release inactive too.
+          if (
+            input.type === "mod" &&
+            matches[0]?.active === false &&
+            /\.jar$/i.test(file.path)
+          )
+            file.path += ".disabled";
           const target = await safePath(serverDir, file.path);
           const current = await statOrNull(target);
           if (current && !current.isFile())
@@ -3564,7 +3672,7 @@ export async function createLaunchpad(ctx) {
         400,
         "Review the exact file changes and confirm the installation first.",
       );
-    if (active || preparingInstall || removal.busy)
+    if (active || preparingInstall || removal.busy || activation.busy)
       throw error(409, "Another Launchpad installation is already running.");
     if ((noOpReviews.get(input?.planId) ?? 0) > Date.now())
       throw error(
@@ -3844,7 +3952,8 @@ export async function createLaunchpad(ctx) {
     return { ok: true };
   }
   const api = {
-    isBusy: () => Boolean(active || preparingInstall || removal.busy),
+    isBusy: () =>
+      Boolean(active || preparingInstall || removal.busy || activation.busy),
     isRecoveryRequired: () => recoveryRequired,
     resolveRecovery: () => withMinecraftMutation(reconcileInstallation),
     async cancelInstall(id) {
@@ -3908,6 +4017,20 @@ export async function createLaunchpad(ctx) {
       )
         throw error(400, "Choose a sort order supported by this provider.");
       input.sort ||= undefined;
+      try {
+        input.categories = categoryIds(input.categories);
+      } catch (cause) {
+        throw error(400, cause.message);
+      }
+      if (
+        input.categories.length &&
+        (input.type !== "mod" ||
+          !["modrinth", "curseforge"].includes(input.platform))
+      )
+        throw error(
+          400,
+          "Category filters are available for Modrinth and CurseForge mods.",
+        );
       const cacheKey = JSON.stringify([
         input.platform,
         input.type,
@@ -3915,6 +4038,7 @@ export async function createLaunchpad(ctx) {
         input.gameVersion,
         input.loader,
         input.sort,
+        input.categories.join(","),
         input.offset,
         input.limit,
       ]);
@@ -4029,6 +4153,7 @@ export async function createLaunchpad(ctx) {
     },
     removalPreview: removal.preview,
     remove: removal.remove,
+    setActive: activation.change,
     job(id) {
       if (!jobs.has(id))
         throw error(
@@ -4047,6 +4172,7 @@ export async function createLaunchpad(ctx) {
       catalogCache.clear();
       activeController?.abort(stopped);
       await removal.close();
+      await activation.close();
       await Promise.allSettled([...previews]);
       await active;
       await Promise.allSettled(

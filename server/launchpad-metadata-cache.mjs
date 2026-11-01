@@ -1,6 +1,7 @@
 import fs from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import { safeProjectUrl } from "../shared/launchpad-project.mjs";
+import { allModCategories } from "../shared/launchpad-categories.mjs";
 
 const maximumBytes = 4 * 1024 ** 2;
 const maximumEntries = 4000;
@@ -11,6 +12,7 @@ const checksum = (value) =>
   typeof value === "string" && /^[a-f0-9]{128}$/.test(value);
 const plain = (value) =>
   value && typeof value === "object" && !Array.isArray(value);
+const categoryNames = new Set(allModCategories.map((row) => row.id));
 function displayFields(value) {
   const result = {};
   for (const key of ["title", "author", "versionName"])
@@ -26,6 +28,31 @@ function displayFields(value) {
       const url = safeProjectUrl(value[key]);
       if (url) result[key] = url;
     }
+  if (Array.isArray(value.categories))
+    result.categories = [
+      ...new Set(value.categories.filter((id) => categoryNames.has(id))),
+    ];
+  if (categoryNames.has(value.mainCategory))
+    result.mainCategory = value.mainCategory;
+  for (const key of ["downloads", "follows"])
+    if (Number.isFinite(value[key]) && value[key] >= 0)
+      result[key] = value[key];
+  if (typeof value.featured === "boolean") result.featured = value.featured;
+  for (const key of ["updatedAt", "releasedAt"])
+    if (
+      typeof value[key] === "string" &&
+      Number.isFinite(Date.parse(value[key]))
+    )
+      result[key] = new Date(value[key]).toISOString();
+  if (Array.isArray(value.gameVersions))
+    result.gameVersions = [
+      ...new Set(
+        value.gameVersions.filter(
+          (version) =>
+            typeof version === "string" && /^\d+(?:\.\d+)+$/.test(version),
+        ),
+      ),
+    ].slice(0, 1000);
   return result;
 }
 
