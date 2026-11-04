@@ -2117,6 +2117,9 @@ test("Launchpad hash-identifies installed mods, filters compatibility, confirms 
     "https://cdn.modrinth.com/data/project/icon.png",
   );
   assert.equal(saved[0].author, "FixtureAuthor");
+  assert.deepEqual(saved[0].authorLinks, [
+    { name: "FixtureAuthor", url: "https://modrinth.com/user/FixtureAuthor" },
+  ]);
   assert.equal(
     (await restarted.installed(selection)).items[0].versionId,
     "new",
@@ -2502,6 +2505,11 @@ test("Modrinth authors use accepted owners or sorted accepted contributors and m
     first.projects.map(({ author }) => author),
     ["LegacyOwner", "LegacyOwner", "Alpha, zulu", undefined],
   );
+  assert.deepEqual(first.projects[2].authorLinks, [
+    { name: "Alpha", url: "https://modrinth.com/user/Alpha" },
+    { name: "zulu", url: "https://modrinth.com/user/zulu" },
+  ]);
+  assert.equal(first.projects[3].authorLinks, undefined);
   assert.deepEqual(
     second.projects.map(({ author }) => author),
     ["LegacyOwner", "Alpha, zulu"],
@@ -2575,6 +2583,12 @@ test("failed contributor lookups preserve titles, icons, updates and saved autho
         versionId: "old",
         title: "Saved title",
         author: "Saved Author",
+        authorLinks: [
+          {
+            name: "Saved Author",
+            url: "https://modrinth.com/user/SavedAuthor",
+          },
+        ],
         type: "mod",
       },
     ]),
@@ -2599,6 +2613,9 @@ test("failed contributor lookups preserve titles, icons, updates and saved autho
   );
   const receipts = JSON.parse(await fs.readFile(receiptPath, "utf8"));
   assert.equal(receipts[0].author, "Saved Author");
+  assert.deepEqual(receipts[0].authorLinks, [
+    { name: "Saved Author", url: "https://modrinth.com/user/SavedAuthor" },
+  ]);
   assert.equal(
     f.requests.filter(({ url }) => new URL(url).pathname === "/v2/teams")
       .length,
@@ -2639,8 +2656,11 @@ test("old mod and modpack receipts are enriched without compatibility filters or
             gameId: 432,
             name: "CurseForge Project",
             authors: [
-              { name: "Creator" },
-              { name: "Contributor" },
+              {
+                name: "Creator",
+                url: "https://www.curseforge.com/members/creator",
+              },
+              { name: "Contributor", url: "javascript:alert(1)" },
               { name: "Creator" },
               null,
               { name: " " },
@@ -2685,6 +2705,10 @@ test("old mod and modpack receipts are enriched without compatibility filters or
   });
   assert.equal(mods.items[0].title, "CurseForge Project");
   assert.equal(mods.items[0].author, "Creator, Contributor");
+  assert.deepEqual(mods.items[0].authorLinks, [
+    { name: "Creator", url: "https://www.curseforge.com/members/creator" },
+    { name: "Contributor" },
+  ]);
   assert.equal(
     mods.items[0].iconUrl,
     "https://media.forgecdn.net/avatars/fixture.png",
@@ -2697,6 +2721,9 @@ test("old mod and modpack receipts are enriched without compatibility filters or
   });
   assert.equal(packs.items[0].title, "Fixture Project");
   assert.equal(packs.items[0].author, "FixtureAuthor");
+  assert.deepEqual(packs.items[0].authorLinks, [
+    { name: "FixtureAuthor", url: "https://modrinth.com/user/FixtureAuthor" },
+  ]);
   assert.equal(packs.items[0].name, "Fixture Project");
   assert.equal(
     packs.items[0].iconUrl,
@@ -5242,6 +5269,61 @@ test("existing CurseForge-only mods require matching fingerprints and SHA-1 befo
     await fs.readFile(path.join(f.serverDir, "mods", "old.jar")),
     f.old,
   );
+});
+
+test("catalog authors link to Modrinth profiles and provider-supplied CurseForge pages", async (t) => {
+  const f = await fixture(t, {
+    request: async (url) => {
+      const address = new URL(url);
+      if (address.pathname === "/v2/search")
+        return Response.json({
+          hits: [{ project_id: "project", title: "Mod", author: "Creator_1" }],
+          total_hits: 1,
+          offset: 0,
+          limit: 20,
+        });
+      if (address.pathname === "/v1/categories")
+        return Response.json({
+          data: [{ id: 6, slug: "mc-mods", name: "Mods" }],
+        });
+      if (address.pathname === "/v1/mods/search")
+        return Response.json({
+          data: [
+            {
+              id: 11,
+              name: "Mod",
+              authors: [
+                {
+                  name: "Creator",
+                  url: "https://www.curseforge.com/members/creator/projects",
+                },
+                { name: "Unlinked" },
+                { name: "Unsafe", url: "javascript:alert(1)" },
+              ],
+            },
+          ],
+          pagination: { totalCount: 1 },
+        });
+    },
+  });
+  const modrinth = await f.service.search(selection);
+  assert.deepEqual(modrinth.projects[0].authorLinks, [
+    { name: "Creator_1", url: "https://modrinth.com/user/Creator_1" },
+  ]);
+  await f.service.settings({ curseforgeApiKey: "fixture-key" });
+  const curseforge = await f.service.search({
+    ...selection,
+    platform: "curseforge",
+  });
+  assert.equal(curseforge.projects[0].author, "Creator, Unlinked, Unsafe");
+  assert.deepEqual(curseforge.projects[0].authorLinks, [
+    {
+      name: "Creator",
+      url: "https://www.curseforge.com/members/creator/projects",
+    },
+    { name: "Unlinked" },
+    { name: "Unsafe" },
+  ]);
 });
 
 test("CurseForge pagination supports 100 rows without skipping its 50-row API pages", async (t) => {

@@ -930,6 +930,7 @@ test("220 installed files stay usable while provider checks run without rescanni
   const items = Array.from({ length: 220 }, (_, index) => ({
     ...installed(`Mod ${String(index + 1).padStart(3, "0")}`),
     size: index + 1,
+    downloads: index + 1,
     update: null,
     updateCheck: "pending",
   }));
@@ -992,7 +993,7 @@ test("220 installed files stay usable while provider checks run without rescanni
   await expect(page.getByRole("article")).toHaveCount(25);
   await page
     .getByLabel("Sort installed content", { exact: true })
-    .selectOption("size");
+    .selectOption("downloads");
   await expect(page.getByRole("article").first()).toHaveAttribute(
     "aria-label",
     "Mod 220",

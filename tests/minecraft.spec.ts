@@ -2203,6 +2203,7 @@ test("Launchpad installed sorts order the entire list before paging and retain i
       json: {
         items: rows.map((row, index) => ({
           ...row,
+          downloads: row.size,
           name: row.path.slice(5),
           platform: "modrinth",
           projectId: `sort-${index}`,
@@ -2255,7 +2256,7 @@ test("Launchpad installed sorts order the entire list before paging and retain i
       ],
     },
     {
-      sort: "size",
+      sort: "downloads",
       paths: [
         "alpha2",
         "omega",
@@ -2344,8 +2345,8 @@ test("Launchpad installed sorts order the entire list before paging and retain i
   await expect(
     page.getByRole("article").getByText("By Gamma", { exact: true }),
   ).toHaveCount(2);
-  await sort.selectOption("size");
-  await expect(sort).toHaveValue("size");
+  await sort.selectOption("downloads");
+  await expect(sort).toHaveValue("downloads");
   await sort.selectOption("author");
   await expect(sort).toHaveValue("author");
   expect(
@@ -2398,6 +2399,7 @@ test("Launchpad keeps refreshed local files usable after installation while remo
       name: replaced ? "better-2.jar" : "better-1.jar",
       title: "Better Mod",
       size: replaced ? 2048 : 1024,
+      downloads: 2048,
       platform: "modrinth",
       projectId: "better",
       versionId: replaced ? "new" : "old",
@@ -2414,6 +2416,7 @@ test("Launchpad keeps refreshed local files usable after installation while remo
       name: "alpha.jar",
       title: "Alpha",
       size: 512,
+      downloads: 512,
       platform: "modrinth",
       projectId: "alpha",
       versionId: "old",
@@ -2423,6 +2426,7 @@ test("Launchpad keeps refreshed local files usable after installation while remo
       name: "zeta.jar",
       title: "Zeta",
       size: 4096,
+      downloads: 4096,
       platform: "modrinth",
       projectId: "zeta",
       versionId: "old",
@@ -2516,7 +2520,7 @@ test("Launchpad keeps refreshed local files usable after installation while remo
     page.getByRole("button", { name: "Update Better Mod", exact: true }),
   ).toBeVisible();
   const sort = page.getByLabel("Sort installed content", { exact: true });
-  await sort.selectOption("size");
+  await sort.selectOption("downloads");
   await page
     .getByRole("button", { name: "Update Better Mod", exact: true })
     .click();

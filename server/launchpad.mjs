@@ -20,6 +20,7 @@ import { createVersionsService } from "./versions.mjs";
 import { cleanInstall, prepareCleanSettings } from "./clean-install.mjs";
 import { inferPackRuntime } from "./launchpad-pack-runtime.mjs";
 import {
+  normalizeAuthorLinks,
   projectPageUrl,
   safeProjectUrl as projectUrl,
 } from "../shared/launchpad-project.mjs";
@@ -367,6 +368,7 @@ export async function createLaunchpad(ctx) {
         "title",
         "iconUrl",
         "author",
+        "authorLinks",
         "url",
         "identityMethod",
         "canonicalSha512",
@@ -1001,6 +1003,8 @@ export async function createLaunchpad(ctx) {
       if (projectUrl(project?.url)) item[urlField] = projectUrl(project.url);
       if (typeof project?.author === "string" && project.author.trim())
         item.author = project.author;
+      const authorLinks = normalizeAuthorLinks(project?.authorLinks);
+      if (authorLinks) item.authorLinks = authorLinks;
       for (const field of [
         "categories",
         "mainCategory",
@@ -1029,7 +1033,9 @@ export async function createLaunchpad(ctx) {
             );
             if (cached) apply(item, cached.value);
             return (
-              !cached?.checkedAt || cached.checkedAt + 10 * 60_000 <= Date.now()
+              !cached?.checkedAt ||
+              cached.checkedAt + 10 * 60_000 <= Date.now() ||
+              (cached.value.author && !cached.value.authorLinks)
             );
           });
         if (!known.length) return;
@@ -2265,6 +2271,7 @@ export async function createLaunchpad(ctx) {
           title: result.title,
           iconUrl: result.iconUrl,
           author: result.author,
+          authorLinks: result.authorLinks,
           projectUrl: projectUrl(result.url),
           type: value.type,
           hosts: found.downloadHosts,
@@ -2305,6 +2312,7 @@ export async function createLaunchpad(ctx) {
     return {
       ...rootResult,
       author: rootMetadata.author,
+      authorLinks: rootMetadata.authorLinks,
       url: rootMetadata.projectUrl ?? projectUrl(rootResult.url),
       files,
       warnings,
@@ -3064,6 +3072,7 @@ export async function createLaunchpad(ctx) {
             title: result.title,
             iconUrl: result.iconUrl,
             author: result.author,
+            authorLinks: result.authorLinks,
             versionName: result.versionName,
             type: input.type,
             hosts: file.hosts ?? found.downloadHosts,
@@ -3235,6 +3244,7 @@ export async function createLaunchpad(ctx) {
             file: {
               ...file,
               author: file.author || matches[0]?.author,
+              authorLinks: file.authorLinks || matches[0]?.authorLinks,
               expected,
               previous,
               action: expected || previous ? "replace" : "install",
@@ -3296,6 +3306,14 @@ export async function createLaunchpad(ctx) {
               item.platform === input.platform &&
               item.projectId === input.projectId,
           )?.author,
+        authorLinks:
+          result.authorLinks ||
+          receipts.find(
+            (item) =>
+              item.pack &&
+              item.platform === input.platform &&
+              item.projectId === input.projectId,
+          )?.authorLinks,
         versionName: result.versionName,
         warnings: [...new Set(result.warnings)],
         unavailableDependencies: result.unavailableDependencies,
@@ -3459,6 +3477,7 @@ export async function createLaunchpad(ctx) {
               title: file.title,
               iconUrl: file.iconUrl,
               author: file.author,
+              authorLinks: file.authorLinks,
               url: file.projectUrl,
               type: file.type,
               installedAt: new Date().toISOString(),
@@ -3636,6 +3655,7 @@ export async function createLaunchpad(ctx) {
               title: plan.title,
               iconUrl: plan.iconUrl,
               author: plan.author,
+              authorLinks: plan.authorLinks,
               url: plan.url,
               versionName: plan.versionName,
               path: "",

@@ -9,11 +9,16 @@ export default function LaunchpadCategoryFilters({
   selected,
   platform,
   onChange,
+  bottom = false,
 }: {
   selected: string[];
   platform?: string;
   onChange: (categories: string[]) => void;
+  bottom?: boolean;
 }) {
+  const panelId = bottom
+    ? "launchpad-bottom-category-panel"
+    : "launchpad-category-panel";
   const [open, setOpen] = useState(false);
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
   const root = useRef<HTMLDivElement>(null);
@@ -74,8 +79,13 @@ export default function LaunchpadCategoryFilters({
         type="button"
         className={`btn${selected.length ? " launchpad-filter-selected" : ""}`}
         ref={trigger}
+        aria-label={
+          bottom
+            ? `Bottom filters${selected.length ? ` / ${selected.length}` : ""}`
+            : undefined
+        }
         aria-expanded={open}
-        aria-controls="launchpad-category-panel"
+        aria-controls={panelId}
         onClick={() => setOpen(!open)}
       >
         <Filter size={15} /> Filters
@@ -83,9 +93,9 @@ export default function LaunchpadCategoryFilters({
       </button>
       {open && (
         <section
-          id="launchpad-category-panel"
+          id={panelId}
           className="panel launchpad-category-panel"
-          aria-label="Category filters"
+          aria-label={bottom ? "Bottom category filters" : "Category filters"}
         >
           <div className="launchpad-category-heading">
             <strong>Categories</strong>

@@ -1,6 +1,9 @@
 import fs from "node:fs/promises";
 import { randomUUID } from "node:crypto";
-import { safeProjectUrl } from "../shared/launchpad-project.mjs";
+import {
+  normalizeAuthorLinks,
+  safeProjectUrl,
+} from "../shared/launchpad-project.mjs";
 import { allModCategories } from "../shared/launchpad-categories.mjs";
 
 const maximumBytes = 4 * 1024 ** 2;
@@ -15,6 +18,8 @@ const plain = (value) =>
 const categoryNames = new Set(allModCategories.map((row) => row.id));
 function displayFields(value) {
   const result = {};
+  const authorLinks = normalizeAuthorLinks(value.authorLinks);
+  if (authorLinks) result.authorLinks = authorLinks;
   for (const key of ["title", "author", "versionName"])
     if (
       typeof value[key] === "string" &&

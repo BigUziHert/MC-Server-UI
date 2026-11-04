@@ -271,6 +271,11 @@ test("FTB search applies compatibility and resolves required server files with p
     synopsis: "An isolated fixture",
     versions: [version],
     installs: 30,
+    authors: [
+      { name: "FTB Team", website: "https://www.feed-the-beast.com/" },
+      { name: "Contributor", website: "javascript:alert(1)" },
+      { name: "Unlinked" },
+    ],
   };
   const file = {
     name: "fixture.jar",
@@ -303,6 +308,12 @@ test("FTB search applies compatibility and resolves required server files with p
   });
   assert.equal(search.total, 1);
   assert.equal(search.projects[0].downloads, 30);
+  assert.equal(search.projects[0].author, "FTB Team, Contributor, Unlinked");
+  assert.deepEqual(search.projects[0].authorLinks, [
+    { name: "FTB Team", url: "https://www.feed-the-beast.com/" },
+    { name: "Contributor" },
+    { name: "Unlinked" },
+  ]);
   assert.equal(
     (
       await ftb.search({
@@ -317,6 +328,7 @@ test("FTB search applies compatibility and resolves required server files with p
   );
   const result = await ftb.resolve(ftbSelection);
   assert.equal(result.url, "https://www.feed-the-beast.com/modpacks/1");
+  assert.deepEqual(result.authorLinks, search.projects[0].authorLinks);
   assert.deepEqual(result.loaderInstall, {
     loader: "neoforge",
     gameVersion: "1.21.1",

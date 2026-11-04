@@ -7,6 +7,7 @@ import {
 import { safeInstallPath } from "./launchpad-archives.mjs";
 import { createInstalledIdentification } from "./launchpad-identification.mjs";
 import { createModrinthRecovery } from "./launchpad-recovery.mjs";
+import { normalizeAuthorLinks } from "../shared/launchpad-project.mjs";
 import {
   allModCategories,
   categoryIds,
@@ -76,6 +77,16 @@ const projectAuthors = (project) =>
       ? project.authors.map((author) => author?.name)
       : [],
   );
+const modrinthAuthorLinks = (names) =>
+  normalizeAuthorLinks(
+    names.map((name) => ({
+      name,
+      url:
+        typeof name === "string" && /^[A-Za-z0-9_-]+$/.test(name)
+          ? `https://modrinth.com/user/${enc(name)}`
+          : undefined,
+    })),
+  );
 const catalogDate = (value) =>
   typeof value === "string" && Number.isFinite(Date.parse(value))
     ? new Date(value).toISOString()
@@ -133,7 +144,7 @@ function catalogFields(project, platform) {
     ];
   return fields;
 }
-function teamAuthors(members) {
+function teamAuthorLinks(members) {
   const accepted = members.filter((member) => member.accepted === true);
   const owners = accepted.filter(
     (member) =>
@@ -141,7 +152,7 @@ function teamAuthors(members) {
       (typeof member.is_owner !== "boolean" &&
         String(member.role).toLowerCase() === "owner"),
   );
-  return authorNames(
+  return modrinthAuthorLinks(
     (owners.length ? owners : accepted)
       .map((member) => member.user?.username)
       .filter((name) => typeof name === "string")
@@ -1115,7 +1126,7 @@ export function createCoreProviders({
       }
       return [...groups].map(([id, members]) => ({
         id,
-        author: teamAuthors(members),
+        authorLinks: teamAuthorLinks(members),
       }));
     },
     (team) => team,
@@ -1130,12 +1141,17 @@ export function createCoreProviders({
       );
     const teams = await mrTeams(teamIds);
     const authors = new Map(
-      teams.projects.map((team) => [team.id, team.author]),
+      teams.projects.map((team) => [team.id, team.authorLinks]),
     );
     return {
       projects: result.projects.map(({ teamId, ...project }) => ({
         ...project,
-        ...(authors.get(teamId) ? { author: authors.get(teamId) } : {}),
+        ...(authors.get(teamId)
+          ? {
+              author: authorNames(authors.get(teamId).map(({ name }) => name)),
+              authorLinks: authors.get(teamId),
+            }
+          : {}),
       })),
       warnings: [
         ...result.warnings,
@@ -1168,6 +1184,7 @@ export function createCoreProviders({
             url: iconUrl(project.links?.websiteUrl),
             iconUrl: iconUrl(project.logo?.thumbnailUrl ?? project.logo?.url),
             author: projectAuthors(project),
+            authorLinks: normalizeAuthorLinks(project.authors),
             ...catalogFields(project, "curseforge"),
           }
         : undefined,
@@ -1340,6 +1357,7 @@ export function createCoreProviders({
             iconUrl: value.icon_url,
             downloads: value.downloads,
             author: value.author,
+            authorLinks: modrinthAuthorLinks([value.author]),
             url: `https://modrinth.com/${input.type}/${value.slug ?? value.project_id}`,
             ...catalogFields(value, "modrinth"),
           })),
@@ -1758,7 +1776,8 @@ export function createCoreProviders({
             description: value.summary,
             iconUrl: value.logo?.thumbnailUrl,
             downloads: value.downloadCount,
-            author: value.authors?.map((author) => author.name).join(", "),
+            author: projectAuthors(value),
+            authorLinks: normalizeAuthorLinks(value.authors),
             url: iconUrl(value.links?.websiteUrl),
             ...catalogFields(value, "curseforge"),
           })),
@@ -1865,6 +1884,7 @@ export function createCoreProviders({
             title: project.name,
             iconUrl: iconUrl(project.logo?.thumbnailUrl ?? project.logo?.url),
             author: projectAuthors(project),
+            authorLinks: normalizeAuthorLinks(project.authors),
             versionName: file.displayName,
             archive: { ...download, format: "server-zip" },
             warnings: [],
@@ -1879,6 +1899,7 @@ export function createCoreProviders({
           title: project.name,
           iconUrl: iconUrl(project.logo?.thumbnailUrl ?? project.logo?.url),
           author: projectAuthors(project),
+          authorLinks: normalizeAuthorLinks(project.authors),
           versionName: file.displayName,
           files: [{ path: fileName(file.fileName), ...download }],
           dependencies: (file.dependencies ?? [])

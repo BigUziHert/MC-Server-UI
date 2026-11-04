@@ -119,6 +119,10 @@ test("metadata cache persists only bounded positive identities and safe display 
     {
       title: "Display",
       author: "Creator",
+      authorLinks: [
+        { name: "Creator", url: "https://modrinth.com/user/Creator" },
+        { name: "Unlinked", url: "javascript:alert(1)" },
+      ],
       token: "secret",
       url: "https://user:password@example.com/",
     },
@@ -144,6 +148,10 @@ test("metadata cache persists only bounded positive identities and safe display 
   assert.equal(reopened.identity(digest("mod")).projectId, "project");
   assert.equal(reopened.identity(digest("unknown")), undefined);
   assert.equal(reopened.project("modrinth", "project").value.author, "Creator");
+  assert.deepEqual(reopened.project("modrinth", "project").value.authorLinks, [
+    { name: "Creator", url: "https://modrinth.com/user/Creator" },
+    { name: "Unlinked" },
+  ]);
   await reopened.close();
 
   const bounded = await createLaunchpadMetadataCache(cacheOptions(root));
@@ -404,6 +412,9 @@ test("restarting Launchpad reuses verified identities and project display withou
   assert.deepEqual(f.requests, []);
   const checked = await restarted.installed({ ...selection, refresh: true });
   assert.equal(checked.items[0].author, "CacheAuthor");
+  assert.deepEqual(checked.items[0].authorLinks, [
+    { name: "CacheAuthor", url: "https://modrinth.com/user/CacheAuthor" },
+  ]);
   assert.equal(checked.items[0].updateCheck, "checked");
   assert.ok(f.requests.includes("/v2/version_files/update"));
   assert.ok(!f.requests.includes("/v2/version_files"));
@@ -535,6 +546,25 @@ test("expired project display metadata refreshes without reidentifying unchanged
   assert.equal(result.items[0].author, "CacheAuthor");
   assert.ok(!f.requests.includes("/v2/version_files"));
   assert.ok(f.requests.includes("/v2/projects"));
+});
+
+test("legacy cached author names gain profile links without reidentifying files", async (t) => {
+  const f = await inventoryFixture(t);
+  const first = await f.boot();
+  await first.installed(selection);
+  await first.close();
+  const filename = path.join(f.dataDir, "launchpad", "metadata-cache.json");
+  const saved = JSON.parse(await fs.readFile(filename, "utf8"));
+  for (const entry of saved.entries) delete entry.value.authorLinks;
+  await fs.writeFile(filename, JSON.stringify(saved));
+  f.requests.length = 0;
+  const restarted = await f.boot();
+  const result = await restarted.installed(selection);
+  assert.deepEqual(result.items[0].authorLinks, [
+    { name: "CacheAuthor", url: "https://modrinth.com/user/CacheAuthor" },
+  ]);
+  assert.ok(f.requests.includes("/v2/teams"));
+  assert.ok(!f.requests.includes("/v2/version_files"));
 });
 
 test("cache write errors cannot fail inventory or shutdown and preserve installed bytes", async (t) => {

@@ -12,12 +12,25 @@ import {
   curseforgeDownloadHosts,
 } from "./launchpad-network.mjs";
 import { safeInstallPath } from "./launchpad-archives.mjs";
+import { normalizeAuthorLinks } from "../shared/launchpad-project.mjs";
 
 const FTB = "https://api.feed-the-beast.com/v1/modpacks/public/modpack";
 const ATL = "https://api.atlauncher.com/v1";
 const ATL_CDN = "https://download.nodecdn.net/containers/atl/";
 const SPIGOT = "https://api.spiget.org/v2";
 const VOID = "https://voidswrath.com";
+const ftbAuthors = (pack) => {
+  const authorLinks = normalizeAuthorLinks(
+    pack.authors?.map((author) => ({
+      name: author?.name,
+      url: author?.website,
+    })),
+  );
+  return {
+    author: authorLinks?.map(({ name }) => name).join(", "),
+    authorLinks,
+  };
+};
 const pluginLoaders = ["bukkit", "spigot", "paper", "purpur"];
 const ftbHosts = [
   "files.feed-the-beast.com",
@@ -563,7 +576,7 @@ export function createExtraProviders({
         description: text(pack.synopsis),
         iconUrl: pack.art?.find((art) => art.type === "square")?.url,
         downloads: pack.installs,
-        author: pack.authors?.map((author) => author.name).join(", "),
+        ...ftbAuthors(pack),
         url: `https://www.feed-the-beast.com/modpacks/${pack.id}`,
       }));
       return resultPage(projects, input);
@@ -625,6 +638,7 @@ export function createExtraProviders({
       return {
         title: pack.name,
         url: `https://www.feed-the-beast.com/modpacks/${numeric(input.projectId)}`,
+        ...ftbAuthors(pack),
         versionName: manifest.name,
         files,
         loaderInstall: {

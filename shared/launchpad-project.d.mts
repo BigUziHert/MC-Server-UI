@@ -1,4 +1,7 @@
 export function safeProjectUrl(value: unknown): string | undefined;
+export function normalizeAuthorLinks(
+  values: unknown,
+): { name: string; url?: string }[] | undefined;
 export function projectPageUrl(project?: {
   platform?: string | null;
   projectId?: string;

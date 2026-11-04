@@ -367,6 +367,11 @@ test("installed column headers reverse sorting while updates stay first across p
   await page.getByRole("switch", { name: "Show installed content" }).check();
   const sort = page.getByLabel("Sort installed content", { exact: true });
   await expect(sort.locator('option[value="updates"]')).toHaveCount(0);
+  await expect(
+    sort.locator(
+      'option[value="active"], option[value="added"], option[value="modified"], option[value="size"]',
+    ),
+  ).toHaveCount(0);
   await expect(sort).toHaveValue("name");
   const headers = page.getByRole("group", {
     name: "Sort installed content columns",
@@ -484,7 +489,9 @@ test("installed column headers reverse sorting while updates stay first across p
     "Echo",
   ]);
   await active.click();
-  await expect(sort).toHaveValue("active");
+  await expect(sort).toHaveValue("");
+  await expect(sort.locator("option:checked")).toHaveText("Column order");
+  await expect(sort.locator("option:checked")).toBeDisabled();
   await expect(active).toHaveAttribute(
     "aria-description",
     "Descending. Updates always appear first.",
@@ -513,7 +520,8 @@ test("installed column headers reverse sorting while updates stay first across p
     "Delta",
   ]);
   await added.click();
-  await expect(sort).toHaveValue("added");
+  await expect(sort).toHaveValue("");
+  await expect(sort.locator("option:checked")).toHaveText("Column order");
   await expect(added).toHaveAttribute(
     "aria-description",
     "Descending. Updates always appear first.",
@@ -542,7 +550,7 @@ test("installed column headers reverse sorting while updates stay first across p
     "Foxtrot",
   ]);
   for (const value of await sort
-    .locator("option")
+    .locator("option:not(:disabled)")
     .evaluateAll((options) =>
       options.map((option) => (option as HTMLOptionElement).value),
     )) {
@@ -997,10 +1005,9 @@ test("category filters expose Technology and World Gen children and reset catalo
   const filters = page.getByRole("button", { name: /^Filters/ });
   await filters.click();
   await expect(filters).toHaveAttribute("aria-expanded", "true");
-  await expect(page.locator(".launchpad-toolbar")).toHaveCSS(
-    "overflow",
-    "visible",
-  );
+  await expect(
+    page.getByRole("group", { name: "Launchpad top controls", exact: true }),
+  ).toHaveCSS("overflow", "visible");
   await page
     .getByRole("button", { name: "Expand Technology", exact: true })
     .click();
@@ -1057,10 +1064,9 @@ test("category filters expose Technology and World Gen children and reset catalo
     .getByRole("button", { name: "Close filters", exact: true })
     .click();
   await filters.click();
-  await expect(page.locator(".launchpad-toolbar")).toHaveCSS(
-    "overflow",
-    "visible",
-  );
+  await expect(
+    page.getByRole("group", { name: "Launchpad top controls", exact: true }),
+  ).toHaveCSS("overflow", "visible");
   const panel = page.getByRole("region", { name: "Category filters" });
   await expect
     .poll(async () => {
@@ -1103,10 +1109,9 @@ test("installed category filters include matching descendants and preserve the s
   await page.getByRole("switch", { name: "Show installed content" }).check();
   await expect(page.getByRole("article")).toHaveCount(2);
   await page.getByRole("button", { name: /^Filters/ }).click();
-  await expect(page.locator(".launchpad-toolbar")).toHaveCSS(
-    "overflow",
-    "visible",
-  );
+  await expect(
+    page.getByRole("group", { name: "Launchpad top controls", exact: true }),
+  ).toHaveCSS("overflow", "visible");
   await page.getByRole("checkbox", { name: "Technology", exact: true }).check();
   await expect(page.getByRole("article")).toHaveCount(1);
   await expect(page.getByRole("article").first()).toHaveAccessibleName(
@@ -1115,4 +1120,454 @@ test("installed category filters include matching descendants and preserve the s
   await expect(
     page.getByLabel("Sort installed content", { exact: true }),
   ).toHaveValue("name");
+});
+
+test("bottom pagination stays in sync with top controls in catalog and installed views", async ({
+  page,
+}, testInfo) => {
+  await catalog(page);
+  const searches: URL[] = [];
+  await page.route("**/api/launchpad/search?**", (route) => {
+    const url = new URL(route.request().url());
+    searches.push(url);
+    const offset = Number(url.searchParams.get("offset"));
+    const limit = Number(url.searchParams.get("limit"));
+    return route.fulfill({
+      json: {
+        projects: Array.from(
+          { length: Math.min(limit, 23 - offset) },
+          (_, index) => ({
+            id: `result-${offset + index + 1}`,
+            platform: "curseforge",
+            title: `Result ${offset + index + 1}`,
+            description: "Bottom pagination fixture",
+          }),
+        ),
+        total: 23,
+        offset,
+        limit,
+      },
+    });
+  });
+  await page.route("**/api/launchpad/installed?**", (route) =>
+    route.fulfill({
+      json: {
+        items: Array.from({ length: 23 }, (_, index) =>
+          installed(`Installed ${index + 1}`),
+        ),
+        warnings: [],
+      },
+    }),
+  );
+  await page.goto("/#launchpad");
+  const topRows = page.getByLabel("Launchpad rows per page", { exact: true });
+  const bottomRows = page.getByLabel("Launchpad bottom rows per page", {
+    exact: true,
+  });
+  const topPage = page.getByRole("status", {
+    name: "Launchpad page",
+    exact: true,
+  });
+  const bottomPage = page.getByRole("status", {
+    name: "Launchpad bottom page",
+    exact: true,
+  });
+  const bottomNext = page.getByRole("button", {
+    name: "Next Launchpad bottom page",
+    exact: true,
+  });
+  await topRows.selectOption("10");
+  await expect(bottomRows).toHaveValue("10");
+  await expect(bottomPage).toHaveText("Page 1 of 3");
+  const footer = page.locator(".launchpad-pagination-footer");
+  await footer.scrollIntoViewIfNeeded();
+  const footerBounds = await footer.boundingBox();
+  const lastRowBounds = await page.getByRole("article").last().boundingBox();
+  expect(footerBounds!.y).toBeGreaterThanOrEqual(
+    lastRowBounds!.y + lastRowBounds!.height,
+  );
+  await bottomNext.click();
+  await expect(topPage).toHaveText("Page 2 of 3");
+  await expect(bottomPage).toHaveText("Page 2 of 3");
+  await expect(page.getByRole("article").first()).toHaveAccessibleName(
+    "Result 11",
+  );
+  await expect
+    .poll(() => searches.at(-1)?.searchParams.get("offset"))
+    .toBe("10");
+  await bottomRows.selectOption("5");
+  await expect(topRows).toHaveValue("5");
+  await expect(topPage).toHaveText("Page 1 of 5");
+  await expect(bottomPage).toHaveText("Page 1 of 5");
+  await expect
+    .poll(() => Object.fromEntries(searches.at(-1)?.searchParams ?? []))
+    .toMatchObject({ limit: "5", offset: "0" });
+
+  await page.getByRole("switch", { name: "Show installed content" }).check();
+  await expect(page.getByRole("article").first()).toHaveAccessibleName(
+    "Installed 1",
+  );
+  await bottomNext.click();
+  await expect(topPage).toHaveText("Page 2 of 5");
+  await expect(bottomPage).toHaveText("Page 2 of 5");
+  await expect(page.getByRole("article").first()).toHaveAccessibleName(
+    "Installed 6",
+  );
+  await page
+    .getByRole("button", { name: "Previous Launchpad page", exact: true })
+    .click();
+  await expect(bottomPage).toHaveText("Page 1 of 5");
+  await bottomRows.selectOption("25");
+  await expect(topRows).toHaveValue("25");
+  await expect(bottomNext).toBeDisabled();
+  await expect(page.getByRole("article")).toHaveCount(23);
+  await page.setViewportSize({ width: 390, height: 844 });
+  await footer.scrollIntoViewIfNeeded();
+  await expect
+    .poll(() =>
+      page.evaluate(() => document.documentElement.scrollWidth - innerWidth),
+    )
+    .toBeLessThanOrEqual(0);
+  await page.screenshot({
+    path: testInfo.outputPath("bottom-pagination-mobile.png"),
+  });
+});
+
+test("author names open individual profiles and preserve unlinked names in both views", async ({
+  page,
+}) => {
+  await catalog(page);
+  const authorLinks = [
+    {
+      name: "Mod Maker",
+      url: "https://www.curseforge.com/members/modmaker/projects",
+    },
+    {
+      name: "Second Maker",
+      url: "https://www.curseforge.com/members/secondmaker/projects",
+    },
+    { name: "Offline Contributor" },
+  ];
+  const entries = [
+    {
+      ...installed("Alpha"),
+      author: "Mod Maker, Second Maker, Offline Contributor",
+      authorLinks,
+    },
+    { ...installed("Legacy"), author: "Legacy Author" },
+    installed("Unknown"),
+  ];
+  await page.route("**/api/launchpad/installed?**", (route) =>
+    route.fulfill({ json: { items: entries, warnings: [] } }),
+  );
+  await page.route("**/api/launchpad/search?**", (route) =>
+    route.fulfill({
+      json: {
+        projects: entries.map((entry) => ({
+          ...entry,
+          id: entry.projectId,
+          description: "Author link fixture",
+        })),
+        total: entries.length,
+        offset: 0,
+        limit: 10,
+      },
+    }),
+  );
+  await page.context().route(authorLinks[0].url!, (route) =>
+    route.fulfill({
+      contentType: "text/html",
+      body: "<h1>Mod Maker profile</h1>",
+    }),
+  );
+  await page.goto("/#launchpad");
+  const authors = page
+    .getByRole("article", { name: "Alpha", exact: true })
+    .locator(".launchpad-installed-author");
+  for (const installedOnly of [false, true]) {
+    if (installedOnly)
+      await page
+        .getByRole("switch", { name: "Show installed content" })
+        .check();
+    await expect(authors.locator("a")).toHaveText([
+      "Mod Maker",
+      "Second Maker",
+    ]);
+    for (const [index, author] of authorLinks.slice(0, 2).entries()) {
+      const link = authors.locator("a").nth(index);
+      await expect(link).toHaveAttribute("href", author.url!);
+      await expect(link).toHaveAttribute("target", "_blank");
+      await expect(link).toHaveAttribute("rel", /noreferrer/);
+    }
+    await expect(authors).toContainText("Offline Contributor");
+    const legacy = page
+      .getByRole("article", { name: "Legacy", exact: true })
+      .locator(".launchpad-installed-author");
+    await expect(legacy).toContainText("Legacy Author");
+    await expect(legacy.locator("a")).toHaveCount(0);
+    const unknown = page
+      .getByRole("article", { name: "Unknown", exact: true })
+      .locator(".launchpad-installed-author");
+    await expect(unknown).toHaveText("Unknown");
+    await expect(unknown.locator("a")).toHaveCount(0);
+  }
+  const [profile] = await Promise.all([
+    page.waitForEvent("popup"),
+    authors.locator("a").first().click(),
+  ]);
+  await expect(profile).toHaveURL(authorLinks[0].url!);
+  await expect(profile.getByRole("heading")).toHaveText("Mod Maker profile");
+  await profile.close();
+  await expect(page).toHaveURL(/#launchpad$/);
+});
+
+test("a saved Size sort falls back to Name without restoring removed dropdown options", async ({
+  page,
+  serverId,
+}) => {
+  await catalog(page);
+  await page.addInitScript((id) => {
+    sessionStorage.setItem(
+      `mc-panel.launchpad.view.${id}`,
+      JSON.stringify({
+        type: "mod",
+        installedOnly: true,
+        installedSort: "size",
+      }),
+    );
+  }, serverId);
+  await page.goto("/#launchpad");
+  const sort = page.getByLabel("Sort installed content", { exact: true });
+  await expect(sort).toHaveValue("name");
+  await expect(
+    sort.locator(
+      'option[value="active"], option[value="added"], option[value="modified"], option[value="size"]',
+    ),
+  ).toHaveCount(0);
+});
+
+test("the complete bottom toolbar shares search, sort and installed state with the top toolbar", async ({
+  page,
+}) => {
+  await catalog(page);
+  const searches: URL[] = [];
+  const projects = Array.from({ length: 12 }, (_, index) => ({
+    id: `catalog-${index + 1}`,
+    platform: "curseforge",
+    title: `Catalog ${index + 1}`,
+    description: "Shared toolbar fixture",
+  }));
+  await page.route("**/api/launchpad/search?**", (route) => {
+    const url = new URL(route.request().url());
+    searches.push(url);
+    const offset = Number(url.searchParams.get("offset"));
+    const limit = Number(url.searchParams.get("limit"));
+    const matching = projects.filter((project) =>
+      project.title
+        .toLowerCase()
+        .includes((url.searchParams.get("query") ?? "").toLowerCase()),
+    );
+    return route.fulfill({
+      json: {
+        projects: matching.slice(offset, offset + limit),
+        total: matching.length,
+        offset,
+        limit,
+      },
+    });
+  });
+  await page.route("**/api/launchpad/installed?**", (route) =>
+    route.fulfill({
+      json: {
+        items: [installed("Alpha", true, true), installed("Bravo")],
+        warnings: [],
+      },
+    }),
+  );
+  await page.goto("/#launchpad");
+  const top = page.getByRole("group", {
+    name: "Launchpad top controls",
+    exact: true,
+  });
+  const bottom = page.getByRole("group", {
+    name: "Launchpad bottom controls",
+    exact: true,
+  });
+  const topSearch = top.getByLabel("Search Launchpad", { exact: true });
+  const bottomSearch = bottom.getByLabel("Search bottom Launchpad", {
+    exact: true,
+  });
+  await bottomSearch.fill("Missing project");
+  await expect(topSearch).toHaveValue("Missing project");
+  await expect(
+    page.getByText("No projects found", { exact: true }),
+  ).toBeVisible();
+  await expect(bottomSearch).toBeFocused();
+  await bottom
+    .getByRole("button", { name: "Clear bottom search", exact: true })
+    .click();
+  await expect(bottomSearch).toHaveValue("");
+  await expect(bottomSearch).toBeFocused();
+  await expect(topSearch).toHaveValue("");
+  await expect(page.getByRole("article")).toHaveCount(10);
+  await topSearch.fill("Catalog 1");
+  await expect(bottomSearch).toHaveValue("Catalog 1");
+  await expect(page.getByRole("article")).toHaveCount(4);
+  await top.getByRole("button", { name: "Clear search", exact: true }).click();
+  await expect(bottomSearch).toHaveValue("");
+  const topSort = top.getByLabel("Sort Launchpad", { exact: true });
+  const bottomSort = bottom.getByLabel("Sort bottom Launchpad", {
+    exact: true,
+  });
+  await bottomSort.selectOption("newest");
+  await expect(topSort).toHaveValue("newest");
+  await expect
+    .poll(() => searches.at(-1)?.searchParams.get("sort"))
+    .toBe("newest");
+  await topSort.selectOption("downloads");
+  await expect(bottomSort).toHaveValue("downloads");
+  const topToggle = top.getByRole("switch", {
+    name: "Show installed content",
+    exact: true,
+  });
+  const bottomToggle = bottom.getByRole("switch", {
+    name: "Show bottom installed content",
+    exact: true,
+  });
+  await bottomToggle.check();
+  await expect(topToggle).toBeChecked();
+  await expect(page.getByRole("article")).toHaveCount(2);
+  const topInstalledSort = top.getByLabel("Sort installed content", {
+    exact: true,
+  });
+  const bottomInstalledSort = bottom.getByLabel(
+    "Sort bottom installed content",
+    { exact: true },
+  );
+  await bottomInstalledSort.selectOption("author");
+  await expect(topInstalledSort).toHaveValue("author");
+  expect(await bottomInstalledSort.getAttribute("id")).not.toBe(
+    await topInstalledSort.getAttribute("id"),
+  );
+  await topInstalledSort.selectOption("downloads");
+  await expect(bottomInstalledSort).toHaveValue("downloads");
+  await expect(
+    bottomInstalledSort.locator(
+      'option[value="active"], option[value="added"], option[value="modified"], option[value="size"]',
+    ),
+  ).toHaveCount(0);
+  const topReverse = top.getByRole("button", {
+    name: "Reverse installed sort order",
+    exact: true,
+  });
+  const bottomReverse = bottom.getByRole("button", {
+    name: "Reverse bottom installed sort order",
+    exact: true,
+  });
+  await bottomReverse.click();
+  await expect(topReverse).toHaveAttribute("title", /^Ascending/);
+  await topReverse.click();
+  await expect(bottomReverse).toHaveAttribute("title", /^Descending/);
+  await expect(
+    bottom.getByRole("button", {
+      name: "Update all from bottom toolbar",
+      exact: true,
+    }),
+  ).toBeEnabled();
+  await topToggle.uncheck();
+  await expect(bottomToggle).not.toBeChecked();
+  const priorRequests = searches.length;
+  await bottom
+    .getByRole("button", {
+      name: "Refresh bottom Launchpad and check updates",
+      exact: true,
+    })
+    .click();
+  await expect
+    .poll(() =>
+      searches
+        .slice(priorRequests)
+        .some((url) => url.searchParams.get("refresh") === "true"),
+    )
+    .toBe(true);
+});
+
+test("top and bottom category filters have distinct panels and share selections on mobile", async ({
+  page,
+}, testInfo) => {
+  await catalog(page);
+  const searches: URL[] = [];
+  await page.route("**/api/launchpad/search?**", (route) => {
+    searches.push(new URL(route.request().url()));
+    return route.fulfill({
+      json: {
+        projects: [
+          {
+            id: "mod",
+            platform: "curseforge",
+            title: "Mod",
+            description: "Shared category filters",
+          },
+        ],
+        total: 1,
+        offset: 0,
+        limit: 10,
+      },
+    });
+  });
+  await page.goto("/#launchpad");
+  const top = page.getByRole("group", {
+    name: "Launchpad top controls",
+    exact: true,
+  });
+  const bottom = page.getByRole("group", {
+    name: "Launchpad bottom controls",
+    exact: true,
+  });
+  const topFilters = top.getByRole("button", { name: /^Filters/ });
+  const bottomFilters = bottom.getByRole("button", { name: /^Bottom filters/ });
+  const topPanelId = await topFilters.getAttribute("aria-controls");
+  const bottomPanelId = await bottomFilters.getAttribute("aria-controls");
+  expect(topPanelId).toBeTruthy();
+  expect(bottomPanelId).toBeTruthy();
+  expect(bottomPanelId).not.toBe(topPanelId);
+  await bottomFilters.click();
+  const bottomPanel = bottom.getByRole("region", {
+    name: "Bottom category filters",
+    exact: true,
+  });
+  await expect(bottomPanel).toHaveAttribute("id", bottomPanelId!);
+  await bottomPanel
+    .getByRole("checkbox", { name: "Adventure and RPG", exact: true })
+    .check();
+  await expect(topFilters).toContainText("1");
+  await expect
+    .poll(() => searches.at(-1)?.searchParams.get("categories"))
+    .toBe("adventure-rpg");
+  await page.keyboard.press("Escape");
+  await expect(bottomPanel).toHaveCount(0);
+  await topFilters.click();
+  const topPanel = top.getByRole("region", {
+    name: "Category filters",
+    exact: true,
+  });
+  await expect(topPanel).toHaveAttribute("id", topPanelId!);
+  await expect(
+    topPanel.getByRole("checkbox", { name: "Adventure and RPG", exact: true }),
+  ).toBeChecked();
+  await topPanel.getByRole("button", { name: "Clear", exact: true }).click();
+  await expect(bottomFilters).toHaveAccessibleName("Bottom filters");
+  await page.keyboard.press("Escape");
+  await expect(topPanel).toHaveCount(0);
+  await page.setViewportSize({ width: 390, height: 844 });
+  await bottomFilters.click();
+  await expect(bottomPanel).toBeVisible();
+  const bounds = await bottomPanel.boundingBox();
+  expect(bounds!.x).toBeGreaterThanOrEqual(0);
+  expect(bounds!.x + bounds!.width).toBeLessThanOrEqual(390);
+  const triggerBounds = await bottomFilters.boundingBox();
+  expect(bounds!.y + bounds!.height).toBeLessThanOrEqual(triggerBounds!.y);
+  await page.screenshot({
+    path: testInfo.outputPath("bottom-toolbar-filters-mobile.png"),
+  });
 });

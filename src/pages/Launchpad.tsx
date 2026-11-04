@@ -1,4 +1,5 @@
 import {
+  Fragment,
   useCallback,
   useContext,
   useEffect,
@@ -46,7 +47,10 @@ import {
   writePreference,
   remoteLaunchpadViewKey,
 } from "../preferences";
-import { projectPageUrl } from "../../shared/launchpad-project.mjs";
+import {
+  projectPageUrl,
+  safeProjectUrl,
+} from "../../shared/launchpad-project.mjs";
 import {
   allModCategories,
   matchesCategories,
@@ -84,6 +88,7 @@ type Project = {
   iconUrl?: string | null;
   downloads?: number;
   author?: string;
+  authorLinks?: { name: string; url?: string }[];
   url?: string;
   releasedAt?: string;
   updatedAt?: string;
@@ -100,6 +105,7 @@ type InstalledItem = {
   title?: string;
   iconUrl?: string;
   author?: string;
+  authorLinks?: Project["authorLinks"];
   update?: Version | null;
   url?: string;
   updateCheck?: "checked" | "unavailable" | "pending";
@@ -193,6 +199,7 @@ function mergeLocalInventory(
         title: old.title ?? item.title,
         iconUrl: old.iconUrl ?? item.iconUrl,
         author: old.author ?? item.author,
+        authorLinks: old.authorLinks ?? item.authorLinks,
         url: old.url ?? item.url,
         update: old.update !== undefined ? old.update : item.update,
         updateCheck: old.updateCheck ?? item.updateCheck,
@@ -270,10 +277,6 @@ const rowsOptions = [5, 10, 25, 50, 75, 100];
 const installedSortOptions = [
   { id: "name", label: "Name" },
   { id: "author", label: "Author" },
-  { id: "active", label: "Active" },
-  { id: "added", label: "Date added" },
-  { id: "modified", label: "Date modified" },
-  { id: "size", label: "Size" },
   { id: "featured", label: "Featured" },
   { id: "relevance", label: "Relevancy" },
   { id: "popular", label: "Popularity" },
@@ -283,7 +286,10 @@ const installedSortOptions = [
   { id: "category", label: "Main Category" },
   { id: "gameVersion", label: "Game Version" },
 ] as const;
-type InstalledSort = (typeof installedSortOptions)[number]["id"];
+const installedColumnSorts = ["active", "added", "modified"] as const;
+type InstalledSort =
+  | (typeof installedSortOptions)[number]["id"]
+  | (typeof installedColumnSorts)[number];
 type SortDirection = "asc" | "desc";
 const defaultInstalledDirection = (sort: InstalledSort): SortDirection =>
   ["name", "author", "category"].includes(sort) ? "asc" : "desc";
@@ -335,9 +341,10 @@ function readSavedView(key: string): SavedView {
           ? values.installedOnly
           : undefined,
       sort: typeof values.sort === "string" ? values.sort : undefined,
-      installedSort: installedSortOptions.some(
-        (item) => item.id === values.installedSort,
-      )
+      installedSort: [
+        ...installedSortOptions.map((item) => item.id),
+        ...installedColumnSorts,
+      ].some((id) => id === values.installedSort)
         ? (values.installedSort as InstalledSort)
         : undefined,
       installedDirection:
@@ -437,10 +444,6 @@ function compareInstalled(
     const left = latest(a),
       right = latest(b);
     order = text(left, right);
-  } else if (sort === "size") {
-    const size = (item: InstalledItem) =>
-      Number.isFinite(item.size) && item.size >= 0 ? item.size : undefined;
-    order = number(size(a), size(b));
   } else if (sort === "author") {
     const left = a.author?.trim() ?? "";
     const right = b.author?.trim() ?? "";
@@ -504,6 +507,34 @@ const queryString = (values: Record<string, string | number | undefined>) => {
     if (value !== undefined && value !== "") params.set(key, String(value));
   return params.toString();
 };
+function ProjectAuthors({ project }: { project: Project }) {
+  if (project.authorLinks?.length)
+    return (
+      <span>
+        By{" "}
+        {project.authorLinks.map((author, index) => {
+          const url = safeProjectUrl(author.url);
+          return (
+            <Fragment key={`${author.name}:${index}`}>
+              {index > 0 && ", "}
+              {url ? (
+                <a href={url} target="_blank" rel="noopener noreferrer">
+                  {author.name}
+                </a>
+              ) : (
+                author.name
+              )}
+            </Fragment>
+          );
+        })}
+      </span>
+    );
+  return project.author ? (
+    <span>By {project.author}</span>
+  ) : (
+    <span className="launchpad-unknown-author">Unknown</span>
+  );
+}
 function InstalledDate({
   value,
   kind,
@@ -610,6 +641,7 @@ export default function Launchpad({
     }
   });
   const [results, setResults] = useState<SearchResult | null>(null);
+  const resultsElement = useRef<HTMLElement>(null);
   const resultsScope = useRef("");
   const [searchLoading, setSearchLoading] = useState(false);
   const [searchError, setSearchError] = useState("");
@@ -2063,6 +2095,7 @@ export default function Launchpad({
             description: entry.path,
             iconUrl: entry.iconUrl,
             author: entry.author,
+            authorLinks: entry.authorLinks,
             url: projectPageUrl(entry),
           },
           entry,
@@ -2098,6 +2131,215 @@ export default function Launchpad({
         .filter(Boolean),
     ),
   ];
+
+  function pagination(bottom = false) {
+    return (
+      <Pagination
+        label={bottom ? "Launchpad bottom" : "Launchpad"}
+        page={Math.floor(currentOffset / limit) + 1}
+        pageSize={limit}
+        total={total}
+        pageSizes={rowsOptions}
+        disabled={loading}
+        onPageChange={(page) => {
+          setOffset((page - 1) * limit);
+          if (bottom)
+            resultsElement.current?.scrollIntoView({ block: "start" });
+        }}
+        onPageSizeChange={(value) => {
+          setLimit(value);
+          setOffset(0);
+          if (bottom)
+            resultsElement.current?.scrollIntoView({ block: "start" });
+          try {
+            writePreference("mc-panel.launchpad.rows", String(value));
+          } catch {
+            /* session only */
+          }
+        }}
+      />
+    );
+  }
+
+  function toolbar(bottom = false) {
+    const sortId = bottom
+      ? "launchpad-bottom-installed-sort"
+      : "launchpad-installed-sort";
+    const updateLabel =
+      availableUpdates.length > 50
+        ? `Update first 50 (${availableUpdates.length} available)`
+        : "Update all";
+    return (
+      <div
+        className={`panel launchpad-toolbar${bottom ? " launchpad-toolbar-bottom launchpad-pagination-footer" : ""}`}
+        role="group"
+        aria-label={
+          bottom ? "Launchpad bottom controls" : "Launchpad top controls"
+        }
+      >
+        {pagination(bottom)}
+        <SearchField
+          className="launchpad-search"
+          grow
+          aria-label={bottom ? "Search bottom Launchpad" : "Search Launchpad"}
+          clearLabel={bottom ? "Clear bottom search" : "Clear search"}
+          placeholder={`Search ${kinds.find((item) => item.id === type)?.label.toLowerCase()}…`}
+          value={query}
+          onValueChange={(value) => {
+            setQuery(value);
+            setOffset(0);
+          }}
+        />
+        {installedOnly ? (
+          <div className="launchpad-sort">
+            <label htmlFor={sortId}>Sort by</label>
+            <select
+              id={sortId}
+              aria-label={
+                bottom
+                  ? "Sort bottom installed content"
+                  : "Sort installed content"
+              }
+              value={
+                installedSortOptions.some((item) => item.id === installedSort)
+                  ? installedSort
+                  : ""
+              }
+              onChange={(event) => {
+                setInstalledSort(event.target.value as InstalledSort);
+                setInstalledDirection(
+                  defaultInstalledDirection(
+                    event.target.value as InstalledSort,
+                  ),
+                );
+                setOffset(0);
+              }}
+            >
+              {!installedSortOptions.some(
+                (item) => item.id === installedSort,
+              ) && (
+                <option value="" disabled>
+                  Column order
+                </option>
+              )}
+              {installedSortOptions.map((item) => (
+                <option key={item.id} value={item.id}>
+                  {item.label}
+                </option>
+              ))}
+            </select>
+            <button
+              type="button"
+              className="btn icon"
+              aria-label={
+                bottom
+                  ? "Reverse bottom installed sort order"
+                  : "Reverse installed sort order"
+              }
+              title={
+                installedDirection === "asc"
+                  ? "Ascending — click for descending"
+                  : "Descending — click for ascending"
+              }
+              onClick={() => {
+                setInstalledDirection((current) =>
+                  current === "asc" ? "desc" : "asc",
+                );
+                setOffset(0);
+              }}
+            >
+              {installedDirection === "asc" ? (
+                <ArrowUp size={14} />
+              ) : (
+                <ArrowDown size={14} />
+              )}
+            </button>
+          </div>
+        ) : sortOptions.length > 0 && source?.available && supported ? (
+          <label className="launchpad-sort">
+            Sort by
+            <select
+              aria-label={bottom ? "Sort bottom Launchpad" : "Sort Launchpad"}
+              value={catalogSort}
+              onChange={(event) => {
+                setSort(event.target.value);
+                setOffset(0);
+              }}
+            >
+              {sortOptions.map((item) => (
+                <option key={item.id} value={item.id}>
+                  {item.label}
+                </option>
+              ))}
+            </select>
+          </label>
+        ) : null}
+        <div className="launchpad-toolbar-actions">
+          {type === "mod" &&
+            (installedOnly ||
+              (source?.available &&
+                supported &&
+                allModCategories.some((category) =>
+                  supportsCategory(category.id, platform),
+                ))) && (
+              <LaunchpadCategoryFilters
+                bottom={bottom}
+                selected={categoryKey ? categoryKey.split(",") : []}
+                platform={installedOnly ? undefined : platform}
+                onChange={(next) => {
+                  setCategories(next);
+                  setOffset(0);
+                }}
+              />
+            )}
+          {installedOnly && type !== "modpack" && allowChanges && (
+            <button
+              className="btn primary"
+              aria-label={
+                bottom ? `${updateLabel} from bottom toolbar` : undefined
+              }
+              disabled={
+                !canInstall ||
+                Boolean(busy) ||
+                !updateFiltersReady ||
+                !installed?.items.some((item) => item.update)
+              }
+              onClick={() => void reviewAllUpdates()}
+            >
+              <RefreshCw size={15} /> {updateLabel}
+            </button>
+          )}
+          <Switch
+            label="Installed only"
+            aria-label={
+              bottom
+                ? "Show bottom installed content"
+                : "Show installed content"
+            }
+            checked={installedOnly}
+            onCheckedChange={(checked) => {
+              setInstalledOnly(checked);
+              setOffset(0);
+              setQuery("");
+              if (!checked && !source?.types.includes(type))
+                changeType(source?.types[0] ?? "modpack");
+            }}
+          />
+          <RefreshButton
+            label={
+              bottom
+                ? "Refresh bottom Launchpad and check updates"
+                : "Refresh Launchpad and check updates"
+            }
+            refreshing={manualRefreshing}
+            onRefresh={refreshInstalled}
+            notify={notify}
+            successMessage="Launchpad refreshed."
+          />
+        </div>
+      </div>
+    );
+  }
 
   function installedHeading(id: InstalledSort, label: string, column: string) {
     const selected = installedSort === id;
@@ -2389,156 +2631,7 @@ export default function Launchpad({
           </div>
         </div>
       )}
-      <div className="panel launchpad-toolbar">
-        <Pagination
-          label="Launchpad"
-          page={Math.floor(currentOffset / limit) + 1}
-          pageSize={limit}
-          total={total}
-          pageSizes={rowsOptions}
-          disabled={loading}
-          onPageChange={(page) => setOffset((page - 1) * limit)}
-          onPageSizeChange={(value) => {
-            setLimit(value);
-            setOffset(0);
-            try {
-              writePreference("mc-panel.launchpad.rows", String(value));
-            } catch {
-              /* session only */
-            }
-          }}
-        />
-        <SearchField
-          className="launchpad-search"
-          grow
-          aria-label="Search Launchpad"
-          placeholder={`Search ${kinds.find((item) => item.id === type)?.label.toLowerCase()}…`}
-          value={query}
-          onValueChange={(value) => {
-            setQuery(value);
-            setOffset(0);
-          }}
-        />
-        {installedOnly ? (
-          <div className="launchpad-sort">
-            <label htmlFor="launchpad-installed-sort">Sort by</label>
-            <select
-              id="launchpad-installed-sort"
-              aria-label="Sort installed content"
-              value={installedSort}
-              onChange={(event) => {
-                setInstalledSort(event.target.value as InstalledSort);
-                setInstalledDirection(
-                  defaultInstalledDirection(
-                    event.target.value as InstalledSort,
-                  ),
-                );
-                setOffset(0);
-              }}
-            >
-              {installedSortOptions.map((item) => (
-                <option key={item.id} value={item.id}>
-                  {item.label}
-                </option>
-              ))}
-            </select>
-            <button
-              type="button"
-              className="btn icon"
-              aria-label="Reverse installed sort order"
-              title={
-                installedDirection === "asc"
-                  ? "Ascending — click for descending"
-                  : "Descending — click for ascending"
-              }
-              onClick={() => {
-                setInstalledDirection((current) =>
-                  current === "asc" ? "desc" : "asc",
-                );
-                setOffset(0);
-              }}
-            >
-              {installedDirection === "asc" ? (
-                <ArrowUp size={14} />
-              ) : (
-                <ArrowDown size={14} />
-              )}
-            </button>
-          </div>
-        ) : sortOptions.length > 0 && source?.available && supported ? (
-          <label className="launchpad-sort">
-            Sort by
-            <select
-              aria-label="Sort Launchpad"
-              value={catalogSort}
-              onChange={(event) => {
-                setSort(event.target.value);
-                setOffset(0);
-              }}
-            >
-              {sortOptions.map((item) => (
-                <option key={item.id} value={item.id}>
-                  {item.label}
-                </option>
-              ))}
-            </select>
-          </label>
-        ) : null}
-        <div className="launchpad-toolbar-actions">
-          {type === "mod" &&
-            (installedOnly ||
-              (source?.available &&
-                supported &&
-                allModCategories.some((category) =>
-                  supportsCategory(category.id, platform),
-                ))) && (
-              <LaunchpadCategoryFilters
-                selected={categoryKey ? categoryKey.split(",") : []}
-                platform={installedOnly ? undefined : platform}
-                onChange={(next) => {
-                  setCategories(next);
-                  setOffset(0);
-                }}
-              />
-            )}
-          {installedOnly && type !== "modpack" && allowChanges && (
-            <button
-              className="btn primary"
-              disabled={
-                !canInstall ||
-                Boolean(busy) ||
-                !updateFiltersReady ||
-                !installed?.items.some((item) => item.update)
-              }
-              onClick={() => void reviewAllUpdates()}
-            >
-              <RefreshCw size={15} />{" "}
-              {availableUpdates.length > 50
-                ? `Update first 50 (${availableUpdates.length} available)`
-                : "Update all"}
-            </button>
-          )}
-          <Switch
-            label="Installed only"
-            aria-label="Show installed content"
-            checked={installedOnly}
-            onCheckedChange={(checked) => {
-              setInstalledOnly(checked);
-              setOffset(0);
-              setQuery("");
-              if (!checked && !source?.types.includes(type))
-                changeType(source?.types[0] ?? "modpack");
-            }}
-          />
-          <RefreshButton
-            label="Refresh Launchpad and check updates"
-            refreshing={manualRefreshing}
-            onRefresh={refreshInstalled}
-            notify={notify}
-            successMessage="Launchpad refreshed."
-          />
-        </div>
-      </div>
+      {toolbar()}
       {job && (
         <div
           className="panel launchpad-job"
@@ -2758,6 +2851,7 @@ export default function Launchpad({
         </div>
       )}
       <section
+        ref={resultsElement}
         id="launchpad-results"
         className="launchpad-results"
         role="tabpanel"
@@ -2976,11 +3070,7 @@ export default function Launchpad({
                     </div>
                   </div>
                   <div className="launchpad-installed-author">
-                    {project.author ? (
-                      <span>By {project.author}</span>
-                    ) : (
-                      <span className="launchpad-unknown-author">Unknown</span>
-                    )}
+                    <ProjectAuthors project={project} />
                   </div>
                   <div className="launchpad-project-action">
                     {(!entry || (entry.platform && entry.projectId)) && (
@@ -3088,6 +3178,7 @@ export default function Launchpad({
           </>
         )}
       </section>
+      {toolbar(true)}
 
       <dialog
         className="modal management-dialog launchpad-dialog"

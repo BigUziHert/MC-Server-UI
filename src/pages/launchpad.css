@@ -384,6 +384,17 @@
   line-height: 1.5;
   overflow-wrap: anywhere;
 }
+.launchpad-installed-author a {
+  color: inherit;
+  text-decoration: underline;
+  text-decoration-color: var(--border);
+  text-underline-offset: 3px;
+}
+.launchpad-installed-author a:hover,
+.launchpad-installed-author a:focus-visible {
+  color: var(--accent);
+  text-decoration-color: currentColor;
+}
 .launchpad-empty-cell {
   color: var(--muted);
 }
@@ -422,6 +433,10 @@
   padding: 14px;
   box-shadow: 0 12px 32px #0006;
   white-space: normal;
+}
+.launchpad-toolbar-bottom .launchpad-category-panel {
+  top: auto;
+  bottom: calc(100% + 8px);
 }
 .launchpad-category-heading,
 .launchpad-category-row {

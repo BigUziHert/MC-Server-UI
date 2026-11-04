@@ -1,6 +1,31 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { projectPageUrl } from "../shared/launchpad-project.mjs";
+import {
+  normalizeAuthorLinks,
+  projectPageUrl,
+} from "../shared/launchpad-project.mjs";
+
+test("author links retain unlinked credits while rejecting unsafe URLs and duplicate names", () => {
+  assert.deepEqual(
+    normalizeAuthorLinks([
+      { name: " Creator ", url: "https://modrinth.com/user/Creator" },
+      { name: "Creator" },
+      { name: "Contributor", url: "javascript:alert(1)" },
+      { name: "No credentials", url: "https://user:password@example.com" },
+      { name: "Plain text" },
+      { name: "bad\nname", url: "https://example.com" },
+      null,
+      { name: " " },
+    ]),
+    [
+      { name: "Creator", url: "https://modrinth.com/user/Creator" },
+      { name: "Contributor" },
+      { name: "No credentials" },
+      { name: "Plain text" },
+    ],
+  );
+  assert.equal(normalizeAuthorLinks(undefined), undefined);
+});
 
 test("project links preserve valid metadata and resolve identified legacy entries", () => {
   assert.equal(

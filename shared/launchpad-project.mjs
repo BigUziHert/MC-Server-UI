@@ -10,6 +10,22 @@ export function safeProjectUrl(value) {
   }
 }
 
+export function normalizeAuthorLinks(values) {
+  if (!Array.isArray(values)) return undefined;
+  const authors = new Map();
+  for (const value of values.slice(0, 100)) {
+    const name = typeof value?.name === "string" ? value.name.trim() : "";
+    if (!name || name.length > 512 || /[\x00-\x1f\x7f]/.test(name)) continue;
+    const url =
+      typeof value.url === "string" && value.url.length <= 2048
+        ? safeProjectUrl(value.url)
+        : undefined;
+    if (!authors.has(name) || url)
+      authors.set(name, { name, ...(url ? { url } : {}) });
+  }
+  return authors.size ? [...authors.values()] : undefined;
+}
+
 // Identified files from older panels/receipts may lack project metadata.
 // These providers accept their stable IDs directly; never guess from a JAR name.
 export function projectPageUrl({ platform, projectId, url } = {}) {
