@@ -1346,6 +1346,9 @@ test("project names link to project pages in the list and installation dialog", 
     page.getByRole("link", { name: "Open Alpha project page" }),
   ).toHaveText("Alpha");
   await expect(
+    page.getByRole("heading", { name: "Alpha", exact: true }),
+  ).toBeVisible();
+  await expect(
     page.getByRole("link", { name: "Open JEI project page" }),
   ).toHaveAttribute("href", "https://www.curseforge.com/projects/238222");
   await expect(

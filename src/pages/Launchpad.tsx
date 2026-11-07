@@ -2971,7 +2971,7 @@ export default function Launchpad({
                     <ProjectIcon url={project.iconUrl} />
                     <div className="launchpad-project-body">
                       <div className="launchpad-project-title">
-                        <h3>
+                        <h3 aria-label={project.title}>
                           {project.url && /^https:\/\//i.test(project.url) ? (
                             <a
                               className="launchpad-project-link"

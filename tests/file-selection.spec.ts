@@ -102,10 +102,13 @@ test("file context menu and shortcuts copy, select all, and confirm deletion wit
   await beta.click({ button: "right" });
   await menu.getByRole("menuitem", { name: /Copy/ }).click();
   await page.getByRole("button", { name: "archive", exact: true }).click();
+  await expect(
+    page.getByRole("checkbox", { name: "Select nested", exact: true }),
+  ).toBeVisible();
   await page.keyboard.press("Control+v");
   await expect(
     page.getByRole("status", { name: "File transfer progress" }),
-  ).toContainText("Transfer complete");
+  ).toContainText(`copied to /${files.folder}/archive.`);
   const response = await request.get(
     `/api/files/content?path=${files.folder}/archive/beta.txt`,
     { headers: { "X-Server-Id": files.id } },
@@ -236,10 +239,13 @@ test("Ctrl+V reads copied desktop folders and files and newer server copies take
     .check();
   await page.keyboard.press("Control+c");
   await page.getByRole("button", { name: "archive", exact: true }).click();
+  await expect(
+    page.getByRole("checkbox", { name: "Select nested", exact: true }),
+  ).toBeVisible();
   await page.keyboard.press("Control+v");
   await expect(
     page.getByRole("status", { name: "File transfer progress" }),
-  ).toContainText("Transfer complete");
+  ).toContainText(`copied to /${files.folder}/archive.`);
   const listing = await request.get(`/api/files?path=${files.folder}/archive`, {
     headers,
   });
