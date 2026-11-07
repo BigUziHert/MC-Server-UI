@@ -85,6 +85,9 @@ jobs:
       - name: Smoke-test desktop navigation
         run: node desktop/menu.smoke.mjs
 
+      - name: Smoke-test native clipboard and editing menus
+        run: node desktop/clipboard.smoke.mjs
+
       - name: Smoke-test the packaged desktop app
         run: pnpm test:desktop
 

@@ -9,7 +9,7 @@ import {
   useRef,
   useState,
 } from "react";
-import { ArrowDown, ArrowUp, Search, X } from "lucide-react";
+import { ArrowDown, ArrowUp, X } from "lucide-react";
 import { findTextMatches, lineAtOffset } from "./file-text-search";
 import FileFindHighlights from "./FileFindHighlights";
 import "./file-text-editor.css";
@@ -139,19 +139,6 @@ const FileTextEditor = forwardRef<
     <div className="form-field file-text-editor">
       <div className="file-editor-toolbar">
         <label htmlFor={id}>{label}</label>
-        <button
-          type="button"
-          className="btn small"
-          aria-label="Find in file"
-          aria-expanded={open}
-          aria-controls={`${id}-find`}
-          aria-keyshortcuts="Control+f Meta+f"
-          title="Find in file (Ctrl+F / ⌘F)"
-          disabled={disabled}
-          onClick={openFind}
-        >
-          <Search size={14} aria-hidden="true" /> Find
-        </button>
       </div>
       {open && (
         <div
@@ -250,6 +237,7 @@ const FileTextEditor = forwardRef<
           ref={editor}
           id={id}
           className="file-editor"
+          aria-keyshortcuts="Control+f Meta+f"
           readOnly={readOnly}
           value={value}
           onChange={(event) => {

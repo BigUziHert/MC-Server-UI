@@ -77,6 +77,91 @@ async function backupNames(request: APIRequestContext, fixture: BackupFixture) {
     .sort();
 }
 
+test("missing backup records can be removed explicitly while the backup folder is unavailable", async ({
+  page,
+  backups,
+}) => {
+  const missing = backups.backups.find(
+    (backup) => backup.name === "Alpha backup",
+  )!;
+  let removed = false;
+  const removals: unknown[] = [];
+  await page.route("**/api/backups", async (route) => {
+    const response = await route.fetch();
+    const result = await response.json();
+    await route.fulfill({
+      response,
+      json: {
+        ...result,
+        backups: result.backups.filter(
+          (backup: { id: string }) => !removed || backup.id !== missing.id,
+        ),
+        missingBackupIds: removed ? [] : [missing.id],
+      },
+    });
+  });
+  await page.route("**/api/backups/location", async (route) => {
+    const response = await route.fetch();
+    await route.fulfill({
+      response,
+      json: {
+        ...(await response.json()),
+        available: false,
+        error: "The backup location is unavailable.",
+      },
+    });
+  });
+  await page.route(`**/api/backups/${missing.id}`, async (route) => {
+    removals.push(route.request().postDataJSON());
+    removed = true;
+    await route.fulfill({ json: { ok: true, removedRecord: true } });
+  });
+  await openBackups(page, backups);
+  await expect(
+    page.getByText("Archive unavailable", { exact: true }),
+  ).toBeVisible();
+  await expect(
+    page.getByRole("button", { name: "Create backup", exact: true }),
+  ).toBeDisabled();
+  await page
+    .getByRole("button", {
+      name: "Remove missing backup record Alpha backup",
+      exact: true,
+    })
+    .click();
+  const dialog = page.getByRole("dialog", {
+    name: "Remove missing backup records?",
+  });
+  await expect(dialog).toContainText(
+    "If their drive is disconnected, reconnect it instead.",
+  );
+  await dialog.getByRole("button", { name: "Cancel", exact: true }).click();
+  expect(removals).toEqual([]);
+  await page
+    .getByRole("checkbox", { name: "Select backup Alpha backup", exact: true })
+    .check();
+  await page
+    .getByRole("button", { name: "Remove missing records", exact: true })
+    .click();
+  await dialog
+    .getByRole("button", { name: "Remove records", exact: true })
+    .click();
+  await expect(dialog).not.toBeVisible();
+  expect(removals).toEqual([{ removeMissingRecord: true, confirm: true }]);
+  await expect(
+    page.getByRole("checkbox", {
+      name: "Select backup Alpha backup",
+      exact: true,
+    }),
+  ).not.toBeVisible();
+  await expect(
+    page.getByRole("checkbox", {
+      name: "Select backup Beta backup",
+      exact: true,
+    }),
+  ).toBeVisible();
+});
+
 test("refresh adopts a pristine schedule and resolves concurrent dirty edits explicitly", async ({
   page,
   request,

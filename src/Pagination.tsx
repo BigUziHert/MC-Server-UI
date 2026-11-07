@@ -1,11 +1,38 @@
 import { ChevronLeft, ChevronRight } from "lucide-react";
+import { useState } from "react";
+import { readPreference, writePreference } from "./preferences";
+
+const defaultPageSizes = [10, 25, 50, 100];
+
+export function usePageSize(id: "files" | "audit" | "subusers") {
+  const key = `mc-panel.${id}.rows`;
+  const [pageSize, setPageSize] = useState(() => {
+    try {
+      const saved = Number(readPreference(key));
+      return defaultPageSizes.includes(saved) ? saved : 25;
+    } catch {
+      return 25;
+    }
+  });
+  function changePageSize(value: number) {
+    if (!defaultPageSizes.includes(value)) return;
+    setPageSize(value);
+    try {
+      writePreference(key, String(value));
+    } catch {
+      // Keep pagination usable when browser storage is unavailable.
+    }
+  }
+  return [pageSize, changePageSize] as const;
+}
+
 export default function Pagination({
   page,
   pageSize,
   total,
   onPageChange,
   onPageSizeChange,
-  pageSizes = [10, 25, 50, 100],
+  pageSizes = defaultPageSizes,
   label = "results",
   disabled = false,
   ariaLabels,

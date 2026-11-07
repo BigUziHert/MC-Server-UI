@@ -119,12 +119,13 @@ async function boundary(root, safePath, io) {
   };
 }
 
-/** Copy selected trees without removing source data or overwriting destinations. */
+/** Copy or move selected trees without overwriting existing destinations. */
 export async function copyServerFiles({
   sourceDir,
   serverDir,
   destinationPath = "",
   paths,
+  mode = "copy",
   safePath,
   fileSystem = fs,
   onProgress,
@@ -133,6 +134,9 @@ export async function copyServerFiles({
   const io = fileSystem;
   const result = { copiedFiles: 0, copiedDirectories: 0, paths: [] };
   try {
+    if (!["copy", "move"].includes(mode))
+      throw failure(400, "Choose copy or move for this file transfer.");
+    if (mode === "move") result.mode = "move";
     if (!Array.isArray(paths) || !paths.length || paths.length > 5000)
       throw failure(
         400,
@@ -162,6 +166,11 @@ export async function copyServerFiles({
       throw failure(400, "Choose a destination folder.");
     const sameServer =
       key(await io.realpath(sourceDir)) === key(await io.realpath(serverDir));
+    if (mode === "move" && !sameServer)
+      throw failure(
+        400,
+        "Cut and paste is available within the same server. Use Copy to transfer files to another server.",
+      );
     const rows = [];
     let totalFiles = 0,
       totalBytes = 0;
@@ -228,6 +237,207 @@ export async function copyServerFiles({
         totalBytes,
       });
     report();
+    if (mode === "move") {
+      // Publish exclusive hard links before removing anything. Unlike rename,
+      // link cannot overwrite a destination that appears after preflight. All
+      // data stays on the same inode, so this never deletes an unverified copy.
+      const destinationStat = await io.lstat(destination);
+      if (rows.some((row) => row.stat.dev !== destinationStat.dev))
+        throw failure(
+          400,
+          "Cut and paste cannot move across drives. Use Copy instead.",
+        );
+      const created = [];
+      let removing = false;
+      const verifySource = async (row) => {
+        const current = await io.lstat(await source(row.relative));
+        if (
+          !identity(current, row.stat) ||
+          current.isSymbolicLink() ||
+          (row.stat.isDirectory()
+            ? !current.isDirectory()
+            : !unchangedFile(current, row.stat))
+        )
+          throw failure(
+            409,
+            "A source item changed during the move. Check both folders before retrying.",
+          );
+      };
+      const verifyTarget = async (row) => {
+        const current = await io.lstat(await target(row.destinationRelative));
+        if (current.isSymbolicLink() || !identity(current, row.createdStat))
+          throw failure(
+            409,
+            "A destination item changed during the move. Check both folders before retrying.",
+          );
+      };
+      const removeClaimedFile = async (
+        from,
+        verifyClaim,
+        verifyRemaining,
+        kind,
+      ) => {
+        // Claim the current directory entry before deleting it. A server or
+        // external editor may replace `from` after the preceding stat checks;
+        // unlinking that path directly could delete bytes we never published.
+        const staging = await io.mkdtemp(
+          path.join(path.dirname(from), ".mc-panel-move-"),
+        );
+        const held = path.join(staging, "source");
+        let claimed = false;
+        try {
+          await io.rename(from, held);
+          claimed = true;
+          if (!verifyClaim(await io.lstat(held)))
+            throw failure(
+              409,
+              `A ${kind} item changed during the move. Check both folders before retrying.`,
+            );
+          await verifyRemaining();
+          await io.unlink(held);
+          claimed = false;
+        } catch (cause) {
+          if (claimed) {
+            try {
+              const current = await io.lstat(held);
+              if (!current.isFile() || current.isSymbolicLink()) throw cause;
+              // Restore only to a free source path. Never overwrite a second
+              // replacement; retain the claimed data for recovery if needed.
+              await io.link(held, from);
+              await io.unlink(held);
+              claimed = false;
+            } catch {
+              const retained = path
+                .relative(sourceDir, held)
+                .split(path.sep)
+                .join("/");
+              throw Object.assign(
+                failure(
+                  409,
+                  `The move stopped. ${kind === "source" ? "Source" : "Destination"} data was retained at “${retained}”. Check both folders before retrying.`,
+                ),
+                { retainedPath: retained },
+              );
+            }
+          }
+          throw cause;
+        } finally {
+          if (!claimed) await io.rmdir(staging).catch(() => {});
+        }
+      };
+      try {
+        for (const row of rows) {
+          await assertAccess();
+          await verifySource(row);
+          const to = await target(row.destinationRelative);
+          if (row.stat.isDirectory()) await io.mkdir(to);
+          else await io.link(await source(row.relative), to);
+          row.createdStat = await io.lstat(
+            await target(row.destinationRelative),
+          );
+          created.push(row);
+          if (row.stat.isFile() && !identity(row.createdStat, row.stat))
+            throw failure(
+              409,
+              "A source item changed before it could be moved.",
+            );
+        }
+        // Validate the entire published selection before unlinking the first
+        // source. A failed preflight/publication leaves every source in place.
+        for (const row of rows) {
+          await assertAccess();
+          await verifySource(row);
+          await verifyTarget(row);
+        }
+        removing = true;
+        for (const row of [...rows].reverse()) {
+          await assertAccess();
+          await verifySource(row);
+          await verifyTarget(row);
+          const from = await source(row.relative);
+          if (row.stat.isDirectory()) {
+            // Never recursively remove: an externally added file stays safe.
+            await io.rmdir(from);
+            result.copiedDirectories++;
+            const to = await target(row.destinationRelative);
+            await io.chmod(to, row.stat.mode & 0o777);
+            await io.utimes(to, row.stat.atime, row.stat.mtime);
+          } else {
+            await removeClaimedFile(
+              from,
+              (stat) => unchangedFile(stat, row.stat),
+              async () => {
+                await assertAccess();
+                await verifyTarget(row);
+              },
+              "source",
+            );
+            result.copiedFiles++;
+            bytesProcessed += row.stat.size;
+          }
+          const root = roots.find((relative) => inside(relative, row.relative));
+          const movedPath = [destinationPath, path.posix.basename(root)]
+            .filter(Boolean)
+            .join("/");
+          if (!result.paths.includes(movedPath)) result.paths.push(movedPath);
+          report();
+        }
+        return result;
+      } catch (cause) {
+        const retainedWarnings = [];
+        for (const row of [...created].reverse()) {
+          try {
+            await verifyTarget(row);
+            const currentSource = await io.lstat(await source(row.relative));
+            if (
+              currentSource.isSymbolicLink() ||
+              !identity(currentSource, row.stat)
+            )
+              continue;
+            const to = await target(row.destinationRelative);
+            // Remove unfinished links only while the original inode remains
+            // at the source. Completed moves or replaced sources keep their
+            // destination; a partial failure must never drop its last link.
+            if (row.stat.isDirectory()) await io.rmdir(to);
+            else
+              await removeClaimedFile(
+                to,
+                (stat) =>
+                  stat.isFile() &&
+                  !stat.isSymbolicLink() &&
+                  identity(stat, row.createdStat),
+                async () => {
+                  const remaining = await io.lstat(await source(row.relative));
+                  if (
+                    !remaining.isFile() ||
+                    remaining.isSymbolicLink() ||
+                    !identity(remaining, row.stat)
+                  )
+                    throw failure(
+                      409,
+                      "The source changed during move cleanup.",
+                    );
+                },
+                "destination",
+              );
+          } catch (cleanupCause) {
+            if (cleanupCause.retainedPath)
+              retainedWarnings.push(cleanupCause.message);
+            /* Retain changed or completed destinations rather than deleting them. */
+          }
+        }
+        if (retainedWarnings.length)
+          throw failure(409, [cause.message, ...retainedWarnings].join(" "));
+        if (["EXDEV", "ENOTSUP", "EOPNOTSUPP", "EPERM"].includes(cause.code))
+          throw failure(
+            409,
+            removing
+              ? "The move could not finish. Check both folders before retrying; completed moves have been retained."
+              : "This filesystem does not support safe Cut and Paste. Use Copy instead. Source files have been retained.",
+          );
+        throw cause;
+      }
+    }
     for (const row of rows) {
       await assertAccess();
       const from = await source(row.relative),

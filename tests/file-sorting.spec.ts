@@ -254,6 +254,38 @@ test("recursive search results use the same sortable columns across result batch
   await expect(paths).toHaveText([`/${second.path}`, `/${first.path}`]);
 });
 
+test("file row count survives leaving the page and reloading", async ({
+  page,
+}) => {
+  const entries = Array.from({ length: 110 }, (_, index): Entry => ({
+    name: `file${index + 1}.txt`,
+    path: `sorting/file${index + 1}.txt`,
+    type: "file",
+    size: index,
+    modified: "2026-10-01T12:00:00.000Z",
+  }));
+  await openFiles(page, entries);
+  const rows = page.getByRole("combobox", {
+    name: "files rows per page",
+    exact: true,
+  });
+  await rows.selectOption("100");
+  await expect(names(page)).toHaveCount(100);
+  await page.getByRole("link", { name: "Console", exact: true }).click();
+  await page.getByRole("link", { name: "File Manager", exact: true }).click();
+  await expect(rows).toHaveValue("100");
+  await page.getByRole("button", { name: "sorting", exact: true }).click();
+  await expect(names(page)).toHaveCount(100);
+  await page.reload();
+  await expect(rows).toHaveValue("100");
+  await page.getByRole("button", { name: "sorting", exact: true }).click();
+  await expect(names(page)).toHaveCount(100);
+  await page
+    .getByRole("button", { name: "Next files page", exact: true })
+    .click();
+  await expect(names(page)).toHaveCount(10);
+});
+
 test("all file sort columns remain reachable on narrow screens without page overflow", async ({
   page,
 }, testInfo) => {

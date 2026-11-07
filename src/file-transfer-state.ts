@@ -4,7 +4,7 @@ import { messageOf, type PageProps, type useServerApi } from "./api";
 type Api = ReturnType<typeof useServerApi>["api"];
 export type Transfer = {
   id: string;
-  kind: "copy" | "upload";
+  kind: "copy" | "move" | "upload";
   destination: string;
   serverName: string;
   status: "running" | "completed" | "failed" | "unconfirmed";
@@ -88,6 +88,7 @@ type CopyResult = {
   copiedFiles: number;
   copiedDirectories: number;
   paths: string[];
+  mode?: "move";
 };
 type CopyOperation = {
   id: string;
@@ -103,17 +104,24 @@ type CopyOperation = {
 export class UnconfirmedTransfer extends Error {}
 export async function pasteFiles(
   api: Api,
-  body: { sourceServerId: string; paths: string[]; destinationPath: string },
+  body: {
+    sourceServerId: string;
+    paths: string[];
+    destinationPath: string;
+    mode?: "copy" | "move";
+  },
   report: Report,
   requestId: string,
 ) {
+  const moving = body.mode === "move";
+  const verb = moving ? "moved" : "copied";
   const completeMessage = (result: CopyResult) =>
-    `${result.copiedFiles} ${result.copiedFiles === 1 ? "file" : "files"} and ${result.copiedDirectories} ${result.copiedDirectories === 1 ? "folder" : "folders"} copied to /${body.destinationPath || "server"}.`;
+    `${result.copiedFiles} ${result.copiedFiles === 1 ? "file" : "files"} and ${result.copiedDirectories} ${result.copiedDirectories === 1 ? "folder" : "folders"} ${verb} to /${body.destinationPath || "server"}.`;
   const partialFailure = (cause: Error, result?: Partial<CopyResult>) => {
     if (result?.copiedFiles || result?.copiedDirectories) {
       report({ completedFiles: result.copiedFiles ?? 0 });
       return new Error(
-        `${cause.message} ${result.copiedFiles ?? 0} files and ${result.copiedDirectories ?? 0} folders were copied before the operation stopped.`,
+        `${cause.message} ${result.copiedFiles ?? 0} files and ${result.copiedDirectories ?? 0} folders were ${verb} before the operation stopped.`,
       );
     }
     return cause;
@@ -124,6 +132,10 @@ export async function pasteFiles(
     let unavailable = 0;
     let timer: ReturnType<typeof setTimeout>;
     const done = (result?: CopyResult, cause?: Error) => {
+      if (moving && result && result.mode !== "move" && !cause)
+        cause = new Error(
+          "This server copied the files without moving their originals. Update MC Panel on the server computer before using Cut and Paste.",
+        );
       if (finished) {
         if (unconfirmed && result && !cause) {
           unconfirmed = false;
@@ -152,7 +164,7 @@ export async function pasteFiles(
       done(
         undefined,
         new UnconfirmedTransfer(
-          "The copy's outcome could not be confirmed. It may still finish on the server. Check the destination before pasting again; the request was not retried.",
+          `The ${moving ? "move" : "copy"}'s outcome could not be confirmed. It may still finish on the server. Check the destination before pasting again; the request was not retried.`,
         ),
       );
     const poll = async () => {
@@ -168,7 +180,9 @@ export async function pasteFiles(
             message:
               operation.phase === "scanning"
                 ? "Scanning files…"
-                : "Copying files…",
+                : moving
+                  ? "Moving files…"
+                  : "Copying files…",
             completedFiles: operation.filesProcessed,
             totalFiles: operation.totalFiles,
             completedBytes: operation.bytesProcessed,
@@ -182,7 +196,7 @@ export async function pasteFiles(
               partialFailure(
                 new Error(
                   operation.error ||
-                    "The copy could not finish. Check the destination for copied files.",
+                    `The ${moving ? "move" : "copy"} could not finish. Check the destination for ${verb} files.`,
                 ),
                 operation.result,
               ),
@@ -212,8 +226,7 @@ export async function pasteFiles(
         else {
           if (finished) return;
           report({
-            message:
-              "Connection interrupted. Checking the original copy's status…",
+            message: `Connection interrupted. Checking the original ${moving ? "move" : "copy"}'s status…`,
           });
         }
       });

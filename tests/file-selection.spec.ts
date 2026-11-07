@@ -83,6 +83,251 @@ async function fileNames(request: APIRequestContext, fixture: FileFixture) {
   return result.entries.map((entry: { name: string }) => entry.name).sort();
 }
 
+test("file context menu and shortcuts copy, select all, and confirm deletion without intercepting text", async ({
+  page,
+  files,
+  request,
+}) => {
+  await openFiles(page, files);
+  const beta = page.getByRole("button", { name: "beta.txt", exact: true });
+  await beta.click({ button: "right" });
+  const menu = page.getByRole("menu", { name: "File actions" });
+  await expect(menu).toBeVisible();
+  await expect(
+    page.getByRole("checkbox", { name: "Select beta.txt", exact: true }),
+  ).toBeChecked();
+  await page.keyboard.press("Escape");
+  await expect(menu).toHaveCount(0);
+  await expect(beta).toBeFocused();
+  await beta.click({ button: "right" });
+  await menu.getByRole("menuitem", { name: /Copy/ }).click();
+  await page.getByRole("button", { name: "archive", exact: true }).click();
+  await page.keyboard.press("Control+v");
+  await expect(
+    page.getByRole("status", { name: "File transfer progress" }),
+  ).toContainText("Transfer complete");
+  const response = await request.get(
+    `/api/files/content?path=${files.folder}/archive/beta.txt`,
+    { headers: { "X-Server-Id": files.id } },
+  );
+  expect((await response.json()).content).toBe("Fixture contents\n");
+  await page.keyboard.press("Backspace");
+  await expect(beta).toBeVisible();
+  await page.keyboard.press("Control+a");
+  await expect(
+    page.getByRole("region", { name: "Selected files and folders" }),
+  ).toContainText("4 selected");
+  await page.keyboard.press("Delete");
+  const dialog = page.getByRole("dialog", {
+    name: "Move selected items to Recycle Bin?",
+    exact: true,
+  });
+  await expect(dialog).toBeVisible();
+  await dialog.getByRole("button", { name: "Cancel", exact: true }).click();
+  expect(await fileNames(request, files)).toContain("beta.txt");
+  const search = page.getByRole("textbox", {
+    name: "Search files and folders",
+    exact: true,
+  });
+  await search.fill("beta");
+  await search.press("Control+a");
+  await expect(
+    page.getByRole("region", { name: "Selected files and folders" }),
+  ).toHaveCount(0);
+  await expect(search).toHaveValue("beta");
+});
+
+test("pasting browser clipboard files uploads into the current folder and leaves text fields alone", async ({
+  page,
+  files,
+  request,
+}) => {
+  await openFiles(page, files);
+  await page.locator("body").evaluate((body) => {
+    const clipboardData = new DataTransfer();
+    clipboardData.items.add(
+      new File(["Copied on this PC"], "clipboard.txt", { type: "text/plain" }),
+    );
+    body.dispatchEvent(
+      new ClipboardEvent("paste", {
+        bubbles: true,
+        cancelable: true,
+        clipboardData,
+      }),
+    );
+  });
+  await expect(
+    page.getByRole("status", { name: "File transfer progress" }),
+  ).toContainText("Transfer complete");
+  const response = await request.get(
+    `/api/files/content?path=${files.folder}/clipboard.txt`,
+    { headers: { "X-Server-Id": files.id } },
+  );
+  expect((await response.json()).content).toBe("Copied on this PC");
+  const search = page.getByRole("textbox", {
+    name: "Search files and folders",
+    exact: true,
+  });
+  await search.evaluate((input) => {
+    const clipboardData = new DataTransfer();
+    clipboardData.items.add(
+      new File(["Do not upload from an editor"], "not-uploaded.txt"),
+    );
+    input.dispatchEvent(
+      new ClipboardEvent("paste", {
+        bubbles: true,
+        cancelable: true,
+        clipboardData,
+      }),
+    );
+  });
+  expect(await fileNames(request, files)).not.toContain("not-uploaded.txt");
+});
+
+test("Ctrl+V reads copied desktop folders and files and newer server copies take precedence", async ({
+  page,
+  files,
+  request,
+}) => {
+  await page.addInitScript(() => {
+    let internal = false;
+    window.mcPanelClipboard = {
+      readFiles: async () =>
+        internal
+          ? null
+          : {
+              id: "selection",
+              files: [
+                {
+                  id: "file",
+                  path: "desktop-folder/copied.txt",
+                  name: "copied.txt",
+                  size: 12,
+                  lastModified: 1234567890000,
+                },
+              ],
+              directories: ["desktop-folder", "desktop-folder/empty"],
+            },
+      readFile: async () => new TextEncoder().encode("desktop data"),
+      releaseFiles: async () => {},
+      markInternalCopy: async () => {
+        internal = true;
+      },
+    };
+  });
+  await openFiles(page, files);
+  await page.keyboard.press("Control+v");
+  await expect(
+    page.getByRole("status", { name: "File transfer progress" }),
+  ).toContainText("Transfer complete");
+  const headers = { "X-Server-Id": files.id };
+  const response = await request.get(
+    `/api/files/content?path=${files.folder}/desktop-folder/copied.txt`,
+    { headers },
+  );
+  expect((await response.json()).content).toBe("desktop data");
+  const empty = await request.get(
+    `/api/files?path=${files.folder}/desktop-folder/empty`,
+    { headers },
+  );
+  expect((await empty.json()).entries).toEqual([]);
+  await page
+    .getByRole("checkbox", { name: "Select beta.txt", exact: true })
+    .check();
+  await page.keyboard.press("Control+c");
+  await page.getByRole("button", { name: "archive", exact: true }).click();
+  await page.keyboard.press("Control+v");
+  await expect(
+    page.getByRole("status", { name: "File transfer progress" }),
+  ).toContainText("Transfer complete");
+  const listing = await request.get(`/api/files?path=${files.folder}/archive`, {
+    headers,
+  });
+  const names = (await listing.json()).entries.map(
+    (entry: { name: string }) => entry.name,
+  );
+  expect(names).toContain("beta.txt");
+  expect(names).not.toContain("desktop-folder");
+});
+
+test("cut and paste moves selected server files and consumes the cut selection", async ({
+  page,
+  files,
+  request,
+}) => {
+  await openFiles(page, files);
+  await page
+    .getByRole("checkbox", { name: "Select beta.txt", exact: true })
+    .check();
+  await page.keyboard.press("Control+x");
+  await expect(
+    page.getByRole("status", { name: "Copied files" }),
+  ).toContainText("cut from");
+  await page.getByRole("button", { name: "archive", exact: true }).click();
+  await page.getByRole("button", { name: "Paste", exact: true }).click();
+  await expect(
+    page.getByRole("status", { name: "File transfer progress" }),
+  ).toContainText("moved to");
+  await expect(page.getByRole("status", { name: "Copied files" })).toHaveCount(
+    0,
+  );
+  expect(await fileNames(request, files)).not.toContain("beta.txt");
+  const response = await request.get(
+    `/api/files/content?path=${files.folder}/archive/beta.txt`,
+    { headers: { "X-Server-Id": files.id } },
+  );
+  expect((await response.json()).content).toBe("Fixture contents\n");
+});
+
+test("Ctrl+S saves edited text without opening the browser save dialog", async ({
+  page,
+  files,
+  request,
+}) => {
+  await openFiles(page, files);
+  await page.getByRole("button", { name: "beta.txt", exact: true }).click();
+  const editor = page.getByRole("textbox", {
+    name: "File contents",
+    exact: true,
+  });
+  await editor.fill("Saved with Ctrl+S");
+  await editor.press("Control+s");
+  await expect(
+    page.getByRole("dialog", { name: "beta.txt", exact: true }),
+  ).not.toBeVisible();
+  const response = await request.get(
+    `/api/files/content?path=${files.folder}/beta.txt`,
+    { headers: { "X-Server-Id": files.id } },
+  );
+  expect((await response.json()).content).toBe("Saved with Ctrl+S");
+});
+
+test("Cut refuses an older server without move support instead of silently copying files", async ({
+  page,
+  files,
+}) => {
+  await page.route("**/api/files?**", async (route) => {
+    const response = await route.fetch();
+    const body = await response.json();
+    delete body.supportsFileMoves;
+    await route.fulfill({ response, json: body });
+  });
+  await openFiles(page, files);
+  await page
+    .getByRole("checkbox", { name: "Select beta.txt", exact: true })
+    .check();
+  await page.keyboard.press("Control+x");
+  await expect(
+    page.getByText(
+      "Update MC Panel on the server computer to use Cut and Paste.",
+      { exact: true },
+    ),
+  ).toBeVisible();
+  await expect(page.getByRole("status", { name: "Copied files" })).toHaveCount(
+    0,
+  );
+});
+
 test("file dialogs keep native modal focus and restore search when the deleted trigger disappears", async ({
   page,
   files,

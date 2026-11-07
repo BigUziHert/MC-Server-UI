@@ -21,7 +21,7 @@ import {
 import SearchField, { useDebouncedValue } from "../SearchField";
 import RefreshButton from "../RefreshButton";
 import StatePanel from "../StatePanel";
-import Pagination from "../Pagination";
+import Pagination, { usePageSize } from "../Pagination";
 import "./management.css";
 
 type Category = "server" | "file" | "backup" | "user" | "player";
@@ -63,7 +63,7 @@ export default function AuditLogs({
 
   const [refreshing, setRefreshing] = useState(false);
   const [page, setPage] = useState(1),
-    [pageSize, setPageSize] = useState(25);
+    [pageSize, setPageSize] = usePageSize("audit");
   const [, tick] = useState(0);
   const generation = useRef(0),
     loaded = useRef(false),

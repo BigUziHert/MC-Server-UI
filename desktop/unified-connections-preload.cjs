@@ -1,6 +1,20 @@
 const { contextBridge, ipcRenderer } = require("electron");
 
 if (process.isMainFrame) {
+  contextBridge.exposeInMainWorld("mcPanelClipboard", {
+    readFiles: () => ipcRenderer.invoke("mc-panel-clipboard:readFiles"),
+    readFile: (selectionId, fileId, offset) =>
+      ipcRenderer.invoke(
+        "mc-panel-clipboard:readFile",
+        selectionId,
+        fileId,
+        offset,
+      ),
+    releaseFiles: (selectionId) =>
+      ipcRenderer.invoke("mc-panel-clipboard:releaseFiles", selectionId),
+    markInternalCopy: () =>
+      ipcRenderer.invoke("mc-panel-clipboard:markInternalCopy"),
+  });
   const invoke = (action, ...args) =>
     ipcRenderer.invoke(`mc-panel-unified:${action}`, ...args);
   contextBridge.exposeInMainWorld("mcPanelConnections", {

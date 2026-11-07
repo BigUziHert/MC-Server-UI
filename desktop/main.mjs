@@ -1,6 +1,8 @@
 import {
   app,
   BrowserWindow,
+  clipboard,
+  ClipboardItem,
   WebContentsView,
   dialog,
   ipcMain,
@@ -26,6 +28,11 @@ import {
 } from "./remote-frontend.mjs";
 import { installPanelPermissionHandlers } from "./permissions.mjs";
 import { installUnifiedConnectionIpc } from "./connections-ipc.mjs";
+import { installEditContextMenu } from "./edit-menu.mjs";
+import {
+  createFileClipboard,
+  installFileClipboardIpc,
+} from "./file-clipboard.mjs";
 import { flushSelectionForQuit, waitForShutdown } from "./shutdown.mjs";
 import {
   installExternalLinkHandlers,
@@ -71,6 +78,7 @@ let updateTimer;
 let initialUpdateTimer;
 let remotePanels;
 let removeConnectionIpc;
+let removeClipboardIpc;
 let updatesOverlay;
 
 async function logError(cause) {
@@ -208,6 +216,7 @@ async function requestQuit(installUpdate = false) {
       (async () => {
         await runtime?.close({ gracefulOnly: true });
         removeConnectionIpc?.();
+        removeClipboardIpc?.();
         await remotePanels?.close();
       })(),
       {
@@ -461,6 +470,7 @@ async function launch() {
     },
   });
   window.setMenu(null);
+  installEditContextMenu(window.webContents, Menu);
   updatesOverlay = createUpdatesOverlay({
     WebContentsView,
     ipcMain,
@@ -483,6 +493,17 @@ async function launch() {
     listLocalServers: () => runtime.listLocalServerRecords(),
   });
   removeConnectionIpc = installUnifiedConnectionIpc(ipcMain, remotePanels);
+  removeClipboardIpc = installFileClipboardIpc(
+    ipcMain,
+    remotePanels,
+    createFileClipboard({
+      clipboard,
+      markInternalCopy: () =>
+        clipboard.write([
+          new ClipboardItem({ "web application/x-mc-panel-files": "internal" }),
+        ]),
+    }),
+  );
   void remotePanels.initialize().catch(logError);
   installPanelPermissionHandlers(
     panelSession,

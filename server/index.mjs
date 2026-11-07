@@ -3042,7 +3042,11 @@ export async function createPanel(options = {}) {
             signal: disconnected.signal,
           });
       res.set("Cache-Control", "private, no-store");
-      res.json({ ...result, uploadFilesPerBatch: MAX_UPLOAD_FILES_PER_BATCH });
+      res.json({
+        ...result,
+        uploadFilesPerBatch: MAX_UPLOAD_FILES_PER_BATCH,
+        supportsFileMoves: true,
+      });
     } catch (cause) {
       if (disconnected.signal.aborted) res.destroy();
       else throw cause;
@@ -3168,7 +3172,15 @@ export async function createPanel(options = {}) {
         paths,
         destinationPath = "",
         sourceServerId = options.id,
+        mode = "copy",
       } = req.body ?? {};
+      if (!["copy", "move"].includes(mode))
+        throw error(400, "Choose copy or move for this file transfer.");
+      if (mode === "move" && sourceServerId !== options.id)
+        throw error(
+          400,
+          "Cut and paste is available within the same server. Use Copy to transfer files to another server.",
+        );
       const requestId = recycleRequestId(req.body?.requestId) ?? randomUUID();
       if (
         !Array.isArray(paths) ||
@@ -3200,6 +3212,14 @@ export async function createPanel(options = {}) {
               403,
               "Your permission to create files on the destination server changed.",
             );
+          if (
+            mode === "move" &&
+            !userWithPermissions(targetUser).permissions.includes("file.delete")
+          )
+            throw error(
+              403,
+              "You need permission to delete source files to cut and paste them.",
+            );
         }
         if (options.getCopySource)
           return options.getCopySource(sourceServerId, principal);
@@ -3224,6 +3244,7 @@ export async function createPanel(options = {}) {
       if (previous) {
         if (
           previous.sourceServerId !== (sourceServerId ?? null) ||
+          (previous.mode ?? "copy") !== mode ||
           previous.destinationPath !== destination ||
           JSON.stringify(previous.paths) !== JSON.stringify(normalizedPaths)
         )
@@ -3238,6 +3259,7 @@ export async function createPanel(options = {}) {
       const operation = {
         id: requestId,
         sourceServerId: sourceServerId ?? null,
+        mode,
         destinationPath: destination,
         paths: normalizedPaths,
         status: "running",
@@ -3260,6 +3282,7 @@ export async function createPanel(options = {}) {
             serverDir,
             destinationPath: destination,
             paths: normalizedPaths,
+            mode,
             safePath,
             assertAccess: async () => {
               if ((await getSource()) !== source)
@@ -3283,8 +3306,8 @@ export async function createPanel(options = {}) {
         invalidateDiskUsage();
         void audit(
           "file",
-          "Files copied",
-          `${result.copiedFiles} files and ${result.copiedDirectories} folders copied to ${destination || "the server root"}.`,
+          mode === "move" ? "Files moved" : "Files copied",
+          `${result.copiedFiles} files and ${result.copiedDirectories} folders ${mode === "move" ? "moved" : "copied"} to ${destination || "the server root"}.`,
         ).catch(() => {});
         res.status(201).json(result);
       } catch (cause) {
@@ -3292,10 +3315,12 @@ export async function createPanel(options = {}) {
           cause.status >= 400 && cause.status < 500
             ? cause.message
             : cause.code === "EEXIST"
-              ? "A destination item appeared during the copy. Existing items were not overwritten."
-              : cause.code === "ENOSPC"
-                ? "The destination drive is full. Completed copies have been retained."
-                : "The copy could not finish. Completed copies have been retained; source files were not removed.";
+              ? "A destination item appeared during the transfer. Existing items were not overwritten."
+              : mode === "move"
+                ? "The move could not finish. Check both folders before retrying; completed moves have been retained."
+                : cause.code === "ENOSPC"
+                  ? "The destination drive is full. Completed copies have been retained."
+                  : "The copy could not finish. Completed copies have been retained; source files were not removed.";
         const result = cause.transferResult ?? {
           copiedFiles: 0,
           copiedDirectories: 0,
@@ -3312,8 +3337,10 @@ export async function createPanel(options = {}) {
         if (result.copiedFiles || result.copiedDirectories)
           void audit(
             "file",
-            "Files partially copied",
-            `${result.copiedFiles} files and ${result.copiedDirectories} folders copied before the operation stopped. ${message}`,
+            mode === "move"
+              ? "Files partially moved"
+              : "Files partially copied",
+            `${result.copiedFiles} files and ${result.copiedDirectories} folders ${mode === "move" ? "moved" : "copied"} before the operation stopped. ${message}`,
           ).catch(() => {});
         res
           .status(
@@ -3676,16 +3703,42 @@ export async function createPanel(options = {}) {
       }
     }),
   );
-  app.get("/api/backups", (_req, res) =>
+  const missingBackupArchive = async (item) => {
+    try {
+      await fs.lstat(path.join(backupDir, `${item.id}.tar.gz`));
+      return false;
+    } catch (cause) {
+      // A missing folder can also mean a disconnected drive. Report it without
+      // silently discarding history or recreating the configured location.
+      if (cause.code === "ENOENT") return true;
+      throw cause;
+    }
+  };
+  app.get("/api/backups", async (_req, res) => {
+    const backups = state.backups;
+    // One directory read per refresh, regardless of the size of backup history.
+    // Permission/I/O failures are not evidence that an archive is missing.
+    const filenames = backups.length
+      ? await fs.readdir(backupDir).then(
+          (names) => new Set(names),
+          (cause) => (cause.code === "ENOENT" ? new Set() : null),
+        )
+      : new Set();
+    const missingBackupIds = filenames
+      ? backups
+          .filter((item) => !filenames.has(`${item.id}.tar.gz`))
+          .map((item) => item.id)
+      : [];
     res.json({
-      backups: state.backups,
+      backups,
+      missingBackupIds,
       schedule: presentedSchedule(),
       timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
       job: state.dismissedBackupJobs.includes(latestBackupJob?.id)
         ? null
         : latestBackupJob,
-    }),
-  );
+    });
+  });
   const backupFailureAudit = (cause) =>
     audit(
       "backup",
@@ -3991,6 +4044,32 @@ export async function createPanel(options = {}) {
       if (backupBusy)
         throw error(409, "Wait for the current backup to finish.");
       const item = getItem(state.backups, req.params.id);
+      if (req.body?.removeMissingRecord === true) {
+        if (req.body.confirm !== true)
+          throw error(400, "Confirm removal of this missing backup record.");
+        if (!(await missingBackupArchive(item)))
+          throw error(
+            409,
+            "The backup archive is available again. Refresh and move it to Recycle Bin instead.",
+          );
+        await queueSave(async () => {
+          const backups = state.backups.filter((entry) => entry.id !== item.id);
+          const entry = auditEntry(
+            "backup",
+            "Missing backup record removed",
+            `${item.name}. Only its history record was removed; no archive or server files were deleted.`,
+            requestActor.getStore() ?? "Local administrator",
+          );
+          await writeState({
+            ...state,
+            backups,
+            audit: [entry, ...state.audit].slice(0, 2000),
+          });
+          state.backups = backups;
+          state.audit = [entry, ...state.audit].slice(0, 2000);
+        });
+        return res.json({ ok: true, removedRecord: true });
+      }
       const recycled = await recycleBackup(item);
       res.json({ ok: true, recycled });
     }),

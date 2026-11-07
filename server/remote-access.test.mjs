@@ -596,6 +596,46 @@ test("remote settings require an explicit grant and only update the selected ser
   );
 });
 
+test("remote cut requires delete permission as well as reading and creating files", async (t) => {
+  const { invite, id, fleet } = await fixture(t);
+  const serverDir = fleet.runtimes.get(id).serverDir;
+  await fs.mkdir(path.join(serverDir, "cut-destination"));
+  await fs.writeFile(path.join(serverDir, "cut-proof.txt"), "protected source");
+  const reader = await invite(["file.read-content", "file.create"]);
+  const request = json("POST", {
+    mode: "move",
+    sourceServerId: id,
+    paths: ["cut-proof.txt"],
+    destinationPath: "cut-destination",
+  });
+  assert.equal((await reader.asUser("/api/files/copy", request)).status, 403);
+  assert.equal(
+    await fs.readFile(path.join(serverDir, "cut-proof.txt"), "utf8"),
+    "protected source",
+  );
+  assert.deepEqual(
+    await fs.readdir(path.join(serverDir, "cut-destination")),
+    [],
+  );
+  const mover = await invite(
+    ["file.read-content", "file.create", "file.delete"],
+    "mover@example.test",
+  );
+  const result = await mover.asUser("/api/files/copy", request);
+  assert.equal(result.status, 201, JSON.stringify(result.body));
+  assert.equal(result.body.mode, "move");
+  await assert.rejects(fs.stat(path.join(serverDir, "cut-proof.txt")), {
+    code: "ENOENT",
+  });
+  assert.equal(
+    await fs.readFile(
+      path.join(serverDir, "cut-destination", "cut-proof.txt"),
+      "utf8",
+    ),
+    "protected source",
+  );
+});
+
 test("remote copy checks proven source read access and destination create access independently", async (t) => {
   const { local, invite, id, fleet } = await fixture(t);
   const created = await local(

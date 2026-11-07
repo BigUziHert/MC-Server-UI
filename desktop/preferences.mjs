@@ -6,6 +6,9 @@ const fail = (status, message) => Object.assign(new Error(message), { status });
 const object = (value) =>
   value && typeof value === "object" && !Array.isArray(value);
 const rowKeys = new Set([
+  "mc-panel.files.rows",
+  "mc-panel.audit.rows",
+  "mc-panel.subusers.rows",
   "mc-panel.launchpad.rows",
   ...[
     "online-players",

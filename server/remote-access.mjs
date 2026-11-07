@@ -150,7 +150,10 @@ export function requiredPermissions(req) {
       return ["audit.read"];
   }
   if (req.method === "POST") {
-    if (route === "/api/files/copy") return ["file.create"];
+    if (route === "/api/files/copy")
+      return req.body?.mode === "move"
+        ? ["file.create", "file.delete"]
+        : ["file.create"];
     if (
       /^\/api\/players\/(?:op|deop|kick|ban|unban)$/.test(route) ||
       /^\/api\/players\/whitelist\/(?:add|remove|state)$/.test(route)

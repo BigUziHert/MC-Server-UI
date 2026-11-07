@@ -442,6 +442,13 @@ test("editor Find navigates literal matches, scrolls, and never submits while se
       writes.push(request.url());
   });
   await expect(editor).toHaveValue(original);
+  await expect(
+    dialog.getByRole("button", { name: "Find in file", exact: true }),
+  ).toHaveCount(0);
+  const viewport = page.viewportSize()!;
+  const bounds = await dialog.boundingBox();
+  expect(bounds!.width).toBeGreaterThan(viewport.width * 0.85);
+  expect(bounds!.height).toBeGreaterThan(viewport.height * 0.8);
   await editor.press("Control+f");
   await expect(find).toBeFocused();
   await find.fill("[a.*]");
@@ -552,9 +559,7 @@ test("editor Find uses displayed offsets for CRLF and lone CR without changing s
     exact: true,
   });
   await expect(editor).toHaveValue(displayed);
-  await dialog
-    .getByRole("button", { name: "Find in file", exact: true })
-    .click();
+  await editor.press("Control+f");
   const find = dialog.getByRole("textbox", {
     name: "Find text in file",
     exact: true,
@@ -1112,8 +1117,8 @@ test("JSON5 and JSONC search results preserve browse-only and read-only permissi
           dialog.getByRole("button", { name: "Save changes", exact: true }),
         ).toBeDisabled();
         await dialog
-          .getByRole("button", { name: "Find in file", exact: true })
-          .click();
+          .getByRole("textbox", { name: "File contents", exact: true })
+          .press("Control+f");
         const find = dialog.getByRole("textbox", {
           name: "Find text in file",
           exact: true,

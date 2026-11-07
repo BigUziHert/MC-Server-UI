@@ -237,6 +237,348 @@ test("native copy preserves nested files, empty folders, source bytes and modifi
   );
 });
 
+test("same-server cut preserves nested contents, empty folders and file identity", async (t) => {
+  const f = await fixture(t);
+  await fs.mkdir(path.join(f.sourceDir, "pack", "empty"), { recursive: true });
+  await fs.mkdir(path.join(f.sourceDir, "destination"));
+  const original = path.join(f.sourceDir, "pack", "mod.jar");
+  await fs.writeFile(original, "exact mod bytes");
+  await fs.utimes(original, new Date("2021-01-02Z"), new Date("2021-01-02Z"));
+  const before = await fs.stat(original);
+  const result = await f.copy({
+    serverDir: f.sourceDir,
+    mode: "move",
+    destinationPath: "destination",
+    paths: ["pack", "pack/mod.jar"],
+  });
+  assert.deepEqual(result, {
+    mode: "move",
+    copiedFiles: 1,
+    copiedDirectories: 2,
+    paths: ["destination/pack"],
+  });
+  await missing(path.join(f.sourceDir, "pack"));
+  const moved = path.join(f.sourceDir, "destination", "pack", "mod.jar");
+  assert.equal(await fs.readFile(moved, "utf8"), "exact mod bytes");
+  assert.equal((await fs.stat(moved)).ino, before.ino);
+  assert.equal((await fs.stat(moved)).mtimeMs, before.mtimeMs);
+  assert.deepEqual(
+    await fs.readdir(path.join(f.sourceDir, "destination", "pack", "empty")),
+    [],
+  );
+});
+
+test("cut rejects cross-server, cross-drive, self and conflicting destinations before mutations", async (t) => {
+  const f = await fixture(t);
+  await fs.mkdir(path.join(f.sourceDir, "destination"));
+  await fs.writeFile(path.join(f.sourceDir, "proof.txt"), "source");
+  const options = {
+    serverDir: f.sourceDir,
+    mode: "move",
+    paths: ["proof.txt"],
+    destinationPath: "destination",
+  };
+  await assert.rejects(
+    f.copy({ ...options, serverDir: f.serverDir, destinationPath: "" }),
+    /same server/,
+  );
+  await assert.rejects(f.copy({ ...options, destinationPath: "" }), /itself/);
+  await assert.rejects(
+    f.copy({
+      ...options,
+      fileSystem: {
+        ...fs,
+        lstat: async (target) => {
+          const stat = await fs.lstat(target);
+          if (target === path.join(f.sourceDir, "proof.txt")) stat.dev += 1;
+          return stat;
+        },
+      },
+    }),
+    /across drives/,
+  );
+  await fs.writeFile(
+    path.join(f.sourceDir, "destination", "proof.txt"),
+    "existing",
+  );
+  await assert.rejects(f.copy(options), /already exists/);
+  assert.equal(
+    await fs.readFile(path.join(f.sourceDir, "proof.txt"), "utf8"),
+    "source",
+  );
+  assert.equal(
+    await fs.readFile(
+      path.join(f.sourceDir, "destination", "proof.txt"),
+      "utf8",
+    ),
+    "existing",
+  );
+});
+
+test("cut publication failure or revoked permission never removes a source", async (t) => {
+  for (const reason of ["link", "access", "changed"]) {
+    const f = await fixture(t);
+    await fs.mkdir(path.join(f.sourceDir, "destination"));
+    for (const name of ["a.txt", "b.txt"])
+      await fs.writeFile(path.join(f.sourceDir, name), name);
+    let linked = 0;
+    await assert.rejects(
+      f.copy({
+        serverDir: f.sourceDir,
+        mode: "move",
+        paths: ["a.txt", "b.txt"],
+        destinationPath: "destination",
+        assertAccess: async () => {
+          if (reason === "access" && linked)
+            throw Object.assign(new Error("revoked"), { status: 403 });
+        },
+        fileSystem: {
+          ...fs,
+          link: async (from, to) => {
+            if (reason === "link" && linked)
+              throw Object.assign(new Error("unsupported"), { code: "EXDEV" });
+            await fs.link(from, to);
+            linked++;
+            if (reason === "changed") await fs.appendFile(from, " changed");
+          },
+        },
+      }),
+    );
+    assert.match(
+      await fs.readFile(path.join(f.sourceDir, "a.txt"), "utf8"),
+      /^a.txt/,
+    );
+    assert.equal(
+      await fs.readFile(path.join(f.sourceDir, "b.txt"), "utf8"),
+      reason === "changed" ? "b.txt changed" : "b.txt",
+    );
+    assert.deepEqual(
+      await fs.readdir(path.join(f.sourceDir, "destination")),
+      [],
+    );
+  }
+});
+
+test("cut never overwrites a destination created after preflight", async (t) => {
+  const f = await fixture(t);
+  await fs.mkdir(path.join(f.sourceDir, "destination"));
+  await fs.writeFile(path.join(f.sourceDir, "proof.txt"), "source");
+  await assert.rejects(
+    f.copy({
+      serverDir: f.sourceDir,
+      mode: "move",
+      paths: ["proof.txt"],
+      destinationPath: "destination",
+      fileSystem: {
+        ...fs,
+        link: async (from, to) => {
+          await fs.writeFile(to, "appeared");
+          await fs.link(from, to);
+        },
+      },
+    }),
+    { code: "EEXIST" },
+  );
+  assert.equal(
+    await fs.readFile(path.join(f.sourceDir, "proof.txt"), "utf8"),
+    "source",
+  );
+  assert.equal(
+    await fs.readFile(
+      path.join(f.sourceDir, "destination", "proof.txt"),
+      "utf8",
+    ),
+    "appeared",
+  );
+});
+
+test("partial cut failure retains completed moves and leaves no alias for unremoved sources", async (t) => {
+  const f = await fixture(t);
+  await fs.mkdir(path.join(f.sourceDir, "destination"));
+  for (const name of ["a.txt", "b.txt"])
+    await fs.writeFile(path.join(f.sourceDir, name), name);
+  await assert.rejects(
+    f.copy({
+      serverDir: f.sourceDir,
+      mode: "move",
+      paths: ["a.txt", "b.txt"],
+      destinationPath: "destination",
+      fileSystem: {
+        ...fs,
+        rename: async (from, to) => {
+          if (from === path.join(f.sourceDir, "a.txt"))
+            throw new Error("device failure");
+          await fs.rename(from, to);
+        },
+      },
+    }),
+    (cause) => {
+      assert.equal(cause.transferResult.copiedFiles, 1);
+      assert.equal(cause.transferResult.mode, "move");
+      return true;
+    },
+  );
+  assert.equal(
+    await fs.readFile(path.join(f.sourceDir, "a.txt"), "utf8"),
+    "a.txt",
+  );
+  await missing(path.join(f.sourceDir, "b.txt"));
+  await missing(path.join(f.sourceDir, "destination", "a.txt"));
+  assert.equal(
+    await fs.readFile(path.join(f.sourceDir, "destination", "b.txt"), "utf8"),
+    "b.txt",
+  );
+});
+
+test("failed cut retains its published original if the source is replaced externally", async (t) => {
+  const f = await fixture(t);
+  await fs.mkdir(path.join(f.sourceDir, "destination"));
+  await fs.writeFile(path.join(f.sourceDir, "proof.txt"), "original");
+  await assert.rejects(
+    f.copy({
+      serverDir: f.sourceDir,
+      mode: "move",
+      paths: ["proof.txt"],
+      destinationPath: "destination",
+      fileSystem: {
+        ...fs,
+        link: async (from, to) => {
+          await fs.link(from, to);
+          await fs.unlink(from);
+          await fs.writeFile(from, "replacement");
+        },
+      },
+    }),
+    /source item changed/,
+  );
+  assert.equal(
+    await fs.readFile(path.join(f.sourceDir, "proof.txt"), "utf8"),
+    "replacement",
+  );
+  assert.equal(
+    await fs.readFile(
+      path.join(f.sourceDir, "destination", "proof.txt"),
+      "utf8",
+    ),
+    "original",
+  );
+});
+
+test("cut preserves a replacement inserted after final source verification", async (t) => {
+  for (const conflictingRestore of [false, true]) {
+    const f = await fixture(t);
+    await fs.mkdir(path.join(f.sourceDir, "destination"));
+    const original = path.join(f.sourceDir, "proof.txt");
+    const destination = path.join(f.sourceDir, "destination", "proof.txt");
+    await fs.writeFile(original, "original");
+    let targetChecks = 0;
+    let retained;
+    await assert.rejects(
+      f.copy({
+        serverDir: f.sourceDir,
+        mode: "move",
+        paths: ["proof.txt"],
+        destinationPath: "destination",
+        fileSystem: {
+          ...fs,
+          lstat: async (target) => {
+            const stat = await fs.lstat(target);
+            if (target === destination && ++targetChecks === 3) {
+              // Publication and the whole-selection check have completed.
+              // The source was just verified, but its path is still mutable.
+              await fs.unlink(original);
+              await fs.writeFile(original, "replacement");
+            }
+            return stat;
+          },
+          rename: async (from, to) => {
+            await fs.rename(from, to);
+            if (from === original && conflictingRestore) {
+              retained = to;
+              await fs.writeFile(original, "newer replacement");
+            }
+          },
+        },
+      }),
+      conflictingRestore ? /Source data was retained/ : /source item changed/,
+    );
+    assert.equal(await fs.readFile(destination, "utf8"), "original");
+    assert.equal(
+      await fs.readFile(original, "utf8"),
+      conflictingRestore ? "newer replacement" : "replacement",
+    );
+    if (conflictingRestore)
+      assert.equal(await fs.readFile(retained, "utf8"), "replacement");
+    else
+      assert.equal(
+        (await fs.readdir(f.sourceDir)).some((name) =>
+          name.startsWith(".mc-panel-move-"),
+        ),
+        false,
+      );
+  }
+});
+
+test("cut rollback preserves destination replacements and reports retained recovery paths", async (t) => {
+  for (const conflictingRestore of [false, true]) {
+    const f = await fixture(t);
+    await fs.mkdir(path.join(f.sourceDir, "destination"));
+    for (const name of ["a.txt", "b.txt"])
+      await fs.writeFile(path.join(f.sourceDir, name), name);
+    const destination = path.join(f.sourceDir, "destination", "a.txt");
+    let targetChecks = 0;
+    let retained;
+    await assert.rejects(
+      f.copy({
+        serverDir: f.sourceDir,
+        mode: "move",
+        paths: ["a.txt", "b.txt"],
+        destinationPath: "destination",
+        fileSystem: {
+          ...fs,
+          link: async (from, to) => {
+            if (from === path.join(f.sourceDir, "b.txt"))
+              throw new Error("publication failed");
+            await fs.link(from, to);
+          },
+          lstat: async (target) => {
+            const stat = await fs.lstat(target);
+            if (target === destination && ++targetChecks === 2) {
+              await fs.unlink(destination);
+              await fs.writeFile(destination, "replacement destination");
+            }
+            return stat;
+          },
+          rename: async (from, to) => {
+            await fs.rename(from, to);
+            if (from === destination && conflictingRestore) {
+              retained = to;
+              await fs.writeFile(destination, "newer destination");
+            }
+          },
+        },
+      }),
+      conflictingRestore
+        ? /Destination data was retained/
+        : /publication failed/,
+    );
+    assert.equal(
+      await fs.readFile(destination, "utf8"),
+      conflictingRestore ? "newer destination" : "replacement destination",
+    );
+    for (const name of ["a.txt", "b.txt"])
+      assert.equal(
+        await fs.readFile(path.join(f.sourceDir, name), "utf8"),
+        name,
+      );
+    if (conflictingRestore)
+      assert.equal(
+        await fs.readFile(retained, "utf8"),
+        "replacement destination",
+      );
+  }
+});
+
 test("same-server copy rejects its source and descendants, duplicates and existing destinations before writing", async (t) => {
   const f = await fixture(t);
   await fs.mkdir(path.join(f.sourceDir, "mods", "nested"), { recursive: true });
@@ -530,6 +872,56 @@ test("fleet copy supports two local servers, request history and no overwrite on
     assert.equal(
       await fs.readFile(path.join(source, "mods", "proof.jar"), "utf8"),
       "jar bytes",
+    );
+  } finally {
+    await f.close();
+  }
+});
+
+test("cut API replays completed moves without repeating them and rejects different operation modes", async (t) => {
+  const f = await apiFixture(t);
+  try {
+    const source = f.fleet.runtimes.get(f.first).serverDir;
+    await fs.mkdir(path.join(source, "destination"));
+    await fs.writeFile(path.join(source, "proof.txt"), "proof");
+    const body = {
+      mode: "move",
+      sourceServerId: f.first,
+      paths: ["proof.txt"],
+      destinationPath: "destination",
+      requestId: randomUUID(),
+    };
+    const moved = await f.request("/api/files/copy", json(body), f.first);
+    assert.equal(moved.status, 201, JSON.stringify(moved.body));
+    assert.equal(moved.body.mode, "move");
+    await missing(path.join(source, "proof.txt"));
+    assert.deepEqual(
+      await f.request("/api/files/copy", json(body), f.first),
+      moved,
+    );
+    assert.equal(
+      (
+        await f.request(
+          "/api/files/copy",
+          json({ ...body, mode: "copy" }),
+          f.first,
+        )
+      ).status,
+      409,
+    );
+    assert.equal(
+      (await f.request("/api/files/copy", json(body), f.second)).status,
+      400,
+    );
+    assert.equal(
+      (
+        await f.request(
+          `/api/files/copy-operation?requestId=${body.requestId}`,
+          {},
+          f.first,
+        )
+      ).body.operation.mode,
+      "move",
     );
   } finally {
     await f.close();

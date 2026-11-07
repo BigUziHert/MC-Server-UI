@@ -5,7 +5,7 @@ dialog.storage-native-dialog {
   max-width: 480px;
 }
 dialog.storage-native-dialog.editor-modal {
-  max-width: 850px;
+  max-width: 1440px;
 }
 dialog.storage-native-dialog::backdrop {
   background: #101016c9;

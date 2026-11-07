@@ -81,6 +81,8 @@ files:
   - desktop/panel-settings.mjs
   - desktop/shutdown.mjs
   - desktop/external-links.mjs
+  - desktop/edit-menu.mjs
+  - desktop/file-clipboard.mjs
   - desktop/remote-panels.mjs
   - desktop/remote-frontend.mjs
   - desktop/permissions.mjs

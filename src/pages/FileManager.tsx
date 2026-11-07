@@ -9,6 +9,7 @@ import {
   type FormEvent,
   type ReactNode,
 } from "react";
+import { createPortal } from "react-dom";
 import { SessionScopeContext } from "../session-scope";
 import {
   ArrowDown,
@@ -16,6 +17,7 @@ import {
   ArrowUpDown,
   ChevronRight,
   Copy,
+  Scissors,
   ClipboardPaste,
   Download,
   File as FileIcon,
@@ -49,13 +51,15 @@ import SearchField, { useDebouncedValue } from "../SearchField";
 import FileTextEditor, { type FileTextEditorHandle } from "../FileTextEditor";
 import RefreshButton from "../RefreshButton";
 import StatePanel from "../StatePanel";
-import Pagination from "../Pagination";
+import Pagination, { usePageSize } from "../Pagination";
+import { collectDesktopClipboardUpload } from "../desktop-clipboard";
 import DownloadButton, { downloadToComputer } from "../DownloadButton";
 import "./file-selection.css";
 import "./recycle-bin.css";
 import {
   copyFiles,
   clearFileClipboard,
+  consumeFileClipboard,
   useFileClipboard,
 } from "../file-clipboard";
 import {
@@ -103,7 +107,9 @@ function TransferProgress({
           {running
             ? transfer.kind === "upload"
               ? "Uploading files"
-              : "Copying files"
+              : transfer.kind === "move"
+                ? "Moving files"
+                : "Copying files"
             : transfer.status === "completed"
               ? "Transfer complete"
               : "Transfer needs attention"}
@@ -233,6 +239,7 @@ type FileResult = {
   search?: string;
   nextCursor?: string | null;
   uploadFilesPerBatch?: number;
+  supportsFileMoves?: boolean;
 };
 type RecycledItem = {
   id: string;
@@ -721,7 +728,7 @@ export default function FileManager({
   const activeListScope = useRef(listScope);
   activeListScope.current = listScope;
   const [page, setPage] = useState(1),
-    [pageSize, setPageSize] = useState(25);
+    [pageSize, setPageSize] = usePageSize("files");
   const [sort, setSort] = useState<FileSort>({
     key: "name",
     direction: "ascending",
@@ -741,6 +748,12 @@ export default function FileManager({
   const [loading, setLoading] = useState(true);
   const [searchProgress, setSearchProgress] = useState(0);
   const [uploadLimit, setUploadLimit] = useState({ scope: "", value: 20 });
+  const [moveCapability, setMoveCapability] = useState({
+    scope: "",
+    supported: false,
+  });
+  const supportsMoves =
+    moveCapability.scope === transferKey && moveCapability.supported;
   const [error, setError] = useState("");
   const [dragging, setDragging] = useState(false);
   const [dialog, setDialog] = useState<FileDialog | null>(null);
@@ -759,6 +772,15 @@ export default function FileManager({
   const [readFailed, setReadFailed] = useState(false);
   const [dialogError, setDialogError] = useState("");
   const [selected, setSelected] = useState<Set<string>>(new Set());
+  const [contextMenu, setContextMenu] = useState<{
+    x: number;
+    y: number;
+  } | null>(null);
+  const contextMenuRef = useRef<HTMLDivElement>(null);
+  const contextMenuTrigger = useRef<HTMLElement | null>(null);
+  const readingClipboard = useRef(false);
+  const clipboardReadAbort = useRef<AbortController | null>(null);
+  const [collectingClipboard, setCollectingClipboard] = useState(false);
   const pendingReveal = useRef<{ scope: string; path: string } | null>(null);
   const revealedRow = useRef<HTMLTableRowElement>(null);
   const moveKey = `${sessionScope}:${scopeKey}:moves`;
@@ -848,6 +870,10 @@ export default function FileManager({
             ? previous
             : { scope: transferKey, value },
         );
+        setMoveCapability({
+          scope: transferKey,
+          supported: result.supportsFileMoves === true,
+        });
         if (
           debouncedQuery &&
           (result.search !== debouncedQuery ||
@@ -1217,8 +1243,16 @@ export default function FileManager({
     if (folderInput.current) folderInput.current.value = "";
   }
 
-  function copySelection() {
+  function copySelection(mode: "copy" | "move" = "copy") {
     if (!canContent || !serverId || loading) return;
+    if (mode === "move" && (!canDelete || movePending || transferring)) return;
+    if (mode === "move" && !supportsMoves) {
+      notify(
+        "Update MC Panel on the server computer to use Cut and Paste.",
+        true,
+      );
+      return;
+    }
     const targets = entries.filter((entry) => selected.has(entry.path));
     if (!targets.length) return;
     copyFiles({
@@ -1227,9 +1261,20 @@ export default function FileManager({
       sourceServerId: serverId,
       sourceName: serverName,
       paths: targets.map((entry) => entry.path),
+      mode,
     });
+    // A fresh server copy replaces any earlier Explorer selection, just as a
+    // normal copy operation replaces the system clipboard.
+    void window.mcPanelClipboard
+      ?.markInternalCopy()
+      .catch((failure: unknown) =>
+        notify(
+          messageOf(failure, "The desktop clipboard could not be updated."),
+          true,
+        ),
+      );
     notify(
-      `${targets.length} ${targets.length === 1 ? "item" : "items"} ready to paste.`,
+      `${targets.length} ${targets.length === 1 ? "item" : "items"} ready to ${mode === "move" ? "move" : "paste"}.`,
     );
   }
   function pasteSelection() {
@@ -1242,53 +1287,212 @@ export default function FileManager({
       loading
     )
       return;
+    if (
+      clipboard.mode === "move" &&
+      (!supportsMoves || clipboard.sourceServerId !== serverId)
+    ) {
+      notify(
+        clipboard.sourceServerId !== serverId
+          ? "Cut and paste is available within the same server. Use Copy to transfer files to another server."
+          : "Update MC Panel on the server computer to use Cut and Paste.",
+        true,
+      );
+      return;
+    }
     const destination = path;
     startFileTransfer(
       transferKey,
-      { kind: "copy", destination, serverName },
-      (report, requestId) =>
-        pasteFiles(
+      {
+        kind: clipboard.mode === "move" ? "move" : "copy",
+        destination,
+        serverName,
+      },
+      async (report, requestId) => {
+        const result = await pasteFiles(
           api,
           {
             sourceServerId: clipboard.sourceServerId,
             paths: [...clipboard.paths],
             destinationPath: destination,
+            mode: clipboard.mode,
           },
           report,
           requestId,
-        ),
+        );
+        if (clipboard.mode === "move") consumeFileClipboard(clipboard);
+        return result;
+      },
       notify,
     );
   }
 
+  async function pasteClipboard() {
+    if (
+      !canCreate ||
+      transferring ||
+      movePending ||
+      loading ||
+      readingClipboard.current
+    )
+      return;
+    readingClipboard.current = true;
+    setCollectingClipboard(true);
+    const controller = new AbortController();
+    clipboardReadAbort.current = controller;
+    const scope = listScope;
+    try {
+      const files = await collectDesktopClipboardUpload({
+        signal: controller.signal,
+      });
+      // Reading a local folder can take time. Never upload into a different
+      // server or folder if the user navigated while it was being collected.
+      if (activeListScope.current !== scope) return;
+      if (files) uploadFiles(() => files);
+      else if (clipboard) pasteSelection();
+      else notify("Copy files on your computer, then press Ctrl+V here.");
+    } catch (failure) {
+      if (!controller.signal.aborted)
+        notify(messageOf(failure, "The copied files could not be read."), true);
+    } finally {
+      readingClipboard.current = false;
+      clipboardReadAbort.current = null;
+      setCollectingClipboard(false);
+    }
+  }
+
+  function selectAllFiles() {
+    if (!loading && !saving && !error && (canContent || canDelete))
+      setSelected(new Set(entries.map((entry) => entry.path)));
+  }
+
   useEffect(() => {
+    if (!contextMenu) return;
+    const menu = contextMenuRef.current;
+    const previous = document.activeElement;
+    menu?.querySelector<HTMLButtonElement>("button:not(:disabled)")?.focus();
+    const close = (event: Event) => {
+      if (!(event.target instanceof Node) || !menu?.contains(event.target))
+        setContextMenu(null);
+    };
+    document.addEventListener("pointerdown", close);
+    window.addEventListener("resize", close);
+    window.addEventListener("scroll", close, true);
+    return () => {
+      document.removeEventListener("pointerdown", close);
+      window.removeEventListener("resize", close);
+      window.removeEventListener("scroll", close, true);
+      if (
+        menu?.contains(document.activeElement) &&
+        previous instanceof HTMLElement &&
+        previous.isConnected
+      )
+        previous.focus({ preventScroll: true });
+    };
+  }, [contextMenu]);
+
+  useEffect(() => setContextMenu(null), [listScope, showingBin, dialog]);
+  useEffect(() => () => clipboardReadAbort.current?.abort(), [listScope]);
+
+  useEffect(() => {
+    const editingText = (target: EventTarget | null) =>
+      target instanceof Element &&
+      !!target.closest(
+        "input:not([type=checkbox]):not([type=radio]):not([type=button]),textarea,[contenteditable]:not([contenteditable=false]),[role=textbox]",
+      );
+    const blocked = () =>
+      dialog || showingBin || document.querySelector("dialog[open]");
     const shortcut = (event: KeyboardEvent) => {
-      if (
-        !(event.ctrlKey || event.metaKey) ||
-        event.altKey ||
-        dialog ||
-        showingBin
-      )
+      if (event.defaultPrevented || blocked() || editingText(event.target))
         return;
-      if (
-        event.target instanceof Element &&
-        event.target.closest(
-          "input:not([type=checkbox]):not([type=radio]):not([type=button]),textarea,[contenteditable=true],[role=textbox]",
-        )
-      )
-        return;
-      if (window.getSelection()?.toString()) return;
-      if (event.key.toLowerCase() === "c" && selected.size && canContent) {
+      const key = event.key.toLowerCase();
+      const modifier = event.ctrlKey || event.metaKey;
+      if (modifier && !event.altKey && key === "a") {
         event.preventDefault();
-        copySelection();
+        selectAllFiles();
+      } else if (
+        modifier &&
+        !event.altKey &&
+        (key === "c" || key === "x") &&
+        selected.size &&
+        canContent &&
+        !window.getSelection()?.toString()
+      ) {
+        event.preventDefault();
+        copySelection(key === "x" ? "move" : "copy");
+      } else if (
+        modifier &&
+        !event.altKey &&
+        key === "v" &&
+        window.mcPanelClipboard &&
+        canCreate
+      ) {
+        event.preventDefault();
+        void pasteClipboard();
+      } else if (
+        modifier &&
+        event.shiftKey &&
+        !event.altKey &&
+        key === "n" &&
+        canCreate
+      ) {
+        event.preventDefault();
+        openCreate("directory");
+      } else if (
+        !modifier &&
+        !event.altKey &&
+        key === "delete" &&
+        selected.size &&
+        canDelete &&
+        !loading &&
+        !error
+      ) {
+        event.preventDefault();
+        openDeleteSelected();
+      } else if (!modifier && !event.altKey && key === "escape") {
+        setContextMenu(null);
+        setSelected(new Set());
+      } else if (
+        !modifier &&
+        ((event.altKey && key === "arrowup") ||
+          (!event.altKey && key === "backspace")) &&
+        path
+      ) {
+        event.preventDefault();
+        navigate(path.split("/").slice(0, -1).join("/"));
       }
-      if (event.key.toLowerCase() === "v" && clipboard && canCreate) {
+    };
+    const paste = (event: ClipboardEvent) => {
+      if (
+        event.defaultPrevented ||
+        blocked() ||
+        editingText(event.target) ||
+        !canCreate ||
+        transferring ||
+        movePending ||
+        loading
+      )
+        return;
+      const data = event.clipboardData;
+      if (
+        data &&
+        (data.files.length ||
+          Array.from(data.items).some((item) => item.kind === "file"))
+      ) {
+        event.preventDefault();
+        // Capture clipboard entries before the browser clears its event store.
+        const source = collectDroppedUpload(data);
+        uploadFiles(() => source);
+      } else if (clipboard) {
         event.preventDefault();
         pasteSelection();
       }
     };
     window.addEventListener("keydown", shortcut);
-    return () => window.removeEventListener("keydown", shortcut);
+    window.addEventListener("paste", paste);
+    return () => {
+      window.removeEventListener("keydown", shortcut);
+      window.removeEventListener("paste", paste);
+    };
   });
 
   async function submitDialog(event: FormEvent) {
@@ -1525,7 +1729,8 @@ export default function FileManager({
           <Copy size={16} />
           <span>
             {clipboard.paths.length}{" "}
-            {clipboard.paths.length === 1 ? "item" : "items"} copied from{" "}
+            {clipboard.paths.length === 1 ? "item" : "items"}{" "}
+            {clipboard.mode === "move" ? "cut" : "copied"} from{" "}
             <strong>{clipboard.sourceName}</strong>. Open a folder or another
             server on this panel, then Paste.
           </span>
@@ -1556,6 +1761,24 @@ export default function FileManager({
       <section
         className={`panel files-panel ${dragging ? "files-dragging" : ""}`}
         aria-label="Server files"
+        onContextMenu={(event) => {
+          if (
+            event.target instanceof Element &&
+            event.target.closest(
+              "input:not([type=checkbox]),textarea,[contenteditable=true]",
+            )
+          )
+            return;
+          event.preventDefault();
+          contextMenuTrigger.current =
+            event.target instanceof Element
+              ? event.target.closest<HTMLElement>("button,input,a,[tabindex]")
+              : null;
+          setContextMenu({
+            x: Math.max(8, Math.min(event.clientX, window.innerWidth - 228)),
+            y: Math.max(8, Math.min(event.clientY, window.innerHeight - 234)),
+          });
+        }}
         onDragEnter={(event) => {
           if (
             canCreate &&
@@ -1595,6 +1818,16 @@ export default function FileManager({
             <span>Upload to /{path || "server"}</span>
           </div>
         )}
+        {collectingClipboard && (
+          <div
+            className="file-clipboard-notice"
+            role="status"
+            aria-label="Reading copied files"
+          >
+            <LoaderCircle size={16} className="spin" /> Reading copied files and
+            folders…
+          </div>
+        )}
         <div className="files-toolbar">
           <nav className="file-breadcrumb" aria-label="File path">
             <HardDrive size={16} />
@@ -1620,7 +1853,7 @@ export default function FileManager({
           <div className="storage-actions">
             <button
               className="btn small"
-              onClick={copySelection}
+              onClick={() => copySelection()}
               disabled={
                 !selectedEntries.length ||
                 !canContent ||
@@ -1634,11 +1867,28 @@ export default function FileManager({
             </button>
             <button
               className="btn small"
-              onClick={pasteSelection}
+              onClick={() => copySelection("move")}
+              disabled={
+                !selectedEntries.length ||
+                !canContent ||
+                !canDelete ||
+                loading ||
+                saving ||
+                !!error ||
+                transferring ||
+                movePending
+              }
+              title="Cut selected files and folders (Ctrl+X)"
+            >
+              <Scissors size={15} /> Cut
+            </button>
+            <button
+              className="btn small"
+              onClick={() => void pasteClipboard()}
               disabled={
                 !canCreate ||
-                !clipboard ||
-                clipboard.origin !== panelOrigin ||
+                (!window.mcPanelClipboard &&
+                  (!clipboard || clipboard.origin !== panelOrigin)) ||
                 transferring ||
                 movePending ||
                 loading
@@ -1877,6 +2127,14 @@ export default function FileManager({
                 {visible.map((entry) => (
                   <tr
                     key={entry.path}
+                    onContextMenu={() => {
+                      if (
+                        !selected.has(entry.path) &&
+                        !saving &&
+                        (canContent || canDelete)
+                      )
+                        setSelected(new Set([entry.path]));
+                    }}
                     ref={
                       pendingReveal.current?.scope === listScope &&
                       pendingReveal.current.path === entry.path
@@ -2046,6 +2304,136 @@ export default function FileManager({
           {canCreate && <span>Drag and drop files here to upload</span>}
         </div>
       </section>
+      {contextMenu &&
+        createPortal(
+          <div
+            ref={contextMenuRef}
+            className="file-context-menu"
+            role="menu"
+            aria-label="File actions"
+            style={{ left: contextMenu.x, top: contextMenu.y }}
+            onContextMenu={(event) => event.preventDefault()}
+            onKeyDown={(event) => {
+              if (event.key === "Escape" || event.key === "Tab") {
+                if (event.key === "Escape") event.preventDefault();
+                contextMenuTrigger.current?.focus({ preventScroll: true });
+                setContextMenu(null);
+                event.stopPropagation();
+                return;
+              }
+              const buttons = Array.from(
+                event.currentTarget.querySelectorAll<HTMLButtonElement>(
+                  "button:not(:disabled)",
+                ),
+              );
+              const index = buttons.indexOf(
+                document.activeElement as HTMLButtonElement,
+              );
+              const next =
+                event.key === "ArrowDown"
+                  ? (index + 1) % buttons.length
+                  : event.key === "ArrowUp"
+                    ? (index - 1 + buttons.length) % buttons.length
+                    : event.key === "Home"
+                      ? 0
+                      : event.key === "End"
+                        ? buttons.length - 1
+                        : -1;
+              if (next >= 0) {
+                event.preventDefault();
+                buttons[next]?.focus();
+              }
+            }}
+          >
+            <button
+              role="menuitem"
+              disabled={
+                !selectedEntries.length ||
+                !canContent ||
+                !canDelete ||
+                loading ||
+                saving ||
+                !!error ||
+                transferring ||
+                movePending
+              }
+              onClick={() => {
+                setContextMenu(null);
+                copySelection("move");
+              }}
+            >
+              <Scissors size={15} /> Cut <kbd>Ctrl+X</kbd>
+            </button>
+            <button
+              role="menuitem"
+              disabled={
+                !selectedEntries.length ||
+                !canContent ||
+                loading ||
+                saving ||
+                !!error
+              }
+              onClick={() => {
+                setContextMenu(null);
+                copySelection();
+              }}
+            >
+              <Copy size={15} /> Copy <kbd>Ctrl+C</kbd>
+            </button>
+            <button
+              role="menuitem"
+              disabled={
+                !canCreate ||
+                transferring ||
+                movePending ||
+                loading ||
+                (!window.mcPanelClipboard &&
+                  (!clipboard || clipboard.origin !== panelOrigin))
+              }
+              onClick={() => {
+                setContextMenu(null);
+                void pasteClipboard();
+              }}
+            >
+              <ClipboardPaste size={15} /> Paste <kbd>Ctrl+V</kbd>
+            </button>
+            <button
+              role="menuitem"
+              disabled={
+                !entries.length ||
+                loading ||
+                saving ||
+                !!error ||
+                (!canContent && !canDelete)
+              }
+              onClick={() => {
+                setContextMenu(null);
+                selectAllFiles();
+              }}
+            >
+              <FileIcon size={15} /> Select all <kbd>Ctrl+A</kbd>
+            </button>
+            <button
+              role="menuitem"
+              disabled={
+                !selectedEntries.length ||
+                !canDelete ||
+                movePending ||
+                checkingMove ||
+                loading ||
+                saving ||
+                !!error
+              }
+              onClick={() => {
+                setContextMenu(null);
+                openDeleteSelected();
+              }}
+            >
+              <Trash2 size={15} /> Delete <kbd>Del</kbd>
+            </button>
+          </div>,
+          document.body,
+        )}
       <div className="storage-hint">
         <HardDrive size={16} />
         <p>
@@ -2069,6 +2457,18 @@ export default function FileManager({
             ) {
               event.preventDefault();
               event.stopPropagation();
+            } else if (
+              (event.ctrlKey || event.metaKey) &&
+              !event.altKey &&
+              !event.shiftKey &&
+              event.key.toLowerCase() === "s" &&
+              (dialog.type === "edit" ||
+                (dialog.type === "create" && dialog.kind === "file"))
+            ) {
+              event.preventDefault();
+              event.stopPropagation();
+              if (canSubmitDialog && !saving && !reading && !readFailed)
+                event.currentTarget.querySelector("form")?.requestSubmit();
             } else if (
               event.key === "Escape" &&
               textEditor.current?.closeFind()

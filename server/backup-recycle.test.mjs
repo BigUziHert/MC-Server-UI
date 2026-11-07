@@ -125,6 +125,113 @@ test("deleted backups recover their archive bytes and original metadata after re
   await missing(path.join(panel.serverDir, "backups"));
 });
 
+test("missing archives can be explicitly removed from history without changing remaining files", async (t) => {
+  const { dataDir, boot } = await fixture(t);
+  const panel = await boot();
+  const backup = (
+    await panel.request(
+      "/api/backups",
+      json("POST", { name: "Deleted outside panel" }),
+    )
+  ).body;
+  const kept = (
+    await panel.request(
+      "/api/backups",
+      json("POST", { name: "Keep this archive" }),
+    )
+  ).body;
+  const keptFile = path.join(dataDir, "backups", `${kept.id}.tar.gz`);
+  const bytes = await fs.readFile(keptFile);
+  const route = `/api/backups/${backup.id}`;
+  assert.equal(
+    (
+      await panel.request(
+        route,
+        json("DELETE", { removeMissingRecord: true, confirm: true }),
+      )
+    ).status,
+    409,
+  );
+  await fs.unlink(path.join(dataDir, "backups", `${backup.id}.tar.gz`));
+  assert.deepEqual(
+    (await panel.request("/api/backups")).body.missingBackupIds,
+    [backup.id],
+  );
+  assert.equal(
+    (await panel.request(route, json("DELETE", { removeMissingRecord: true })))
+      .status,
+    400,
+  );
+  assert.notEqual((await panel.request(route, json("DELETE"))).status, 200);
+  assert.equal((await panel.request("/api/backups")).body.backups.length, 2);
+  assert.deepEqual(
+    (
+      await panel.request(
+        route,
+        json("DELETE", { removeMissingRecord: true, confirm: true }),
+      )
+    ).body,
+    { ok: true, removedRecord: true },
+  );
+  assert.deepEqual(await fs.readFile(keptFile), bytes);
+  await panel.close();
+  const restarted = await boot();
+  assert.deepEqual((await restarted.request("/api/backups")).body.backups, [
+    kept,
+  ]);
+  assert.deepEqual(
+    (await restarted.request("/api/files/recycle-bin")).body.items,
+    [],
+  );
+  assert.ok(
+    (await restarted.request("/api/audit")).body.entries.some(
+      (entry) => entry.action === "Missing backup record removed",
+    ),
+  );
+});
+
+test("an unavailable backup folder preserves records until explicit removal and never deletes offline archives", async (t) => {
+  const { dataDir, boot } = await fixture(t);
+  const panel = await boot();
+  const backup = (
+    await panel.request(
+      "/api/backups",
+      json("POST", { name: "Disconnected folder" }),
+    )
+  ).body;
+  const directory = path.join(dataDir, "backups");
+  const offline = path.join(dataDir, "offline-backups");
+  const bytes = await fs.readFile(path.join(directory, `${backup.id}.tar.gz`));
+  await fs.rename(directory, offline);
+  const route = `/api/backups/${backup.id}`;
+  assert.equal((await panel.request(route, json("DELETE"))).status, 409);
+  const listed = (await panel.request("/api/backups")).body;
+  assert.deepEqual(listed.backups, [backup]);
+  assert.deepEqual(listed.missingBackupIds, [backup.id]);
+  assert.equal(
+    (
+      await panel.request(
+        route,
+        json("DELETE", { removeMissingRecord: true, confirm: true }),
+      )
+    ).status,
+    200,
+  );
+  await missing(directory);
+  assert.deepEqual(
+    await fs.readFile(path.join(offline, `${backup.id}.tar.gz`)),
+    bytes,
+  );
+  await panel.close();
+  await fs.rename(offline, directory);
+  const restarted = await boot();
+  assert.deepEqual((await restarted.request("/api/backups")).body.backups, []);
+  assert.deepEqual(
+    await fs.readFile(path.join(directory, `${backup.id}.tar.gz`)),
+    bytes,
+  );
+});
+
 test("retention recycles obsolete scheduled archives while preserving the active limit and manual backups", async (t) => {
   const { boot } = await fixture(t);
   const panel = await boot();

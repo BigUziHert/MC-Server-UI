@@ -24,7 +24,6 @@ import {
   Puzzle,
   RefreshCw,
   SlidersHorizontal,
-  ExternalLink,
   Trash2,
   X,
 } from "lucide-react";
@@ -2972,19 +2971,21 @@ export default function Launchpad({
                     <ProjectIcon url={project.iconUrl} />
                     <div className="launchpad-project-body">
                       <div className="launchpad-project-title">
-                        <h3>{project.title}</h3>
-                        {project.url && /^https:\/\//i.test(project.url) && (
-                          <a
-                            className="launchpad-project-link"
-                            href={project.url}
-                            target="_blank"
-                            rel="noopener noreferrer"
-                            aria-label={`Open ${project.title} project page`}
-                            title="Open project page"
-                          >
-                            <ExternalLink size={14} />
-                          </a>
-                        )}
+                        <h3>
+                          {project.url && /^https:\/\//i.test(project.url) ? (
+                            <a
+                              className="launchpad-project-link"
+                              href={project.url}
+                              target="_blank"
+                              rel="noopener noreferrer"
+                              aria-label={`Open ${project.title} project page`}
+                            >
+                              {project.title}
+                            </a>
+                          ) : (
+                            project.title
+                          )}
+                        </h3>
                         {entry && (
                           <span className="launchpad-badge">
                             {entry.platform && entry.projectId
@@ -3222,18 +3223,21 @@ export default function Launchpad({
             </span>
           </div>
           <p className="management-dialog-description">
-            {selection?.project.title}
-          </p>
-          {selection?.project.url &&
-            /^https:\/\//i.test(selection.project.url) && (
+            {selection?.project.url &&
+            /^https:\/\//i.test(selection.project.url) ? (
               <a
+                className="launchpad-project-link"
                 href={selection.project.url}
                 target="_blank"
                 rel="noopener noreferrer"
+                aria-label={`Open ${selection.project.title} project page`}
               >
-                Open project page <ExternalLink size={14} />
+                {selection.project.title}
               </a>
+            ) : (
+              selection?.project.title
             )}
+          </p>
           {!plan && selection?.bulk ? (
             <p role="status">
               {busy

@@ -58,6 +58,7 @@ type Schedule = {
 };
 type BackupResult = {
   backups: Backup[];
+  missingBackupIds?: string[];
   schedule: Schedule;
   timezone?: string;
   job?: BackupJob | null;
@@ -229,7 +230,11 @@ function BackupProgress({
     </section>
   );
 }
-type DeleteDialog = { backups: Backup[]; bulk: boolean };
+type DeleteDialog = {
+  backups: Backup[];
+  bulk: boolean;
+  removeMissing?: boolean;
+};
 type RestoreDialog = { restore: Backup };
 const defaults: Schedule = {
   enabled: false,
@@ -291,6 +296,9 @@ export default function Backups({
       setLocationState({ moving: false, available: true });
   }, [canRead, canChangeLocation]);
   const [backups, setBackups] = useState<Backup[]>([]);
+  const [missingBackupIds, setMissingBackupIds] = useState<Set<string>>(
+    new Set(),
+  );
   const [schedule, setSchedule] = useState<Schedule>(defaults);
   const [savedSchedule, setSavedSchedule] = useState<Schedule>(defaults);
   const scheduleDraft = useRef(schedule);
@@ -399,6 +407,7 @@ export default function Backups({
         if (token !== generation.current || sequence !== loadSequence.current)
           return false;
         setBackups(result.backups);
+        setMissingBackupIds(new Set(result.missingBackupIds ?? []));
         if (revision === jobRevision.current && !startingRef.current)
           acceptJob(result.job || null);
         const available = new Set(result.backups.map((backup) => backup.id));
@@ -436,6 +445,7 @@ export default function Backups({
   useEffect(() => {
     generation.current++;
     setBackups([]);
+    setMissingBackupIds(new Set());
     setSelected(new Set());
     setDialog(null);
     setDialogError("");
@@ -653,7 +663,13 @@ export default function Backups({
     if (
       !dialog ||
       busyRef.current ||
-      storageBlocked ||
+      (storageBlocked &&
+        !(
+          typeof dialog === "object" &&
+          "backups" in dialog &&
+          dialog.removeMissing &&
+          !locationState.moving
+        )) ||
       (dialog === "create"
         ? !canCreate
         : "restore" in dialog
@@ -740,6 +756,14 @@ export default function Backups({
           try {
             await api(`/backups/${encodeURIComponent(backup.id)}`, {
               method: "DELETE",
+              ...(dialog.removeMissing
+                ? {
+                    body: JSON.stringify({
+                      removeMissingRecord: true,
+                      confirm: true,
+                    }),
+                  }
+                : {}),
             });
             deleted.add(backup.id);
           } catch (failure) {
@@ -761,16 +785,20 @@ export default function Backups({
         if (failed.length) {
           setDialog({ ...dialog, backups: failed });
           setDialogError(
-            `${deleted.size} ${deleted.size === 1 ? "backup" : "backups"} moved to Recycle Bin. ${failed.length} ${failed.length === 1 ? "backup could" : "backups could"} not be moved${dialog.bulk ? (failed.length === 1 ? " and remains selected" : " and remain selected") : ""}.`,
+            dialog.removeMissing
+              ? `${deleted.size} missing backup records removed. ${failed.length} records could not be removed.`
+              : `${deleted.size} ${deleted.size === 1 ? "backup" : "backups"} moved to Recycle Bin. ${failed.length} ${failed.length === 1 ? "backup could" : "backups could"} not be moved${dialog.bulk ? (failed.length === 1 ? " and remains selected" : " and remain selected") : ""}.`,
           );
           setDeleteErrors(failures);
           await load();
           return;
         }
         notify(
-          deleted.size === 1
-            ? "Backup moved to Recycle Bin."
-            : `${deleted.size} backups moved to Recycle Bin.`,
+          dialog.removeMissing
+            ? `${deleted.size} missing backup ${deleted.size === 1 ? "record" : "records"} removed.`
+            : deleted.size === 1
+              ? "Backup moved to Recycle Bin."
+              : `${deleted.size} backups moved to Recycle Bin.`,
         );
       }
       await load();
@@ -785,12 +813,22 @@ export default function Backups({
     }
   }
 
-  function confirmDelete(targets: Backup[], bulk = false) {
-    if (!canDelete || storageBlocked) return;
+  function confirmDelete(
+    targets: Backup[],
+    bulk = false,
+    removeMissing = false,
+  ) {
+    if (
+      !canDelete ||
+      busyRef.current ||
+      locationState.moving ||
+      (!removeMissing && storageBlocked)
+    )
+      return;
     dialogVersion.current++;
     setDialogError("");
     setDeleteErrors([]);
-    setDialog({ backups: targets, bulk });
+    setDialog({ backups: targets, bulk, removeMissing });
   }
 
   async function confirmRestore(backup: Backup) {
@@ -816,6 +854,9 @@ export default function Backups({
   }
 
   const selectedBackups = backups.filter((backup) => selected.has(backup.id));
+  const selectedMissingBackups = selectedBackups.filter((backup) =>
+    missingBackupIds.has(backup.id),
+  );
   const allSelected =
     backups.length > 0 && selectedBackups.length === backups.length;
   const someSelected = selectedBackups.length > 0 && !allSelected;
@@ -964,7 +1005,7 @@ export default function Backups({
                       ref={(element) => {
                         if (element) element.indeterminate = someSelected;
                       }}
-                      disabled={!canDelete || busy || storageBlocked}
+                      disabled={!canDelete || busy || locationState.moving}
                       onChange={(event) =>
                         setSelected(
                           event.target.checked
@@ -984,6 +1025,7 @@ export default function Backups({
                       !canDelete ||
                       busy ||
                       storageBlocked ||
+                      selectedMissingBackups.length > 0 ||
                       selectedBackups.length === 0
                     }
                     onClick={() => confirmDelete(selectedBackups, true)}
@@ -991,6 +1033,17 @@ export default function Backups({
                     <Trash2 size={14} />
                     Delete selected
                   </button>
+                  {selectedMissingBackups.length > 0 && (
+                    <button
+                      className="btn small danger"
+                      disabled={!canDelete || busy || locationState.moving}
+                      onClick={() =>
+                        confirmDelete(selectedMissingBackups, true, true)
+                      }
+                    >
+                      Remove missing records
+                    </button>
+                  )}
                 </div>
               )}
               {!backups.length ? (
@@ -1028,7 +1081,7 @@ export default function Backups({
                           className="backup-checkbox"
                           aria-label={`Select backup ${backup.name}`}
                           checked={selected.has(backup.id)}
-                          disabled={!canDelete || busy || storageBlocked}
+                          disabled={!canDelete || busy || locationState.moving}
                           onChange={(event) => {
                             const checked = event.target.checked;
                             setSelected((current) => {
@@ -1076,6 +1129,11 @@ export default function Backups({
                               )}
                           </p>
                           <div className="backup-tags">
+                            {missingBackupIds.has(backup.id) && (
+                              <span className="backup-trigger">
+                                Archive unavailable
+                              </span>
+                            )}
                             <span className="backup-complete">
                               <Check size={11} />
                               Completed
@@ -1100,7 +1158,11 @@ export default function Backups({
                               aria-label={`Restore backup ${backup.name}`}
                               title="Restore server to this backup"
                               disabled={
-                                busy || starting || activeJob || storageBlocked
+                                busy ||
+                                starting ||
+                                activeJob ||
+                                storageBlocked ||
+                                missingBackupIds.has(backup.id)
                               }
                               onClick={() => void confirmRestore(backup)}
                             >
@@ -1110,7 +1172,10 @@ export default function Backups({
                           {canDownload && (
                             <DownloadButton
                               className="btn icon"
-                              disabled={storageBlocked}
+                              disabled={
+                                storageBlocked ||
+                                missingBackupIds.has(backup.id)
+                              }
                               onError={(message) => notify(message, true)}
                               href={downloadUrl(
                                 `/backups/${encodeURIComponent(backup.id)}/download`,
@@ -1123,10 +1188,26 @@ export default function Backups({
                           )}
                           <button
                             className="btn icon delete-action"
-                            aria-label={`Delete backup ${backup.name}`}
-                            title="Move backup to Recycle Bin"
-                            disabled={!canDelete || busy || storageBlocked}
-                            onClick={() => confirmDelete([backup])}
+                            aria-label={`${missingBackupIds.has(backup.id) ? "Remove missing backup record" : "Delete backup"} ${backup.name}`}
+                            title={
+                              missingBackupIds.has(backup.id)
+                                ? "Remove missing backup record"
+                                : "Move backup to Recycle Bin"
+                            }
+                            disabled={
+                              !canDelete ||
+                              busy ||
+                              locationState.moving ||
+                              (storageBlocked &&
+                                !missingBackupIds.has(backup.id))
+                            }
+                            onClick={() =>
+                              confirmDelete(
+                                [backup],
+                                false,
+                                missingBackupIds.has(backup.id),
+                              )
+                            }
                           >
                             <Trash2 size={15} />
                           </button>
@@ -1429,16 +1510,20 @@ export default function Backups({
                     ? "Create a backup"
                     : "restore" in dialog
                       ? "Restore this backup?"
-                      : dialog.bulk
-                        ? "Move selected backups to Recycle Bin?"
-                        : "Move this backup to Recycle Bin?"}
+                      : dialog.removeMissing
+                        ? "Remove missing backup records?"
+                        : dialog.bulk
+                          ? "Move selected backups to Recycle Bin?"
+                          : "Move this backup to Recycle Bin?"}
                 </h2>
                 <p id="backup-dialog-description">
                   {dialog === "create"
                     ? "Save a compressed .tar.gz archive of your current server files."
                     : "restore" in dialog
                       ? "Replace your server files with this saved backup point."
-                      : "You can restore these archives from File Manager → Recycle Bin. They use disk space until permanently deleted."}
+                      : dialog.removeMissing
+                        ? "These archives cannot be found. If their drive is disconnected, reconnect it instead. Removing records does not delete files or recover deleted archives."
+                        : "You can restore these archives from File Manager → Recycle Bin. They use disk space until permanently deleted."}
                 </p>
               </div>
               <button
@@ -1518,7 +1603,18 @@ export default function Backups({
             ) : (
               <>
                 <p className="delete-description">
-                  {dialog.bulk ? (
+                  {dialog.removeMissing ? (
+                    <>
+                      Remove{" "}
+                      {dialog.backups.length === 1 ? (
+                        <strong>{dialog.backups[0].name}</strong>
+                      ) : (
+                        <strong>{dialog.backups.length} missing backups</strong>
+                      )}{" "}
+                      from backup history? These records will no longer appear
+                      here, even if their drive is reconnected.
+                    </>
+                  ) : dialog.bulk ? (
                     <>
                       Move{" "}
                       <strong>
@@ -1538,7 +1634,11 @@ export default function Backups({
                 {dialog.bulk && (
                   <ul
                     className="backup-delete-targets"
-                    aria-label="Backups to recycle"
+                    aria-label={
+                      dialog.removeMissing
+                        ? "Backup records to remove"
+                        : "Backups to recycle"
+                    }
                   >
                     {dialog.backups.map((backup) => (
                       <li key={backup.id}>
@@ -1578,7 +1678,13 @@ export default function Backups({
                 className={`btn ${dialog === "create" ? "primary" : "danger"}`}
                 disabled={
                   busy ||
-                  storageBlocked ||
+                  (storageBlocked &&
+                    !(
+                      typeof dialog === "object" &&
+                      "backups" in dialog &&
+                      dialog.removeMissing &&
+                      !locationState.moving
+                    )) ||
                   (dialog === "create"
                     ? !canCreate ||
                       starting ||
@@ -1602,11 +1708,15 @@ export default function Backups({
                     ? busy
                       ? "Restoring backup…"
                       : "Restore backup"
-                    : busy
-                      ? "Moving backups…"
-                      : deleteErrors.length > 0
-                        ? "Retry failed moves"
-                        : "Move to Recycle Bin"}
+                    : dialog.removeMissing
+                      ? busy
+                        ? "Removing records…"
+                        : "Remove records"
+                      : busy
+                        ? "Moving backups…"
+                        : deleteErrors.length > 0
+                          ? "Retry failed moves"
+                          : "Move to Recycle Bin"}
               </button>
             </div>
           </form>

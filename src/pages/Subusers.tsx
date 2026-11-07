@@ -29,7 +29,7 @@ import SearchField, { useDebouncedValue } from "../SearchField";
 import RefreshButton from "../RefreshButton";
 import StatePanel from "../StatePanel";
 import { copyText } from "../clipboard";
-import Pagination from "../Pagination";
+import Pagination, { usePageSize } from "../Pagination";
 import catalog from "../../shared/subuser-permissions.json";
 import "./subusers.css";
 
@@ -820,7 +820,7 @@ function AccessManagement({
   const [search, setSearch] = useState("");
   const debouncedSearch = useDebouncedValue(search);
   const [page, setPage] = useState(1);
-  const [pageSize, setPageSize] = useState(25);
+  const [pageSize, setPageSize] = usePageSize("subusers");
   const loaded = useRef(false);
   const [editor, setEditor] = useState<"invite" | "grant" | Subuser | null>(
     null,

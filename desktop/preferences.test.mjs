@@ -26,6 +26,9 @@ test("desktop preferences whitelist display fields and reject credentials, arbit
   for (const [key, value] of [
     [navigation, '{"server":true,"minecraft":false}'],
     [rows, "25"],
+    ["mc-panel.files.rows", "100"],
+    ["mc-panel.audit.rows", "50"],
+    ["mc-panel.subusers.rows", "10"],
     ["mc-panel.players.rows.history", "100"],
     [
       view,
@@ -38,6 +41,8 @@ test("desktop preferences whitelist display fields and reject credentials, arbit
     ["mc-panel-desktop", "token"],
     ["mc-panel.active-server", "server"],
     [rows, "10000"],
+    ["mc-panel.files.rows", "0"],
+    ["mc-panel.arbitrary.rows", "25"],
     [navigation, '{"server":"true"}'],
     [navigation, '{"token":"secret"}'],
     [view, '{"password":"secret"}'],

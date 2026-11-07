@@ -4,6 +4,44 @@
   gap: 13px;
   min-width: 0;
 }
+.file-context-menu {
+  position: fixed;
+  z-index: 1000;
+  display: grid;
+  width: 220px;
+  padding: 6px;
+  border: 1px solid var(--border, #373948);
+  border-radius: 8px;
+  background: var(--panel, #20212b);
+  box-shadow: 0 8px 32px #0006;
+}
+.file-context-menu button {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-height: 38px;
+  padding: 8px;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--text, #dfe2f1);
+  text-align: left;
+  cursor: pointer;
+}
+.file-context-menu button:enabled:is(:hover, :focus-visible) {
+  background: var(--border, #373948);
+  outline: none;
+}
+.file-context-menu button:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+.file-context-menu kbd {
+  margin-left: auto;
+  color: var(--muted, #969bb3);
+  font: inherit;
+  font-size: 11px;
+}
 .file-selection-name .file-name {
   flex: 1;
   min-width: 0;

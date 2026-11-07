@@ -7,6 +7,7 @@ export type FileClipboard = {
   sourceServerId: string;
   sourceName: string;
   paths: string[];
+  mode?: "copy" | "move";
 };
 
 let clipboard: FileClipboard | null = null;
@@ -27,6 +28,10 @@ export function clearFileClipboard(sessionScope?: string) {
   if (sessionScope && clipboard?.sessionScope !== sessionScope) return;
   clipboard = null;
   listeners.forEach((listener) => listener());
+}
+
+export function consumeFileClipboard(value: FileClipboard) {
+  if (clipboard === value) clearFileClipboard(value.sessionScope);
 }
 
 // This clipboard is intentionally in memory and confined to this panel's origin.

@@ -1319,7 +1319,7 @@ test("installed content tabs retain their own snapshots and ignore late response
   await expect(page.getByText("Stale warning", { exact: true })).toHaveCount(0);
 });
 
-test("installed project buttons resolve older panel responses without metadata URLs", async ({
+test("project names link to project pages in the list and installation dialog", async ({
   page,
 }) => {
   await catalog(page);
@@ -1343,6 +1343,9 @@ test("installed project buttons resolve older panel responses without metadata U
     page.getByRole("link", { name: "Open Alpha project page" }),
   ).toHaveAttribute("href", "https://modrinth.com/project/Alpha");
   await expect(
+    page.getByRole("link", { name: "Open Alpha project page" }),
+  ).toHaveText("Alpha");
+  await expect(
     page.getByRole("link", { name: "Open JEI project page" }),
   ).toHaveAttribute("href", "https://www.curseforge.com/projects/238222");
   await expect(
@@ -1353,8 +1356,18 @@ test("installed project buttons resolve older panel responses without metadata U
     .getByRole("button", { name: "Update Alpha", exact: true })
     .click();
   await expect(
-    page.getByRole("dialog").getByRole("link", { name: "Open project page" }),
+    page
+      .getByRole("dialog")
+      .getByRole("link", { name: "Open Alpha project page" }),
   ).toHaveAttribute("href", "https://modrinth.com/project/Alpha");
+  await expect(
+    page
+      .getByRole("dialog")
+      .getByRole("link", { name: "Open Alpha project page" }),
+  ).toHaveText("Alpha");
+  await expect(
+    page.getByText("Open project page", { exact: true }),
+  ).toHaveCount(0);
 });
 
 test("installed project links and update-all review span platforms and retry the accepted download", async ({
