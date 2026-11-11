@@ -2288,10 +2288,11 @@ function ConsolePage({
                   Console connection unavailable. Retrying…
                 </div>
               ) : visibleLines.length ? (
-                visibleLines.map((line, index) => (
+                visibleLines.map((line) => (
                   <div
                     className={`log-line log-${line.level}`}
-                    key={`${line.id}-${index}`}
+                    // Keep retained rows mounted so scroll anchoring survives log rotation.
+                    key={line.id}
                   >
                     <time>
                       {/^\d{2}:\d{2}/.test(line.time)

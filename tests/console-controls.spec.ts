@@ -104,6 +104,99 @@ for (const mode of ["command", "message"] as const) {
   });
 }
 
+for (const width of [1348, 390]) {
+  test(`paused console preserves the visible text through log bursts and history rollover at ${width}px`, async ({
+    page,
+    serverId,
+  }) => {
+    await page.setViewportSize({ width, height: 1000 });
+    const line = (id: number) => ({
+      id,
+      level: "info",
+      time: "12:00:00",
+      message: `Log ${id}: ${"Loading world chunks and checking pending server tasks. ".repeat(id % 5 === 0 ? 8 : id % 3 === 0 ? 3 : 1)}`,
+    });
+    let lines = Array.from({ length: 1000 }, (_, index) => line(index + 1));
+    const append = (count: number) => {
+      const latest = lines.at(-1)!.id;
+      // Match the server's rolling 1,500-line console history.
+      lines = [
+        ...lines,
+        ...Array.from({ length: count }, (_, index) =>
+          line(latest + index + 1),
+        ),
+      ].slice(-1500);
+    };
+    await page.route(/\/api\/console(?:\?|$)/, (route) =>
+      route.fulfill({ json: { lines } }),
+    );
+    await page.addInitScript(
+      (id) => localStorage.setItem("mc-panel.active-server", id),
+      serverId,
+    );
+    await page.goto("/#console");
+    const output = page.getByRole("log");
+    const rows = output.locator(".log-line");
+    await expect(rows).toHaveCount(1000);
+    await page.evaluate(() => document.fonts.ready);
+    const autoscroll = page.getByRole("button", {
+      name: "Autoscroll",
+      exact: true,
+    });
+    const bottomGap = () =>
+      output.evaluate(
+        (element) =>
+          element.scrollHeight - element.clientHeight - element.scrollTop,
+      );
+    await expect.poll(bottomGap).toBeLessThanOrEqual(1);
+    await autoscroll.click();
+    await expect(autoscroll).toHaveAttribute("aria-pressed", "false");
+
+    const lastOriginal = rows.filter({ hasText: /^12:00:00INFOLog 1000:/ });
+    const relativeTop = (row: typeof lastOriginal) =>
+      row.evaluate(
+        (element) =>
+          element.getBoundingClientRect().top -
+          element.closest(".console-output")!.getBoundingClientRect().top,
+      );
+    const originalTop = await relativeTop(lastOriginal);
+    append(200);
+    await expect(rows.last()).toContainText("Log 1200:");
+    expect(
+      Math.abs((await relativeTop(lastOriginal)) - originalTop),
+    ).toBeLessThanOrEqual(1);
+
+    const reading = rows.filter({ hasText: /^12:00:00INFOLog 700:/ });
+    await reading.evaluate((element) => {
+      const container = element.closest(".console-output")!;
+      // Preserve a position partway through a wrapped row, not just its index.
+      container.scrollTop +=
+        element.getBoundingClientRect().top -
+        container.getBoundingClientRect().top +
+        7;
+    });
+    const readingTop = await relativeTop(reading);
+    expect(readingTop).toBeLessThan(0);
+    expect(readingTop).toBeGreaterThan(-10);
+    for (const burst of [600, 300]) {
+      append(burst);
+      await expect(rows.last()).toContainText(`Log ${lines.at(-1)!.id}:`);
+      await expect(rows).toHaveCount(1500);
+      expect(
+        Math.abs((await relativeTop(reading)) - readingTop),
+      ).toBeLessThanOrEqual(1);
+      await expect(autoscroll).toHaveAttribute("aria-pressed", "false");
+    }
+
+    await autoscroll.click();
+    await expect(autoscroll).toHaveAttribute("aria-pressed", "true");
+    await expect.poll(bottomGap).toBeLessThanOrEqual(1);
+    append(200);
+    await expect(rows.last()).toContainText("Log 2300:");
+    await expect.poll(bottomGap).toBeLessThanOrEqual(1);
+  });
+}
+
 test("cleared console lines stay hidden when the marker is absent and recover after a new log sequence", async ({
   page,
   serverId,
