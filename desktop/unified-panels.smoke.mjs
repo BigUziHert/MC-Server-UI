@@ -549,7 +549,13 @@ async function smoke() {
       const response = await fetch("/api/servers", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ name: "Local geometry fixture", port: 25567 }),
+        body: JSON.stringify({
+          name: "Local geometry fixture",
+          port: 25567,
+          // Keep connection guidance deterministic and avoid a live public-IP
+          // lookup during the viewport comparison.
+          connectionHost: "geometry.example.test",
+        }),
       });
       if (!response.ok) throw new Error("Geometry fixture creation failed.");
       const id = (await response.json()).server.id;
@@ -576,8 +582,17 @@ async function smoke() {
       await expect(
         page.getByRole("log", { name: "Server console output" }),
       ).toBeVisible();
+      // The heading and empty console render before /server returns. Its
+      // address guidance and resource details change the surrounding height.
+      await expect(page.locator(".server-banner .status-badge")).toHaveText(
+        panelId === "local" ? "offline" : "running",
+        { timeout: 15000 },
+      );
       const geometry = await page.evaluate(async () => {
         await document.fonts.ready;
+        await new Promise((resolve) =>
+          requestAnimationFrame(() => requestAnimationFrame(resolve)),
+        );
         const shell = document.querySelector(".main-shell");
         const content = document.querySelector(".main-content");
         const sidebar = document.querySelector(".sidebar");
@@ -676,9 +691,26 @@ async function smoke() {
       }, zoom);
       let shorterGeometry;
       for (const height of [1080, 1392]) {
-        // The test-only override exercises large viewports even on small CI
-        // displays. Production never sets the selected native zoom factor.
-        await page.setViewportSize({ width: 2560, height });
+        // Electron applies native zoom to these window dimensions. Keep the
+        // intended CSS viewport genuinely tall at both zoom levels, and wait
+        // for the resize/zoom to settle before comparing available height.
+        // Production never sets the selected native zoom factor.
+        await page.setViewportSize({
+          width: Math.round(2560 * zoom),
+          height: Math.round(height * zoom),
+        });
+        await expect
+          .poll(() =>
+            page.evaluate(
+              (expectedHeight) =>
+                Math.max(
+                  Math.abs(innerWidth - 2560),
+                  Math.abs(innerHeight - expectedHeight),
+                ),
+              height,
+            ),
+          )
+          .toBeLessThanOrEqual(1);
         const localGeometry = await measureWorkspace(
           "local",
           localServerId,
@@ -717,7 +749,7 @@ async function smoke() {
                 shorterGeometry.consoleHeight -
                 (localGeometry.viewportHeight - shorterGeometry.documentHeight),
             ) < 1,
-            "The console uses the extra height when the same-width window grows",
+            `The console uses the extra height when the same-width window grows: ${JSON.stringify({ zoom, shorter: shorterGeometry, taller: localGeometry })}`,
           );
         }
         shorterGeometry = localGeometry;
