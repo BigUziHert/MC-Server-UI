@@ -68,6 +68,8 @@ export function installUnifiedConnectionIpc(ipcMain, controller) {
     "acceptInvitation",
     "signOut",
     "retry",
+    "renameConnection",
+    "changePassword",
     "forget",
     "removeSavedConnection",
     "selectServer",

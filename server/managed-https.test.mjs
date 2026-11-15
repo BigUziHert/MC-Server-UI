@@ -120,8 +120,16 @@ test("managed Caddy uses explicit public ACME IP profiles and only TCP HTTPS to 
       server.routes[0].handle[0].upstreams[0].dial,
       "127.0.0.1:3002",
     );
+    assert.deepEqual(
+      server.routes[0].handle[0].headers.request.set["X-MC-Client-IP"],
+      ["{http.request.remote.host}"],
+    );
     assert.equal(
-      server.routes[0].handle[0].headers.request,
+      server.routes[0].handle[0].headers.request.set["X-MC-Proxy"][0].length,
+      36,
+    );
+    assert.equal(
+      server.routes[0].handle[0].headers.request.set.Host,
       undefined,
       "Original public Host is preserved.",
     );

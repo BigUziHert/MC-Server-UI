@@ -173,6 +173,7 @@ export function createWindowsProcessTree(
     timeoutMs = 5000,
     spawnProcess = spawn,
     now = Date.now,
+    expectedBirth,
     readSnapshot = async () => {
       const result = await runPowerShell(snapshotScript, {
         spawnProcess,
@@ -220,6 +221,7 @@ export function createWindowsProcessTree(
       !rootCaptured &&
       rootWasAlive &&
       root &&
+      (expectedBirth === undefined || root.birth === BigInt(expectedBirth)) &&
       root.birth >= rootFloor &&
       root.birth < rootCeiling
     ) {
@@ -347,4 +349,34 @@ export function createWindowsProcessTree(
       child.removeListener?.("exit", onExit);
     },
   };
+}
+
+export async function windowsProcessIdentity(
+  pid,
+  { spawnProcess = spawn, timeoutMs = 15000 } = {},
+) {
+  if (!Number.isSafeInteger(pid) || pid <= 4) return null;
+  // Reading one cached process handle avoids enumerating every Windows process
+  // on every server start. Its creation timestamp also guards against PID reuse.
+  const script = `
+$ErrorActionPreference = 'Stop'
+[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+$process = $null
+try {
+  try { $process = [System.Diagnostics.Process]::GetProcessById(${pid}) }
+  catch [System.ArgumentException] { 'null'; exit 0 }
+  $null = $process.Handle
+  if ($process.HasExited) { 'null'; exit 0 }
+  @{ pid = ${pid}; birth = [Math]::Floor([decimal]$process.StartTime.ToUniversalTime().Ticks / 10).ToString('0') } | ConvertTo-Json -Compress
+} finally { if ($null -ne $process) { $process.Dispose() } }
+`;
+  const result = await runPowerShell(script, { spawnProcess, timeoutMs });
+  if (result === null) return null;
+  if (
+    result?.pid !== pid ||
+    typeof result.birth !== "string" ||
+    !/^[1-9]\d{1,18}$/.test(result.birth)
+  )
+    throw new Error("Windows returned an invalid server process identity.");
+  return result;
 }

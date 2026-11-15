@@ -11,6 +11,9 @@ import { DesktopWorkspaceContext } from "./workspace-target";
 export type PanelSession = {
   role: "subuser";
   accountId?: string;
+  expiresAt?: string;
+  panelId?: string;
+  panelName?: string;
   email: string;
   serverId: string | null;
   userId: string;

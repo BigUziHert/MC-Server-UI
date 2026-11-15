@@ -31,6 +31,7 @@ export function createLauncherStop({
   onInputClosed = () => {},
 }) {
   let requested = false;
+  let panelRequested = false;
   let shutdownStarted = false;
   let paused = false;
   let acknowledged = false;
@@ -49,6 +50,7 @@ export function createLauncherStop({
     child.stdin.end();
   };
   return {
+    get panelRequested() { return panelRequested; },
     get requested() {
       return requested;
     },
@@ -79,6 +81,7 @@ export function createLauncherStop({
       acknowledge();
     },
     requestStop() {
+      panelRequested = true;
       if (requested) {
         acknowledge();
         return;

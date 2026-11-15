@@ -58,6 +58,23 @@ export async function api<T = any>(
       new Error(body.error || `Request failed (${response.status})`),
       {
         status: response.status,
+        ...(typeof body.code === "string" ? { code: body.code } : {}),
+        ...(body.dependency && typeof body.dependency === "object"
+          ? { dependency: body.dependency }
+          : {}),
+        ...(Array.isArray(body.dependencyDecisions)
+          ? { dependencyDecisions: body.dependencyDecisions }
+          : {}),
+        ...(body.detectedRuntime && typeof body.detectedRuntime === "object"
+          ? { detectedRuntime: body.detectedRuntime }
+          : {}),
+        ...(Array.isArray(body.runtimeRequirements)
+          ? { runtimeRequirements: body.runtimeRequirements }
+          : {}),
+        ...(Array.isArray(body.warnings) ? { warnings: body.warnings } : {}),
+        ...(body.requiresAcknowledgement === true
+          ? { requiresAcknowledgement: true }
+          : {}),
         ...(body.setupNotCreated === true ? { setupNotCreated: true } : {}),
         ...(Number.isSafeInteger(body.uploaded) && body.uploaded >= 0
           ? { uploaded: body.uploaded }
@@ -241,6 +258,7 @@ export function relativeTime(value: string) {
   if (seconds < 86400)
     return `${Math.floor(seconds / 3600)} ${Math.floor(seconds / 3600) === 1 ? "hour" : "hours"} ago`;
   return new Date(value).toLocaleDateString(undefined, {
+    year: "numeric",
     month: "short",
     day: "numeric",
   });

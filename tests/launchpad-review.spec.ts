@@ -119,6 +119,367 @@ const acceptedJob = {
   cancellable: true,
 };
 
+test("held updates stay out of bulk changes and retained history requires explicit undo confirmation", async ({
+  page,
+}) => {
+  await catalog(page);
+  let held = false;
+  await page.route("**/api/launchpad/installed?**", (route) =>
+    route.fulfill({
+      json: {
+        items: [
+          {
+            ...installed("library"),
+            updateHeld: held,
+            previousVersionId: "older",
+            previousVersionName: "0.9",
+          },
+        ],
+        warnings: [],
+      },
+    }),
+  );
+  const policyWrites: unknown[] = [];
+  await page.route("**/api/launchpad/update-policy", (route) => {
+    const body = route.request().postDataJSON();
+    policyWrites.push(body);
+    held = body.hold;
+    return route.fulfill({ json: { ok: true } });
+  });
+  await page.route("**/api/launchpad/history", (route) =>
+    route.fulfill({
+      json: {
+        operations: [
+          {
+            jobId: "previous-change",
+            kind: "update",
+            title: "Update library",
+            createdAt: "2026-11-15T12:00:00Z",
+            undoAvailable: true,
+          },
+        ],
+      },
+    }),
+  );
+  const undoWrites: unknown[] = [];
+  await page.route("**/api/launchpad/jobs/previous-change/undo", (route) => {
+    undoWrites.push(route.request().postDataJSON());
+    return route.fulfill({ json: { ok: true } });
+  });
+  await page.goto("/#launchpad");
+  await page
+    .getByRole("switch", { name: "Show installed content", exact: true })
+    .click();
+  const row = page.getByRole("article", { name: "library", exact: true });
+  await expect(row).toContainText("Previously installed: 0.9");
+  await row
+    .getByRole("button", { name: "Hold this version", exact: true })
+    .click();
+  await expect(row).toContainText("Version held");
+  await expect(
+    page.getByRole("button", { name: "Update all", exact: true }),
+  ).toBeDisabled();
+  expect(policyWrites).toEqual([{ path: "mods/library.jar", hold: true }]);
+  await page
+    .getByRole("button", { name: "Recent changes", exact: true })
+    .first()
+    .click();
+  const history = page.getByRole("dialog", {
+    name: "Recent content changes",
+    exact: true,
+  });
+  await history
+    .getByRole("button", { name: "Review undo", exact: true })
+    .click();
+  const undo = page.getByRole("dialog", {
+    name: "Undo content change",
+    exact: true,
+  });
+  await expect(undo).toContainText("Restored versions will be held");
+  expect(undoWrites).toHaveLength(0);
+  await undo.getByRole("button", { name: "Confirm undo", exact: true }).click();
+  await expect(undo).not.toBeVisible();
+  expect(undoWrites).toEqual([{ confirmed: true }]);
+});
+
+test("unknown runtime targets require explicit verification before preview", async ({
+  page,
+}) => {
+  await catalog(page);
+  await page.route(/\/api\/launchpad(?:\?.*)?$/, (route) =>
+    route.fulfill({
+      json: {
+        platforms: [
+          { id: "modrinth", name: "Modrinth", available: true, types: ["mod"] },
+        ],
+        gameVersion: null,
+        loader: null,
+        gameVersions: ["1.21.1"],
+        status: "offline",
+        warnings: [],
+      },
+    }),
+  );
+  await page.route("**/api/launchpad/installed?**", (route) =>
+    route.fulfill({ json: { items: [], warnings: [] } }),
+  );
+  let previews = 0;
+  await page.route("**/api/launchpad/preview", (route) => {
+    previews++;
+    return route.fulfill({ json: plan });
+  });
+  await page.goto("/#launchpad");
+  await page.getByRole("button", { name: "Install Pack", exact: true }).click();
+  const dialog = page.getByRole("dialog");
+  await dialog
+    .getByLabel("Target loader", { exact: true })
+    .selectOption("neoforge");
+  await dialog
+    .getByLabel("Target Minecraft version", { exact: true })
+    .selectOption("1.21.1");
+  const review = dialog.getByRole("button", {
+    name: "Review installation",
+    exact: true,
+  });
+  await expect(review).toBeDisabled();
+  expect(previews).toBe(0);
+  await dialog
+    .getByRole("checkbox", { name: /I verified this server/ })
+    .check();
+  await expect(review).toBeEnabled();
+  await review.click();
+  await expect.poll(() => previews).toBe(1);
+});
+
+test("dependency choices re-review safely and expose runtime risks before confirmation", async ({
+  page,
+}) => {
+  await catalog(page);
+  await page.route("**/api/launchpad/installed?**", (route) =>
+    route.fulfill({ json: { items: [], warnings: [] } }),
+  );
+  const reviews: Record<string, unknown>[] = [];
+  let cancellations = 0;
+  await page.route("**/api/launchpad/preview/*/cancel", (route) => {
+    cancellations++;
+    return route.fulfill({ json: { cancelled: true } });
+  });
+  await page.route("**/api/launchpad/preview", (route) => {
+    const body = route.request().postDataJSON();
+    reviews.push(body);
+    return route.fulfill({
+      json: {
+        ...plan,
+        planId: `dependency-${reviews.length}`,
+        dependencyDecisions: [
+          {
+            key: "modrinth:library",
+            title: "Shared Library",
+            installedVersion: "3.0",
+            proposedVersion: "2.0",
+            direction: "downgrade",
+            requiredBy: ["Pack"],
+            choice: body.resolutions?.["modrinth:library"] || "keep-installed",
+            allowedChoices: ["keep-installed", "use-proposed", "skip"],
+            status: "unverified",
+            warning: "The installed version needs verification.",
+          },
+        ],
+        runtimeRequirements: [
+          {
+            mod: "Example",
+            id: "minecraft",
+            range: { any: [">=1.22"] },
+            installed: "1.21.1",
+            status: "unverified",
+          },
+        ],
+      },
+    });
+  });
+  await page.goto("/#launchpad");
+  await page.getByRole("button", { name: "Install Pack", exact: true }).click();
+  await page
+    .getByRole("button", { name: "Review installation", exact: true })
+    .click();
+  const dialog = page.getByRole("dialog");
+  await expect(dialog).toContainText("Runtime requirements need review");
+  await expect(
+    dialog.getByRole("button", { name: "Install anyway", exact: true }),
+  ).toBeEnabled();
+  await dialog
+    .getByLabel("Dependency choice for Shared Library")
+    .selectOption("use-proposed");
+  await expect.poll(() => reviews.length).toBe(2);
+  expect(reviews[1].resolutions).toEqual({
+    "modrinth:library": "use-proposed",
+  });
+  expect(cancellations).toBeGreaterThan(0);
+  await expect(
+    dialog.getByLabel("Dependency choice for Shared Library"),
+  ).toHaveValue("use-proposed");
+});
+
+test("bulk update review excludes duplicate projects and lets users choose remaining updates", async ({
+  page,
+}) => {
+  await catalog(page);
+  const items = [
+    installed("alpha"),
+    installed("beta"),
+    installed("duplicate"),
+    { ...installed("duplicate"), path: "mods/duplicate-old.jar" },
+  ];
+  await page.route("**/api/launchpad/installed?**", (route) =>
+    route.fulfill({ json: { items, warnings: [] } }),
+  );
+  const reviews: { updates: { projectId: string }[] }[] = [];
+  await page.route("**/api/launchpad/updates/preview", (route) => {
+    const body = route.request().postDataJSON();
+    reviews.push(body);
+    return route.fulfill({
+      json: { ...plan, planId: `bulk-${reviews.length}` },
+    });
+  });
+  await page.route("**/api/launchpad/preview/*/cancel", (route) =>
+    route.fulfill({ json: { cancelled: true } }),
+  );
+  await page.goto("/#launchpad");
+  await page
+    .getByRole("switch", { name: "Show installed content", exact: true })
+    .click();
+  await expect(
+    page.getByText("duplicate copies are excluded", { exact: false }),
+  ).toBeVisible();
+  await page.getByRole("button", { name: "Update all", exact: true }).click();
+  await expect.poll(() => reviews.length).toBe(1);
+  expect(reviews[0].updates.map((item) => item.projectId)).toEqual([
+    "alpha",
+    "beta",
+  ]);
+  const dialog = page.getByRole("dialog");
+  await dialog.getByRole("checkbox", { name: /beta/ }).uncheck();
+  await dialog
+    .getByRole("button", { name: "Review updates", exact: true })
+    .click();
+  await expect.poll(() => reviews.length).toBe(2);
+  expect(reviews[1].updates.map((item) => item.projectId)).toEqual(["alpha"]);
+});
+
+for (const contentType of ["mod", "plugin"] as const) {
+  test(`${contentType} activation requires an explicit acknowledgement for dependency risks`, async ({
+    page,
+  }) => {
+    await catalog(page, contentType);
+    const directory = contentType === "plugin" ? "plugins" : "mods";
+    await page.route("**/api/launchpad/installed?**", (route) =>
+      route.fulfill({
+        json: {
+          items: [{ ...installed("alpha"), path: `${directory}/alpha.jar` }],
+          warnings: [],
+        },
+      }),
+    );
+    const writes: { type?: string; acknowledgedDependencies?: boolean }[] = [];
+    await page.route("**/api/launchpad/active", (route) => {
+      const body = route.request().postDataJSON();
+      writes.push(body);
+      return route.fulfill({
+        json: body.acknowledgedDependencies
+          ? { path: `${directory}/alpha.jar.disabled`, active: false }
+          : {
+              path: `${directory}/alpha.jar`,
+              active: true,
+              requiresAcknowledgement: true,
+              warnings: ["Beta requires Alpha."],
+            },
+      });
+    });
+    await page.goto("/#launchpad");
+    await page
+      .getByRole("switch", { name: "Show installed content", exact: true })
+      .click();
+    await page
+      .getByRole("switch", { name: "Active: alpha", exact: true })
+      .click();
+    const dialog = page.getByRole("dialog");
+    await expect(dialog).toContainText("Beta requires Alpha");
+    expect(writes).toHaveLength(1);
+    await dialog
+      .getByRole("button", { name: "Change active state anyway", exact: true })
+      .click();
+    await expect.poll(() => writes.length).toBe(2);
+    expect(writes[1].acknowledgedDependencies).toBe(true);
+    expect(writes[1].type).toBe(contentType);
+  });
+}
+
+test("blocked removal can re-review dependents together before one explicit confirmation", async ({
+  page,
+}) => {
+  await catalog(page);
+  await page.route("**/api/launchpad/installed?**", (route) =>
+    route.fulfill({
+      json: { items: [installed("library"), installed("addon")], warnings: [] },
+    }),
+  );
+  const reviews: { includeDependents?: boolean }[] = [];
+  const writes: unknown[] = [];
+  await page.route("**/api/launchpad/removal-preview", (route) => {
+    const body = route.request().postDataJSON();
+    reviews.push(body);
+    return route.fulfill({
+      json: {
+        planId: `remove-${reviews.length}`,
+        title: "library",
+        blocked: !body.includeDependents,
+        includesDependents: !!body.includeDependents,
+        files: [
+          { path: "mods/library.jar", size: 100 },
+          ...(body.includeDependents
+            ? [{ path: "mods/addon.jar", size: 100 }]
+            : []),
+        ],
+        dependents: [{ path: "mods/addon.jar", title: "addon" }],
+        warnings: [],
+      },
+    });
+  });
+  await page.route("**/api/launchpad/removal-preview/*/cancel", (route) =>
+    route.fulfill({ json: { cancelled: true } }),
+  );
+  await page.route("**/api/launchpad/remove", (route) => {
+    writes.push(route.request().postDataJSON());
+    return route.fulfill({ json: { removed: true } });
+  });
+  await page.goto("/#launchpad");
+  await page
+    .getByRole("switch", { name: "Show installed content", exact: true })
+    .click();
+  await page
+    .getByRole("button", { name: "Remove library", exact: true })
+    .click();
+  const dialog = page.getByRole("dialog");
+  await expect(dialog).toContainText("Mod removal blocked");
+  expect(writes).toHaveLength(0);
+  await dialog
+    .getByRole("button", {
+      name: "Review removing dependents together",
+      exact: true,
+    })
+    .click();
+  await expect(
+    dialog.getByRole("list", { name: "Files to remove", exact: true }),
+  ).toContainText("mods/addon.jar");
+  await dialog.getByRole("button", { name: "Remove mod", exact: true }).click();
+  await expect.poll(() => writes.length).toBe(1);
+  expect(writes[0]).toMatchObject({
+    planId: "remove-2",
+    confirmed: true,
+    acknowledgedDependents: true,
+  });
+});
+
 async function reviewInstallation(page: Page) {
   await page.getByRole("button", { name: "Install Pack", exact: true }).click();
   await page
@@ -182,10 +543,10 @@ for (const bulk of [false, true]) {
     };
     await start();
     const dialog = page.getByRole("dialog", {
-      name: /^(?:Install content|Review installation)$/,
+      name: /^(?:Install content|Review installation|Review selected updates)$/,
     });
     await expect(
-      dialog.getByRole("button", { name: "Preparing review...", exact: true }),
+      dialog.getByRole("button", { name: "Preparing review…", exact: true }),
     ).toBeDisabled();
     await expect.poll(() => Boolean(held)).toBe(true);
     await dialog.getByRole("button", { name: "Cancel", exact: true }).click();
@@ -1566,3 +1927,209 @@ test("modpack installation waits for the requested backup and stops on backup fa
     page.getByRole("heading", { name: "Recycle Bin", exact: true }),
   ).toBeVisible();
 });
+
+test("catalog dependencies are advisory and visible before staging installation", async ({
+  page,
+}) => {
+  await catalog(page);
+  await page.route("**/api/launchpad/installed?**", (route) =>
+    route.fulfill({ json: { items: [installed("alpha")], warnings: [] } }),
+  );
+  let stages = 0;
+  await page.route("**/api/launchpad/preview", (route) => {
+    stages++;
+    return route.fulfill({ json: plan });
+  });
+  await page.route("**/api/launchpad/dependencies?**", (route) =>
+    route.fulfill({
+      json: {
+        summaryIsAdvisory: true,
+        declarationsAvailable: true,
+        dependencies: [
+          {
+            title: "Library",
+            relation: "required",
+            status: "installed",
+            installedVersion: "2.0",
+            proposedVersion: "1.0",
+            requiredBy: ["alpha"],
+          },
+        ],
+        warnings: [],
+      },
+    }),
+  );
+  await page.goto("/#launchpad");
+  await page
+    .getByRole("switch", { name: "Show installed content", exact: true })
+    .click();
+  await page.getByRole("button", { name: "Update alpha", exact: true }).click();
+  const summary = page.getByRole("region", {
+    name: "Catalog dependency summary",
+    exact: true,
+  });
+  await expect(summary).toContainText("Installed 2.0");
+  await expect(summary).toContainText("Proposed 1.0");
+  await expect(summary).toContainText("Catalog information only");
+  expect(stages).toBe(0);
+});
+
+test("selected disable pauses for each dependency acknowledgement and advances only after success", async ({
+  page,
+}) => {
+  await catalog(page);
+  await page.route("**/api/launchpad/installed?**", (route) =>
+    route.fulfill({
+      json: { items: [installed("alpha"), installed("beta")], warnings: [] },
+    }),
+  );
+  const writes: { path: string; acknowledgedDependencies?: boolean }[] = [];
+  await page.route("**/api/launchpad/active", (route) => {
+    const body = route.request().postDataJSON();
+    writes.push(body);
+    return route.fulfill({
+      json:
+        body.path.includes("alpha") && !body.acknowledgedDependencies
+          ? {
+              path: body.path,
+              active: true,
+              requiresAcknowledgement: true,
+              warnings: ["Beta requires Alpha."],
+            }
+          : { path: body.path + ".disabled", active: false },
+    });
+  });
+  await page.goto("/#launchpad");
+  await page
+    .getByRole("switch", { name: "Show installed content", exact: true })
+    .click();
+  await page
+    .getByRole("checkbox", { name: "Select alpha", exact: true })
+    .check();
+  await page
+    .getByRole("checkbox", { name: "Select beta", exact: true })
+    .check();
+  await page
+    .getByRole("button", { name: "Disable selected", exact: true })
+    .click();
+  await expect(page.getByRole("dialog")).toContainText("Beta requires Alpha");
+  expect(writes).toHaveLength(1);
+  await page
+    .getByRole("button", { name: "Change active state anyway", exact: true })
+    .click();
+  await expect.poll(() => writes.length).toBe(3);
+  expect(writes.map((item) => item.path)).toEqual([
+    "mods/alpha.jar",
+    "mods/alpha.jar",
+    "mods/beta.jar",
+  ]);
+  await expect(
+    page.getByRole("group", {
+      name: "Selected installed content",
+      exact: true,
+    }),
+  ).toContainText("0 selected");
+});
+
+test("selected removal reviews each current inventory only after the previous removal completes", async ({
+  page,
+}) => {
+  await catalog(page);
+  await page.route("**/api/launchpad/installed?**", (route) =>
+    route.fulfill({
+      json: { items: [installed("alpha"), installed("beta")], warnings: [] },
+    }),
+  );
+  const reviews: string[] = [],
+    removals: string[] = [];
+  await page.route("**/api/launchpad/removal-preview", (route) => {
+    const body = route.request().postDataJSON();
+    reviews.push(body.path);
+    return route.fulfill({
+      json: {
+        planId: body.path,
+        title: body.path,
+        blocked: false,
+        files: [{ path: body.path, size: 100 }],
+        dependents: [],
+        warnings: [],
+      },
+    });
+  });
+  await page.route("**/api/launchpad/remove", (route) => {
+    removals.push(route.request().postDataJSON().planId);
+    return route.fulfill({ json: { ok: true } });
+  });
+  await page.goto("/#launchpad");
+  await page
+    .getByRole("switch", { name: "Show installed content", exact: true })
+    .click();
+  await page
+    .getByRole("checkbox", { name: "Select alpha", exact: true })
+    .check();
+  await page
+    .getByRole("checkbox", { name: "Select beta", exact: true })
+    .check();
+  await page
+    .getByRole("button", { name: "Remove selected", exact: true })
+    .click();
+  const dialog = page.getByRole("dialog");
+  await expect(dialog).toContainText("mods/alpha.jar");
+  expect(reviews).toEqual(["mods/alpha.jar"]);
+  await dialog.getByRole("button", { name: "Remove mod", exact: true }).click();
+  await expect.poll(() => reviews.length).toBe(2);
+  expect(removals).toEqual(["mods/alpha.jar"]);
+  await expect(dialog).toContainText("mods/beta.jar");
+  await dialog.getByRole("button", { name: "Remove mod", exact: true }).click();
+  await expect.poll(() => removals.length).toBe(2);
+});
+
+for (const cancelAction of ["Cancel remaining", "Browse catalog"]) {
+  test(`selected disable can stop remaining items through ${cancelAction} while a request is in flight`, async ({
+    page,
+  }) => {
+    await catalog(page);
+    await page.route("**/api/launchpad/installed?**", (route) =>
+      route.fulfill({
+        json: { items: [installed("alpha"), installed("beta")], warnings: [] },
+      }),
+    );
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const writes: string[] = [];
+    await page.route("**/api/launchpad/active", async (route) => {
+      const body = route.request().postDataJSON();
+      writes.push(body.path);
+      await gate;
+      return route.fulfill({
+        json: { path: body.path + ".disabled", active: false },
+      });
+    });
+    await page.goto("/#launchpad");
+    await page
+      .getByRole("switch", { name: "Show installed content", exact: true })
+      .click();
+    await page
+      .getByRole("checkbox", { name: "Select alpha", exact: true })
+      .check();
+    await page
+      .getByRole("checkbox", { name: "Select beta", exact: true })
+      .check();
+    await page
+      .getByRole("button", { name: "Disable selected", exact: true })
+      .click();
+    await expect.poll(() => writes.length).toBe(1);
+    await expect(
+      page.getByRole("tab", { name: "Plugins", exact: true }),
+    ).toBeDisabled();
+    await page.getByRole("button", { name: cancelAction, exact: true }).click();
+    release();
+    await expect(
+      page.getByText(/Selected disable: 1 of 2 completed/),
+    ).toBeVisible();
+    await expect(page.getByText(/Remaining changes cancelled/)).toBeVisible();
+    expect(writes).toEqual(["mods/alpha.jar"]);
+  });
+}

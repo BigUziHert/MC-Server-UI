@@ -39,7 +39,7 @@ export default function HostDirectoryPicker({
       ? "/backups/location/directories"
       : "/server-setup/directories";
   const [target, setTarget] = useState<string | null>(
-    initialDirectory.trim() || null,
+    initialDirectory.trim().replace(/^"(.*)"$/, "$1") || null,
   );
   const [listing, setListing] = useState<Listing | null>(null);
   const [address, setAddress] = useState(initialDirectory);
@@ -172,14 +172,16 @@ export default function HostDirectoryPicker({
           onKeyDown={(event) => {
             if (event.key === "Enter") {
               event.preventDefault();
-              navigate(address.trim() || null);
+              navigate(address.trim().replace(/^"(.*)"$/, "$1") || null);
             }
           }}
         />
         <button
           type="button"
           className="btn"
-          onClick={() => navigate(address.trim() || null)}
+          onClick={() =>
+            navigate(address.trim().replace(/^"(.*)"$/, "$1") || null)
+          }
         >
           Open
         </button>

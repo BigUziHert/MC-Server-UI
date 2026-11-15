@@ -3,6 +3,8 @@ import assert from "node:assert/strict";
 import fs from "node:fs/promises";
 import path from "node:path";
 import os from "node:os";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
 import {
   installationFileTransaction,
   inspectInstallationDirectory,
@@ -21,6 +23,46 @@ async function fixture(t) {
   });
   return root;
 }
+
+test(
+  "Windows subst folders are reviewed at their canonical backing path",
+  { skip: process.platform !== "win32" },
+  async (t) => {
+    const root = await fixture(t);
+    const directory = path.join(root, "server");
+    await fs.mkdir(directory);
+    let drive;
+    for (const letter of ["Z", "Y", "X", "W", "V"]) {
+      try {
+        await fs.stat(`${letter}:\\`);
+      } catch (cause) {
+        if (cause.code === "ENOENT") {
+          drive = `${letter}:`;
+          break;
+        }
+      }
+    }
+    if (!drive) return t.skip("No unused test drive letter.");
+    const run = promisify(execFile);
+    try {
+      await run("subst.exe", [drive, root]);
+    } catch {
+      return t.skip("This Windows session does not permit subst mappings.");
+    }
+    try {
+      const inspected = await inspectInstallationDirectory(`${drive}\\server`, {
+        requireExisting: true,
+      });
+      assert.equal(
+        inspected.directory.toLowerCase(),
+        (await fs.realpath(directory)).toLowerCase(),
+      );
+      assert.equal(inspected.exists, true);
+    } finally {
+      await run("subst.exe", [drive, "/D"]);
+    }
+  },
+);
 
 test("installation inspection is read-only and creation preserves an empty chosen folder", async (t) => {
   const root = await fixture(t);

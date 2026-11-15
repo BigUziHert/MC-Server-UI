@@ -493,7 +493,7 @@ test("inspection rejects malformed input, escaping worlds and symbolic links wit
         json("POST", { directory: noProperties }),
       )
     ).status,
-    400,
+    200,
   );
   for (const properties of [
     "server-port=bad",
@@ -1802,3 +1802,19 @@ for (const initialLaunch of ["java-args", "jar"]) {
     assert.equal(server.version, "Configured JAR");
   });
 }
+
+test("legacy NeoForge 1.20.1 launcher uses Forge compatibility without inventing a Minecraft version", async (t) => {
+  const { directory, prepare } = await fixture(t);
+  await prepare(directory, { jars: [] });
+  const relative = "libraries/net/neoforged/forge/1.20.1-47.1.79/win_args.txt";
+  await fs.mkdir(path.dirname(path.join(directory, relative)), {
+    recursive: true,
+  });
+  await fs.writeFile(
+    path.join(directory, relative),
+    "-Xmx2G example.ServerMain",
+  );
+  const metadata = await inspectJavaArguments(directory, [`@${relative}`]);
+  assert.equal(metadata.software, "Forge");
+  assert.equal(metadata.version, "1.20.1-47.1.79");
+});

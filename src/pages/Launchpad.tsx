@@ -39,7 +39,9 @@ import { canChangeContent } from "../page-permissions";
 import SearchField, { useDebouncedValue } from "../SearchField";
 import RefreshButton from "../RefreshButton";
 import StatePanel from "../StatePanel";
-import Pagination from "../Pagination";
+import Pagination, { defaultPageSizes } from "../Pagination";
+import { setSetupModpack } from "../setup-handoff";
+import DownloadButton from "../DownloadButton";
 import Switch from "../Switch";
 import {
   readPreference,
@@ -78,6 +80,11 @@ type Version = {
   loaders: string[];
   publishedAt: string;
   downloadable: boolean;
+  channel?: string;
+  versionType?: string;
+  serverCompatible?: boolean;
+  unavailableReason?: string;
+  reason?: string;
 };
 type Project = {
   id: string;
@@ -101,6 +108,9 @@ type InstalledItem = {
   projectId?: string;
   versionId?: string;
   versionName?: string;
+  updateHeld?: boolean;
+  previousVersionId?: string;
+  previousVersionName?: string;
   title?: string;
   iconUrl?: string;
   author?: string;
@@ -141,6 +151,15 @@ type Job = {
     acknowledgedUnavailableDependencies?: true;
   };
   recoveryEntries?: unknown[];
+  undoAvailable?: boolean;
+};
+type ContentOperation = {
+  jobId: string;
+  kind: string;
+  title: string;
+  createdAt: string;
+  undoAvailable: boolean;
+  undoneAt?: string;
 };
 type Config = {
   platforms: Platform[];
@@ -195,6 +214,10 @@ function mergeLocalInventory(
         projectId: old.projectId ?? item.projectId,
         versionId: old.versionId ?? item.versionId,
         versionName: old.versionName ?? item.versionName,
+        updateHeld: item.updateHeld ?? old.updateHeld,
+        previousVersionId: item.previousVersionId ?? old.previousVersionId,
+        previousVersionName:
+          item.previousVersionName ?? old.previousVersionName,
         title: old.title ?? item.title,
         iconUrl: old.iconUrl ?? item.iconUrl,
         author: old.author ?? item.author,
@@ -215,16 +238,46 @@ function mergeLocalInventory(
     }),
   };
 }
+type DependencyDecision = {
+  key: string;
+  title: string;
+  installedVersion?: string;
+  proposedVersion?: string;
+  installedPath?: string;
+  requiredBy?: string[];
+  choice: string;
+  allowedChoices: string[];
+  status: string;
+  direction?: string;
+  warning?: string;
+};
+type RuntimeRequirement = {
+  mod: string;
+  path: string;
+  id: string;
+  range: unknown;
+  installed?: string;
+  status: string;
+};
 type Plan = {
   planId: string;
   title: string;
   versionName: string;
   expiresAt: string;
+  dependencyDecisions?: DependencyDecision[];
+  runtimeRequirements?: RuntimeRequirement[];
+  skippedUpdates?: { title?: string; projectId: string; reason: string }[];
   files: {
     path: string;
+    title?: string;
     size: number;
     action: "install" | "replace";
     previousPath?: string;
+    installedVersion?: string;
+    proposedVersion?: string;
+    direction?: string;
+    installReason?: string;
+    requiredBy?: string[];
   }[];
   warnings: string[];
   cleanInstall?: boolean;
@@ -265,6 +318,8 @@ type RemovalPlan = {
   blocked: boolean;
   requiresAcknowledgement?: boolean;
   expiresAt?: string;
+  includesDependents?: boolean;
+  orphanCandidates?: { path: string; title?: string }[];
 };
 const kinds = [
   { id: "modpack", label: "Modpacks", icon: Layers3 },
@@ -272,8 +327,11 @@ const kinds = [
   { id: "datapack", label: "Datapacks", icon: FileCode2 },
   { id: "plugin", label: "Plugins", icon: Package },
 ] as const;
-const rowsOptions = [5, 10, 25, 50, 75, 100];
+const rowsOptions = defaultPageSizes;
 const installedSortOptions = [
+  { id: "active", label: "Active" },
+  { id: "added", label: "Date added" },
+  { id: "modified", label: "Date modified" },
   { id: "name", label: "Name" },
   { id: "author", label: "Author" },
   { id: "featured", label: "Featured" },
@@ -314,6 +372,7 @@ type SavedView = {
   installedSort?: InstalledSort;
   installedDirection?: SortDirection;
   categories?: string[];
+  runtime?: string;
 };
 function readSavedView(key: string): SavedView {
   try {
@@ -323,6 +382,7 @@ function readSavedView(key: string): SavedView {
     if (!saved || typeof saved !== "object" || Array.isArray(saved)) return {};
     const values = saved as Record<string, unknown>;
     return {
+      runtime: typeof values.runtime === "string" ? values.runtime : undefined,
       platform:
         typeof values.platform === "string" ? values.platform : undefined,
       type: kinds.some((kind) => kind.id === values.type)
@@ -593,9 +653,10 @@ export function ProjectIcon({ url }: { url?: string | null }) {
 export default function Launchpad({
   notify,
   permissions,
-}: PageProps & { permissions?: string[] }) {
+  onCreateServer,
+}: PageProps & { permissions?: string[]; onCreateServer?: () => void }) {
   const allowChanges = canChangeContent(permissions);
-  const { api, post } = useServerApi();
+  const { api, post, downloadUrl } = useServerApi();
   const serverId = useContext(ServerScope);
   const panel = useContext(PanelScope);
   const viewKey =
@@ -623,6 +684,36 @@ export default function Launchpad({
   const [installedDirection, setInstalledDirection] =
     useState<SortDirection>("asc");
   const [installedOnly, setInstalledOnly] = useState(false);
+  const modeQueries = useRef({ browse: "", installed: "" });
+  const [selectedPaths, setSelectedPaths] = useState(new Set<string>());
+  const [selectionBatch, setSelectionBatch] = useState<{
+    action: "remove" | "disable";
+    items: InstalledItem[];
+    total: number;
+  } | null>(null);
+  const selectionStarted = useRef<string | null>(null);
+  const [selectionOutcome, setSelectionOutcome] = useState<{
+    action: "remove" | "disable";
+    total: number;
+    remaining: string[];
+    status: "running" | "cancelled" | "failed" | "complete";
+  } | null>(null);
+  const [dependencySummary, setDependencySummary] = useState<{
+    dependencies: {
+      title: string;
+      relation: string;
+      installedVersion?: string;
+      proposedVersion?: string;
+      status: string;
+      installedPath?: string;
+    }[];
+    warnings: string[];
+    declarationsAvailable?: boolean;
+  } | null>(null);
+  const [dependencySummaryLoading, setDependencySummaryLoading] =
+    useState(false);
+  const [dependencySummaryError, setDependencySummaryError] = useState("");
+
   const [categories, setCategories] = useState<string[]>([]);
   const categoryKey =
     type === "mod"
@@ -649,10 +740,9 @@ export default function Launchpad({
   );
   // Installed updates and individual content installs target this server, even
   // when catalog filters are set to another Minecraft version or loader.
-  const contentGameVersion =
-    config?.gameVersion && /^\d+(?:\.\d+)+$/.test(config.gameVersion)
-      ? config.gameVersion
-      : gameVersion.trim();
+  const contentGameVersion = config?.gameVersion
+    ? config.gameVersion
+    : gameVersion.trim();
   const contentLoader =
     config?.loader && loaders.includes(config.loader)
       ? config.loader
@@ -710,12 +800,90 @@ export default function Launchpad({
   const [plan, setPlan] = useState<Plan | null>(null);
   const consumedPlans = useRef(new Set<string>());
   const [cleanAccepted, setCleanAccepted] = useState(false);
+  const [manualRuntimeAcknowledged, setManualRuntimeAcknowledged] =
+    useState(false);
   const [backupFirst, setBackupFirst] = useState(false);
+  const [preserveWorld, setPreserveWorld] = useState(true);
+  const backupForSelection = useRef(false);
+  const [resolutions, setResolutions] = useState<Record<string, string>>({});
+  const [dependencyProblems, setDependencyProblems] = useState<
+    DependencyDecision[]
+  >([]);
+  const [runtimeProblems, setRuntimeProblems] = useState<RuntimeRequirement[]>(
+    [],
+  );
+  const [selectedUpdatePaths, setSelectedUpdatePaths] =
+    useState<Set<string> | null>(null);
+  const [activation, setActivation] = useState<{
+    entry: InstalledItem;
+    active: boolean;
+    warnings: string[];
+  } | null>(null);
+  const [keepCurrentReview, setKeepCurrentReview] = useState(false);
+  const [historyOpen, setHistoryOpen] = useState(false);
+  const [contentHistory, setContentHistory] = useState<ContentOperation[]>([]);
+  const [historyLoading, setHistoryLoading] = useState(false);
+  const [historyError, setHistoryError] = useState("");
+  const [undoReview, setUndoReview] = useState<{
+    jobId: string;
+    title: string;
+  } | null>(null);
+  const [undoNotice, setUndoNotice] = useState<{
+    jobId: string;
+    title: string;
+  } | null>(null);
+  const [undoBusy, setUndoBusy] = useState(false);
+  const [undoError, setUndoError] = useState("");
+  const historyDialog = useRef<HTMLDialogElement>(null);
+  const undoDialog = useRef<HTMLDialogElement>(null);
+  useEffect(() => {
+    if (historyOpen) historyDialog.current?.showModal();
+    else historyDialog.current?.close();
+  }, [historyOpen]);
+  useEffect(() => {
+    if (undoReview) undoDialog.current?.showModal();
+    else undoDialog.current?.close();
+  }, [undoReview]);
+  const [clientPack, setClientPack] = useState<{
+    filename: string;
+    files: number;
+    warnings: string[];
+  } | null>(null);
+  const [clientPackBusy, setClientPackBusy] = useState(false);
+  const clientPackDialog = useRef<HTMLDialogElement>(null);
+  useEffect(() => {
+    if (clientPack) clientPackDialog.current?.showModal();
+    else clientPackDialog.current?.close();
+  }, [clientPack]);
+  async function reviewClientPack() {
+    if (clientPackBusy) return;
+    const currentSession = session.current;
+    setClientPackBusy(true);
+    try {
+      const result = await api<{
+        filename: string;
+        files: number;
+        warnings: string[];
+      }>("/launchpad/client-pack/preview");
+      if (currentSession === session.current) setClientPack(result);
+    } catch (cause) {
+      if (currentSession === session.current) notify(messageOf(cause), true);
+    } finally {
+      if (currentSession === session.current) setClientPackBusy(false);
+    }
+  }
+  const activationDialog = useRef<HTMLDialogElement>(null);
+  useEffect(() => {
+    if (activation) activationDialog.current?.showModal();
+    else activationDialog.current?.close();
+  }, [activation]);
   const [dialogError, setDialogError] = useState("");
   const [removal, setRemoval] = useState<InstalledItem | null>(null);
   const [removalPlan, setRemovalPlan] = useState<RemovalPlan | null>(null);
   const [removalError, setRemovalError] = useState("");
   const [removalAcknowledged, setRemovalAcknowledged] = useState(false);
+  const [removalDependentsAccepted, setRemovalDependentsAccepted] =
+    useState(false);
   const [busy, setBusy] = useState<
     | "preview"
     | "install"
@@ -752,15 +920,41 @@ export default function Launchpad({
     : (sortOptions[0]?.id ?? "");
   const supported = Boolean(source?.types.includes(type));
   const working = Boolean(job && ["queued", "running"].includes(job.status));
+  const updateProjectCounts = new Map<string, number>();
+  for (const item of installed?.items ?? [])
+    if (item.projectId && item.platform) {
+      const key = `${item.platform}:${item.projectId}`;
+      updateProjectCounts.set(key, (updateProjectCounts.get(key) || 0) + 1);
+    }
+  const duplicateUpdateCount = (installed?.items ?? []).filter(
+    (item) =>
+      item.update &&
+      !item.updateHeld &&
+      (updateProjectCounts.get(`${item.platform}:${item.projectId}`) || 0) > 1,
+  ).length;
   const availableUpdates = (installed?.items ?? []).filter(
     (item) =>
       item.update &&
+      !item.updateHeld &&
+      (updateProjectCounts.get(`${item.platform}:${item.projectId}`) || 0) <=
+        1 &&
       item.platform &&
       item.projectId &&
       !pendingPaths.has(item.path),
   );
   const canRecover = allowChanges && status === "offline" && !working;
   const canInstall = canRecover && !job?.recoveryRequired;
+  const changeDisabledReason = !allowChanges
+    ? "Your account cannot change server content."
+    : working
+      ? "An installation is running."
+      : job?.recoveryRequired
+        ? "Resolve the interrupted installation before changing files."
+        : status !== "offline"
+          ? "Stop the server in Console before changing content."
+          : busy
+            ? "Another action is in progress."
+            : "";
   const canDismissJob =
     permissions === undefined || permissions.includes("file.update");
   const contentName =
@@ -774,7 +968,9 @@ export default function Launchpad({
         targetVersion,
       ].filter(
         (value): value is string =>
-          typeof value === "string" && /^\d+(?:\.\d+)+$/.test(value),
+          typeof value === "string" &&
+          Boolean(value) &&
+          (value === config?.gameVersion || /^\d+(?:\.\d+)+$/.test(value)),
       ),
     ),
   ];
@@ -814,6 +1010,13 @@ export default function Launchpad({
         }
         if (initial) {
           const saved = readSavedView(viewKey);
+          if (
+            saved.runtime &&
+            saved.runtime !== `${next.gameVersion}:${next.loader}`
+          ) {
+            delete saved.gameVersion;
+            delete saved.loader;
+          }
           const first =
             next.platforms.find((item) => item.id === saved.platform) ??
             next.platforms.find(
@@ -836,7 +1039,7 @@ export default function Launchpad({
           setGameVersion(
             saved.gameVersion !== undefined
               ? saved.gameVersion
-              : next.gameVersion && /^\d+(?:\.\d+)+$/.test(next.gameVersion)
+              : next.gameVersion
                 ? next.gameVersion
                 : "",
           );
@@ -975,6 +1178,16 @@ export default function Launchpad({
     jobActionPending.current = false;
     jobEpoch.current++;
     unavailableJobs.current.clear();
+    setHistoryOpen(false);
+    setContentHistory([]);
+    setUndoReview(null);
+    setUndoNotice(null);
+    setUndoBusy(false);
+    setHistoryLoading(false);
+    setClientPack(null);
+    setClientPackBusy(false);
+    setActivation(null);
+    setKeepCurrentReview(false);
     setJobAction(false);
     setViewReady(null);
     setConfig(null);
@@ -982,6 +1195,10 @@ export default function Launchpad({
     setInventory(null);
     inventoryRef.current = null;
     inventoryCache.current.clear();
+    cancelSelectionBatch();
+    setSelectedPaths(new Set());
+    modeQueries.current = { browse: "", installed: "" };
+    setSelectionOutcome(null);
     forceScan.current = null;
     manualCompletion.current?.(false);
     manualCompletion.current = null;
@@ -1050,6 +1267,7 @@ export default function Launchpad({
           installedSort,
           installedDirection,
           categories,
+          runtime: `${config.gameVersion}:${config.loader}`,
         }),
         "session",
       );
@@ -1083,7 +1301,6 @@ export default function Launchpad({
     if (query.trim() !== filteredQuery.trim()) {
       setSearchLoading(true);
       setSearchError("");
-      setResults(null);
       return;
     }
     const controller = new AbortController();
@@ -1100,7 +1317,6 @@ export default function Launchpad({
     ]);
     if (resultsScope.current !== scope) {
       resultsScope.current = scope;
-      setResults(null);
     }
     setSearchLoading(true);
     setSearchError("");
@@ -1384,7 +1600,15 @@ export default function Launchpad({
               (version) =>
                 version.downloadable &&
                 version.id === selection.installed?.update?.id,
-            ) ?? next.versions.find((version) => version.downloadable);
+            ) ??
+            next.versions.find(
+              (version) =>
+                version.downloadable &&
+                !["alpha", "beta", "snapshot"].includes(
+                  version.channel || version.versionType || "",
+                ),
+            ) ??
+            next.versions.find((version) => version.downloadable);
           setVersionId(preferred?.id ?? "");
         })
         .catch((cause) => {
@@ -1461,11 +1685,34 @@ export default function Launchpad({
     };
   }, [api, job?.id, job?.status, jobReload, notify, reconcileJob]);
 
-  async function actOnJob(action: "cancel" | "recover") {
+  useEffect(() => {
+    let pendingRead = false,
+      active = true;
+    const timer = window.setInterval(async () => {
+      if (
+        pendingRead ||
+        document.visibilityState === "hidden" ||
+        pending.current
+      )
+        return;
+      pendingRead = true;
+      try {
+        if (active) await loadConfig(false);
+      } finally {
+        pendingRead = false;
+      }
+    }, 10000);
+    return () => {
+      active = false;
+      window.clearInterval(timer);
+    };
+  }, [loadConfig]);
+
+  async function actOnJob(action: "cancel" | "recover" | "keep") {
     if (
       !job ||
       !allowChanges ||
-      (action === "recover" && !canRecover) ||
+      (action !== "cancel" && !canRecover) ||
       jobActionPending.current
     )
       return;
@@ -1479,7 +1726,9 @@ export default function Launchpad({
         action === "cancel"
           ? `/launchpad/jobs/${encodeURIComponent(id)}/cancel`
           : "/launchpad/recovery/resolve",
+        action === "keep" ? { keepCurrent: true, confirmed: true } : {},
       );
+      setKeepCurrentReview(false);
       if (session.current === currentSession && result.job)
         setJob((current) =>
           current?.id === id && result.job?.id === id ? result.job : current,
@@ -1496,6 +1745,132 @@ export default function Launchpad({
     }
   }
 
+  async function openContentHistory() {
+    const currentSession = session.current;
+    setHistoryOpen(true);
+    setHistoryLoading(true);
+    setHistoryError("");
+    try {
+      const result = await api<{ operations: ContentOperation[] }>(
+        "/launchpad/history",
+      );
+      if (currentSession === session.current)
+        setContentHistory(result.operations);
+    } catch (cause) {
+      if (currentSession === session.current) setHistoryError(messageOf(cause));
+    } finally {
+      if (currentSession === session.current) setHistoryLoading(false);
+    }
+  }
+  function reviewUndo(jobId: string, title: string) {
+    setHistoryOpen(false);
+    setUndoError("");
+    setUndoReview({ jobId, title });
+  }
+  async function undoContent() {
+    if (!undoReview || undoBusy || !canInstall) return;
+    const currentSession = session.current;
+    setUndoBusy(true);
+    setUndoError("");
+    try {
+      await api(
+        `/launchpad/jobs/${encodeURIComponent(undoReview.jobId)}/undo`,
+        { method: "POST", body: JSON.stringify({ confirmed: true }) },
+      );
+      if (currentSession === session.current) {
+        setUndoReview(null);
+        setUndoNotice(null);
+        setJob(null);
+        await refreshInstalled();
+        notify(
+          "Previous files and version records restored. Restored versions are held from automatic updates.",
+        );
+      }
+    } catch (cause) {
+      if (currentSession === session.current) setUndoError(messageOf(cause));
+    } finally {
+      if (currentSession === session.current) setUndoBusy(false);
+    }
+  }
+  async function holdVersion(entry: InstalledItem) {
+    if (pending.current || !allowChanges) return;
+    const currentSession = session.current;
+    pending.current = true;
+    setBusy("active");
+    try {
+      await api("/launchpad/update-policy", {
+        method: "PATCH",
+        body: JSON.stringify({ path: entry.path, hold: !entry.updateHeld }),
+      });
+      if (currentSession === session.current) {
+        await refreshInstalled();
+        notify(
+          entry.updateHeld
+            ? "Automatic updates enabled for this file."
+            : "This version is held. Update all will leave it unchanged.",
+        );
+      }
+    } catch (cause) {
+      if (currentSession === session.current) notify(messageOf(cause), true);
+    } finally {
+      if (currentSession === session.current) {
+        pending.current = false;
+        setBusy(null);
+      }
+    }
+  }
+  function changeInventoryMode(next: boolean) {
+    if (next !== installedOnly && selectionBatch) cancelSelectionBatch();
+    modeQueries.current[installedOnly ? "installed" : "browse"] = query;
+    setInstalledOnly(next);
+    setQuery(modeQueries.current[next ? "installed" : "browse"]);
+    setOffset(0);
+  }
+  function endSelectionItem(paths: Set<string>) {
+    setSelectionOutcome((current) => {
+      if (!current) return null;
+      const remaining = current.remaining.filter((path) => !paths.has(path));
+      return {
+        ...current,
+        remaining,
+        status: remaining.length ? current.status : "complete",
+      };
+    });
+    setSelectedPaths(
+      (current) => new Set([...current].filter((path) => !paths.has(path))),
+    );
+    selectionStarted.current = null;
+    setSelectionBatch((current) => {
+      if (!current) return null;
+      const items = current.items.filter((item) => !paths.has(item.path));
+      return items.length ? { ...current, items } : null;
+    });
+  }
+  function cancelSelectionBatch() {
+    setSelectionOutcome((current) =>
+      current?.status === "running" || current?.status === "failed"
+        ? { ...current, status: "cancelled" }
+        : current,
+    );
+    selectionStarted.current = null;
+    setSelectionBatch(null);
+  }
+  function startSelectedAction(action: "remove" | "disable") {
+    const items = (installed?.items || []).filter(
+      (item) =>
+        selectedPaths.has(item.path) &&
+        (action !== "disable" || item.active !== false),
+    );
+    if (!items.length || !canInstall || busy) return;
+    selectionStarted.current = null;
+    setSelectionOutcome({
+      action,
+      total: items.length,
+      remaining: items.map((item) => item.path),
+      status: "running",
+    });
+    setSelectionBatch({ action, items, total: items.length });
+  }
   function chooseProject(project: Project, entry?: InstalledItem) {
     if (!allowChanges) return;
     operation.current++;
@@ -1503,7 +1878,17 @@ export default function Launchpad({
     setDialogError("");
     setPlan(null);
     setCleanAccepted(false);
-    setBackupFirst(false);
+    setBackupFirst(
+      type === "modpack" &&
+        (permissions === undefined || permissions.includes("backup.create")),
+    );
+    setManualRuntimeAcknowledged(false);
+    setPreserveWorld(true);
+    backupForSelection.current = false;
+    setResolutions({});
+    setDependencyProblems([]);
+    setRuntimeProblems([]);
+    setSelectedUpdatePaths(null);
     // Modpacks replace the server runtime, so catalog installs start with the
     // chosen filters. Installed-only updates keep the current server target.
     const browsingModpack = type === "modpack" && !installedOnly;
@@ -1528,6 +1913,7 @@ export default function Launchpad({
   }
   function closeRemoval() {
     if (busy === "remove") return;
+    cancelSelectionBatch();
     operation.current++;
     setRemoval(null);
     setRemovalPlan(null);
@@ -1535,7 +1921,11 @@ export default function Launchpad({
     pending.current = false;
     setBusy(null);
   }
-  async function reviewRemoval(entry: InstalledItem) {
+  async function reviewRemoval(
+    entry: InstalledItem,
+    includeDependents = false,
+    cleanupPaths: string[] = [],
+  ) {
     if (pending.current || !canInstall) return;
     const currentSession = session.current,
       currentOperation = ++operation.current;
@@ -1544,11 +1934,14 @@ export default function Launchpad({
     setRemovalError("");
     pending.current = true;
     setRemovalAcknowledged(false);
+    setRemovalDependentsAccepted(false);
     setBusy("removal-preview");
     try {
       const next = await post<RemovalPlan>("/launchpad/removal-preview", {
         path: entry.path,
         type,
+        ...(includeDependents ? { includeDependents: true } : {}),
+        ...(cleanupPaths.length ? { cleanupPaths } : {}),
       });
       if (
         currentSession === session.current &&
@@ -1581,7 +1974,7 @@ export default function Launchpad({
       pending.current ||
       !removal ||
       !removalPlan?.planId ||
-      removalPlan.blocked ||
+      (removalPlan.blocked && !removalDependentsAccepted) ||
       (removalPlan.requiresAcknowledgement && !removalAcknowledged) ||
       !canInstall
     )
@@ -1592,9 +1985,12 @@ export default function Launchpad({
     setBusy("remove");
     setRemovalError("");
     try {
-      await post("/launchpad/remove", {
+      const result = await post<{ undoJobId?: string }>("/launchpad/remove", {
         planId: removalPlan.planId,
         confirmed: true,
+        ...(removalPlan.includesDependents || removalDependentsAccepted
+          ? { acknowledgedDependents: true }
+          : {}),
         ...(removalAcknowledged
           ? { acknowledgedUnreadableDependencies: true }
           : {}),
@@ -1608,6 +2004,7 @@ export default function Launchpad({
       setRemoval(null);
       setRemovalPlan(null);
       const removedPaths = new Set(removalPlan.files.map((file) => file.path));
+      endSelectionItem(removedPaths);
       if (inventoryRef.current?.api === api) {
         const next = {
           ...inventoryRef.current,
@@ -1623,6 +2020,11 @@ export default function Launchpad({
         setInventory(next);
       }
       reloadContent();
+      if (result.undoJobId)
+        setUndoNotice({
+          jobId: result.undoJobId,
+          title: removal.title || removal.name,
+        });
       notify(`${removal.title || removal.name} moved to Recycle Bin.`);
     } catch (cause) {
       if (
@@ -1630,6 +2032,11 @@ export default function Launchpad({
         currentOperation === operation.current
       ) {
         setRemovalError(messageOf(cause));
+        setSelectionOutcome((current) =>
+          current?.status === "running"
+            ? { ...current, status: "failed" }
+            : current,
+        );
         // A failed or stale confirmation needs a fresh dependency/file review.
         setRemovalPlan(null);
       }
@@ -1655,13 +2062,32 @@ export default function Launchpad({
       if (previewRequest.current === controller) previewRequest.current = null;
     });
   }
-  async function preview(event: FormEvent) {
-    event.preventDefault();
+  async function preview(
+    event?: FormEvent,
+    changedResolutions?: Record<string, string>,
+  ) {
+    event?.preventDefault();
     if (selection?.bulk) {
-      await reviewAllUpdates();
+      await reviewAllUpdates(true, changedResolutions);
       return;
     }
-    if (plan || !selection || !versionId || pending.current) return;
+    if (
+      (plan && !changedResolutions) ||
+      !selection ||
+      !versionId ||
+      pending.current
+    )
+      return;
+    if (
+      type !== "modpack" &&
+      (!config?.gameVersion || !config.loader) &&
+      !manualRuntimeAcknowledged
+    ) {
+      setDialogError(
+        "Verify the Minecraft version and loader from server logs before reviewing this installation.",
+      );
+      return;
+    }
     if (!targetVersion.trim()) {
       setDialogError(
         "Choose your server’s Minecraft version before reviewing this installation.",
@@ -1686,7 +2112,15 @@ export default function Launchpad({
     pending.current = true;
     setBusy("preview");
     setDialogError("");
+    setDependencyProblems([]);
+    setRuntimeProblems([]);
     try {
+      if (plan) {
+        await post(
+          `/launchpad/preview/${encodeURIComponent(plan.planId)}/cancel`,
+        );
+        setPlan(null);
+      }
       const next = await prepareReview("/launchpad/preview", {
         platform: selection.project.platform,
         projectId: selection.project.id,
@@ -1694,6 +2128,12 @@ export default function Launchpad({
         type,
         gameVersion: targetVersion.trim(),
         loader: targetLoader,
+        ...(Object.keys(changedResolutions || resolutions).length
+          ? { resolutions: changedResolutions || resolutions }
+          : {}),
+        ...(type === "modpack" && !preserveWorld
+          ? { preserveWorld: false }
+          : {}),
         ...(selection.installed
           ? { replacePath: selection.installed.path }
           : {}),
@@ -1712,8 +2152,15 @@ export default function Launchpad({
       if (
         currentSession === session.current &&
         currentOperation === operation.current
-      )
+      ) {
         setDialogError(messageOf(cause));
+        const problem = cause as {
+          dependencyDecisions?: DependencyDecision[];
+          runtimeRequirements?: RuntimeRequirement[];
+        };
+        setDependencyProblems(problem.dependencyDecisions || []);
+        setRuntimeProblems(problem.runtimeRequirements || []);
+      }
     } finally {
       if (
         currentSession === session.current &&
@@ -1758,8 +2205,13 @@ export default function Launchpad({
     setBusy("install");
     setDialogError("");
     try {
-      if (backupFirst && (type === "modpack" || plan.cleanInstall)) {
+      if (
+        backupFirst &&
+        !backupForSelection.current &&
+        (type === "modpack" || plan.cleanInstall)
+      ) {
         await post("/backups", { name: "Before modpack installation" });
+        backupForSelection.current = true;
         if (
           currentSession !== session.current ||
           currentOperation !== operation.current
@@ -1774,6 +2226,9 @@ export default function Launchpad({
           : {}),
         ...(plan.unavailableDependencies?.length
           ? { acknowledgedUnavailableDependencies: true }
+          : {}),
+        ...(plan.runtimeRequirements?.length
+          ? { acknowledgedRuntimeRequirements: true }
           : {}),
       });
       if (
@@ -1796,7 +2251,13 @@ export default function Launchpad({
         currentOperation === operation.current
       ) {
         if (accepted) accept(accepted);
-        else setDialogError(messageOf(cause));
+        else {
+          setDialogError(messageOf(cause));
+          if (
+            [404, 409, 410].includes((cause as { status?: number }).status || 0)
+          )
+            setPlan(null);
+        }
       }
     } finally {
       if (
@@ -1834,9 +2295,26 @@ export default function Launchpad({
     }
     return null;
   }
-  async function reviewAllUpdates() {
+  async function reviewAllUpdates(
+    reuseSelection = false,
+    changedResolutions?: Record<string, string>,
+    rootPaths?: Set<string>,
+  ) {
     if (pending.current || !canInstall || type === "modpack") return;
-    const updates = availableUpdates.slice(0, 50);
+    const updates = availableUpdates
+      .filter(
+        (item) =>
+          !reuseSelection ||
+          !(rootPaths || selectedUpdatePaths) ||
+          (rootPaths || selectedUpdatePaths)!.has(item.path),
+      )
+      .slice(0, 50);
+    if (!reuseSelection) {
+      setSelectedUpdatePaths(new Set(updates.map((item) => item.path)));
+      setResolutions({});
+      setDependencyProblems([]);
+      setRuntimeProblems([]);
+    }
     if (!updates.length) return;
     const currentSession = session.current,
       currentOperation = ++operation.current;
@@ -1856,10 +2334,17 @@ export default function Launchpad({
     setBusy("preview");
     pending.current = true;
     try {
+      if (plan)
+        await post(
+          `/launchpad/preview/${encodeURIComponent(plan.planId)}/cancel`,
+        );
       const next = await prepareReview("/launchpad/updates/preview", {
         type,
         gameVersion: contentGameVersion,
         loader: contentLoader,
+        ...(Object.keys(changedResolutions || resolutions).length
+          ? { resolutions: changedResolutions || resolutions }
+          : {}),
         updates: updates.map((item) => ({
           platform: item.platform,
           projectId: item.projectId,
@@ -1974,8 +2459,13 @@ export default function Launchpad({
       }
     }
   }
-  async function setModActive(entry: InstalledItem, active: boolean) {
-    if (pending.current || !canInstall || type !== "mod") return;
+  async function setContentActive(
+    entry: InstalledItem,
+    active: boolean,
+    acknowledgedDependencies = false,
+  ) {
+    if (pending.current || !canInstall || (type !== "mod" && type !== "plugin"))
+      return;
     const currentSession = session.current;
     pending.current = true;
     setBusy("active");
@@ -1983,11 +2473,24 @@ export default function Launchpad({
       const result = await post<{
         path: string;
         active: boolean;
+        requiresAcknowledgement?: boolean;
+        warnings?: string[];
         modifiedAt: string;
         addedAt: string;
-      }>("/launchpad/active", { path: entry.path, active });
+      }>("/launchpad/active", {
+        type,
+        path: entry.path,
+        active,
+        ...(acknowledgedDependencies ? { acknowledgedDependencies: true } : {}),
+      });
       if (currentSession !== session.current) return;
-      const previous = inventoryCache.current.get("mod");
+      if (result.requiresAcknowledgement) {
+        setActivation({ entry, active, warnings: result.warnings || [] });
+        return;
+      }
+      setActivation(null);
+      endSelectionItem(new Set([entry.path]));
+      const previous = inventoryCache.current.get(type);
       if (previous?.api === api) {
         const next = {
           ...previous,
@@ -2004,8 +2507,8 @@ export default function Launchpad({
             ),
           },
         };
-        inventoryCache.current.set("mod", next);
-        if (inventoryRef.current?.type === "mod") {
+        inventoryCache.current.set(type, next);
+        if (inventoryRef.current?.type === type) {
           scanEpoch.current++;
           inventoryRef.current = next;
           setInventory(next);
@@ -2016,7 +2519,14 @@ export default function Launchpad({
         `${entry.title || entry.name} ${active ? "enabled" : "disabled"}.`,
       );
     } catch (cause) {
-      if (currentSession === session.current) notify(messageOf(cause), true);
+      if (currentSession === session.current) {
+        notify(messageOf(cause), true);
+        setSelectionOutcome((current) =>
+          current?.status === "running"
+            ? { ...current, status: "failed" }
+            : current,
+        );
+      }
     } finally {
       if (currentSession === session.current) {
         pending.current = false;
@@ -2025,14 +2535,19 @@ export default function Launchpad({
     }
   }
   function changeType(next: ContentType) {
+    if (pending.current || busy) return;
+    cancelSelectionBatch();
+    setSelectedPaths(new Set());
     setType(next);
     setCategories([]);
     setLoader((current) =>
       loadersFor(next).includes(current)
         ? current
-        : next === "datapack"
-          ? "datapack"
-          : "",
+        : loadersFor(next).includes(config?.loader || "")
+          ? config!.loader!
+          : next === "datapack"
+            ? "datapack"
+            : "",
     );
     setQuery("");
     setOffset(0);
@@ -2067,6 +2582,65 @@ export default function Launchpad({
       setOffset(currentOffset);
   }, [installedOnly, installed, offset, currentOffset]);
   const selectedVersion = versions.find((version) => version.id === versionId);
+  useEffect(() => {
+    if (!selectionBatch || busy || removal || activation || !canInstall) return;
+    const entry = selectionBatch.items[0];
+    if (!entry || selectionStarted.current === entry.path) return;
+    selectionStarted.current = entry.path;
+    if (selectionBatch.action === "remove") void reviewRemoval(entry);
+    else void setContentActive(entry, false);
+  }, [selectionBatch, busy, removal, activation, canInstall]);
+  useEffect(() => {
+    setDependencySummary(null);
+    setDependencySummaryError("");
+    if (
+      !selection ||
+      selection.bulk ||
+      plan ||
+      !versionId ||
+      !targetVersion ||
+      !targetLoader
+    ) {
+      setDependencySummaryLoading(false);
+      return;
+    }
+    const controller = new AbortController();
+    setDependencySummaryLoading(true);
+    const params = new URLSearchParams({
+      platform: selection.project.platform,
+      projectId: selection.project.id,
+      versionId,
+      type,
+      gameVersion: targetVersion,
+      loader: targetLoader,
+    });
+    void api<NonNullable<typeof dependencySummary>>(
+      `/launchpad/dependencies?${params}`,
+      { signal: controller.signal },
+    )
+      .then((result) => {
+        if (!controller.signal.aborted) setDependencySummary(result);
+      })
+      .catch((cause) => {
+        if (!controller.signal.aborted)
+          setDependencySummaryError(messageOf(cause));
+      })
+      .finally(() => {
+        if (!controller.signal.aborted) setDependencySummaryLoading(false);
+      });
+    return () => controller.abort();
+  }, [
+    api,
+    selection?.project.platform,
+    selection?.project.id,
+    selection?.bulk,
+    versionId,
+    targetVersion,
+    targetLoader,
+    type,
+    Boolean(plan),
+  ]);
+
   const loading = installedOnly
     ? !installed && scanLoading
     : !results && searchLoading;
@@ -2301,11 +2875,28 @@ export default function Launchpad({
                 !canInstall ||
                 Boolean(busy) ||
                 !updateFiltersReady ||
-                !installed?.items.some((item) => item.update)
+                !availableUpdates.length ||
+                scanRefreshing ||
+                Boolean(installed?.checkingUpdates)
               }
               onClick={() => void reviewAllUpdates()}
             >
               <RefreshCw size={15} /> {updateLabel}
+            </button>
+          )}
+          {(permissions === undefined || permissions.includes("file.read")) && (
+            <button
+              className="btn"
+              disabled={clientPackBusy}
+              onClick={() => void reviewClientPack()}
+            >
+              <Download size={15} />
+              {clientPackBusy ? "Preparing export…" : "Export client pack"}
+            </button>
+          )}
+          {allowChanges && (
+            <button className="btn" onClick={() => void openContentHistory()}>
+              Recent changes
             </button>
           )}
           <Switch
@@ -2317,9 +2908,7 @@ export default function Launchpad({
             }
             checked={installedOnly}
             onCheckedChange={(checked) => {
-              setInstalledOnly(checked);
-              setOffset(0);
-              setQuery("");
+              changeInventoryMode(checked);
               if (!checked && !source?.types.includes(type))
                 changeType(source?.types[0] ?? "modpack");
             }}
@@ -2396,7 +2985,12 @@ export default function Launchpad({
         className={`launchpad-column-heading launchpad-column-${column}`}
         aria-label={`Sort by ${label}`}
         aria-pressed={selected}
-        title={`Sort ${label.toLowerCase()} ${ascending ? "ascending" : "descending"}`}
+        disabled={selected}
+        title={
+          selected
+            ? `Sorted ${ascending ? "ascending" : "descending"}; this catalog provides a fixed order`
+            : `Sort ${label.toLowerCase()} ${ascending ? "ascending" : "descending"}`
+        }
         onClick={() => {
           setSort(catalogId);
           setOffset(0);
@@ -2467,6 +3061,18 @@ export default function Launchpad({
             onChange={(event) => {
               const next = config.platforms.find(
                 (item) => item.id === event.target.value,
+              );
+              const dropped = categories.filter(
+                (id) => !supportsCategory(id, event.target.value),
+              );
+              if (dropped.length)
+                notify(
+                  `${dropped.length} category filters are unavailable on ${next?.name || "this platform"} and were cleared.`,
+                );
+              setCategories((current) =>
+                current.filter((id) =>
+                  supportsCategory(id, event.target.value),
+                ),
               );
               setPlatform(event.target.value);
               setQuery("");
@@ -2553,7 +3159,9 @@ export default function Launchpad({
             aria-selected={type === id}
             aria-controls="launchpad-results"
             tabIndex={type === id ? 0 : -1}
-            disabled={!installedOnly && !source?.types.includes(id)}
+            disabled={
+              Boolean(busy) || (!installedOnly && !source?.types.includes(id))
+            }
             title={
               !installedOnly && !source?.types.includes(id)
                 ? `${source?.name ?? "This platform"} does not offer ${label.toLowerCase()}.`
@@ -2630,7 +3238,164 @@ export default function Launchpad({
           </div>
         </div>
       )}
+      <div
+        className="launchpad-view-tabs"
+        role="group"
+        aria-label="Catalog view"
+      >
+        <button
+          className={`btn ${!installedOnly ? "primary" : ""}`}
+          aria-pressed={!installedOnly}
+          onClick={() => {
+            changeInventoryMode(false);
+          }}
+        >
+          Browse catalog
+        </button>
+        <button
+          className={`btn ${installedOnly ? "primary" : ""}`}
+          aria-pressed={installedOnly}
+          onClick={() => {
+            changeInventoryMode(true);
+          }}
+        >
+          Installed content{installed ? ` (${installed.items.length})` : ""}
+          {availableUpdates.length
+            ? ` · ${availableUpdates.length} updates`
+            : ""}
+        </button>
+      </div>
       {toolbar()}
+      {installedOnly && type !== "modpack" && allowChanges && (
+        <div
+          className="launchpad-selection-bar"
+          role="group"
+          aria-label="Selected installed content"
+        >
+          <strong>{selectedPaths.size} selected</strong>
+          <button
+            className="btn"
+            disabled={Boolean(busy) || !!selectionBatch}
+            onClick={() =>
+              setSelectedPaths(
+                new Set(
+                  visibleProjects.flatMap(({ entry }) =>
+                    entry ? [entry.path] : [],
+                  ),
+                ),
+              )
+            }
+          >
+            Select this page
+          </button>
+          <button
+            className="btn"
+            disabled={!selectedPaths.size || Boolean(busy) || !!selectionBatch}
+            onClick={() => setSelectedPaths(new Set())}
+          >
+            Clear selection
+          </button>
+          <button
+            className="btn"
+            disabled={
+              !canInstall ||
+              Boolean(busy) ||
+              !!selectionBatch ||
+              scanRefreshing ||
+              !availableUpdates.some((item) => selectedPaths.has(item.path))
+            }
+            onClick={() => {
+              setSelectedUpdatePaths(new Set(selectedPaths));
+              setResolutions({});
+              void reviewAllUpdates(true, {}, selectedPaths);
+            }}
+          >
+            Update selected
+          </button>
+          {(type === "mod" || type === "plugin") && (
+            <button
+              className="btn"
+              disabled={
+                !canInstall ||
+                Boolean(busy) ||
+                !!selectionBatch ||
+                !selectedPaths.size
+              }
+              onClick={() => startSelectedAction("disable")}
+            >
+              Disable selected
+            </button>
+          )}
+          <button
+            className="btn danger"
+            disabled={
+              !canInstall ||
+              Boolean(busy) ||
+              !!selectionBatch ||
+              !selectedPaths.size
+            }
+            onClick={() => startSelectedAction("remove")}
+          >
+            Remove selected
+          </button>
+          {selectionBatch && (
+            <span role="status">
+              {selectionBatch.action === "remove"
+                ? "Reviewing removal"
+                : "Disabling"}
+              : {selectionBatch.total - selectionBatch.items.length + 1} of{" "}
+              {selectionBatch.total}. Each file is checked before changing it.{" "}
+              <button
+                className="btn"
+                onClick={() => {
+                  cancelSelectionBatch();
+                  if (!busy) {
+                    setActivation(null);
+                    setRemoval(null);
+                    setRemovalPlan(null);
+                  }
+                }}
+              >
+                Cancel remaining
+              </button>
+              {!busy && !removal && !activation && (
+                <button
+                  className="btn"
+                  onClick={() => {
+                    selectionStarted.current = null;
+                    setSelectionOutcome((current) =>
+                      current ? { ...current, status: "running" } : current,
+                    );
+                    setSelectionBatch({ ...selectionBatch });
+                  }}
+                >
+                  Retry selected item
+                </button>
+              )}
+            </span>
+          )}
+        </div>
+      )}
+      {selectionOutcome && (
+        <p className="management-notice" role="status">
+          Selected{" "}
+          {selectionOutcome.action === "remove" ? "removal" : "disable"}:{" "}
+          {selectionOutcome.total - selectionOutcome.remaining.length} of{" "}
+          {selectionOutcome.total} completed.{" "}
+          {selectionOutcome.status === "cancelled"
+            ? "Remaining changes cancelled; an in-flight item may still finish."
+            : selectionOutcome.status === "failed"
+              ? "Paused after an error. The current item may have changed; refresh installed content before retrying. Unstarted items were not requested."
+              : selectionOutcome.status === "complete"
+                ? "All selected changes completed."
+                : "Checking each file before changing it."}{" "}
+          {!selectionBatch && !busy && (
+            <button className="btn" onClick={() => setSelectionOutcome(null)}>
+              Dismiss selection status
+            </button>
+          )}
+        </p>
+      )}
       {job && (
         <div
           className="panel launchpad-job"
@@ -2668,6 +3433,15 @@ export default function Launchpad({
                   </a>
                 )}
             </div>
+            {job.undoAvailable && (
+              <button
+                className="btn"
+                disabled={!canInstall || undoBusy}
+                onClick={() => reviewUndo(job.id, job.message)}
+              >
+                Undo installation…
+              </button>
+            )}
             {job.status === "failed" && job.retryable && job.retryInput && (
               <button
                 className="btn"
@@ -2694,6 +3468,40 @@ export default function Launchpad({
               >
                 Retry recovery
               </button>
+            )}
+            {job.recoveryRequired && canRecover && (
+              <div>
+                {keepCurrentReview ? (
+                  <>
+                    <p>
+                      Keep the current files and accept the interrupted
+                      installation state? Retained originals stay available for
+                      manual recovery.
+                    </p>
+                    <button
+                      className="btn danger"
+                      disabled={jobAction}
+                      onClick={() => void actOnJob("keep")}
+                    >
+                      Confirm current files
+                    </button>
+                    <button
+                      className="btn"
+                      onClick={() => setKeepCurrentReview(false)}
+                    >
+                      Cancel
+                    </button>
+                  </>
+                ) : (
+                  <button
+                    className="btn"
+                    disabled={jobAction}
+                    onClick={() => setKeepCurrentReview(true)}
+                  >
+                    Keep current files…
+                  </button>
+                )}
+              </div>
             )}
             {!working &&
               !job.recoveryRequired &&
@@ -2849,13 +3657,45 @@ export default function Launchpad({
           </button>
         </div>
       )}
+      {undoNotice && (
+        <div className="launchpad-inline-notice" role="status">
+          <span>{undoNotice.title} was removed.</span>
+          <button
+            className="btn"
+            onClick={() => reviewUndo(undoNotice.jobId, undoNotice.title)}
+          >
+            Review undo
+          </button>
+          <button
+            className="btn icon"
+            aria-label="Dismiss removal undo notice"
+            onClick={() => setUndoNotice(null)}
+          >
+            <X size={15} />
+          </button>
+        </div>
+      )}
+      {!installedOnly && searchLoading && results && (
+        <p role="status">Updating projects…</p>
+      )}
+      {duplicateUpdateCount > 0 && installedOnly && (
+        <p className="launchpad-inline-notice" role="status">
+          {duplicateUpdateCount} duplicate copies are excluded from Update all.
+          Review and remove the extra copies before updating those projects.
+        </p>
+      )}
+      {changeDisabledReason && (
+        <p className="launchpad-inline-notice" role="status">
+          {changeDisabledReason}
+        </p>
+      )}
       <section
         ref={resultsElement}
         id="launchpad-results"
         className="launchpad-results"
         role="tabpanel"
         aria-labelledby={`launchpad-tab-${type}`}
-        aria-busy={loading}
+        aria-busy={loading || searchLoading}
       >
         {!installedOnly && (!source?.available || !supported) ? (
           <StatePanel
@@ -2863,7 +3703,9 @@ export default function Launchpad({
             icon={<SlidersHorizontal size={25} />}
             title={`${source?.name ?? "Platform"} ${supported ? "is unavailable" : "does not offer this content"}`}
             message={
-              source?.reason || "Choose another platform or content type."
+              permissions !== undefined && source?.requiresKey
+                ? "Ask the computer owner to configure this platform’s API key in Launchpad settings, or choose another platform."
+                : source?.reason || "Choose another platform or content type."
             }
             action={
               permissions === undefined &&
@@ -2904,13 +3746,29 @@ export default function Launchpad({
             icon={<Package size={27} />}
             title={
               installedOnly
-                ? "No installed content matches"
+                ? query || categoryKey
+                  ? "No installed content matches"
+                  : "No content installed yet"
                 : "No projects found"
             }
             message={
               installedOnly
                 ? "Installed files appear here after a scan. Try another content type or search."
                 : "Try another search, Minecraft version, or loader."
+            }
+            action={
+              query || categoryKey ? (
+                <button
+                  className="btn"
+                  onClick={() => {
+                    setQuery("");
+                    setCategories([]);
+                    setOffset(0);
+                  }}
+                >
+                  Clear filters
+                </button>
+              ) : undefined
             }
           />
         ) : (
@@ -2931,7 +3789,7 @@ export default function Launchpad({
               {installedOnly && <span> · Updates always appear first.</span>}
             </div>
             <div
-              className={`launchpad-installed-list${type === "mod" ? " has-active" : ""}`}
+              className={`launchpad-installed-list${type === "mod" || type === "plugin" ? " has-active" : ""}`}
               tabIndex={0}
               role="region"
               aria-label={
@@ -2952,11 +3810,17 @@ export default function Launchpad({
                 {columnHeading("name", "Name", "name")}
                 <span className="launchpad-column-action">Action</span>
                 {columnHeading("author", "Author", "author")}
-                {type === "mod" && columnHeading("active", "Active", "active")}
-                {columnHeading("added", "Date added", "added", "newest")}
+                {(type === "mod" || type === "plugin") &&
+                  columnHeading("active", "Active", "active")}
+                {columnHeading(
+                  "added",
+                  installedOnly ? "Date added" : "Published",
+                  "added",
+                  "newest",
+                )}
                 {columnHeading(
                   "modified",
-                  "Date modified",
+                  installedOnly ? "Date modified" : "Updated",
                   "modified",
                   "updated",
                 )}
@@ -2968,6 +3832,25 @@ export default function Launchpad({
                   aria-label={project.title}
                 >
                   <div className="launchpad-project-main">
+                    {installedOnly &&
+                      entry &&
+                      type !== "modpack" &&
+                      allowChanges && (
+                        <input
+                          type="checkbox"
+                          aria-label={`Select ${project.title}`}
+                          checked={selectedPaths.has(entry.path)}
+                          disabled={Boolean(busy) || !!selectionBatch}
+                          onChange={(event) =>
+                            setSelectedPaths((current) => {
+                              const next = new Set(current);
+                              if (event.target.checked) next.add(entry.path);
+                              else next.delete(entry.path);
+                              return next;
+                            })
+                          }
+                        />
+                      )}
                     <ProjectIcon url={project.iconUrl} />
                     <div className="launchpad-project-body">
                       <div className="launchpad-project-title">
@@ -2993,14 +3876,18 @@ export default function Launchpad({
                               : "Unidentified file"}
                           </span>
                         )}
-                        {entry?.update && (
+                        {entry?.updateHeld && (
+                          <span className="launchpad-badge">Version held</span>
+                        )}
+                        {entry?.update && !entry.updateHeld && (
                           <span className="launchpad-badge update">
                             Update available
                           </span>
                         )}
-                        {entry?.active === false && type === "mod" && (
-                          <span className="launchpad-badge">Disabled</span>
-                        )}
+                        {entry?.active === false &&
+                          (type === "mod" || type === "plugin") && (
+                            <span className="launchpad-badge">Disabled</span>
+                          )}
                         {installedOnly && entry?.platform && (
                           <span className="launchpad-badge">
                             {config.platforms.find(
@@ -3012,7 +3899,7 @@ export default function Launchpad({
                           duplicateProjects.has(
                             `${entry.platform}:${entry.projectId}`,
                           ) && (
-                            <span className="launchpad-badge update">
+                            <span className="launchpad-badge duplicate">
                               Duplicate — remove one
                             </span>
                           )}
@@ -3037,6 +3924,22 @@ export default function Launchpad({
                         {entry?.versionName && (
                           <span>Installed: {entry.versionName}</span>
                         )}
+                        {entry?.previousVersionName && (
+                          <span>
+                            Previously installed: {entry.previousVersionName}
+                          </span>
+                        )}
+                        {entry?.platform && entry.projectId && allowChanges && (
+                          <button
+                            className="btn small"
+                            disabled={Boolean(busy) || working}
+                            onClick={() => void holdVersion(entry)}
+                          >
+                            {entry.updateHeld
+                              ? "Allow updates"
+                              : "Hold this version"}
+                          </button>
+                        )}
                         {entry &&
                           updateCheckLabel(
                             entry,
@@ -3054,7 +3957,7 @@ export default function Launchpad({
                         {!entry?.platform && entry && (
                           <span>
                             {scanRefreshing
-                              ? "Checking this file’s project details..."
+                              ? "Checking this file’s project details…"
                               : "Could not identify this file for automatic updates."}
                           </span>
                         )}
@@ -3080,8 +3983,7 @@ export default function Launchpad({
                           className={`btn ${entry && !entry.update ? "" : "primary"}`}
                           aria-label={`${entry?.update ? "Update" : entry ? "Choose version for" : "Install"} ${project.title}`}
                           disabled={
-                            !allowChanges ||
-                            working ||
+                            !canInstall ||
                             Boolean(busy) ||
                             Boolean(entry && pendingPaths.has(entry.path)) ||
                             !config.platforms.find(
@@ -3109,9 +4011,20 @@ export default function Launchpad({
                         )}
                       </div>
                     )}
+                    {type === "modpack" && onCreateServer && (
+                      <button
+                        className="btn launchpad-create-server"
+                        onClick={() => {
+                          setSetupModpack(project);
+                          onCreateServer();
+                        }}
+                      >
+                        Create new server with this modpack
+                      </button>
+                    )}
                     {entry && type !== "modpack" && (
                       <>
-                        {type === "mod" && (
+                        {(type === "mod" || type === "plugin") && (
                           <Switch
                             className="launchpad-active"
                             aria-label={`Active: ${project.title}`}
@@ -3123,12 +4036,13 @@ export default function Launchpad({
                               pendingPaths.has(entry.path)
                             }
                             title={
-                              status !== "offline"
-                                ? "Stop the server before enabling or disabling mods."
-                                : `${entry.active === false ? "Enable" : "Disable"} ${project.title}`
+                              changeDisabledReason ||
+                              (status !== "offline"
+                                ? `Stop the server before enabling or disabling ${contentName}s.`
+                                : `${entry.active === false ? "Enable" : "Disable"} ${project.title}`)
                             }
                             onCheckedChange={(active) =>
-                              void setModActive(entry, active)
+                              void setContentActive(entry, active)
                             }
                           />
                         )}
@@ -3137,9 +4051,10 @@ export default function Launchpad({
                           className="btn launchpad-remove"
                           aria-label={`Remove ${project.title}`}
                           title={
-                            status !== "offline"
+                            changeDisabledReason ||
+                            (status !== "offline"
                               ? `Stop the server before removing ${contentName}s.`
-                              : `Review ${contentName} removal`
+                              : `Review ${contentName} removal`)
                           }
                           disabled={
                             !canInstall ||
@@ -3152,7 +4067,7 @@ export default function Launchpad({
                         </button>
                       </>
                     )}
-                    {type === "mod" && !entry && (
+                    {(type === "mod" || type === "plugin") && !entry && (
                       <span
                         className="launchpad-active launchpad-empty-cell"
                         aria-label="Not installed"
@@ -3206,11 +4121,13 @@ export default function Launchpad({
             </button>
           </div>
           <h2 id="launchpad-install-title">
-            {plan
-              ? "Review installation"
-              : selection?.installed?.update
-                ? "Update content"
-                : "Install content"}
+            {selection?.bulk
+              ? "Review selected updates"
+              : plan
+                ? "Review installation"
+                : selection?.installed?.update
+                  ? "Update content"
+                  : "Install content"}
           </h2>
           <div className="launchpad-step">
             <span>Step {plan ? "2" : "1"} of 2</span>
@@ -3219,7 +4136,9 @@ export default function Launchpad({
                 ? type === "modpack"
                   ? "Review modpack"
                   : "Review file changes"
-                : "Select a version"}
+                : selection?.bulk
+                  ? "Select updates"
+                  : "Select a version"}
             </span>
           </div>
           <p className="management-dialog-description">
@@ -3238,6 +4157,36 @@ export default function Launchpad({
               selection?.project.title
             )}
           </p>
+          {selection?.bulk && (
+            <fieldset
+              disabled={Boolean(busy)}
+              className="launchpad-update-selection"
+            >
+              <legend>Updates to include</legend>
+              {availableUpdates.slice(0, 50).map((item) => (
+                <label className="launchpad-clean-confirm" key={item.path}>
+                  <input
+                    type="checkbox"
+                    checked={selectedUpdatePaths?.has(item.path) ?? true}
+                    onChange={(event) => {
+                      const next = new Set(
+                        selectedUpdatePaths ||
+                          availableUpdates.map((entry) => entry.path),
+                      );
+                      if (event.target.checked) next.add(item.path);
+                      else next.delete(item.path);
+                      setSelectedUpdatePaths(next);
+                      setResolutions({});
+                      setPlan(null);
+                    }}
+                  />
+                  {item.title || item.name} ·{" "}
+                  {item.versionName || "Unknown installed version"} →{" "}
+                  {item.update?.version || item.update?.name}
+                </label>
+              ))}
+            </fieldset>
+          )}
           {!plan && selection?.bulk ? (
             <p role="status">
               {busy
@@ -3256,7 +4205,10 @@ export default function Launchpad({
                   aria-describedby={
                     !targetLoader ? "launchpad-loader-notice" : undefined
                   }
-                  disabled={Boolean(busy)}
+                  disabled={
+                    Boolean(busy) ||
+                    (type !== "modpack" && Boolean(config.loader))
+                  }
                   onChange={(event) => setTargetLoader(event.target.value)}
                 >
                   <option value="">Not selected</option>
@@ -3283,7 +4235,10 @@ export default function Launchpad({
                   id="launchpad-target-minecraft"
                   value={targetVersion}
                   required
-                  disabled={Boolean(busy)}
+                  disabled={
+                    Boolean(busy) ||
+                    (type !== "modpack" && Boolean(config.gameVersion))
+                  }
                   onChange={(event) => setTargetVersion(event.target.value)}
                 >
                   <option value="">Select Minecraft version</option>
@@ -3294,8 +4249,23 @@ export default function Launchpad({
                   ))}
                 </select>
               </div>
+              {type !== "modpack" &&
+                (!config.gameVersion || !config.loader) && (
+                  <label className="launchpad-clean-confirm">
+                    <input
+                      type="checkbox"
+                      checked={manualRuntimeAcknowledged}
+                      onChange={(event) =>
+                        setManualRuntimeAcknowledged(event.target.checked)
+                      }
+                    />
+                    I verified this server’s Minecraft version and loader from
+                    its logs or launch files. Automatic detection is
+                    unavailable.
+                  </label>
+                )}
               {versionsLoading ? (
-                <p role="status">Loading compatible versions...</p>
+                <p role="status">Loading compatible versions…</p>
               ) : versionsError ? (
                 <div className="launchpad-error" role="alert">
                   <span>{versionsError}</span>
@@ -3317,7 +4287,12 @@ export default function Launchpad({
                     value={versionId}
                     disabled={Boolean(busy)}
                     required
-                    onChange={(event) => setVersionId(event.target.value)}
+                    onChange={(event) => {
+                      setVersionId(event.target.value);
+                      setResolutions({});
+                      setDependencyProblems([]);
+                      setRuntimeProblems([]);
+                    }}
                   >
                     <option value="">
                       {versions.length
@@ -3331,14 +4306,77 @@ export default function Launchpad({
                         disabled={!version.downloadable}
                       >
                         {version.name || version.version}
+                        {version.id === selection?.installed?.versionId
+                          ? " · Installed"
+                          : version.id ===
+                              selection?.installed?.previousVersionId
+                            ? " · Previously installed"
+                            : ""}
+                        {version.channel || version.versionType
+                          ? ` · ${version.channel || version.versionType}`
+                          : ""}
                         {!version.downloadable
-                          ? " · Manual download required"
+                          ? ` · ${version.serverCompatible === false ? "Client only" : version.reason || version.unavailableReason || "No compatible server download"}`
                           : ""}
                       </option>
                     ))}
                   </select>
                 </div>
               )}
+              <section
+                className="launchpad-dependency-summary"
+                aria-label="Catalog dependency summary"
+              >
+                <strong>Declared dependencies</strong>
+                <p>
+                  Catalog information only. The full review checks downloaded
+                  files, version conflicts, and runtime requirements before
+                  installation.
+                </p>
+                {dependencySummaryLoading && (
+                  <p role="status">Loading declared dependencies…</p>
+                )}
+                {dependencySummaryError && (
+                  <p role="status">
+                    Catalog dependency details are unavailable:{" "}
+                    {dependencySummaryError}. Continue to the full review to
+                    check requirements.
+                  </p>
+                )}
+                {dependencySummary && (
+                  <>
+                    <ul>
+                      {dependencySummary.dependencies.map((item, index) => (
+                        <li key={`${item.title}:${index}`}>
+                          <strong>{item.title}</strong> · {item.relation} ·{" "}
+                          {item.status === "installed"
+                            ? `Installed${item.installedVersion ? ` ${item.installedVersion}` : ""}`
+                            : item.status === "disabled"
+                              ? `Installed but disabled${item.installedVersion ? ` ${item.installedVersion}` : ""}`
+                              : item.status === "not-identified"
+                                ? "Not identified in installed inventory; full review required"
+                                : "Catalog details unavailable"}
+                          {item.proposedVersion
+                            ? ` · Proposed ${item.proposedVersion}`
+                            : ""}
+                        </li>
+                      ))}
+                    </ul>
+                    {!dependencySummary.dependencies.length && (
+                      <p>
+                        {dependencySummary.declarationsAvailable === false
+                          ? "This catalog does not expose dependency declarations. Full review is required."
+                          : "No dependencies declared by this catalog. Full review also checks the actual files."}
+                      </p>
+                    )}
+                    {dependencySummary.warnings.map((warning) => (
+                      <p className="management-warning" key={warning}>
+                        {warning}
+                      </p>
+                    ))}
+                  </>
+                )}
+              </section>
               {selectedVersion && (
                 <div className="launchpad-version-details">
                   <span>{selectedVersion.gameVersions.join(", ")}</span>
@@ -3361,13 +4399,22 @@ export default function Launchpad({
               <p className="management-dialog-description">
                 {type === "modpack" ? (
                   <>
-                    <strong>{plan.versionName}</strong> will be installed into a
-                    clean server folder. The server will remain stopped.
+                    <strong>{plan.versionName}</strong> replaces the pack
+                    runtime and content.{" "}
+                    {preserveWorld
+                      ? "Worlds and server settings are preserved."
+                      : "The server folder will be replaced."}{" "}
+                    The server will remain stopped.
                   </>
                 ) : plan.files.length ? (
                   <>
-                    <strong>{plan.versionName}</strong> will make these changes
-                    to this server. The server will remain stopped.
+                    <strong>
+                      {selection?.bulk
+                        ? "The selected updates"
+                        : plan.versionName}
+                    </strong>{" "}
+                    will make these changes to this server. The server will
+                    remain stopped.
                   </>
                 ) : (
                   <>
@@ -3422,7 +4469,23 @@ export default function Launchpad({
                     {plan.files.map((file) => (
                       <li key={file.path}>
                         <span>
-                          {file.path}
+                          {file.title && <strong>{file.title}</strong>}
+                          <span>{file.path}</span>
+                          {(file.installedVersion || file.proposedVersion) && (
+                            <small className="launchpad-previous-path">
+                              {file.installedVersion || "Not installed"} →{" "}
+                              {file.proposedVersion || "Unknown version"}
+                              {file.direction ? ` · ${file.direction}` : ""}
+                            </small>
+                          )}
+                          {file.installReason && (
+                            <small className="launchpad-previous-path">
+                              {file.installReason}
+                              {file.requiredBy?.length
+                                ? ` · required by ${file.requiredBy.join(", ")}`
+                                : ""}
+                            </small>
+                          )}
                           {file.previousPath &&
                             file.previousPath !== file.path && (
                               <small className="launchpad-previous-path">
@@ -3433,7 +4496,11 @@ export default function Launchpad({
                         <span
                           className={`launchpad-badge ${file.action === "replace" ? "update" : ""}`}
                         >
-                          {file.action === "replace" ? "Replace" : "Install"}
+                          {file.direction === "downgrade"
+                            ? "Downgrade"
+                            : file.action === "replace"
+                              ? "Replace"
+                              : "Install"}
                         </span>
                         <span>{formatBytes(file.size)}</span>
                       </li>
@@ -3542,20 +4609,44 @@ export default function Launchpad({
               )}
               {(type === "modpack" || plan.cleanInstall) && (
                 <>
+                  <label className="launchpad-clean-confirm">
+                    <input
+                      type="checkbox"
+                      checked={preserveWorld}
+                      disabled={Boolean(busy)}
+                      onChange={(event) => {
+                        setPreserveWorld(event.target.checked);
+                        setPlan(null);
+                        setCleanAccepted(false);
+                      }}
+                    />
+                    Keep worlds and server settings
+                  </label>
                   <div className="launchpad-inline-notice launchpad-clean-warning">
                     <AlertCircle size={17} />
                     <div>
                       <strong>
-                        This replaces the server folder’s contents
+                        {preserveWorld
+                          ? "This replaces the pack runtime and installed content"
+                          : "This replaces the server folder’s contents"}
                       </strong>
                       <p>
-                        Existing files, including worlds, mods, plugins and
-                        settings, will move to Recycle Bin for recovery. The
-                        modpack and its required server software will be
-                        installed into a clean folder.
+                        {preserveWorld
+                          ? "Worlds and server settings remain in place. Pack mods and configuration are replaced; replaced files move to Recycle Bin. Create a backup before updating a pack."
+                          : "Existing files, including worlds, mods, plugins and settings, move to Recycle Bin. The modpack and runtime are installed into a clean folder."}{" "}
+                        <a href="#backups">Open Backups</a>
                       </p>
                     </div>
                   </div>
+                  {permissions &&
+                    (!permissions.includes("file.read") ||
+                      !permissions.includes("file.create")) && (
+                      <p className="management-warning">
+                        Your account cannot restore retained files from Recycle
+                        Bin. Ask the server owner to keep a backup and help
+                        recover files if needed.
+                      </p>
+                    )}
                   <label className="launchpad-clean-confirm">
                     <input
                       type="checkbox"
@@ -3565,8 +4656,9 @@ export default function Launchpad({
                         setCleanAccepted(event.target.checked)
                       }
                     />
-                    I understand this replaces all files in this server’s
-                    folder.
+                    {preserveWorld
+                      ? "I understand this replaces pack software, mods, and configuration."
+                      : "I understand this replaces all files in this server’s folder."}
                   </label>
                   {plan.hasExistingContent &&
                     (permissions === undefined ||
@@ -3586,6 +4678,93 @@ export default function Launchpad({
                 </>
               )}
             </>
+          )}
+          {(plan?.dependencyDecisions || dependencyProblems).length > 0 && (
+            <section
+              className="launchpad-dependency-decisions"
+              aria-label="Dependency choices"
+            >
+              <h3>Dependency changes</h3>
+              {(plan?.dependencyDecisions || dependencyProblems).map(
+                (decision) => (
+                  <label className="form-field" key={decision.key}>
+                    <strong>{decision.title}</strong>
+                    <span>
+                      {decision.installedVersion || "Not installed"} →{" "}
+                      {decision.proposedVersion || "No proposed version"}
+                      {decision.direction ? ` · ${decision.direction}` : ""}
+                    </span>
+                    {decision.requiredBy?.length ? (
+                      <small>
+                        Required by {decision.requiredBy.join(", ")}
+                      </small>
+                    ) : null}
+                    {decision.warning && (
+                      <small className="management-warning">
+                        {decision.warning}
+                      </small>
+                    )}
+                    <select
+                      aria-label={`Dependency choice for ${decision.title}`}
+                      value={resolutions[decision.key] || decision.choice}
+                      disabled={Boolean(busy)}
+                      onChange={(event) => {
+                        const next = {
+                          ...resolutions,
+                          [decision.key]: event.target.value,
+                        };
+                        setResolutions(next);
+                        void preview(undefined, next);
+                      }}
+                    >
+                      {decision.allowedChoices.map((choice) => (
+                        <option key={choice} value={choice}>
+                          {choice === "keep-installed"
+                            ? "Keep installed version"
+                            : choice === "skip"
+                              ? "Skip this dependency (review risk)"
+                              : "Use proposed version"}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                ),
+              )}
+            </section>
+          )}
+          {(plan?.runtimeRequirements || runtimeProblems).length > 0 && (
+            <div className="launchpad-inline-notice launchpad-clean-warning">
+              <div>
+                <strong>Runtime requirements need review</strong>
+                {(plan?.runtimeRequirements || runtimeProblems).map(
+                  (requirement, index) => (
+                    <p key={index}>
+                      {requirement.mod || requirement.path} requires{" "}
+                      {requirement.id}{" "}
+                      {typeof requirement.range === "string"
+                        ? requirement.range
+                        : JSON.stringify(requirement.range)}
+                      ; installed {requirement.installed || "unknown"}. Status:{" "}
+                      {requirement.status}.
+                    </p>
+                  ),
+                )}
+                <a href="#versions">Review server runtime in Versions</a>
+                <p>Install anyway accepts these compatibility risks.</p>
+              </div>
+            </div>
+          )}
+          {!!plan?.skippedUpdates?.length && (
+            <div className="launchpad-inline-notice">
+              <div>
+                <strong>Updates excluded from this review</strong>
+                {plan.skippedUpdates.map((item, index) => (
+                  <p key={index}>
+                    {item.title || item.projectId}: {item.reason}
+                  </p>
+                ))}
+              </div>
+            </div>
           )}
           {!canInstall && (
             <p className="management-form-error" role="alert">
@@ -3627,11 +4806,11 @@ export default function Launchpad({
                     setDialogError("");
                   }}
                 >
-                  Back
+                  {selection?.bulk ? "Close review" : "Back"}
                 </button>
                 <button
                   type="button"
-                  className="btn primary"
+                  className={`btn ${type === "modpack" || plan.cleanInstall ? "danger" : "primary"}`}
                   disabled={
                     Boolean(busy) ||
                     !canInstall ||
@@ -3647,10 +4826,11 @@ export default function Launchpad({
                     <Download size={15} />
                   )}
                   {busy === "install"
-                    ? "Starting installation..."
+                    ? "Starting installation…"
                     : type !== "modpack" && plan.files.length === 0
                       ? "Already up to date"
-                      : plan.unavailableDependencies?.length
+                      : plan.unavailableDependencies?.length ||
+                          plan.runtimeRequirements?.length
                         ? "Install anyway"
                         : "Confirm installation"}
                 </button>
@@ -3664,8 +4844,12 @@ export default function Launchpad({
                   !canInstall ||
                   !targetVersion.trim() ||
                   !targetLoader ||
+                  (type !== "modpack" &&
+                    (!config.gameVersion || !config.loader) &&
+                    !manualRuntimeAcknowledged) ||
                   (!selection?.bulk &&
-                    (!selectedVersion?.downloadable || versionsLoading))
+                    (!selectedVersion?.downloadable || versionsLoading)) ||
+                  (selection?.bulk && selectedUpdatePaths?.size === 0)
                 }
               >
                 {busy === "preview" ? (
@@ -3674,7 +4858,7 @@ export default function Launchpad({
                   <ArrowRight size={15} />
                 )}
                 {busy === "preview"
-                  ? "Preparing review..."
+                  ? "Preparing review…"
                   : selection?.bulk
                     ? "Review updates"
                     : "Review installation"}
@@ -3709,8 +4893,8 @@ export default function Launchpad({
         <h2 id="launchpad-removal-title">
           {removalPlan?.blocked
             ? removalPlan.dependents.length
-              ? "Mod removal blocked"
-              : "Dependency check incomplete"
+              ? `${contentName === "plugin" ? "Plugin" : "Mod"} removal blocked`
+              : "Removal needs review"
             : `Remove ${contentName}`}
         </h2>
         <p className="management-dialog-description">
@@ -3720,7 +4904,7 @@ export default function Launchpad({
         </p>
         {busy === "removal-preview" && (
           <p className="management-dialog-description" role="status">
-            {type === "mod"
+            {type === "mod" || type === "plugin"
               ? "Checking installed dependencies…"
               : "Checking the installed file…"}
           </p>
@@ -3737,8 +4921,15 @@ export default function Launchpad({
             </ul>
             {removalPlan.dependents.length > 0 && (
               <div className="launchpad-removal-dependencies">
-                <p>Remove these dependent mods first:</p>
-                <ul aria-label="Mods requiring this mod" tabIndex={0}>
+                <p>
+                  {removalPlan.includesDependents
+                    ? `These dependent ${contentName}s are included in this removal:`
+                    : `These installed ${contentName}s require this file:`}
+                </p>
+                <ul
+                  aria-label={`${contentName === "plugin" ? "Plugins" : "Mods"} requiring this ${contentName}`}
+                  tabIndex={0}
+                >
                   {removalPlan.dependents.map((item) => (
                     <li key={item.path}>
                       <strong>{item.title}</strong>
@@ -3794,11 +4985,8 @@ export default function Launchpad({
             )}
             {removalPlan.blocked && (
               <p className="management-dialog-description">
-                Inspect or repair the listed files in{" "}
-                <a href="#files" onClick={closeRemoval}>
-                  File Manager
-                </a>
-                , then review removal again.
+                These installed {contentName}s require the selected file. Review
+                removing them together below, or keep this file installed.
               </p>
             )}
           </>
@@ -3817,6 +5005,20 @@ export default function Launchpad({
             {removalError}
           </p>
         )}
+        {removalPlan?.blocked && (
+          <label className="launchpad-clean-confirm">
+            <input
+              type="checkbox"
+              checked={removalDependentsAccepted}
+              disabled={Boolean(busy)}
+              onChange={(event) =>
+                setRemovalDependentsAccepted(event.target.checked)
+              }
+            />
+            I understand that removing only this file can prevent dependent{" "}
+            {contentName}s from loading.
+          </label>
+        )}
         <div className="management-dialog-actions">
           <button
             type="button"
@@ -3826,7 +5028,35 @@ export default function Launchpad({
           >
             {removalPlan?.blocked ? "Close" : "Cancel"}
           </button>
-          {removalPlan && !removalPlan.blocked ? (
+          {removalPlan?.blocked && removal && (
+            <button
+              className="btn danger"
+              disabled={Boolean(busy)}
+              onClick={() => void reviewRemoval(removal, true)}
+            >
+              Review removing dependents together
+            </button>
+          )}
+          {removalPlan?.orphanCandidates?.length &&
+          removal &&
+          !removalPlan.blocked ? (
+            <button
+              className="btn"
+              disabled={Boolean(busy)}
+              onClick={() =>
+                void reviewRemoval(
+                  removal,
+                  Boolean(removalPlan.includesDependents),
+                  removalPlan.orphanCandidates!.map((item) => item.path),
+                )
+              }
+            >
+              Review optional unused dependencies (
+              {removalPlan.orphanCandidates.length})
+            </button>
+          ) : null}
+          {removalPlan &&
+          (!removalPlan.blocked || removalDependentsAccepted) ? (
             <button
               type="button"
               className="btn danger"
@@ -3845,7 +5075,11 @@ export default function Launchpad({
               ) : (
                 <Trash2 size={15} />
               )}
-              {busy === "remove" ? "Removing…" : `Remove ${contentName}`}
+              {busy === "remove"
+                ? "Removing…"
+                : removalPlan.blocked
+                  ? `Remove ${contentName} anyway`
+                  : `Remove ${contentName}`}
             </button>
           ) : removalError && removal ? (
             <button
@@ -3857,6 +5091,181 @@ export default function Launchpad({
               Try again
             </button>
           ) : null}
+        </div>
+      </dialog>
+      <dialog
+        ref={historyDialog}
+        className="modal management-dialog launchpad-dialog"
+        aria-labelledby="content-history-title"
+        onCancel={(event) => {
+          event.preventDefault();
+          setHistoryOpen(false);
+        }}
+      >
+        <h2 id="content-history-title">Recent content changes</h2>
+        {historyLoading ? (
+          <p role="status">Loading changes…</p>
+        ) : historyError ? (
+          <p role="alert">{historyError}</p>
+        ) : contentHistory.length ? (
+          <ul className="launchpad-review-files">
+            {contentHistory.map((item) => (
+              <li key={item.jobId}>
+                <span>
+                  <strong>{item.title}</strong>
+                  <small className="launchpad-previous-path">
+                    {new Date(item.createdAt).toLocaleString()}
+                    {item.undoneAt ? " · Undone" : ""}
+                  </small>
+                </span>
+                {item.undoAvailable && (
+                  <button
+                    className="btn"
+                    disabled={!canInstall}
+                    onClick={() => reviewUndo(item.jobId, item.title)}
+                  >
+                    Review undo
+                  </button>
+                )}
+              </li>
+            ))}
+          </ul>
+        ) : (
+          <p>No retained content changes are available.</p>
+        )}
+        <div className="management-dialog-actions">
+          <button className="btn" onClick={() => setHistoryOpen(false)}>
+            Close
+          </button>
+          {historyError && (
+            <button className="btn" onClick={() => void openContentHistory()}>
+              Retry
+            </button>
+          )}
+        </div>
+      </dialog>
+      <dialog
+        ref={undoDialog}
+        className="modal management-dialog launchpad-dialog"
+        aria-labelledby="content-undo-title"
+        onCancel={(event) => {
+          event.preventDefault();
+          if (!undoBusy) setUndoReview(null);
+        }}
+      >
+        <h2 id="content-undo-title">Undo content change</h2>
+        <p>
+          <strong>{undoReview?.title}</strong>
+        </p>
+        <p>
+          The host will verify that affected files still match the recorded
+          change, restore previous files and version records, and remove newly
+          installed dependencies from that operation. Restored versions will be
+          held from automatic updates.
+        </p>
+        {!canInstall && (
+          <p className="management-warning">{changeDisabledReason}</p>
+        )}
+        {undoError && (
+          <p role="alert" className="management-form-error">
+            {undoError}
+          </p>
+        )}
+        <div className="management-dialog-actions">
+          <button
+            className="btn"
+            disabled={undoBusy}
+            onClick={() => setUndoReview(null)}
+          >
+            Cancel
+          </button>
+          <button
+            className="btn danger"
+            disabled={undoBusy || !canInstall}
+            onClick={() => void undoContent()}
+          >
+            {undoBusy ? "Restoring previous files…" : "Confirm undo"}
+          </button>
+        </div>
+      </dialog>
+      <dialog
+        ref={clientPackDialog}
+        className="modal management-dialog launchpad-dialog"
+        aria-labelledby="client-pack-title"
+        onCancel={(event) => {
+          event.preventDefault();
+          setClientPack(null);
+        }}
+      >
+        <h2 id="client-pack-title">Export client pack</h2>
+        <p>
+          {clientPack?.filename} · {clientPack?.files || 0} files
+        </p>
+        <p>
+          Share the reviewed client downloads with players. Check the export
+          warnings for files that need manual installation.
+        </p>
+        {clientPack?.warnings.map((warning) => (
+          <p className="management-warning" key={warning}>
+            {warning}
+          </p>
+        ))}
+        <div className="management-dialog-actions">
+          <button className="btn" onClick={() => setClientPack(null)}>
+            Cancel
+          </button>
+          <DownloadButton
+            className="btn primary"
+            href={downloadUrl("/launchpad/client-pack")}
+            onError={(message) => notify(message, true)}
+          >
+            Download client pack
+          </DownloadButton>
+        </div>
+      </dialog>
+      <dialog
+        ref={activationDialog}
+        className="modal management-dialog launchpad-dialog"
+        aria-labelledby="launchpad-activation-title"
+        onCancel={(event) => {
+          event.preventDefault();
+          if (!busy) {
+            setActivation(null);
+            cancelSelectionBatch();
+          }
+        }}
+      >
+        <h2 id="launchpad-activation-title">Review dependency risks</h2>
+        {activation?.warnings.map((warning) => (
+          <p key={warning} className="management-warning">
+            {warning}
+          </p>
+        ))}
+        <p>
+          Changing this {contentName} can leave other installed {contentName}s
+          without required dependencies.
+        </p>
+        <div className="management-dialog-actions">
+          <button
+            className="btn"
+            disabled={Boolean(busy)}
+            onClick={() => {
+              setActivation(null);
+              cancelSelectionBatch();
+            }}
+          >
+            Cancel
+          </button>
+          <button
+            className="btn danger"
+            disabled={Boolean(busy)}
+            onClick={() =>
+              activation &&
+              void setContentActive(activation.entry, activation.active, true)
+            }
+          >
+            Change active state anyway
+          </button>
         </div>
       </dialog>
       <dialog
@@ -3953,7 +5362,7 @@ export default function Launchpad({
               className="btn primary"
               disabled={Boolean(busy) || !apiKey.trim()}
             >
-              {busy === "settings" ? "Saving..." : "Save API key"}
+              {busy === "settings" ? "Saving…" : "Save API key"}
             </button>
           </div>
         </form>

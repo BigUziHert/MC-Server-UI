@@ -298,6 +298,7 @@ export function createExtraProviders({
         .then((value) => {
           controller.signal.throwIfAborted();
           entry.pending = false;
+          if (value?.skipped) entry.until = Date.now() + 60_000;
           return value;
         })
         .catch((cause) => {
@@ -543,22 +544,37 @@ export function createExtraProviders({
               502,
               "Feed The Beast returned an invalid pack catalog.",
             );
+          let skipped = 0;
           const packs = await pooled(
             index.packs.slice(0, 500),
-            (id) => ftbPack(String(id)),
-            20,
+            async (id) => {
+              try {
+                return await ftbPack(String(id));
+              } catch (cause) {
+                if (cause?.name === "AbortError" || input.signal?.aborted)
+                  throw cause;
+                skipped++;
+                return null;
+              }
+            },
+            6,
           );
-          return packs.filter(
-            (pack) =>
-              !pack.private &&
-              (pack.versions ?? []).some((version) =>
-                compatible(ftbVersion(version), input),
+          return {
+            packs: packs
+              .filter(Boolean)
+              .filter(
+                (pack) =>
+                  !pack.private &&
+                  (pack.versions ?? []).some((version) =>
+                    compatible(ftbVersion(version), input),
+                  ),
               ),
-          );
+            skipped,
+          };
         },
         20 * 60 * 1000,
       );
-      const projects = sortCatalog(matching, input.sort, {
+      const projects = sortCatalog(matching.packs, input.sort, {
         downloads: (pack) => pack.installs,
         popular: (pack) => pack.plays,
         updated: (pack) =>
@@ -579,7 +595,15 @@ export function createExtraProviders({
         ...ftbAuthors(pack),
         url: `https://www.feed-the-beast.com/modpacks/${pack.id}`,
       }));
-      return resultPage(projects, input);
+      return resultPage(
+        projects,
+        input,
+        matching.skipped
+          ? [
+              `${matching.skipped} Feed The Beast packs could not be loaded and are hidden. Refresh to retry.`,
+            ]
+          : [],
+      );
     },
     async versions(input) {
       requiredType(input, "modpack");
@@ -755,17 +779,18 @@ export function createExtraProviders({
               try {
                 return await atVersion(pack, version);
               } catch (cause) {
-                if (cause.status === 404)
-                  return {
-                    id: version.version,
-                    name: version.version,
-                    version: version.version,
-                    gameVersions: [version.minecraft],
-                    loaders: [],
-                    publishedAt: date(version.published),
-                    downloadable: false,
-                  };
-                throw cause;
+                if (cause?.name === "AbortError" || input.signal?.aborted)
+                  throw cause;
+                return {
+                  id: version.version,
+                  name: version.version,
+                  version: version.version,
+                  gameVersions: [version.minecraft],
+                  loaders: [],
+                  publishedAt: date(version.published),
+                  downloadable: false,
+                  warning: cause.message,
+                };
               }
             },
             20,
@@ -990,7 +1015,9 @@ export function createExtraProviders({
           Number.isSafeInteger(loaded.total) &&
           loaded.total >= input.offset + loaded.values.length
             ? loaded.total
-            : input.offset + loaded.values.length,
+            : input.offset +
+              loaded.values.length +
+              (loaded.values.length === input.limit ? 1 : 0),
         offset: input.offset,
         limit: input.limit,
         warnings:

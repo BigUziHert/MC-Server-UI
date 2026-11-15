@@ -52,6 +52,59 @@ async function fixture(t, recycleOptions = {}) {
   return { root, dataDir, serverDir, stageDir, bin, ctx, result, put, stage };
 }
 
+test("world-preserving installation keeps world identity, access lists and custom JVM settings while replacing pack security defaults", async (t) => {
+  const f = await fixture(t);
+  await f.put(
+    f.serverDir,
+    "server.properties",
+    "level-name=survival\nonline-mode=true\nwhite-list=true\nenforce-whitelist=true\nserver-port=25577\n",
+  );
+  await f.put(f.serverDir, "survival/level.dat", "world data");
+  await f.put(f.serverDir, "ops.json", '[{"name":"Host"}]');
+  await f.put(f.serverDir, "whitelist.json", '[{"name":"Friend"}]');
+  await f.put(f.serverDir, "user_jvm_args.txt", "-Xmx6144M\n-XX:+UseZGC\n");
+  const identity = await fs.stat(path.join(f.serverDir, "survival"));
+  await f.stage("server.jar", "new runtime");
+  await f.stage(
+    "server.properties",
+    "online-mode=false\nwhite-list=false\nenable-rcon=true\nrcon.password=pack-password\n",
+  );
+  await f.stage("ops.json", '[{"name":"PackAuthor"}]');
+  await f.stage("survival/level.dat", "pack world");
+  f.result.configuration.launchType = "java-args";
+  const ctx = { ...f.ctx, preserveWorld: true };
+  await prepareCleanSettings(f.result, ctx);
+  await cleanInstall(f.result, ctx);
+  assert.equal(
+    (await fs.stat(path.join(f.serverDir, "survival"))).ino,
+    identity.ino,
+  );
+  assert.equal(
+    await fs.readFile(path.join(f.serverDir, "survival/level.dat"), "utf8"),
+    "world data",
+  );
+  assert.equal(
+    await fs.readFile(path.join(f.serverDir, "ops.json"), "utf8"),
+    '[{"name":"Host"}]',
+  );
+  const values = parseProperties(
+    await fs.readFile(path.join(f.serverDir, "server.properties"), "utf8"),
+  );
+  assert.equal(values.get("online-mode"), "true");
+  assert.equal(values.get("white-list"), "true");
+  assert.equal(values.get("enable-rcon"), "false");
+  assert.equal(values.get("rcon.password"), "");
+  assert.match(
+    await fs.readFile(path.join(f.serverDir, "user_jvm_args.txt"), "utf8"),
+    /UseZGC/,
+  );
+  assert.ok(
+    !(await f.bin.list()).some((item) =>
+      ["survival", "ops.json", "whitelist.json"].includes(item.originalPath),
+    ),
+  );
+});
+
 test("clean install replaces the entire selected server and keeps all previous files in recovery", async (t) => {
   const f = await fixture(t);
   await f.put(f.serverDir, "server.jar", "previous runtime");
@@ -472,3 +525,30 @@ test("the clean install root cannot contain panel recovery storage", async (t) =
   );
   assert.deepEqual(await f.bin.list(), []);
 });
+
+test(
+  "preserved world and access policy retain their actual filename casing",
+  { skip: process.platform !== "win32" },
+  async (t) => {
+    const f = await fixture(t);
+    await f.put(f.serverDir, "server.properties", "level-name=world\n");
+    await f.put(f.serverDir, "World/level.dat", "world bytes");
+    await f.put(f.serverDir, "Ops.json", "[]");
+    await f.stage("server.jar", "new runtime");
+    await f.stage("world/level.dat", "pack world");
+    await f.stage("ops.json", "untrusted operators");
+    f.ctx.preserveWorld = true;
+    await prepareCleanSettings(f.result, f.ctx);
+    assert.ok(f.result.preserveExistingPaths.includes("World"));
+    assert.ok(f.result.preserveExistingPaths.includes("Ops.json"));
+    await cleanInstall(f.result, f.ctx);
+    assert.equal(
+      await fs.readFile(path.join(f.serverDir, "World/level.dat"), "utf8"),
+      "world bytes",
+    );
+    assert.equal(
+      await fs.readFile(path.join(f.serverDir, "Ops.json"), "utf8"),
+      "[]",
+    );
+  },
+);

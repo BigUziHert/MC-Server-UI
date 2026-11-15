@@ -1,3 +1,10 @@
+import {
+  readSetupDrafts,
+  saveSetupDraft,
+  removeSetupDraft,
+  useSetupScope,
+} from "./setup-drafts";
+import { peekSetupModpack, takeSetupModpack } from "./setup-handoff";
 import { useEffect, useRef, useState, type FormEvent } from "react";
 import {
   AlertCircle,
@@ -21,6 +28,7 @@ import { usePanelApi, formatBytes } from "./api";
 import type { ServerRecord } from "./ServerManager";
 import SearchField, { useDebouncedValue } from "./SearchField";
 import HostDirectoryPicker from "./HostDirectoryPicker";
+import { JavaExecutableField } from "./LaunchSettings";
 import { SoftwareIcon } from "./pages/Versions";
 import { ProjectIcon } from "./pages/Launchpad";
 import "./onboarding.css";
@@ -89,11 +97,13 @@ type Catalog = {
   platforms: Platform[];
   gameVersions: string[];
   hostMemoryMB: number;
+  runningAllocatedMemoryMB?: number;
   freeMemoryMB?: number;
   java: Java;
   warnings?: string[];
   managedServersDir?: string;
   managedJavaDirectory?: string;
+  suggestedPort?: number;
 };
 type Project = {
   id: string;
@@ -146,14 +156,43 @@ type Job = {
   progress?: { message?: string };
   completed?: number;
   total?: number;
+  cancellable?: boolean;
 };
 type Step = "source" | "catalog" | "configure" | "review" | "install" | "done";
+type SetupResumeState = {
+  version: 1;
+  kind: "software" | "modpack";
+  provider: Provider | null;
+  project: Project | null;
+  gameVersion: string;
+  buildId: string;
+  packVersionId: string;
+  packLoader: string;
+  runtime: { provider: string; version: string; build: string; label: string };
+  plan: Plan | null;
+  name: string;
+  memory: string;
+  port: string;
+  javaPath: string;
+  customLocation: boolean;
+  installationDirectory: string;
+  accepted: boolean;
+  acknowledged: boolean;
+  runtimeRequestId: string;
+  runtimeDone: boolean;
+  packDone: boolean;
+  activeJob: { kind: "versions" | "launchpad"; id: string } | null;
+  uncertainSubmission: "versions" | "launchpad" | null;
+};
 type Props = {
+  resumeDraftId?: string;
   servers: ServerRecord[];
   remoteHost?: string;
   onBack: () => void;
   onClose: () => void;
-  onSaved: (server: ServerRecord) => void;
+  onSaved: (server: ServerRecord, outcome?: { incomplete?: boolean }) => void;
+  onBackground?: () => void;
+  onChangeHost?: () => void;
   onLockChange: (locked: boolean) => void;
   closeRequest: { current: (() => void) | null };
 };
@@ -169,6 +208,9 @@ const names: Record<string, string> = {
   velocity: "Velocity",
 };
 const modLoaders = ["fabric", "forge", "neoforge", "quilt"];
+const packPageSize = 20;
+const normalizedFolder = (value: string) =>
+  value.trim().replace(/^"(.*)"$/, "$1");
 function javaVersions(choices: JavaChoices) {
   const versions = new Map<number, JavaInstallation>();
   const installations = [...choices.installations].sort(
@@ -195,7 +237,9 @@ const query = (values: Record<string, string | number>) =>
       .map(([key, value]) => [key, String(value)]),
   ).toString();
 const terminal = (job: Job) =>
-  ["complete", "completed", "failed"].includes(job.state || job.status || "");
+  ["complete", "completed", "failed", "cancelled"].includes(
+    job.state || job.status || "",
+  );
 const wait = (signal: AbortSignal) =>
   new Promise<void>((resolve, reject) => {
     const finish = () => {
@@ -212,24 +256,62 @@ const wait = (signal: AbortSignal) =>
 
 export default function NewServerWizard({
   servers,
+  resumeDraftId,
   remoteHost,
   onBack,
   onClose,
   onSaved,
+  onBackground,
+  onChangeHost,
   onLockChange,
   closeRequest,
 }: Props) {
   const { api } = usePanelApi();
-  const [step, setStep] = useState<Step>("source");
-  const [kind, setKind] = useState<"software" | "modpack">("software");
+  const setupScope = useSetupScope();
+  const [savedDraft] = useState(() =>
+    readSetupDrafts(setupScope).find((item) => item.id === resumeDraftId),
+  );
+  const [resumed] = useState(() => {
+    const state = savedDraft?.state as SetupResumeState | undefined;
+    return state?.version === 1 &&
+      ["software", "modpack"].includes(state.kind) &&
+      state.runtime &&
+      typeof state.runtime.provider === "string" &&
+      typeof state.runtimeRequestId === "string"
+      ? state
+      : undefined;
+  });
+  const draftCreatedAt = useRef(savedDraft?.createdAt || Date.now());
+  const initialServer = savedDraft?.serverId
+    ? (servers.find(
+        (item) =>
+          item.id === savedDraft.serverId &&
+          (!savedDraft.serverDir ||
+            !item.serverDir ||
+            item.serverDir === savedDraft.serverDir),
+      ) ?? null)
+    : null;
+  const [draftError, setDraftError] = useState("");
+  const [handoff] = useState(peekSetupModpack);
+  useEffect(() => {
+    if (handoff) takeSetupModpack();
+  }, [handoff]);
+  const [step, setStep] = useState<Step>(
+    resumed ? "install" : handoff ? "catalog" : "source",
+  );
+  const [kind, setKind] = useState<"software" | "modpack">(
+    resumed?.kind ?? (handoff ? "modpack" : "software"),
+  );
   const [catalog, setCatalog] = useState<Catalog | null>(null);
   const [catalogError, setCatalogError] = useState("");
   const [refresh, setRefresh] = useState(0);
-  const [provider, setProvider] = useState<Provider | null>(null);
+  const [provider, setProvider] = useState<Provider | null>(
+    resumed?.provider ?? null,
+  );
   const [releases, setReleases] = useState<Release[]>([]);
   const [builds, setBuilds] = useState<Release[]>([]);
-  const [gameVersion, setGameVersion] = useState("");
-  const [buildId, setBuildId] = useState("");
+  const [gameVersion, setGameVersion] = useState(resumed?.gameVersion ?? "");
+  const [buildId, setBuildId] = useState(resumed?.buildId ?? "");
   const [experimental, setExperimental] = useState(false);
   const [platform, setPlatform] = useState("modrinth");
   const [projects, setProjects] = useState<Project[]>([]);
@@ -240,21 +322,39 @@ export default function NewServerWizard({
   const [filterVersion, setFilterVersion] = useState("");
   const [filterLoader, setFilterLoader] = useState("");
   const [sort, setSort] = useState("downloads");
-  const [project, setProject] = useState<Project | null>(null);
+  const [project, setProject] = useState<Project | null>(
+    resumed?.project ??
+      (handoff ? { ...handoff, iconUrl: handoff.iconUrl || undefined } : null),
+  );
   const [packVersions, setPackVersions] = useState<PackVersion[]>([]);
-  const [packVersionId, setPackVersionId] = useState("");
-  const [packLoader, setPackLoader] = useState("");
+  const [packVersionId, setPackVersionId] = useState(
+    resumed?.packVersionId ?? "",
+  );
+  const [packLoader, setPackLoader] = useState(resumed?.packLoader ?? "");
   const [loading, setLoading] = useState(false);
   const [listError, setListError] = useState("");
   const [apiKey, setApiKey] = useState("");
-  const [name, setName] = useState("");
-  const [memory, setMemory] = useState("4");
-  const [customLocation, setCustomLocation] = useState(false);
-  const [installationDirectory, setInstallationDirectory] = useState("");
+  const [name, setName] = useState(resumed?.name ?? "");
+  const nameEdited = useRef(false);
+  const memoryEdited = useRef(false);
+  const portEdited = useRef(Boolean(resumed));
+  const [memory, setMemory] = useState(resumed?.memory ?? "4");
+  const [customLocation, setCustomLocation] = useState(
+    resumed?.customLocation ?? false,
+  );
+  const [installationDirectory, setInstallationDirectory] = useState(
+    resumed?.installationDirectory ?? "",
+  );
   const [folderBrowserOpen, setFolderBrowserOpen] = useState(false);
   const browseFolderButton = useRef<HTMLButtonElement>(null);
   const [supportDirectory, setSupportDirectory] = useState("");
   const [javaMajor, setJavaMajor] = useState<number | null>(null);
+  const [customJava, setCustomJava] = useState(Boolean(resumed));
+  const [customJavaPath, setCustomJavaPath] = useState(
+    resumed?.javaPath ?? "java",
+  );
+  const [acknowledgedJavaCompatibility, setAcknowledgedJavaCompatibility] =
+    useState(false);
   const [javaChoices, setJavaChoices] = useState<JavaChoices | null>(null);
   const [javaLoading, setJavaLoading] = useState(false);
   const [javaError, setJavaError] = useState("");
@@ -265,19 +365,22 @@ export default function NewServerWizard({
   );
   const [javaInstallError, setJavaInstallError] = useState("");
   const [port, setPort] = useState(() => {
+    if (resumed) return resumed.port;
     let next = 25565;
     while (servers.some((s) => s.port === next)) next++;
     return String(next);
   });
-  const [plan, setPlan] = useState<Plan | null>(null);
+  const [plan, setPlan] = useState<Plan | null>(resumed?.plan ?? null);
   const [runtime, setRuntime] = useState<{
     provider: string;
     version: string;
     build: string;
     label: string;
-  } | null>(null);
-  const [accepted, setAccepted] = useState(false);
-  const [acknowledged, setAcknowledged] = useState(false);
+  } | null>(resumed?.runtime ?? null);
+  const [accepted, setAccepted] = useState(resumed?.accepted ?? false);
+  const [acknowledged, setAcknowledged] = useState(
+    resumed?.acknowledged ?? false,
+  );
   const [warnings, setWarnings] = useState<string[]>([]);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
@@ -285,19 +388,25 @@ export default function NewServerWizard({
   const [configurationDetailsOpen, setConfigurationDetailsOpen] =
     useState(false);
   const [progress, setProgress] = useState("");
-  const [created, setCreated] = useState<ServerRecord | null>(null);
+  const [jobProgress, setJobProgress] = useState<Job | null>(null);
+  const [cancelling, setCancelling] = useState(false);
+  const [created, setCreated] = useState<ServerRecord | null>(initialServer);
   const controller = useRef(new AbortController());
   const heading = useRef<HTMLHeadingElement>(null);
-  const requestId = useRef(crypto.randomUUID());
-  const runtimeRequestId = useRef(crypto.randomUUID());
-  const createdRef = useRef<ServerRecord | null>(null);
-  const runtimeDone = useRef(false);
-  const packDone = useRef(false);
+  const requestId = useRef(savedDraft?.id ?? crypto.randomUUID());
+  const runtimeRequestId = useRef(
+    resumed?.runtimeRequestId ?? crypto.randomUUID(),
+  );
+  const createdRef = useRef<ServerRecord | null>(initialServer);
+  const runtimeDone = useRef(resumed?.runtimeDone ?? false);
+  const packDone = useRef(resumed?.packDone ?? false);
   const activeJob = useRef<{
     kind: "versions" | "launchpad";
     id: string;
-  } | null>(null);
-  const uncertainSubmission = useRef<"versions" | "launchpad" | null>(null);
+  } | null>(resumed?.activeJob ?? null);
+  const uncertainSubmission = useRef<"versions" | "launchpad" | null>(
+    resumed?.uncertainSubmission ?? null,
+  );
   const observedJobs = useRef(new Set<string>());
   const busyRef = useRef(false);
   const packVersion = packVersions.find((item) => item.id === packVersionId);
@@ -315,11 +424,17 @@ export default function NewServerWizard({
     build: kind === "software" ? buildId : "",
   });
   const selectedJava =
-    javaChoicesKey === javaSelectionKey
-      ? javaChoices?.installations.find(
-          (item) => item.majorVersion === javaMajor,
-        )
-      : undefined;
+    customJava && customJavaPath.trim()
+      ? {
+          path: normalizedFolder(customJavaPath),
+          majorVersion: javaMajor ?? 0,
+          version: "Custom installation",
+        }
+      : javaChoicesKey === javaSelectionKey
+        ? javaChoices?.installations.find(
+            (item) => item.majorVersion === javaMajor,
+          )
+        : undefined;
   const canInstallJava =
     javaChoices?.installSupported &&
     Number.isInteger(javaChoices.requiredJavaVersion) &&
@@ -361,6 +476,8 @@ export default function NewServerWizard({
       .then((result) => {
         if (cancel.signal.aborted) return;
         setCatalog(result);
+        if (!portEdited.current && Number.isInteger(result.suggestedPort))
+          setPort(String(result.suggestedPort));
       })
       .catch((cause) => {
         if (!cancel.signal.aborted) setCatalogError(message(cause));
@@ -409,7 +526,7 @@ export default function NewServerWizard({
     return () => cancel.abort();
   }, [api, step, isPrepared, javaSelectionKey, javaRefresh]);
   useEffect(() => {
-    if (!provider || kind !== "software") return;
+    if (resumed || !provider || kind !== "software") return;
     const cancel = new AbortController();
     setLoading(true);
     setListError("");
@@ -437,7 +554,7 @@ export default function NewServerWizard({
     return () => cancel.abort();
   }, [api, provider, kind, refresh]);
   useEffect(() => {
-    if (!provider || !gameVersion || kind !== "software") return;
+    if (resumed || !provider || !gameVersion || kind !== "software") return;
     const cancel = new AbortController();
     setLoading(true);
     setListError("");
@@ -450,6 +567,12 @@ export default function NewServerWizard({
       .then((result) => {
         if (cancel.signal.aborted) return;
         setBuilds(result.builds);
+        const visible = result.builds.filter(
+          (item) => item.stable || experimental,
+        );
+        setBuildId(
+          (visible.find((item) => item.recommended) ?? visible[0])?.id ?? "",
+        );
       })
       .catch((cause) => {
         if (!cancel.signal.aborted) setListError(message(cause));
@@ -472,7 +595,7 @@ export default function NewServerWizard({
     setProjects([]);
     const timer = setTimeout(() => {
       void api<{ projects: Project[]; total: number }>(
-        `/server-setup/launchpad/search?${query({ platform, type: "modpack", query: search.trim(), gameVersion: filterVersion, loader: filterLoader, sort, limit: 5, offset })}`,
+        `/server-setup/launchpad/search?${query({ platform, type: "modpack", query: search.trim(), gameVersion: filterVersion, loader: filterLoader, sort, limit: packPageSize, offset })}`,
         { signal: cancel.signal },
       )
         .then((result) => {
@@ -506,7 +629,7 @@ export default function NewServerWizard({
     refresh,
   ]);
   useEffect(() => {
-    if (!project) return;
+    if (resumed || !project) return;
     const cancel = new AbortController();
     setLoading(true);
     setListError("");
@@ -532,11 +655,13 @@ export default function NewServerWizard({
     return () => cancel.abort();
   }, [api, project, filterVersion, filterLoader, refresh]);
   useEffect(() => {
-    if (!packVersion) return;
+    if (resumed || !packVersion) return;
     setGameVersion(
       packVersion.gameVersions.includes(filterVersion)
         ? filterVersion
-        : packVersion.gameVersions[0] || "",
+        : [...packVersion.gameVersions].sort((a, b) =>
+            b.localeCompare(a, "en", { numeric: true }),
+          )[0] || "",
     );
     setPackLoader(
       packVersion.loaders.find(
@@ -583,20 +708,35 @@ export default function NewServerWizard({
   }
   function configure() {
     if (!isPrepared || loading) return;
-    if (!name)
-      setName(
+    if (!nameEdited.current) {
+      const base =
         kind === "modpack"
-          ? project!.title.slice(0, 64)
-          : "My Minecraft server",
-      );
+          ? project!.title.slice(0, 60)
+          : "My Minecraft server";
+      let suggested = base,
+        index = 2;
+      while (
+        servers.some(
+          (server) => server.name.toLowerCase() === suggested.toLowerCase(),
+        )
+      )
+        suggested = `${base} ${index++}`;
+      setName(suggested);
+    }
     const suggestion = Math.max(
       1,
       Math.min(
         kind === "modpack" ? 6 : 4,
-        Math.floor((catalog?.hostMemoryMB || 8192) / 2048),
+        Math.floor(
+          Math.max(
+            2048,
+            (catalog?.hostMemoryMB || 8192) -
+              (catalog?.runningAllocatedMemoryMB || 0),
+          ) / 2048,
+        ),
       ),
     );
-    setMemory(String(suggestion));
+    if (!memoryEdited.current) setMemory(String(suggestion));
     setStep("configure");
     setError("");
     setJavaInstallJob(null);
@@ -690,7 +830,13 @@ export default function NewServerWizard({
       servers.some((s) => s.port === Number(port))
     ) {
       setError(
-        "Choose an unused server port between 1024 and 65535 in Advanced settings.",
+        servers.some((s) => s.port === Number(port))
+          ? `Port ${port} is already used by ${servers.find((s) => s.port === Number(port))!.name}. Choose another port.`
+          : "Choose an unused server port between 1024 and 65535 in Advanced settings.",
+      );
+      setConfigurationDetailsOpen(true);
+      requestAnimationFrame(() =>
+        document.getElementById("setup-port")?.focus(),
       );
       return;
     }
@@ -712,10 +858,12 @@ export default function NewServerWizard({
         supportDirectory?: string;
       }>("/server-setup/preflight", {
         memoryLimitMB: mb,
+        port: Number(port),
         installationDirectory: customLocation
-          ? installationDirectory.trim()
+          ? normalizedFolder(installationDirectory)
           : undefined,
         javaPath: selectedJava.path,
+        acknowledgedJavaCompatibility,
         provider: kind === "software" ? provider?.id : packLoader,
         gameVersion,
         requiredJavaVersion:
@@ -741,7 +889,7 @@ export default function NewServerWizard({
         const next = await request<Plan>("/server-setup/modpack-preview", {
           ...packSelection(),
           installationDirectory: customLocation
-            ? installationDirectory.trim()
+            ? normalizedFolder(installationDirectory)
             : undefined,
         });
         const required = next.loaderInstall;
@@ -757,8 +905,9 @@ export default function NewServerWizard({
           required.loader !== packLoader ||
           required.gameVersion !== gameVersion
         )
-          throw new Error(
-            "The pack's runtime differs from the selected release. Choose a matching release and try again.",
+          throw Object.assign(
+            new Error("This release has a different declared runtime."),
+            { detectedRuntime: required },
           );
         if (!next.runtime || !next.cleanInstall)
           throw new Error(
@@ -780,7 +929,31 @@ export default function NewServerWizard({
         });
       setStep("review");
     } catch (cause) {
-      if (!controller.current.signal.aborted) setError(message(cause));
+      if (!controller.current.signal.aborted) {
+        const detected = (
+          cause as {
+            detectedRuntime?: {
+              loader?: string;
+              gameVersion?: string;
+              loaderVersion?: string;
+            };
+          }
+        )?.detectedRuntime;
+        if (
+          kind === "modpack" &&
+          detected?.gameVersion &&
+          detected.loader &&
+          modLoaders.includes(detected.loader)
+        ) {
+          setGameVersion(detected.gameVersion);
+          setPackLoader(detected.loader);
+          setJavaRefresh((value) => value + 1);
+          setAcknowledgedJavaCompatibility(false);
+          setError(
+            `This release runs on Minecraft ${detected.gameVersion} with ${names[detected.loader] || detected.loader}. The selection has been corrected. Check Java and review again before creating the server.`,
+          );
+        } else setError(message(cause));
+      }
     } finally {
       busyRef.current = false;
       if (!controller.current.signal.aborted) setBusy(false);
@@ -794,8 +967,10 @@ export default function NewServerWizard({
     uncertainSubmission.current = null;
     observedJobs.current.add(`${type}:${job.id}`);
     activeJob.current = { kind: type, id: job.id };
+    persistSetup();
     let current = job;
     while (!terminal(current)) {
+      setJobProgress(current);
       setProgress(
         current.progress?.message ||
           current.message ||
@@ -810,7 +985,10 @@ export default function NewServerWizard({
       current = "job" in response ? response.job : response;
     }
     activeJob.current = null;
-    if ((current.state || current.status) === "failed") {
+    setJobProgress(null);
+    if (
+      ["failed", "cancelled"].includes(current.state || current.status || "")
+    ) {
       if (type === "versions") runtimeRequestId.current = crypto.randomUUID();
       throw new Error(
         current.error ||
@@ -820,6 +998,7 @@ export default function NewServerWizard({
     }
     if (type === "versions") runtimeDone.current = true;
     else packDone.current = true;
+    persistSetup();
   }
   async function startJob(
     type: "versions" | "launchpad",
@@ -827,6 +1006,7 @@ export default function NewServerWizard({
     serverId: string,
   ) {
     uncertainSubmission.current = type;
+    persistSetup();
     try {
       const response = await request<Job | { job: Job }>(
         `/${type}/install`,
@@ -864,13 +1044,40 @@ export default function NewServerWizard({
     setCreated(latest);
     return latest;
   }
+  async function cancelInstallation() {
+    const pending = activeJob.current;
+    if (
+      !pending ||
+      !createdRef.current ||
+      !jobProgress?.cancellable ||
+      cancelling
+    )
+      return;
+    setCancelling(true);
+    try {
+      const result = await request<Job | { job: Job }>(
+        `/${pending.kind}/jobs/${encodeURIComponent(pending.id)}/cancel`,
+        {},
+        createdRef.current.id,
+      );
+      setJobProgress("job" in result ? result.job : result);
+    } catch (cause) {
+      setError(message(cause));
+    } finally {
+      setCancelling(false);
+    }
+  }
   async function openConsole() {
     if (busyRef.current) return;
     busyRef.current = true;
     setBusy(true);
     setError("");
     try {
-      onSaved(await refreshCreatedServer());
+      onSaved(await refreshCreatedServer(), {
+        incomplete: !(kind === "software"
+          ? runtimeDone.current
+          : packDone.current),
+      });
     } catch (cause) {
       if (!controller.current.signal.aborted) setError(message(cause));
     } finally {
@@ -878,11 +1085,61 @@ export default function NewServerWizard({
       if (!controller.current.signal.aborted) setBusy(false);
     }
   }
+  function persistSetup() {
+    if (!runtime) return;
+    if (kind === "software" ? runtimeDone.current : packDone.current) {
+      removeSetupDraft(setupScope, requestId.current);
+      return;
+    }
+    const state: SetupResumeState = {
+      version: 1,
+      kind,
+      provider,
+      project,
+      gameVersion,
+      buildId,
+      packVersionId,
+      packLoader,
+      runtime,
+      plan,
+      name,
+      memory,
+      port,
+      javaPath: normalizedFolder(
+        selectedJava?.path || customJavaPath || "java",
+      ),
+      customLocation,
+      installationDirectory,
+      accepted,
+      acknowledged,
+      runtimeRequestId: runtimeRequestId.current,
+      runtimeDone: runtimeDone.current,
+      packDone: packDone.current,
+      activeJob: activeJob.current,
+      uncertainSubmission: uncertainSubmission.current,
+    };
+    const stored = saveSetupDraft({
+      id: requestId.current,
+      scope: setupScope,
+      createdAt: draftCreatedAt.current,
+      name: name || "Unfinished server",
+      serverId: createdRef.current?.id ?? savedDraft?.serverId,
+      serverDir: createdRef.current?.serverDir ?? savedDraft?.serverDir,
+      state,
+    });
+    if (!stored)
+      setDraftError(
+        "This browser could not save the setup draft. Keep this setup open until installation finishes.",
+      );
+  }
+  useEffect(() => {
+    if (step === "install" || step === "done" || created) persistSetup();
+  }, [step, busy, error, jobProgress, created]);
   async function install() {
     if (
       busyRef.current ||
       !runtime ||
-      !accepted ||
+      ((kind !== "software" || provider?.kind !== "proxy") && !accepted) ||
       (plan?.unavailableDependencies?.length && !acknowledged)
     )
       return;
@@ -891,7 +1148,29 @@ export default function NewServerWizard({
     setError("");
     setStep("install");
     try {
-      setProgress("Creating your server…");
+      persistSetup();
+      if (resumed && savedDraft?.serverId) {
+        const response = await request<{ servers: ServerRecord[] }>("/servers");
+        const existing = response.servers.find(
+          (item) => item.id === savedDraft.serverId,
+        );
+        if (
+          !existing ||
+          (savedDraft.serverDir &&
+            existing.serverDir &&
+            existing.serverDir !== savedDraft.serverDir)
+        )
+          throw new Error(
+            "The saved server was removed or its folder changed. This draft cannot create a replacement. Remove the draft from Add server and review the current server manually.",
+          );
+        createdRef.current = existing;
+        setCreated(existing);
+      }
+      setProgress(
+        createdRef.current
+          ? "Checking the saved installation…"
+          : "Creating your server…",
+      );
       if (!createdRef.current) {
         setCreationRejected(false);
         const response = await request<{ server: ServerRecord }>(
@@ -899,7 +1178,10 @@ export default function NewServerWizard({
           {
             requestId: requestId.current,
             confirmed: true,
-            acceptedEula: accepted,
+            acceptedEula:
+              kind === "software" && provider?.kind === "proxy"
+                ? false
+                : accepted,
             configuration: {
               name: name.trim(),
               mode: "live",
@@ -907,7 +1189,7 @@ export default function NewServerWizard({
               port: Number(port),
               javaPath: selectedJava?.path,
               installationDirectory: customLocation
-                ? installationDirectory.trim()
+                ? normalizedFolder(installationDirectory)
                 : undefined,
             },
           },
@@ -921,6 +1203,7 @@ export default function NewServerWizard({
         });
         createdRef.current = response.server;
         setCreated(response.server);
+        persistSetup();
       }
       const serverId = createdRef.current.id;
       if (uncertainSubmission.current) {
@@ -1020,6 +1303,12 @@ export default function NewServerWizard({
       return;
     }
     if (!busyRef.current) {
+      if (step === "install" && !createdRef.current && !creationRejected) {
+        setError(
+          "Server creation has not been confirmed. Retry to check the original request before closing setup.",
+        );
+        return;
+      }
       if (createdRef.current) void openConsole();
       else onClose();
     }
@@ -1093,9 +1382,21 @@ export default function NewServerWizard({
                   ? "Your server is ready"
                   : "Setting up your server"}
       </h2>
-      {remoteHost && (
+      {
         <p className="setup-host-context">
-          Server PC: <strong>{remoteHost}</strong>
+          Computer: <strong>{remoteHost || "This computer"}</strong>{" "}
+          {onChangeHost && !busy && !created && (
+            <button type="button" className="btn" onClick={onChangeHost}>
+              Change computer
+            </button>
+          )}
+        </p>
+      }
+      {provider?.kind === "proxy" && (
+        <p className="management-notice">
+          Velocity is a proxy. Configure its listener port and backend servers
+          in velocity.toml before starting; the panel port does not configure
+          that listener.
         </p>
       )}
       <p className="setup-intro">
@@ -1214,7 +1515,7 @@ export default function NewServerWizard({
               {!catalog.providers.some((item) =>
                 `${item.name} ${item.description}`
                   .toLowerCase()
-                  .includes(search.toLowerCase()),
+                  .includes(softwareQuery.toLowerCase()),
               ) && (
                 <p className="setup-empty">No software matches your search.</p>
               )}
@@ -1233,7 +1534,9 @@ export default function NewServerWizard({
               </div>
               <div className="setup-field-grid">
                 <label className="form-field">
-                  Minecraft version
+                  {provider.kind === "proxy"
+                    ? "Proxy version"
+                    : "Minecraft version"}
                   <select
                     value={gameVersion}
                     disabled={!releases.length || loading}
@@ -1468,13 +1771,13 @@ export default function NewServerWizard({
                       <ChevronLeft size={17} />
                     </button>
                     <span>
-                      Page {Math.floor(offset / 5) + 1} of{" "}
-                      {Math.max(1, Math.ceil(total / 5))}
+                      Page {Math.floor(offset / packPageSize) + 1} of{" "}
+                      {Math.max(1, Math.ceil(total / packPageSize))}
                     </span>
                     <button
                       className="btn icon"
                       aria-label="Next modpacks"
-                      disabled={loading || offset + 5 >= total}
+                      disabled={loading || offset + packPageSize >= total}
                       onClick={() => setOffset((value) => value + 5)}
                     >
                       <ChevronRight size={17} />
@@ -1576,13 +1879,18 @@ export default function NewServerWizard({
       )}
 
       {step === "configure" && (
-        <form id="setup-configure" onSubmit={(event) => void review(event)}>
+        <form
+          id="setup-configure"
+          onSubmit={(event) => void review(event)}
+          noValidate
+        >
           <div className="setup-choice-summary">
             <Check size={18} />
             <span>
               <strong>{title}</strong>
               <small>
-                Minecraft {gameVersion} ·{" "}
+                {provider?.kind === "proxy" ? "Proxy" : "Minecraft"}{" "}
+                {gameVersion} ·{" "}
                 {kind === "software" ? build?.label : packVersion?.name}
               </small>
             </span>
@@ -1603,7 +1911,10 @@ export default function NewServerWizard({
               maxLength={64}
               value={name}
               disabled={busy}
-              onChange={(event) => setName(event.target.value)}
+              onChange={(event) => {
+                nameEdited.current = true;
+                setName(event.target.value);
+              }}
               placeholder="Survival with friends"
             />
           </div>
@@ -1624,7 +1935,10 @@ export default function NewServerWizard({
                 step={1}
                 value={Number(memory)}
                 disabled={busy}
-                onChange={(event) => setMemory(event.target.value)}
+                onChange={(event) => {
+                  memoryEdited.current = true;
+                  setMemory(event.target.value);
+                }}
               />
               <input
                 id="setup-memory"
@@ -1635,10 +1949,16 @@ export default function NewServerWizard({
                 required
                 value={memory}
                 disabled={busy}
-                onChange={(event) => setMemory(event.target.value)}
+                onChange={(event) => {
+                  memoryEdited.current = true;
+                  setMemory(event.target.value);
+                }}
               />
             </div>
             <small>
+              {catalog?.runningAllocatedMemoryMB
+                ? `${(catalog.runningAllocatedMemoryMB / 1024).toFixed(1)} GB already allocated to running servers. `
+                : ""}
               {catalog?.hostMemoryMB
                 ? `${(catalog.hostMemoryMB / 1024).toFixed(0)} GB installed on the server PC. `
                 : ""}
@@ -1742,10 +2062,49 @@ export default function NewServerWizard({
               </option>
               {javaChoices?.installations.map((item) => (
                 <option key={item.majorVersion} value={item.majorVersion}>
-                  JAVA {item.majorVersion}
+                  Java {item.majorVersion}
                 </option>
               ))}
             </select>
+            <label>
+              <input
+                type="checkbox"
+                checked={customJava}
+                disabled={busy}
+                onChange={(event) => {
+                  setCustomJava(event.target.checked);
+                  setAcknowledgedJavaCompatibility(false);
+                }}
+              />{" "}
+              Choose a specific Java installation
+            </label>
+            {customJava && (
+              <>
+                <JavaExecutableField
+                  id="setup-custom-java"
+                  value={customJavaPath}
+                  onChange={(value) => {
+                    setCustomJavaPath(value);
+                    setAcknowledgedJavaCompatibility(false);
+                  }}
+                />
+                <label>
+                  <input
+                    type="checkbox"
+                    checked={acknowledgedJavaCompatibility}
+                    disabled={busy}
+                    onChange={(event) =>
+                      setAcknowledgedJavaCompatibility(event.target.checked)
+                    }
+                  />{" "}
+                  Allow a newer Java runtime after checking compatibility
+                </label>
+                <small>
+                  Some older loaders require the exact Java version. The host
+                  still verifies that this executable can start.
+                </small>
+              </>
+            )}
             <small id="setup-java-help">
               {javaLoading
                 ? "Checking Java installations on the computer running MC Panel."
@@ -1833,14 +2192,20 @@ export default function NewServerWizard({
             </summary>
             <div className="setup-field-grid">
               <label className="form-field">
-                Server port
+                {provider?.kind === "proxy"
+                  ? "Panel connection port"
+                  : "Server port"}
                 <input
+                  id="setup-port"
                   type="number"
                   min={1024}
                   max={65535}
                   value={port}
                   disabled={busy}
-                  onChange={(event) => setPort(event.target.value)}
+                  onChange={(event) => {
+                    portEdited.current = true;
+                    setPort(event.target.value);
+                  }}
                 />
               </label>
             </div>
@@ -1849,6 +2214,13 @@ export default function NewServerWizard({
       )}
       {step === "review" && (
         <>
+          {provider?.kind !== "proxy" && (
+            <p className="setup-warning">
+              New servers start with the whitelist off. Anyone who can reach the
+              server can join. After setup, use Players to add allowed players
+              and enable the whitelist before sharing the address.
+            </p>
+          )}
           <dl className="setup-review">
             <div>
               <dt>Server</dt>
@@ -1862,7 +2234,9 @@ export default function NewServerWizard({
               </dd>
             </div>
             <div>
-              <dt>Minecraft</dt>
+              <dt>
+                {provider?.kind === "proxy" ? "Proxy version" : "Minecraft"}
+              </dt>
               <dd>{gameVersion}</dd>
             </div>
             <div>
@@ -1928,23 +2302,25 @@ export default function NewServerWizard({
               </label>
             </div>
           )}
-          <label className="setup-check setup-eula">
-            <input
-              type="checkbox"
-              checked={accepted}
-              onChange={(event) => setAccepted(event.target.checked)}
-            />{" "}
-            <span>
-              I agree to the{" "}
-              <a
-                href="https://aka.ms/MinecraftEULA"
-                target="_blank"
-                rel="noreferrer"
-              >
-                Minecraft EULA <ExternalLink size={12} />
-              </a>
-            </span>
-          </label>
+          {(kind !== "software" || provider?.kind !== "proxy") && (
+            <label className="setup-check setup-eula">
+              <input
+                type="checkbox"
+                checked={accepted}
+                onChange={(event) => setAccepted(event.target.checked)}
+              />{" "}
+              <span>
+                I agree to the{" "}
+                <a
+                  href="https://aka.ms/MinecraftEULA"
+                  target="_blank"
+                  rel="noreferrer"
+                >
+                  Minecraft EULA <ExternalLink size={12} />
+                </a>
+              </span>
+            </label>
+          )}
         </>
       )}
       {step === "install" && (
@@ -1959,12 +2335,35 @@ export default function NewServerWizard({
             {busy
               ? "Keep MC Panel open while the downloads are verified and installed."
               : created
-                ? "Your server folder is saved. Retry to continue setting up the same server."
+                ? "Your server folder and setup draft are saved on this device for seven days. Retry now, or use Finish setup in Add server to continue later."
                 : creationRejected
                   ? "Your server wasn’t created. Go back to correct your settings; your selections are saved."
                   : "We couldn’t confirm server creation. Retry to continue without creating a duplicate."}
           </p>
-          {busy && <progress aria-label="Installation progress" />}
+          {busy && (
+            <progress
+              aria-label="Installation progress"
+              max={Math.max(1, jobProgress?.total ?? 0)}
+              value={
+                jobProgress?.total ? (jobProgress.completed ?? 0) : undefined
+              }
+            />
+          )}
+          {busy && onBackground && (
+            <button className="btn" type="button" onClick={onBackground}>
+              Continue in background
+            </button>
+          )}
+          {busy && jobProgress?.cancellable && (
+            <button
+              className="btn danger"
+              type="button"
+              disabled={cancelling}
+              onClick={() => void cancelInstallation()}
+            >
+              {cancelling ? "Cancelling…" : "Cancel installation"}
+            </button>
+          )}
         </div>
       )}
       {step === "done" && (
@@ -1974,7 +2373,8 @@ export default function NewServerWizard({
           </span>
           <strong>{name}</strong>
           <p>
-            {title} · Minecraft {gameVersion} · {memory} GB
+            {title} · {provider?.kind === "proxy" ? "Proxy" : "Minecraft"}{" "}
+            {gameVersion} · {memory} GB
           </p>
           <small>Installed and stopped</small>
         </div>
@@ -1982,6 +2382,11 @@ export default function NewServerWizard({
       {busy && step === "configure" && (
         <p className="setup-loading" role="status">
           <LoaderCircle size={18} className="spin" /> {progress}
+        </p>
+      )}
+      {draftError && (
+        <p className="setup-error" role="alert">
+          {draftError}
         </p>
       )}
       {error && (
@@ -2032,7 +2437,8 @@ export default function NewServerWizard({
             onClick={() => void install()}
             disabled={
               busy ||
-              !accepted ||
+              ((kind !== "software" || provider?.kind !== "proxy") &&
+                !accepted) ||
               Boolean(plan?.unavailableDependencies?.length && !acknowledged)
             }
           >
@@ -2044,7 +2450,7 @@ export default function NewServerWizard({
           <div className="setup-recovery-actions">
             {created && (
               <button className="btn" onClick={() => void openConsole()}>
-                Open Console
+                Finish later
               </button>
             )}
             <button className="btn primary" onClick={() => void install()}>

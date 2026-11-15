@@ -1,5 +1,5 @@
 .update-ready {
-  color: var(--accent, #ffd000);
+  color: var(--accent, var(--accent));
 }
 :root.updates-overlay,
 .updates-overlay body,
@@ -75,7 +75,7 @@
 .update-progress progress {
   flex: 1;
   min-width: 0;
-  accent-color: #ffd000;
+  accent-color: var(--accent);
 }
 .welcome-header-actions {
   display: flex;

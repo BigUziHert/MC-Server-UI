@@ -37,7 +37,10 @@ async function cleanupWorkspace(workspace) {
 // Resolve an interrupted replacement before any caller creates a missing root.
 // The directory identities distinguish our two trees from external replacements;
 // ambiguous states remain untouched and make only this server unavailable.
-export async function reconcileInterruptedRestores(serverDir) {
+export async function reconcileInterruptedRestores(
+  serverDir,
+  { restoreMetadata } = {},
+) {
   const root = path.resolve(serverDir);
   const parent = path.dirname(root);
   const names = await fs.readdir(parent).catch((cause) => {
@@ -114,6 +117,15 @@ export async function reconcileInterruptedRestores(serverDir) {
       throw blocked(
         "The active, original or staged folder has an unexpected identity.",
       );
+    if (record.metadata) {
+      if (!restoreMetadata)
+        throw blocked("The saved launch settings also need recovery.");
+      await restoreMetadata(
+        sameIdentity(await optionalStat(root), record.staged)
+          ? record.metadata.after
+          : record.metadata.before,
+      );
+    }
     recovered.push(detail);
     await cleanupWorkspace(workspace);
     await syncDirectory(parent);
@@ -249,7 +261,7 @@ export async function validateBackupArchive(archive) {
 export async function restoreBackupArchive(
   serverDir,
   archive,
-  { validate } = {},
+  { validate, commit, rollback, metadata } = {},
 ) {
   const root = path.resolve(serverDir);
   const parent = path.dirname(root);
@@ -287,6 +299,7 @@ export async function restoreBackupArchive(
     original: fileIdentity(rootStat),
     staged: null,
     phase: "preparing",
+    ...(metadata ? { metadata } : {}),
   };
   let preserveWorkspace = false;
   let restored = false;
@@ -368,9 +381,16 @@ export async function restoreBackupArchive(
       await syncDirectory(parent);
       await renameDirectory(staged, root, restoredRoot);
       await syncDirectory(parent);
+      await commit?.();
+      transaction.phase = "committed";
+      await persistJournal(journal, transaction);
     } catch (cause) {
       try {
+        const live = await optionalStat(root);
+        if (sameIdentity(live, restoredRoot))
+          await renameDirectory(root, staged, restoredRoot);
         await renameDirectory(previous, root, rootStat);
+        await rollback?.();
       } catch (rollback) {
         preserveWorkspace = true;
         throw failure(

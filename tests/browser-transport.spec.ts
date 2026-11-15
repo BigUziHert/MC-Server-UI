@@ -80,6 +80,8 @@ test("browser workspace connects to independent HTTPS panels with isolated files
         port,
         transport: "direct",
       });
+      const label = `Browser host ${name.toUpperCase()}`;
+      await fleet.access.renamePanel(label);
       const email = `${name}@example.test`;
       const account = await fleet.access.createAccount({ email });
       await fleet.access.grantServer(sharedServerId, account.id, {
@@ -104,7 +106,7 @@ test("browser workspace connects to independent HTTPS panels with isolated files
       await fs.writeFile(path.join(directory, "server-icon.png"), png);
       return {
         origin,
-        label: new URL(origin).host,
+        label,
         email,
         account,
         fleet,
@@ -247,7 +249,7 @@ test("browser workspace connects to independent HTTPS panels with isolated files
       false,
     );
 
-    // Forget must revoke the host account, not just hide this browser's saved
+    // Leave must revoke the host account, not just hide this browser's saved
     // address. Another signed-in device loses access while panel C stays usable.
     const otherDevice = await a.fleet.access.login({
       email: a.email,
@@ -262,7 +264,7 @@ test("browser workspace connects to independent HTTPS panels with isolated files
       exact: true,
     });
     await forgetDialog
-      .getByRole("button", { name: `Forget ${a.label}`, exact: true })
+      .getByRole("button", { name: `Leave ${a.label}`, exact: true })
       .click();
     await expect(forgetDialog).toContainText("access to every shared server");
     await forgetDialog
@@ -276,10 +278,10 @@ test("browser workspace connects to independent HTTPS panels with isolated files
       a.received.some((request) => request.path === "/api/access/leave"),
     ).toBe(false);
     await forgetDialog
-      .getByRole("button", { name: `Forget ${a.label}`, exact: true })
+      .getByRole("button", { name: `Leave ${a.label}`, exact: true })
       .click();
     await forgetDialog
-      .getByRole("button", { name: "Forget connection", exact: true })
+      .getByRole("button", { name: "Leave computer", exact: true })
       .click();
     await expect(forgetDialog.getByText(a.label, { exact: true })).toHaveCount(
       0,
@@ -334,7 +336,7 @@ test("browser workspace connects to independent HTTPS panels with isolated files
       }),
     ).toBeVisible();
 
-    // Only a new owner-issued account and invitation restore access after Forget.
+    // Only a new owner-issued account and invitation restore access after Leave.
     a.account = await a.fleet.access.createAccount({ email: a.email });
     await a.fleet.access.grantServer(sharedServerId, a.account.id, {
       permissions: [
@@ -398,7 +400,9 @@ test("browser workspace connects to independent HTTPS panels with isolated files
       .getByRole("button", { name: "Close panel connections", exact: true })
       .click();
 
-    await expect(page.getByText(a.label, { exact: true })).toHaveCount(0);
+    await expect(
+      page.getByRole("heading", { name: a.label, exact: true }),
+    ).toBeVisible();
     await expect(
       page.getByRole("button", {
         name: `Select server Shared name on ${c.label}`,

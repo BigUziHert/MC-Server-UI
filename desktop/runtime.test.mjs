@@ -546,7 +546,7 @@ test("desktop runtime isolates environment settings and persists its data across
   await Promise.all([second.close(), second.close()]);
 });
 
-test("desktop close awaits graceful shutdown of managed Java and releases its listener", async (t) => {
+test("desktop close still stops managed Java after a settings failure and retries cleanup", async (t) => {
   const { launch } = await fixture(t);
   const commands = [];
   let exited = false;
@@ -613,11 +613,47 @@ test("desktop close awaits graceful shutdown of managed Java and releases its li
     ).status,
     200,
   );
-  await runtime.close();
+  const closeSettings = runtime.panelSettings.close.bind(runtime.panelSettings);
+  let attempts = 0;
+  runtime.panelSettings.close = async () => {
+    if (++attempts === 1) throw new Error("Fixture settings close failed");
+    await closeSettings();
+  };
+  await assert.rejects(runtime.close(), /Fixture settings close failed/);
   assert.deepEqual(commands, ["stop\n"]);
   assert.equal(exited, true);
   assert.equal(killed, false);
   await assert.rejects(fetch(runtime.url + "/api/server"));
+  await assert.doesNotReject(runtime.close());
+  assert.equal(attempts, 2);
+  assert.deepEqual(commands, ["stop\n"]);
+});
+
+test("desktop shutdown aggregates independent errors and retries a failed fleet close", async (t) => {
+  const { launch } = await fixture(t);
+  const runtime = await launch();
+  const closeSettings = runtime.panelSettings.close.bind(runtime.panelSettings);
+  const closeFleet = runtime.fleet.close.bind(runtime.fleet);
+  let settingsAttempts = 0,
+    fleetAttempts = 0;
+  runtime.panelSettings.close = async () => {
+    if (++settingsAttempts === 1)
+      throw new Error("Fixture settings close failure");
+    await closeSettings();
+  };
+  runtime.fleet.close = async (options) => {
+    await closeFleet(options);
+    if (++fleetAttempts === 1) throw new Error("Fixture fleet close failure");
+  };
+  await assert.rejects(runtime.close(), (cause) => {
+    assert.equal(cause.errors.length, 2);
+    assert.match(cause.message, /settings close failure/);
+    assert.match(cause.message, /fleet close failure/);
+    return true;
+  });
+  await assert.doesNotReject(runtime.close());
+  assert.equal(settingsAttempts, 2);
+  assert.equal(fleetAttempts, 2);
 });
 
 test("desktop startup requires an explicit absolute data directory", async () => {

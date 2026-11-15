@@ -606,10 +606,18 @@ test("recursive file search enforces listing permission, selected-server access 
     ).status,
     200,
   );
-  const allowed = await signed("/api/files?search=test");
-  assert.equal(allowed.status, 200);
+  const allowedEntries = [];
+  let allowedCursor;
+  do {
+    const allowed = await signed(
+      `/api/files?search=test${allowedCursor ? `&cursor=${encodeURIComponent(allowedCursor)}` : ""}`,
+    );
+    assert.equal(allowed.status, 200);
+    allowedEntries.push(...allowed.body.entries);
+    allowedCursor = allowed.body.nextCursor;
+  } while (allowedCursor);
   assert.deepEqual(
-    allowed.body.entries.map((entry) => entry.path),
+    allowedEntries.map((entry) => entry.path),
     ["mods/test.json"],
   );
   assert.equal(

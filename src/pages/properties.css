@@ -98,12 +98,12 @@
   background: #0009;
 }
 .property-error {
-  color: var(--danger, #f48282);
+  color: var(--danger, var(--danger-text));
   font-size: 12px;
   line-height: 1.5;
 }
 .property-field input[aria-invalid="true"] {
-  border-color: var(--danger, #f48282);
+  border-color: var(--danger, var(--danger-text));
 }
 @media (max-width: 650px) {
   .properties-grid {

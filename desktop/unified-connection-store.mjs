@@ -40,6 +40,12 @@ function identity(value) {
     userId: value.userId,
     ...(text(value.accountId, 128) ? { accountId: value.accountId } : {}),
     serverId: text(value.serverId, 128) ? value.serverId : null,
+    ...(text(value.panelId, 128) ? { panelId: value.panelId } : {}),
+    ...(text(value.panelName, 100) ? { panelName: value.panelName } : {}),
+    ...(text(value.expiresAt, 64) &&
+    Number.isFinite(Date.parse(value.expiresAt))
+      ? { expiresAt: value.expiresAt }
+      : {}),
   };
 }
 
@@ -217,6 +223,11 @@ export function createUnifiedConnectionStore({ dataDir, safeStorage }) {
         panels.push({
           id: entry.id,
           origin,
+          ...(text(entry.nickname, 100) ? { nickname: entry.nickname } : {}),
+          ...(text(entry.hostIdentity, 128)
+            ? { hostIdentity: entry.hostIdentity }
+            : {}),
+          ...(text(entry.panelName, 100) ? { panelName: entry.panelName } : {}),
           ...(fingerprint(entry.trustedFingerprint)
             ? { trustedFingerprint: entry.trustedFingerprint }
             : {}),
@@ -291,6 +302,13 @@ export function createUnifiedConnectionStore({ dataDir, safeStorage }) {
           return {
             id: panel.id,
             origin,
+            ...(text(panel.nickname, 100) ? { nickname: panel.nickname } : {}),
+            ...(text(panel.hostIdentity, 128)
+              ? { hostIdentity: panel.hostIdentity }
+              : {}),
+            ...(text(panel.panelName, 100)
+              ? { panelName: panel.panelName }
+              : {}),
             ...(fingerprint(panel.trustedFingerprint)
               ? { trustedFingerprint: panel.trustedFingerprint }
               : {}),

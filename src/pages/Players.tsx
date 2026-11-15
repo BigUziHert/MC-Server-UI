@@ -1,3 +1,4 @@
+import { defaultPageSizes } from "../Pagination";
 import {
   useCallback,
   useContext,
@@ -65,7 +66,7 @@ type WhitelistAction =
   | { kind: "add" | "remove"; player?: Operator }
   | { kind: "state"; enabled: boolean };
 
-const pageSizes = [5, 10, 25, 50, 75, 100];
+const pageSizes = defaultPageSizes;
 
 function usePlayerPagination<T>(id: string, players: T[], filter = "") {
   const serverId = useContext(ServerScope);
@@ -210,6 +211,11 @@ export default function Players({
   permissions,
 }: PageProps & { permissions?: string[] }) {
   const { api, post } = useServerApi();
+  const canRead =
+    permissions === undefined ||
+    ["players.read", "players.whitelist", "control.console"].some((id) =>
+      permissions.includes(id),
+    );
   const [data, setData] = useState<PlayersResponse | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
@@ -242,6 +248,10 @@ export default function Players({
 
   const refresh = useCallback(
     (silent = false, afterMutation = false): Promise<boolean> => {
+      if (!canRead) {
+        setLoading(false);
+        return Promise.resolve(false);
+      }
       if (inFlight.current && !afterMutation) return inFlight.current;
       const currentRequest = ++request.current;
       readController.current?.abort();
@@ -274,7 +284,7 @@ export default function Players({
       inFlight.current = pending;
       return pending;
     },
-    [api],
+    [api, canRead],
   );
 
   useEffect(() => {
@@ -290,7 +300,9 @@ export default function Players({
     setRemoving(null);
     setWhitelistAction(null);
     void refresh();
-    const interval = window.setInterval(() => void refresh(true), 5000);
+    const interval = window.setInterval(() => {
+      if (document.visibilityState !== "hidden") void refresh(true);
+    }, 5000);
     return () => {
       window.clearInterval(interval);
       request.current += 1;
@@ -323,8 +335,18 @@ export default function Players({
     (permissions === undefined || permissions.includes("control.console")),
   );
   const managementUnavailable =
-    "Player management is unavailable. Refresh or wait for the server to finish starting or stopping.";
+    permissions !== undefined && !permissions.includes("control.console")
+      ? "You can view players. Ask the server owner for Console permission to manage operators and bans, or Whitelist permission to manage admission."
+      : "Player management is unavailable. Refresh or wait for the server to finish starting or stopping.";
   const canKick = canManage && data?.status === "running";
+  const canWhitelist = Boolean(
+    data &&
+    !error &&
+    ["running", "offline"].includes(data.status) &&
+    (permissions === undefined ||
+      permissions.includes("control.console") ||
+      permissions.includes("players.whitelist")),
+  );
   const operators = data?.operators ?? [];
   const filtered = operators.filter((player) =>
     player.name.toLowerCase().includes(query.trim().toLowerCase()),
@@ -448,7 +470,7 @@ export default function Players({
     setRemoving(player);
   }
   function openWhitelist(action: WhitelistAction) {
-    if (!canManage) return;
+    if (!canWhitelist) return;
     setFormError("");
     setWhitelistName(
       action.kind === "state" ? "" : (action.player?.name ?? ""),
@@ -470,7 +492,7 @@ export default function Players({
   async function submitWhitelist(event: FormEvent) {
     event.preventDefault();
     if (!whitelistAction || busy) return;
-    if (!canManage) {
+    if (!canWhitelist) {
       setFormError(managementUnavailable);
       return;
     }
@@ -577,6 +599,29 @@ export default function Players({
     }
   }
 
+  if (!canRead)
+    return (
+      <div className="management-page players-page">
+        <h1>Players</h1>
+        <StatePanel
+          variant="empty"
+          title="Player access is not shared"
+          message="Ask the server owner for permission to view players."
+        />
+      </div>
+    );
+  if (error && !data)
+    return (
+      <div className="management-page players-page">
+        <h1>Players</h1>
+        <StatePanel
+          variant="error"
+          title="Unable to load players"
+          message={error}
+          onRetry={() => void refresh(true)}
+        />
+      </div>
+    );
   return (
     <div className="management-page players-page">
       <div className="page-heading management-heading">
@@ -584,7 +629,18 @@ export default function Players({
           <h1>Players</h1>
         </div>
       </div>
-
+      {!canManage && (
+        <p className="management-notice" role="status">
+          {managementUnavailable}
+        </p>
+      )}
+      {data?.whitelistEnabled === false && (
+        <p className="management-notice" role="status">
+          The whitelist is off. Anyone who can reach this server and meets its
+          authentication rules can join. Enable the whitelist below to limit
+          admission.
+        </p>
+      )}
       <div className="panel players-online-banner">
         <Users size={19} />
         <strong>
@@ -611,7 +667,7 @@ export default function Players({
       <div className="players-rosters">
         <Roster
           id="online-players"
-          title="Online Players"
+          title="Online players"
           players={online}
           empty="No players online."
           loading={loading && !data}
@@ -664,7 +720,7 @@ export default function Players({
                     : "Add to whitelist"
                 }
                 disabled={
-                  !canManage || busy || data?.whitelistAvailable === false
+                  !canWhitelist || busy || data?.whitelistAvailable === false
                 }
                 onClick={() =>
                   openWhitelist({
@@ -684,7 +740,7 @@ export default function Players({
         />
         <Roster
           id="banned-players"
-          title="Banned Players"
+          title="Banned players"
           players={banned}
           empty={
             data?.bansAvailable === false
@@ -765,7 +821,7 @@ export default function Players({
                 aria-label="Add player to whitelist"
                 title="Add player"
                 disabled={
-                  !canManage || busy || data?.whitelistAvailable === false
+                  !canWhitelist || busy || data?.whitelistAvailable === false
                 }
                 onClick={() => openWhitelist({ kind: "add" })}
               >
@@ -783,7 +839,7 @@ export default function Players({
                 label=""
                 checked={data?.whitelistEnabled ?? false}
                 disabled={
-                  !canManage ||
+                  !canWhitelist ||
                   busy ||
                   data?.whitelistSettingsAvailable === false ||
                   (!data?.whitelistEnabled &&
@@ -802,7 +858,7 @@ export default function Players({
               aria-label={`Remove saved whitelist player ${player.name}`}
               title="Remove from whitelist"
               disabled={
-                !canManage || busy || data?.whitelistAvailable === false
+                !canWhitelist || busy || data?.whitelistAvailable === false
               }
               onClick={() => openWhitelist({ kind: "remove", player })}
             >
@@ -937,7 +993,9 @@ export default function Players({
                     className="btn"
                     aria-label={`${isWhitelisted(player) ? "Remove" : "Add"} ${player.name} ${isWhitelisted(player) ? "from" : "to"} whitelist`}
                     disabled={
-                      !canManage || busy || data?.whitelistAvailable === false
+                      !canWhitelist ||
+                      busy ||
+                      data?.whitelistAvailable === false
                     }
                     onClick={() =>
                       openWhitelist({
@@ -1091,7 +1149,7 @@ export default function Players({
                 ? data?.status === "offline"
                   ? "Operator access will be removed from the saved list before the server next starts."
                   : "Minecraft will process a deop command. Check Console for confirmation."
-                : "OP grants powerful in-game commands, including changes to the world and player management, according to your server’s operator level. Only grant it to someone you trust."}
+                : `OP grants powerful in-game commands. Only grant it to someone you trust. ${data?.status === "offline" ? "This change is saved for the next start; the player must have joined this server before." : "The panel sends a Minecraft console command. Check Console for confirmation."}`}
             </p>
           </div>
           {!canManage && (
@@ -1119,7 +1177,7 @@ export default function Players({
               className={`btn ${removing ? "danger" : "primary"}`}
               disabled={busy || !canManage}
             >
-              {busy ? "Sending..." : removing ? "Remove OP" : "Grant OP"}
+              {busy ? "Sending…" : removing ? "Remove OP" : "Grant OP"}
             </button>
           </div>
         </form>
@@ -1152,7 +1210,7 @@ export default function Players({
           <p className="management-dialog-description">
             {whitelistAction?.kind === "state" ? (
               whitelistAction.enabled ? (
-                "Only whitelisted players will be allowed to join this server."
+                `Only whitelisted players and operators will be allowed to join. ${!whitelist.length ? "The whitelist is empty; add your friends before enabling it. " : ""}${data?.status === "running" ? "Players already connected may remain online. Kick them separately if needed; enforce-whitelist in Properties takes effect after a restart." : "The change takes effect when the server next starts."}`
               ) : (
                 "Players will be able to join without being on the whitelist. Player and IP bans still apply."
               )
@@ -1195,7 +1253,7 @@ export default function Players({
                 : "The panel sends a Minecraft console command. The roster and switch update when the server saves the result."}
             </p>
           </div>
-          {(!canManage || formError) && (
+          {(!canWhitelist || formError) && (
             <p className="management-form-error" role="alert">
               <AlertCircle size={15} />
               {formError || managementUnavailable}
@@ -1215,7 +1273,7 @@ export default function Players({
               className={`btn ${whitelistAction?.kind === "remove" ? "danger" : "primary"}`}
               disabled={
                 busy ||
-                !canManage ||
+                !canWhitelist ||
                 (whitelistAction?.kind === "state"
                   ? data?.whitelistSettingsAvailable === false ||
                     (whitelistAction.enabled &&
@@ -1224,7 +1282,7 @@ export default function Players({
               }
             >
               {busy
-                ? "Sending..."
+                ? "Sending…"
                 : whitelistAction?.kind === "state"
                   ? `${whitelistAction.enabled ? "Enable" : "Disable"} whitelist`
                   : whitelistAction?.kind === "remove"
@@ -1332,7 +1390,7 @@ export default function Players({
                 (moderating?.action === "kick" && !canKick)
               }
             >
-              {busy ? "Sending..." : actionLabel}
+              {busy ? "Sending…" : actionLabel}
             </button>
           </div>
         </form>

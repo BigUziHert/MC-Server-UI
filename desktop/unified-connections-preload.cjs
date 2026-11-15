@@ -29,6 +29,10 @@ if (process.isMainFrame) {
       invoke("acceptInvitation", panelId, credentials),
     signOut: (panelId) => invoke("signOut", panelId),
     retry: (panelId) => invoke("retry", panelId),
+    renameConnection: (panelId, name) =>
+      invoke("renameConnection", panelId, name),
+    changePassword: (panelId, input) =>
+      invoke("changePassword", panelId, input),
     forget: (panelId, expectedAccountId) =>
       invoke("forget", panelId, expectedAccountId),
     removeSavedConnection: (panelId, expectedEpoch) =>

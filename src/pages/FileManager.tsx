@@ -691,9 +691,7 @@ export default function FileManager({
     permissions === undefined || permissions.includes("file.update");
   const canDelete =
     permissions === undefined || permissions.includes("file.delete");
-  const canBin =
-    canRead &&
-    (permissions === undefined || permissions.includes("backup.read"));
+  const canBin = canRead || permissions?.includes("backup.read") === true;
   const { api, post, downloadUrl, scopeKey } = useServerApi();
   const serverId = useContext(ServerScope);
   const sessionScope = useContext(SessionScopeContext);
@@ -765,6 +763,8 @@ export default function FileManager({
         : canDelete;
   const [name, setName] = useState("");
   const [content, setContent] = useState("");
+  const originalContent = useRef("");
+  const [discardRequested, setDiscardRequested] = useState(false);
   const [encoding, setEncoding] = useState<"utf8" | "latin1">("utf8");
   const [revision, setRevision] = useState<string>();
   const [saving, setSaving] = useState(false);
@@ -1107,9 +1107,24 @@ export default function FileManager({
   function closeDialog() {
     editRequestId.current++;
     setReading(false);
+    setDiscardRequested(false);
     setDialog(null);
     setDialogMoveId(null);
   }
+  const hasUnsavedChanges =
+    (dialog?.type === "edit" && content !== originalContent.current) ||
+    (dialog?.type === "create" && Boolean(name || content));
+  function requestCloseDialog() {
+    if (savingRef.current) return;
+    if (hasUnsavedChanges) setDiscardRequested(true);
+    else closeDialog();
+  }
+  useEffect(() => {
+    if (!hasUnsavedChanges) return;
+    const warn = (event: BeforeUnloadEvent) => event.preventDefault();
+    window.addEventListener("beforeunload", warn);
+    return () => window.removeEventListener("beforeunload", warn);
+  }, [hasUnsavedChanges]);
   function openDelete(entry: Entry) {
     if (!canDelete || movePending || checkingMove) return;
     editRequestId.current++;
@@ -1161,6 +1176,8 @@ export default function FileManager({
     setReadFailed(false);
     setName("");
     setContent("");
+    originalContent.current = "";
+    setDiscardRequested(false);
     setRevision(undefined);
     setDialogError("");
     setDialog({ type: "create", kind });
@@ -1178,6 +1195,8 @@ export default function FileManager({
     }
     const id = ++editRequestId.current;
     setContent("");
+    originalContent.current = "";
+    setDiscardRequested(false);
     setRevision(undefined);
     setDialogError("");
     setReadFailed(false);
@@ -1191,6 +1210,7 @@ export default function FileManager({
       }>(`/files/content?path=${encodeURIComponent(entry.path)}`);
       if (id === editRequestId.current) {
         setContent(result.content);
+        originalContent.current = result.content;
         setEncoding(result.encoding ?? "utf8");
         setRevision(result.revision);
       }
@@ -1400,7 +1420,11 @@ export default function FileManager({
         "input:not([type=checkbox]):not([type=radio]):not([type=button]),textarea,[contenteditable]:not([contenteditable=false]),[role=textbox]",
       );
     const blocked = () =>
-      dialog || showingBin || document.querySelector("dialog[open]");
+      dialog ||
+      showingBin ||
+      document.querySelector(
+        'dialog[open], [role="dialog"][aria-modal="true"]',
+      );
     const shortcut = (event: KeyboardEvent) => {
       if (event.defaultPrevented || blocked() || editingText(event.target))
         return;
@@ -1626,12 +1650,19 @@ export default function FileManager({
       ),
     [entries],
   );
-  if (!canRead)
+  if (!canRead && !(showingBin && canBin))
     return (
       <StatePanel
         variant="empty"
         title="Files unavailable"
         message="You do not have permission to browse server files."
+        action={
+          canBin ? (
+            <button className="btn" onClick={() => setShowingBin(true)}>
+              Open Recycle Bin
+            </button>
+          ) : undefined
+        }
       />
     );
   if (showingBin && canBin)
@@ -1940,7 +1971,7 @@ export default function FileManager({
                     ? requestedQuery
                       ? `${searchProgress} matches · searching…`
                       : "Loading…"
-                    : `${entries.length} ${requestedQuery ? "matches" : "items"}`}
+                    : `${entries.length} ${requestedQuery ? (entries.length === 1 ? "match" : "matches") : entries.length === 1 ? "item" : "items"}`}
               </span>
             )}
             <div
@@ -2480,7 +2511,9 @@ export default function FileManager({
           onCancel={(event) => {
             event.preventDefault();
             if (!textEditor.current?.closeFind() && !savingRef.current)
-              closeDialog();
+              discardRequested
+                ? setDiscardRequested(false)
+                : requestCloseDialog();
           }}
           onMouseDown={(event) => {
             if (event.target !== event.currentTarget || savingRef.current)
@@ -2495,7 +2528,7 @@ export default function FileManager({
               // Keep the pointer's default focus action from stealing focus
               // back from the trigger restored by closeDialog.
               event.preventDefault();
-              closeDialog();
+              requestCloseDialog();
             }
           }}
         >
@@ -2524,7 +2557,7 @@ export default function FileManager({
                 className="btn icon"
                 aria-label="Close dialog"
                 disabled={saving}
-                onClick={closeDialog}
+                onClick={requestCloseDialog}
               >
                 <X size={18} />
               </button>
@@ -2625,6 +2658,26 @@ export default function FileManager({
                 {dialogError}
               </p>
             )}
+            {discardRequested && (
+              <div className="storage-form-error" role="alert">
+                <p>Discard your unsaved changes?</p>
+                <button
+                  type="button"
+                  className="btn primary"
+                  onClick={() => setDiscardRequested(false)}
+                  autoFocus
+                >
+                  Keep editing
+                </button>{" "}
+                <button
+                  type="button"
+                  className="btn danger"
+                  onClick={closeDialog}
+                >
+                  Discard changes
+                </button>
+              </div>
+            )}
             {moving && moveBatch && dialogMoveId === moveBatch.id && (
               <div className="recycle-bin-notice" role="status">
                 <LoaderCircle size={18} className="spin" />
@@ -2642,7 +2695,7 @@ export default function FileManager({
                 type="button"
                 className="btn"
                 disabled={saving}
-                onClick={closeDialog}
+                onClick={requestCloseDialog}
               >
                 {movePending && dialogMoveId === moveBatch?.id
                   ? "Close"
@@ -2822,14 +2875,11 @@ function RecycleBin({
   onBack,
   permissions,
 }: PageProps & { onBack: () => void; permissions?: string[] }) {
-  const canRestore =
+  const permitted = (item: RecycledItem, action: "restore" | "delete") =>
     permissions === undefined ||
-    (permissions.includes("file.create") &&
-      permissions.includes("backup.create"));
-  const canDelete =
-    permissions === undefined ||
-    (permissions.includes("file.delete") &&
-      permissions.includes("backup.delete"));
+    permissions.includes(
+      `${item.kind === "backup" ? "backup" : "file"}.${action === "restore" ? "create" : "delete"}`,
+    );
   const { api, scopeKey } = useServerApi();
   const sessionScope = useContext(SessionScopeContext);
   const recoveryKey = `${sessionScope}:${scopeKey}:recovery`;
@@ -2839,6 +2889,9 @@ function RecycleBin({
   const [reviewingItem, setReviewingItem] = useState<string | null>(null);
   const restoring = batch?.running ? batch.currentItemId : reviewingItem;
   const [items, setItems] = useState<RecycledItem[]>([]);
+  const [recyclePage, setRecyclePage] = useState(1);
+  const [recycleSize, setRecycleSize] = usePageSize("recycle-bin");
+  const [recycleSort, setRecycleSort] = useState("newest");
   const [query, setQuery] = useState("");
   const debouncedQuery = useDebouncedValue(query);
   const loaded = useRef(false);
@@ -2852,7 +2905,37 @@ function RecycleBin({
     batchId?: string;
   } | null>(null);
   const [actionError, setActionError] = useState("");
+  const [restoreMode, setRestoreMode] = useState("original");
+  const [restoreName, setRestoreName] = useState("");
+  const [restoreServerOffline, setRestoreServerOffline] = useState(false);
+  useEffect(() => {
+    if (action?.type !== "restore") return;
+    let active = true,
+      pending = false;
+    setRestoreServerOffline(false);
+    const poll = async () => {
+      if (pending || document.visibilityState === "hidden") return;
+      pending = true;
+      try {
+        const server = await api<{ status: string }>("/server");
+        if (active) setRestoreServerOffline(server.status === "offline");
+      } catch {
+        if (active) setRestoreServerOffline(false);
+      } finally {
+        pending = false;
+      }
+    };
+    void poll();
+    const timer = setInterval(poll, 3000);
+    return () => {
+      active = false;
+      clearInterval(timer);
+    };
+  }, [action?.type, api]);
   const [restoreWarnings, setRestoreWarnings] = useState<string[]>([]);
+  const [restoreDuplicates, setRestoreDuplicates] = useState<
+    { path: string; title: string }[]
+  >([]);
   const [checkingRestore, setCheckingRestore] = useState(false);
   const restoreReview = useRef(0);
   const previewRequest = useRef<AbortController | null>(null);
@@ -2984,10 +3067,13 @@ function RecycleBin({
 
   async function checkRestore(targets: RecycledItem[], signal: AbortSignal) {
     const warnings: string[] = [];
+    const duplicates: { path: string; title: string }[] = [];
     for (const item of targets.filter(
       (value) =>
         value.kind !== "backup" &&
-        /^mods\/[^/]+\.jar$/i.test(value.originalPath),
+        /^(?:mods|plugins)\/[^/]+\.jar(?:\.disabled)?$/i.test(
+          value.originalPath,
+        ),
     )) {
       if (signal.aborted) break;
       try {
@@ -2997,28 +3083,29 @@ function RecycleBin({
         }>(
           `/files/recycle-bin/${encodeURIComponent(item.id)}/restore-preview`,
           {
-            signal: AbortSignal.any([signal, AbortSignal.timeout(5000)]),
+            signal: AbortSignal.any([signal, AbortSignal.timeout(12000)]),
           },
         );
+        if (targets.length === 1) duplicates.push(...result.duplicates);
         warnings.push(
           ...result.duplicates.map(
             (duplicate) =>
-              `Restoring ${item.name} would add another copy of ${duplicate.title || "this mod"}. Already installed: ${duplicate.path}. Remove the extra copy before starting the server.`,
+              `Restoring ${item.name} would add another copy of ${duplicate.title || "this content"}. Already installed: ${duplicate.path}. Remove the extra copy before starting the server.`,
           ),
           ...result.warnings,
         );
       } catch (cause) {
         if (signal.aborted) break;
         warnings.push(
-          `Could not check ${item.name} for duplicate mods: ${messageOf(cause)}`,
+          `Could not check ${item.name} for duplicate installed content: ${messageOf(cause)}`,
         );
       }
     }
-    return [...new Set(warnings)];
+    return { warnings: [...new Set(warnings)], duplicates };
   }
   async function restore(item: RecycledItem) {
     if (
-      !canRestore ||
+      !permitted(item, "restore") ||
       pending ||
       checkingOperation ||
       reviewingItem ||
@@ -3032,9 +3119,16 @@ function RecycleBin({
     setReviewingItem(item.id);
     setRestoreErrors((previous) => ({ ...previous, [item.id]: "" }));
     try {
-      const warnings = await checkRestore([item], controller.signal);
+      const { warnings, duplicates } = await checkRestore(
+        [item],
+        controller.signal,
+      );
       if (token !== restoreReview.current) return;
       if (warnings.length) {
+        setRestoreMode("original");
+        setRestoreServerOffline(false);
+        setRestoreName(item.name);
+        setRestoreDuplicates(duplicates);
         setRestoreWarnings(warnings);
         setActionError("");
         setAction({ type: "restore", targets: [item] });
@@ -3053,7 +3147,7 @@ function RecycleBin({
     targets: RecycledItem[],
   ) {
     if (
-      (type === "restore" ? !canRestore : !canDelete) ||
+      targets.some((item) => !permitted(item, type)) ||
       !targets.length ||
       pending ||
       checkingOperation ||
@@ -3062,6 +3156,10 @@ function RecycleBin({
       return;
     setActionError("");
     setRestoreWarnings([]);
+    setRestoreDuplicates([]);
+    setRestoreMode("original");
+    setRestoreServerOffline(false);
+    setRestoreName(targets[0]?.name ?? "");
     setAction({ type, targets: [...targets] });
     const token = ++restoreReview.current;
     previewRequest.current?.abort();
@@ -3069,9 +3167,13 @@ function RecycleBin({
     previewRequest.current = controller;
     if (type === "restore") {
       setCheckingRestore(true);
-      const warnings = await checkRestore(targets, controller.signal);
+      const { warnings, duplicates } = await checkRestore(
+        targets,
+        controller.signal,
+      );
       if (token === restoreReview.current) {
         setRestoreWarnings(warnings);
+        setRestoreDuplicates(duplicates);
         setCheckingRestore(false);
       }
     }
@@ -3081,7 +3183,9 @@ function RecycleBin({
     previewRequest.current?.abort();
     setCheckingRestore(false);
     setReviewingItem(null);
+    setRestoreServerOffline(false);
     setRestoreWarnings([]);
+    setRestoreDuplicates([]);
     setAction(null);
     setActionError("");
     actionDialog.current?.close();
@@ -3091,19 +3195,66 @@ function RecycleBin({
     event.preventDefault();
     if (
       !action ||
-      (action.type === "restore" ? !canRestore : !canDelete) ||
+      action.targets.some((item) => !permitted(item, action.type)) ||
       pending ||
       checkingOperation ||
       checkingRestore
     )
       return;
     setActionError("");
+    const singleFile =
+      action.type === "restore" &&
+      action.targets.length === 1 &&
+      action.targets[0].kind !== "backup";
+    if (
+      singleFile &&
+      restoreMode === "rename" &&
+      (!restoreName.trim() ||
+        /[\\/:]/.test(restoreName) ||
+        restoreName === "." ||
+        restoreName === "..")
+    ) {
+      setActionError("Choose a filename without path separators.");
+      return;
+    }
+    if (
+      singleFile &&
+      (restoreMode === "replace" || restoreMode.startsWith("duplicate:")) &&
+      !restoreServerOffline
+    ) {
+      setActionError("Stop the server before replacing an existing file.");
+      return;
+    }
+    const parentPath = action.targets[0]?.originalPath
+      .split("/")
+      .slice(0, -1)
+      .join("/");
+    const restoreOptions =
+      singleFile && restoreMode === "rename"
+        ? {
+            destinationPath: [parentPath, restoreName.trim()]
+              .filter(Boolean)
+              .join("/"),
+          }
+        : singleFile &&
+            restoreMode.startsWith("duplicate:") &&
+            restoreDuplicates.some(
+              (item) => `duplicate:${item.path}` === restoreMode,
+            )
+          ? {
+              destinationPath: restoreMode.slice("duplicate:".length),
+              replaceExisting: true,
+            }
+          : singleFile && restoreMode === "replace"
+            ? { replaceExisting: true }
+            : undefined;
     const id = startRecoveryBatch(
       api,
       recoveryKey,
       action.type,
       action.targets,
       notify,
+      { restoreOptions },
     );
     if (id) setAction({ ...action, batchId: id });
   }
@@ -3116,6 +3267,22 @@ function RecycleBin({
     `${item.name} ${item.originalPath} ${item.kind === "backup" ? "backup archive" : ""}`
       .toLowerCase()
       .includes(debouncedQuery.toLowerCase()),
+  );
+  visible.sort((a, b) =>
+    recycleSort === "name"
+      ? a.name.localeCompare(b.name)
+      : recycleSort === "size"
+        ? b.size - a.size
+        : (recycleSort === "oldest" ? 1 : -1) *
+          (Date.parse(a.deletedAt) - Date.parse(b.deletedAt)),
+  );
+  const currentRecyclePage = Math.min(
+    recyclePage,
+    Math.max(1, Math.ceil(visible.length / recycleSize)),
+  );
+  const recycleRows = visible.slice(
+    (currentRecyclePage - 1) * recycleSize,
+    currentRecyclePage * recycleSize,
   );
   const selectedItems = items.filter((item) => selected.has(item.id));
   const visibleSelected = visible.filter((item) =>
@@ -3258,7 +3425,7 @@ function RecycleBin({
             <button
               className="btn small"
               disabled={
-                !canRestore ||
+                selectedItems.some((item) => !permitted(item, "restore")) ||
                 !selectedItems.length ||
                 pending ||
                 checkingOperation ||
@@ -3279,7 +3446,7 @@ function RecycleBin({
             <button
               className="btn danger small"
               disabled={
-                !canDelete ||
+                selectedItems.some((item) => !permitted(item, "delete")) ||
                 !selectedItems.length ||
                 pending ||
                 checkingOperation ||
@@ -3301,9 +3468,27 @@ function RecycleBin({
             onRetry={() => void load()}
           />
         )}
+        {items.length > 0 && (
+          <label className="form-field">
+            Sort recycled items
+            <select
+              aria-label="Sort recycled items"
+              value={recycleSort}
+              onChange={(event) => {
+                setRecycleSort(event.target.value);
+                setRecyclePage(1);
+              }}
+            >
+              <option value="newest">Newest first</option>
+              <option value="oldest">Oldest first</option>
+              <option value="name">Name</option>
+              <option value="size">Largest first</option>
+            </select>
+          </label>
+        )}
         {loading && !loaded.current ? (
           <StatePanel variant="loading" title="Loading recycled items…" />
-        ) : !visible.length ? (
+        ) : error && !visible.length ? null : !visible.length ? (
           <StatePanel
             variant="empty"
             icon={<Trash2 size={30} />}
@@ -3318,7 +3503,7 @@ function RecycleBin({
           />
         ) : (
           <ul className="recycle-bin-items" aria-label="Recycled items">
-            {visible.map((item) => (
+            {recycleRows.map((item) => (
               <li
                 key={item.id}
                 className="recycle-bin-item"
@@ -3388,7 +3573,16 @@ function RecycleBin({
                   )}
                   {restoreErrors[item.id] && (
                     <p className="storage-form-error" role="alert">
-                      {restoreErrors[item.id]}
+                      {restoreErrors[item.id]}{" "}
+                      {item.kind !== "backup" && (
+                        <button
+                          className="btn small"
+                          disabled={pending || checkingOperation}
+                          onClick={() => void openAction("restore", [item])}
+                        >
+                          Choose restore options
+                        </button>
+                      )}
                     </p>
                   )}
                 </div>
@@ -3397,7 +3591,7 @@ function RecycleBin({
                     className="btn small"
                     aria-label={`Restore ${item.name}`}
                     disabled={
-                      !canRestore ||
+                      !permitted(item, "restore") ||
                       pending ||
                       checkingOperation ||
                       !!reviewingItem ||
@@ -3421,7 +3615,7 @@ function RecycleBin({
                     className="btn danger small"
                     aria-label={`Permanently delete ${item.name}`}
                     disabled={
-                      !canDelete ||
+                      !permitted(item, "delete") ||
                       pending ||
                       checkingOperation ||
                       !!reviewingItem
@@ -3441,6 +3635,19 @@ function RecycleBin({
               </li>
             ))}
           </ul>
+        )}
+        {visible.length > 0 && (
+          <Pagination
+            page={currentRecyclePage}
+            pageSize={recycleSize}
+            total={visible.length}
+            onPageChange={setRecyclePage}
+            onPageSizeChange={(size) => {
+              setRecycleSize(size);
+              setRecyclePage(1);
+            }}
+            label="recycled items"
+          />
         )}
         <div className="files-footer">
           <span>
@@ -3531,13 +3738,68 @@ function RecycleBin({
                 onDismiss={dismissStatus}
               />
             )}
+            {action.type === "restore" &&
+              action.targets.length === 1 &&
+              action.targets[0].kind !== "backup" && (
+                <fieldset disabled={pending || checkingRestore}>
+                  <legend>Restore destination and conflicts</legend>
+                  <label className="form-field">
+                    Restore behavior
+                    <select
+                      aria-label="Restore behavior"
+                      value={restoreMode}
+                      onChange={(event) => setRestoreMode(event.target.value)}
+                    >
+                      <option value="original">
+                        Keep existing file; refuse a conflict
+                      </option>
+                      <option value="rename">
+                        Restore with a different name
+                      </option>
+                      <option value="replace" disabled={!restoreServerOffline}>
+                        Replace existing file (server must be stopped)
+                      </option>
+                      {restoreDuplicates.map((item) => (
+                        <option
+                          key={item.path}
+                          value={`duplicate:${item.path}`}
+                          disabled={!restoreServerOffline}
+                        >
+                          Replace installed copy: {item.path}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                  {restoreMode === "rename" && (
+                    <label className="form-field">
+                      Restore filename
+                      <input
+                        aria-label="Restore filename"
+                        value={restoreName}
+                        onChange={(event) => setRestoreName(event.target.value)}
+                        required
+                      />
+                    </label>
+                  )}
+                  {(restoreMode === "replace" ||
+                    restoreMode.startsWith("duplicate:")) && (
+                    <p className="storage-form-error">
+                      The current file will move to Recycle Bin before the
+                      recovered file replaces it.
+                    </p>
+                  )}
+                </fieldset>
+              )}
             {checkingRestore && (
-              <StatePanel variant="loading" title="Checking restored mods…" />
+              <StatePanel
+                variant="loading"
+                title="Checking restored content…"
+              />
             )}
             {!!restoreWarnings.length && (
               <div className="management-notice warning" role="status">
                 <div>
-                  <strong>Review duplicate mods before restoring</strong>
+                  <strong>Restore check</strong>
                   {restoreWarnings.map((warning) => (
                     <p key={warning}>{warning}</p>
                   ))}
@@ -3580,7 +3842,11 @@ function RecycleBin({
                   checkingOperation ||
                   !!reviewingItem ||
                   checkingRestore ||
-                  (action.type === "restore" ? !canRestore : !canDelete)
+                  (action.type === "restore" &&
+                    (restoreMode === "replace" ||
+                      restoreMode.startsWith("duplicate:")) &&
+                    !restoreServerOffline) ||
+                  action.targets.some((item) => !permitted(item, action.type))
                 }
               >
                 {batch?.running && action.batchId === batch.id

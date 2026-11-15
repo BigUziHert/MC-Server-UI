@@ -63,6 +63,44 @@ async function fixture(t) {
   return { directory, serverDir, archive, boot };
 }
 
+test("backup restore rolls files and runtime metadata back together when the metadata commit fails", async (t) => {
+  const f = await fixture(t);
+  await fs.writeFile(path.join(f.serverDir, "server.jar"), "backed up runtime");
+  await createTar({ cwd: f.serverDir, file: f.archive, gzip: true }, [
+    "server.jar",
+  ]);
+  await fs.writeFile(path.join(f.serverDir, "server.jar"), "current runtime");
+  let settings = "current";
+  await assert.rejects(
+    restoreBackupArchive(f.serverDir, f.archive, {
+      metadata: { before: { name: "current" }, after: { name: "backup" } },
+      commit: async () => {
+        settings = "backup";
+        throw new Error("settings disk failure");
+      },
+      rollback: async () => {
+        settings = "current";
+      },
+    }),
+    /settings disk failure/,
+  );
+  assert.equal(settings, "current");
+  assert.equal(
+    await fs.readFile(path.join(f.serverDir, "server.jar"), "utf8"),
+    "current runtime",
+  );
+  await restoreBackupArchive(f.serverDir, f.archive, {
+    commit: async () => {
+      settings = "backup";
+    },
+  });
+  assert.equal(settings, "backup");
+  assert.equal(
+    await fs.readFile(path.join(f.serverDir, "server.jar"), "utf8"),
+    "backed up runtime",
+  );
+});
+
 async function rawArchive(file, entries) {
   const chunks = [];
   for (const entry of entries) {
@@ -571,6 +609,31 @@ test("restore confirmation receipts survive restart and never replace later edit
     200,
   );
   await assert.rejects(fs.stat(path.join(serverDir, "later.txt")), {
+    code: "ENOENT",
+  });
+});
+
+test("owner can restore the matching launch configuration with an older backup", async (t) => {
+  const { serverDir, boot } = await fixture(t);
+  const panel = await boot();
+  const backup = (
+    await panel.request("/api/backups", { name: "Before upgrade" })
+  ).body;
+  assert.equal(backup.hasRuntimeSnapshot, true);
+  assert.equal(backup.runtimeSnapshot, undefined);
+  await fs.writeFile(path.join(serverDir, "replacement.jar"), "new runtime");
+  await panel.updateConfiguration(
+    { ...panel.descriptor(), jar: "replacement.jar" },
+    async () => {},
+  );
+  const result = await panel.request(`/api/backups/${backup.id}/restore`, {
+    confirm: true,
+    restoreConfiguration: true,
+  });
+  assert.equal(result.status, 200, JSON.stringify(result.body));
+  assert.equal(result.body.configurationRestored, true);
+  assert.equal(panel.descriptor().jar, "server.jar");
+  await assert.rejects(fs.stat(path.join(serverDir, "replacement.jar")), {
     code: "ENOENT",
   });
 });

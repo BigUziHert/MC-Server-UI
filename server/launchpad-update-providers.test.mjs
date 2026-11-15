@@ -234,13 +234,15 @@ test("batch updates reject current, older, incompatible, wrong-project and unsaf
             rows.map((row, index) => [row.sha512, candidates[index]]),
           ),
         )
-      : json(rows.map((row) => current(row))),
+      : url.includes("/project/")
+        ? json([])
+        : json(rows.map((row) => current(row))),
   );
   const result = await p.updates(input, rows);
   assert.equal(result.updates[newer.sha512].id, `new${newer.versionId}`);
-  for (const index of [1, 2, 3, 8])
+  for (const index of [1, 2, 3, 8, 11])
     assert.equal(result.updates[rows[index].sha512], null);
-  for (const index of [4, 5, 6, 7, 9, 10, 11, 12, 13])
+  for (const index of [4, 5, 6, 7, 9, 10, 12, 13])
     assert.equal(Object.hasOwn(result.updates, rows[index].sha512), false);
   assert.deepEqual(result.warnings, []);
   assert.match(result.issues[rows[4].sha512], /selected neoforge loader/);
@@ -249,13 +251,10 @@ test("batch updates reject current, older, incompatible, wrong-project and unsaf
   assert.match(result.issues[rows[7].sha512], /client-only/);
   assert.match(result.issues[rows[9].sha512], /outside the provider/);
   assert.match(result.issues[rows[10].sha512], /no downloadable file/);
-  assert.match(
-    result.issues[rows[11].sha512],
-    /did not return an update result/,
-  );
+  assert.equal(result.issues[rows[11].sha512], undefined);
   assert.match(result.issues[rows[12].sha512], /invalid update compatibility/);
   assert.match(result.issues[rows[13].sha512], /file size/);
-  assert.equal(Object.keys(result.issues).length, 9);
+  assert.equal(Object.keys(result.issues).length, 8);
 });
 
 test("unverified current identity or publication dates remain unknown instead of becoming update or no-update cache entries", async () => {
@@ -341,6 +340,7 @@ test("missing or invalid later responses cannot overwrite a previously discovere
   const p = provider(async (url) => {
     if (url.endsWith("/update"))
       return json(response ? { [row.sha512]: response } : {});
+    if (url.includes("/project/")) return json([]);
     return currentFails
       ? new Response("", { status: 404 })
       : json([current(row)]);
@@ -1614,4 +1614,48 @@ test("CurseForge bounds file pagination across all compatible loaders and never 
       assert.equal(pages.filter((page) => page.selected === "4").length, 5);
     }
   }
+});
+
+test("bulk choices fall back to the newest verified stable server release", async () => {
+  for (const unsuitable of ["beta", "client", "layout"]) {
+    const row = item(0);
+    const stable = raw(row, {
+      id: "stable",
+      date_published: "2026-07-15T00:00:00Z",
+      version_type: "release",
+    });
+    const latest = raw(
+      row,
+      unsuitable === "beta"
+        ? { version_type: "beta" }
+        : unsuitable === "client"
+          ? { environment: "client_only" }
+          : { files: [{ ...raw(row).files[0], filename: "sources.zip" }] },
+    );
+    const p = provider(async (url, options) => {
+      if (url.endsWith("/update")) {
+        assert.deepEqual(JSON.parse(options.body).version_types, ["release"]);
+        return json({ [row.sha512]: latest });
+      }
+      if (url.includes("/project/"))
+        return json([latest, stable, current(row)]);
+      return json([current(row)]);
+    });
+    const result = await p.updates(input, [row]);
+    assert.equal(
+      result.updates[row.sha512]?.id,
+      "stable",
+      JSON.stringify(result),
+    );
+    assert.equal(result.issues[row.sha512], undefined);
+  }
+});
+
+test("explicit no-newer bulk results are checked without an issue", async () => {
+  const row = item(0);
+  const result = await provider(async () =>
+    json({ [row.sha512]: null }),
+  ).updates(input, [row]);
+  assert.deepEqual(result.updates, { [row.sha512]: null });
+  assert.deepEqual(result.issues, {});
 });

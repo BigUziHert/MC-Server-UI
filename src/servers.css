@@ -219,7 +219,7 @@
   align-items: center;
   gap: 8px;
   font-size: 12px;
-  color: #f0ae9a;
+  color: var(--danger-text);
   margin-top: 17px;
 }
 .server-add-dialog .server-add-intro {
@@ -260,7 +260,7 @@
   border: 1px solid #404356;
   background: #303140;
   border-radius: 10px;
-  color: #ffd000;
+  color: var(--accent);
 }
 .server-add-choice > span:nth-child(2) {
   min-width: 0;
@@ -329,7 +329,7 @@
   background: #272833;
 }
 .server-advanced > summary:focus-visible {
-  outline: 2px solid #ffd000;
+  outline: 2px solid var(--accent);
   outline-offset: 3px;
 }
 .server-advanced > summary > svg:last-child {
@@ -546,7 +546,7 @@
   text-align: center;
 }
 .server-workspace-loading > svg {
-  color: #ffd000;
+  color: var(--accent);
 }
 .server-workspace-loading h1 {
   font-size: 23px;
@@ -562,7 +562,7 @@
   width: 72px;
   height: 72px;
   margin-bottom: 8px;
-  color: #ffd000;
+  color: var(--accent);
   background: #20212b;
   border: 1px solid #404356;
   border-radius: 18px;
@@ -626,7 +626,7 @@
   margin: 0 0 22px;
 }
 .fleet-welcome-copy h1 > span {
-  color: #ffd000;
+  color: var(--accent);
 }
 .fleet-welcome-copy > p {
   max-width: 440px;
@@ -689,7 +689,7 @@
   border: 1px solid #40435677;
   border-radius: 30px;
   background: linear-gradient(150deg, #303140, #20212b);
-  color: #ffd000;
+  color: var(--accent);
   box-shadow:
     0 20px 65px #0005,
     inset 0 1px 0 #71778f33;
@@ -727,7 +727,7 @@
   width: 7px;
   height: 7px;
   border-radius: 2px;
-  background: #ffd000;
+  background: var(--accent);
   transform: rotate(20deg);
 }
 .fleet-art-dot-one {
@@ -1008,4 +1008,28 @@
   .server-dialog {
     padding: 19px;
   }
+}
+.setup-connection-fields {
+  display: contents;
+  border: 0;
+  padding: 0;
+  margin: 0;
+  min-width: 0;
+}
+.setup-background {
+  position: fixed;
+  z-index: 90;
+  bottom: 18px;
+  left: 50%;
+  transform: translateX(-50%);
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 12px;
+  padding: 12px 18px;
+  max-width: calc(100vw - 32px);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--panel);
+  box-shadow: 0 8px 30px #0008;
 }

@@ -32,6 +32,9 @@ export default function PanelConnections({
   const [busy, setBusy] = useState<string | null>(null);
   const [error, setError] = useState("");
   const [signingIn, setSigningIn] = useState<string | null>(null);
+  const [changingPassword, setChangingPassword] = useState<string | null>(null);
+  const [currentPassword, setCurrentPassword] = useState("");
+  const [newPassword, setNewPassword] = useState("");
   function cancelSignIn() {
     setSigningIn(null);
   }
@@ -66,8 +69,6 @@ export default function PanelConnections({
   const canForget = removingSaved
     ? Boolean(
         forgettingPanel &&
-        !forgettingPanel.signedIn &&
-        !forgettingPanel.pendingLeave &&
         forget?.sessionEpoch &&
         forget.sessionEpoch === forgettingPanel.sessionEpoch,
       )
@@ -201,7 +202,7 @@ export default function PanelConnections({
       ) : forget ? (
         <>
           <h3>
-            {removingSaved ? "Remove saved connection to" : "Forget"}{" "}
+            {removingSaved || !unified ? "Remove from this device:" : "Leave"}{" "}
             {forget.label}?
           </h3>
           {removingSaved ? (
@@ -210,7 +211,9 @@ export default function PanelConnections({
                 This removes this computer's saved connection and certificate
                 trust for <strong>{forget.label}</strong>. Accounts,
                 permissions, and Minecraft servers on the host stay unchanged.
-                Other saved panels remain connected.
+                Other saved computers remain connected. If a Leave request was
+                interrupted, account deletion on the host may still be
+                incomplete.
               </p>
               <p>
                 To connect again, enter the panel address and sign in, or accept
@@ -219,7 +222,7 @@ export default function PanelConnections({
               {!canForget && (
                 <p role="alert">
                   {forgettingPanel?.pendingLeave
-                    ? "Account removal is pending. Return to Manage Connections and use Retry Forget."
+                    ? "Account removal is pending. Return to Manage Connections and use Retry Leave."
                     : "This connection changed. Return to Manage Connections and confirm removal again."}
                 </p>
               )}
@@ -245,17 +248,18 @@ export default function PanelConnections({
               </p>
               {pendingLeave && (
                 <p role="status">
-                  Forget is not complete. Retry Forget finishes the same request
+                  Leave is not complete. Retry Leave finishes the same request
                   and removes the saved connection. Closing this dialog does not
                   cancel it; sign-in and sign-out stay unavailable until it is
-                  resolved.
+                  resolved. You can also remove the saved connection locally
+                  from Manage Connections.
                 </p>
               )}
               {!canForget && (
                 <p role="alert">
                   {sameAccount
-                    ? "Sign in to this saved panel from Manage Connections before forgetting it."
-                    : "The signed-in account has changed. Return to Manage Connections and confirm Forget for the intended account."}
+                    ? "Sign in to this saved panel from Manage Connections before leaving it."
+                    : "The signed-in account has changed. Return to Manage Connections and confirm Leave for the intended account."}
                 </p>
               )}
             </>
@@ -296,11 +300,11 @@ export default function PanelConnections({
               ) : (
                 <Trash2 size={16} />
               )}{" "}
-              {removingSaved
-                ? "Remove saved connection"
+              {removingSaved || !unified
+                ? "Remove from this device"
                 : pendingLeave
-                  ? "Retry Forget"
-                  : "Forget connection"}
+                  ? "Retry Leave"
+                  : "Leave computer"}
             </button>
           </div>
         </>
@@ -308,8 +312,8 @@ export default function PanelConnections({
         <>
           <p>
             {unified
-              ? "Manage your saved panels and sign in to another panel."
-              : "Open a saved panel or forget its sign-in on this computer. Unavailable and signed-out panels remain here for retry."}
+              ? "Manage saved computers. Remove from this device works offline; Leave deletes your account on the host."
+              : "Open a saved panel or remove its saved sign-in from this device. Unavailable and signed-out panels remain here for retry."}
           </p>
           {!connections ? (
             <p role="status">Loading connections…</p>
@@ -323,11 +327,12 @@ export default function PanelConnections({
             <ul className="panel-connections-list">
               {panels.map((panel) => {
                 const unavailable = panel.connectionState === "unavailable";
-                const removeSaved =
-                  unified && !panel.signedIn && !panel.pendingLeave;
+                const removeSaved = unified;
                 const status =
                   unified && panel.pendingLeave
-                    ? "Forget incomplete — Retry Forget"
+                    ? panel.leaving
+                      ? "Leaving…"
+                      : "Leave incomplete — retry or remove locally"
                     : panel.connectionState === "connecting"
                       ? "Connecting…"
                       : unavailable
@@ -343,6 +348,13 @@ export default function PanelConnections({
                       <Globe2 size={18} />
                       <div>
                         <strong>{panel.label}</strong>
+                        <small>{panel.origin}</small>
+                        {panel.session?.expiresAt && (
+                          <small>
+                            Session renews while connected · expires{" "}
+                            {new Date(panel.session.expiresAt).toLocaleString()}
+                          </small>
+                        )}
                         <small>
                           {status}
                           {(!unified && connections.activeId === panel.id) ||
@@ -382,6 +394,43 @@ export default function PanelConnections({
                       </div>
                     </div>
                     <div className="panel-connections-row-actions">
+                      {unified && (
+                        <button
+                          className="btn"
+                          disabled={Boolean(busy)}
+                          onClick={() => {
+                            const name = window.prompt(
+                              "Name for this computer",
+                              panel.label,
+                            );
+                            if (name !== null)
+                              void window.mcPanelConnections
+                                ?.renameConnection?.(panel.id, name)
+                                .then(() =>
+                                  window.dispatchEvent(
+                                    new Event("mc-panel-connections-changed"),
+                                  ),
+                                )
+                                .catch((cause) => setError(cause.message));
+                          }}
+                        >
+                          Rename
+                        </button>
+                      )}
+                      {unified && panel.signedIn && !panel.pendingLeave && (
+                        <button
+                          className="btn"
+                          disabled={Boolean(busy)}
+                          onClick={() => {
+                            setChangingPassword(panel.id);
+                            setCurrentPassword("");
+                            setNewPassword("");
+                            setError("");
+                          }}
+                        >
+                          Change password
+                        </button>
+                      )}
                       {(!unified ||
                         (!panel.pendingLeave &&
                           (unavailable ||
@@ -440,7 +489,7 @@ export default function PanelConnections({
                       <button
                         className="btn"
                         disabled={Boolean(busy)}
-                        aria-label={`${removeSaved ? "Remove saved connection to" : unified && panel.pendingLeave ? "Retry Forget" : "Forget"} ${panel.label}`}
+                        aria-label={`${removeSaved ? "Remove saved connection to" : unified && panel.pendingLeave ? "Retry Leave" : "Remove from this device"} ${panel.label}`}
                         onClick={() => {
                           cancelSignIn();
                           setForget({
@@ -457,11 +506,38 @@ export default function PanelConnections({
                       >
                         <Trash2 size={15} />{" "}
                         {removeSaved
-                          ? "Remove saved connection"
+                          ? "Remove from this device"
                           : unified && panel.pendingLeave
-                            ? "Retry Forget"
-                            : "Forget"}
+                            ? "Retry Leave"
+                            : "Remove from this device"}
                       </button>
+                      {unified && panel.signedIn && (
+                        <button
+                          className="btn danger"
+                          disabled={Boolean(busy) || panel.leaving}
+                          aria-label={`Leave ${panel.label}`}
+                          onClick={() => {
+                            cancelSignIn();
+                            setForget({
+                              id: panel.id,
+                              label: panel.label,
+                              mode: "account",
+                              sessionEpoch: panel.sessionEpoch,
+                              accountId:
+                                panel.session?.accountId ??
+                                panel.session?.userId,
+                              email: panel.session?.email,
+                            });
+                            setError("");
+                          }}
+                        >
+                          {panel.leaving
+                            ? "Leaving…"
+                            : panel.pendingLeave
+                              ? "Retry Leave"
+                              : "Leave computer"}
+                        </button>
+                      )}
                     </div>
                     {unified &&
                       !panel.pendingLeave &&
@@ -481,6 +557,81 @@ export default function PanelConnections({
                           </button>
                         </div>
                       )}
+                    {changingPassword === panel.id && (
+                      <form
+                        className="panel-signin-form"
+                        onSubmit={(event) => {
+                          event.preventDefault();
+                          if (busy) return;
+                          setBusy(panel.id);
+                          setError("");
+                          void window.mcPanelConnections
+                            ?.changePassword?.(panel.id, {
+                              currentPassword,
+                              newPassword,
+                            })
+                            .then(() => {
+                              setChangingPassword(null);
+                              setCurrentPassword("");
+                              setNewPassword("");
+                            })
+                            .catch((cause) => setError(cause.message))
+                            .finally(() => setBusy(null));
+                        }}
+                      >
+                        <label>
+                          Current password
+                          <input
+                            type="password"
+                            autoComplete="current-password"
+                            required
+                            minLength={12}
+                            maxLength={128}
+                            value={currentPassword}
+                            onChange={(event) =>
+                              setCurrentPassword(event.target.value)
+                            }
+                          />
+                        </label>
+                        <label>
+                          New password
+                          <input
+                            type="password"
+                            autoComplete="new-password"
+                            required
+                            minLength={12}
+                            maxLength={128}
+                            value={newPassword}
+                            onChange={(event) =>
+                              setNewPassword(event.target.value)
+                            }
+                          />
+                        </label>
+                        <p>
+                          Other sessions for this account will be signed out.
+                        </p>
+                        <div className="panel-connections-actions">
+                          <button
+                            type="button"
+                            className="btn"
+                            disabled={Boolean(busy)}
+                            onClick={() => {
+                              setChangingPassword(null);
+                              setCurrentPassword("");
+                              setNewPassword("");
+                            }}
+                          >
+                            Cancel
+                          </button>
+                          <button
+                            className="btn primary"
+                            disabled={Boolean(busy)}
+                          >
+                            Change password
+                          </button>
+                        </div>
+                      </form>
+                    )}
                   </li>
                 );
               })}

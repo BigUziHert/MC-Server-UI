@@ -9,7 +9,7 @@ import { createAccessService, SUBUSER_COOKIE } from "./access.mjs";
 import { createRemoteGateway } from "./remote-access.mjs";
 
 const password = "Revocation fixture password!";
-const lifetime = 7 * 24 * 60 * 60 * 1000;
+const lifetime = 30 * 24 * 60 * 60 * 1000;
 const proofLifetime = 90 * 24 * 60 * 60 * 1000;
 const hash = (value) => createHash("sha256").update(value).digest("hex");
 const bearer = (value) => ({ headers: { authorization: `Bearer ${value}` } });
@@ -262,7 +262,7 @@ test("membership proof storage is bounded and rejects malformed persistent capab
     password,
   });
   const saved = await f.read();
-  assert.equal(saved.revocationProofs.length, 4096);
+  assert.equal(saved.revocationProofs.length, 32);
   assert.ok(
     saved.revocationProofs.some(
       (item) => item.hash === hash(signed.revocationToken),

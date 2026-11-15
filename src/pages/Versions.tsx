@@ -78,7 +78,8 @@ function newerStableBuild(candidate: Build, installed: string) {
 type Job = {
   id: string;
   requestId?: string;
-  status: "queued" | "running" | "completed" | "failed";
+  status: "queued" | "running" | "completed" | "failed" | "cancelled";
+  cancellable?: boolean;
   state?: "queued" | "running" | "complete" | "failed";
   message?: string;
   error?: string;
@@ -137,9 +138,32 @@ export function SoftwareIcon({ software }: { software: string }) {
 export default function Versions({
   notify,
   permissions,
-}: PageProps & { permissions?: string[] }) {
+  serverData,
+}: PageProps & {
+  permissions?: string[];
+  serverData?:
+    | (Omit<Partial<Current>, "version" | "software"> & {
+        version?: string | null;
+        software?: string | null;
+      })
+    | null;
+}) {
   const allowChanges = canChangeContent(permissions);
   const { api, post } = useServerApi();
+  const liveStatus = useRef(serverData);
+  liveStatus.current = serverData;
+  const readServer = useCallback(
+    () =>
+      !liveStatus.current
+        ? api<Current>("/server")
+        : Promise.resolve({
+            ...liveStatus.current,
+            software: liveStatus.current.software || "Unknown",
+            version: liveStatus.current.version || "",
+            mode: "live",
+          } as Current),
+    [api],
+  );
   const scope = useContext(ServerScope);
   const [providers, setProviders] = useState<Provider[]>([]);
   const [current, setCurrent] = useState<Current | null>(null);
@@ -161,8 +185,12 @@ export default function Versions({
   const [loading, setLoading] = useState(true);
   const [loadingBuilds, setLoadingBuilds] = useState(false);
   const [error, setError] = useState("");
+  const [progressError, setProgressError] = useState("");
   const [confirming, setConfirming] = useState<Build | null>(null);
   const [accepted, setAccepted] = useState(false);
+  const [preserveWorld, setPreserveWorld] = useState(true);
+  const [acknowledgedRuntimeChange, setAcknowledgedRuntimeChange] =
+    useState(false);
   const [installMode, setInstallMode] = useState<"update" | "clean">("clean");
   const [submitting, setSubmitting] = useState(false);
   const [checkingUpdate, setCheckingUpdate] = useState(false);
@@ -191,11 +219,18 @@ export default function Versions({
             ? "Installed build could not be identified. Choose a version to review an update."
             : "";
   const canUpdate = Boolean(
-    runtimeUpdate?.available &&
-    runtimeUpdate.provider === selected?.id &&
-    runtimeUpdate.gameVersion === version,
+    runtimeUpdate?.available && runtimeUpdate.provider === selected?.id,
   );
+  const changingMinecraft = canUpdate && runtimeUpdate?.gameVersion !== version;
   const updating = installMode === "update";
+  const buildAction = (build: Build | null) => {
+    if (!canUpdate || !build) return "Install";
+    if (changingMinecraft) return "Change Minecraft version";
+    const installed = installedRuntimeBuild(runtimeUpdate);
+    if (!installed) return "Update";
+    if (build.id === installed) return "Reinstall";
+    return newerStableBuild(build, installed) ? "Update" : "Downgrade";
+  };
   const updateReason = canUpdate
     ? ""
     : runtimeUpdate?.reason ||
@@ -215,7 +250,7 @@ export default function Versions({
         const [catalog, server, releaseResult, buildResult] = await Promise.all(
           [
             api<Catalog>(`/versions${manual ? "?refresh=1" : ""}`),
-            api<Current>("/server"),
+            readServer(),
             manual && target.selected
               ? api<{ versions: Release[] }>(
                   `/versions/${encodeURIComponent(target.selected.id)}?refresh=1`,
@@ -230,6 +265,7 @@ export default function Versions({
         );
         if (token !== generation.current) return false;
         loaded.current = true;
+        setProgressError("");
         if (releaseResult) setReleases(releaseResult.versions);
         if (buildResult) {
           setBuilds(buildResult.builds);
@@ -276,8 +312,11 @@ export default function Versions({
   }, [scope, refresh]);
   useEffect(() => {
     let cancelled = false;
+    let polling = false;
     const timer = setInterval(() => {
-      void Promise.all([api<Current>("/server"), api<Catalog>("/versions")])
+      if (polling || document.visibilityState === "hidden") return;
+      polling = true;
+      void Promise.all([readServer(), api<Catalog>("/versions")])
         .then(([server, catalog]) => {
           if (!cancelled) {
             setCurrent({
@@ -298,13 +337,16 @@ export default function Versions({
             }
           }
         })
-        .catch(() => {});
+        .catch(() => {})
+        .finally(() => {
+          polling = false;
+        });
     }, 3000);
     return () => {
       cancelled = true;
       clearInterval(timer);
     };
-  }, [api]);
+  }, [api, readServer]);
   useEffect(() => {
     if (confirming) dialog.current?.showModal();
     else dialog.current?.close();
@@ -321,6 +363,7 @@ export default function Versions({
           ),
         );
         if (cancelled) return;
+        setProgressError("");
         setJob(result);
         if (result.status === "completed") {
           notify(
@@ -328,7 +371,7 @@ export default function Versions({
               "Server software installed. Start the server when you are ready.",
           );
           const [server, catalog] = await Promise.all([
-            api<Current>("/server"),
+            readServer(),
             api<Catalog>("/versions"),
           ]);
           if (!cancelled) {
@@ -347,14 +390,14 @@ export default function Versions({
         else timer = setTimeout(poll, 1000);
       } catch (cause) {
         if (!cancelled) {
-          setError(
+          setProgressError(
             cause instanceof Error
               ? cause.message
               : "Unable to check installation progress.",
           );
           if ((cause as { status?: number }).status === 404) {
             setJob(null);
-            setError(
+            setProgressError(
               "This installation is no longer being tracked. Check the current server software before trying again.",
             );
           } else timer = setTimeout(poll, 3000);
@@ -498,6 +541,7 @@ export default function Versions({
       !selected ||
       !confirming ||
       (updating ? !canUpdate : !accepted) ||
+      (updating && changingMinecraft && !acknowledgedRuntimeChange) ||
       submitting ||
       jobBusy ||
       current?.status !== "offline"
@@ -512,7 +556,12 @@ export default function Versions({
       version,
       build: confirming.id,
       confirmed: true,
-      ...(updating ? { updateRuntime: true } : { cleanInstall: true }),
+      ...(updating
+        ? {
+            updateRuntime: true,
+            ...(changingMinecraft ? { acknowledgedRuntimeChange } : {}),
+          }
+        : { cleanInstall: true, preserveWorld }),
     };
     const signature = JSON.stringify(input);
     if (installRequest.current?.signature !== signature)
@@ -585,6 +634,7 @@ export default function Versions({
             </strong>
           </div>
           <span className={`status-badge ${current.status}`}>
+            <i />
             {current.status}
           </span>
           <div className="versions-current-update">
@@ -692,6 +742,48 @@ export default function Versions({
           message={error}
           onRetry={() => void refresh(true)}
         />
+      )}
+      {progressError && (
+        <StatePanel
+          variant="error"
+          title="Installation status unavailable"
+          message={progressError}
+          onRetry={() => void refresh(true)}
+        />
+      )}
+      {jobBusy && job?.cancellable && (
+        <button
+          className="btn danger"
+          disabled={submitting}
+          onClick={async () => {
+            setSubmitting(true);
+            try {
+              setJob(
+                normalizeJob(
+                  await post<Job | { job: Job }>(
+                    `/versions/jobs/${encodeURIComponent(job.id)}/cancel`,
+                  ),
+                ),
+              );
+            } catch (cause) {
+              setProgressError(
+                cause instanceof Error
+                  ? cause.message
+                  : "Could not cancel installation.",
+              );
+            } finally {
+              setSubmitting(false);
+            }
+          }}
+        >
+          Cancel installation
+        </button>
+      )}
+      {job?.status === "completed" && (
+        <p className="management-notice">
+          <a href="#launchpad">Review installed content in Launchpad</a> before
+          starting after a runtime change.
+        </p>
       )}
       {!selected ? (
         <>
@@ -906,6 +998,11 @@ export default function Versions({
                       <div className="versions-build-info">
                         <strong>
                           {build.label}{" "}
+                          {canUpdate &&
+                            build.id ===
+                              installedRuntimeBuild(runtimeUpdate) && (
+                              <span className="tag">Installed</span>
+                            )}
                           {(build.recommended || index === 0) && (
                             <span className="tag">
                               {build.recommended
@@ -932,7 +1029,7 @@ export default function Versions({
                         </span>
                       </div>
                       <button
-                        className="btn primary"
+                        className={`btn ${canUpdate && buildAction(build) !== "Update" ? "" : "primary"}`}
                         aria-describedby={
                           updateReason ? "runtime-update-reason" : undefined
                         }
@@ -947,6 +1044,7 @@ export default function Versions({
                           uncertainInstall.current = null;
                           setConfirming(build);
                           setInstallMode(canUpdate ? "update" : "clean");
+                          setAcknowledgedRuntimeChange(false);
                           setAccepted(false);
                           setDialogError("");
                         }}
@@ -956,7 +1054,7 @@ export default function Versions({
                         ) : (
                           <Download size={14} />
                         )}
-                        {canUpdate ? "Update" : "Install"}
+                        {buildAction(build)}
                       </button>
                     </div>
                   ))}
@@ -1008,10 +1106,44 @@ export default function Versions({
           </button>
         </div>
         <p className="management-dialog-description">
-          {updating ? "Update" : "Install"} {selected?.name} {confirming?.label}{" "}
-          for Minecraft {version}. The server will remain stopped when
-          installation finishes.
+          {updating ? buildAction(confirming) : "Install"} {selected?.name}{" "}
+          {confirming?.label} for Minecraft {version}. The server will remain
+          stopped when installation finishes.
         </p>
+        {updating && confirming && (
+          <div
+            className={`management-notice ${buildAction(confirming) === "Downgrade" ? "warning" : ""}`}
+          >
+            <p>
+              Installed {installedRuntimeBuild(runtimeUpdate) ?? "unknown"} →
+              Selected {confirming.id}.
+              {buildAction(confirming) === "Downgrade" &&
+                " This is a downgrade. Installed mods may require a newer loader; check compatibility before starting."}
+            </p>
+          </div>
+        )}
+        {updating && changingMinecraft && (
+          <div className="management-notice warning">
+            <p>
+              Minecraft {runtimeUpdate?.gameVersion} → {version}. Your worlds,
+              mods and settings are kept, but mods may need compatible versions.
+              Opening a world in a newer release may permanently upgrade it.
+              Create a backup before continuing.
+            </p>
+            <label>
+              <input
+                type="checkbox"
+                checked={acknowledgedRuntimeChange}
+                disabled={submitting}
+                onChange={(event) =>
+                  setAcknowledgedRuntimeChange(event.target.checked)
+                }
+              />{" "}
+              I have a backup and understand that world and mod compatibility
+              can change.
+            </label>
+          </div>
+        )}
         {updateReason && (
           <p className="management-dialog-description">{updateReason}</p>
         )}
@@ -1050,7 +1182,9 @@ export default function Versions({
               />
               <span>
                 <strong>Clean install</strong>
-                <small>Replace all files in this server’s folder.</small>
+                <small>
+                  Replace software and content; choose whether to keep worlds.
+                </small>
               </span>
             </label>
           </fieldset>
@@ -1071,27 +1205,55 @@ export default function Versions({
           </div>
         ) : (
           <>
+            <label className="versions-confirm">
+              <input
+                type="checkbox"
+                checked={preserveWorld}
+                disabled={submitting}
+                onChange={(event) => {
+                  setPreserveWorld(event.target.checked);
+                  setAccepted(false);
+                }}
+              />
+              Keep worlds and server settings
+            </label>
             <div className="management-notice warning">
               <AlertCircle size={18} />
               <div>
-                <strong>This replaces the server folder’s contents</strong>
+                <strong>
+                  {preserveWorld
+                    ? "This replaces server software and installed content"
+                    : "This replaces the server folder’s contents"}
+                </strong>
                 <p>
-                  All current files will be removed, including worlds, mods,
-                  plugins and settings. The selected software will be installed
-                  into a clean folder.
+                  {preserveWorld
+                    ? "Worlds and server settings stay in place. Mods, plugins, and runtime files are replaced. Create a backup before changing Minecraft versions; a newer release may permanently upgrade your world."
+                    : "All current files, including worlds, mods, plugins and settings, move to Recycle Bin. The selected software is installed into a clean folder. Create a backup first."}
                   {confirming && !confirming.stable
                     ? " This is an experimental build."
-                    : ""}
+                    : ""}{" "}
+                  <a href="#backups">Open Backups</a>
                 </p>
               </div>
             </div>
+            {permissions &&
+              (!permissions.includes("file.read") ||
+                !permissions.includes("file.create")) && (
+                <p className="management-warning">
+                  Your account cannot restore retained files from Recycle Bin.
+                  Ask the server owner to keep a backup and help recover files
+                  if needed.
+                </p>
+              )}
             <label className="versions-confirm">
               <input
                 type="checkbox"
                 checked={accepted}
                 onChange={(event) => setAccepted(event.target.checked)}
               />{" "}
-              I understand this replaces all files in this server’s folder.
+              {preserveWorld
+                ? "I understand this replaces server software, mods, and plugins."
+                : "I understand this replaces all files in this server’s folder."}
             </label>
           </>
         )}
@@ -1120,10 +1282,11 @@ export default function Versions({
             Cancel
           </button>
           <button
-            className="btn primary"
+            className={`btn ${updating ? "primary" : "danger"}`}
             disabled={
               !allowChanges ||
               (updating ? !canUpdate : !accepted) ||
+              (updating && changingMinecraft && !acknowledgedRuntimeChange) ||
               submitting ||
               jobBusy ||
               current?.status !== "offline"

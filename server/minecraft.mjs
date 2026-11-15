@@ -1,4 +1,8 @@
 import { terminalJobs } from "./terminal-jobs.mjs";
+import { catalogSettings } from "./catalog-settings.mjs";
+import { exportClientPack } from "./client-pack.mjs";
+import { probeJava, compatibleJava } from "./java-discovery.mjs";
+import { publicErrorDetails } from "./error-details.mjs";
 import { createOperationReceipts } from "./operation-receipts.mjs";
 import { remotePrincipal } from "./remote-access.mjs";
 import fs from "node:fs/promises";
@@ -200,13 +204,10 @@ async function checkRuntimeSelection(ctx, selection, previous) {
     ctx,
     await ctx.getServer({ refresh: true }),
   );
-  if (
-    state.provider !== selection.provider ||
-    state.gameVersion !== selection.version
-  )
+  if (state.provider !== selection.provider)
     throw fail(
       409,
-      "Runtime updates must use the installed software and Minecraft version. Choose a clean installation to change either.",
+      "Runtime updates must use the installed software. Choose a clean installation to change the server software.",
     );
   if (
     previous &&
@@ -422,50 +423,11 @@ export async function createMinecraft(ctx) {
   let lastJob = null,
     closing = false;
   const operations = new Set();
-  const platformConfig = {
-    async get() {
-      try {
-        const value = JSON.parse(
-          await fs.readFile(
-            await ctx.safePath(ctx.dataDir, "catalog-settings.json"),
-            "utf8",
-          ),
-        );
-        return {
-          curseforgeApiKey:
-            typeof value.curseforgeApiKey === "string"
-              ? value.curseforgeApiKey
-              : null,
-        };
-      } catch (cause) {
-        if (missing(cause)) return { curseforgeApiKey: null };
-        throw cause;
-      }
-    },
-    async set(value) {
-      return ctx.withMinecraftMutation(
-        async () => {
-          const temporary = await ctx.safePath(
-            ctx.dataDir,
-            `catalog-settings.${randomUUID()}.tmp`,
-          );
-          try {
-            await fs.writeFile(temporary, JSON.stringify(value), {
-              flag: "wx",
-              mode: 0o600,
-            });
-            await fs.rename(
-              temporary,
-              await ctx.safePath(ctx.dataDir, "catalog-settings.json"),
-            );
-          } finally {
-            await fs.rm(temporary, { force: true });
-          }
-        },
-        { requireStopped: false },
-      );
-    },
-  };
+  const platformConfig = catalogSettings(
+    ctx.catalogDataDir ?? ctx.dataDir,
+    ctx.safePath,
+    [await ctx.safePath(ctx.dataDir, "catalog-settings.json")],
+  );
   const extras =
     ctx.extraProviders ??
     (await createExtraProviders({
@@ -558,20 +520,56 @@ export async function createMinecraft(ctx) {
           input.updateRuntime === true
             ? await checkRuntimeSelection(ctx, selection)
             : null;
+        if (
+          original &&
+          original.gameVersion !== selection.version &&
+          input.acknowledgedRuntimeChange !== true
+        )
+          throw fail(
+            400,
+            "Changing Minecraft versions can make worlds, mods and plugins incompatible. Back up your server and acknowledge this risk before updating.",
+          );
+        const builds = await versions.builds?.(
+          selection.provider,
+          selection.version,
+        );
+        const requiredJava = builds?.builds?.find(
+          (entry) => entry.id === selection.build,
+        )?.javaVersion;
+        if (Number.isInteger(requiredJava)) {
+          const java = await (ctx.javaProbe ?? probeJava)(
+            original?.javaPath ?? ctx.getConfiguration().javaPath,
+          );
+          if (
+            !compatibleJava(java, requiredJava, {
+              provider: selection.provider,
+            }) &&
+            !(
+              input.acknowledgedJavaCompatibility === true &&
+              java.available &&
+              java.majorVersion >= requiredJava &&
+              !/^(?:x86|i[3-6]86|32)$/i.test(java.architecture ?? "")
+            )
+          )
+            throw fail(
+              409,
+              `This build requires Java ${requiredJava} (64-bit). The selected executable reports ${java.available ? `Java ${java.majorVersion}` : "unavailable"}. Choose a compatible executable in Launch settings before installing.`,
+            );
+        }
         staging = await privatePath(job.id);
         await fs.mkdir(staging);
         const result = await versions.stage(selection, {
           stageDir: staging,
           javaPath: original?.javaPath ?? ctx.getConfiguration().javaPath,
           onProgress: (progress) => {
-            job.message = progress.message;
+            Object.assign(job, progress);
           },
           signal: controller.signal,
         });
         if (controller.signal.aborted)
           throw fail(
             409,
-            "Installation cancelled while the panel was closing.",
+            "Installation cancelled before promotion. Existing server files were retained.",
           );
         if (original) {
           if (
@@ -587,14 +585,18 @@ export async function createMinecraft(ctx) {
         }
         const promotionContext = {
           ...ctx,
+          preserveWorld: input.preserveWorld === true,
           signal: controller.signal,
           snapshotInstalled: launchpad.snapshotInstalled,
           clearInstalled: launchpad.clearInstalled,
           restoreInstalled: launchpad.restoreInstalled,
+          restoreRecycledReceipt: (...args) =>
+            launchpad.restoreRecycledReceipt(...args),
           onProgress: (progress) => {
-            job.message = progress.message;
+            Object.assign(job, progress);
           },
         };
+        job.cancellable = false;
         const recovery = original
           ? await promoteRuntimeVersion(result, promotionContext, original)
           : await promoteVersion(result, promotionContext);
@@ -627,7 +629,7 @@ export async function createMinecraft(ctx) {
     });
     jobs.set(job.id, job);
     lastJob = job.id;
-    const active = { controller, operation };
+    const active = { controller, operation, job };
     operations.add(active);
     // A terminal job enables Start and other edits in the UI. Publish it only
     // after staging cleanup and the mutation wrapper have released their lock.
@@ -643,6 +645,7 @@ export async function createMinecraft(ctx) {
           }),
       )
       .finally(async () => {
+        job.cancellable = false;
         job.finishedAt = new Date().toISOString();
         if (job.status === "failed")
           await ctx
@@ -660,13 +663,20 @@ export async function createMinecraft(ctx) {
     return { ...job };
   }
   function mount(app) {
+    const ownerId = (req) =>
+      req[remotePrincipal]?.accountId ??
+      (req[remotePrincipal]
+        ? `${req[remotePrincipal].serverId}:${req[remotePrincipal].userId}`
+        : "local-owner");
     const endpoint = (work) => async (req, res, next) => {
       try {
         if (closing) throw fail(503, "Minecraft management is shutting down.");
         await work(req, res);
       } catch (cause) {
         if (cause.status && cause.status < 600)
-          res.status(cause.status).json({ error: cause.message });
+          res
+            .status(cause.status)
+            .json({ error: cause.message, ...publicErrorDetails(cause) });
         else next(cause);
       }
     };
@@ -695,6 +705,27 @@ export async function createMinecraft(ctx) {
       }),
     );
     app.post(
+      "/api/versions/jobs/:id/cancel",
+      endpoint(async (req, res) => {
+        const active = [...operations].find(
+          (entry) => entry.job.id === req.params.id,
+        );
+        if (!active || !active.job.cancellable)
+          throw fail(
+            409,
+            "This installation is already finishing. Wait for it to complete.",
+          );
+        active.controller.abort(
+          fail(
+            409,
+            "Installation cancelled. Existing server files were retained.",
+          ),
+        );
+        await active.operation;
+        res.json({ job: publicJob(active.job) });
+      }),
+    );
+    app.post(
       "/api/versions/install",
       endpoint(async (req, res) => {
         const principal = req[remotePrincipal];
@@ -711,6 +742,10 @@ export async function createMinecraft(ctx) {
             confirmed: input.confirmed,
             cleanInstall: input.cleanInstall === true,
             updateRuntime: input.updateRuntime === true,
+            preserveWorld: input.preserveWorld === true,
+            acknowledgedRuntimeChange: input.acknowledgedRuntimeChange === true,
+            acknowledgedJavaCompatibility:
+              input.acknowledgedJavaCompatibility === true,
           },
           (id) => {
             try {
@@ -801,6 +836,55 @@ export async function createMinecraft(ctx) {
           }
         }),
       );
+    app.get(
+      "/api/launchpad/dependencies",
+      endpoint(async (req, res) =>
+        res.json(await launchpad.dependencies(req.query)),
+      ),
+    );
+    for (const preview of [true, false])
+      app.get(
+        `/api/launchpad/client-pack${preview ? "/preview" : ""}`,
+        endpoint(async (req, res) => {
+          const controller = new AbortController();
+          res.once("close", () => {
+            if (!res.writableEnded) controller.abort();
+          });
+          const result = await exportClientPack({
+            ...ctx,
+            receipts: launchpad.snapshotInstalled(),
+            configuration: ctx.getConfiguration(),
+            fetch: catalogFetch,
+            signal: controller.signal,
+          });
+          if (preview) {
+            const { buffer, ...details } = result;
+            res.json(details);
+          } else
+            res
+              .set({
+                "Content-Type": "application/zip",
+                "Content-Disposition": `attachment; filename="${result.filename}"`,
+              })
+              .send(result.buffer);
+        }),
+      );
+    app.get(
+      "/api/launchpad/history",
+      endpoint(async (_req, res) => res.json(await launchpad.history())),
+    );
+    app.patch(
+      "/api/launchpad/update-policy",
+      endpoint(async (req, res) =>
+        res.json(await launchpad.updatePolicy(req.body)),
+      ),
+    );
+    app.post(
+      "/api/launchpad/jobs/:id/undo",
+      endpoint(async (req, res) =>
+        res.json(await launchpad.undoJob(req.params.id, req.body)),
+      ),
+    );
     app.put(
       "/api/launchpad/settings",
       endpoint(async (req, res) =>
@@ -821,16 +905,17 @@ export async function createMinecraft(ctx) {
         try {
           plan = await launchpad[method]({
             ...req.body,
+            ownerId: ownerId(req),
             signal: controller.signal,
           });
           if (controller.signal.aborted || res.destroyed) {
-            await launchpad.cancelPreview(plan.planId);
+            await launchpad.cancelPreview(plan.planId, ownerId(req));
             return;
           }
           res.json(plan);
           await finished(res, { readable: false, cleanup: true });
         } catch (cause) {
-          if (plan) await launchpad.cancelPreview(plan.planId);
+          if (plan) await launchpad.cancelPreview(plan.planId, ownerId(req));
           if (!controller.signal.aborted) throw cause;
         } finally {
           res.off("close", disconnected);
@@ -844,13 +929,15 @@ export async function createMinecraft(ctx) {
     app.post(
       "/api/launchpad/preview/:id/cancel",
       endpoint(async (req, res) =>
-        res.json(await launchpad.cancelPreview(req.params.id)),
+        res.json(await launchpad.cancelPreview(req.params.id, ownerId(req))),
       ),
     );
     app.post(
       "/api/launchpad/removal-preview/:id/cancel",
       endpoint(async (req, res) =>
-        res.json(await launchpad.cancelRemovalPreview(req.params.id)),
+        res.json(
+          await launchpad.cancelRemovalPreview(req.params.id, ownerId(req)),
+        ),
       ),
     );
     app.post(
@@ -861,8 +948,8 @@ export async function createMinecraft(ctx) {
     );
     app.post(
       "/api/launchpad/recovery/resolve",
-      endpoint(async (_req, res) =>
-        res.json(await launchpad.resolveRecovery()),
+      endpoint(async (req, res) =>
+        res.json(await launchpad.resolveRecovery(req.body)),
       ),
     );
     app.post(
@@ -885,12 +972,21 @@ export async function createMinecraft(ctx) {
     app.post(
       "/api/launchpad/removal-preview",
       endpoint(async (req, res) =>
-        res.json(await launchpad.removalPreview(req.body)),
+        res.json(
+          await launchpad.removalPreview({
+            ...req.body,
+            ownerId: ownerId(req),
+          }),
+        ),
       ),
     );
     app.post(
       "/api/launchpad/remove",
-      endpoint(async (req, res) => res.json(await launchpad.remove(req.body))),
+      endpoint(async (req, res) =>
+        res.json(
+          await launchpad.remove({ ...req.body, ownerId: ownerId(req) }),
+        ),
+      ),
     );
     app.post(
       "/api/launchpad/active",
@@ -901,7 +997,11 @@ export async function createMinecraft(ctx) {
     app.post(
       "/api/launchpad/install",
       endpoint(async (req, res) =>
-        res.status(202).json(await launchpad.install(req.body)),
+        res
+          .status(202)
+          .json(
+            await launchpad.install({ ...req.body, ownerId: ownerId(req) }),
+          ),
       ),
     );
     app.get(
@@ -910,7 +1010,19 @@ export async function createMinecraft(ctx) {
     );
   }
   return {
+    activity: () => ({
+      versions: [...operations].map(({ job }) => publicJob(job)),
+      launchpad: launchpad.activity?.() ?? null,
+    }),
+    waitForIdle: async () => {
+      await Promise.allSettled([...operations].map((entry) => entry.operation));
+      await launchpad.waitForIdle?.();
+    },
     isRecoveryRequired: launchpad.isRecoveryRequired,
+    snapshotInstalled: launchpad.snapshotInstalled,
+    restoreInstalled: launchpad.restoreInstalled,
+    restoreRecycledReceipt: (...args) =>
+      launchpad.restoreRecycledReceipt(...args),
     duplicateCheck: launchpad.duplicateCheck,
     mount,
     async close() {

@@ -1,5 +1,6 @@
 import fs from "node:fs/promises";
 import path from "node:path";
+import { isCanonicalVolumeAlias } from "./canonical-volume.mjs";
 
 const fail = (status, message) => Object.assign(new Error(message), { status });
 
@@ -84,7 +85,14 @@ export function createHostDirectoryBrowser({
         process.platform === "win32"
           ? canonical.toLowerCase() === resolved.toLowerCase()
           : canonical === resolved;
-      if (!same)
+      if (
+        !same &&
+        !(await isCanonicalVolumeAlias(resolved, canonical, {
+          platform,
+          fileSystem,
+          signal,
+        }))
+      )
         throw fail(
           400,
           "Choose the folder's actual path without symbolic links or directory junctions.",

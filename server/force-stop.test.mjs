@@ -31,7 +31,7 @@ async function fixture(t, options = {}) {
     useEnvironment: false,
     scheduler: false,
     stopTimeoutMs: 20,
-    forceStopTimeoutMs: 200,
+    forceStopTimeoutMs: options.forceStopTimeoutMs ?? 2000,
     createWindowsProcessTree:
       options.createWindowsProcessTree ??
       ((child, settings) => ({
@@ -179,7 +179,7 @@ test("failed termination stays stopping, reports failure, and allows a fresh exp
 });
 
 test("a successful killer does not report offline before the child exits", async (t) => {
-  const f = await fixture(t);
+  const f = await fixture(t, { forceStopTimeoutMs: 200 });
   await f.power("stop");
   const pending = f.power("force-stop", { confirmed: true });
   await eventually(() => f.killers.length === 1);

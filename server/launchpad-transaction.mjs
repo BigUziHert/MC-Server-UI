@@ -58,20 +58,30 @@ export async function createLaunchpadRecovery({
     );
   async function write(value) {
     const temporary = await privatePath(`${randomUUID()}.journal.tmp`);
-    const handle = await fs.open(temporary, "wx", 0o600);
     try {
-      await handle.writeFile(JSON.stringify(value));
-      await handle.sync();
+      const handle = await fs.open(temporary, "wx", 0o600);
+      try {
+        await handle.writeFile(JSON.stringify(value));
+        await handle.sync();
+      } finally {
+        await handle.close();
+      }
+      await fs.rename(temporary, target);
+      record = value;
     } finally {
-      await handle.close();
+      await fs.rm(temporary, { force: true }).catch(() => {});
     }
-    await fs.rename(temporary, target);
-    record = value;
   }
-  async function walk(relative = "", directories = []) {
+  async function walk(relative = "", directories = [], preservedPaths = []) {
     const result = [];
     for (const name of await fs.readdir(await safePath(serverDir, relative))) {
       const child = relative ? `${relative}/${name}` : name;
+      if (
+        preservedPaths.some(
+          (value) => child === value || child.startsWith(`${value}/`),
+        )
+      )
+        continue;
       const stat = await fs.lstat(await safePath(serverDir, child));
       if (stat.isSymbolicLink())
         throw new Error(
@@ -79,7 +89,7 @@ export async function createLaunchpadRecovery({
         );
       if (stat.isDirectory()) {
         directories.push(child);
-        result.push(...(await walk(child, directories)));
+        result.push(...(await walk(child, directories, preservedPaths)));
       } else if (stat.isFile()) result.push(child);
       else
         throw new Error(
@@ -96,6 +106,7 @@ export async function createLaunchpadRecovery({
     receipts,
     configuration,
     wholeRoot = false,
+    preservedPaths = [],
   }) {
     if (record)
       throw new Error("An interrupted installation needs recovery first.");
@@ -105,7 +116,7 @@ export async function createLaunchpadRecovery({
     const saved = [];
     const directories = [];
     const paths = wholeRoot
-      ? await walk("", directories)
+      ? await walk("", directories, preservedPaths)
       : [...new Set(originals)];
     const stage = /^[a-f0-9-]{36}$/.test(planId ?? "")
       ? await fs.lstat(await privatePath(planId)).catch(() => null)
@@ -142,6 +153,7 @@ export async function createLaunchpadRecovery({
         receipts,
         configuration,
         wholeRoot,
+        preservedPaths,
         stageIdentity: stage
           ? { ino: stage.ino, dev: stage.dev, birthtimeMs: stage.birthtimeMs }
           : null,
@@ -195,16 +207,8 @@ export async function createLaunchpadRecovery({
     const outputs = new Map(record.files.map((file) => [file.path, file]));
     const paths = new Set([...originals.keys(), ...outputs.keys()]);
     const backup = await privatePath(record.directory);
-    for (const original of originals.values())
-      if (
-        (await hash(await safePath(backup, original.backup))) !==
-        original.sha512
-      )
-        throw new Error(
-          "An installation recovery copy changed. Restore originals from Recycle Bin and retry recovery.",
-        );
     if (record.wholeRoot)
-      for (const relative of await walk())
+      for (const relative of await walk("", [], record.preservedPaths ?? []))
         if (!paths.has(relative))
           throw new Error(
             `Preserved externally added file: ${relative}. Move it aside before retrying recovery.`,
@@ -227,6 +231,20 @@ export async function createLaunchpadRecovery({
         throw new Error(
           `Preserved changed file: ${relative}. Restore its original from Recycle Bin or the retained recovery folder, then retry recovery.`,
         );
+    }
+    for (const original of originals.values()) {
+      if (current.get(original.path) === original.sha512) continue;
+      try {
+        if (
+          (await hash(await safePath(backup, original.backup))) !==
+          original.sha512
+        )
+          throw new Error("checksum mismatch");
+      } catch {
+        throw new Error(
+          `The recovery copy for ${original.path} is unavailable. Restore that file from Recycle Bin, then retry recovery, or explicitly keep current files.`,
+        );
+      }
     }
     // The whole snapshot has been checked before removing any known output.
     for (const [relative, digest] of current) {
@@ -270,6 +288,16 @@ export async function createLaunchpadRecovery({
     begin,
     clear,
     reconcile,
+    async keepCurrent() {
+      if (!record) return;
+      // This explicitly abandons rollback only. Retained recovery bytes remain
+      // on disk for manual recovery and are not treated as orphaned previews.
+      const retained = record.directory;
+      await fs.rm(target, { force: true });
+      record = null;
+      activeTransactions.delete(target);
+      return { retained };
+    },
     release: () => activeTransactions.delete(target),
     get: () => record,
     commit: () => write({ ...record, state: "committed" }),

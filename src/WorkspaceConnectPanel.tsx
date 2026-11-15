@@ -9,6 +9,9 @@ type Target = {
   panel: PanelConnections["panels"][number];
   token: string;
   email?: string;
+  panelName?: string;
+  servers?: { id: string; name: string }[];
+  inviteExpiresAt?: string;
   error?: string;
 };
 
@@ -28,7 +31,7 @@ export default function WorkspaceConnectPanel({
   const revision = useRef(0);
   const pending = useRef(false);
   const temporary = useRef<string | null>(null);
-  const mode = initialMode;
+  const [mode, setMode] = useState(initialMode);
   const [address, setAddress] = useState(initialUrl);
   const [target, setTarget] = useState<Target | null>(null);
   const [busy, setBusy] = useState(false);
@@ -111,7 +114,7 @@ export default function WorkspaceConnectPanel({
           throw new Error(
             `Already signed in to ${panel.origin}${panel.session?.email ? ` as ${panel.session.email}` : ""}. This invitation is for ${invitation.email}. Use Manage Connections to sign out before accepting it.`,
           );
-        if (active()) setTarget({ panel, token, email: invitation.email });
+        if (active()) setTarget({ panel, token, ...invitation });
       } catch (cause) {
         if (active())
           setTarget({
@@ -174,23 +177,40 @@ export default function WorkspaceConnectPanel({
           ? "Use the owner's invitation to set a password for your account. Your other panels stay signed in."
           : "Enter your panel address and account details. The panel is saved after sign-in succeeds."}
       </p>
+      {!target && (
+        <div className="connect-panel-actions">
+          <button
+            type="button"
+            className="btn"
+            aria-pressed={mode === "signin"}
+            onClick={() => {
+              back();
+              setMode("signin");
+            }}
+          >
+            Sign in
+          </button>
+          <button
+            type="button"
+            className="btn"
+            aria-pressed={mode === "invitation"}
+            onClick={() => {
+              back();
+              setMode("invitation");
+            }}
+          >
+            Accept invitation
+          </button>
+        </div>
+      )}
       {mode === "signin" ? (
         <>
           <PanelSignInForm
-            initialAddress={
-              address ||
-              (window.mcPanelConnections?.runtime === "browser"
-                ? window.location.origin
-                : "")
-            }
+            initialAddress={address}
+            onCancel={onClose}
             onComplete={onOpened}
             onBusyChange={setBusy}
           />
-          <div className="connect-panel-actions">
-            <button className="btn" onClick={onClose}>
-              Cancel
-            </button>
-          </div>
         </>
       ) : target ? (
         <>
@@ -207,17 +227,32 @@ export default function WorkspaceConnectPanel({
               </p>
             </>
           ) : (
-            <PanelSignInForm
-              key={`${target.panel.id}:${target.token}`}
-              panel={target.panel}
-              token={target.token}
-              initialEmail={target.email}
-              onComplete={() => {
-                temporary.current = null;
-                onOpened();
-              }}
-              onBusyChange={setBusy}
-            />
+            <>
+              <div className="connect-panel-hint">
+                <strong>{target.panelName || target.panel.origin}</strong>
+                <p>
+                  {target.servers?.length
+                    ? `Server access: ${target.servers.map((server) => server.name).join(", ")}`
+                    : "This invitation has no server grants yet. The owner can add them later."}
+                </p>
+                {target.inviteExpiresAt && (
+                  <p>
+                    Expires {new Date(target.inviteExpiresAt).toLocaleString()}.
+                  </p>
+                )}
+              </div>
+              <PanelSignInForm
+                key={`${target.panel.id}:${target.token}`}
+                panel={target.panel}
+                token={target.token}
+                initialEmail={target.email}
+                onComplete={() => {
+                  temporary.current = null;
+                  onOpened();
+                }}
+                onBusyChange={setBusy}
+              />
+            </>
           )}
           <div className="connect-panel-actions">
             <button className="btn" onClick={back}>

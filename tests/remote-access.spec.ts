@@ -379,7 +379,7 @@ for (const width of [1280, 390]) {
       page.getByRole("heading", { name: "Console", exact: true }),
     ).toBeVisible();
     await page
-      .getByRole("button", { name: "Rename server", exact: true })
+      .getByRole("button", { name: "Edit server settings", exact: true })
       .click();
     const dialog = page.getByRole("dialog", {
       name: "Server settings",
@@ -391,8 +391,8 @@ for (const width of [1280, 390]) {
     await expect(dialog.getByLabel("Server port", { exact: true })).toHaveValue(
       "25565",
     );
-    await expect(dialog.getByLabel("Memory (MB)", { exact: true })).toHaveValue(
-      "2048",
+    await expect(dialog.getByLabel("Memory (GB)", { exact: true })).toHaveValue(
+      "2",
     );
     await expect(
       dialog.getByText("Launch method", { exact: true }),
@@ -406,7 +406,7 @@ for (const width of [1280, 390]) {
     await dialog
       .getByLabel("Server name", { exact: true })
       .fill("Family renamed");
-    await dialog.getByLabel("Memory (MB)", { exact: true }).fill("3072");
+    await dialog.getByLabel("Memory (GB)", { exact: true }).fill("3");
     await dialog
       .getByRole("button", { name: "Save changes", exact: true })
       .click();
@@ -480,7 +480,7 @@ test("a fully shared account uses the complete desktop workspace and mobile navi
   await expect(
     page.getByRole("button", { name: "Server settings", exact: true }),
   ).toBeVisible();
-  await expect(page.getByRole("button", { name: "Rename server" })).toHaveCount(
+  await expect(page.getByRole("button", { name: "Edit server settings" })).toHaveCount(
     1,
   );
   await page.screenshot({

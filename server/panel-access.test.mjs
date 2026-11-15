@@ -10,6 +10,103 @@ const password = "Panel account fixture password!";
 const secondPassword = "Independent legacy credential!";
 const req = (cookie) => ({ headers: { cookie: cookie.split(";")[0] } });
 const token = (invitation) => new URL(invitation.invitationUrl).hash.slice(8);
+
+test("sharing saves selected grants and a bounded invitation together without resetting an active account", async (t) => {
+  const f = await fixture(t);
+  const shared = await f.access.share({
+    email: "friend@example.test",
+    expiresInHours: 1,
+    grants: [
+      {
+        serverId: "server-a",
+        permissions: ["server.view", "players.whitelist"],
+      },
+      { serverId: "server-b", permissions: ["server.view"] },
+    ],
+  });
+  assert.deepEqual(shared.user.serverIds, ["server-a", "server-b"]);
+  const preview = await f.access.previewInvitation(token(shared));
+  assert.equal(preview.servers.length, 2);
+  const signedIn = await f.access.accept(token(shared), password);
+  const again = await f.access.share({
+    email: "friend@example.test",
+    grants: [
+      { serverId: "server-a", permissions: ["server.view", "file.read"] },
+    ],
+  });
+  assert.equal(again.alreadyActive, true);
+  assert.equal(again.invitationUrl, undefined);
+  assert.ok(await f.access.authenticate(req(signedIn.cookie)));
+  assert.ok(await f.access.login({ email: "friend@example.test", password }));
+});
+
+test("delegated sharing cannot exceed live grants or grant host folder access", async (t) => {
+  const f = await fixture(t);
+  const actor = await f.enroll();
+  await f.access.grantServer("server-a", actor.account.id, {
+    permissions: ["server.view", "user.create", "players.whitelist"],
+  });
+  const input = {
+    email: "guest@example.test",
+    grants: [
+      {
+        serverId: "server-a",
+        permissions: ["server.view", "players.whitelist"],
+      },
+    ],
+  };
+  const created = await f.access.share(input, req(actor.cookie));
+  assert.equal(created.user.serverIds.length, 1);
+  for (const grants of [
+    [{ serverId: "server-b", permissions: ["server.view"] }],
+    [{ serverId: "server-a", permissions: ["server.view", "control.console"] }],
+    [{ serverId: "server-a", permissions: ["server.view", "backup.location"] }],
+  ])
+    await assert.rejects(
+      f.access.share(
+        { ...input, email: "blocked@example.test", grants },
+        req(actor.cookie),
+      ),
+      { status: 403 },
+    );
+  assert.equal(
+    f.access
+      .listAccounts()
+      .some((account) => account.email === "blocked@example.test"),
+    false,
+  );
+});
+
+test("sessions renew for thirty days and password changes revoke other sessions only", async (t) => {
+  const f = await fixture(t);
+  const first = await f.enroll();
+  const other = await f.access.login({ email: first.account.email, password });
+  f.advance(29 * 86400_000);
+  const renewed = await f.access.authenticate(req(first.cookie));
+  assert.ok(renewed.expiresAt);
+  f.advance(29 * 86400_000);
+  assert.ok(await f.access.authenticate(req(first.cookie)));
+  assert.equal(await f.access.authenticate(req(other.cookie)), null);
+  const newer = await f.access.login({ email: first.account.email, password });
+  await f.access.changePassword(req(first.cookie), {
+    currentPassword: password,
+    newPassword: secondPassword,
+  });
+  assert.ok(await f.access.authenticate(req(first.cookie)));
+  assert.equal(await f.access.authenticate(req(newer.cookie)), null);
+  await assert.rejects(
+    f.access.login({ email: first.account.email, password }),
+    { status: 401 },
+  );
+  assert.ok(
+    await f.access.login({
+      email: first.account.email,
+      password: secondPassword,
+    }),
+  );
+  f.advance(30 * 86400_000);
+  assert.equal(await f.access.authenticate(req(first.cookie)), null);
+});
 async function fixture(t) {
   const root = await fs.realpath(
     await fs.mkdtemp(path.join(os.tmpdir(), "mc-panel-access-")),
@@ -97,6 +194,15 @@ test("previewing and cancelling an invitation preserves a passwordless account a
     assert.deepEqual(await f.access.previewInvitation(token(invitation)), {
       email: account.email,
       panelAddress: "https://panel.example.test",
+      panelId: f.access.status().panelId,
+      panelName: f.access.status().panelName,
+      servers: [
+        {
+          id: "server-a",
+          name: "server-a",
+          permissions: ["server.view", "file.read"],
+        },
+      ],
       inviteExpiresAt: invitation.inviteExpiresAt,
     });
   }
@@ -890,4 +996,66 @@ test("ambiguous duplicate legacy identities retain independent scopes instead of
     ["control.start"],
   );
   assert.equal(f.legacy.length, 2);
+});
+
+test("owner can revoke pending links, end sessions, and dismiss durable migration notes independently", async (t) => {
+  const f = await fixture(t),
+    first = await f.enroll();
+  const originalId = f.access.status().panelId;
+  await f.access.renamePanel("Minecraft at home");
+  assert.equal(f.access.status().panelName, "Minecraft at home");
+  assert.equal(f.access.status().panelId, originalId);
+  const pending = await f.access.createAccount({
+    email: "pending@example.test",
+  });
+  const invite = await f.access.inviteAccount(pending.id, {
+    expiresInHours: 168,
+  });
+  await f.access.revokeInvitation(pending.id);
+  await assert.rejects(f.access.previewInvitation(token(invite)), {
+    status: 401,
+  });
+  assert.ok(await f.access.authenticate(req(first.cookie)));
+  await f.access.signOutAll();
+  assert.equal(await f.access.authenticate(req(first.cookie)), null);
+  assert.ok(f.access.account(first.account.id));
+  const file = path.join(f.root, "remote-access.json");
+  await f.access.close();
+  const saved = JSON.parse(await fs.readFile(file, "utf8"));
+  saved.accounts[0].accessReview = {
+    message: "Review old permissions",
+    serverIds: ["gone"],
+    previousPolicy: { permissions: ["server.view"] },
+  };
+  await fs.writeFile(file, JSON.stringify(saved));
+  const restarted = await f.boot();
+  assert.ok(restarted.account(first.account.id).accessReview);
+  await restarted.dismissAccessReview(first.account.id);
+  assert.equal(restarted.account(first.account.id).accessReview, undefined);
+});
+
+test("delegated invitation cannot take over a pending account with access to another server", async (t) => {
+  const f = await fixture(t),
+    actor = await f.enroll();
+  await f.access.grantServer("server-a", actor.account.id, {
+    permissions: ["server.view", "user.create"],
+  });
+  const pending = await f.access.createAccount({
+    email: "pending-wide@example.test",
+  });
+  await f.access.grantServer("server-b", pending.id, {
+    permissions: ["server.view", "control.console"],
+  });
+  await assert.rejects(
+    f.access.share(
+      {
+        email: pending.email,
+        grants: [{ serverId: "server-a", permissions: ["server.view"] }],
+      },
+      req(actor.cookie),
+    ),
+    { status: 403 },
+  );
+  assert.deepEqual(f.access.account(pending.id).serverIds, ["server-b"]);
+  assert.equal(f.access.account(pending.id).invitedAt, undefined);
 });

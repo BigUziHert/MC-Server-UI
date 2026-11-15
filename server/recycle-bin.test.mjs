@@ -956,10 +956,14 @@ test("a running live server recycles and restores unused configuration across dr
         crossedDrive++;
         throw exdev();
       }
+      if (to === source && !from.includes(".mc-restore-")) {
+        crossedDrive++;
+        throw exdev();
+      }
       return rename(from, to);
     });
     t.mock.method(fs, "copyFile", async (from, to, flags) => {
-      if (from === source || to === source) {
+      if (from === source || to.includes(".mc-restore-")) {
         assert.equal(
           (await panel.request("/api/server")).body.status,
           "running",
@@ -1009,7 +1013,7 @@ test("a running live server recycles and restores unused configuration across dr
       [],
     );
     assert.equal((await panel.request("/api/server")).body.status, "running");
-    assert.equal(crossedDrive, 1);
+    assert.equal(crossedDrive, 2);
     assert.equal(recycleCopies, 1);
     assert.equal(restoreCopies, 1);
     assert.equal(starts, 1);
@@ -1347,17 +1351,14 @@ test("failed final journal after atomic rename remains recoverable after restart
       if (update.phase) restorePhases.push(update.phase);
     },
   });
-  assert.deepEqual(
-    [...new Set(restorePhases)],
-    ["scanning", "copying", "finalizing"],
-  );
+  assert.deepEqual([...new Set(restorePhases)], ["scanning", "finalizing"]);
   assert.equal(
     await fs.readFile(path.join(f.serverDir, "proof"), "utf8"),
     "recover after crash",
   );
 });
 
-test("failed restore retains archive and partial new destination without overwriting on retry", async (t) => {
+test("failed cross-volume restore keeps partial bytes in staging and never publishes an incomplete live destination", async (t) => {
   const f = await fixture(t);
   await fs.mkdir(path.join(f.serverDir, "world"));
   await fs.writeFile(path.join(f.serverDir, "world", "a"), "first");
@@ -1367,6 +1368,14 @@ test("failed restore retains archive and partial new destination without overwri
   const broken = await f.boot({
     fileSystem: {
       ...fs,
+      rename: async (from, to) => {
+        if (
+          to === path.join(f.serverDir, "world") &&
+          !from.includes(".mc-restore-")
+        )
+          throw exdev();
+        return fs.rename(from, to);
+      },
       copyFile: async (from, to, flag) => {
         if (path.basename(from) === "b")
           throw new Error("injected restore failure");
@@ -1375,19 +1384,21 @@ test("failed restore retains archive and partial new destination without overwri
     },
   });
   await assert.rejects(broken.restore(item.id), /restore failure/);
+  await missing(path.join(f.serverDir, "world"));
+  assert.equal((await bin.list())[0].status, "ready");
+  const staging = path.join(f.serverDir, `.mc-restore-${item.id}`);
   assert.equal(
-    await fs.readFile(path.join(f.serverDir, "world", "a"), "utf8"),
+    await fs.readFile(path.join(staging, "content", "a"), "utf8"),
     "first",
   );
-  assert.equal((await bin.list())[0].status, "ready");
-  await assert.rejects(bin.restore(item.id), /already exists/);
-  const partial = await bin.recycle("world");
+  assert.equal(path.dirname(staging), f.serverDir);
+  await fs.rm(staging, { recursive: true });
   await bin.restore(item.id);
   assert.equal(
     await fs.readFile(path.join(f.serverDir, "world", "b"), "utf8"),
     "second",
   );
-  assert.equal((await bin.list())[0].id, partial.id);
+  assert.deepEqual(await bin.list(), []);
 });
 
 test("file APIs expose a protected bin, restore across restart and reject unsupported mutations", async (t) => {
@@ -1631,13 +1642,13 @@ test("a gated restore excludes other mutations and backups, and graceful shutdow
     });
     const id = deleted.body.recycled.id;
     const target = path.join(await fs.realpath(f.serverDir), "proof");
-    const originalCopy = fs.copyFile;
-    t.mock.method(fs, "copyFile", async (from, to, flags) => {
+    const originalRename = fs.rename;
+    t.mock.method(fs, "rename", async (from, to) => {
       if (to === target) {
         entered.resolve();
         await release.promise;
       }
-      return originalCopy(from, to, flags);
+      return originalRename(from, to);
     });
     const abort = new AbortController();
     const pending = panel
@@ -1650,7 +1661,7 @@ test("a gated restore excludes other mutations and backups, and graceful shutdow
       entered.promise,
       pending.then((response) => {
         throw new Error(
-          `Restore completed before its gated copy: ${JSON.stringify(response)}`,
+          `Restore completed before its gated atomic publication: ${JSON.stringify(response)}`,
         );
       }),
     ]);

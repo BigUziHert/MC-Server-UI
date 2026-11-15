@@ -130,6 +130,15 @@ test("invitation preview identifies the pending account without issuing access o
     assert.deepEqual(result.body, {
       email: account.email,
       panelAddress: origin,
+      panelId: f.fleet.access.status().panelId,
+      panelName: f.fleet.access.status().panelName,
+      servers: [
+        {
+          id: f.serverId,
+          name: f.fleet.runtimes.get(f.serverId).descriptor().name,
+          permissions: ["server.view", "file.read"],
+        },
+      ],
       inviteExpiresAt: invitation.inviteExpiresAt,
     });
   }

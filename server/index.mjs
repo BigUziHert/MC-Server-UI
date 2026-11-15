@@ -1,3 +1,10 @@
+import {
+  createOwnedDirectories,
+  removeOwnedEmptyDirectories,
+} from "./owned-directories.mjs";
+import { catalogSettings } from "./catalog-settings.mjs";
+import { createProcessOwnership } from "./process-ownership.mjs";
+import { offlinePlayerUuid, lookupPlayerProfile } from "./player-profiles.mjs";
 import express from "express";
 import multer from "multer";
 import { spawn } from "node:child_process";
@@ -5,7 +12,7 @@ import { EventEmitter } from "node:events";
 import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
-import { availableParallelism } from "node:os";
+import { availableParallelism, totalmem } from "node:os";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import permissionsCatalog from "../shared/subuser-permissions.json" with { type: "json" };
 import { createProcessTelemetry } from "./telemetry.mjs";
@@ -26,6 +33,12 @@ import {
 import { planFileDownload, streamFileArchive } from "./file-download.mjs";
 import { createFileSearch, listServerFiles } from "./file-search.mjs";
 import { createBackupArchive } from "./backup-archive.mjs";
+import {
+  runtimeSnapshot,
+  restoreSnapshotRecords,
+} from "./runtime-snapshot.mjs";
+import { publicErrorDetails } from "./error-details.mjs";
+import { serverPorts, preflightServerPorts } from "./server-ports.mjs";
 import {
   createBackupLocation,
   backupStorageDirectories,
@@ -89,6 +102,12 @@ import {
   parseProperties,
 } from "./import.mjs";
 
+const publicBackup = ({ runtimeSnapshot: snapshot, ...item }) => ({
+  ...item,
+  hasRuntimeSnapshot: Boolean(snapshot),
+});
+const publicRecycleItem = (item) =>
+  item.backup ? { ...item, backup: publicBackup(item.backup) } : item;
 const projectDir = path.resolve(
   path.dirname(fileURLToPath(import.meta.url)),
   "..",
@@ -282,6 +301,7 @@ export function validateServerConfiguration(
     "mode",
     "port",
     "memoryLimitMB",
+    "restartOnCrash",
     "jar",
     "launchType",
     "launchScript",
@@ -290,6 +310,8 @@ export function validateServerConfiguration(
     "javaPath",
     "motd",
     "connectionHost",
+    "software",
+    "minecraftVersion",
   ]);
   if (Object.keys(input).some((key) => !allowed.has(key)))
     throw error(400, "Unknown server setting.");
@@ -298,6 +320,7 @@ export function validateServerConfiguration(
     mode: "live",
     port: 25565,
     memoryLimitMB: 4096,
+    restartOnCrash: false,
     jar: "server.jar",
     launchType: "jar",
     launchScript: "",
@@ -320,6 +343,35 @@ export function validateServerConfiguration(
       "Server names must contain 1–64 characters without control characters.",
     );
   result.name = result.name.trim();
+  if (
+    Object.hasOwn(input, "software") &&
+    ![
+      "Java",
+      "Vanilla",
+      "Paper",
+      "Purpur",
+      "Folia",
+      "Velocity",
+      "Fabric",
+      "Quilt",
+      "Forge",
+      "NeoForge",
+      "Spigot",
+      "Bukkit",
+    ].includes(input.software)
+  )
+    throw error(400, "Choose a recognized server software type.");
+  if (
+    Object.hasOwn(input, "minecraftVersion") &&
+    input.minecraftVersion !== null &&
+    (typeof input.minecraftVersion !== "string" ||
+      !/^(?:\d{1,2}\.\d+(?:\.\d+)?(?:-(?:pre|rc|snapshot)-?\d+)?|\d{2}w\d{2}[a-z])$/.test(
+        input.minecraftVersion,
+      ))
+  )
+    throw error(400, "Enter a valid Minecraft release or snapshot version.");
+  if (typeof result.restartOnCrash !== "boolean")
+    throw error(400, "Choose whether to restart after a crash.");
   try {
     result.connectionHost = validateConnectionHost(result.connectionHost);
   } catch (cause) {
@@ -589,6 +641,7 @@ export async function createPanel(options = {}) {
     mode,
     port: Number(options.port ?? 25565),
     memoryLimitMB: memoryLimit,
+    restartOnCrash: options.restartOnCrash ?? false,
     jar: configuredJar,
     launchType: options.launchType ?? "jar",
     launchScript: options.launchScript ?? "",
@@ -615,7 +668,30 @@ export async function createPanel(options = {}) {
   await fs.mkdir(dataDir, { recursive: true });
   const restoreRecovery = [
     ...(options.restoreRecovery ?? []),
-    ...(await reconcileInterruptedRestores(serverDir)),
+    ...(await reconcileInterruptedRestores(serverDir, {
+      restoreMetadata: (snapshot) =>
+        restoreSnapshotRecords(snapshot, dataDir, safePath, async (saved) => {
+          const {
+            software,
+            version,
+            minecraftVersion,
+            maxPlayers,
+            ...settings
+          } = saved;
+          const next = {
+            ...configuration,
+            ...validateServerConfiguration(settings, configuration, true),
+            software,
+            version,
+            minecraftVersion,
+            maxPlayers,
+          };
+          await options.persistMinecraftConfiguration?.(next);
+          configuration = next;
+          configuredJar = next.jar;
+          memoryLimit = next.memoryLimitMB;
+        }),
+    })),
   ];
   const defaultBackupDir = await safePath(dataDir, "backups");
   let backupDir = defaultBackupDir;
@@ -786,7 +862,23 @@ export async function createPanel(options = {}) {
     await save();
   }
 
-  let status = "offline";
+  const processOwner = await createProcessOwnership({
+    dataDir,
+    serverDir,
+    safePath,
+    ...(options.processIdentity
+      ? { identify: options.processIdentity }
+      : options.spawnServer
+        ? { identify: async () => null, allowUntracked: true }
+        : {}),
+  });
+  const recoveredProcess = await processOwner.current();
+  let orphaned = Boolean(recoveredProcess);
+  let orphanedUnresolved = Boolean(recoveredProcess?.unresolved);
+  let status = orphaned ? "stopping" : "offline";
+  let crashTimer;
+  const crashHistory = [];
+  let lastExit = state.lastExit ?? null;
   let configBusy = false;
   let startedAt = null;
   let processHandle = null;
@@ -834,9 +926,17 @@ export async function createPanel(options = {}) {
       : {
           memoryLimitMB: detected.memoryLimitMB ?? null,
           software:
-            detected.software ??
-            (config.launchType === "executable" ? "Custom" : "Java"),
-          version: detected.version ?? "Unknown",
+            detected.software && !["Java", "Custom"].includes(detected.software)
+              ? detected.software
+              : config.software && !["Java", "Custom"].includes(config.software)
+                ? config.software
+                : config.launchType === "executable"
+                  ? "Custom"
+                  : "Java",
+          version:
+            detected.version && detected.version !== "Unknown"
+              ? detected.version
+              : (config.minecraftVersion ?? "Unknown"),
           memoryLimitSource:
             detected.memoryLimitMB == null ? "unknown" : "launch",
         };
@@ -1041,6 +1141,7 @@ export async function createPanel(options = {}) {
       "mode",
       "port",
       "memoryLimitMB",
+      "restartOnCrash",
       "jar",
       "launchType",
       "launchScript",
@@ -1099,7 +1200,7 @@ export async function createPanel(options = {}) {
         ...Object.fromEntries(
           Object.keys(configuration).map((key) => [
             key,
-            next[key] ?? configuration[key],
+            Object.hasOwn(next, key) ? next[key] : configuration[key],
           ]),
         ),
       };
@@ -1176,6 +1277,8 @@ export async function createPanel(options = {}) {
       throw error(409, "The server is already running or changing state.");
     // Reserve the transition before any filesystem awaits so concurrent starts cannot spawn twice.
     status = "starting";
+    clearTimeout(crashTimer);
+    lastExit = null;
     clearPlayers();
     try {
       if (options.existingServerDir)
@@ -1217,11 +1320,38 @@ export async function createPanel(options = {}) {
       } catch {
         /* Shown as an actionable error below. */
       }
-      if (parseProperties(eula).get("eula")?.toLowerCase() !== "true")
+      if (
+        configuration.software !== "Velocity" &&
+        parseProperties(eula).get("eula")?.toLowerCase() !== "true"
+      )
         throw error(
           400,
           "Read the Minecraft EULA, then set eula=true in your server eula.txt before starting.",
         );
+      const launchProperties = parseProperties(
+        await fs
+          .readFile(await safePath(serverDir, "server.properties"), "utf8")
+          .catch((cause) => {
+            if (cause.code === "ENOENT") return "";
+            throw cause;
+          }),
+      );
+      const filePort = Number(
+        launchProperties.get("server-port") ?? configuration.port,
+      );
+      if (filePort !== configuration.port) {
+        await options.checkServerPorts?.(launchProperties, filePort);
+        await applyMinecraftConfiguration({ port: filePort });
+      }
+      await options.checkServerPorts?.(launchProperties, configuration.port);
+      const memoryWarning = options.startMemoryWarning?.(memoryLimit);
+      if (memoryWarning) append(`[Panel] ${memoryWarning}`, "warn");
+      for (const warning of await preflightServerPorts(
+        launchProperties,
+        configuration.port,
+        options.probeServerPort,
+      ))
+        append(`[Panel] ${warning}`, "warn");
       await writeProperties({ "server-port": configuration.port });
       if (!configuration.minecraftVersion)
         detectedStartup = {
@@ -1300,7 +1430,9 @@ export async function createPanel(options = {}) {
       telemetry.reset(child.pid);
       startedAt = Date.now();
       let becameReady = false;
+      let ownershipUnresolved = false;
       let launchError;
+      let failureReason = "";
       const ready = (text) => {
         if (processHandle !== child || status !== "starting" || becameReady)
           return;
@@ -1328,6 +1460,12 @@ export async function createPanel(options = {}) {
           const chunks = buffer.split(/\r?\n/);
           buffer = chunks.pop().slice(-32768);
           for (const text of chunks) {
+            if (
+              /FAILED TO BIND TO PORT|Address already in use|UnsupportedClassVersionError|requires Java|Could not reserve enough space|OutOfMemoryError|Encountered an unexpected exception|crash report has been saved|Unable to access jarfile|Failed to load|Exception in thread/.test(
+                text,
+              )
+            )
+              failureReason = text.replace(/\x1b\[[0-9;]*m/g, "").slice(0, 600);
             trackPlayerOutput(text, child);
             ready(text);
             append(
@@ -1357,12 +1495,56 @@ export async function createPanel(options = {}) {
         launchError = cause;
         append(`[Panel] Java failed: ${cause.message}`, "error");
       });
-      child.on("close", (code) => {
+      child.on("close", (code, signal) => {
         if (processHandle !== child) return;
+        const unexpected = !stop.panelRequested;
+        lastExit = {
+          code,
+          signal: signal ?? null,
+          at: new Date().toISOString(),
+          unexpected,
+          startupFailed: !becameReady && unexpected,
+          reason:
+            (launchError?.message ?? failureReason) ||
+            (code === 137 || signal === "SIGKILL"
+              ? "The operating system killed the server. It may have run out of memory; reduce server allocations and check the host logs."
+              : null) ||
+            (!becameReady && unexpected
+              ? "The server exited before startup finished. Open Console to see the error."
+              : unexpected
+                ? "The server stopped unexpectedly. Open Console to review its last messages."
+                : "Server stopped."),
+        };
+        state.lastExit = lastExit;
+        void save().catch(() => {});
+        const unresolvedWrapper =
+          ["script", "executable"].includes(configuration.launchType) &&
+          (unexpected || ownershipUnresolved) &&
+          !terminationPromise &&
+          (!options.spawnServer || options.processIdentity);
+        if (unresolvedWrapper) {
+          orphaned = true;
+          orphanedUnresolved = true;
+        }
+        if (!unresolvedWrapper)
+          void processOwner
+            .clear(child.pid)
+            .catch((cause) =>
+              append(
+                `[Panel] Process ownership cleanup: ${cause.message}`,
+                "warn",
+              ),
+            );
+        if (unexpected)
+          options.onUnexpectedExit?.({
+            serverId: options.id,
+            name: configuration.name,
+            ...lastExit,
+          });
         void lifecycleAudit(
-          !becameReady && !stop.requested
+          !becameReady && !stop.panelRequested
             ? "Server start failed"
-            : code === 0 || stop.requested
+            : stop.panelRequested
               ? "Server stopped"
               : "Server exited unexpectedly",
           launchError?.message ??
@@ -1375,7 +1557,9 @@ export async function createPanel(options = {}) {
         startupMetadataAt = 0;
         processStop = undefined;
         status =
-          terminationPromise || terminationFailure ? "stopping" : "offline";
+          orphaned || terminationPromise || terminationFailure
+            ? "stopping"
+            : "offline";
         startedAt = null;
         clearPlayers();
         events.emit("server-exit", child);
@@ -1384,17 +1568,68 @@ export async function createPanel(options = {}) {
           code === 0 ? "info" : "error",
         );
         finishProcessExit();
+        if (
+          becameReady &&
+          unexpected &&
+          configuration.restartOnCrash &&
+          !closed
+        ) {
+          const now = Date.now();
+          while (crashHistory.length && crashHistory[0] < now - 15 * 60_000)
+            crashHistory.shift();
+          crashHistory.push(now);
+          if (crashHistory.length <= 3) {
+            const delay = [10_000, 60_000, 300_000][crashHistory.length - 1];
+            append(
+              `[Panel] Restarting after the crash in ${delay / 1000} seconds.`,
+              "warn",
+            );
+            crashTimer = setTimeout(() => {
+              if (!closed && status === "offline")
+                void startServer(true).catch((cause) =>
+                  append(cause.message, "error"),
+                );
+            }, delay);
+            crashTimer.unref?.();
+          } else
+            append(
+              "[Panel] Automatic restart paused after repeated crashes. Open Console and fix the error before starting again.",
+              "error",
+            );
+        }
       });
+      await processOwner
+        .remember(child, executable, spawnedAt, {
+          tree: ["script", "executable"].includes(configuration.launchType),
+        })
+        .catch((cause) => {
+          ownershipUnresolved = true;
+          processStop?.requestStop();
+          throw error(
+            409,
+            `The server was asked to stop because process recovery metadata could not be saved: ${cause.message}`,
+          );
+        });
     } catch (cause) {
-      status = "offline";
+      status = processHandle ? "stopping" : "offline";
       startedAt = null;
+      lastExit = {
+        code: null,
+        at: new Date().toISOString(),
+        unexpected: true,
+        startupFailed: true,
+        reason: cause.message,
+      };
+      state.lastExit = lastExit;
+      void save().catch(() => {});
       await lifecycleAudit("Server start failed", cause.message);
       throw cause;
     }
   }
 
   function finishProcessExit() {
-    if (processHandle || terminationPromise || terminationFailure) return;
+    if (orphaned || processHandle || terminationPromise || terminationFailure)
+      return;
     terminationTarget?.tree?.dispose?.();
     terminationTarget = undefined;
     status = "offline";
@@ -1485,6 +1720,46 @@ export async function createPanel(options = {}) {
   }
 
   async function power(action, { confirmed = false } = {}) {
+    if (orphaned) {
+      if (action === "resolve-orphan" && confirmed) {
+        const properties = parseProperties(
+          await fs
+            .readFile(await safePath(serverDir, "server.properties"), "utf8")
+            .catch((cause) => {
+              if (cause.code === "ENOENT") return "";
+              throw cause;
+            }),
+        );
+        await preflightServerPorts(
+          properties,
+          configuration.port,
+          options.probeServerPort,
+        );
+        await processOwner.confirmStopped();
+        orphaned = false;
+        orphanedUnresolved = false;
+        status = "offline";
+        return;
+      }
+      if (action !== "force-stop" || !confirmed)
+        throw error(
+          409,
+          "A server from the previous panel session is still running. Use Force Stop to end it before changing files or starting another copy. Unsaved world changes may be lost.",
+        );
+      try {
+        await processOwner.stop();
+      } catch (cause) {
+        orphanedUnresolved = Boolean(
+          (await processOwner.current())?.unresolved,
+        );
+        throw error(409, cause.message);
+      }
+      orphanedUnresolved = false;
+      orphaned = false;
+      status = "offline";
+      return;
+    }
+    if (["stop", "force-stop"].includes(action)) clearTimeout(crashTimer);
     if (!["start", "stop", "restart", "force-stop"].includes(action))
       throw error(400, "Choose start, stop, restart, or force-stop.");
     if (action === "force-stop") {
@@ -1625,6 +1900,9 @@ export async function createPanel(options = {}) {
     dataDir,
     safePath,
     withMinecraftMutation,
+    catalogDataDir: options.catalogDataDir ?? dataDir,
+    checkServerPorts: options.checkServerPorts,
+    javaProbe: options.javaProbe,
     isContentMutationActive: () =>
       activeMutations > 0 || recycleBusy || minecraftBusy,
     versionsService: options.versionsService,
@@ -1845,6 +2123,10 @@ export async function createPanel(options = {}) {
       phase: "writing",
     };
     const liveChild = status === "running" ? processHandle : null;
+    const savedRuntime = runtimeSnapshot(
+      configuration,
+      minecraft.snapshotInstalled(),
+    );
     let failed;
     let committed = false;
     let historySaved = false;
@@ -1889,6 +2171,7 @@ export async function createPanel(options = {}) {
         createdAt: new Date().toISOString(),
         status: "completed",
         trigger,
+        runtimeSnapshot: savedRuntime,
       };
       const completedArchive = await fs.open(`${target}.tmp`, "r+");
       try {
@@ -1922,7 +2205,7 @@ export async function createPanel(options = {}) {
           ? "Scheduler"
           : (requestActor.getStore() ?? "Local administrator"),
       );
-      return item;
+      return publicBackup(item);
     } catch (cause) {
       failed = signal.aborted && !committed ? signal.reason : cause;
       try {
@@ -2112,6 +2395,19 @@ export async function createPanel(options = {}) {
         req.path === "/api/server/icon" ||
         req.path === "/api/console/command");
     if (protectedMutation) {
+      if (
+        orphaned &&
+        !(
+          req.path === "/api/server/power" &&
+          ["force-stop", "resolve-orphan"].includes(req.body?.action)
+        )
+      )
+        return next(
+          error(
+            409,
+            "A server from the previous panel session is still running. Force Stop it before changing files.",
+          ),
+        );
       if (minecraftBusy)
         return next(
           error(
@@ -2180,7 +2476,7 @@ export async function createPanel(options = {}) {
     diskGeneration++;
     diskCache.at = 0;
   };
-  app.get("/api/server", async (_req, res) => {
+  app.get("/api/server", async (req, res) => {
     await refreshStartupMetadata();
     if (
       !diskScan &&
@@ -2213,7 +2509,10 @@ export async function createPanel(options = {}) {
       sampledChild && Number.isInteger(sampledChild.pid)
         ? telemetry.sample(sampledChild.pid)
         : null,
-      advertisedConnection(configuration, publicAddress),
+      advertisedConnection(configuration, publicAddress, {
+        remote: Boolean(req[remotePrincipal]),
+        lanAddresses: (options.localAddresses ?? localNetworkAddresses)(),
+      }),
     ]);
     const currentSample =
       sampledChild &&
@@ -2234,6 +2533,9 @@ export async function createPanel(options = {}) {
       serverIconVersion: cachedIcon?.version ?? null,
       iconPreference: state.iconPreference,
       status,
+      orphaned,
+      orphanedUnresolved,
+      lastExit,
       mode,
       version: startupMetadata.version,
       software: startupMetadata.software,
@@ -2293,6 +2595,7 @@ export async function createPanel(options = {}) {
       "connectionHost",
       "port",
       "memoryLimitMB",
+      "restartOnCrash",
       "motd",
       "launchType",
       "software",
@@ -2322,6 +2625,7 @@ export async function createPanel(options = {}) {
         "connectionHost",
         "port",
         "memoryLimitMB",
+        "restartOnCrash",
         "motd",
       ]);
       if (
@@ -2540,7 +2844,57 @@ export async function createPanel(options = {}) {
         "This player's identity changed or is unavailable. Refresh the player list before trying again.",
       );
   };
-  const offlineIdentity = (snapshot, name, uuid, authoritative) => {
+  const offlineIdentity = async (snapshot, name, uuid, authoritative) => {
+    if (!authoritative) {
+      const properties = parseProperties(
+        await fs
+          .readFile(await safePath(serverDir, "server.properties"), "utf8")
+          .catch((cause) => {
+            if (cause.code === "ENOENT") return "";
+            throw cause;
+          }),
+      );
+      if (properties.get("online-mode")?.toLowerCase() === "false") {
+        // Proxy/Floodgate servers may forward authenticated UUIDs while their
+        // backend uses offline mode. Preserve a unique known identity.
+        const saved = snapshot.history.filter(
+          (player) =>
+            player.name.toLowerCase() === name.toLowerCase() && player.uuid,
+        );
+        const identities = new Set(
+          saved.map((player) => player.uuid.toLowerCase()),
+        );
+        if (identities.size === 1)
+          return { name, uuid: uuid ?? [...identities][0] };
+        if (identities.size > 1)
+          throw error(
+            409,
+            "This player has multiple saved identities. Resolve the profile while the server is running.",
+          );
+        const resolved = offlinePlayerUuid(name);
+        if (uuid && uuid.toLowerCase() !== resolved)
+          throw error(
+            409,
+            "This saved profile belongs to a different authentication mode. Enter the exact case-sensitive offline username again without selecting the old profile.",
+          );
+        return { name, uuid: resolved };
+      }
+      const known = snapshot.history.filter(
+        (player) =>
+          player.name.toLowerCase() === name.toLowerCase() &&
+          player.uuid &&
+          player.uuid[14] !== "3",
+      );
+      if (!known.length) {
+        const profile = await lookupPlayerProfile(name, options.profileFetch);
+        if (uuid && uuid.toLowerCase() !== profile.uuid)
+          throw error(
+            409,
+            "The Minecraft profile changed. Refresh the player list before changing access.",
+          );
+        return profile;
+      }
+    }
     const matches = (authoritative ?? snapshot.history).filter(
       (player) => player.name.toLowerCase() === name.toLowerCase(),
     );
@@ -2621,7 +2975,7 @@ export async function createPanel(options = {}) {
           if (action === "state") {
             await writeProperties({ "white-list": String(req.body.enabled) });
           } else {
-            const player = offlineIdentity(
+            const player = await offlineIdentity(
               snapshot,
               req.body.name,
               req.body.uuid,
@@ -2700,7 +3054,7 @@ export async function createPanel(options = {}) {
             serverDir,
             safePath,
             action,
-            player: offlineIdentity(snapshot, name, req.body.uuid),
+            player: await offlineIdentity(snapshot, name, req.body.uuid),
             reason: req.body.reason,
           });
           return savedPlayerAction(res, command, "banned-players.json");
@@ -2744,7 +3098,7 @@ export async function createPanel(options = {}) {
         const command = `${action} ${name}`;
         if (req.panelOfflinePlayerMutation) {
           const snapshot = await loadPlayerHistory();
-          const player = offlineIdentity(
+          const player = await offlineIdentity(
             snapshot,
             name,
             req.body.uuid,
@@ -2768,6 +3122,11 @@ export async function createPanel(options = {}) {
   app.post(
     "/api/server/power",
     trackOperation(async (req, res) => {
+      if (req.body?.action === "resolve-orphan" && req[remotePrincipal])
+        throw error(
+          403,
+          "Only the host owner can confirm an untracked server was stopped.",
+        );
       await power(req.body?.action, { confirmed: req.body?.confirmed });
       res.json({ status });
     }),
@@ -2787,7 +3146,8 @@ export async function createPanel(options = {}) {
         throw error(409, "Start the server before sending a command.");
       const normalized = command.trim().replace(/^\//, "");
       append(`> ${normalized}`);
-      if (normalized === "stop") await power("stop");
+      if (["stop", "end"].includes(normalized.toLowerCase()))
+        await power("stop");
       else await writeServer(processHandle, normalized);
       const playerEvent = playerCommandAudit(normalized);
       if (playerEvent)
@@ -2820,18 +3180,81 @@ export async function createPanel(options = {}) {
         : latestRecycleOperation,
     });
   });
-  app.get("/api/files/recycle-bin", async (_req, res) => {
-    res.json({ items: await recycleBin.list(), protected: true });
+  const recyclePermissions = (req) => {
+    if (!req[remotePrincipal]) return null;
+    const user = currentAccessUser(req[remotePrincipal]);
+    return user ? userWithPermissions(user).permissions : [];
+  };
+  const mayAccessRecycle = (req, item, action) => {
+    const permissions = recyclePermissions(req);
+    if (permissions && item.kind === "unknown") return false;
+    if (permissions && item.status === "incomplete" && item.originalPath === "")
+      return false;
+    return (
+      permissions === null ||
+      permissions.includes(
+        `${item.kind === "backup" ? "backup" : "file"}.${action}`,
+      )
+    );
+  };
+  const requireRecycleRead = (req) => {
+    const permissions = recyclePermissions(req);
+    if (
+      permissions &&
+      !permissions.includes("file.read") &&
+      !permissions.includes("backup.read")
+    )
+      throw error(
+        403,
+        "You need permission to view files or backups to open Recycle Bin.",
+      );
+  };
+  const authorizedRecycleItem = async (req, id, action) => {
+    const item = (await recycleBin.list()).find((entry) => entry.id === id);
+    if (!item && !req[remotePrincipal]) return { kind: "unknown" };
+    if (!item || !mayAccessRecycle(req, item, action))
+      throw error(404, "This Recycle Bin item is unavailable.");
+    if (
+      action === "create" &&
+      item.kind !== "backup" &&
+      req.body?.replaceExisting === true
+    ) {
+      const permissions = recyclePermissions(req);
+      if (
+        permissions &&
+        (!permissions.includes("file.update") ||
+          !permissions.includes("file.delete"))
+      )
+        throw error(
+          403,
+          "You need permission to update and delete files before replacing an existing file.",
+        );
+    }
+    return item;
+  };
+  app.get("/api/files/recycle-bin", async (req, res) => {
+    requireRecycleRead(req);
+    res.json({
+      items: (await recycleBin.list())
+        .filter((item) => mayAccessRecycle(req, item, "read"))
+        .map(publicRecycleItem),
+      protected: true,
+    });
   });
   const recycleActions = new Map();
   let latestRecycleAction = null;
   app.get("/api/files/recycle-bin/operation", (req, res) => {
+    requireRecycleRead(req);
     const requestId = recycleRequestId(req.query.requestId);
+    const operation = requestId
+      ? recycleActions.get(requestId)
+      : latestRecycleAction;
     res.set("Cache-Control", "no-store");
     res.json({
-      operation: requestId
-        ? (recycleActions.get(requestId) ?? null)
-        : latestRecycleAction,
+      operation:
+        operation && mayAccessRecycle(req, operation, "read")
+          ? operation
+          : null,
     });
   });
   const runRecycleAction = async (req, res, type, work) => {
@@ -2840,9 +3263,25 @@ export async function createPanel(options = {}) {
       recycleRequestId(
         type === "delete" ? req.query.requestId : req.body?.requestId,
       ) ?? randomUUID();
+    const fingerprint = JSON.stringify([
+      req.body?.destinationPath ?? null,
+      req.body?.replaceExisting === true,
+    ]);
     const previous = recycleActions.get(id);
     if (previous) {
-      if (previous.itemId !== itemId || previous.type !== type)
+      if (
+        !mayAccessRecycle(
+          req,
+          previous,
+          type === "delete" ? "delete" : "create",
+        )
+      )
+        throw error(404, "This Recycle Bin item is unavailable.");
+      if (
+        previous.itemId !== itemId ||
+        previous.type !== type ||
+        previous.fingerprint !== fingerprint
+      )
         throw error(409, "This recovery request ID belongs to another action.");
       if (previous.status === "completed") return res.json(previous.result);
       throw error(
@@ -2850,10 +3289,22 @@ export async function createPanel(options = {}) {
         previous.error ?? "This recovery action is still in progress.",
       );
     }
+    const item = await authorizedRecycleItem(
+      req,
+      itemId,
+      type === "delete" ? "delete" : "create",
+    );
     const operation = {
       id,
       itemId,
+      kind:
+        item.kind === "backup"
+          ? "backup"
+          : item.kind === "unknown"
+            ? "unknown"
+            : "file",
       type,
+      fingerprint,
       status: "running",
       phase: "scanning",
       filesProcessed: 0,
@@ -2929,6 +3380,7 @@ export async function createPanel(options = {}) {
   app.get(
     "/api/files/recycle-bin/:id/restore-preview",
     trackOperation(async (req, res) => {
+      await authorizedRecycleItem(req, req.params.id, "read");
       const timeout = AbortSignal.timeout(10_000);
       const disconnected = new AbortController();
       const signal = AbortSignal.any([timeout, disconnected.signal]);
@@ -2939,12 +3391,16 @@ export async function createPanel(options = {}) {
       req.once("aborted", cancel);
       res.once("close", cancel);
       try {
-        const item = await recycleBin.inspect(req.params.id, { signal });
+        const item = await recycleBin.inspect(req.params.id, {
+          signal,
+          includePayload: true,
+        });
         const result =
           item.sha512 && minecraft.duplicateCheck
             ? await minecraft.duplicateCheck({
                 path: item.originalPath,
                 sha512: item.sha512,
+                payloadPath: item.payloadPath,
                 signal,
               })
             : { duplicates: [], warnings: [] };
@@ -2971,7 +3427,7 @@ export async function createPanel(options = {}) {
           const item = await recycleBin.inspect(itemId, {
             includeHash: false,
           });
-          operation.item = item;
+          operation.item = publicRecycleItem(item);
           if (item.kind === "backup") {
             // A failed final recycle journal write can leave a stale history row.
             // The bin verifies the archive destination itself and refuses conflicts;
@@ -2999,9 +3455,35 @@ export async function createPanel(options = {}) {
                 `${item.backup.name} · restored from Recycle Bin.`,
               ),
             ).catch(() => {});
-            return { ok: true, kind: "backup", backup: item.backup };
+            return {
+              ok: true,
+              kind: "backup",
+              backup: publicBackup(item.backup),
+            };
           }
-          const restoredPath = await recycleBin.restore(itemId, { onProgress });
+          const targetPath = req.body?.destinationPath ?? item.originalPath;
+          await safePath(serverDir, targetPath);
+          let replacement;
+          if (req.body?.replaceExisting === true) {
+            if (status !== "offline")
+              throw error(
+                409,
+                "Stop the server before replacing files from Recycle Bin.",
+              );
+            if (await exists(await safePath(serverDir, targetPath)))
+              replacement = await recycleBin.recycle(targetPath);
+          }
+          let restoredPath;
+          try {
+            restoredPath = await recycleBin.restore(itemId, {
+              onProgress,
+              destinationPath: targetPath,
+            });
+          } catch (cause) {
+            if (replacement)
+              await recycleBin.restore(replacement.id).catch(() => {});
+            throw cause;
+          }
           void trackTask(async () => {
             const kind = await fileKind(restoredPath, item.type);
             await audit(
@@ -3010,7 +3492,18 @@ export async function createPanel(options = {}) {
               `${restoredPath} · restored from Recycle Bin.`,
             );
           }).catch(() => {});
-          return { ok: true, path: restoredPath };
+          let receiptWarning;
+          try {
+            await minecraft.restoreRecycledReceipt(itemId, restoredPath);
+          } catch {
+            receiptWarning =
+              "The file was restored, but its Launchpad history could not be saved. Refresh Launchpad before updating it.";
+          }
+          return {
+            ok: true,
+            path: restoredPath,
+            ...(receiptWarning ? { warnings: [receiptWarning] } : {}),
+          };
         },
       );
     }),
@@ -3730,7 +4223,10 @@ export async function createPanel(options = {}) {
           .map((item) => item.id)
       : [];
     res.json({
-      backups,
+      backups: backups.map(({ runtimeSnapshot: snapshot, ...item }) => ({
+        ...item,
+        hasRuntimeSnapshot: Boolean(snapshot),
+      })),
       missingBackupIds,
       schedule: presentedSchedule(),
       timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
@@ -3905,6 +4401,7 @@ export async function createPanel(options = {}) {
             ? [principal.accountId ?? null, principal.userId, principal.email]
             : "local-owner",
           backupId: req.params.id,
+          restoreConfiguration: req.body?.restoreConfiguration === true,
         },
         () => {
           if (status !== "offline")
@@ -3912,6 +4409,30 @@ export async function createPanel(options = {}) {
           return withMinecraftMutation(async () => {
             await backupLocation.assertAvailable();
             const item = getItem(state.backups, req.params.id);
+            if (req.body?.restoreConfiguration === true && principal)
+              throw error(
+                403,
+                "Only the computer owner can restore saved launch settings.",
+              );
+            const savedRuntime =
+              req.body?.restoreConfiguration === true
+                ? item.runtimeSnapshot
+                : null;
+            if (req.body?.restoreConfiguration === true && !savedRuntime)
+              throw error(
+                409,
+                "This older backup contains server files only. Restore files with the current launch settings.",
+              );
+            const previousRuntime = runtimeSnapshot(
+              configuration,
+              minecraft.snapshotInstalled(),
+            );
+            const restoreConfiguration =
+              savedRuntime?.configuration ?? configuration;
+            const applySnapshot = async (snapshot) => {
+              await minecraft.restoreInstalled(snapshot.installed);
+              await applyMinecraftConfiguration(snapshot.configuration);
+            };
             const archive = await safePath(backupDir, `${item.id}.tar.gz`);
             if (!(await exists(archive)))
               throw error(404, "Backup archive not found.");
@@ -3920,6 +4441,16 @@ export async function createPanel(options = {}) {
               serverDir,
               archive,
               {
+                ...(savedRuntime
+                  ? {
+                      metadata: {
+                        before: previousRuntime,
+                        after: savedRuntime,
+                      },
+                      commit: () => applySnapshot(savedRuntime),
+                      rollback: () => applySnapshot(previousRuntime),
+                    }
+                  : {}),
                 validate: async (staged) => {
                   try {
                     const validateRetainedExecutable = async (value) => {
@@ -3983,23 +4514,30 @@ export async function createPanel(options = {}) {
                           "The selected startup executable is missing.",
                         );
                     };
-                    if (configuration.launchType === "jar") {
-                      const jar = await safePath(staged, configuration.jar);
+                    if (restoreConfiguration.launchType === "jar") {
+                      const jar = await safePath(
+                        staged,
+                        restoreConfiguration.jar,
+                      );
                       if (!(await fs.stat(jar)).isFile())
                         throw new Error(
                           "The selected server JAR is not a regular file.",
                         );
                     } else {
-                      await validateStartupFiles(staged, configuration);
+                      await validateStartupFiles(staged, restoreConfiguration);
                     }
-                    if (configuration.launchType === "executable")
+                    if (restoreConfiguration.launchType === "executable")
                       await validateRetainedExecutable(
-                        configuration.launchExecutable,
+                        restoreConfiguration.launchExecutable,
                       );
                     else if (
-                      ["jar", "java-args"].includes(configuration.launchType)
+                      ["jar", "java-args"].includes(
+                        restoreConfiguration.launchType,
+                      )
                     )
-                      await validateRetainedExecutable(configuration.javaPath);
+                      await validateRetainedExecutable(
+                        restoreConfiguration.javaPath,
+                      );
                   } catch (cause) {
                     const detail =
                       cause.code === "ENOENT" || cause.code === "ENOTDIR"
@@ -4031,7 +4569,12 @@ export async function createPanel(options = {}) {
                 .join(" ");
               append(`[Panel] ${warning}`, "warn");
             }
-            return { ok: true, backupId: item.id, ...restored };
+            return {
+              ok: true,
+              backupId: item.id,
+              configurationRestored: Boolean(savedRuntime),
+              ...restored,
+            };
           });
         },
       );
@@ -4071,7 +4614,7 @@ export async function createPanel(options = {}) {
         return res.json({ ok: true, removedRecord: true });
       }
       const recycled = await recycleBackup(item);
-      res.json({ ok: true, recycled });
+      res.json({ ok: true, recycled: publicRecycleItem(recycled) });
     }),
   );
   const presentedUser = (user) => ({
@@ -4142,13 +4685,32 @@ export async function createPanel(options = {}) {
     }),
   );
   app.post(
+    "/api/subusers/share",
+    trackOperation(async (req, res) => {
+      if (!options.shareAccess)
+        throw error(409, "Sharing is unavailable for this server.");
+      const result = await options.shareAccess(
+        req.body ?? {},
+        req[remotePrincipal] ? req : undefined,
+      );
+      const warning = await committedAccessAudit(
+        "Server access granted",
+        result.user?.email ?? "",
+      );
+      res.status(201).json({ ...result, ...(warning ? { warning } : {}) });
+    }),
+  );
+  app.post(
     "/api/subusers/:id/invite",
     subuserOperation(async (req, res) => {
       const accountUser = options.accessUserForServer?.(req.params.id);
       if (accountUser) {
         if (req[remotePrincipal])
           throw error(403, "Only the panel owner can invite a panel account.");
-        const invitation = await options.inviteAccount(accountUser.accountId);
+        const invitation = await options.inviteAccount(
+          accountUser.accountId,
+          req.body,
+        );
         const warning = await committedAccessAudit(
           "Panel invitation link created",
           accountUser.email,
@@ -4213,7 +4775,15 @@ export async function createPanel(options = {}) {
         !roles.has(role)
       )
         throw error(400, "Enter a valid email address and role.");
-      if (state.users.some((item) => item.email === email.toLowerCase()))
+      if (
+        state.users.some(
+          (item) =>
+            item.email === email.toLowerCase() &&
+            (options.resolveAccessUser
+              ? options.resolveAccessUser(item.id, item)
+              : item),
+        )
+      )
         throw error(409, "This email already has access to this server.");
       const item = {
         id: randomUUID(),
@@ -4333,6 +4903,7 @@ export async function createPanel(options = {}) {
             ? 400
             : 500);
     res.status(status).json({
+      ...(status < 500 ? publicErrorDetails(cause) : {}),
       error:
         status >= 500 && status !== 503
           ? "The operation failed. Check the API terminal for details."
@@ -4408,6 +4979,34 @@ export async function createPanel(options = {}) {
       return trackTask(() => updateConfiguration(...args));
     },
     audit,
+    activity: () => ({
+      ...minecraft.activity(),
+      backups: [...backupJobs.values()].filter(
+        (job) => job.status === "running" || job.status === "queued",
+      ),
+      mutations: activeMutations,
+    }),
+    waitForIdle: async () => {
+      await minecraft.waitForIdle();
+      while (inFlightTasks.size) await Promise.allSettled([...inFlightTasks]);
+    },
+    emergencyRelease: async () => {
+      clearTimeout(crashTimer);
+      for (const [id, controller] of backupControllers)
+        if (backupJobs.get(id)?.cancellable !== false)
+          controller.abort(cancelledBackup());
+      const child = processHandle;
+      if (child?.stdin?.writable) {
+        try {
+          child.stdin.write("save-on\n");
+          processStop?.requestStop();
+        } catch {}
+        await Promise.race([
+          new Promise((resolve) => child.once("close", resolve)),
+          new Promise((resolve) => setTimeout(resolve, 5000)),
+        ]);
+      }
+    },
     close: ({ gracefulOnly = false } = {}) => {
       if (!closePromise) {
         closed = true;
@@ -4415,72 +5014,99 @@ export async function createPanel(options = {}) {
         clearInterval(scheduler);
         if (!options.telemetry) telemetry.close();
         clearTimeout(stopTimer);
+        clearTimeout(crashTimer);
         closePromise = (async () => {
-          await fileSearch.close();
-          await minecraft.close();
+          const failures = [];
+          const capture = async (work) => {
+            try {
+              return await work();
+            } catch (cause) {
+              failures.push(cause);
+            }
+          };
+          await Promise.all([
+            capture(() => fileSearch.close()),
+            capture(() => minecraft.close()),
+          ]);
           // An HTTP client can leave before its disk writes or backup finish.
           // Wait for the handler itself, including save-on and its audit write.
           while (inFlightTasks.size)
             await Promise.allSettled([...inFlightTasks]);
           clearTimeout(stopTimer);
-          if (terminationPromise) await terminationPromise;
-          if (processHandle) {
-            const child = processHandle;
-            const stop = processStop;
-            processStopActor ??= "Server process";
-            const exited = new Promise((resolve) =>
-              child.once("close", resolve),
-            );
-            stop.requestStop();
-            let timeout;
-            try {
-              if (gracefulOnly || stop.shutdownStarted) await exited;
-              else
-                await Promise.race([
-                  exited,
-                  new Promise((resolve) => {
-                    timeout = setTimeout(() => {
-                      if (!stop.shutdownStarted) resolve();
-                    }, options.stopTimeoutMs ?? 15000);
-                  }),
-                ]);
-              if (processHandle === child) {
-                if (stop.shutdownStarted) await exited;
-                else {
-                  await terminateProcessTree(child, {
-                    tree: ["script", "executable"].includes(
-                      configuration.launchType,
-                    ),
-                    spawnProcess: options.spawnProcess,
-                  });
-                  let killTimeout;
-                  try {
-                    await Promise.race([
-                      exited,
-                      new Promise((_resolve, reject) => {
-                        killTimeout = setTimeout(
-                          () =>
-                            reject(
-                              new Error(
-                                "The server process did not exit after termination. Close it before restarting the panel.",
+          if (terminationPromise) await capture(() => terminationPromise);
+          await capture(async () => {
+            if (processHandle) {
+              const child = processHandle;
+              const stop = processStop;
+              processStopActor ??= "Server process";
+              const exited = new Promise((resolve) =>
+                child.once("close", resolve),
+              );
+              stop.requestStop();
+              let timeout;
+              try {
+                if (gracefulOnly || stop.shutdownStarted) await exited;
+                else
+                  await Promise.race([
+                    exited,
+                    new Promise((resolve) => {
+                      timeout = setTimeout(() => {
+                        if (!stop.shutdownStarted) resolve();
+                      }, options.stopTimeoutMs ?? 15000);
+                    }),
+                  ]);
+                if (processHandle === child) {
+                  if (stop.shutdownStarted) await exited;
+                  else {
+                    await terminateProcessTree(child, {
+                      tree: ["script", "executable"].includes(
+                        configuration.launchType,
+                      ),
+                      spawnProcess: options.spawnProcess,
+                    });
+                    let killTimeout;
+                    try {
+                      await Promise.race([
+                        exited,
+                        new Promise((_resolve, reject) => {
+                          killTimeout = setTimeout(
+                            () =>
+                              reject(
+                                new Error(
+                                  "The server process did not exit after termination. Close it before restarting the panel.",
+                                ),
                               ),
-                            ),
-                          5000,
-                        );
-                      }),
-                    ]);
-                  } finally {
-                    clearTimeout(killTimeout);
+                            5000,
+                          );
+                        }),
+                      ]);
+                    } finally {
+                      clearTimeout(killTimeout);
+                    }
                   }
                 }
+              } finally {
+                clearTimeout(timeout);
               }
-            } finally {
-              clearTimeout(timeout);
             }
-          }
-          await playerHistory.flush();
-          await saveChain;
-        })();
+          });
+          await capture(() => playerHistory.flush());
+          await capture(async () => {
+            try {
+              await saveChain;
+            } catch {
+              await save();
+            }
+          });
+          if (failures.length)
+            throw new AggregateError(
+              failures,
+              `Server cleanup could not finish: ${failures.map((cause) => cause.message).join("; ")}`,
+            );
+        })().catch((cause) => {
+          closePromise = undefined;
+          throw cause;
+        });
       }
       return closePromise;
     },
@@ -4584,6 +5210,7 @@ export async function createFleet(options = {}) {
     "mode",
     "port",
     "memoryLimitMB",
+    "restartOnCrash",
     "jar",
     "launchType",
     "launchScript",
@@ -4591,6 +5218,8 @@ export async function createFleet(options = {}) {
     "launchExecutable",
     "javaPath",
     "motd",
+    "software",
+    "minecraftVersion",
   ];
   const onlyConfig = (entry) =>
     Object.fromEntries(
@@ -4611,17 +5240,52 @@ export async function createFleet(options = {}) {
         new Error("Restore access to its existing folder and retry."),
       )
     ).descriptor();
-  const checkPort = (port, exceptId) => {
-    if (
-      registry.servers.some(
-        (entry) => entry.id !== exceptId && entry.port === port,
+  const checkServerPorts = async (properties, port, exceptId) => {
+    if (!Number.isInteger(port) || port < 1024 || port > 65535)
+      throw error(400, "Choose a port from 1024 to 65535.");
+    const requested = serverPorts(properties, port);
+    for (const entry of registry.servers) {
+      if (entry.id === exceptId) continue;
+      const stored = await (async () => {
+        if (runtimes.get(entry.id)?.unavailable) return new Map();
+        try {
+          return parseProperties(
+            await fs.readFile(
+              await safePath(entry.serverDir, "server.properties"),
+              "utf8",
+            ),
+          );
+        } catch (cause) {
+          if (["ENOENT", "ENOTDIR", "EACCES", "EPERM"].includes(cause.code))
+            return new Map();
+          throw cause;
+        }
+      })();
+      for (const existing of serverPorts(stored, entry.port))
+        if (
+          requested.some(
+            (binding) =>
+              binding.type === existing.type && binding.port === existing.port,
+          )
+        )
+          throw error(
+            409,
+            `Port ${existing.port} is already assigned (${existing.type.toUpperCase()}) to ${entry.name}'s ${existing.label} service. Choose another port.`,
+          );
+    }
+    for (const binding of requested)
+      if (
+        requested.filter(
+          (other) => other.type === binding.type && other.port === binding.port,
+        ).length > 1
       )
-    )
-      throw error(
-        409,
-        `Port ${port} is already assigned to another server. Choose a different port.`,
-      );
+        throw error(
+          409,
+          `Port ${binding.port} is assigned to both the game and RCON service. Choose separate TCP ports.`,
+        );
   };
+  const checkPort = (port, exceptId) =>
+    checkServerPorts(new Map(), port, exceptId);
   const installationOptions = async (
     exceptId,
     ownSupportDirectory = false,
@@ -4742,8 +5406,46 @@ export async function createFleet(options = {}) {
     entry,
     preserveFiles = false,
     publish = true,
+    outsideQueue = false,
   ) => {
-    const restoreRecovery = await reconcileInterruptedRestores(entry.serverDir);
+    const restoreRecovery = await reconcileInterruptedRestores(
+      entry.serverDir,
+      {
+        restoreMetadata: (snapshot) =>
+          restoreSnapshotRecords(
+            snapshot,
+            entry.dataDir,
+            safePath,
+            async (saved) => {
+              const {
+                software,
+                version,
+                minecraftVersion,
+                maxPlayers,
+                ...settings
+              } = saved;
+              const next = {
+                ...entry,
+                ...validateServerConfiguration(settings, entry, true),
+                software,
+                version,
+                minecraftVersion,
+                maxPlayers,
+              };
+              const saveRecovered = () =>
+                persist({
+                  ...registry,
+                  servers: registry.servers.map((item) =>
+                    item.id === entry.id ? next : item,
+                  ),
+                });
+              if (outsideQueue) await serialize(saveRecovered);
+              else await saveRecovered();
+              Object.assign(entry, next);
+            },
+          ),
+      },
+    );
     if (entry.storage === "external") {
       await inspectImport(entry.serverDir, entry.id, true);
       if (entry.launchType !== "jar")
@@ -4840,9 +5542,18 @@ export async function createFleet(options = {}) {
       accessUserForServer: (userId) => access?.userForServer(entry.id, userId),
       grantAccount: (accountId, input) =>
         access.grantServer(entry.id, accountId, input),
+      shareAccess: (input, req) =>
+        access.share(
+          {
+            ...input,
+            grants: [{ serverId: entry.id, permissions: input.permissions }],
+          },
+          req,
+        ),
       createLegacyUser: (email, create) =>
         access.withLegacyIdentity(email, create),
-      inviteAccount: (accountId) => access.inviteAccount(accountId),
+      inviteAccount: (accountId, input) =>
+        access.inviteAccount(accountId, input),
       subusersForDisplay: (users) =>
         access
           ? [
@@ -4870,6 +5581,11 @@ export async function createFleet(options = {}) {
       scheduler: options.scheduler,
       spawnServer: options.spawnServer,
       spawnProcess: options.spawnProcess,
+      profileFetch: options.profileFetch,
+      probeServerPort: options.probeServerPort,
+      javaProbe: options.javaProbe,
+      processIdentity: options.processIdentity,
+      onUnexpectedExit: options.onUnexpectedExit,
       createWindowsProcessTree: options.createWindowsProcessTree,
       stopTimeoutMs: options.stopTimeoutMs,
       forceStopTimeoutMs: options.forceStopTimeoutMs,
@@ -4877,6 +5593,39 @@ export async function createFleet(options = {}) {
       telemetry,
       publicAddress,
       startupMetadataTtlMs: options.startupMetadataTtlMs,
+      catalogDataDir: dataDir,
+      startMemoryWarning: (requested) => {
+        const active = [...runtimes]
+          .filter(
+            ([id, runtime]) =>
+              id !== entry.id &&
+              ["running", "starting"].includes(runtime.descriptor().status),
+          )
+          .map(([, runtime]) => runtime.descriptor());
+        const known = active.reduce(
+          (sum, current) => sum + (current.configuredMemoryLimitMB ?? 0),
+          requested ?? 0,
+        );
+        const unknown =
+          active.some((current) => current.configuredMemoryLimitMB == null) ||
+          requested == null;
+        const overBudget =
+          known * 1.15 > Math.floor(totalmem() / 1024 ** 2) - 2048;
+        return (
+          [
+            overBudget
+              ? "Configured memory plus estimated Java overhead leaves less than 2 GB for the host. Reduce allocations if the computer becomes unresponsive."
+              : "",
+            unknown
+              ? "Some script or executable memory limits are unknown; their actual memory use is additional."
+              : "",
+          ]
+            .filter(Boolean)
+            .join(" ") || null
+        );
+      },
+      checkServerPorts: (properties, port) =>
+        checkServerPorts(properties, port, entry.id),
       versionsService: options.versionsService,
       versionsOptions: options.versionsOptions,
       catalogFetch: options.catalogFetch,
@@ -4927,7 +5676,7 @@ export async function createFleet(options = {}) {
       },
       persistMinecraftConfiguration: (next) =>
         serialize(async () => {
-          checkPort(next.port, entry.id);
+          await checkPort(next.port, entry.id);
           const { status: _status, ...saved } = next;
           await persist({
             ...registry,
@@ -4961,15 +5710,71 @@ export async function createFleet(options = {}) {
       return runtime;
     }
   };
+  const runtimeRecoveries = new Map();
+  const recoveryAttempts = new Map();
   const resolveRuntime = async (id) => {
-    const runtime = runtimes.get(id);
-    if (!runtime?.unavailable) return runtime;
-    return serialize(async () => {
-      const current = runtimes.get(id);
-      if (!current?.unavailable) return current;
-      const entry = registry.servers.find((item) => item.id === id);
-      return entry ? makeRuntime(entry, true, true) : undefined;
-    });
+    const current = runtimes.get(id);
+    if (!current?.unavailable) return current;
+    if (runtimeRecoveries.has(id)) return runtimeRecoveries.get(id);
+    const entry = registry.servers.find((item) => item.id === id);
+    if (!entry) return undefined;
+    // A cheap filesystem probe bypasses backoff when a drive, folder, or
+    // configured launch dependency returns. Unchanged failed runtimes still
+    // avoid expensive reconstruction on every concurrent polling request.
+    const probePaths = [
+      entry.serverDir,
+      entry.jar,
+      entry.launchScript,
+      ...(entry.launchArgs ?? [])
+        .filter((arg) => typeof arg === "string" && arg.startsWith("@"))
+        .map((arg) => arg.slice(1)),
+    ]
+      .filter(Boolean)
+      .map((file) =>
+        path.isAbsolute(file) ? file : path.join(entry.serverDir, file),
+      );
+    const probe = JSON.stringify(
+      await Promise.all(
+        probePaths.map(async (file) => {
+          try {
+            const stat = await fs.lstat(file);
+            return [file, stat.dev, stat.ino, stat.mtimeMs, stat.size];
+          } catch (cause) {
+            return [file, cause.code];
+          }
+        }),
+      ),
+    );
+    if (runtimeRecoveries.has(id)) return runtimeRecoveries.get(id);
+    if (runtimes.get(id) !== current) return runtimes.get(id);
+    const attempt = recoveryAttempts.get(id);
+    if (attempt?.probe === probe && Date.now() - attempt.at < 5000)
+      return current;
+    recoveryAttempts.set(id, { at: Date.now(), probe });
+    const fingerprint = JSON.stringify(entry);
+    const pending = (async () => {
+      let repaired;
+      try {
+        repaired = await makeAvailableRuntime({ ...entry }, true, false, true);
+      } catch {
+        return current;
+      }
+      return serialize(async () => {
+        if (
+          closed ||
+          runtimes.get(id) !== current ||
+          JSON.stringify(registry.servers.find((item) => item.id === id)) !==
+            fingerprint
+        ) {
+          await repaired.close();
+          return runtimes.get(id);
+        }
+        runtimes.set(id, repaired);
+        return repaired;
+      });
+    })().finally(() => runtimeRecoveries.delete(id));
+    runtimeRecoveries.set(id, pending);
+    return pending;
   };
   if (await exists(registryPath)) {
     registry = JSON.parse(await fs.readFile(registryPath, "utf8"));
@@ -5138,6 +5943,27 @@ export async function createFleet(options = {}) {
     await persist();
   }
   try {
+    const legacyCatalogs = await Promise.all(
+      [
+        path.join(dataDir, "setup-catalog-settings.json"),
+        ...registry.servers.map((entry) =>
+          path.join(entry.dataDir, "catalog-settings.json"),
+        ),
+      ].map(async (file) => ({
+        file,
+        modified: await fs.stat(file).then(
+          (stat) => stat.mtimeMs,
+          () => 0,
+        ),
+      })),
+    );
+    await catalogSettings(
+      dataDir,
+      safePath,
+      legacyCatalogs
+        .sort((a, b) => b.modified - a.modified)
+        .map((item) => item.file),
+    ).get();
     for (const entry of registry.servers) await makeRuntime(entry, true);
   } catch (cause) {
     await Promise.all([...runtimes.values()].map((runtime) => runtime.close()));
@@ -5164,6 +5990,12 @@ export async function createFleet(options = {}) {
       dataDir,
       canIssueInvitations: () => remote?.status().ready === true,
       listServerIds: () => registry.servers.map((entry) => entry.id),
+      listServers: () =>
+        registry.servers.map((entry) => ({
+          id: entry.id,
+          name: runtimes.get(entry.id)?.descriptor().name ?? entry.name,
+          available: !runtimes.get(entry.id)?.unavailable,
+        })),
       listLegacyUsers: () =>
         [...runtimes].flatMap(([serverId, runtime]) =>
           (runtime.subusers?.() ?? []).map((user) => ({ serverId, user })),
@@ -5328,6 +6160,56 @@ export async function createFleet(options = {}) {
       return "The change was saved, but its audit history could not be saved.";
     }
   };
+  app.get("/api/access/people", async (_req, res) =>
+    res.json(await access.people()),
+  );
+  app.post("/api/access/share", async (req, res) => {
+    const result = await access.share(req.body ?? {});
+    const warnings = [];
+    for (const server of result.servers ?? []) {
+      const runtime = runtimes.get(
+        typeof server === "string" ? server : server.id,
+      );
+      if (runtime?.audit)
+        await runtime
+          .audit("user", "Server access granted", result.user?.email ?? "")
+          .catch(() =>
+            warnings.push(
+              "Access was saved, but an activity entry could not be recorded.",
+            ),
+          );
+    }
+    res.status(201).json({
+      ...result,
+      ...(warnings.length ? { warning: [...new Set(warnings)].join(" ") } : {}),
+    });
+  });
+  app.post("/api/access/sign-out-all", async (_req, res) => {
+    await access.signOutAll();
+    const warning = await accountAudit(
+      "All remote sessions signed out",
+      "Saved accounts and server grants were retained.",
+    );
+    res.json({ ok: true, ...(warning ? { warning } : {}) });
+  });
+  app.post("/api/panel-users/:id/revoke-invitation", async (req, res) => {
+    await access.revokeInvitation(req.params.id);
+    const warning = await accountAudit(
+      "Invitation revoked",
+      access.account(req.params.id)?.email ?? "",
+    );
+    res.json({ ok: true, ...(warning ? { warning } : {}) });
+  });
+  app.post("/api/panel-users/:id/access-review/dismiss", async (req, res) =>
+    res.json(await access.dismissAccessReview(req.params.id)),
+  );
+  app.delete("/api/panel-users/:id/servers/:serverId", async (req, res) => {
+    await access.revoke(req.params.serverId, req.params.id);
+    res.json({ ok: true });
+  });
+  app.patch("/api/access/panel", async (req, res) =>
+    res.json(await access.renamePanel(req.body?.name)),
+  );
   app.post("/api/panel-users", async (req, res) => {
     const user = await access.createAccount(req.body ?? {});
     const warning = await accountAudit("Panel account created", user.email);
@@ -5351,7 +6233,10 @@ export async function createFleet(options = {}) {
     res.json({ ok: true, ...(warning ? { warning } : {}) });
   });
   app.post("/api/panel-users/:id/invite", async (req, res) => {
-    const invitation = await access.inviteAccount(req.params.id);
+    const invitation = await access.inviteAccount(
+      req.params.id,
+      req.body ?? {},
+    );
     const warning = await accountAudit(
       "Panel invitation link created",
       invitation.account.email,
@@ -5427,12 +6312,38 @@ export async function createFleet(options = {}) {
   app.get("/api/server-recovery", async (_req, res) =>
     res.json(await recovery.list()),
   );
+  const recoveryGrants = (id) =>
+    access
+      .listAccounts()
+      .filter(
+        (account) =>
+          account.serverIds?.includes(id) &&
+          !account.excludedServerIds?.includes(id),
+      )
+      .map(({ id, email }) => ({ id, email }));
   app.get("/api/server-recovery/:id", async (req, res) =>
-    res.json(await recovery.inspect(req.params.id)),
+    res.json({
+      ...(await recovery.inspect(req.params.id)),
+      accessGrants: recoveryGrants(req.params.id),
+    }),
   );
   app.post("/api/server-recovery/:id", async (req, res) => {
     const server = await serialize(async () => {
-      const { confirmed, revision, ...input } = req.body ?? {};
+      const {
+        confirmed,
+        revision,
+        restoreGrants = [],
+        ...input
+      } = req.body ?? {};
+      if (
+        !Array.isArray(restoreGrants) ||
+        restoreGrants.length > 1000 ||
+        restoreGrants.some((id) => typeof id !== "string")
+      )
+        throw error(
+          400,
+          "Choose the accounts whose access should be restored.",
+        );
       if (confirmed !== true || typeof revision !== "string")
         throw error(
           400,
@@ -5455,7 +6366,7 @@ export async function createFleet(options = {}) {
         },
         true,
       );
-      checkPort(config.port);
+      await checkPort(config.port);
       if (config.launchType === "jar" && !inspected.jars.includes(config.jar))
         throw error(409, "Choose a server JAR from the reviewed folder.");
       const startup = await validateStartupFiles(inspected.serverDir, config);
@@ -5476,13 +6387,18 @@ export async function createFleet(options = {}) {
         version: startup.version ?? "Configured JAR",
         software: startup.software ?? "Java",
       };
-      const runtime = await makeRuntime(entry, false, true);
+      const runtime = await makeAvailableRuntime(entry, true, false);
       try {
+        const grants = recoveryGrants(entry.id);
+        for (const user of [...grants, ...(runtime.subusers?.() ?? [])])
+          if (!restoreGrants.includes(user.id))
+            await access.revoke(entry.id, user.id);
         await persist({
           ...registry,
           defaultServerId: registry.defaultServerId ?? entry.id,
           servers: [...registry.servers, entry],
         });
+        runtimes.set(entry.id, runtime);
       } catch (cause) {
         runtimes.delete(entry.id);
         await runtime.close();
@@ -5507,6 +6423,7 @@ export async function createFleet(options = {}) {
       const input = req.body;
       const allowed = new Set([
         "requestId",
+        "acceptedEula",
         "directory",
         "name",
         "jar",
@@ -5516,6 +6433,7 @@ export async function createFleet(options = {}) {
         "launchExecutable",
         "javaPath",
         "memoryLimitMB",
+        "restartOnCrash",
         "port",
       ]);
       if (
@@ -5528,6 +6446,11 @@ export async function createFleet(options = {}) {
           400,
           "Provide the folder, server name, launch method, Java executable, memory, and port.",
         );
+      if (
+        input.acceptedEula !== undefined &&
+        typeof input.acceptedEula !== "boolean"
+      )
+        throw error(400, "Choose whether to accept the Minecraft EULA.");
       const requestId = input.requestId;
       if (
         (authority || requestId !== undefined) &&
@@ -5617,7 +6540,7 @@ export async function createFleet(options = {}) {
           JSON.stringify(candidate.launchArgs ?? []) ===
             JSON.stringify(config.launchArgs),
       );
-      checkPort(config.port);
+      await checkPort(config.port);
       const id = randomUUID();
       const instanceDir = await safePath(dataDir, `instances/${id}`);
       const entry = {
@@ -5659,12 +6582,28 @@ export async function createFleet(options = {}) {
         await runtime.close();
         throw cause;
       }
+      if (input.acceptedEula === true) {
+        const target = await containedSourcePath(
+          inspected.directory,
+          "eula.txt",
+        );
+        const current = await fs.readFile(target, "utf8").catch((cause) => {
+          if (cause.code === "ENOENT") return "";
+          throw cause;
+        });
+        await fs.writeFile(
+          target,
+          updateProperties(current, new Map([["eula", "true"]]), {
+            appendMissing: true,
+          }),
+        );
+      }
       const server = await finishCreatorAccess(entry, req, authority);
       await runtime
         .audit(
           "server",
           "Existing server imported",
-          `Existing folder linked in place: ${inspected.directory}. No source files were changed and the server was not started.`,
+          `Existing folder linked in place: ${inspected.directory}. ${input.acceptedEula === true ? "EULA acceptance was saved; " : "No source files were changed; "}the server was not started.`,
         )
         .catch((cause) =>
           console.error("Import audit could not be saved:", cause),
@@ -5690,6 +6629,28 @@ export async function createFleet(options = {}) {
     safePath,
     audit: panelAudit,
     inspectInstallationDirectory: inspectInstallation,
+    checkPort,
+    runningAllocatedMemoryMB: () =>
+      [...runtimes.values()].reduce((sum, runtime) => {
+        const current = runtime.descriptor();
+        return (
+          sum +
+          (["running", "starting"].includes(current.status)
+            ? (current.memoryLimitMB ?? 0)
+            : 0)
+        );
+      }, 0),
+    suggestedPort: async () => {
+      for (let port = 25565; port <= 65535; port++) {
+        try {
+          await checkPort(port);
+          return port;
+        } catch (cause) {
+          if (cause.status !== 409) throw cause;
+        }
+      }
+      throw error(409, "No available game port was found.");
+    },
     javaPath:
       options.javaPath ??
       env.JAVA_PATH ??
@@ -5767,7 +6728,7 @@ export async function createFleet(options = {}) {
         }
       }
       if (authority) access.assertCreationCapacity(authority.email);
-      checkPort(config.port);
+      await checkPort(config.port);
       const id = randomUUID();
       const installation =
         installationDirectory === undefined
@@ -5802,26 +6763,24 @@ export async function createFleet(options = {}) {
             "The instances storage directory overlaps an existing server. Choose a panel data directory outside your server files.",
           );
       }
-      if (installation)
-        await prepareInstallationDirectory(
-          instanceDir,
-          await installationOptions(),
-        );
-      else await fs.mkdir(instanceDir, { recursive: true });
-      const serverDir = installation
-        ? (
+      const createdDirectories = [];
+      let serverDir, initialFiles, runtime;
+      try {
+        createdDirectories.push(...(await createOwnedDirectories(instanceDir)));
+        if (installation) {
+          serverDir = (
             await prepareInstallationDirectory(installation.directory, {
               forbiddenDirectories: [
                 ...(await installationOptions()).forbiddenDirectories,
                 instanceDir,
               ],
             })
-          ).directory
-        : await safePath(instanceDir, "server");
-      if (!installation) await fs.mkdir(serverDir);
-      const initialFiles = await installationFileTransaction(serverDir);
-      let runtime;
-      try {
+          ).directory;
+        } else {
+          serverDir = await safePath(instanceDir, "server");
+          createdDirectories.push(...(await createOwnedDirectories(serverDir)));
+        }
+        initialFiles = await installationFileTransaction(serverDir);
         // EULA acceptance is only written after an explicit guided-review choice.
         await initialFiles.write(
           "eula.txt",
@@ -5855,7 +6814,11 @@ export async function createFleet(options = {}) {
             ? { setupRequestId: requestId, setupFingerprint: fingerprint }
             : {}),
         };
-        if (requestId) await setup.copySettings(instanceDir);
+        await fs.writeFile(
+          await safePath(instanceDir, "server-name.txt"),
+          `${config.name}\nServer files: ${serverDir}\n`,
+          { flag: "wx" },
+        );
         runtime = await makeRuntime(entry);
         await persist({
           ...registry,
@@ -5865,7 +6828,14 @@ export async function createFleet(options = {}) {
       } catch (cause) {
         runtimes.delete(id);
         await runtime?.close();
-        await initialFiles.rollback().catch(() => {});
+        await initialFiles?.rollback().catch(() => {});
+        await fs
+          .rm(await safePath(instanceDir, "server-name.txt"), { force: true })
+          .catch(() => {});
+        await removeOwnedEmptyDirectories(
+          createdDirectories,
+          installation ? [installation.directory] : [],
+        ).catch(() => {});
         throw cause;
       }
       const createdEntry = registry.servers.find((entry) => entry.id === id);
@@ -5966,6 +6936,24 @@ export async function createFleet(options = {}) {
         throw error(400, "Provide server settings.");
       const { settingsRevision: expectedRevision, ...changes } = input;
       if (
+        principal &&
+        (Object.hasOwn(changes, "software") ||
+          Object.hasOwn(changes, "minecraftVersion"))
+      )
+        throw error(
+          403,
+          "Only the host owner can set fallback runtime identification.",
+        );
+      if (
+        (Object.hasOwn(changes, "software") ||
+          Object.hasOwn(changes, "minecraftVersion")) &&
+        runtimes.get(id)?.descriptor().status !== "offline"
+      )
+        throw error(
+          409,
+          "Stop this server before changing its runtime identification.",
+        );
+      if (
         expectedRevision !== undefined &&
         expectedRevision !== descriptor(entry).settingsRevision
       )
@@ -5978,7 +6966,7 @@ export async function createFleet(options = {}) {
         onlyConfig(entry),
         entry.storage === "external",
       );
-      checkPort(config.port, entry.id);
+      await checkPort(config.port, entry.id);
       const next = { ...entry, ...config };
       if (config.port !== entry.port) next.address = `localhost:${config.port}`;
       if (
@@ -6119,6 +7107,7 @@ export async function createFleet(options = {}) {
     const status = cause.status ?? (cause.code === "ENOENT" ? 404 : 500);
     if (status >= 500 && status !== 503) console.error(cause);
     res.status(status).json({
+      ...(status < 500 ? publicErrorDetails(cause) : {}),
       error:
         status >= 500 && status !== 503
           ? "The operation failed. Check the API terminal for details."
@@ -6133,18 +7122,42 @@ export async function createFleet(options = {}) {
     runtimes,
     remoteApp,
     access,
+    emergencyRelease: () =>
+      Promise.allSettled(
+        [...runtimes.values()].map((runtime) => runtime.emergencyRelease?.()),
+      ),
     tick: async (now) =>
       Promise.all([...runtimes.values()].map((runtime) => runtime.tick(now))),
     close: async (closeOptions = {}) => {
       closed = true;
       try {
-        await remote.close();
-        await setup.close();
         await changeChain.catch(() => {});
-        await Promise.all(
-          [...runtimes.values()].map((runtime) => runtime.close(closeOptions)),
+        const tasks = [
+          ["Remote access", () => remote.close()],
+          ["Server setup", () => setup.close()],
+          ...[...runtimes.values()].map((runtime) => [
+            runtime.descriptor().name,
+            () => runtime.close(closeOptions),
+          ]),
+          ["Accounts", () => access.close()],
+        ];
+        const results = await Promise.allSettled(
+          tasks.map(([, work]) => Promise.resolve().then(work)),
         );
-        await access.close();
+        const failures = results.flatMap((result, index) =>
+          result.status === "rejected"
+            ? [
+                new Error(`${tasks[index][0]}: ${result.reason.message}`, {
+                  cause: result.reason,
+                }),
+              ]
+            : [],
+        );
+        if (failures.length)
+          throw new AggregateError(
+            failures,
+            failures.map((cause) => cause.message).join("\n"),
+          );
         // Mutations already report audit persistence failures. They must not
         // turn a completed server shutdown into a permanently failed quit.
         await panelAuditChain.catch((cause) => {

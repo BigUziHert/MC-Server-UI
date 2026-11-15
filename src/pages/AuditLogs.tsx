@@ -159,7 +159,7 @@ export default function AuditLogs({
     <div className="management-page">
       <div className="page-heading management-heading">
         <div>
-          <h1>Audit logs</h1>
+          <h1>Audit Logs</h1>
         </div>
       </div>
 
@@ -266,7 +266,7 @@ export default function AuditLogs({
         )}
         {loading ? (
           <StatePanel variant="loading" title="Loading server activity…" />
-        ) : filtered.length === 0 ? (
+        ) : error && filtered.length === 0 ? null : filtered.length === 0 ? (
           <StatePanel
             variant="empty"
             icon={hasFilters ? <Search size={27} /> : <Activity size={27} />}

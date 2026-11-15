@@ -52,6 +52,7 @@ async function fixture(t) {
     assert.ok(path.basename(root).startsWith("mc-installed-meta-"));
     await fs.rm(root, { recursive: true, force: true });
   });
+
   return {
     root,
     read: (configuration, detected = {}) =>
@@ -218,4 +219,99 @@ test("oversized metadata and unsupported launchers cannot supply inferred releas
       }),
       {},
     );
+});
+
+for (const [software, main, extra] of [
+  [
+    "Paper",
+    "io.papermc.paperclip.Main",
+    [["patch.properties", "version=1.21.1"]],
+  ],
+  [
+    "Vanilla",
+    "net.minecraft.bundler.Main",
+    [["version.json", JSON.stringify({ id: "1.21.1" })]],
+  ],
+])
+  test(`renamed ${software} JARs identify their loader and Minecraft from archive metadata`, async (t) => {
+    const f = await fixture(t);
+    await fs.writeFile(
+      path.join(f.root, "renamed-runtime.jar"),
+      zip([
+        [
+          "META-INF/MANIFEST.MF",
+          `Manifest-Version: 1.0\nMain-Class: ${main}\n`,
+        ],
+        ...extra,
+      ]),
+    );
+    assert.deepEqual(
+      await f.read({
+        launchType: "jar",
+        jar: "renamed-runtime.jar",
+        software: "Java",
+      }),
+      { software, version: "1.21.1", gameVersion: "1.21.1" },
+    );
+  });
+
+for (const software of ["Paper", "Purpur", "Folia"])
+  test(`shared Paperclip launcher identifies ${software} from its bundled server entry`, async (t) => {
+    const f = await fixture(t);
+    await fs.writeFile(
+      path.join(f.root, "renamed.jar"),
+      zip([
+        [
+          "META-INF/MANIFEST.MF",
+          "Manifest-Version: 1.0\nMain-Class: io.papermc.paperclip.Main\n",
+        ],
+        [
+          "META-INF/versions.list",
+          `${"a".repeat(64)}\t1.21.1\t1.21.1/${software.toLowerCase()}-1.21.1.jar\n`,
+        ],
+      ]),
+    );
+    assert.deepEqual(await f.read({ launchType: "jar", jar: "renamed.jar" }), {
+      software,
+      version: "1.21.1",
+      gameVersion: "1.21.1",
+    });
+  });
+
+test("legacy Forge identifies Minecraft from its manifest classpath and loader version from the Forge package section", async (t) => {
+  const f = await fixture(t);
+  await fs.writeFile(
+    path.join(f.root, "renamed.jar"),
+    zip([
+      [
+        "META-INF/MANIFEST.MF",
+        "Manifest-Version: 1.0\r\nMain-Class: net.minecraftforge.fml.relauncher.ServerLaunchWrapper\r\nClass-Path: libraries/first.jar minecraft_server.1.12.\r\n 2.jar\r\n\r\nName: net/minecraftforge/common/\r\nSpecification-Title: Forge\r\nImplementation-Version: 14.23.5.2860\r\n\r\nName: unrelated/package/\r\nImplementation-Version: 9.9.9\r\nImplementation-Title: Fabric\r\n",
+      ],
+    ]),
+  );
+  assert.deepEqual(await f.read({ launchType: "jar", jar: "renamed.jar" }), {
+    software: "Forge",
+    version: "14.23.5.2860",
+    gameVersion: "1.12.2",
+  });
+});
+
+test("conflicting bundled and manifest Minecraft releases are not selected automatically", async (t) => {
+  const f = await fixture(t);
+  await fs.writeFile(
+    path.join(f.root, "renamed.jar"),
+    zip([
+      [
+        "META-INF/MANIFEST.MF",
+        "Manifest-Version: 1.0\nMain-Class: io.papermc.paperclip.Main\nMinecraft-Version: 1.20.1\n",
+      ],
+      [
+        "META-INF/versions.list",
+        `${"a".repeat(64)}\t1.21.1\t1.21.1/folia-1.21.1.jar\n`,
+      ],
+    ]),
+  );
+  assert.deepEqual(await f.read({ launchType: "jar", jar: "renamed.jar" }), {
+    software: "Folia",
+  });
 });

@@ -13,7 +13,7 @@
   flex: 0 1 auto;
 }
 .recycle-bin-entry-content .file-name > svg:first-child {
-  color: var(--accent, #ffd000);
+  color: var(--accent, var(--accent));
 }
 .recycle-bin-entry-note {
   margin-left: auto;
@@ -44,7 +44,7 @@
 .recycle-bin-notice > svg {
   flex-shrink: 0;
   margin-top: 2px;
-  color: var(--accent, #ffd000);
+  color: var(--accent, var(--accent));
 }
 .recycle-bin-notice p {
   margin: 0;
@@ -187,7 +187,7 @@
 .recycle-action-progress progress {
   width: 100%;
   margin-top: 10px;
-  accent-color: var(--accent, #ffd000);
+  accent-color: var(--accent, var(--accent));
 }
 .recycle-action-progress-actions {
   display: flex;

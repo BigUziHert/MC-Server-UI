@@ -1607,7 +1607,7 @@ test("Minecraft heads use UUIDs or usernames and Players polling updates joins a
   await expect(page.locator(".online-players")).toHaveCount(0);
   await openPage(page, "players", "Players");
   const onlineRoster = page.getByRole("region", {
-    name: "Online Players",
+    name: "Online players",
     exact: true,
   });
   const playerRows = onlineRoster.getByRole("listitem");
@@ -1680,7 +1680,7 @@ test("failed skin requests use local Minecraft heads and changing a player ident
   );
   await page.goto("/#players");
   const onlineRoster = page.getByRole("region", {
-    name: "Online Players",
+    name: "Online players",
     exact: true,
   });
   let fallback = onlineRoster.getByRole("img", {
@@ -1699,7 +1699,7 @@ test("failed skin requests use local Minecraft heads and changing a player ident
   expect(failedRequests).toHaveLength(1);
   await expect(
     onlineRoster.getByRole("listitem", {
-      name: "Online Players OfflineSkin",
+      name: "Online players OfflineSkin",
       exact: true,
     }),
   ).toBeVisible();
@@ -2513,7 +2513,7 @@ test("detects NeoForge with joined nogui%* and preserves its script, JVM argumen
     await expect(dialog.getByLabel("Server JAR", { exact: true })).toHaveCount(
       0,
     );
-    await expect(dialog.getByLabel("Memory (MB)", { exact: true })).toHaveCount(
+    await expect(dialog.getByLabel("Memory (GB)", { exact: true })).toHaveCount(
       0,
     );
     await expect(
@@ -2576,7 +2576,7 @@ test("detects NeoForge with joined nogui%* and preserves its script, JVM argumen
     await expect(dialog.getByLabel("Server JAR", { exact: true })).toHaveCount(
       0,
     );
-    await expect(dialog.getByLabel("Memory (MB)", { exact: true })).toHaveCount(
+    await expect(dialog.getByLabel("Memory (GB)", { exact: true })).toHaveCount(
       0,
     );
     await dialog
@@ -2693,7 +2693,7 @@ test("imports a custom startup script without requiring a JAR or executing its c
     await expect(dialog.getByLabel("Server JAR", { exact: true })).toHaveCount(
       0,
     );
-    await expect(dialog.getByLabel("Memory (MB)", { exact: true })).toHaveCount(
+    await expect(dialog.getByLabel("Memory (GB)", { exact: true })).toHaveCount(
       0,
     );
     await dialog.getByText("Advanced settings", { exact: true }).click();

@@ -44,6 +44,7 @@ async function fixture(t, mode = "live", fleet = false) {
     useEnvironment: false,
     telemetry: { reset() {}, sample: async () => ({ available: false }) },
     publicAddress: { resolve: async () => null },
+    profileFetch: async () => new Response(null, { status: 404 }),
     spawnServer: () => {
       child = new EventEmitter();
       child.pid = 12345;

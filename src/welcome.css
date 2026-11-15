@@ -85,12 +85,12 @@
 }
 
 .fleet-welcome-choice:hover {
-  border-color: #ffd000;
+  border-color: var(--accent);
   background: #272833;
 }
 
 .fleet-welcome-choice:focus-visible {
-  outline: 2px solid #ffd000;
+  outline: 2px solid var(--accent);
   outline-offset: 4px;
 }
 
@@ -102,7 +102,7 @@
   flex-shrink: 0;
   border-radius: 10px;
   background: #303140;
-  color: #ffd000;
+  color: var(--accent);
 }
 
 .fleet-welcome-choice > span:nth-child(2) {

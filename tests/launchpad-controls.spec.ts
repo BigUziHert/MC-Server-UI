@@ -371,7 +371,7 @@ test("installed column headers reverse sorting while updates stay first across p
     sort.locator(
       'option[value="active"], option[value="added"], option[value="modified"], option[value="size"]',
     ),
-  ).toHaveCount(0);
+  ).toHaveCount(3);
   await expect(sort).toHaveValue("name");
   const headers = page.getByRole("group", {
     name: "Sort installed content columns",
@@ -489,9 +489,9 @@ test("installed column headers reverse sorting while updates stay first across p
     "Echo",
   ]);
   await active.click();
-  await expect(sort).toHaveValue("");
-  await expect(sort.locator("option:checked")).toHaveText("Column order");
-  await expect(sort.locator("option:checked")).toBeDisabled();
+  await expect(sort).toHaveValue("active");
+  await expect(sort.locator("option:checked")).toHaveText("Active");
+  await expect(sort.locator("option:checked")).toBeEnabled();
   await expect(active).toHaveAttribute(
     "aria-description",
     "Descending. Updates always appear first.",
@@ -520,8 +520,8 @@ test("installed column headers reverse sorting while updates stay first across p
     "Delta",
   ]);
   await added.click();
-  await expect(sort).toHaveValue("");
-  await expect(sort.locator("option:checked")).toHaveText("Column order");
+  await expect(sort).toHaveValue("added");
+  await expect(sort.locator("option:checked")).toHaveText("Date added");
   await expect(added).toHaveAttribute(
     "aria-description",
     "Descending. Updates always appear first.",
@@ -596,11 +596,8 @@ test("installed column headers reverse sorting while updates stay first across p
     path: testInfo.outputPath("installed-columns-mobile.png"),
     fullPage: true,
   });
-  await added.click();
-  await expect(added).toHaveAttribute(
-    "aria-description",
-    "Descending. Updates always appear first.",
-  );
+  await sort.selectOption("added");
+  await expect(sort).toHaveValue("added");
   await expect(names).toHaveText([
     "Cedar",
     "Zulu",
@@ -707,10 +704,7 @@ test("Modrinth shows only supported catalog sorts, headers and category children
   const header = page.getByRole("group", {
     name: "Sort catalog content columns",
   });
-  await expect(header.getByRole("button")).toHaveText([
-    "Date added",
-    "Date modified",
-  ]);
+  await expect(header.getByRole("button")).toHaveText(["Published", "Updated"]);
   await expect(
     header.getByRole("button", { name: "Sort by Name", exact: true }),
   ).toHaveCount(0);
@@ -727,14 +721,14 @@ test("Modrinth shows only supported catalog sorts, headers and category children
     .poll(() => searches.at(-1)?.searchParams.get("offset"))
     .toBe("10");
   await header
-    .getByRole("button", { name: "Sort by Date added", exact: true })
+    .getByRole("button", { name: "Sort by Published", exact: true })
     .click();
   await expect
     .poll(() => Object.fromEntries(searches.at(-1)?.searchParams ?? []))
     .toMatchObject({ sort: "newest", offset: "0" });
   await expect(sort).toHaveValue("newest");
   await header
-    .getByRole("button", { name: "Sort by Date modified", exact: true })
+    .getByRole("button", { name: "Sort by Updated", exact: true })
     .click();
   await expect
     .poll(() => searches.at(-1)?.searchParams.get("sort"))
@@ -842,8 +836,8 @@ test("catalog and installed rows share columns with compact headers and update v
   await expect(header.getByRole("button")).toHaveText([
     "Name",
     "Author",
-    "Date added",
-    "Date modified",
+    "Published",
+    "Updated",
   ]);
   await expect(
     row.getByRole("switch", { name: "Active: Alpha", exact: true }),

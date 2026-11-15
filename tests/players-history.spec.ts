@@ -662,11 +662,11 @@ test("four compact rosters expose online actions and fit desktop and mobile layo
   await page.setViewportSize({ width: 1823, height: 1216 });
   await open(page, server.id);
   const online = page.getByRole("region", {
-    name: "Online Players",
+    name: "Online players",
     exact: true,
   });
   const banList = page.getByRole("region", {
-    name: "Banned Players",
+    name: "Banned players",
     exact: true,
   });
   const ops = page.getByRole("region", { name: "Operators", exact: true });
@@ -896,8 +896,8 @@ test("live whitelist requests wait for readback and unavailable settings disable
 });
 
 const pagedLists = [
-  "Online Players",
-  "Banned Players",
+  "Online players",
+  "Banned players",
   "Operators",
   "Whitelist",
   "Player history",
@@ -1016,7 +1016,7 @@ test("all five player lists page independently, remember row counts, and reset s
   }
   await page
     .getByRole("combobox", {
-      name: "Online Players rows per page",
+      name: "Online players rows per page",
       exact: true,
     })
     .selectOption("10");
@@ -1025,7 +1025,7 @@ test("all five player lists page independently, remember row counts, and reset s
     .selectOption("25");
   await expect(
     page
-      .getByRole("region", { name: "Online Players", exact: true })
+      .getByRole("region", { name: "Online players", exact: true })
       .getByRole("listitem"),
   ).toHaveCount(10);
   await expect(
@@ -1036,7 +1036,7 @@ test("all five player lists page independently, remember row counts, and reset s
   await page.reload();
   for (const title of pagedLists) {
     const selected =
-      title === "Online Players" ? "10" : title === "Whitelist" ? "25" : "5";
+      title === "Online players" ? "10" : title === "Whitelist" ? "25" : "5";
     await expect(
       page.getByRole("combobox", {
         name: `${title} rows per page`,

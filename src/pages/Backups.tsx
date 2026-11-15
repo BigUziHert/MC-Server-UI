@@ -32,6 +32,7 @@ import "./storage-dialog.css";
 import RefreshButton from "../RefreshButton";
 import StatePanel from "../StatePanel";
 import Switch from "../Switch";
+import Pagination, { usePageSize } from "../Pagination";
 import DownloadButton from "../DownloadButton";
 import BackupLocation, { type BackupLocationState } from "../BackupLocation";
 
@@ -45,6 +46,7 @@ type Backup = {
   compression?: "gzip";
   compressionLevel?: number;
   originalSize?: number;
+  hasRuntimeSnapshot?: boolean;
 };
 type Schedule = {
   revision?: string;
@@ -255,12 +257,16 @@ const scheduleFields = [
 ] as const;
 const sameSchedule = (left: Schedule, right: Schedule) =>
   scheduleFields.every((key) => left[key] === right[key]);
-const fullDate = (date: string) =>
+const fullDate = (date: string, timezone?: string) =>
   new Date(date).toLocaleString(undefined, {
+    year: "numeric",
     month: "short",
     day: "numeric",
     hour: "numeric",
     minute: "2-digit",
+    ...(timezone && timezone !== "server time"
+      ? { timeZone: timezone, timeZoneName: "short" as const }
+      : {}),
   });
 
 export default function Backups({
@@ -279,8 +285,7 @@ export default function Backups({
     permissions === undefined || permissions.includes("backup.download");
   const canRestore =
     permissions === undefined || permissions.includes("backup.restore");
-  const canChangeLocation =
-    permissions === undefined || permissions.includes("backup.location");
+  const canChangeLocation = permissions === undefined;
   const { api, downloadUrl, scopeKey } = useServerApi();
   const [locationState, setLocationState] = useState<BackupLocationState>({
     moving: false,
@@ -296,10 +301,14 @@ export default function Backups({
       setLocationState({ moving: false, available: true });
   }, [canRead, canChangeLocation]);
   const [backups, setBackups] = useState<Backup[]>([]);
+  const [historyPage, setHistoryPage] = useState(1);
+  const [historySize, setHistorySize] = usePageSize("backups");
+  const [historySort, setHistorySort] = useState("newest");
   const [missingBackupIds, setMissingBackupIds] = useState<Set<string>>(
     new Set(),
   );
   const [schedule, setSchedule] = useState<Schedule>(defaults);
+  const [scheduleLoaded, setScheduleLoaded] = useState(false);
   const [savedSchedule, setSavedSchedule] = useState<Schedule>(defaults);
   const scheduleDraft = useRef(schedule);
   const scheduleBaseline = useRef<Schedule>(defaults);
@@ -322,6 +331,8 @@ export default function Backups({
     "create" | DeleteDialog | RestoreDialog | null
   >(null);
   const [restoreConfirmed, setRestoreConfirmed] = useState(false);
+  const [restoreConfiguration, setRestoreConfiguration] = useState(true);
+  const [restoreStatusError, setRestoreStatusError] = useState("");
   const [restoreServerStatus, setRestoreServerStatus] = useState<string | null>(
     null,
   );
@@ -415,6 +426,7 @@ export default function Backups({
           (current) => new Set([...current].filter((id) => available.has(id))),
         );
         setSavedSchedule(result.schedule);
+        setScheduleLoaded(true);
         setTimezone(result.timezone || "server time");
         if (
           initial ||
@@ -466,6 +478,7 @@ export default function Backups({
     setLocationState({ moving: false, available: true });
     dialogVersion.current++;
     setSchedule(defaults);
+    setScheduleLoaded(false);
     scheduleDraft.current = defaults;
     scheduleBaseline.current = defaults;
     setScheduleConflict(false);
@@ -624,13 +637,13 @@ export default function Backups({
   }, [dialog !== null]);
 
   function updateSchedule(patch: Partial<Schedule>) {
-    if (!canSchedule) return;
+    if (!canSchedule || !scheduleLoaded) return;
     setSaved(false);
     setSchedule((current) => ({ ...current, ...patch }));
   }
   async function saveSchedule(event: FormEvent) {
     event.preventDefault();
-    if (!canSchedule || saving || scheduleConflict) return;
+    if (!canSchedule || !scheduleLoaded || saving || scheduleConflict) return;
     const token = generation.current;
     loadSequence.current++;
     setSaving(true);
@@ -734,6 +747,9 @@ export default function Backups({
             body: JSON.stringify({
               confirm: true,
               requestId: restoreRequestId.current,
+              ...(permissions === undefined && dialog.restore.hasRuntimeSnapshot
+                ? { restoreConfiguration }
+                : {}),
             }),
           },
         );
@@ -833,25 +849,51 @@ export default function Backups({
 
   async function confirmRestore(backup: Backup) {
     if (!canRestore || busyRef.current || storageBlocked) return;
-    const token = generation.current;
-    const version = ++dialogVersion.current;
+    dialogVersion.current++;
     restoreRequestId.current = crypto.randomUUID();
     setDialogError("");
     setDeleteErrors([]);
     setRestoreConfirmed(false);
+    setRestoreConfiguration(true);
+    setRestoreStatusError("");
     setRestoreServerStatus(null);
     setDialog({ restore: backup });
-    try {
-      const server = await api<{ status: string }>("/server", {
-        signal: AbortSignal.timeout(10_000),
-      });
-      if (token === generation.current && version === dialogVersion.current)
-        setRestoreServerStatus(server.status);
-    } catch (failure) {
-      if (token === generation.current && version === dialogVersion.current)
-        setDialogError(messageOf(failure));
-    }
   }
+  const restoreId =
+    dialog && dialog !== "create" && "restore" in dialog
+      ? dialog.restore.id
+      : null;
+  useEffect(() => {
+    if (!restoreId || busy) return;
+    let active = true,
+      pending = false;
+    const check = async () => {
+      if (pending || document.visibilityState === "hidden") return;
+      pending = true;
+      try {
+        const result = await api<{ status: string }>("/server", {
+          signal: AbortSignal.timeout(10_000),
+        });
+        if (active) {
+          setRestoreServerStatus(result.status);
+          setRestoreStatusError("");
+        }
+      } catch (cause) {
+        if (active) {
+          setRestoreServerStatus(null);
+          setRestoreStatusError(messageOf(cause));
+        }
+      } finally {
+        pending = false;
+      }
+    };
+    void check();
+    const timer = setInterval(check, 3000);
+    return () => {
+      active = false;
+      clearInterval(timer);
+    };
+  }, [restoreId, api, busy]);
 
   const selectedBackups = backups.filter((backup) => selected.has(backup.id));
   const selectedMissingBackups = selectedBackups.filter((backup) =>
@@ -862,6 +904,22 @@ export default function Backups({
   const someSelected = selectedBackups.length > 0 && !allSelected;
 
   const totalSize = backups.reduce((sum, backup) => sum + backup.size, 0);
+  const sortedBackups = [...backups].sort((a, b) =>
+    historySort === "name"
+      ? a.name.localeCompare(b.name)
+      : historySort === "size"
+        ? b.size - a.size
+        : (historySort === "oldest" ? 1 : -1) *
+          (Date.parse(a.createdAt) - Date.parse(b.createdAt)),
+  );
+  const currentHistoryPage = Math.min(
+    historyPage,
+    Math.max(1, Math.ceil(backups.length / historySize)),
+  );
+  const historyRows = sortedBackups.slice(
+    (currentHistoryPage - 1) * historySize,
+    currentHistoryPage * historySize,
+  );
   const latest = [...backups].sort(
     (a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime(),
   )[0];
@@ -1046,7 +1104,25 @@ export default function Backups({
                   )}
                 </div>
               )}
-              {!backups.length ? (
+              {backups.length > 0 && (
+                <label className="form-field">
+                  Sort backups
+                  <select
+                    aria-label="Sort backups"
+                    value={historySort}
+                    onChange={(event) => {
+                      setHistorySort(event.target.value);
+                      setHistoryPage(1);
+                    }}
+                  >
+                    <option value="newest">Newest first</option>
+                    <option value="oldest">Oldest first</option>
+                    <option value="name">Name</option>
+                    <option value="size">Largest first</option>
+                  </select>
+                </label>
+              )}
+              {!backups.length && error ? null : !backups.length ? (
                 <StatePanel
                   variant="empty"
                   icon={<Archive size={29} />}
@@ -1065,156 +1141,159 @@ export default function Backups({
                 />
               ) : (
                 <div className="backup-list">
-                  {[...backups]
-                    .sort(
-                      (a, b) =>
-                        new Date(b.createdAt).getTime() -
-                        new Date(a.createdAt).getTime(),
-                    )
-                    .map((backup) => (
-                      <article
-                        className={`backup-item${selected.has(backup.id) ? " selected" : ""}`}
-                        key={backup.id}
-                      >
-                        <input
-                          type="checkbox"
-                          className="backup-checkbox"
-                          aria-label={`Select backup ${backup.name}`}
-                          checked={selected.has(backup.id)}
-                          disabled={!canDelete || busy || locationState.moving}
-                          onChange={(event) => {
-                            const checked = event.target.checked;
-                            setSelected((current) => {
-                              const next = new Set(current);
-                              if (checked) next.add(backup.id);
-                              else next.delete(backup.id);
-                              return next;
-                            });
-                          }}
-                        />
-                        <div className="backup-item-icon">
-                          <Archive size={20} />
-                        </div>
-                        <div className="backup-item-info">
-                          <h3 title={backup.name}>{backup.name}</h3>
-                          <p>
-                            <span>{fullDate(backup.createdAt)}</span>
-                            <span className="backup-meta-separator">·</span>
-                            <span>{formatBytes(backup.size)} compressed</span>
-                            <span className="backup-meta-separator">·</span>
-                            <span
-                              title={
-                                backup.compression === "gzip" &&
-                                backup.compressionLevel === 9
-                                  ? "Maximum gzip compression (level 9)"
-                                  : "Gzip compressed archive"
-                              }
-                            >
-                              .tar.gz
-                            </span>
-                            {typeof backup.originalSize === "number" &&
-                              Number.isFinite(backup.originalSize) &&
-                              backup.originalSize > backup.size && (
-                                <>
-                                  <span className="backup-meta-separator">
-                                    ·
-                                  </span>
-                                  <span>
-                                    {formatBytes(
-                                      backup.originalSize - backup.size,
-                                    )}{" "}
-                                    saved
-                                  </span>
-                                </>
-                              )}
-                          </p>
-                          <div className="backup-tags">
-                            {missingBackupIds.has(backup.id) && (
-                              <span className="backup-trigger">
-                                Archive unavailable
-                              </span>
-                            )}
-                            <span className="backup-complete">
-                              <Check size={11} />
-                              Completed
-                            </span>
-                            <span className="backup-trigger">
-                              {backup.trigger === "scheduled" ? (
-                                <Clock3 size={11} />
-                              ) : (
-                                <Archive size={11} />
-                              )}
-                              {backup.trigger === "scheduled"
-                                ? "Scheduled"
-                                : "Manual"}
-                            </span>
-                          </div>
-                        </div>
-                        <div className="backup-item-actions">
-                          {canRestore && (
-                            <button
-                              className="btn icon"
-                              type="button"
-                              aria-label={`Restore backup ${backup.name}`}
-                              title="Restore server to this backup"
-                              disabled={
-                                busy ||
-                                starting ||
-                                activeJob ||
-                                storageBlocked ||
-                                missingBackupIds.has(backup.id)
-                              }
-                              onClick={() => void confirmRestore(backup)}
-                            >
-                              <RotateCcw size={16} />
-                            </button>
-                          )}
-                          {canDownload && (
-                            <DownloadButton
-                              className="btn icon"
-                              disabled={
-                                storageBlocked ||
-                                missingBackupIds.has(backup.id)
-                              }
-                              onError={(message) => notify(message, true)}
-                              href={downloadUrl(
-                                `/backups/${encodeURIComponent(backup.id)}/download`,
-                              )}
-                              aria-label={`Download backup ${backup.name}`}
-                              title="Download backup"
-                            >
-                              <Download size={16} />
-                            </DownloadButton>
-                          )}
-                          <button
-                            className="btn icon delete-action"
-                            aria-label={`${missingBackupIds.has(backup.id) ? "Remove missing backup record" : "Delete backup"} ${backup.name}`}
+                  {historyRows.map((backup) => (
+                    <article
+                      className={`backup-item${selected.has(backup.id) ? " selected" : ""}`}
+                      key={backup.id}
+                    >
+                      <input
+                        type="checkbox"
+                        className="backup-checkbox"
+                        aria-label={`Select backup ${backup.name}`}
+                        checked={selected.has(backup.id)}
+                        disabled={!canDelete || busy || locationState.moving}
+                        onChange={(event) => {
+                          const checked = event.target.checked;
+                          setSelected((current) => {
+                            const next = new Set(current);
+                            if (checked) next.add(backup.id);
+                            else next.delete(backup.id);
+                            return next;
+                          });
+                        }}
+                      />
+                      <div className="backup-item-icon">
+                        <Archive size={20} />
+                      </div>
+                      <div className="backup-item-info">
+                        <h3 title={backup.name}>{backup.name}</h3>
+                        <p>
+                          <span>{fullDate(backup.createdAt)}</span>
+                          <span className="backup-meta-separator">·</span>
+                          <span>{formatBytes(backup.size)} compressed</span>
+                          <span className="backup-meta-separator">·</span>
+                          <span
                             title={
-                              missingBackupIds.has(backup.id)
-                                ? "Remove missing backup record"
-                                : "Move backup to Recycle Bin"
-                            }
-                            disabled={
-                              !canDelete ||
-                              busy ||
-                              locationState.moving ||
-                              (storageBlocked &&
-                                !missingBackupIds.has(backup.id))
-                            }
-                            onClick={() =>
-                              confirmDelete(
-                                [backup],
-                                false,
-                                missingBackupIds.has(backup.id),
-                              )
+                              backup.compression === "gzip" &&
+                              backup.compressionLevel === 9
+                                ? "Maximum gzip compression (level 9)"
+                                : "Gzip compressed archive"
                             }
                           >
-                            <Trash2 size={15} />
-                          </button>
+                            .tar.gz
+                          </span>
+                          {typeof backup.originalSize === "number" &&
+                            Number.isFinite(backup.originalSize) &&
+                            backup.originalSize > backup.size && (
+                              <>
+                                <span className="backup-meta-separator">·</span>
+                                <span>
+                                  {formatBytes(
+                                    backup.originalSize - backup.size,
+                                  )}{" "}
+                                  saved
+                                </span>
+                              </>
+                            )}
+                        </p>
+                        <div className="backup-tags">
+                          {missingBackupIds.has(backup.id) && (
+                            <span className="backup-trigger">
+                              Archive unavailable
+                            </span>
+                          )}
+                          <span className="backup-complete">
+                            <Check size={11} />
+                            Completed
+                          </span>
+                          <span className="backup-trigger">
+                            {backup.trigger === "scheduled" ? (
+                              <Clock3 size={11} />
+                            ) : (
+                              <Archive size={11} />
+                            )}
+                            {backup.trigger === "scheduled"
+                              ? "Scheduled"
+                              : "Manual"}
+                          </span>
                         </div>
-                      </article>
-                    ))}
+                      </div>
+                      <div className="backup-item-actions">
+                        {canRestore && (
+                          <button
+                            className="btn icon"
+                            type="button"
+                            aria-label={`Restore backup ${backup.name}`}
+                            title="Restore server to this backup"
+                            disabled={
+                              busy ||
+                              starting ||
+                              activeJob ||
+                              storageBlocked ||
+                              missingBackupIds.has(backup.id)
+                            }
+                            onClick={() => void confirmRestore(backup)}
+                          >
+                            <RotateCcw size={16} />
+                          </button>
+                        )}
+                        {canDownload && (
+                          <DownloadButton
+                            className="btn icon"
+                            disabled={
+                              storageBlocked || missingBackupIds.has(backup.id)
+                            }
+                            onError={(message) => notify(message, true)}
+                            href={downloadUrl(
+                              `/backups/${encodeURIComponent(backup.id)}/download`,
+                            )}
+                            aria-label={`Download backup ${backup.name}`}
+                            title="Download backup"
+                          >
+                            <Download size={16} />
+                          </DownloadButton>
+                        )}
+                        <button
+                          className="btn icon delete-action"
+                          aria-label={`${missingBackupIds.has(backup.id) ? "Remove missing backup record" : "Delete backup"} ${backup.name}`}
+                          title={
+                            missingBackupIds.has(backup.id)
+                              ? "Remove missing backup record"
+                              : "Move backup to Recycle Bin"
+                          }
+                          disabled={
+                            !canDelete ||
+                            busy ||
+                            locationState.moving ||
+                            (storageBlocked && !missingBackupIds.has(backup.id))
+                          }
+                          onClick={() =>
+                            confirmDelete(
+                              [backup],
+                              false,
+                              missingBackupIds.has(backup.id),
+                            )
+                          }
+                        >
+                          <Trash2 size={15} />
+                        </button>
+                      </div>
+                    </article>
+                  ))}
                 </div>
+              )}
+              {backups.length > 0 && (
+                <Pagination
+                  page={currentHistoryPage}
+                  pageSize={historySize}
+                  total={backups.length}
+                  onPageChange={setHistoryPage}
+                  onPageSizeChange={(size) => {
+                    setHistorySize(size);
+                    setHistoryPage(1);
+                  }}
+                  label="backups"
+                />
               )}
               <div className="backup-history-footer">
                 <ShieldCheck size={14} />
@@ -1245,206 +1324,223 @@ export default function Backups({
                   </div>
                 </div>
                 <form onSubmit={saveSchedule}>
-                  {scheduleConflict && (
-                    <div className="storage-form-error" role="alert">
-                      <p>
-                        This schedule changed on another client. Your unsaved
-                        edits are still here.
-                      </p>
-                      <p>
-                        Currently saved:{" "}
-                        {savedSchedule.enabled ? "enabled" : "disabled"},{" "}
-                        {savedSchedule.type === "interval"
-                          ? `every ${savedSchedule.intervalHours} hours`
-                          : `${savedSchedule.type}${savedSchedule.type === "weekly" ? ` on ${["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"][savedSchedule.dayOfWeek]}` : ""} at ${savedSchedule.time} (${timezone})`}
-                        , retain {savedSchedule.retention} backups.
-                      </p>
-                      <div className="backup-job-actions">
-                        <button
-                          type="button"
-                          className="btn small"
-                          onClick={() => {
-                            scheduleBaseline.current = savedSchedule;
-                            scheduleDraft.current = savedSchedule;
-                            setSchedule(savedSchedule);
-                            setScheduleConflict(false);
-                            setSaved(false);
-                          }}
-                        >
-                          Load current schedule
-                        </button>
-                        <button
-                          type="button"
-                          className="btn small"
-                          onClick={() => {
-                            const edits = Object.fromEntries(
-                              scheduleFields
-                                .filter(
-                                  (key) =>
-                                    scheduleDraft.current[key] !==
-                                    scheduleBaseline.current[key],
-                                )
-                                .map((key) => [
-                                  key,
-                                  scheduleDraft.current[key],
-                                ]),
-                            );
-                            const merged = { ...savedSchedule, ...edits };
-                            scheduleBaseline.current = savedSchedule;
-                            scheduleDraft.current = merged;
-                            setSchedule(merged);
-                            setScheduleConflict(false);
-                            setSaved(false);
-                          }}
-                        >
-                          Keep my edits for review
-                        </button>
-                      </div>
-                    </div>
+                  {!scheduleLoaded && (
+                    <p className="storage-form-error" role="status">
+                      Load the current backup schedule before making changes.
+                    </p>
                   )}
-                  <div className="schedule-toggle-row">
-                    <div>
-                      <strong>Enable schedule</strong>
-                    </div>
-                    <Switch
-                      aria-label="Enable automatic backups"
-                      label=""
-                      checked={schedule.enabled}
-                      onCheckedChange={(enabled) => updateSchedule({ enabled })}
-                      disabled={!canSchedule || saving}
-                    />
-                  </div>
-                  <div className="schedule-fields">
-                    <label className="form-field">
-                      Frequency
-                      <select
-                        value={schedule.type}
-                        onChange={(event) =>
-                          updateSchedule({
-                            type: event.target.value as Schedule["type"],
-                          })
+                  <fieldset
+                    disabled={!scheduleLoaded}
+                    className="setup-connection-fields"
+                  >
+                    {scheduleConflict && (
+                      <div className="storage-form-error" role="alert">
+                        <p>
+                          This schedule changed on another client. Your unsaved
+                          edits are still here.
+                        </p>
+                        <p>
+                          Currently saved:{" "}
+                          {savedSchedule.enabled ? "enabled" : "disabled"},{" "}
+                          {savedSchedule.type === "interval"
+                            ? `every ${savedSchedule.intervalHours} hours`
+                            : `${savedSchedule.type}${savedSchedule.type === "weekly" ? ` on ${["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"][savedSchedule.dayOfWeek]}` : ""} at ${savedSchedule.time} (${timezone})`}
+                          , retain {savedSchedule.retention} backups.
+                        </p>
+                        <div className="backup-job-actions">
+                          <button
+                            type="button"
+                            className="btn small"
+                            onClick={() => {
+                              scheduleBaseline.current = savedSchedule;
+                              scheduleDraft.current = savedSchedule;
+                              setSchedule(savedSchedule);
+                              setScheduleConflict(false);
+                              setSaved(false);
+                            }}
+                          >
+                            Load current schedule
+                          </button>
+                          <button
+                            type="button"
+                            className="btn small"
+                            onClick={() => {
+                              const edits = Object.fromEntries(
+                                scheduleFields
+                                  .filter(
+                                    (key) =>
+                                      scheduleDraft.current[key] !==
+                                      scheduleBaseline.current[key],
+                                  )
+                                  .map((key) => [
+                                    key,
+                                    scheduleDraft.current[key],
+                                  ]),
+                              );
+                              const merged = { ...savedSchedule, ...edits };
+                              scheduleBaseline.current = savedSchedule;
+                              scheduleDraft.current = merged;
+                              setSchedule(merged);
+                              setScheduleConflict(false);
+                              setSaved(false);
+                            }}
+                          >
+                            Keep my edits for review
+                          </button>
+                        </div>
+                      </div>
+                    )}
+                    <div className="schedule-toggle-row">
+                      <div>
+                        <strong>Enable schedule</strong>
+                      </div>
+                      <Switch
+                        aria-label="Enable automatic backups"
+                        label=""
+                        checked={schedule.enabled}
+                        onCheckedChange={(enabled) =>
+                          updateSchedule({ enabled })
                         }
                         disabled={!canSchedule || saving}
-                      >
-                        <option value="interval">At an interval</option>
-                        <option value="daily">Every day</option>
-                        <option value="weekly">Every week</option>
-                      </select>
-                    </label>
-                    {schedule.type === "interval" ? (
+                      />
+                    </div>
+                    <div className="schedule-fields">
                       <label className="form-field">
-                        Back up every
+                        Frequency
+                        <select
+                          value={schedule.type}
+                          onChange={(event) =>
+                            updateSchedule({
+                              type: event.target.value as Schedule["type"],
+                            })
+                          }
+                          disabled={!canSchedule || saving}
+                        >
+                          <option value="interval">At an interval</option>
+                          <option value="daily">Every day</option>
+                          <option value="weekly">Every week</option>
+                        </select>
+                      </label>
+                      {schedule.type === "interval" ? (
+                        <label className="form-field">
+                          Back up every
+                          <div className="input-with-unit">
+                            <input
+                              type="number"
+                              min={1}
+                              max={720}
+                              required
+                              value={schedule.intervalHours}
+                              onChange={(event) =>
+                                updateSchedule({
+                                  intervalHours: Number(event.target.value),
+                                })
+                              }
+                              disabled={!canSchedule || saving}
+                            />
+                            <span>hours</span>
+                          </div>
+                        </label>
+                      ) : (
+                        <>
+                          <div
+                            className={`schedule-time-fields ${schedule.type === "weekly" ? "weekly" : ""}`}
+                          >
+                            {schedule.type === "weekly" && (
+                              <label className="form-field">
+                                Day
+                                <select
+                                  value={schedule.dayOfWeek}
+                                  onChange={(event) =>
+                                    updateSchedule({
+                                      dayOfWeek: Number(event.target.value),
+                                    })
+                                  }
+                                  disabled={!canSchedule || saving}
+                                >
+                                  {[
+                                    "Sunday",
+                                    "Monday",
+                                    "Tuesday",
+                                    "Wednesday",
+                                    "Thursday",
+                                    "Friday",
+                                    "Saturday",
+                                  ].map((day, index) => (
+                                    <option key={day} value={index}>
+                                      {day}
+                                    </option>
+                                  ))}
+                                </select>
+                              </label>
+                            )}
+                            <label className="form-field">
+                              Time
+                              <input
+                                type="time"
+                                required
+                                value={schedule.time}
+                                onChange={(event) =>
+                                  updateSchedule({ time: event.target.value })
+                                }
+                                disabled={!canSchedule || saving}
+                              />
+                            </label>
+                          </div>
+                          <p className="schedule-retention-hint">
+                            Timezone: {timezone}
+                          </p>
+                        </>
+                      )}
+                      <label className="form-field">
+                        Scheduled backups to keep
                         <div className="input-with-unit">
                           <input
                             type="number"
                             min={1}
-                            max={720}
+                            max={100}
                             required
-                            value={schedule.intervalHours}
+                            value={schedule.retention}
                             onChange={(event) =>
                               updateSchedule({
-                                intervalHours: Number(event.target.value),
+                                retention: Number(event.target.value),
                               })
                             }
                             disabled={!canSchedule || saving}
                           />
-                          <span>hours</span>
+                          <span>backups</span>
                         </div>
                       </label>
-                    ) : (
-                      <>
-                        <div
-                          className={`schedule-time-fields ${schedule.type === "weekly" ? "weekly" : ""}`}
-                        >
-                          {schedule.type === "weekly" && (
-                            <label className="form-field">
-                              Day
-                              <select
-                                value={schedule.dayOfWeek}
-                                onChange={(event) =>
-                                  updateSchedule({
-                                    dayOfWeek: Number(event.target.value),
-                                  })
-                                }
-                                disabled={!canSchedule || saving}
-                              >
-                                {[
-                                  "Sunday",
-                                  "Monday",
-                                  "Tuesday",
-                                  "Wednesday",
-                                  "Thursday",
-                                  "Friday",
-                                  "Saturday",
-                                ].map((day, index) => (
-                                  <option key={day} value={index}>
-                                    {day}
-                                  </option>
-                                ))}
-                              </select>
-                            </label>
-                          )}
-                          <label className="form-field">
-                            Time
-                            <input
-                              type="time"
-                              required
-                              value={schedule.time}
-                              onChange={(event) =>
-                                updateSchedule({ time: event.target.value })
-                              }
-                              disabled={!canSchedule || saving}
-                            />
-                          </label>
-                        </div>
-                        <p className="schedule-retention-hint">
-                          Timezone: {timezone}
-                        </p>
-                      </>
-                    )}
-                    <label className="form-field">
-                      Scheduled backups to keep
-                      <div className="input-with-unit">
-                        <input
-                          type="number"
-                          min={1}
-                          max={100}
-                          required
-                          value={schedule.retention}
-                          onChange={(event) =>
-                            updateSchedule({
-                              retention: Number(event.target.value),
-                            })
-                          }
-                          disabled={!canSchedule || saving}
-                        />
-                        <span>backups</span>
-                      </div>
-                    </label>
-                    <p className="schedule-retention-hint">
-                      Older scheduled backups move to Recycle Bin when this
-                      limit is reached. They use disk space until permanently
-                      deleted. Manual backups stay until you delete them.
-                    </p>
-                    <button
-                      className="btn primary schedule-save"
-                      type="submit"
-                      disabled={!canSchedule || saving || scheduleConflict}
-                    >
-                      {saving ? (
-                        <LoaderCircle size={15} className="spin" />
-                      ) : saved ? (
-                        <Check size={15} />
-                      ) : (
-                        <CalendarClock size={15} />
-                      )}
-                      {saving
-                        ? "Saving…"
-                        : saved
-                          ? "Schedule saved"
-                          : "Save schedule"}
-                    </button>
-                  </div>
+                      <p className="schedule-retention-hint">
+                        Older scheduled backups move to Recycle Bin when this
+                        limit is reached. They use disk space until permanently
+                        deleted. Manual backups stay until you delete them.
+                      </p>
+                      <button
+                        className="btn primary schedule-save"
+                        type="submit"
+                        disabled={
+                          !canSchedule ||
+                          !scheduleLoaded ||
+                          saving ||
+                          scheduleConflict
+                        }
+                      >
+                        {saving ? (
+                          <LoaderCircle size={15} className="spin" />
+                        ) : saved ? (
+                          <Check size={15} />
+                        ) : (
+                          <CalendarClock size={15} />
+                        )}
+                        {saving
+                          ? "Saving…"
+                          : saved
+                            ? "Schedule saved"
+                            : "Save schedule"}
+                      </button>
+                    </div>
+                  </fieldset>
                 </form>
               </section>
               <div
@@ -1455,16 +1551,20 @@ export default function Backups({
                 </span>
                 <div>
                   <span>
-                    {savedSchedule.enabled
-                      ? "Next scheduled backup"
-                      : "Automatic backups are off"}
+                    {!scheduleLoaded
+                      ? "Backup schedule unavailable"
+                      : savedSchedule.enabled
+                        ? "Next scheduled backup"
+                        : "Automatic backups are off"}
                   </span>
                   <strong>
-                    {savedSchedule.enabled && savedSchedule.nextRun
-                      ? fullDate(savedSchedule.nextRun)
-                      : savedSchedule.enabled
-                        ? "Waiting for the next interval"
-                        : "Enable a schedule to get started"}
+                    {!scheduleLoaded
+                      ? "Retry loading backups to check the saved schedule"
+                      : savedSchedule.enabled && savedSchedule.nextRun
+                        ? fullDate(savedSchedule.nextRun, timezone)
+                        : savedSchedule.enabled
+                          ? "Waiting for the next interval"
+                          : "Enable a schedule to get started"}
                   </strong>
                 </div>
               </div>
@@ -1570,17 +1670,55 @@ export default function Backups({
                   <ShieldCheck size={17} />
                   <p>
                     The saved archive stays in your backup history. The server
-                    remains stopped after restoring. Panel access and launch
-                    settings stay as they are.
+                    remains stopped after restoring. Panel access stays as it
+                    is. Launch settings{" "}
+                    {restoreConfiguration &&
+                    dialog.restore.hasRuntimeSnapshot &&
+                    permissions === undefined
+                      ? "will be restored from the snapshot below."
+                      : "stay as they are."}
                   </p>
                 </div>
                 {restoreServerStatus !== "offline" && !dialogError && (
                   <p className="storage-form-error" role="status">
                     {restoreServerStatus === null
                       ? "Checking server status…"
-                      : "Stop the server from Console, then return here to restore this backup."}
+                      : "Stop the server before restoring. This dialog checks its status automatically."}
                   </p>
                 )}
+                {restoreStatusError && (
+                  <p className="storage-form-error" role="alert">
+                    {restoreStatusError}
+                  </p>
+                )}
+                {restoreServerStatus !== "offline" && (
+                  <button
+                    type="button"
+                    className="btn"
+                    disabled={busy}
+                    onClick={() => {
+                      closeDialog();
+                      window.location.hash = "console";
+                    }}
+                  >
+                    Open Console
+                  </button>
+                )}
+                {permissions === undefined &&
+                  dialog.restore.hasRuntimeSnapshot && (
+                    <label className="backup-select-all">
+                      <input
+                        type="checkbox"
+                        checked={restoreConfiguration}
+                        disabled={busy}
+                        onChange={(event) =>
+                          setRestoreConfiguration(event.target.checked)
+                        }
+                      />
+                      Restore saved launch settings and installed content
+                      records
+                    </label>
+                  )}
                 <label className="backup-select-all">
                   <input
                     type="checkbox"

@@ -446,6 +446,9 @@ test("Quilt records alias versions but keeps conditional requirements inconclusi
 test("alternate provider proof accepts Maven ranges and explicit wildcards conservatively", () => {
   for (const [version, range] of [
     ["1.8.0", "[1.7.7,)"],
+    ["1.5", "1.5"],
+    ["1.5", undefined],
+    ["2.0", ""],
     ["1.5", "[1.5,2)"],
     ["1.0.0", "[1]"],
     ["3", "(,1],[3,)"],
@@ -464,9 +467,7 @@ test("alternate provider proof accepts Maven ranges and explicit wildcards conse
     ["2.0", "[1.5,2)"],
     ["1.0-beta", "[1,)"],
     ["1.21.1-3.7.2", "[1.21.1-3.7.3,)"],
-    ["1.5", "1.5"],
     ["1.5", ">=1.0"],
-    ["1.5", undefined],
     ["1.5", ["*"]],
     [undefined, "*"],
     ["${file.jarVersion}", "*"],

@@ -564,7 +564,7 @@ test("settings conflicts retain the draft and require explicit reload before ove
     );
     await page.goto("/#console");
     await page
-      .getByRole("button", { name: "Rename server", exact: true })
+      .getByRole("button", { name: "Edit server settings", exact: true })
       .click();
     await page
       .getByRole("textbox", { name: "Server name", exact: true })
@@ -865,3 +865,61 @@ test("signing out clears private clipboard metadata before another account opens
     page.getByText("Private customer project", { exact: true }),
   ).toHaveCount(0);
 });
+
+for (const dismissal of ["Escape", "backdrop"] as const) {
+  test(`file edits survive an accidental ${dismissal} dismissal`, async ({
+    page,
+  }) => {
+    await page.route("**/api/files?*", (route) =>
+      route.fulfill({
+        json: {
+          path: "",
+          entries: [
+            {
+              name: "review-draft.txt",
+              path: "review-draft.txt",
+              type: "file",
+              size: 5,
+              modified: "2026-11-15T00:00:00Z",
+            },
+          ],
+        },
+      }),
+    );
+    await page.route("**/api/files/content?*", (route) =>
+      route.fulfill({ json: { content: "saved", revision: "original" } }),
+    );
+    await page.goto("/#files");
+    await page
+      .getByRole("button", { name: "Edit review-draft.txt", exact: true })
+      .click();
+    const dialog = page.getByRole("dialog");
+    await dialog
+      .getByLabel("File contents", { exact: true })
+      .fill("keep my work");
+    if (dismissal === "Escape") await page.keyboard.press("Escape");
+    else await page.mouse.click(2, 2);
+    await expect(
+      dialog.getByText("Discard your unsaved changes?", { exact: true }),
+    ).toBeVisible();
+    await dialog
+      .getByRole("button", { name: "Keep editing", exact: true })
+      .click();
+    await expect(
+      dialog.getByLabel("File contents", { exact: true }),
+    ).toHaveValue("keep my work");
+    await dialog
+      .getByRole("button", { name: "Close dialog", exact: true })
+      .click();
+    await dialog
+      .getByRole("button", { name: "Discard changes", exact: true })
+      .click();
+    await expect(dialog).toHaveCount(0);
+    await page
+      .getByRole("button", { name: "Edit review-draft.txt", exact: true })
+      .click();
+    await expect(page.getByLabel("File contents", { exact: true })).toHaveValue(
+      "saved",
+    );
+  });
+}

@@ -454,7 +454,7 @@ test("Stop sends one graceful request across both controls and can retry a faile
 });
 
 for (const width of [1348, 390]) {
-  test(`a stopping server offers a confirmed Force Stop and recovers at ${width}px`, async ({
+  test(`a stopping server offers a confirmed Force stop and recovers at ${width}px`, async ({
     page,
     request,
     serverId,
@@ -501,11 +501,11 @@ for (const width of [1348, 390]) {
       .click();
     await expect(page.getByRole("dialog")).toHaveCount(0);
     const force = consolePower.getByRole("button", {
-      name: "Force Stop",
+      name: "Force stop",
       exact: true,
     });
     const sidebarForce = sidebarPower.getByRole("button", {
-      name: "Force Stop",
+      name: "Force stop",
       exact: true,
       includeHidden: true,
     });
@@ -732,7 +732,7 @@ for (const width of [1348, 390]) {
 }
 
 for (const stopSource of ["power", "console"] as const) {
-  test(`Force Stop recovers from a hung ${stopSource} Stop request and retries failed termination`, async ({
+  test(`Force stop recovers from a hung ${stopSource} Stop request and retries failed termination`, async ({
     page,
     request,
     serverId,
@@ -799,7 +799,7 @@ for (const stopSource of ["power", "console"] as const) {
     }
     const force = page
       .locator(".server-power")
-      .getByRole("button", { name: "Force Stop", exact: true });
+      .getByRole("button", { name: "Force stop", exact: true });
     try {
       await expect(force).toBeEnabled();
       await force.click();

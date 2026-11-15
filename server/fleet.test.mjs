@@ -64,6 +64,7 @@ async function fixture(t, settings = {}) {
       scheduler: false,
       useEnvironment: false,
       publicAddress: { resolve: async () => null },
+      profileFetch: async () => new Response(null, { status: 404 }),
       ...settings,
       ...extra,
     });
@@ -1277,4 +1278,42 @@ test("server removal rejects ongoing configuration work without closing the serv
     (await panel.request(`/api/servers/${id}`, { method: "DELETE" })).status,
     404,
   );
+});
+
+test("owner runtime identification survives restart and can clear an unknown launcher's version", async (t) => {
+  const { boot } = await fixture(t);
+  const panel = await boot();
+  const id = (await panel.request("/api/servers")).body.defaultServerId;
+  const result = await panel.request(
+    `/api/servers/${id}`,
+    json("PATCH", { software: "Paper", minecraftVersion: "1.21.4" }),
+  );
+  assert.equal(result.status, 200, JSON.stringify(result.body));
+  assert.equal(panel.runtimes.get(id).descriptor().software, "Paper");
+  assert.equal(panel.runtimes.get(id).descriptor().minecraftVersion, "1.21.4");
+  assert.equal(
+    (
+      await panel.request(
+        `/api/servers/${id}`,
+        json("PATCH", { minecraftVersion: "../bad" }),
+      )
+    ).status,
+    400,
+  );
+  await panel.close();
+  const restarted = await boot();
+  assert.equal(
+    restarted.runtimes.get(id).descriptor().minecraftVersion,
+    "1.21.4",
+  );
+  assert.equal(
+    (
+      await restarted.request(
+        `/api/servers/${id}`,
+        json("PATCH", { software: "Java", minecraftVersion: null }),
+      )
+    ).status,
+    200,
+  );
+  assert.equal(restarted.runtimes.get(id).descriptor().minecraftVersion, null);
 });

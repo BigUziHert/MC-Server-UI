@@ -375,7 +375,7 @@ async function remoteAccount(
   return { writes };
 }
 
-test("saved connections expose unavailable and signed-out panels and forget only the confirmed destination", async ({
+test("saved connections expose unavailable and signed-out panels and remove only the confirmed destination", async ({
   page,
 }) => {
   await desktopBridge(page, {
@@ -403,10 +403,14 @@ test("saved connections expose unavailable and signed-out panels and forget only
     "This saved panel is offline.",
   );
   await dialog
-    .getByRole("button", { name: "Forget pc-one.example:3002" })
+    .getByRole("button", {
+      name: "Remove from this device pc-one.example:3002",
+    })
     .click();
   await expect(
-    dialog.getByRole("heading", { name: "Forget pc-one.example:3002?" }),
+    dialog.getByRole("heading", {
+      name: "Remove from this device: pc-one.example:3002?",
+    }),
   ).toBeVisible();
   await expect(dialog).toContainText(
     "Minecraft servers on that panel stay on their host and keep running",
@@ -416,10 +420,12 @@ test("saved connections expose unavailable and signed-out panels and forget only
     dialog.getByRole("button", { name: "Retry pc-one.example:3002" }),
   ).toBeVisible();
   await dialog
-    .getByRole("button", { name: "Forget pc-one.example:3002" })
+    .getByRole("button", {
+      name: "Remove from this device pc-one.example:3002",
+    })
     .click();
   await dialog
-    .getByRole("button", { name: "Forget connection", exact: true })
+    .getByRole("button", { name: "Remove from this device", exact: true })
     .click();
   await expect(
     dialog.getByRole("button", { name: "Retry pc-one.example:3002" }),
@@ -439,7 +445,7 @@ test("saved connections expose unavailable and signed-out panels and forget only
   await expect(account).toBeFocused();
 });
 
-test("the remote sign-in screen can forget its saved connection without contacting the host", async ({
+test("the remote sign-in screen can remove its saved connection without contacting the host", async ({
   page,
 }) => {
   await desktopBridge(page, {
@@ -463,13 +469,17 @@ test("the remote sign-in screen can forget its saved connection without contacti
   await page.getByRole("button", { name: "Manage panel connections" }).click();
   const dialog = page.getByRole("dialog", { name: "Panel connections" });
   await dialog
-    .getByRole("button", { name: "Forget pc-one.example:3002" })
+    .getByRole("button", {
+      name: "Remove from this device pc-one.example:3002",
+    })
     .click();
   await dialog
-    .getByRole("button", { name: "Forget connection", exact: true })
+    .getByRole("button", { name: "Remove from this device", exact: true })
     .click();
   await expect(
-    dialog.getByRole("button", { name: "Forget pc-one.example:3002" }),
+    dialog.getByRole("button", {
+      name: "Remove from this device pc-one.example:3002",
+    }),
   ).toHaveCount(0);
   await expect(
     dialog.getByRole("button", { name: "Open pc-two.example:3002" }),

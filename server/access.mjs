@@ -9,12 +9,13 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { promisify } from "node:util";
 import { isIP } from "node:net";
+import { hostname } from "node:os";
 import { legacyConnectionHost } from "./connection.mjs";
 import permissionCatalog from "../shared/subuser-permissions.json" with { type: "json" };
 
 export const SUBUSER_COOKIE = "__Host-mc-subuser";
 const invitationLifetime = 24 * 60 * 60 * 1000;
-const sessionLifetime = 7 * 24 * 60 * 60 * 1000;
+const sessionLifetime = 30 * 24 * 60 * 60 * 1000;
 const leaveReceiptLifetime = 7 * 24 * 60 * 60 * 1000;
 const maximumLeaveReceipts = 4096;
 const maximumAccessRevocations = 4096;
@@ -25,6 +26,11 @@ const invalidLink =
   "This invitation link is invalid, expired, or already used. If you saved your password, choose Sign in. Otherwise, ask the server owner to reissue the invitation for your existing account.";
 const invalidLogin = "The email or password is incorrect.";
 const fail = (status, message) => Object.assign(new Error(message), { status });
+const invitationDuration = (hours = 24) => {
+  if (![1, 24, 168].includes(hours))
+    throw fail(400, "Choose an invitation expiry of 1 hour, 1 day or 7 days.");
+  return hours * 60 * 60 * 1000;
+};
 const digest = (value) => createHash("sha256").update(value).digest("hex");
 const secret = () => randomBytes(32).toString("base64url");
 const validSecret = (value) =>
@@ -193,6 +199,7 @@ export async function createAccessService({
   dataDir,
   getUser,
   listServerIds = () => [],
+  listServers = () => listServerIds().map((id) => ({ id, name: id })),
   listLegacyUsers = () => [],
   canIssueInvitations = () => true,
   now = Date.now,
@@ -200,6 +207,10 @@ export async function createAccessService({
   const storage = path.join(dataDir, "remote-access.json");
   let state = {
     version: 4,
+    identity: {
+      id: randomUUID(),
+      name: hostname().slice(0, 100) || "MC Panel",
+    },
     configuration: validateAccessConfiguration({}),
     memberships: [],
     tokens: [],
@@ -225,6 +236,7 @@ export async function createAccessService({
     )
       throw new Error("Invalid access storage.");
     const configuration = { ...saved.configuration };
+    migrationNeeded = !saved.identity;
     if (
       saved.version === 1 &&
       (Object.hasOwn(configuration, "from") ||
@@ -233,6 +245,16 @@ export async function createAccessService({
       configuration.transport ??= "proxy";
     state = {
       version: 4,
+      identity:
+        saved.identity &&
+        /^[a-f0-9-]{36}$/i.test(saved.identity.id) &&
+        typeof saved.identity.name === "string" &&
+        saved.identity.name.trim()
+          ? {
+              id: saved.identity.id,
+              name: saved.identity.name.trim().slice(0, 100),
+            }
+          : state.identity,
       configuration: validateAccessConfiguration(configuration),
       memberships: saved.memberships,
       tokens: saved.tokens,
@@ -443,6 +465,7 @@ export async function createAccessService({
   }
   let queue = Promise.resolve();
   const downloadTickets = new Map();
+  const renewedSessions = new Map();
   let closing = false;
   let pendingAuthentications = 0;
   const serialize = (operation) => {
@@ -516,7 +539,17 @@ export async function createAccessService({
   };
   const withRevocationProof = (next, proof) =>
     [
-      ...next.revocationProofs.filter((entry) => entry.expiresAt > now()),
+      ...next.revocationProofs.filter(
+        (entry) =>
+          entry.expiresAt > now() && entry.accountId !== proof.record.accountId,
+      ),
+      ...next.revocationProofs
+        .filter(
+          (entry) =>
+            entry.expiresAt > now() &&
+            entry.accountId === proof.record.accountId,
+        )
+        .slice(-31),
       proof.record,
     ]
       .sort((a, b) => a.expiresAt - b.expiresAt)
@@ -563,6 +596,12 @@ export async function createAccessService({
   };
   const status = () => ({
     ...state.configuration,
+    panelId: state.identity.id,
+    panelName: state.identity.name,
+    activeSessions: state.sessions.filter((item) => item.expiresAt > now())
+      .length,
+    pendingInvitations: state.tokens.filter((item) => item.expiresAt > now())
+      .length,
     ready: Boolean(
       state.configuration.enabled && state.configuration.publicUrl,
     ),
@@ -765,6 +804,20 @@ export async function createAccessService({
   const findAccount = (id) =>
     accountById(id) ?? legacyAccounts().find((account) => account.id === id);
   const promoted = (account) => {
+    if (
+      account.legacy &&
+      state.memberships.some(
+        (membership) =>
+          membership.email === account.email &&
+          !account.legacyMembers?.some(
+            (entry) => scopeKey(entry) === scopeKey(membership),
+          ),
+      )
+    )
+      throw fail(
+        409,
+        "A server holding this person's existing access is unavailable. Reconnect it before combining the account so its grants and sign-ins are preserved.",
+      );
     if (account.accessReview?.duplicateLegacyIdentities)
       throw fail(
         409,
@@ -877,6 +930,9 @@ export async function createAccessService({
     email: record.email,
     serverId: record.serverId,
     userId: record.userId,
+    expiresAt: new Date(record.expiresAt).toISOString(),
+    panelId: state.identity.id,
+    panelName: state.identity.name,
     permissions: Array.isArray(user.permissions) ? [...user.permissions] : [],
     memberships: memberships.map(({ serverId, userId }) => ({
       serverId,
@@ -904,7 +960,7 @@ export async function createAccessService({
       cookie: `${SUBUSER_COOKIE}=${value}; Path=/; HttpOnly; SameSite=Strict; Secure; Max-Age=${sessionLifetime / 1000}`,
     };
   };
-  const accountSessionView = (account) => {
+  const accountSessionView = (account, session) => {
     const memberships = serverIds()
       .filter((id) => permitsServer(account, id))
       .map((serverId) => ({ serverId, userId: account.id }));
@@ -914,6 +970,11 @@ export async function createAccessService({
       accountId: account.id,
       userId: account.id,
       email: account.email,
+      expiresAt: new Date(
+        session?.expiresAt ?? now() + sessionLifetime,
+      ).toISOString(),
+      panelId: state.identity.id,
+      panelName: state.identity.name,
       serverId,
       permissions: serverId ? [...accountPermissions(account, serverId)] : [],
       hostPermissions: [
@@ -962,7 +1023,7 @@ export async function createAccessService({
       return activated(account) &&
         account.email === record.email &&
         account.authRevision === record.authRevision
-        ? accountSessionView(account)
+        ? accountSessionView(account, record)
         : null;
     }
     const memberships = [];
@@ -1224,6 +1285,304 @@ export async function createAccessService({
     account: (id) => publicAccount(findAccount(id)),
     listAccounts: () =>
       [...state.accounts, ...legacyAccounts()].map(publicAccount),
+    people: () => ({
+      users: [...state.accounts, ...legacyAccounts()].map(publicAccount),
+      servers: listServers().map(({ id, name }) => ({ id, name })),
+      panelId: state.identity.id,
+      panelName: state.identity.name,
+    }),
+    renamePanel: (name) =>
+      serialize(async () => {
+        if (
+          typeof name !== "string" ||
+          !name.trim() ||
+          name.length > 100 ||
+          /[\x00-\x1f]/.test(name)
+        )
+          throw fail(400, "Enter a computer name with 1–100 characters.");
+        await persist({
+          ...cleaned(),
+          identity: { ...state.identity, name: name.trim() },
+        });
+        return status();
+      }),
+    signOutAll: () =>
+      serialize(async () => {
+        // Ordinary sign-out must not be reported as account deletion to clients.
+        await persist({ ...cleaned(), sessions: [] });
+        return status();
+      }),
+    changePassword: (req, input) =>
+      serializeAuthentication(async () => {
+        const session = await authenticatedSession(req);
+        if (!session) throw fail(401, "Sign in before changing your password.");
+        if (
+          !validPassword(input?.currentPassword) ||
+          !validPassword(input?.newPassword)
+        )
+          throw fail(
+            400,
+            "Use 12–128 characters and enter your current password.",
+          );
+        const hash = digest(cookieSecret(req));
+        if (session.accountId) {
+          const account = accountById(session.accountId);
+          if (!(await matchesPassword(input.currentPassword, account.password)))
+            throw fail(401, "The current password is incorrect.");
+          const updated = {
+            ...account,
+            password: await hashPassword(input.newPassword),
+            authRevision: randomUUID(),
+          };
+          const next = replaceAccount(cleaned(), updated, account);
+          await persist({
+            ...next,
+            sessions: next.sessions
+              .filter(
+                (entry) =>
+                  entry.accountId !== account.id || entry.hash === hash,
+              )
+              .map((entry) =>
+                entry.hash === hash
+                  ? {
+                      ...entry,
+                      authRevision: updated.authRevision,
+                      expiresAt: now() + sessionLifetime,
+                    }
+                  : entry,
+              ),
+          });
+        } else {
+          const scopes = new Set(session.memberships.map(scopeKey));
+          const owned = state.memberships.filter(
+            (entry) =>
+              entry.email === session.email && scopes.has(scopeKey(entry)),
+          );
+          if (
+            !owned.length ||
+            !(
+              await Promise.all(
+                owned.map((entry) =>
+                  matchesPassword(input.currentPassword, entry.password),
+                ),
+              )
+            ).every(Boolean)
+          )
+            throw fail(401, "The current password is incorrect.");
+          const password = await hashPassword(input.newPassword);
+          const next = cleaned();
+          await persist({
+            ...next,
+            memberships: next.memberships.map((entry) =>
+              owned.includes(entry) ? { ...entry, password } : entry,
+            ),
+            sessions: next.sessions.filter(
+              (entry) =>
+                entry.hash === hash ||
+                entry.email !== session.email ||
+                !sessionScopes(entry).some((scope) =>
+                  scopes.has(scopeKey(scope)),
+                ),
+            ),
+          });
+        }
+        return {
+          ok: true,
+          message:
+            "Password changed. Other sessions for this account have been signed out.",
+        };
+      }),
+    dismissAccessReview: (id) =>
+      serialize(async () => {
+        const account = findAccount(id);
+        if (!account) throw fail(404, "Panel account not found.");
+        if (account.accessReview?.duplicateLegacyIdentities)
+          throw fail(
+            409,
+            "Resolve the duplicate legacy identities before dismissing this review.",
+          );
+        const { accessReview, ...updated } = promoted(account);
+        await persist(replaceAccount(cleaned(), updated, account));
+        return publicAccount(updated);
+      }),
+    revokeInvitation: (id) =>
+      serialize(async () => {
+        const account = findAccount(id);
+        if (!account) throw fail(404, "Panel account not found.");
+        await persist({
+          ...cleaned(),
+          tokens: state.tokens.filter(
+            (item) =>
+              item.accountId !== account.id && item.email !== account.email,
+          ),
+        });
+        return publicAccount(account);
+      }),
+    share: (input, req) =>
+      serialize(async () => {
+        if (
+          !input ||
+          typeof input !== "object" ||
+          Array.isArray(input) ||
+          Object.keys(input).some(
+            (key) =>
+              !["email", "grants", "invite", "expiresInHours"].includes(key),
+          )
+        )
+          throw fail(400, "Enter valid sharing details.");
+        const email = normalizedEmail(input.email);
+        if (!validEmail(email)) throw fail(400, "Enter a valid email address.");
+        const duration = invitationDuration(input.expiresInHours);
+        if (
+          !Array.isArray(input.grants) ||
+          !input.grants.length ||
+          input.grants.length > 100
+        )
+          throw fail(400, "Choose at least one server to share.");
+        const actor = req ? await authenticatedSession(req) : null;
+        if (req && !actor)
+          throw fail(401, "Sign in again before sharing a server.");
+        const seen = new Set();
+        const grants = [];
+        for (const grant of input.grants) {
+          if (
+            !grant ||
+            Object.keys(grant).some(
+              (key) => !["serverId", "permissions"].includes(key),
+            ) ||
+            !serverIds().includes(grant.serverId) ||
+            seen.has(grant.serverId)
+          )
+            throw fail(400, "Choose each available server only once.");
+          seen.add(grant.serverId);
+          const permissions = validPermissions(grant.permissions);
+          if (!permissions.includes("server.view"))
+            throw fail(400, "Include Can View Server in each grant.");
+          if (actor) {
+            const scope = actor.memberships.find(
+              (entry) => entry.serverId === grant.serverId,
+            );
+            const authority = scope
+              ? await liveUser({ ...scope, email: actor.email })
+              : null;
+            if (
+              !authority?.permissions?.includes("user.create") ||
+              permissions.includes("backup.location") ||
+              permissions.some(
+                (permission) => !authority.permissions.includes(permission),
+              )
+            )
+              throw fail(
+                403,
+                "You can only share servers and permissions within your own access.",
+              );
+          }
+          grants.push({ serverId: grant.serverId, permissions });
+        }
+        const current = [...state.accounts, ...legacyAccounts()].find(
+          (item) => item.email === email,
+        );
+        if (actor && current?.hostPermissions?.length)
+          throw fail(
+            403,
+            "Only the owner can manage an account with computer permissions.",
+          );
+        let account = current ? promoted(current) : validateAccount({ email });
+        if (actor)
+          for (const grant of grants) {
+            const scope = actor.memberships.find(
+              (entry) => entry.serverId === grant.serverId,
+            );
+            const authority = scope
+              ? await liveUser({ ...scope, email: actor.email })
+              : null;
+            if (
+              (account.serverOverrides[grant.serverId]?.permissions ?? []).some(
+                (id) => !authority.permissions.includes(id),
+              ) ||
+              account.serverOverrides[grant.serverId]?.hostPermissions?.length
+            )
+              throw fail(
+                403,
+                "Only the owner can change this account's higher access.",
+              );
+          }
+        for (const grant of grants)
+          account = {
+            ...account,
+            serverIds: [...new Set([...account.serverIds, grant.serverId])],
+            excludedServerIds: account.excludedServerIds.filter(
+              (id) => id !== grant.serverId,
+            ),
+            serverOverrides: {
+              ...account.serverOverrides,
+              [grant.serverId]: {
+                permissions: grant.permissions,
+                hostPermissions:
+                  account.serverOverrides[grant.serverId]?.hostPermissions ??
+                  [],
+              },
+            },
+          };
+        let next = replaceAccount(cleaned(), account, current);
+        let invitation;
+        // Sharing with an activated person never changes their password or sessions.
+        if (input.invite !== false && !activated(account)) {
+          // An invitation creates a password for the whole account. A delegate
+          // must control every existing scope before issuing that capability.
+          if (actor)
+            for (const id of account.serverIds) {
+              const scope = actor.memberships.find(
+                (entry) => entry.serverId === id,
+              );
+              const authority = scope
+                ? await liveUser({ ...scope, email: actor.email })
+                : null;
+              if (
+                !authority?.permissions.includes("user.create") ||
+                accountPermissions(account, id).some(
+                  (permission) => !authority.permissions.includes(permission),
+                ) ||
+                account.serverOverrides[id]?.hostPermissions?.length
+              )
+                throw fail(
+                  403,
+                  "The owner must invite this person because their account has access beyond the servers you manage.",
+                );
+            }
+          requireReady();
+          const token = secret(),
+            createdAt = now(),
+            expiresAt = createdAt + duration;
+          account = { ...account, invitedAt: createdAt };
+          next = replaceAccount(next, account, current);
+          next.tokens = [
+            ...next.tokens.filter(
+              (item) => item.accountId !== account.id && item.email !== email,
+            ),
+            {
+              accountId: account.id,
+              email,
+              hash: digest(token),
+              createdAt,
+              expiresAt,
+            },
+          ];
+          invitation = {
+            invitationUrl: `${state.configuration.publicUrl}/#invite=${token}`,
+            inviteExpiresAt: new Date(expiresAt).toISOString(),
+          };
+        }
+        await persist(next);
+        return {
+          user: publicAccount(account),
+          ...invitation,
+          alreadyActive: activated(account),
+          servers: listServers()
+            .filter((server) => seen.has(server.id))
+            .map(({ id, name }) => ({ id, name })),
+        };
+      }),
     userForServer,
     usersForServer: (serverId) =>
       state.accounts
@@ -1276,6 +1635,12 @@ export async function createAccessService({
           ),
           serverOverrides: { ...account.serverOverrides, [serverId]: override },
         };
+        if (
+          updated.accessReview?.serverIds?.every(
+            (id) => id === serverId || updated.serverOverrides[id],
+          )
+        )
+          delete updated.accessReview;
         await persist(replaceAccount(cleaned(), updated, current));
         return {
           id: updated.id,
@@ -1318,14 +1683,14 @@ export async function createAccessService({
         if (!current) throw fail(404, "Panel account not found.");
         await persist(withoutIdentity(cleaned(), current.email, id));
       }),
-    inviteAccount: (id) =>
+    inviteAccount: (id, input = {}) =>
       serialize(async () => {
         requireReady();
         const current = findAccount(id);
         if (!current) throw fail(404, "Panel account not found.");
         const token = secret(),
           createdAt = now(),
-          expiresAt = createdAt + invitationLifetime;
+          expiresAt = createdAt + invitationDuration(input.expiresInHours);
         const account = {
           ...promoted(current),
           password: undefined,
@@ -1628,7 +1993,6 @@ export async function createAccessService({
           state.configuration,
         );
         const reset =
-          !configuration.enabled ||
           configuration.publicUrl !== state.configuration.publicUrl ||
           configuration.transport !== state.configuration.transport;
         await persist({
@@ -1696,6 +2060,24 @@ export async function createAccessService({
         return {
           email: record.email,
           panelAddress: state.configuration.publicUrl,
+          panelId: state.identity.id,
+          panelName: state.identity.name,
+          servers: record.accountId
+            ? listServers()
+                .filter((server) =>
+                  permitsServer(accountById(record.accountId), server.id),
+                )
+                .map(({ id, name }) => ({
+                  id,
+                  name,
+                  permissions: accountPermissions(
+                    accountById(record.accountId),
+                    id,
+                  ),
+                }))
+            : listServers()
+                .filter((server) => server.id === record.serverId)
+                .map(({ id, name }) => ({ id, name })),
           inviteExpiresAt: new Date(record.expiresAt).toISOString(),
         };
       }),
@@ -1851,7 +2233,41 @@ export async function createAccessService({
         };
       }),
     async authenticate(req) {
-      return closing ? null : authenticatedSession(req);
+      if (closing) return null;
+      return serialize(async () => {
+        const session = await authenticatedSession(req);
+        if (!session) return null;
+        const value = cookieSecret(req);
+        const hash =
+          req?.[downloadSessionHash] ?? (value ? digest(value) : null);
+        const expiresAt = now() + sessionLifetime;
+        const record = state.sessions.find((item) => item.hash === hash);
+        const savedExpiry = renewedSessions.get(hash) ?? record.expiresAt;
+        const next = {
+          ...cleaned(),
+          sessions: state.sessions.map((record) =>
+            record.hash === hash ? { ...record, expiresAt } : record,
+          ),
+        };
+        // Every successful communication renews the live lease. Coalesce disk
+        // writes to one minute; an unrelated durable mutation includes it too.
+        // A failed renewal write must not invalidate a still-valid credential.
+        if (expiresAt - savedExpiry >= 60_000) {
+          try {
+            await persist(next);
+            renewedSessions.set(hash, expiresAt);
+          } catch {
+            return session;
+          }
+        } else {
+          state = next;
+          renewedSessions.set(hash, savedExpiry);
+        }
+        for (const key of renewedSessions.keys())
+          if (!state.sessions.some((item) => item.hash === key))
+            renewedSessions.delete(key);
+        return { ...session, expiresAt: new Date(expiresAt).toISOString() };
+      });
     },
     leave: (req, input) => {
       if (
@@ -2081,16 +2497,38 @@ export async function createAccessService({
   };
 }
 
-// Ignore spoofed forwarding headers: only the gateway's actual peer is trusted.
+// Treat privacy addresses in the same IPv6 subnet as one rate-limit client.
+export function accessClientKey(address) {
+  if (typeof address !== "string") return "unknown";
+  const value = address.toLowerCase().replace(/%.*/, "");
+  if (value.startsWith("::ffff:") && isIP(value.slice(7)) === 4)
+    return value.slice(7);
+  if (isIP(value) !== 6) return isIP(value) ? value : "unknown";
+  const [left, right = ""] = value.split("::");
+  const head = left ? left.split(":") : [],
+    tail = right ? right.split(":") : [];
+  const groups = value.includes("::")
+    ? [...head, ...Array(8 - head.length - tail.length).fill("0"), ...tail]
+    : head;
+  return (
+    groups
+      .slice(0, 4)
+      .map((group) => Number.parseInt(group, 16).toString(16))
+      .join(":") + "::/64"
+  );
+}
+
+// Ignore spoofed forwarding headers unless the gateway supplies a trusted key.
 export function createAccessRateLimiter({
   limit = 10,
-  keyForRequest = (req) => req.socket?.remoteAddress || "unknown",
+  keyForRequest = (req) => accessClientKey(req.socket?.remoteAddress),
+  failuresOnly = false,
   windowMs = 15 * 60 * 1000,
   maxEntries = 10_000,
   now = Date.now,
 } = {}) {
   const entries = new Map();
-  return (req, res, next) => {
+  const middleware = (req, res, next) => {
     const time = now();
     for (const [key, entry] of entries)
       if (entry.expiresAt <= time) entries.delete(key);
@@ -2098,16 +2536,22 @@ export function createAccessRateLimiter({
     let entry = entries.get(key);
     if (!entry) {
       if (entries.size >= maxEntries) {
-        res.setHeader("Retry-After", String(Math.ceil(windowMs / 1000)));
-        return res
-          .status(429)
-          .json({ error: "Too many sign-in attempts. Try again later." });
+        const oldest = [...entries].reduce(
+          (first, entry) =>
+            !first || entry[1].expiresAt < first[1].expiresAt ? entry : first,
+          null,
+        );
+        if (oldest) entries.delete(oldest[0]);
       }
       entry = { count: 0, expiresAt: time + windowMs };
       entries.set(key, entry);
     }
-    entry.count += 1;
-    if (entry.count > (typeof limit === "function" ? limit(req) : limit)) {
+    if (!failuresOnly) entry.count += 1;
+    if (
+      entry.count >=
+      (typeof limit === "function" ? limit(req) : limit) +
+        (failuresOnly ? 0 : 1)
+    ) {
       res.setHeader(
         "Retry-After",
         String(Math.max(1, Math.ceil((entry.expiresAt - time) / 1000))),
@@ -2116,6 +2560,14 @@ export function createAccessRateLimiter({
         .status(429)
         .json({ error: "Too many sign-in attempts. Try again later." });
     }
+    if (failuresOnly && typeof res.once === "function")
+      res.once("finish", () => {
+        if (res.statusCode === 401) entry.count += 1;
+        else if (res.statusCode >= 200 && res.statusCode < 300)
+          entries.delete(key);
+      });
     next();
   };
+  middleware.reset = (req) => entries.delete(keyForRequest(req));
+  return middleware;
 }

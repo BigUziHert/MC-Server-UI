@@ -1,3 +1,4 @@
+import { SetupAccountContext, UnfinishedSetupNotice } from "./setup-drafts";
 import {
   useCallback,
   useContext,
@@ -8,11 +9,11 @@ import {
 } from "react";
 import {
   ArrowDown,
+  AlertCircle,
   ArrowDownToLine,
   ArrowRight,
   Box,
   Check,
-  CheckCheck,
   ChevronRight,
   CircleHelp,
   Clock3,
@@ -103,8 +104,17 @@ type Page =
   | "backups"
   | "audit";
 type Server = {
+  orphaned?: boolean;
+  orphanedUnresolved?: boolean;
+  lastExit?: {
+    at: string;
+    code: number | null;
+    reason?: string;
+    unexpected?: boolean;
+    startupFailed?: boolean;
+  } | null;
   name: string;
-  address: string;
+  address: string | null;
   status: "running" | "offline" | "starting" | "stopping";
   mode: "live";
   version: string | null;
@@ -118,7 +128,8 @@ type Server = {
   iconVersion?: string | null;
   serverIconVersion?: string | null;
   iconPreference?: "server" | "default";
-  addressSource?: "public" | "custom" | "local";
+  addressSource?: "public" | "custom" | "local" | "lan" | "unavailable";
+  lanAddress?: string | null;
   addressNote?: string;
   memoryLimit: number | null;
   memoryLimitSource?: "panel" | "launch" | "unknown";
@@ -304,15 +315,17 @@ function Sparkline({
   );
 }
 
-export default function App(props: Parameters<typeof PanelApp>[0]) {
+export default function App(props: Parameters<typeof LegacyHostedPanelApp>[0]) {
   return window.mcPanelConnections?.unified ? (
     <DesktopWorkspace />
   ) : (
-    <PanelApp {...props} />
+    <LegacyHostedPanelApp {...props} />
   );
 }
 
-function PanelApp({
+// Host-served compatibility for pre-unified released desktop shells.
+// This branch is intentionally retained; see docs/legacy-desktop-compatibility.md.
+function LegacyHostedPanelApp({
   session,
   onSignedOut,
   requestedRemoteServer,
@@ -663,7 +676,7 @@ function PanelApp({
     else if (!active)
       document.title = `${loading ? "Opening" : error ? "Connection error" : "Welcome"} · MC Panel`;
   }, [active, error, firstServerSetup, loading]);
-  const saved = (server: ServerRecord) => {
+  const saved = (server: ServerRecord, outcome?: { incomplete?: boolean }) => {
     fleetRequest.current++;
     fleetInFlight.current = false;
     setLoading(false);
@@ -676,11 +689,13 @@ function PanelApp({
     setActiveId(server.id);
     if (!manager?.editing) window.location.hash = "console";
     setNotice(
-      manager?.editing
-        ? "Server settings saved."
-        : server.source === "imported"
-          ? "Server imported. Your files stay in their original folder."
-          : "Server created. Your new workspace is ready.",
+      outcome?.incomplete
+        ? "Server created, but installation did not finish. Open Versions or Launchpad to finish setup before starting."
+        : manager?.editing
+          ? "Server settings saved."
+          : server.source === "imported"
+            ? "Server imported. Your files stay in their original folder."
+            : "Server created. Your new workspace is ready.",
     );
     setManager(null);
     void loadServers();
@@ -726,7 +741,8 @@ function PanelApp({
             onConnect={setConnection}
             onAdd={
               canAddServer
-                ? () => setManager({ editing: null, initialStep: "choice" })
+                ? (initialStep = "choice") =>
+                    setManager({ editing: null, initialStep })
                 : undefined
             }
             onSettings={
@@ -814,7 +830,7 @@ function PanelApp({
           className={`toast ${!active || firstServerSetup ? "fleet-empty-toast" : ""}`}
           role="status"
         >
-          <CheckCheck size={18} />
+          <MessageSquare size={18} />
           <span>{notice}</span>
           <button
             aria-label="Dismiss server notification"
@@ -829,9 +845,18 @@ function PanelApp({
   return (
     <SessionActiveContext.Provider value={isSessionActive}>
       <SessionScopeContext.Provider value={sessionScope}>
-        <PropertyDraftsContext.Provider value={propertyDrafts.current}>
-          {workspace}
-        </PropertyDraftsContext.Provider>
+        <SetupAccountContext.Provider
+          value={
+            session?.accountId ||
+            session?.userId ||
+            session?.email ||
+            "local-owner"
+          }
+        >
+          <PropertyDraftsContext.Provider value={propertyDrafts.current}>
+            {workspace}
+          </PropertyDraftsContext.Provider>
+        </SetupAccountContext.Provider>
       </SessionScopeContext.Provider>
     </SessionActiveContext.Provider>
   );
@@ -1067,7 +1092,7 @@ export function ServerWorkspace({
   servers: ServerRecord[];
   selected: ServerRecord;
   onSelect: (id: string) => void;
-  onAdd?: () => void;
+  onAdd?: (step?: "choice" | "create" | "import") => void;
   onSettings?: (status?: ServerRecord["status"]) => void;
   onConnect: (mode: ConnectionMode) => void;
   session?: PanelSession;
@@ -1078,8 +1103,14 @@ export function ServerWorkspace({
   const panelTarget = useContext(PanelScope);
   const can = (permission: string) =>
     !permissions || permissions.includes(permission);
-  const allowedNavigation = navigation.filter(
-    (item) => !pagePermissions[item.id] || can(pagePermissions[item.id]!),
+  const allowedNavigation = navigation.filter((item) =>
+    item.id === "files"
+      ? can("file.read") || can("backup.read")
+      : item.id === "players"
+        ? can("players.read") ||
+          can("players.whitelist") ||
+          can("control.console")
+        : !pagePermissions[item.id] || can(pagePermissions[item.id]!),
   );
   const [requestedPage, setPage] = useState<Page>(getPage);
   const page = allowedNavigation.some((item) => item.id === requestedPage)
@@ -1187,10 +1218,22 @@ export function ServerWorkspace({
   }, [api]);
   const controls = useServerPower(server, refresh, notify, permissions);
   useEffect(() => {
-    void refresh();
-    const timer = window.setInterval(refresh, 3000);
+    let running = false;
+    const poll = async () => {
+      if (running || document.visibilityState === "hidden") return;
+      running = true;
+      try {
+        await refresh();
+      } finally {
+        running = false;
+      }
+    };
+    void poll();
+    const timer = window.setInterval(poll, 3000);
+    document.addEventListener("visibilitychange", poll);
     return () => {
       clearInterval(timer);
+      document.removeEventListener("visibilitychange", poll);
       latestStatusResponse.current = ++statusRequest.current;
     };
   }, [refresh]);
@@ -1474,6 +1517,49 @@ export function ServerWorkspace({
           </div>
         </header>
         <main className="main-content">
+          {onAdd && (
+            <UnfinishedSetupNotice
+              serverId={selected.id}
+              onResume={() => onAdd("choice")}
+            />
+          )}
+          {server?.orphaned && (
+            <div className="management-notice warning" role="alert">
+              <AlertCircle size={18} />
+              <span>
+                {server.orphanedUnresolved
+                  ? "The previous launcher exited, and its remaining server processes cannot be identified safely. Stop this server's Java processes on the host before confirming below."
+                  : "A server process from a previous panel session is still running. Settings stay locked until it stops. Force stop can recover control, but unsaved game progress may be lost."}
+              </span>
+              {server.orphanedUnresolved && !permissions && (
+                <button
+                  className="btn"
+                  onClick={() => controls.setConfirmPower("resolve-orphan")}
+                >
+                  Confirm already stopped
+                </button>
+              )}
+            </div>
+          )}
+          {server?.status === "offline" &&
+            (server.lastExit?.unexpected || server.lastExit?.startupFailed) && (
+              <div className="connection-error" role="alert">
+                <strong>
+                  {server.lastExit.startupFailed
+                    ? "Server startup failed."
+                    : "The server stopped unexpectedly."}
+                </strong>{" "}
+                {server.lastExit.reason ||
+                  `Exit code ${server.lastExit.code ?? "unknown"}.`}{" "}
+                <a className="btn" href="#console">
+                  Review Console logs
+                </a>
+                <span>
+                  Check the latest error, Java version, and installed mods
+                  before restarting.
+                </span>
+              </div>
+            )}
           {connectionError && (
             <div className="connection-error" role="alert">
               {selected.sourceError
@@ -1514,10 +1600,18 @@ export function ServerWorkspace({
             <Players notify={notify} permissions={permissions} />
           )}
           {page === "versions" && (
-            <Versions notify={notify} permissions={permissions} />
+            <Versions
+              notify={notify}
+              permissions={permissions}
+              serverData={server}
+            />
           )}
           {page === "launchpad" && (
-            <Launchpad notify={notify} permissions={permissions} />
+            <Launchpad
+              notify={notify}
+              permissions={permissions}
+              onCreateServer={onAdd ? () => onAdd("create") : undefined}
+            />
           )}
           {page === "properties" && (
             <Properties notify={notify} permissions={permissions} />
@@ -1551,7 +1645,11 @@ export function ServerWorkspace({
           className={`toast ${toast.error ? "error" : ""}`}
           role={toast.error ? "alert" : "status"}
         >
-          {toast.error ? <CircleHelp size={18} /> : <CheckCheck size={18} />}
+          {toast.error ? (
+            <AlertCircle size={18} />
+          ) : (
+            <MessageSquare size={18} />
+          )}
           <span>{toast.message}</span>
           <button
             aria-label="Dismiss notification"
@@ -1646,25 +1744,30 @@ function useServerPower(
   const [commandBusy, setCommandBusy] = useState(false);
   const commandRequest = useRef(0);
   const [powerAction, setPowerAction] = useState<
-    "start" | "stop" | "restart" | "force-stop" | null
+    "start" | "stop" | "restart" | "force-stop" | "resolve-orphan" | null
   >(null);
   const activePowerAction = useRef<typeof powerAction>(null);
   const powerRequest = useRef(0);
   const busy = commandBusy || powerAction !== null;
-  const canPower = (action: "start" | "stop" | "restart" | "force-stop") =>
+  const canPower = (
+    action: "start" | "stop" | "restart" | "force-stop" | "resolve-orphan",
+  ) =>
     !permissions ||
-    permissions.includes(
-      `control.${action === "force-stop" ? "stop" : action}`,
-    );
+    (action !== "resolve-orphan" &&
+      permissions.includes(
+        `control.${action === "force-stop" ? "stop" : action}`,
+      ));
   const [confirmPower, setConfirmPower] = useState<
-    "restart" | "force-stop" | null
+    "restart" | "force-stop" | "resolve-orphan" | null
   >(null);
   useDialogFocus(confirmPower !== null, () => setConfirmPower(null));
   useEffect(() => {
     if (confirmPower === "force-stop" && server?.status !== "stopping")
       setConfirmPower(null);
   }, [confirmPower, server?.status]);
-  async function power(action: "start" | "stop" | "restart" | "force-stop") {
+  async function power(
+    action: "start" | "stop" | "restart" | "force-stop" | "resolve-orphan",
+  ) {
     if (!canPower(action)) return;
     // Block repeated clicks before React updates both sets of controls. A
     // confirmed force stop can still replace a graceful stop that is stuck.
@@ -1685,7 +1788,9 @@ function useServerPower(
     try {
       await post("/server/power", {
         action,
-        ...(action === "force-stop" ? { confirmed: true } : {}),
+        ...(["force-stop", "resolve-orphan"].includes(action)
+          ? { confirmed: true }
+          : {}),
       });
       if (token !== powerRequest.current) return;
       await refresh();
@@ -1760,7 +1865,7 @@ function PowerButtons({
           }}
         >
           <Square size={12} fill="currentColor" />
-          {server?.status === "stopping" ? "Force Stop" : "Stop"}
+          {server?.status === "stopping" ? "Force stop" : "Stop"}
         </button>
       )}
     </div>
@@ -1784,13 +1889,16 @@ function PowerConfirmation({
             aria-labelledby="power-title"
           >
             <h2 id="power-title">
-              {confirmPower === "force-stop" ? "Force stop" : "Restart"} your
-              server?
+              {confirmPower === "resolve-orphan"
+                ? "Confirm the server is already stopped?"
+                : `${confirmPower === "force-stop" ? "Force stop" : "Restart"} your server?`}
             </h2>
             <p>
-              {confirmPower === "force-stop"
-                ? "This immediately ends the server process without waiting for saving to finish. Unsaved progress may be lost or world files damaged. Use this only if the server is stuck stopping. The server will stay stopped."
-                : "Connected players will be disconnected. The server will receive a graceful stop command to save its world."}
+              {confirmPower === "resolve-orphan"
+                ? "Confirm only after checking the host and stopping every Java process belonging to this server. The panel checks its game port before unlocking files. Other servers must remain untouched."
+                : confirmPower === "force-stop"
+                  ? "This immediately ends the server process without waiting for saving to finish. Unsaved progress may be lost or world files damaged. Use this only if the server is stuck stopping. The server will stay stopped."
+                  : "Connected players will be disconnected. The server will receive a graceful stop command to save its world."}
             </p>
             <div className="modal-actions">
               <button className="btn" onClick={() => setConfirmPower(null)}>
@@ -1800,9 +1908,11 @@ function PowerConfirmation({
                 className={`btn ${confirmPower === "restart" ? "restart-button" : "danger"}`}
                 onClick={() => power(confirmPower)}
               >
-                {confirmPower === "force-stop"
-                  ? "Force stop server"
-                  : "Restart server"}
+                {confirmPower === "resolve-orphan"
+                  ? "I stopped this server's processes"
+                  : confirmPower === "force-stop"
+                    ? "Force stop server"
+                    : "Restart server"}
               </button>
             </div>
           </section>
@@ -1874,7 +1984,20 @@ function ConsolePage({
       const latest = Number(result.lines.at(-1)?.id ?? 0);
       if (latest && latest < lastLogId.current) setHiddenUntil(null);
       if (latest) lastLogId.current = latest;
-      setLines(result.lines);
+      setLines((previous) =>
+        previous.length === result.lines.length &&
+        previous.every((line, index) => {
+          const next = result.lines[index];
+          return (
+            line.id === next.id &&
+            line.time === next.time &&
+            line.level === next.level &&
+            line.message === next.message
+          );
+        })
+          ? previous
+          : result.lines,
+      );
       setLogError(false);
     } catch {
       if (request < latestLogResponse.current) return;
@@ -1884,10 +2007,22 @@ function ConsolePage({
   }, [api, canConsole]);
   useEffect(() => {
     if (!canConsole) return;
-    void loadLogs();
-    const timer = setInterval(loadLogs, 1500);
+    let running = false;
+    const poll = async () => {
+      if (running || document.visibilityState === "hidden") return;
+      running = true;
+      try {
+        await loadLogs();
+      } finally {
+        running = false;
+      }
+    };
+    void poll();
+    const timer = setInterval(poll, 1500);
+    document.addEventListener("visibilitychange", poll);
     return () => {
       clearInterval(timer);
+      document.removeEventListener("visibilitychange", poll);
       latestLogResponse.current = ++logRequest.current;
     };
   }, [loadLogs, canConsole]);
@@ -1955,6 +2090,7 @@ function ConsolePage({
     }
   }
   function downloadLogs() {
+    if (!lines.length) return;
     const blob = new Blob(
       [
         lines
@@ -1970,8 +2106,10 @@ function ConsolePage({
     const anchor = document.createElement("a");
     anchor.href = url;
     anchor.download = "server-console.log";
+    document.body.appendChild(anchor);
     anchor.click();
-    URL.revokeObjectURL(url);
+    anchor.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 60_000);
     notify("Console log download started.");
   }
   const isRunning = server?.status === "running";
@@ -2026,16 +2164,14 @@ function ConsolePage({
               {onSettings && (
                 <button
                   className="rename-server-button"
-                  aria-label="Rename server"
-                  title="Rename server"
+                  aria-label="Edit server settings"
+                  title="Server settings (including name)"
                   onClick={onSettings}
                 >
                   <Pencil size={14} />
                 </button>
               )}
-              <span
-                className={`status-badge ${isRunning ? "running" : "offline"}`}
-              >
+              <span className={`status-badge ${server?.status || "offline"}`}>
                 <i />
                 {server?.status || "Connecting"}
               </span>
@@ -2050,6 +2186,17 @@ function ConsolePage({
               <span>{gameAddress || "Loading address…"}</span>
               <Copy size={12} />
             </button>
+            {server?.addressNote && (
+              <p className="address-note" role="status">
+                {server.addressNote}
+              </p>
+            )}
+            {server?.lanAddress &&
+              formatGameAddress(server.lanAddress) !== gameAddress && (
+                <p className="address-note">
+                  On the same network: {formatGameAddress(server.lanAddress)}
+                </p>
+              )}
           </div>
         </div>
         {server?.sourceError && <p role="status">{server.sourceError}</p>}
@@ -2157,11 +2304,18 @@ function ConsolePage({
           <div className="storage-progress">
             <div
               style={{
-                width: `${Math.max(1, Math.min(100, ((server?.disk || 0) / (server?.diskLimit || 1024 ** 3)) * 100))}%`,
+                width:
+                  server?.diskLimit && server.disk != null
+                    ? `${Math.min(100, (server.disk / server.diskLimit) * 100)}%`
+                    : "0%",
               }}
             />
           </div>
-          <div className="metric-footnote">Filesystem storage</div>
+          <div className="metric-footnote">
+            {server?.diskLimit
+              ? "Filesystem storage"
+              : "Filesystem capacity unavailable"}
+          </div>
         </div>
         <div className="metric-card players-metric">
           <div className="metric-label">
@@ -2170,7 +2324,7 @@ function ConsolePage({
           </div>
           <div className="metric-value">
             {playersUnavailable ? "—" : server?.players.length || 0}
-            <span>/ {server?.maxPlayers || 20}</span>
+            <span>/ {server?.maxPlayers ?? "—"}</span>
           </div>
           <div className="metric-subtitle">
             {playersUnavailable
@@ -2227,6 +2381,7 @@ function ConsolePage({
                   className="tool-button"
                   aria-label="Download console logs"
                   title="Download logs"
+                  disabled={!lines.length}
                   onClick={downloadLogs}
                 >
                   <ArrowDownToLine size={16} />
@@ -2282,6 +2437,14 @@ function ConsolePage({
               role="log"
               aria-label="Server console output"
               aria-live="off"
+              onScroll={(event) => {
+                const output = event.currentTarget;
+                if (
+                  output.scrollHeight - output.clientHeight - output.scrollTop >
+                  24
+                )
+                  setAutoScroll(false);
+              }}
             >
               {logError ? (
                 <div className="console-empty">

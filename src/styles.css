@@ -16,6 +16,10 @@
   --muted: #969bb3;
   --accent: #ffd000;
   --danger: #dc2040;
+  --danger-text: #ffb3bd;
+  --danger-surface: #3a232d;
+  --danger-border: #784452;
+  --modal-backdrop: #090a12b8;
 }
 * {
   box-sizing: border-box;
@@ -55,7 +59,7 @@ a:focus-visible,
 input:focus-visible,
 select:focus-visible,
 textarea:focus-visible {
-  outline: 2px solid #ffd000;
+  outline: 2px solid var(--accent);
   outline-offset: 3px;
 }
 a {
@@ -141,7 +145,7 @@ textarea::placeholder {
   }
 }
 input[type="checkbox"] {
-  accent-color: #ffd000;
+  accent-color: var(--accent);
   width: 15px;
   height: 15px;
 }
@@ -186,7 +190,7 @@ input:disabled {
   letter-spacing: -0.7px;
 }
 .brand-icon {
-  background: #ffd000;
+  background: var(--accent);
   color: #20212b;
   height: 37px;
   width: 37px;
@@ -210,7 +214,7 @@ input:disabled {
   display: grid;
   place-items: center;
   background: #272833;
-  color: #ffd000;
+  color: var(--accent);
   border-radius: 6px;
   width: 32px;
   height: 34px;
@@ -298,16 +302,16 @@ input:disabled {
 }
 .nav-item.active {
   background: #272833;
-  color: #ffd000;
+  color: var(--accent);
   font-weight: 550;
 }
 .nav-item.active svg {
-  color: #ffd000;
+  color: var(--accent);
 }
 .nav-active-dot {
   width: 5px;
   height: 5px;
-  background: #ffd000;
+  background: var(--accent);
   border-radius: 50%;
   margin-left: auto;
 }
@@ -419,7 +423,7 @@ input:disabled {
   color: #b1b6ce;
 }
 .help-button:hover {
-  color: #ffd000;
+  color: var(--accent);
 }
 .main-content {
   min-width: 0;
@@ -462,13 +466,14 @@ input:disabled {
   border-color: #404356;
 }
 .btn.primary {
-  background: #ffd000;
-  border-color: #ffd000;
+  background: var(--accent);
+  border-color: var(--accent);
   color: #20212b;
   font-weight: 650;
 }
 .btn.primary:hover:not(:disabled) {
-  background: #ffd000;
+  background: #ffe05c;
+  border-color: var(--accent);
 }
 .btn.danger,
 .btn.stop-button {
@@ -602,13 +607,13 @@ input:disabled {
   padding: 4px 7px;
   border-radius: 4px;
   border: 1px solid #404356;
-  color: #ffd000;
+  color: var(--accent);
   background: #272833;
 }
 .status-badge i {
   width: 4px;
   height: 4px;
-  background: #ffd000;
+  background: var(--accent);
   border-radius: 50%;
 }
 .status-badge.offline {
@@ -631,7 +636,7 @@ input:disabled {
   font-size: 10px;
 }
 .address-button:hover {
-  color: #ffd000;
+  color: var(--accent);
 }
 .server-power {
   display: flex;
@@ -808,7 +813,7 @@ input:disabled {
   display: flex;
   align-items: center;
   gap: 4px;
-  color: #ffd000;
+  color: var(--accent);
   background: #272833;
   border: 1px solid #303140;
   border-radius: 3px;
@@ -820,7 +825,7 @@ input:disabled {
   height: 3px;
   width: 3px;
   border-radius: 50%;
-  background: #ffd000;
+  background: var(--accent);
 }
 .console-tools {
   display: flex;
@@ -866,7 +871,7 @@ input:disabled {
 .console-level-warn[aria-pressed="true"] {
   border-color: #776229;
   background: #3b3218;
-  color: #ffd000;
+  color: var(--accent);
 }
 .tool-button {
   background: none;
@@ -928,18 +933,18 @@ input:disabled {
   overflow-wrap: anywhere;
 }
 .log-success .log-level {
-  color: #ffd000;
+  color: var(--accent);
   background: #272833;
 }
 .log-success .log-message {
   color: #d4d8e9;
 }
 .log-warn .log-level {
-  color: #ffd000;
+  color: var(--accent);
   background: #3b3218;
 }
 .log-warn .log-message {
-  color: #ffd000;
+  color: var(--accent);
 }
 .log-error .log-level {
   color: var(--danger);
@@ -998,7 +1003,7 @@ input:disabled {
   padding: 11px 14px;
   background: #20212b;
   border-top: 1px solid #303140;
-  color: #ffd000;
+  color: var(--accent);
 }
 .command-form input {
   background: none;
@@ -1024,7 +1029,7 @@ input:disabled {
   color: #969bb3;
 }
 .command-form button {
-  background: #ffd000;
+  background: var(--accent);
   color: #272833;
   display: grid;
   place-items: center;
@@ -1096,7 +1101,7 @@ input:disabled {
 }
 .connection-error {
   background: #352323;
-  color: #efb3ac;
+  color: var(--danger-text);
   border: 1px solid #5c3833;
   padding: 12px 15px;
   border-radius: 7px;
@@ -1184,7 +1189,7 @@ input:disabled {
   display: grid;
   place-items: center;
   background: #303140;
-  color: #ffd000;
+  color: var(--accent);
 }
 .help-modal p {
   font-size: 12px;
@@ -1196,7 +1201,7 @@ input:disabled {
 }
 .help-step > span {
   background: #272833;
-  color: #ffd000;
+  color: var(--accent);
   width: 25px;
   height: 25px;
   border-radius: 50%;
@@ -1718,8 +1723,8 @@ input:disabled {
   transition: transform 0.15s;
 }
 .shared-switch[aria-checked="true"] .shared-switch-track {
-  border-color: var(--accent, #ffd600);
-  background: var(--accent, #ffd600);
+  border-color: var(--accent, var(--accent));
+  background: var(--accent, var(--accent));
 }
 .shared-switch[aria-checked="true"] .shared-switch-track > span {
   transform: translateX(14px);
@@ -1730,7 +1735,7 @@ input:disabled {
   cursor: not-allowed;
 }
 .shared-switch:focus-visible {
-  outline: 2px solid var(--accent, #ffd600);
+  outline: 2px solid var(--accent, var(--accent));
   outline-offset: 4px;
   border-radius: 4px;
 }
@@ -1752,4 +1757,61 @@ input:disabled {
 }
 .players-roster-search {
   margin: 10px;
+}
+
+/* Shared feedback, status and dialog tokens apply across workspace pages. */
+.form-error,
+.management-notice.warning {
+  color: var(--danger-text);
+  background: var(--danger-surface);
+  border: 1px solid var(--danger-border);
+  border-radius: 8px;
+  padding: 12px;
+}
+.form-error:empty {
+  display: none;
+}
+.management-notice.warning svg {
+  color: var(--danger-text);
+}
+.status-badge.starting,
+.status-badge.stopping {
+  color: var(--accent);
+  background: #ffd00012;
+}
+.status-badge.starting i,
+.status-badge.stopping i {
+  background: var(--accent);
+}
+:is(dialog)::backdrop {
+  background: var(--modal-backdrop) !important;
+  backdrop-filter: blur(4px) !important;
+}
+:is(
+  .modal-actions,
+  .storage-modal-footer,
+  .management-dialog-actions,
+  .server-dialog-actions,
+  .updates-actions
+) {
+  gap: 10px;
+  flex-wrap: wrap;
+}
+.btn:is(
+    .players-remove,
+    .subuser-delete,
+    .delete-action,
+    .launchpad-remove
+  ):hover:not(:disabled) {
+  color: var(--danger-text) !important;
+  border-color: var(--danger-border) !important;
+  background: var(--danger-surface) !important;
+}
+.storage-actions .btn.small {
+  font-size: 11px;
+}
+
+.workspace-notification {
+  top: 20px;
+  bottom: auto;
 }

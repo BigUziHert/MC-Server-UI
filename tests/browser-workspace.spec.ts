@@ -1063,7 +1063,7 @@ test("browser creation and import use only the host that granted creation access
       name: "Import an existing server",
       exact: true,
     }),
-  ).toContainText("Server PC: c.example.test");
+  ).toContainText("Computer: c.example.test");
   expect(
     calls.some(
       (call) => call.path === "/api/server-setup" && call.origin === home,

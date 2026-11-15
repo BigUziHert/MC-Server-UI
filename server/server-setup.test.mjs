@@ -275,6 +275,8 @@ test("catalog-only Launchpad exposes no install or file-management methods and n
   assert.deepEqual(Object.keys(catalog).sort(), [
     "close",
     "config",
+    "dependencies",
+    "invalidateCatalogCaches",
     "search",
     "settings",
     "versions",
@@ -543,7 +545,8 @@ test("guided modpacks install their runtime atomically and switching to Vanilla 
   );
   assert.equal(packJob.status, "completed", JSON.stringify(packJob));
   assert.deepEqual(runtimeStages, ["neoforge"]);
-  for (const removed of ["old-world", "mods/old-loader.jar", "config/old.toml"])
+  assert.ok((await fs.stat(path.join(serverDir, "old-world"))).isDirectory());
+  for (const removed of ["mods/old-loader.jar", "config/old.toml"])
     await assert.rejects(fs.stat(path.join(serverDir, removed)), {
       code: "ENOENT",
     });
@@ -796,10 +799,7 @@ test("explicit EULA acceptance and the new-server CurseForge key are persisted w
   const instanceDir = path.dirname(created.body.server.serverDir);
   assert.equal(
     JSON.parse(
-      await fs.readFile(
-        path.join(instanceDir, "catalog-settings.json"),
-        "utf8",
-      ),
+      await fs.readFile(path.join(f.root, "catalog-settings.json"), "utf8"),
     ).curseforgeApiKey,
     "fixture-key",
   );
@@ -964,7 +964,7 @@ test("pack reviews expose verified runtime requirements, clean scratch data and 
   );
   assert.equal(scratch.length, 1);
   assert.equal(path.dirname(scratch[0]), scratchParent);
-  assert.deepEqual(await fs.readdir(scratchParent), []);
+  await assert.rejects(fs.stat(scratchParent), { code: "ENOENT" });
   assert.deepEqual(await fs.readdir(f.root), before);
   await assert.rejects(fs.stat(installationDirectory), { code: "ENOENT" });
 });

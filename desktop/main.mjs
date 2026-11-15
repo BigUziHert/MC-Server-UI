@@ -7,6 +7,7 @@ import {
   dialog,
   ipcMain,
   Menu,
+  Notification,
   nativeImage,
   session,
   safeStorage,
@@ -150,6 +151,48 @@ async function requestQuit(installUpdate = false) {
       .filter(
         (server) => server.mode === "live" && server.status !== "offline",
       );
+    const active = [...(runtime?.fleet.runtimes.values() || [])].flatMap(
+      (server) => {
+        const activity = server.activity?.();
+        if (
+          !activity ||
+          (!activity.launchpad &&
+            !activity.versions?.length &&
+            !activity.backups?.length &&
+            !activity.mutations)
+        )
+          return [];
+        return [{ server, name: server.descriptor().name, activity }];
+      },
+    );
+    if (active.length) {
+      const { response } = await dialog.showMessageBox(window, {
+        type: "warning",
+        title: installUpdate
+          ? "Wait before installing the update?"
+          : "Work is still running",
+        message:
+          "These servers have active installations, backups or file changes.",
+        detail:
+          active
+            .map(
+              ({ name, activity }) =>
+                `${name}: ${activity.launchpad?.message ?? activity.versions?.[0]?.message ?? (activity.backups?.length ? "creating a backup" : "changing files")}`,
+            )
+            .join("\n") +
+          "\nQuit anyway cancels unfinished downloads. Promotion and backup finalization still finish safely.",
+        buttons: ["Keep running", "Quit when finished", "Quit anyway"],
+        defaultId: 0,
+        cancelId: 0,
+        noLink: true,
+      });
+      if (response === 0) {
+        quitting = false;
+        return false;
+      }
+      if (response === 1)
+        await Promise.all(active.map(({ server }) => server.waitForIdle?.()));
+    }
     if (running.length) {
       const { response } = await dialog.showMessageBox(window, {
         type: "question",
@@ -227,7 +270,7 @@ async function requestQuit(installUpdate = false) {
             title: "Shutdown is still waiting",
             message: "A Minecraft server is still saving or stopping.",
             detail:
-              "MC Panel will keep waiting without interrupting server writes. You can inspect desktop.log or explicitly exit now. Exiting now can interrupt a world save and does not install a pending update.",
+              "MC Panel will keep waiting without interrupting server writes. You can inspect desktop.log or explicitly exit now. Exiting now requests save-on and stop, waits briefly, and does not install a pending update. Servers that cannot finish stopping will remain running in the background and must be stopped before editing their files.",
             buttons: ["Keep waiting", "Open log folder", "Exit now"],
             defaultId: 0,
             cancelId: 0,
@@ -240,6 +283,7 @@ async function requestQuit(installUpdate = false) {
       },
     );
     if (!finished) {
+      await runtime?.fleet.emergencyRelease?.();
       updates?.dispose();
       canQuit = true;
       tray?.destroy();
@@ -270,14 +314,15 @@ async function requestQuit(installUpdate = false) {
       type: "error",
       title: "Shutdown did not finish",
       message: "MC Panel could not finish saving or stopping a server.",
-      detail:
-        "Details are in desktop.log. Exiting now could interrupt unfinished server writes. Open the log folder to investigate, or choose Exit now to close the app.",
-      buttons: ["Open log folder", "Exit now"],
+      detail: `${cause.message}\n\nRetry quit after resolving the problem, or open desktop.log for details. Exiting now requests save-on and stop, then waits briefly. Servers that cannot finish stopping will remain running in the background.`,
+      buttons: ["Retry quit", "Open log folder", "Exit now"],
       defaultId: 0,
-      cancelId: 0,
+      cancelId: 1,
       noLink: true,
     });
-    if (response === 1) {
+    if (response === 0) return requestQuit(installUpdate);
+    if (response === 2) {
+      await runtime?.fleet.emergencyRelease?.();
       updates?.dispose();
       canQuit = true;
       tray?.destroy();
@@ -387,6 +432,17 @@ async function launch() {
   runtime = await startDesktopRuntime({
     dataDir: path.join(userData, "data"),
     selectServerDirectory,
+    onUnexpectedExit: ({ name, reason }) => {
+      tray?.setToolTip(`MC Panel — ${name} stopped unexpectedly`.slice(0, 127));
+      if (Notification.isSupported()) {
+        const notice = new Notification({
+          title: `${name} stopped unexpectedly`,
+          body: reason,
+        });
+        notice.on("click", showWindow);
+        notice.show();
+      }
+    },
     updates,
     loginItem: {
       supported,

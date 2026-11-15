@@ -378,7 +378,11 @@ test("each fresh manual panel launch starts multiple saved servers once, preserv
   const firstAttempt = runtime.startConfiguredServers();
   assert.equal(runtime.startConfiguredServers(), firstAttempt);
   const result = await firstAttempt;
-  assert.deepEqual(result.startedServerIds, [first.id, second.id]);
+  assert.deepEqual(
+    result.startedServerIds,
+    [first.id, second.id],
+    JSON.stringify(result),
+  );
   assert.deepEqual(
     result.failures.map((failure) => failure.serverId),
     [broken.id, removed.id],
@@ -389,7 +393,7 @@ test("each fresh manual panel launch starts multiple saved servers once, preserv
   );
   assert.match(
     runtime.panelSettings.snapshot().startupError,
-    /no longer available/,
+    /Removed from the panel/,
   );
   assert.equal(spawned.length, 2);
   assert.equal(
@@ -459,4 +463,51 @@ test("window close uses the saved tray preference and never hides a quitting win
           keepWindowInTray({ trayAvailable, quitting, keepInTray }),
           trayAvailable && !quitting && keepInTray,
         );
+});
+
+test("the owner can retry failed automatic starts without spawning successful servers twice", async (t) => {
+  const { launch, spawned } = await fixture(t);
+  const runtime = await launch();
+  const chosen = await server(runtime, "Retry pack", 25585, false);
+  await runtime.panelSettings.save({ autoStartServerIds: [chosen.id] });
+  assert.equal((await runtime.startConfiguredServers()).failures.length, 1);
+  assert.equal(
+    (
+      await fetch(`${runtime.url}/api/desktop/startup/retry`, {
+        method: "POST",
+      })
+    ).status,
+    401,
+  );
+  await acceptEula(runtime, chosen.id);
+  const response = await runtime.request("/desktop/startup/retry", "POST", {});
+  assert.equal(response.status, 200);
+  assert.deepEqual((await response.json()).startedServerIds, [chosen.id]);
+  assert.equal(runtime.panelSettings.snapshot().startupError, undefined);
+  assert.equal(
+    (await runtime.request("/desktop/startup/retry", "POST", {})).status,
+    200,
+  );
+  assert.equal(spawned.length, 1);
+});
+
+test("automatic settings retain removed server names and distinguish disconnected folders", async (t) => {
+  const { dataDir } = await fixture(t);
+  const descriptors = new Map([
+    ["one", { name: "External pack", unavailable: false }],
+    ["two", { name: "Old pack" }],
+  ]);
+  const store = createPanelSettings({
+    dataDir,
+    hasServer: (id) => descriptors.has(id),
+    describeServer: (id) => descriptors.get(id),
+  });
+  await store.save({ autoStartServerIds: ["one", "two"] });
+  descriptors.get("one").unavailable = true;
+  descriptors.delete("two");
+  const result = await store.read();
+  assert.deepEqual(result.missingAutoStartServerIds, ["two"]);
+  assert.deepEqual(result.unavailableAutoStartServerIds, ["one"]);
+  assert.equal(result.autoStartServerNames.two, "Old pack");
+  await store.close();
 });

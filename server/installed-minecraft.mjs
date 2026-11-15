@@ -16,7 +16,54 @@ const wanted = new Set([
   "quilt-server-launch.properties",
   "version.json",
   "META-INF/MANIFEST.MF",
+  "META-INF/versions.list",
+  "patch.properties",
 ]);
+
+function manifestSections(source) {
+  return source
+    .replace(/\r\n?/g, "\n")
+    .replace(/\n /g, "")
+    .split(/\n\n+/)
+    .map((section) => {
+      const fields = new Map();
+      for (const line of section.split("\n")) {
+        if (!line) continue;
+        const match = /^([a-zA-Z0-9_-]+): (.*)$/.exec(line);
+        if (!match || fields.has(match[1].toLowerCase()))
+          throw new Error("Invalid manifest attributes");
+        fields.set(match[1].toLowerCase(), match[2]);
+      }
+      return fields;
+    });
+}
+
+function bundledVersion(source) {
+  if (!source) return {};
+  const lines = source.trim().split(/\r?\n/);
+  if (lines.length !== 1) return {};
+  const [hash, id, target, extra] = lines[0].split("\t");
+  if (
+    extra !== undefined ||
+    !/^[a-f0-9]{64}$/i.test(hash) ||
+    !release(id) ||
+    !target ||
+    target.includes("\\") ||
+    target.split("/").some((part) => !part || part === "." || part === "..")
+  )
+    return {};
+  const product = /^(paper|purpur|folia)-/.exec(target.split("/").at(-1));
+  return {
+    gameVersion: id,
+    ...(product
+      ? {
+          software: { paper: "Paper", purpur: "Purpur", folia: "Folia" }[
+            product[1]
+          ],
+        }
+      : {}),
+  };
+}
 
 // Inspect only bounded metadata; no archive is extracted or executed. Filename
 // guesses cannot select a Minecraft release for an imported server.
@@ -111,16 +158,96 @@ export async function installedMinecraftMetadata({
       : new Map();
     const installer = parseProperties(metadata.get("install.properties") ?? "");
     const main = metadata.get("META-INF/MANIFEST.MF") ?? "";
+    const sections = manifestSections(main);
+    const attributes = sections[0];
+    const mainClass = attributes.get("main-class") ?? "";
     const software =
       metadata.has("fabric-server-launch.properties") ||
       installer.has("fabric-loader-version") ||
-      /Main-Class:\s*net\.fabricmc\./i.test(main)
+      /^net\.fabricmc\./i.test(mainClass)
         ? "Fabric"
         : metadata.has("quilt-server-launch.properties") ||
-            /Main-Class:\s*org\.quiltmc\./i.test(main)
+            /^org\.quiltmc\./i.test(mainClass)
           ? "Quilt"
           : (detected.software ?? configuration.software);
-    if (!["Fabric", "Quilt"].includes(software)) return {};
+    if (!["Fabric", "Quilt"].includes(software)) {
+      const title = `${attributes.get("implementation-title") ?? ""} ${mainClass} ${attributes.get("brand-id") ?? ""}`;
+      const bundled = bundledVersion(metadata.get("META-INF/versions.list"));
+      const forge =
+        /^(?:net\.minecraftforge\.fml|cpw\.mods\.fml)\.relauncher\.ServerLaunchWrapper$|^net\.minecraftforge\.server\.ServerMain$/.test(
+          mainClass,
+        );
+      const identified = forge
+        ? "Forge"
+        : /purpur/i.test(title)
+          ? "Purpur"
+          : /folia/i.test(title)
+            ? "Folia"
+            : /paper(?:clip|mc)?/i.test(title)
+              ? (bundled.software ?? "Paper")
+              : /spigot/i.test(title)
+                ? "Spigot"
+                : /bukkit/i.test(title)
+                  ? "Bukkit"
+                  : /velocity/i.test(title)
+                    ? "Velocity"
+                    : /net\.minecraft\.(?:server|bundler)\.Main/.test(title)
+                      ? "Vanilla"
+                      : null;
+      const versionInfo = JSON.parse(metadata.get("version.json") ?? "{}");
+      const patch = parseProperties(metadata.get("patch.properties") ?? "");
+      // Forge's manifest explicitly identifies the referenced Minecraft server;
+      // this is launcher metadata, not a guess from the user-selected JAR name.
+      const forgeMinecraft = forge
+        ? (attributes.get("class-path") ?? "").split(/\s+/).flatMap((entry) => {
+            const match = /^minecraft_server\.(.+)\.jar$/.exec(entry);
+            return match && release(match[1]) ? [match[1]] : [];
+          })
+        : [];
+      const releases = [
+        ...new Set(
+          [
+            release(versionInfo.id),
+            release(attributes.get("minecraft-version")),
+            release(patch.get("version")),
+            bundled.gameVersion,
+            ...forgeMinecraft,
+          ].filter(Boolean),
+        ),
+      ];
+      const gameVersion = releases.length === 1 ? releases[0] : null;
+      if (!identified) return {};
+      if (forge) {
+        const forgeSection = sections.find(
+          (section) => section.get("name") === "net/minecraftforge/common/",
+        );
+        const rawVersion =
+          forgeSection?.get("implementation-version") ??
+          attributes.get("implementation-version");
+        const loaderVersion =
+          gameVersion && rawVersion?.startsWith(`${gameVersion}-`)
+            ? rawVersion.slice(gameVersion.length + 1)
+            : rawVersion;
+        return {
+          software: identified,
+          ...(gameVersion ? { gameVersion } : {}),
+          ...(/^[0-9]+(?:\.[0-9]+){2,3}(?:[-+][a-zA-Z0-9.-]+)?$/.test(
+            loaderVersion ?? "",
+          )
+            ? { version: loaderVersion }
+            : {}),
+        };
+      }
+      return {
+        software: identified,
+        ...(gameVersion ? { gameVersion, version: gameVersion } : {}),
+        ...(!gameVersion &&
+        identified === "Velocity" &&
+        attributes.get("implementation-version")
+          ? { version: attributes.get("implementation-version") }
+          : {}),
+      };
+    }
     const result = { software };
     const loader = software.toLowerCase();
     const installerVersion = installer.get(`${loader}-loader-version`);

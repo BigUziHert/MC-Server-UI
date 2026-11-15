@@ -38,7 +38,10 @@ const libraryWrapper = (metadata) => {
  * `required` lists mandatory IDs; `requirements` also records constraints from
  * optional dependencies that apply while a replacement provider is installed.
  */
-export async function inspectInstalledMod(archive, { loader, signal } = {}) {
+export async function inspectInstalledMod(
+  archive,
+  { loader, signal, includeRuntime = false } = {},
+) {
   const provided = new Set(),
     required = new Set(),
     providers = [],
@@ -183,6 +186,8 @@ export async function inspectInstalledMod(archive, { loader, signal } = {}) {
           !["javafml", "lowcodefml"].includes(mod.modLoader)
         )
           require(mod.modLoader, mod.loaderVersion);
+        if (includeRuntime && loader === "forge" && mod.modLoader === "javafml")
+          require("javafml", mod.loaderVersion);
         if (mod.dependencies !== undefined && !object(mod.dependencies))
           invalid();
         for (const dependencies of Object.values(mod.dependencies ?? {})) {

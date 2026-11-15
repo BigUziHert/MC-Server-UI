@@ -1,6 +1,7 @@
 import fs from "node:fs/promises";
 import { constants } from "node:fs";
 import path from "node:path";
+import { isCanonicalVolumeAlias } from "./canonical-volume.mjs";
 
 const fail = (status, message) => Object.assign(new Error(message), { status });
 const samePath = (first, second) =>
@@ -31,14 +32,17 @@ async function location(directory) {
           "Choose an actual folder, not a file, symbolic link, or directory junction.",
         );
       const canonical = await fs.realpath(ancestor);
-      if (!samePath(canonical, ancestor))
+      if (
+        !samePath(canonical, ancestor) &&
+        !(await isCanonicalVolumeAlias(ancestor, canonical))
+      )
         throw fail(
           400,
           "Choose the folder's actual path without symbolic links or directory junctions.",
         );
       return {
         directory: path.join(canonical, ...missing),
-        ancestor,
+        ancestor: canonical,
         exists: !missing.length,
       };
     } catch (cause) {

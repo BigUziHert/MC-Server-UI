@@ -232,7 +232,7 @@ export async function createRecycleBin({
     )
       throw error(
         409,
-        "The Recycle Bin storage parent changed. Its files have been retained.",
+        "The Recycle Bin storage parent changed. Restore the original folder on the computer hosting this server, then restart MC Panel and try again.",
       );
     store.parentStat ??= parentStat;
     const checked = await safePath(
@@ -251,7 +251,7 @@ export async function createRecycleBin({
       if (store.rootStat)
         throw error(
           409,
-          "The Recycle Bin storage location changed. Its files have been retained.",
+          "The Recycle Bin folder is missing. Restart MC Panel on the computer hosting this server, then try again. Restarting recreates the folder but cannot recover its deleted contents.",
         );
       return null;
     }
@@ -263,7 +263,7 @@ export async function createRecycleBin({
     )
       throw error(
         409,
-        "The Recycle Bin storage location changed. Its files have been retained.",
+        "The Recycle Bin storage location changed. Restore the original folder on the computer hosting this server, then restart MC Panel and try again.",
       );
     store.rootStat ??= current;
     return checked;
@@ -359,7 +359,7 @@ export async function createRecycleBin({
     let metadata;
     try {
       const metadataPath = await safePath(entryDir, "entry.json");
-      if ((await io.stat(metadataPath)).size > 64 * 1024)
+      if ((await io.stat(metadataPath)).size > 16 * 1024 * 1024)
         throw error(
           409,
           "The recovery record is invalid. Stored files have been retained.",
@@ -709,14 +709,23 @@ export async function createRecycleBin({
   const view = async (record) => {
     const { entryDir, metadata, payload } = record;
     const stored = await lstat(payload);
+    const restoredTarget =
+      !stored && metadata.phase === "restoring" && metadata.restoreIdentity
+        ? await lstat(await originalPathFor(metadata)(metadata.originalPath))
+        : null;
+    const moved =
+      restoredTarget &&
+      sameIdentity(restoredTarget, metadata.restoreIdentity) &&
+      !restoredTarget.isSymbolicLink();
     const deleting = await lstat(await safePath(entryDir, ".deleting"));
     const ready =
-      stored &&
-      !deleting &&
-      !stored.isSymbolicLink() &&
-      (metadata.type === "file" ? stored.isFile() : stored.isDirectory()) &&
-      metadata.phase !== "copying" &&
-      metadata.phase !== "restored";
+      moved ||
+      (stored &&
+        !deleting &&
+        !stored.isSymbolicLink() &&
+        (metadata.type === "file" ? stored.isFile() : stored.isDirectory()) &&
+        metadata.phase !== "copying" &&
+        metadata.phase !== "restored");
     return {
       id: metadata.id,
       name:
@@ -767,7 +776,7 @@ export async function createRecycleBin({
       await assertServerRoot(expected);
       originalRootStat = { ...expected };
     },
-    inspect(id, { signal, includeHash = true } = {}) {
+    inspect(id, { signal, includeHash = true, includePayload = false } = {}) {
       return exclusive(async () => {
         signal?.throwIfAborted();
         const record = await read(id);
@@ -776,9 +785,13 @@ export async function createRecycleBin({
         if (item.status !== "ready") throw error(409, item.message);
         return {
           ...item,
+          ...(includePayload ? { payloadPath: record.payload } : {}),
           ...(includeHash &&
+          (await lstat(record.payload)) &&
           item.type === "file" &&
-          /^mods\/[^/]+\.jar(?:\.disabled)?$/i.test(item.originalPath) &&
+          /^(?:mods|plugins)\/[^/]+\.jar(?:\.disabled)?$/i.test(
+            item.originalPath,
+          ) &&
           item.size <= 512 * 1024 ** 2
             ? { sha512: await hashFile(record.payload, "sha512", signal) }
             : {}),
@@ -958,7 +971,10 @@ export async function createRecycleBin({
         }
       });
     },
-    restore(id, { commitBackup, onProgress } = {}) {
+    restore(
+      id,
+      { commitBackup, onProgress, destinationPath: requestedPath } = {},
+    ) {
       return exclusive(async () => {
         const progress = (update) => {
           try {
@@ -974,6 +990,32 @@ export async function createRecycleBin({
         });
         const record = await read(id);
         const { entryDir, payload, metadata } = record;
+        if (
+          requestedPath !== undefined &&
+          requestedPath !== metadata.originalPath
+        ) {
+          if (metadata.kind === "backup")
+            throw error(
+              400,
+              "Backup archives must return to their original backup history location.",
+            );
+          await originalPathFor(metadata)(requestedPath);
+          metadata.originalPath = requestedPath;
+          await persist(entryDir, metadata);
+        }
+        const movedTarget = metadata.restoreIdentity
+          ? await lstat(await originalPathFor(metadata)(metadata.originalPath))
+          : null;
+        const resumedMove =
+          movedTarget &&
+          sameIdentity(movedTarget, metadata.restoreIdentity) &&
+          !movedTarget.isSymbolicLink() &&
+          (metadata.kind !== "backup" ||
+            (metadata.restoreHash &&
+              movedTarget.isFile() &&
+              (await hashFile(
+                await originalPathFor(metadata)(metadata.originalPath),
+              )) === metadata.restoreHash));
         if (metadata.kind === "backup" && typeof commitBackup !== "function")
           throw error(
             409,
@@ -986,16 +1028,17 @@ export async function createRecycleBin({
           );
         let scannedFiles = 0,
           scannedBytes = 0;
-        await walk(payload, "", [], (row) => {
-          if (row.type === "file") {
-            scannedFiles++;
-            scannedBytes += row.size;
-          }
-          progress({
-            filesProcessed: scannedFiles,
-            bytesProcessed: scannedBytes,
+        if (!resumedMove)
+          await walk(payload, "", [], (row) => {
+            if (row.type === "file") {
+              scannedFiles++;
+              scannedBytes += row.size;
+            }
+            progress({
+              filesProcessed: scannedFiles,
+              bytesProcessed: scannedBytes,
+            });
           });
-        });
         progress({ totalFiles: scannedFiles, totalBytes: scannedBytes });
         const destinationPath = originalPathFor(metadata);
         const destination = await destinationPath(metadata.originalPath);
@@ -1003,12 +1046,13 @@ export async function createRecycleBin({
         // A backup's archive and its history are committed separately. If the
         // panel stopped between them, retry only our verified identical copy.
         const resume =
-          metadata.kind === "backup" &&
-          metadata.phase === "restoring" &&
-          existing?.isFile() &&
-          !existing.isSymbolicLink() &&
-          existing.size === (await io.lstat(payload)).size &&
-          (await hashFile(destination)) === (await hashFile(payload));
+          resumedMove ||
+          (metadata.kind === "backup" &&
+            metadata.phase === "restoring" &&
+            existing?.isFile() &&
+            !existing.isSymbolicLink() &&
+            existing.size === (await lstat(payload))?.size &&
+            (await hashFile(destination)) === (await hashFile(payload)));
         if (existing && !resume)
           throw error(
             409,
@@ -1021,23 +1065,101 @@ export async function createRecycleBin({
           await destinationPath(parent);
         }
         metadata.phase = "restoring";
+        if (!resume) {
+          const stat = await io.lstat(payload);
+          metadata.restoreIdentity = {
+            dev: stat.dev,
+            ino: stat.ino,
+            birthtimeMs: stat.birthtimeMs,
+          };
+          if (metadata.kind === "backup")
+            metadata.restoreHash = await hashFile(payload);
+        }
         await persist(entryDir, metadata);
-        if (!resume)
-          await copyVerified(
-            payload,
-            (relative) =>
-              destinationPath(
-                [metadata.originalPath, relative].filter(Boolean).join("/"),
-              ),
-            progress,
-          );
+        if (!resume) {
+          await destinationPath(metadata.originalPath);
+          if (await lstat(destination))
+            throw error(
+              409,
+              "The restore destination appeared while restoring. Move it and retry.",
+            );
+          try {
+            await io.rename(payload, destination);
+          } catch (cause) {
+            if (cause.code !== "EXDEV") throw cause;
+            const parentDirectory = path.dirname(destination);
+            const stagingName = `.mc-restore-${id}`;
+            const stage = await safePath(parentDirectory, stagingName);
+            if (await lstat(stage))
+              throw error(
+                409,
+                `A previous restore left ${stagingName} beside the destination. Keep or remove that staging copy before retrying; the original archive is retained.`,
+              );
+            await io.mkdir(stage);
+            const stageIdentity = await io.lstat(stage);
+            await copyVerified(
+              payload,
+              (relative) =>
+                safePath(
+                  stage,
+                  ["content", relative].filter(Boolean).join("/"),
+                ),
+              progress,
+            );
+            if (
+              !sameIdentity(
+                await io.lstat(await safePath(parentDirectory, stagingName)),
+                stageIdentity,
+              )
+            )
+              throw error(
+                409,
+                "The restore staging folder changed. Recovery data was retained.",
+              );
+            const content = await safePath(stage, "content");
+            const copied = await io.lstat(content);
+            metadata.restoreIdentity = {
+              dev: copied.dev,
+              ino: copied.ino,
+              birthtimeMs: copied.birthtimeMs,
+            };
+            await persist(entryDir, metadata);
+            await destinationPath(metadata.originalPath);
+            if (await lstat(destination))
+              throw error(
+                409,
+                "The restore destination appeared while copying. The complete copy remains in its staging folder.",
+              );
+            await io.rename(content, destination);
+            await io.rmdir(stage).catch(() => {});
+          }
+        }
         progress({
           phase: "finalizing",
           filesProcessed: scannedFiles,
           bytesProcessed: scannedBytes,
         });
-        if (metadata.kind === "backup")
-          await commitBackup({ ...metadata.backup });
+        if (metadata.kind === "backup") {
+          try {
+            await commitBackup({ ...metadata.backup });
+          } catch (cause) {
+            // A failed history write must leave the archive recoverable. Only
+            // move our exact unchanged archive back; preserve external edits.
+            const target = await lstat(destination);
+            if (
+              !(await lstat(payload)) &&
+              target?.isFile() &&
+              !target.isSymbolicLink() &&
+              sameIdentity(target, metadata.restoreIdentity) &&
+              (await hashFile(destination)) === metadata.restoreHash
+            ) {
+              await io.rename(destination, payload).catch((rollback) => {
+                cause.message += ` The archive remains at its restore destination because recovery rollback failed: ${rollback.message}`;
+              });
+            }
+            throw cause;
+          }
+        }
         metadata.phase = "restored";
         await persist(entryDir, metadata);
         // Restore cleanup removes its archived payload only after the destination

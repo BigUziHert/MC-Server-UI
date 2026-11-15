@@ -1131,8 +1131,14 @@ test("Versions updates an imported NeoForge runtime without a clean install and 
   await expect(
     dialog.getByRole("button", { name: "Install version", exact: true }),
   ).toBeDisabled();
-  await expect(dialog).toContainText("All current files will be removed");
-  await dialog.getByRole("checkbox").check();
+  await expect(dialog).toContainText(
+    "Worlds and server settings stay in place",
+  );
+  await dialog
+    .getByRole("checkbox", { name: "Keep worlds and server settings" })
+    .uncheck();
+  await expect(dialog).toContainText("All current files, including worlds");
+  await dialog.getByRole("checkbox", { name: /I understand/ }).check();
   await expect(
     dialog.getByRole("button", { name: "Install version", exact: true }),
   ).toBeEnabled();
@@ -1163,32 +1169,40 @@ test("Versions updates an imported NeoForge runtime without a clean install and 
   ]);
   await expect(dialog).not.toBeVisible();
 
-  // Both a loader switch and a Minecraft release change require a clean install.
-  for (const [provider, minecraft] of [
-    ["fabric", "1.21.1"],
-    ["neoforge", "1.20.1"],
-  ]) {
-    detectedProvider = provider;
-    detectedMinecraft = minecraft;
-    await expect(
-      page.getByRole("button", { name: "Install", exact: true }),
-    ).toBeVisible();
-    const explanation =
-      provider === "fabric"
-        ? "Runtime updates require the same server software. Changing software requires a clean install."
-        : `Runtime updates are available for Minecraft ${minecraft}. Changing the Minecraft release requires a clean install.`;
-    await expect(page.locator("#runtime-update-reason")).toHaveText(
-      explanation,
-    );
-    await page.getByRole("button", { name: "Install", exact: true }).click();
-    await expect(dialog).toContainText(explanation);
-    await expect(dialog.getByRole("radio")).toHaveCount(0);
-    await expect(
-      dialog.getByRole("button", { name: "Install version", exact: true }),
-    ).toBeDisabled();
-    await expect(dialog.getByRole("checkbox")).not.toBeChecked();
-    await dialog.getByRole("button", { name: "Cancel", exact: true }).click();
-  }
+  // Changing software requires replacement; same-provider Minecraft changes require a separate compatibility acknowledgement.
+  detectedProvider = "fabric";
+  await expect(
+    page.getByRole("button", { name: "Install", exact: true }),
+  ).toBeVisible();
+  await page.getByRole("button", { name: "Install", exact: true }).click();
+  await expect(dialog).toContainText(
+    "Changing software requires a clean install",
+  );
+  await expect(dialog.getByRole("radio")).toHaveCount(0);
+  await expect(
+    dialog.getByRole("button", { name: "Install version", exact: true }),
+  ).toBeDisabled();
+  await dialog.getByRole("button", { name: "Cancel", exact: true }).click();
+  detectedProvider = "neoforge";
+  detectedMinecraft = "1.20.1";
+  await expect(
+    page.getByRole("button", { name: "Change Minecraft version", exact: true }),
+  ).toBeVisible();
+  await page
+    .getByRole("button", { name: "Change Minecraft version", exact: true })
+    .click();
+  await expect(
+    dialog.getByRole("button", { name: "Update runtime", exact: true }),
+  ).toBeDisabled();
+  await dialog.getByRole("checkbox", { name: /I have a backup/ }).check();
+  await dialog
+    .getByRole("button", { name: "Update runtime", exact: true })
+    .click();
+  expect(installations.at(-1)).toMatchObject({
+    updateRuntime: true,
+    acknowledgedRuntimeChange: true,
+    version: "1.21.1",
+  });
 });
 
 test("Versions shows official builds and requires a reviewed choice before installation", async ({
@@ -1268,16 +1282,18 @@ test("Versions shows official builds and requires a reviewed choice before insta
   await expect(dialog.getByRole("button", { name: /Install/ })).toBeDisabled();
   await expect(dialog).toContainText(/worlds|world/i);
   await expect(dialog).toContainText(
-    "All current files will be removed, including worlds, mods, plugins and settings.",
+    "Worlds and server settings stay in place.",
   );
-  await expect(dialog).not.toContainText("stay in place");
+  await expect(
+    dialog.getByRole("checkbox", { name: "Keep worlds and server settings" }),
+  ).toBeChecked();
   const confirm = dialog.getByRole("button", {
     name: "Install version",
     exact: true,
   });
   await dialog
     .getByRole("checkbox", {
-      name: "I understand this replaces all files in this server’s folder.",
+      name: "I understand this replaces server software, mods, and plugins.",
       exact: true,
     })
     .check();
@@ -1300,6 +1316,7 @@ test("Versions shows official builds and requires a reviewed choice before insta
       build: "21.1.250",
       confirmed: true,
       cleanInstall: true,
+      preserveWorld: true,
       requestId: expect.any(String),
     },
   ]);
@@ -1734,10 +1751,10 @@ for (const viewport of [
       "A required server library could not be checked.",
     );
     await expect(dialog).toContainText(
-      "Existing files, including worlds, mods, plugins and settings, will move to Recycle Bin for recovery.",
+      "Worlds and server settings remain in place.",
     );
     const acknowledgement = dialog.getByRole("checkbox", {
-      name: "I understand this replaces all files in this server’s folder.",
+      name: "I understand this replaces pack software, mods, and configuration.",
       exact: true,
     });
     const confirm = dialog.getByRole("button", {
@@ -4239,7 +4256,7 @@ test("Launchpad ignores delayed installed metadata after loader, version, type a
   }
 });
 
-test("Launchpad Minecraft selects show stable releases only and scope filters and reviewed targets", async ({
+test("Launchpad Minecraft selects include the installed snapshot and scope filters independently of reviewed targets", async ({
   page,
   serverId,
 }) => {
@@ -4337,16 +4354,17 @@ test("Launchpad Minecraft selects show stable releases only and scope filters an
     name: "Minecraft version",
     exact: true,
   });
-  await expect(version).toHaveValue("");
+  await expect(version).toHaveValue(experimental[0]);
   await expect(version.locator("option")).toHaveText([
     "All versions",
     ...catalog,
+    experimental[0],
   ]);
   await expect
     .poll(
       () =>
         searches.length > 0 &&
-        !searches.at(-1)?.searchParams.has("gameVersion"),
+        searches.at(-1)?.searchParams.get("gameVersion") === experimental[0],
     )
     .toBe(true);
   await page
@@ -4374,17 +4392,19 @@ test("Launchpad Minecraft selects show stable releases only and scope filters an
     name: "Target Minecraft version",
     exact: true,
   });
-  await expect(target).toHaveValue("");
+  await expect(target).toHaveValue(experimental[0]);
+  await expect(target).toBeDisabled();
   await expect(target.locator("option")).toHaveText([
     "Select Minecraft version",
     ...catalog,
+    experimental[0],
   ]);
-  await target.selectOption("1.21.1");
+
   await dialog.getByRole("button", { name: /Review/ }).click();
   await expect
     .poll(() => review)
     .toMatchObject({
-      gameVersion: "1.21.1",
+      gameVersion: experimental[0],
       loader: "neoforge",
       projectId: "catalog-0",
       versionId: "build",
@@ -4515,16 +4535,9 @@ for (const browse of [
         loader: "neoforge",
       });
 
-    await targetVersion.selectOption("26.2");
-    await expect(projectVersion).toHaveValue("jei-26.2-neoforge");
-    await targetLoader.selectOption("fabric");
-    await expect(projectVersion).toHaveValue("jei-26.2-fabric");
-    expect(
-      Object.fromEntries(versionRequests.at(-1)!.searchParams),
-    ).toMatchObject({
-      gameVersion: "26.2",
-      loader: "fabric",
-    });
+    await expect(targetVersion).toBeDisabled();
+    await expect(targetLoader).toBeDisabled();
+    await expect(projectVersion).toHaveValue("jei-1.21.1-neoforge");
     await dialog.getByRole("button", { name: "Cancel", exact: true }).click();
     await expect(browseVersion).toHaveValue(browse.gameVersion);
     await expect(browseLoader).toHaveValue(browse.loader);
@@ -4955,8 +4968,15 @@ for (const blockedBy of ["none", "dependent", "unreadable"]) {
       await expect(
         dialog.getByRole("list", { name: "Mods requiring this mod" }),
       ).toContainText("Dependent Add-on");
-      await expect(dialog).toContainText("Remove these dependent mods first");
-      await expect(dialog.getByRole("checkbox")).toHaveCount(0);
+      await expect(dialog).toContainText(
+        "These installed mods require this file",
+      );
+      await expect(
+        dialog.getByRole("button", {
+          name: "Review removing dependents together",
+        }),
+      ).toBeEnabled();
+      await expect(dialog.getByRole("checkbox")).not.toBeChecked();
       await dialog.getByRole("button", { name: "Close", exact: true }).click();
       expect(removals).toHaveLength(0);
       return;

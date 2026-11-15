@@ -62,13 +62,14 @@ test("CurseForge download credentials rotate at execution and only follow truste
     /different service/,
   );
   assert.equal(calls, 1);
-  await assert.rejects(
-    downloadVerified(f.file, f.target, hosts, request, {
-      curseforgeKey: async () => null,
-    }),
-    /Add a CurseForge API key/,
+  await downloadVerified(f.file, f.target, hosts, request, {
+    curseforgeKey: async () => null,
+  });
+  assert.deepEqual(
+    requests.slice(4).map((entry) => entry.key),
+    [null, null],
   );
-  assert.equal(requests.length, 4);
+  await fs.unlink(f.target);
   for (const status of [401, 403]) {
     await assert.rejects(
       downloadVerified(

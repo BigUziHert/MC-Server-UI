@@ -170,6 +170,7 @@ async function fixture(t, mode = "live", { varyPathCase = false } = {}) {
     useEnvironment: false,
     scheduler: false,
     publicAddress: { resolve: async () => null },
+    profileFetch: async () => new Response(null, { status: 404 }),
     spawnServer: () => {
       child = new EventEmitter();
       child.pid = 12345;
@@ -574,7 +575,7 @@ test("offline access edits reject unknown identities and malformed files without
       json("POST", { name: "Unknown_Player" }),
     );
     assert.equal(response.status, 409);
-    assert.match(response.body.error, /no unique saved profile/);
+    assert.match(response.body.error, /No Minecraft Java profile was found/);
   }
   await fs.writeFile(
     path.join(panel.serverDir, "usercache.json"),

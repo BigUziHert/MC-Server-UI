@@ -14,6 +14,9 @@ async function settingsFixture(
     startupSupported?: boolean;
     startupReason?: string;
     missingAutoStartServerIds?: string[];
+    unavailableAutoStartServerIds?: string[];
+    autoStartServerNames?: Record<string, string>;
+    startupError?: string;
     servers?: typeof startupServers;
     remoteWarning?: string;
   } = {},
@@ -26,6 +29,11 @@ async function settingsFixture(
     startupSupported: options.startupSupported ?? true,
     startupReason: options.startupReason,
     missingAutoStartServerIds: options.missingAutoStartServerIds ?? [],
+    unavailableAutoStartServerIds: options.unavailableAutoStartServerIds ?? [],
+    autoStartServerNames: options.autoStartServerNames ?? {},
+    startupError: options.startupError,
+    startupAttempted: true,
+    startupPending: false,
   };
   const servers = options.servers ?? startupServers;
   let remote = {
@@ -42,6 +50,7 @@ async function settingsFixture(
     },
   };
   const writes: unknown[] = [];
+  const startupRetries: unknown[] = [];
   const remoteWrites: unknown[] = [];
   await page.route("**/api/access/session", (route) =>
     route.fulfill({ json: { role: "owner" } }),
@@ -83,6 +92,13 @@ async function settingsFixture(
     }
     return route.fulfill({ json: settings });
   });
+  await page.route("**/api/desktop/startup/retry", (route) => {
+    startupRetries.push(route.request().method());
+    settings = { ...settings, startupError: undefined };
+    return route.fulfill({
+      json: { failures: [], startedServerIds: ["survival"] },
+    });
+  });
   await page.route("**/api/access/settings", async (route) => {
     if (route.request().method() === "PUT") {
       remoteWrites.push(route.request().postDataJSON());
@@ -107,7 +123,7 @@ async function settingsFixture(
       },
     });
   });
-  return { writes, remoteWrites };
+  return { writes, remoteWrites, startupRetries };
 }
 
 async function openSettings(page: Page) {
@@ -116,6 +132,53 @@ async function openSettings(page: Page) {
     .click();
   return page.getByRole("dialog", { name: "Panel Settings", exact: true });
 }
+
+test("automatic startup failures appear on launch and can be reviewed and retried", async ({
+  page,
+}) => {
+  await page.addInitScript(() => {
+    let bridge: Window["mcPanelConnections"];
+    Object.defineProperty(window, "mcPanelConnections", {
+      configurable: true,
+      get: () => bridge,
+      set: (value) => {
+        bridge = { ...value, runtime: "desktop" };
+      },
+    });
+  });
+  const fixture = await settingsFixture(page, {
+    startupError: "Survival world: accept the Minecraft EULA before starting.",
+    autoStartServerIds: ["survival", "removed-world"],
+    missingAutoStartServerIds: ["removed-world"],
+    autoStartServerNames: { "removed-world": "Old survival world" },
+  });
+  await page.goto("/");
+  const notice = page.locator(".panel-startup-notice");
+  await expect(notice).toContainText("accept the Minecraft EULA");
+  await notice.getByRole("button", { name: "Review", exact: true }).click();
+  const dialog = page.getByRole("dialog", {
+    name: "Panel Settings",
+    exact: true,
+  });
+  await dialog
+    .getByRole("button", {
+      name: "Servers to start when the panel opens",
+      exact: true,
+    })
+    .click();
+  await expect(
+    dialog.getByRole("checkbox", { name: /Old survival world \(removed\)/ }),
+  ).toBeChecked();
+  await page.keyboard.press("Escape");
+  await dialog
+    .getByRole("button", { name: "Retry failed starts", exact: true })
+    .click();
+  await expect(
+    dialog.getByRole("button", { name: "Retry failed starts", exact: true }),
+  ).toHaveCount(0);
+  expect(fixture.startupRetries).toEqual(["POST"]);
+  await expect(notice).toHaveCount(0);
+});
 
 test("startup roster failures can retry without discarding settings edits", async ({
   page,

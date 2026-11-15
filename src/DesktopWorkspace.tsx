@@ -98,6 +98,11 @@ export default function DesktopWorkspace() {
   const [connection, setConnection] = useState<ConnectionMode | null>(
     invitationUrl ? "invitation" : null,
   );
+  const [signInAddress, setSignInAddress] = useState("");
+  const signIn = useCallback((origin: string) => {
+    setSignInAddress(origin);
+    setConnection("signin");
+  }, []);
   const currentInvitationUrl = useRef(invitationUrl);
   currentInvitationUrl.current = invitationUrl;
   useEffect(() => {
@@ -134,6 +139,24 @@ export default function DesktopWorkspace() {
   const [managingConnections, setManagingConnections] = useState(false);
   const manageConnections = useCallback(() => setManagingConnections(true), []);
   const [notice, setNotice] = useState("");
+  const [dismissedConnectionError, setDismissedConnectionError] = useState("");
+  const [confirmConnectionReset, setConfirmConnectionReset] = useState(false);
+  const previousConnectionState = useRef<PanelConnections | null>(null);
+  useEffect(() => {
+    const previous = previousConnectionState.current;
+    previousConnectionState.current = connections;
+    if (!connections || !previous || connections.ready === false) return;
+    const lost = previous.panels.find(
+      (old) =>
+        !old.local &&
+        old.signedIn &&
+        !connections.panels.some((next) => next.id === old.id && next.signedIn),
+    );
+    if (lost)
+      setNotice(
+        `You are no longer signed in to ${lost.label}. Sign in again from the server selector; contact the owner if your access was removed.`,
+      );
+  }, [connections]);
   const [selecting, setSelecting] = useState(false);
   const [refreshRevision, setRefreshRevision] = useState(0);
   const selectionRequest = useRef(0);
@@ -232,7 +255,11 @@ export default function DesktopWorkspace() {
         .then(() => {
           if (!alive.current || selectionRequest.current !== request) return;
           setSelected(serverId ? { panelId, serverId } : null);
-          if (currentManager.current === previousManager) changeManager(null);
+          if (
+            currentManager.current === previousManager &&
+            previousManager?.editing
+          )
+            changeManager(null);
           if (!preservePage || !window.location.hash)
             window.location.hash = "console";
           refresh();
@@ -253,7 +280,8 @@ export default function DesktopWorkspace() {
       !connections ||
       connections.ready === false ||
       localLoading ||
-      selecting
+      selecting ||
+      manager
     )
       return;
     if (
@@ -294,6 +322,7 @@ export default function DesktopWorkspace() {
     localServers,
     selected,
     selecting,
+    manager,
     select,
   ]);
   useEffect(() => {
@@ -377,13 +406,18 @@ export default function DesktopWorkspace() {
       }
     }
     const value = currentManager.current;
-    if (value && !managerAllowedFor(value, connections)) changeManager(null);
+    if (value && !managerAllowedFor(value, connections, false))
+      changeManager(null);
   }, [connections, changeManager]);
   const openManager = (
     panelId = "local",
     step: Manager["step"] = "choice",
     editing: ServerRecord | null = null,
   ) => {
+    if (currentManager.current && !currentManager.current.editing) {
+      window.dispatchEvent(new Event("mc-panel-resume-setup"));
+      return;
+    }
     const host = panels.find((item) => item.id === panelId);
     setChooseHost(null);
     changeManager({
@@ -411,7 +445,8 @@ export default function DesktopWorkspace() {
     manager?.panelId !== "local"
       ? panels.find((item) => item.id === manager?.panelId)
       : undefined;
-  const managerAllowed = manager && managerAllowedFor(manager, connections);
+  const managerAllowed =
+    manager && managerAllowedFor(manager, connections, false);
   const ownsManager = (value: Manager) =>
     alive.current &&
     currentManager.current === value &&
@@ -426,8 +461,17 @@ export default function DesktopWorkspace() {
       select,
       refresh,
       manageConnections,
+      signIn,
     }),
-    [connections, localServers, selected, select, refresh, manageConnections],
+    [
+      connections,
+      localServers,
+      selected,
+      select,
+      refresh,
+      manageConnections,
+      signIn,
+    ],
   );
   const expire = useCallback(() => {
     // A rejected scoped request refreshes only that host's session/permissions.
@@ -456,7 +500,7 @@ export default function DesktopWorkspace() {
                       servers={roster}
                       selected={server}
                       onSelect={(id) => select(selected!.panelId, id)}
-                      onAdd={canAddServer ? () => add() : undefined}
+                      onAdd={canAddServer ? (step) => add(step) : undefined}
                       onSettings={
                         !remote || permissions?.includes("server.update")
                           ? (status) =>
@@ -538,7 +582,7 @@ export default function DesktopWorkspace() {
                           <div role="alert">
                             <p>{localError}</p>
                             <button className="btn primary" onClick={refresh}>
-                              Retry connection
+                              Reconnect
                             </button>
                           </div>
                         )}
@@ -551,7 +595,7 @@ export default function DesktopWorkspace() {
                       <h1>Unable to load your servers</h1>
                       <p>{localError}</p>
                       <button className="btn primary" onClick={refresh}>
-                        Retry connection
+                        Reconnect
                       </button>
                     </div>
                     <div className="workspace-account-state">
@@ -588,13 +632,14 @@ export default function DesktopWorkspace() {
       )}
       {connection && (
         <ConnectPanel
-          key={invitationUrl}
+          key={invitationUrl || signInAddress}
           desktop={window.mcPanelConnections?.runtime !== "browser"}
           initialMode={connection}
-          initialUrl={invitationUrl}
+          initialUrl={invitationUrl || signInAddress}
           onClose={() => {
             setConnection(null);
             setInvitationUrl("");
+            setSignInAddress("");
             if (invitationUrl)
               window.history.replaceState(
                 null,
@@ -605,6 +650,7 @@ export default function DesktopWorkspace() {
           onOpened={() => {
             setConnection(null);
             setInvitationUrl("");
+            setSignInAddress("");
             if (invitationUrl)
               window.history.replaceState(
                 null,
@@ -655,6 +701,25 @@ export default function DesktopWorkspace() {
                   key={`${manager.panelId}:${manager.epoch}:${manager.editing?.id ?? "new"}`}
                   editing={manager.editing}
                   remoteHost={managerPanel?.label}
+                  remoteUnavailable={
+                    !!managerPanel &&
+                    managerPanel.connectionState !== "connected"
+                  }
+                  onReconnect={() => {
+                    if (managerPanel)
+                      void window.mcPanelConnections
+                        ?.retry?.(managerPanel.id)
+                        .then(refresh)
+                        .catch((cause) => setNotice(cause.message));
+                  }}
+                  onChangeHost={
+                    creationHosts.length > 1
+                      ? () => {
+                          changeManager(null);
+                          setChooseHost(manager.step);
+                        }
+                      : undefined
+                  }
                   initialStep={manager.step}
                   servers={
                     managerPanel
@@ -664,7 +729,7 @@ export default function DesktopWorkspace() {
                   onClose={() => {
                     if (ownsManager(manager)) changeManager(null);
                   }}
-                  onSaved={(saved) => {
+                  onSaved={(saved, outcome) => {
                     if (!ownsManager(manager)) return;
                     const target = manager.panelId;
                     const selection = selectionRequest.current;
@@ -712,7 +777,9 @@ export default function DesktopWorkspace() {
                         if (currentCompletion()) setNotice(cause.message);
                       });
                     setNotice(
-                      `${managerPanel?.label ?? "This computer"}: Server saved.`,
+                      outcome?.incomplete
+                        ? "Server created, but installation did not finish. Open Versions or Launchpad to finish setup before starting."
+                        : `${managerPanel?.label ?? "This computer"}: Server saved.`,
                     );
                     refresh();
                   }}
@@ -738,20 +805,44 @@ export default function DesktopWorkspace() {
           </SessionActiveContext.Provider>
         </SessionScopeContext.Provider>
       )}
-      {(notice || connections?.error) && (
+      {(notice ||
+        (connections?.error &&
+          connections.error !== dismissedConnectionError)) && (
         <div
-          className="toast fleet-empty-toast"
+          className="toast fleet-empty-toast workspace-notification"
           role={notice ? "status" : "alert"}
         >
           <span>{notice || connections?.error}</span>
-          {notice && (
-            <button
-              aria-label="Dismiss server notification"
-              onClick={() => setNotice("")}
-            >
-              <X size={16} />
-            </button>
-          )}
+          {connections?.error &&
+            window.mcPanelConnections?.resetSavedConnections && (
+              <button
+                onClick={() => {
+                  if (!confirmConnectionReset) {
+                    setConfirmConnectionReset(true);
+                    return;
+                  }
+                  void window.mcPanelConnections!.resetSavedConnections!()
+                    .then(() => {
+                      setConfirmConnectionReset(false);
+                      refresh();
+                    })
+                    .catch((cause) => setNotice(cause.message));
+                }}
+              >
+                {confirmConnectionReset
+                  ? "Confirm reset of saved connections"
+                  : "Reset saved connections"}
+              </button>
+            )}
+          <button
+            aria-label="Dismiss server notification"
+            onClick={() => {
+              setNotice("");
+              setDismissedConnectionError(connections?.error ?? "");
+            }}
+          >
+            <X size={16} />
+          </button>
         </div>
       )}
     </DesktopWorkspaceContext.Provider>
@@ -807,10 +898,17 @@ function ChooseHost({
             <button
               key={panel.id}
               className="btn"
+              aria-label={panel.label}
               onClick={() => onSelect(panel.id)}
             >
               <Plus size={18} />
-              {panel.label}
+              <span>
+                <strong>{panel.label}</strong>
+                <small>
+                  {panel.session?.email} · {panel.servers?.length ?? 0} shared
+                  servers
+                </small>
+              </span>
             </button>
           ))}
       </div>

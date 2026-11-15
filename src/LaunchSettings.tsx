@@ -1,3 +1,6 @@
+import { useRef, useState } from "react";
+import { usePanelApi } from "./api";
+
 export type LaunchType = "jar" | "java-args" | "script" | "executable";
 
 export type StartupDraft = {
@@ -40,7 +43,7 @@ export function startupPayload(value: StartupDraft) {
   return {
     launchType: value.launchType,
     jar: value.launchType === "jar" ? value.jar.trim() : "",
-    javaPath: value.javaPath.trim() || "java",
+    javaPath: value.javaPath.trim().replace(/^"(.*)"$/, "$1") || "java",
     launchScript:
       value.launchType === "script" ? value.launchScript.trim() : "",
     launchExecutable:
@@ -87,6 +90,8 @@ export function LaunchMethodFields({
   jars,
   candidates,
 }: FieldsProps) {
+  const argumentDrafts = useRef<Partial<Record<LaunchType, string>>>({});
+  argumentDrafts.current[value.launchType] = value.launchArgs;
   const set = (field: keyof StartupDraft, content: string) =>
     onChange({ ...value, [field]: content });
   function changeMethod(type: LaunchType) {
@@ -94,7 +99,8 @@ export function LaunchMethodFields({
     onChange({
       ...value,
       launchType: type,
-      launchArgs: candidate?.launchArgs?.join("\n") ?? "",
+      launchArgs:
+        argumentDrafts.current[type] ?? candidate?.launchArgs?.join("\n") ?? "",
       ...(candidate?.javaPath ? { javaPath: candidate.javaPath } : {}),
       ...(type === "script" && candidate
         ? { launchScript: candidate.path }
@@ -206,21 +212,11 @@ export function LaunchAdvancedFields({
   return (
     <>
       {(value.launchType === "jar" || value.launchType === "java-args") && (
-        <div className="form-field">
-          <label htmlFor={`${idPrefix}-java`}>Java executable</label>
-          <input
-            id={`${idPrefix}-java`}
-            required
-            value={value.javaPath}
-            onChange={(event) =>
-              onChange({ ...value, javaPath: event.target.value })
-            }
-          />
-          <small>
-            Use java from PATH or the full path to the Java version this server
-            requires.
-          </small>
-        </div>
+        <JavaExecutableField
+          id={`${idPrefix}-java`}
+          value={value.javaPath}
+          onChange={(javaPath) => onChange({ ...value, javaPath })}
+        />
       )}
       {value.launchType !== "jar" && (
         <div className="form-field">
@@ -250,6 +246,134 @@ export function LaunchAdvancedFields({
         </div>
       )}
     </>
+  );
+}
+
+export function JavaExecutableField({
+  id,
+  value,
+  onChange,
+}: {
+  id: string;
+  value: string;
+  onChange: (value: string) => void;
+}) {
+  const { api } = usePanelApi();
+  const [choices, setChoices] = useState<
+    { path: string; majorVersion: number; version: string; vendor?: string }[]
+  >([]);
+  const [busy, setBusy] = useState(false);
+  const [feedback, setFeedback] = useState<{
+    path: string;
+    message: string;
+    error?: boolean;
+  } | null>(null);
+  async function check(discover = false) {
+    setBusy(true);
+    try {
+      if (discover) {
+        const result = await api<{ installations: typeof choices }>(
+          "/server-setup/java?refresh=1",
+          { signal: AbortSignal.timeout(30_000) },
+        );
+        setChoices(result.installations);
+        setFeedback({
+          path: value,
+          message: result.installations.length
+            ? "Choose a detected installation, or keep a custom path."
+            : "No Java installations were found. Install Java on this computer or enter its full path.",
+        });
+      } else {
+        const result = await api<{
+          java: {
+            available: boolean;
+            version?: string;
+            majorVersion?: number;
+            error?: string;
+          };
+        }>("/server-setup/java/probe", {
+          method: "POST",
+          body: JSON.stringify({
+            javaPath: value.trim().replace(/^"(.*)"$/, "$1"),
+          }),
+          signal: AbortSignal.timeout(30_000),
+        });
+        setFeedback({
+          path: value,
+          error: !result.java.available,
+          message: result.java.available
+            ? `Detected Java ${result.java.majorVersion ?? result.java.version}. Check that it supports this server's Minecraft and loader versions.`
+            : result.java.error || "Java could not be started at this path.",
+        });
+      }
+    } catch (cause) {
+      setFeedback({
+        path: value,
+        error: true,
+        message:
+          cause instanceof Error ? cause.message : "Java could not be checked.",
+      });
+    } finally {
+      setBusy(false);
+    }
+  }
+  return (
+    <div className="form-field">
+      <label htmlFor={id}>Java executable</label>
+      <input
+        id={id}
+        value={value}
+        required
+        onChange={(event) => onChange(event.target.value)}
+      />
+      {choices.length > 0 && (
+        <select
+          aria-label="Detected Java installations"
+          value={choices.some((item) => item.path === value) ? value : ""}
+          onChange={(event) => onChange(event.target.value)}
+        >
+          <option value="" disabled>
+            Choose a detected installation
+          </option>
+          {choices.map((item) => (
+            <option key={item.path} value={item.path}>
+              Java {item.majorVersion} · {item.vendor || item.version} ·{" "}
+              {item.path}
+            </option>
+          ))}
+        </select>
+      )}
+      <div className="server-dialog-actions">
+        <button
+          className="btn"
+          type="button"
+          disabled={busy}
+          onClick={() => void check(true)}
+        >
+          Find Java installations
+        </button>
+        <button
+          className="btn"
+          type="button"
+          disabled={busy || !value.trim()}
+          onClick={() => void check()}
+        >
+          {busy ? "Checking Java…" : "Check Java"}
+        </button>
+      </div>
+      <small>
+        Use java from PATH or a full path. An existing server may need an older
+        Java runtime.
+      </small>
+      {feedback?.path === value && (
+        <p
+          className={feedback.error ? "form-error" : "muted"}
+          role={feedback.error ? "alert" : "status"}
+        >
+          {feedback.message}
+        </p>
+      )}
+    </div>
   );
 }
 

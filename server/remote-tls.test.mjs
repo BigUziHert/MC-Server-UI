@@ -78,7 +78,7 @@ test("remote TLS persists a certificate and reuses it across process restarts an
   assert.deepEqual((await fs.readdir(root)).sort(), ["remote-tls.json"]);
 });
 
-test("a changed public host or new LAN address renews the remote certificate", async (t) => {
+test("a changed public host renews the certificate but incidental LAN changes preserve trust", async (t) => {
   const { root } = await fixture(t);
   let local = ["192.168.10.20"];
   const service = createRemoteTls({
@@ -97,12 +97,21 @@ test("a changed public host or new LAN address renews the remote certificate", a
   );
   local = ["192.168.10.21"];
   const lanChanged = await service.ensure("https://203.0.113.13:3002");
-  assert.notEqual(
+  assert.equal(
     lanChanged.certificate.fingerprint256,
     next.certificate.fingerprint256,
   );
   assert.equal(
     new X509Certificate(lanChanged.cert).checkIP("192.168.10.21"),
+    undefined,
+  );
+  const newPublic = await service.ensure("https://192.168.10.21:3002");
+  assert.notEqual(
+    newPublic.certificate.fingerprint256,
+    lanChanged.certificate.fingerprint256,
+  );
+  assert.equal(
+    new X509Certificate(newPublic.cert).checkIP("192.168.10.21"),
     "192.168.10.21",
   );
 });
