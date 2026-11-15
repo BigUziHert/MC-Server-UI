@@ -664,8 +664,6 @@ export default function Launchpad({
   onCreateServer,
 }: PageProps & { permissions?: string[]; onCreateServer?: () => void }) {
   const allowChanges = canChangeContent(permissions);
-  const canChangeUpdateChannel =
-    permissions === undefined || permissions.includes("server.update");
   const { api, post, downloadUrl } = useServerApi();
   const serverId = useContext(ServerScope);
   const panel = useContext(PanelScope);
@@ -695,19 +693,6 @@ export default function Launchpad({
     useState<SortDirection>("asc");
   const [installedOnly, setInstalledOnly] = useState(false);
   const modeQueries = useRef({ browse: "", installed: "" });
-  const [selectedPaths, setSelectedPaths] = useState(new Set<string>());
-  const [selectionBatch, setSelectionBatch] = useState<{
-    action: "remove" | "disable";
-    items: InstalledItem[];
-    total: number;
-  } | null>(null);
-  const selectionStarted = useRef<string | null>(null);
-  const [selectionOutcome, setSelectionOutcome] = useState<{
-    action: "remove" | "disable";
-    total: number;
-    remaining: string[];
-    status: "running" | "cancelled" | "failed" | "complete";
-  } | null>(null);
   const [dependencySummary, setDependencySummary] = useState<{
     dependencies: {
       title: string;
@@ -1206,10 +1191,7 @@ export default function Launchpad({
     setInventory(null);
     inventoryRef.current = null;
     inventoryCache.current.clear();
-    cancelSelectionBatch();
-    setSelectedPaths(new Set());
     modeQueries.current = { browse: "", installed: "" };
-    setSelectionOutcome(null);
     forceScan.current = null;
     manualCompletion.current?.(false);
     manualCompletion.current = null;
@@ -1803,43 +1785,6 @@ export default function Launchpad({
       if (currentSession === session.current) setUndoBusy(false);
     }
   }
-  async function saveUpdateChannel(updateChannel: UpdateChannel) {
-    if (pending.current || !canChangeUpdateChannel) return;
-    const currentSession = session.current;
-    pending.current = true;
-    setBusy("active");
-    try {
-      const saved = await api<{ updateChannel: UpdateChannel }>(
-        "/launchpad/update-policy",
-        {
-          method: "PATCH",
-          body: JSON.stringify({ updateChannel }),
-        },
-      );
-      if (currentSession !== session.current) return;
-      // Invalidate before publishing the policy. A prior scan must not repopulate
-      // cached Alpha offers after the user switches back to stable releases.
-      scanEpoch.current++;
-      inventoryCache.current.clear();
-      inventoryRef.current = null;
-      setInventory(null);
-      setConfig((current) =>
-        current ? { ...current, updateChannel: saved.updateChannel } : current,
-      );
-      setSelectedPaths(new Set());
-      setReload((value) => value + 1);
-      notify(
-        "Update channel saved for this server. Checking installed content again.",
-      );
-    } catch (cause) {
-      if (currentSession === session.current) notify(messageOf(cause), true);
-    } finally {
-      if (currentSession === session.current) {
-        pending.current = false;
-        setBusy(null);
-      }
-    }
-  }
   async function holdVersion(entry: InstalledItem) {
     if (pending.current || !allowChanges) return;
     const currentSession = session.current;
@@ -1868,56 +1813,10 @@ export default function Launchpad({
     }
   }
   function changeInventoryMode(next: boolean) {
-    if (next !== installedOnly && selectionBatch) cancelSelectionBatch();
     modeQueries.current[installedOnly ? "installed" : "browse"] = query;
     setInstalledOnly(next);
     setQuery(modeQueries.current[next ? "installed" : "browse"]);
     setOffset(0);
-  }
-  function endSelectionItem(paths: Set<string>) {
-    setSelectionOutcome((current) => {
-      if (!current) return null;
-      const remaining = current.remaining.filter((path) => !paths.has(path));
-      return {
-        ...current,
-        remaining,
-        status: remaining.length ? current.status : "complete",
-      };
-    });
-    setSelectedPaths(
-      (current) => new Set([...current].filter((path) => !paths.has(path))),
-    );
-    selectionStarted.current = null;
-    setSelectionBatch((current) => {
-      if (!current) return null;
-      const items = current.items.filter((item) => !paths.has(item.path));
-      return items.length ? { ...current, items } : null;
-    });
-  }
-  function cancelSelectionBatch() {
-    setSelectionOutcome((current) =>
-      current?.status === "running" || current?.status === "failed"
-        ? { ...current, status: "cancelled" }
-        : current,
-    );
-    selectionStarted.current = null;
-    setSelectionBatch(null);
-  }
-  function startSelectedAction(action: "remove" | "disable") {
-    const items = (installed?.items || []).filter(
-      (item) =>
-        selectedPaths.has(item.path) &&
-        (action !== "disable" || item.active !== false),
-    );
-    if (!items.length || !canInstall || busy) return;
-    selectionStarted.current = null;
-    setSelectionOutcome({
-      action,
-      total: items.length,
-      remaining: items.map((item) => item.path),
-      status: "running",
-    });
-    setSelectionBatch({ action, items, total: items.length });
   }
   function chooseProject(project: Project, entry?: InstalledItem) {
     if (!allowChanges) return;
@@ -1961,7 +1860,6 @@ export default function Launchpad({
   }
   function closeRemoval() {
     if (busy === "remove") return;
-    cancelSelectionBatch();
     operation.current++;
     setRemoval(null);
     setRemovalPlan(null);
@@ -2052,7 +1950,6 @@ export default function Launchpad({
       setRemoval(null);
       setRemovalPlan(null);
       const removedPaths = new Set(removalPlan.files.map((file) => file.path));
-      endSelectionItem(removedPaths);
       if (inventoryRef.current?.api === api) {
         const next = {
           ...inventoryRef.current,
@@ -2080,11 +1977,6 @@ export default function Launchpad({
         currentOperation === operation.current
       ) {
         setRemovalError(messageOf(cause));
-        setSelectionOutcome((current) =>
-          current?.status === "running"
-            ? { ...current, status: "failed" }
-            : current,
-        );
         // A failed or stale confirmation needs a fresh dependency/file review.
         setRemovalPlan(null);
       }
@@ -2351,15 +2243,14 @@ export default function Launchpad({
   async function reviewAllUpdates(
     reuseSelection = false,
     changedResolutions?: Record<string, string>,
-    rootPaths?: Set<string>,
   ) {
     if (pending.current || !canInstall || type === "modpack") return;
     const updates = availableUpdates
       .filter(
         (item) =>
           !reuseSelection ||
-          !(rootPaths || selectedUpdatePaths) ||
-          (rootPaths || selectedUpdatePaths)!.has(item.path),
+          !selectedUpdatePaths ||
+          selectedUpdatePaths.has(item.path),
       )
       .slice(0, 50);
     if (!reuseSelection) {
@@ -2542,7 +2433,6 @@ export default function Launchpad({
         return;
       }
       setActivation(null);
-      endSelectionItem(new Set([entry.path]));
       const previous = inventoryCache.current.get(type);
       if (previous?.api === api) {
         const next = {
@@ -2574,11 +2464,6 @@ export default function Launchpad({
     } catch (cause) {
       if (currentSession === session.current) {
         notify(messageOf(cause), true);
-        setSelectionOutcome((current) =>
-          current?.status === "running"
-            ? { ...current, status: "failed" }
-            : current,
-        );
       }
     } finally {
       if (currentSession === session.current) {
@@ -2589,8 +2474,6 @@ export default function Launchpad({
   }
   function changeType(next: ContentType) {
     if (pending.current || busy) return;
-    cancelSelectionBatch();
-    setSelectedPaths(new Set());
     setType(next);
     setCategories([]);
     setLoader((current) =>
@@ -2635,14 +2518,6 @@ export default function Launchpad({
       setOffset(currentOffset);
   }, [installedOnly, installed, offset, currentOffset]);
   const selectedVersion = versions.find((version) => version.id === versionId);
-  useEffect(() => {
-    if (!selectionBatch || busy || removal || activation || !canInstall) return;
-    const entry = selectionBatch.items[0];
-    if (!entry || selectionStarted.current === entry.path) return;
-    selectionStarted.current = entry.path;
-    if (selectionBatch.action === "remove") void reviewRemoval(entry);
-    else void setContentActive(entry, false);
-  }, [selectionBatch, busy, removal, activation, canInstall]);
   useEffect(() => {
     setDependencySummary(null);
     setDependencySummaryError("");
@@ -3318,174 +3193,7 @@ export default function Launchpad({
             : ""}
         </button>
       </div>
-      {installedOnly && (
-        <div className="management-notice">
-          <label className="launchpad-sort">
-            Update channel
-            <select
-              aria-label="Update channel"
-              value={config.updateChannel ?? "installed"}
-              disabled={
-                !canChangeUpdateChannel ||
-                Boolean(busy) ||
-                working ||
-                !!selectionBatch ||
-                configLoading
-              }
-              onChange={(event) =>
-                void saveUpdateChannel(event.target.value as UpdateChannel)
-              }
-            >
-              <option value="installed">Follow installed stability</option>
-              <option value="release">Stable releases only</option>
-              <option value="beta">Stable and beta</option>
-              <option value="alpha">Stable, beta and alpha</option>
-            </select>
-          </label>
-          <p>
-            Applies to update checks on this server. By default, stable files
-            stay stable; beta files accept stable or beta; alpha files accept
-            all channels. Unknown channels use stable releases.
-          </p>
-          {!canChangeUpdateChannel && (
-            <p>
-              Changing this preference requires permission to edit server
-              settings.
-            </p>
-          )}
-        </div>
-      )}
       {toolbar()}
-      {installedOnly && type !== "modpack" && allowChanges && (
-        <div
-          className="launchpad-selection-bar"
-          role="group"
-          aria-label="Selected installed content"
-        >
-          <strong>{selectedPaths.size} selected</strong>
-          <button
-            className="btn"
-            disabled={Boolean(busy) || !!selectionBatch}
-            onClick={() =>
-              setSelectedPaths(
-                new Set(
-                  visibleProjects.flatMap(({ entry }) =>
-                    entry ? [entry.path] : [],
-                  ),
-                ),
-              )
-            }
-          >
-            Select this page
-          </button>
-          <button
-            className="btn"
-            disabled={!selectedPaths.size || Boolean(busy) || !!selectionBatch}
-            onClick={() => setSelectedPaths(new Set())}
-          >
-            Clear selection
-          </button>
-          <button
-            className="btn"
-            disabled={
-              !canInstall ||
-              Boolean(busy) ||
-              !!selectionBatch ||
-              scanRefreshing ||
-              !availableUpdates.some((item) => selectedPaths.has(item.path))
-            }
-            onClick={() => {
-              setSelectedUpdatePaths(new Set(selectedPaths));
-              setResolutions({});
-              void reviewAllUpdates(true, {}, selectedPaths);
-            }}
-          >
-            Update selected
-          </button>
-          {(type === "mod" || type === "plugin") && (
-            <button
-              className="btn"
-              disabled={
-                !canInstall ||
-                Boolean(busy) ||
-                !!selectionBatch ||
-                !selectedPaths.size
-              }
-              onClick={() => startSelectedAction("disable")}
-            >
-              Disable selected
-            </button>
-          )}
-          <button
-            className="btn danger"
-            disabled={
-              !canInstall ||
-              Boolean(busy) ||
-              !!selectionBatch ||
-              !selectedPaths.size
-            }
-            onClick={() => startSelectedAction("remove")}
-          >
-            Remove selected
-          </button>
-          {selectionBatch && (
-            <span role="status">
-              {selectionBatch.action === "remove"
-                ? "Reviewing removal"
-                : "Disabling"}
-              : {selectionBatch.total - selectionBatch.items.length + 1} of{" "}
-              {selectionBatch.total}. Each file is checked before changing it.{" "}
-              <button
-                className="btn"
-                onClick={() => {
-                  cancelSelectionBatch();
-                  if (!busy) {
-                    setActivation(null);
-                    setRemoval(null);
-                    setRemovalPlan(null);
-                  }
-                }}
-              >
-                Cancel remaining
-              </button>
-              {!busy && !removal && !activation && (
-                <button
-                  className="btn"
-                  onClick={() => {
-                    selectionStarted.current = null;
-                    setSelectionOutcome((current) =>
-                      current ? { ...current, status: "running" } : current,
-                    );
-                    setSelectionBatch({ ...selectionBatch });
-                  }}
-                >
-                  Retry selected item
-                </button>
-              )}
-            </span>
-          )}
-        </div>
-      )}
-      {selectionOutcome && (
-        <p className="management-notice" role="status">
-          Selected{" "}
-          {selectionOutcome.action === "remove" ? "removal" : "disable"}:{" "}
-          {selectionOutcome.total - selectionOutcome.remaining.length} of{" "}
-          {selectionOutcome.total} completed.{" "}
-          {selectionOutcome.status === "cancelled"
-            ? "Remaining changes cancelled; an in-flight item may still finish."
-            : selectionOutcome.status === "failed"
-              ? "Paused after an error. The current item may have changed; refresh installed content before retrying. Unstarted items were not requested."
-              : selectionOutcome.status === "complete"
-                ? "All selected changes completed."
-                : "Checking each file before changing it."}{" "}
-          {!selectionBatch && !busy && (
-            <button className="btn" onClick={() => setSelectionOutcome(null)}>
-              Dismiss selection status
-            </button>
-          )}
-        </p>
-      )}
       {job && (
         <div
           className="panel launchpad-job"
@@ -3922,25 +3630,6 @@ export default function Launchpad({
                   aria-label={project.title}
                 >
                   <div className="launchpad-project-main">
-                    {installedOnly &&
-                      entry &&
-                      type !== "modpack" &&
-                      allowChanges && (
-                        <input
-                          type="checkbox"
-                          aria-label={`Select ${project.title}`}
-                          checked={selectedPaths.has(entry.path)}
-                          disabled={Boolean(busy) || !!selectionBatch}
-                          onChange={(event) =>
-                            setSelectedPaths((current) => {
-                              const next = new Set(current);
-                              if (event.target.checked) next.add(entry.path);
-                              else next.delete(entry.path);
-                              return next;
-                            })
-                          }
-                        />
-                      )}
                     <ProjectIcon url={project.iconUrl} />
                     <div className="launchpad-project-body">
                       <div className="launchpad-project-title">
@@ -5336,10 +5025,7 @@ export default function Launchpad({
         aria-labelledby="launchpad-activation-title"
         onCancel={(event) => {
           event.preventDefault();
-          if (!busy) {
-            setActivation(null);
-            cancelSelectionBatch();
-          }
+          if (!busy) setActivation(null);
         }}
       >
         <h2 id="launchpad-activation-title">Review dependency risks</h2>
@@ -5356,10 +5042,7 @@ export default function Launchpad({
           <button
             className="btn"
             disabled={Boolean(busy)}
-            onClick={() => {
-              setActivation(null);
-              cancelSelectionBatch();
-            }}
+            onClick={() => setActivation(null)}
           >
             Cancel
           </button>

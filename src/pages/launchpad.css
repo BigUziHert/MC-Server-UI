@@ -982,23 +982,6 @@
   }
 }
 
-.launchpad-selection-bar {
-  position: sticky;
-  top: 0;
-  z-index: 3;
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 8px;
-  padding: 12px;
-  margin: 10px 0;
-  background: var(--panel);
-  border: 1px solid var(--border);
-  border-radius: 10px;
-}
-.launchpad-selection-bar > span {
-  flex-basis: 100%;
-}
 .launchpad-dependency-summary {
   margin: 12px 0;
   padding: 12px;
@@ -1012,10 +995,4 @@
 .launchpad-dependency-summary li {
   margin: 8px 0;
   overflow-wrap: anywhere;
-}
-.launchpad-project-main > input[type="checkbox"] {
-  flex: 0 0 auto;
-  width: 16px;
-  height: 16px;
-  accent-color: var(--accent);
 }
