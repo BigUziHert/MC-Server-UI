@@ -1,3 +1,4 @@
+import { normalizeChannel } from "../shared/launchpad-channels.mjs";
 import fs from "node:fs/promises";
 import path from "node:path";
 import {
@@ -81,6 +82,7 @@ export async function recoverJarIdentity(
             projectId: version.project_id,
             versionId: version.id,
             versionName: version.name,
+            channel: normalizeChannel(version.version_type ?? "release"),
             title: version.name,
             identityMethod,
             canonicalSha512: file.hashes.sha512.toLowerCase(),

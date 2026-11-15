@@ -1,3 +1,4 @@
+import { normalizeChannel } from "../shared/launchpad-channels.mjs";
 import fs from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import {
@@ -101,6 +102,9 @@ export async function createLaunchpadMetadataCache({
           platform: value.platform,
           projectId: value.projectId,
           versionId: value.versionId,
+          ...(normalizeChannel(value.channel)
+            ? { channel: value.channel }
+            : {}),
           ...(value.platform === "modrinth" &&
           ["jar-timestamps", "jar-contents"].includes(value.identityMethod) &&
           checksum(value.canonicalSha512)

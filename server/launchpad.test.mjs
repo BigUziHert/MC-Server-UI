@@ -1639,7 +1639,10 @@ test("failed or incomplete Modrinth rechecks retain known updates after cache ex
   t.mock.method(Date, "now", () => now);
   const f = await fixture(t, {
     request: async (url) => {
-      if (new URL(url).pathname !== "/v2/version_files/update") return;
+      const pathname = new URL(url).pathname;
+      if (failure === "missing" && pathname === "/v2/project/project/version")
+        return new Response(null, { status: 503 });
+      if (pathname !== "/v2/version_files/update") return;
       if (failure === "404") return new Response(null, { status: 404 });
       if (failure === "missing") return Response.json({});
     },
@@ -1692,7 +1695,18 @@ test("a forced refresh interrupted before update checks cannot reuse a cached up
 });
 
 test("update issues belong only to the affected mod while unidentified files stay neutral", async (t) => {
-  const f = await fixture(t);
+  let now = Date.now();
+  t.mock.method(Date, "now", () => now);
+  let historyFails = true;
+  const f = await fixture(t, {
+    request: async (url) => {
+      if (
+        historyFails &&
+        new URL(url).pathname === "/v2/project/dependency/version"
+      )
+        return new Response(null, { status: 503 });
+    },
+  });
   f.versions.dep.environment = "client_only";
   await fs.writeFile(path.join(f.serverDir, "mods", "dep.jar"), f.dependency);
   await fs.writeFile(
@@ -1721,7 +1735,7 @@ test("update issues belong only to the affected mod while unidentified files sta
   assert.equal(normal.updateCheck, "checked");
   assert.equal(normal.updateIssue, undefined);
   assert.equal(client.updateCheck, "unavailable");
-  assert.match(client.updateIssue, /client.only/i);
+  assert.match(client.updateIssue, /provider request failed.*503/i);
   assert.equal(unknown.platform, null);
   assert.equal(unknown.update, undefined);
   assert.equal(unknown.updateIssue, undefined);
@@ -1730,6 +1744,8 @@ test("update issues belong only to the affected mod while unidentified files sta
     [],
     "per-mod issues and unmatched catalog files do not generate broad warnings",
   );
+  historyFails = false;
+  now += 31_000;
   f.versions.dep.environment = "client_only_server_optional";
   const recovered = await service.installed({ ...selection, refresh: true });
   const checked = recovered.items.find((item) => item.path === "mods/dep.jar");
@@ -6684,8 +6700,10 @@ test("unexpected background finalization failures terminate polling with a warni
 test("failed bulk update checks advance progress while another provider is still pending", async (t) => {
   const f = await fixture(t, {
     request: async (url) => {
-      if (new URL(url).pathname === "/v2/version_files/update")
-        return Response.json({});
+      const pathname = new URL(url).pathname;
+      if (pathname === "/v2/version_files/update") return Response.json({});
+      if (pathname === "/v2/project/project/version")
+        return new Response(null, { status: 503 });
     },
   });
   const extra = Buffer.from("another catalog's mod");
@@ -7048,7 +7066,7 @@ test("fallback update failures are isolated per project and missing installed re
     );
   assert.match(
     first.items.find((item) => item.projectId === "empty").updateIssue,
-    /No compatible/,
+    /installed release was not found/,
   );
   assert.match(
     first.items.find((item) => item.projectId === "missing-current")
@@ -9281,5 +9299,261 @@ test("CurseForge dependency summaries retain required optional and incompatible 
   await assert.rejects(
     provider.declaredDependencies({ projectId: "10", versionId: "21" }),
     /different release/,
+  );
+});
+
+test("update channel preferences persist per server and reject invalid or mixed changes", async (t) => {
+  const f = await fixture(t);
+  assert.equal((await f.service.config()).updateChannel, "installed");
+  for (const value of [
+    null,
+    [],
+    { updateChannel: "nightly" },
+    { updateChannel: "alpha", path: "mods/old.jar", hold: true },
+  ])
+    await assert.rejects(f.service.updatePolicy(value), { status: 400 });
+  const writes = await Promise.all([
+    f.service.updatePolicy({ updateChannel: "alpha" }),
+    f.service.updatePolicy({ updateChannel: "beta" }),
+  ]);
+  assert.deepEqual(
+    writes.map((row) => row.updateChannel),
+    ["alpha", "beta"],
+  );
+  assert.equal((await f.service.config()).updateChannel, "beta");
+  assert.deepEqual(
+    JSON.parse(
+      await fs.readFile(
+        path.join(f.dataDir, "launchpad", "update-policy.json"),
+        "utf8",
+      ),
+    ),
+    { version: 1, updateChannel: "beta" },
+  );
+  assert.equal(
+    (await fs.readdir(path.join(f.dataDir, "launchpad"))).filter((name) =>
+      name.endsWith(".tmp"),
+    ).length,
+    0,
+  );
+  await f.service.close();
+  const reopened = await f.boot();
+  assert.equal((await reopened.config()).updateChannel, "beta");
+  const other = await fixture(t);
+  assert.equal((await other.service.config()).updateChannel, "installed");
+});
+
+test("fallback update channels follow verified installed stability and invalidate cached offers", async (t) => {
+  const f = await fixture(t);
+  await f.service.close();
+  let reads = 0;
+  const versions = [
+    { id: "old", channel: "beta", publishedAt: "2026-01-01" },
+    { id: "stable", channel: "release", publishedAt: "2026-02-01" },
+    { id: "beta", channel: "beta", publishedAt: "2026-03-01" },
+    { id: "alpha", channel: "alpha", publishedAt: "2026-04-01" },
+  ].map((row) => ({ ...row, name: row.id, downloadable: true }));
+  await fs.writeFile(
+    path.join(f.dataDir, "launchpad", "installed.json"),
+    JSON.stringify([
+      {
+        platform: "fixturecatalog",
+        type: "mod",
+        path: "mods/old.jar",
+        sha512: hashes(f.old).sha512,
+        projectId: "project",
+        versionId: "old",
+      },
+    ]),
+  );
+  const extraProviders = [
+    {
+      id: "fixturecatalog",
+      name: "Fixture",
+      types: ["mod"],
+      versions: async () => {
+        reads++;
+        return versions;
+      },
+    },
+  ];
+  const service = await f.boot({ extraProviders });
+  let result = await service.installed({
+    ...selection,
+    updateChannel: "alpha",
+  });
+  assert.equal(result.items[0].channel, "beta");
+  assert.equal(
+    result.items[0].update.id,
+    "beta",
+    "an installed-query parameter cannot override the saved policy",
+  );
+  await service.updatePolicy({ updateChannel: "alpha" });
+  result = await service.installed(selection);
+  assert.equal(result.items[0].update.id, "alpha");
+  await service.updatePolicy({ updateChannel: "release" });
+  result = await service.installed(selection);
+  assert.equal(
+    result.items[0].update.id,
+    "stable",
+    "a previous alpha offer must not survive a policy change",
+  );
+  assert.equal(reads, 3);
+  versions[0].channel = "release";
+  await service.updatePolicy({ updateChannel: "installed" });
+  result = await service.installed(selection);
+  assert.equal(
+    result.items[0].update.id,
+    "stable",
+    "stable installations never silently accept beta/alpha",
+  );
+  versions[0].channel = "beta";
+  versions.splice(1, 1); // No stable build exists for this server target.
+  await service.updatePolicy({ updateChannel: "release" });
+  result = await service.installed(selection);
+  assert.equal(result.items[0].update, undefined);
+  assert.equal(result.items[0].updateCheck, "checked");
+  assert.deepEqual(result.warnings, []);
+});
+
+test("Modrinth old identities backfill channels and persist them without widening stable installations", async (t) => {
+  const f = await fixture(t);
+  f.versions.old.version_type = "beta";
+  f.versions.new.version_type = "beta";
+  await fs.writeFile(
+    path.join(f.dataDir, "launchpad", "installed.json"),
+    JSON.stringify([
+      {
+        platform: "modrinth",
+        type: "mod",
+        path: "mods/old.jar",
+        sha512: hashes(f.old).sha512,
+        projectId: "project",
+        versionId: "old",
+      },
+    ]),
+  );
+  await f.service.close();
+  const service = await f.boot();
+  const result = await service.installed(selection);
+  assert.equal(result.items[0].channel, "beta");
+  assert.equal(result.items[0].update?.id, "new");
+  const update = f.requests
+    .filter(({ url }) => new URL(url).pathname === "/v2/version_files/update")
+    .at(-1);
+  assert.deepEqual(JSON.parse(update.body).version_types, ["release", "beta"]);
+  await service.close();
+  const reopened = await f.boot();
+  const before = f.requests.length;
+  const local = await reopened.installed({ ...selection, local: true });
+  assert.equal(local.items[0].channel, "beta");
+  assert.equal(
+    f.requests.length,
+    before,
+    "the backfilled channel persists with the verified identity",
+  );
+});
+
+test("review and installation receipts retain selected prerelease channels", async (t) => {
+  const f = await fixture(t);
+  f.versions.new.version_type = "beta";
+  const plan = await f.service.preview(selection);
+  assert.equal(plan.channel, "beta");
+  assert.equal(
+    plan.files.find((file) => file.path === "mods/new.jar").channel,
+    "beta",
+  );
+  const job = await f.service.install({ planId: plan.planId, confirmed: true });
+  assert.equal((await waitForJob(f.service, job.job.id)).status, "completed");
+  assert.equal(
+    f.service.snapshotInstalled().find((row) => row.path === "mods/new.jar")
+      .channel,
+    "beta",
+  );
+  await f.service.close();
+  const reopened = await f.boot();
+  assert.equal(
+    (await reopened.installed({ ...selection, local: true })).items.find(
+      (row) => row.path === "mods/new.jar",
+    ).channel,
+    "beta",
+  );
+});
+
+test("unpinned dependency channels follow the saved ceiling while valid pins remain explicit", async (t) => {
+  let f;
+  f = await fixture(t, {
+    request: (url) => {
+      if (new URL(url).pathname === "/v2/project/dependency/version")
+        return Response.json([
+          f.versions.depAlpha,
+          f.versions.depBeta,
+          f.versions.dep,
+        ]);
+    },
+  });
+  f.versions.dep.version_type = "release";
+  for (const [id, channel, date] of [
+    ["depBeta", "beta", "2026-03-01"],
+    ["depAlpha", "alpha", "2026-04-01"],
+  ]) {
+    const data = bytes(`dependency ${channel}`);
+    const url = `https://cdn.modrinth.com/${id}.jar`;
+    f.downloads.set(url, data);
+    f.versions[id] = {
+      ...f.versions.dep,
+      id,
+      name: id,
+      version_type: channel,
+      date_published: date,
+      files: [
+        {
+          filename: `${id}.jar`,
+          url,
+          size: data.length,
+          hashes: hashes(data),
+          primary: true,
+        },
+      ],
+    };
+  }
+  f.versions.new.dependencies = [
+    { project_id: "dependency", version_id: null, dependency_type: "required" },
+  ];
+  let review = await f.service.preview({
+    ...selection,
+    updateChannel: "alpha",
+  });
+  assert.equal(
+    review.files.find((file) => file.path === "mods/dep.jar").channel,
+    "release",
+    "query input cannot expand the saved default",
+  );
+  await f.service.cancelPreview(review.planId);
+  await f.service.updatePolicy({ updateChannel: "beta" });
+  review = await f.service.preview(selection);
+  assert.equal(
+    review.files.find((file) => file.path === "mods/depBeta.jar").channel,
+    "beta",
+  );
+  assert.ok(
+    review.unavailableDependencies.some((row) =>
+      /beta release/.test(row.issue),
+    ),
+  );
+  assert.ok(!review.files.some((file) => file.channel === "alpha"));
+  await f.service.cancelPreview(review.planId);
+  await f.service.updatePolicy({ updateChannel: "release" });
+  f.versions.new.dependencies[0].version_id = "depAlpha";
+  review = await f.service.preview(selection);
+  assert.equal(
+    review.files.find((file) => file.path === "mods/depAlpha.jar").channel,
+    "alpha",
+    "an exact required pin remains explicit and reviewable",
+  );
+  assert.ok(
+    review.unavailableDependencies.some((row) =>
+      /alpha release/.test(row.issue),
+    ),
   );
 });

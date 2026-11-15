@@ -1007,6 +1007,14 @@ test("remote file creation and download use distinct permissions and logout inva
 });
 
 test("remote route permissions fail closed for unassigned routes and distinguish destructive storage actions", () => {
+  assert.deepEqual(
+    requiredPermissions({
+      method: "PATCH",
+      path: "/api/launchpad/update-policy",
+      body: { updateChannel: "alpha" },
+    }),
+    ["server.update"],
+  );
   const routes = [
     ["GET", "/api/files/recycle-operation", ["file.read"]],
     ["HEAD", "/api/files/recycle-operation", ["file.read"]],
@@ -2127,6 +2135,49 @@ test("wrong proxy passwords cannot lock out a known email using its correct pass
           email: "sister@example.test",
           password: "Correct-test-password!",
         }),
+      )
+    ).status,
+    200,
+  );
+});
+
+test("update channel preference requires server settings permission rather than content editor grants", async (t) => {
+  const { local, invite } = await fixture(t);
+  const editor = await invite([
+    "file.read",
+    "file.create",
+    "file.update",
+    "file.delete",
+    "control.start",
+    "control.stop",
+  ]);
+  assert.equal(
+    (
+      await editor.asUser(
+        "/api/launchpad/update-policy",
+        json("PATCH", { updateChannel: "alpha" }),
+      )
+    ).status,
+    403,
+  );
+  const manager = await invite(
+    ["file.read", "server.update"],
+    "manager@example.test",
+  );
+  assert.equal(
+    (
+      await manager.asUser(
+        "/api/launchpad/update-policy",
+        json("PATCH", { updateChannel: "beta" }),
+      )
+    ).status,
+    200,
+  );
+  assert.equal(
+    (
+      await local(
+        "/api/launchpad/update-policy",
+        json("PATCH", { updateChannel: "installed" }),
       )
     ).status,
     200,

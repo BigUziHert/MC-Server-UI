@@ -1,3 +1,8 @@
+import {
+  allowedUpdateChannels,
+  isUpdateChannel,
+  normalizeChannel,
+} from "../shared/launchpad-channels.mjs";
 import { terminalJobs } from "./terminal-jobs.mjs";
 import { createLaunchpadRecovery } from "./launchpad-transaction.mjs";
 import { createLaunchpadHistory } from "./launchpad-history.mjs";
@@ -314,6 +319,23 @@ export async function createLaunchpad(ctx) {
         pathFor: privatePath,
         platforms: providers.map((provider) => provider.id),
       });
+  let updateChannel = "installed";
+  let updatePolicyWarning;
+  if (!ctx.catalogOnly) {
+    try {
+      const saved = JSON.parse(
+        await fs.readFile(await privatePath("update-policy.json"), "utf8"),
+      );
+      if (saved?.version !== 1 || !isUpdateChannel(saved.updateChannel))
+        throw new Error("Invalid saved update channel");
+      updateChannel = saved.updateChannel;
+    } catch (cause) {
+      if (!missing(cause))
+        updatePolicyWarning =
+          "The saved update channel could not be read. Updates follow installed stability until you save a new preference.";
+    }
+  }
+  let policyWrites = Promise.resolve();
   let receipts = [];
   try {
     const saved = ctx.catalogOnly
@@ -381,6 +403,7 @@ export async function createLaunchpad(ctx) {
         "projectId",
         "versionId",
         "versionName",
+        "channel",
         "installReason",
         "requiredBy",
         "updateHeld",
@@ -408,6 +431,8 @@ export async function createLaunchpad(ctx) {
   const updateKey = (input, item) =>
     JSON.stringify([
       input.type,
+      input.updateChannel,
+      normalizeChannel(item.channel),
       input.type === "modpack" ? "" : input.gameVersion,
       input.type === "modpack" ? "" : input.loader,
       item.platform,
@@ -535,7 +560,7 @@ export async function createLaunchpad(ctx) {
   function invalidateCatalogCaches() {
     catalogController.abort(
       new DOMException(
-        "Catalog credentials changed. Refresh to retry.",
+        "Catalog settings changed. Refresh to retry.",
         "AbortError",
       ),
     );
@@ -806,6 +831,7 @@ export async function createLaunchpad(ctx) {
     const limit = Math.min(100, Math.max(1, Number(input.limit) || 20));
     return {
       ...input,
+      updateChannel,
       ...(input.type === "modpack"
         ? { preserveWorld: input.preserveWorld !== false }
         : {}),
@@ -1106,6 +1132,9 @@ export async function createLaunchpad(ctx) {
         const receipt = sha512
           ? receiptIndex.get(`${relativePath}\0${sha512}`)
           : undefined;
+        const cachedIdentity = sha512
+          ? metadataCache?.identity(sha512)
+          : undefined;
         const known =
           identities.get(sha512)?.value ??
           // A later explicit installation may choose another provider for the
@@ -1124,6 +1153,13 @@ export async function createLaunchpad(ctx) {
             Object.entries(receipt ?? {}).filter(([, value]) => value != null),
           ),
           ...(known?.platform ? known : {}),
+          ...(receipt?.platform === cachedIdentity?.platform &&
+          receipt?.projectId === cachedIdentity?.projectId &&
+          receipt?.versionId === cachedIdentity?.versionId &&
+          normalizeChannel(cachedIdentity?.channel) &&
+          !normalizeChannel(receipt?.channel)
+            ? { channel: cachedIdentity.channel }
+            : {}),
           ...(["mod", "plugin"].includes(type)
             ? { active: !/\.disabled$/i.test(file.name) }
             : {}),
@@ -1513,21 +1549,9 @@ export async function createLaunchpad(ctx) {
                       }
                       cached = await abortable(versionWork, input.signal);
                     }
-                    const versions = cached.versions
-                      .filter(
-                        (value) =>
-                          value.downloadable !== false &&
-                          (!value.channel || value.channel === "release"),
-                      )
-                      .sort((a, b) =>
-                        (b.publishedAt ?? "").localeCompare(
-                          a.publishedAt ?? "",
-                        ),
-                      );
                     let current = cached.versions.find(
                       (value) => String(value.id) === item.versionId,
                     );
-                    const newest = versions[0];
                     if (!current && found.installedVersion) {
                       const installedKey = JSON.stringify([
                         found.id,
@@ -1562,16 +1586,35 @@ export async function createLaunchpad(ctx) {
                       }
                       current = installed.value;
                     }
-                    if (!newest || !current)
+                    if (!current)
                       throw error(
                         404,
-                        !newest
-                          ? "No compatible downloadable releases were returned. Update status could not be checked."
-                          : "The installed release was not found in the compatible catalog. Update status could not be checked.",
+                        "The installed release was not found in the compatible catalog. Update status could not be checked.",
                       );
-                    const latestDate = Date.parse(newest.publishedAt),
+                    item.channel =
+                      normalizeChannel(current.channel) ??
+                      normalizeChannel(item.channel);
+                    const allowed = allowedUpdateChannels(
+                      input.updateChannel,
+                      item.channel,
+                    );
+                    const newest = cached.versions
+                      .filter(
+                        (value) =>
+                          value.downloadable !== false &&
+                          allowed.includes(
+                            normalizeChannel(value.channel) ?? "release",
+                          ),
+                      )
+                      .sort((a, b) =>
+                        (b.publishedAt ?? "").localeCompare(
+                          a.publishedAt ?? "",
+                        ),
+                      )[0];
+                    const latestDate = Date.parse(newest?.publishedAt),
                       currentDate = Date.parse(current.publishedAt);
                     if (
+                      newest &&
                       String(newest.id) !== item.versionId &&
                       (!Number.isFinite(latestDate) ||
                         !Number.isFinite(currentDate))
@@ -1581,6 +1624,7 @@ export async function createLaunchpad(ctx) {
                         "The release dates could not be verified. Update status could not be checked.",
                       );
                     const value =
+                      newest &&
                       String(newest.id) !== item.versionId &&
                       latestDate > currentDate
                         ? publicVersion(newest)
@@ -1651,10 +1695,15 @@ export async function createLaunchpad(ctx) {
             .map((other) => other.path);
   }
   async function installed(input) {
-    input = selection(input);
+    input = { ...selection(input), updateChannel };
     const cacheGeneration = metadataCache?.generation;
     const catalogSignal = catalogController.signal;
-    const scope = JSON.stringify([input.type, input.gameVersion, input.loader]);
+    const scope = JSON.stringify([
+      input.type,
+      input.gameVersion,
+      input.loader,
+      input.updateChannel,
+    ]);
     const existingCheck = backgroundChecks.get(scope);
     if (
       !enabled(input.local) &&
@@ -1749,6 +1798,7 @@ export async function createLaunchpad(ctx) {
     }
     const flightKey = JSON.stringify([
       cacheGeneration,
+      input.updateChannel,
       input.type,
       input.gameVersion,
       input.loader,
@@ -1902,17 +1952,40 @@ export async function createLaunchpad(ctx) {
         warnings.push(...cached.warnings);
     }
     const modrinth = providers.find((value) => value.id === "modrinth");
-    if (unknown.length) {
+    // Older receipts/cache entries predate channel metadata. Backfill it from
+    // the verified hash without replacing their explicitly selected identity.
+    const identityHash = (item) => item.canonicalSha512 ?? item.sha512;
+    const identityCandidates = [
+      ...unknown,
+      ...items.filter(
+        (item) =>
+          item.platform === "modrinth" &&
+          !normalizeChannel(item.channel) &&
+          item.sha512,
+      ),
+    ];
+    if (identityCandidates.length) {
       const applyIdentities = (matches) => {
         if (input.signal.aborted) return;
-        for (const item of unknown) {
-          const version = matches[item.sha512];
+        for (const item of identityCandidates) {
+          const version = matches[identityHash(item)];
+          if (item.platform) {
+            if (
+              String(version?.project_id) === item.projectId &&
+              String(version?.id) === item.versionId
+            )
+              item.channel = normalizeChannel(
+                version.version_type ?? "release",
+              );
+            continue;
+          }
           if (version)
             Object.assign(item, {
               platform: "modrinth",
               projectId: String(version.project_id),
               versionId: String(version.id),
               versionName: version.name,
+              channel: normalizeChannel(version.version_type ?? "release"),
               title: version.name,
             });
         }
@@ -1920,7 +1993,7 @@ export async function createLaunchpad(ctx) {
       try {
         const result = await abortable(
           (modrinth.identifyInstalled ?? modrinth.identify)(
-            [...new Set(unknown.map((item) => item.sha512))],
+            [...new Set(identityCandidates.map(identityHash))],
             {
               signal: input.signal,
               refresh: enabled(input.refresh),
@@ -2019,6 +2092,9 @@ export async function createLaunchpad(ctx) {
                 projectId: String(match.file.modId ?? match.id),
                 versionId: String(match.file.id),
                 versionName: match.file.displayName,
+                channel: { 1: "release", 2: "beta", 3: "alpha" }[
+                  match.file.releaseType
+                ],
                 title: match.file.displayName,
               });
           }
@@ -2137,6 +2213,7 @@ export async function createLaunchpad(ctx) {
       }
     }
     const secret = await key();
+    if (updatePolicyWarning) warnings.push(updatePolicyWarning);
     return {
       platforms: providers.map((value) => ({
         id: value.id,
@@ -2158,6 +2235,7 @@ export async function createLaunchpad(ctx) {
       types,
       loaders,
       gameVersions: versionsCache ?? [],
+      updateChannel,
       gameVersion: current.gameVersion ?? null,
       loader: current.loader ?? null,
       status: current.status,
@@ -2405,6 +2483,7 @@ export async function createLaunchpad(ctx) {
               platform: existing.platform,
               projectId: existing.projectId,
               versionId: value.versionId,
+              channel: existing.channel,
             },
             title: existing.title,
             versionName: existing.versionName,
@@ -2412,6 +2491,29 @@ export async function createLaunchpad(ctx) {
         ],
       };
     }
+    const dependencyCandidates = (value, versions) => {
+      const existing = local.find(
+        (item) =>
+          item.platform === value.platform &&
+          item.projectId === value.projectId,
+      );
+      const current = versions.find(
+        (version) => String(version.id) === existing?.versionId,
+      );
+      const allowed = allowedUpdateChannels(
+        input.updateChannel,
+        normalizeChannel(current?.channel) ?? existing?.channel,
+      );
+      return versions
+        .filter(
+          (version) =>
+            version.downloadable !== false &&
+            allowed.includes(normalizeChannel(version.channel) ?? "release"),
+        )
+        .sort((a, b) =>
+          (b.publishedAt ?? "").localeCompare(a.publishedAt ?? ""),
+        );
+    };
     async function visit(
       value,
       depth = 0,
@@ -2493,16 +2595,9 @@ export async function createLaunchpad(ctx) {
             skipClientDependency(dependency.title);
             return;
           }
-          const versions = (await found.versions(value)).filter(
-            (version) =>
-              version.downloadable !== false &&
-              (!version.channel || version.channel === "release"),
-          );
-          value.versionId = versions.sort(
-            (a, b) =>
-              (({ release: 0, beta: 1, alpha: 2 })[a.channel] ?? 0) -
-                ({ release: 0, beta: 1, alpha: 2 }[b.channel] ?? 0) ||
-              (b.publishedAt ?? "").localeCompare(a.publishedAt ?? ""),
+          value.versionId = dependencyCandidates(
+            value,
+            await found.versions(value),
           )[0]?.id;
           if (!value.versionId)
             throw error(
@@ -2561,16 +2656,9 @@ export async function createLaunchpad(ctx) {
               ? null
               : await found.compatibleDependencyVersion(value);
           if (!compatible) {
-            const candidates = (await found.versions(value)).filter(
-              (version) =>
-                version.downloadable !== false &&
-                (!version.channel || version.channel === "release"),
-            );
-            compatible = candidates.sort(
-              (a, b) =>
-                (({ release: 0, beta: 1, alpha: 2 })[a.channel] ?? 0) -
-                  ({ release: 0, beta: 1, alpha: 2 }[b.channel] ?? 0) ||
-                (b.publishedAt ?? "").localeCompare(a.publishedAt ?? ""),
+            compatible = dependencyCandidates(
+              value,
+              await found.versions(value),
             )[0];
             if (!compatible) {
               const decision = decisionFor(value, requiredBy);
@@ -2791,6 +2879,9 @@ export async function createLaunchpad(ctx) {
             file.installedIdentity?.versionId ?? value.versionId,
           ),
           versionName: file.versionName ?? result.versionName,
+          channel: normalizeChannel(
+            file.installedIdentity?.channel ?? result.channel,
+          ),
           installReason: depth ? "dependency" : "requested",
           requiredBy: requiredBy ? [requiredBy] : [],
           title: result.title,
@@ -4217,6 +4308,7 @@ export async function createLaunchpad(ctx) {
               item.projectId === input.projectId,
           )?.authorLinks,
         versionName: result.versionName,
+        channel: normalizeChannel(result.channel),
         warnings: [...new Set(result.warnings)],
         unavailableDependencies: result.unavailableDependencies,
         dependencyDecisions: result.dependencyDecisions ?? [],
@@ -4245,6 +4337,7 @@ export async function createLaunchpad(ctx) {
         planId,
         title: plan.title,
         versionName: plan.versionName,
+        channel: plan.channel,
         unchangedCount: unchanged.length,
         files: files.map((file) => ({
           path: file.path,
@@ -4254,6 +4347,7 @@ export async function createLaunchpad(ctx) {
           previousPath: file.previous?.path,
           installedVersion: file.installedVersion,
           proposedVersion: file.proposedVersion,
+          channel: file.channel,
           direction: file.direction,
           installReason: file.installReason,
           requiredBy: file.requiredBy ?? [],
@@ -4407,6 +4501,7 @@ export async function createLaunchpad(ctx) {
               projectId: file.projectId,
               versionId: file.versionId,
               versionName: file.versionName,
+              channel: file.channel,
               title: file.title,
               iconUrl: file.iconUrl,
               author: file.author,
@@ -4624,6 +4719,7 @@ export async function createLaunchpad(ctx) {
               authorLinks: plan.authorLinks,
               url: plan.url,
               versionName: plan.versionName,
+              channel: plan.channel,
               clientManifest: plan.clientManifest,
               clientManifestFormat: plan.clientManifestFormat,
               path: "",
@@ -5146,6 +5242,41 @@ export async function createLaunchpad(ctx) {
     };
   }
   async function updatePolicy(input = {}) {
+    if (!input || typeof input !== "object" || Array.isArray(input))
+      throw error(400, "Choose a valid update policy.");
+    if (Object.hasOwn(input, "updateChannel")) {
+      if (
+        !isUpdateChannel(input.updateChannel) ||
+        Object.hasOwn(input, "path") ||
+        Object.hasOwn(input, "hold")
+      )
+        throw error(
+          400,
+          "Choose installed stability, release, beta, or alpha updates separately from a file hold.",
+        );
+      const next = input.updateChannel;
+      const write = policyWrites
+        .catch(() => {})
+        .then(async () => {
+          const temporary = await privatePath(`${randomUUID()}.tmp`);
+          try {
+            await fs.writeFile(
+              temporary,
+              JSON.stringify({ version: 1, updateChannel: next }),
+              { flag: "wx", mode: 0o600 },
+            );
+            await fs.rename(temporary, await privatePath("update-policy.json"));
+          } finally {
+            await fs.rm(temporary, { force: true });
+          }
+          updateChannel = next;
+          updatePolicyWarning = undefined;
+          invalidateCatalogCaches();
+          return { ok: true, updateChannel };
+        });
+      policyWrites = write;
+      return write;
+    }
     if (typeof input.path !== "string" || typeof input.hold !== "boolean")
       throw error(
         400,
@@ -5747,6 +5878,7 @@ export async function createLaunchpad(ctx) {
       );
       await terminal?.flush();
       await receiptWrites.catch(() => {});
+      await policyWrites.catch(() => {});
       await metadataCache?.close();
       for (const [id] of plans)
         await fs

@@ -61,6 +61,9 @@ import LaunchpadCategoryFilters from "./LaunchpadCategoryFilters";
 import "./management.css";
 import "./launchpad.css";
 
+type UpdateChannel = "installed" | "release" | "beta" | "alpha";
+const channelLabel = (value?: string) =>
+  value === "beta" ? "Beta" : value === "alpha" ? "Alpha" : "";
 type ContentType = "modpack" | "mod" | "datapack" | "plugin";
 type Platform = {
   id: string;
@@ -108,6 +111,7 @@ type InstalledItem = {
   projectId?: string;
   versionId?: string;
   versionName?: string;
+  channel?: string;
   updateHeld?: boolean;
   previousVersionId?: string;
   previousVersionName?: string;
@@ -162,6 +166,7 @@ type ContentOperation = {
   undoneAt?: string;
 };
 type Config = {
+  updateChannel?: UpdateChannel;
   platforms: Platform[];
   gameVersion: string | null;
   loader: string | null;
@@ -214,6 +219,7 @@ function mergeLocalInventory(
         projectId: old.projectId ?? item.projectId,
         versionId: old.versionId ?? item.versionId,
         versionName: old.versionName ?? item.versionName,
+        channel: item.channel ?? old.channel,
         updateHeld: item.updateHeld ?? old.updateHeld,
         previousVersionId: item.previousVersionId ?? old.previousVersionId,
         previousVersionName:
@@ -263,6 +269,7 @@ type Plan = {
   planId: string;
   title: string;
   versionName: string;
+  channel?: string;
   expiresAt: string;
   dependencyDecisions?: DependencyDecision[];
   runtimeRequirements?: RuntimeRequirement[];
@@ -275,6 +282,7 @@ type Plan = {
     previousPath?: string;
     installedVersion?: string;
     proposedVersion?: string;
+    channel?: string;
     direction?: string;
     installReason?: string;
     requiredBy?: string[];
@@ -656,6 +664,8 @@ export default function Launchpad({
   onCreateServer,
 }: PageProps & { permissions?: string[]; onCreateServer?: () => void }) {
   const allowChanges = canChangeContent(permissions);
+  const canChangeUpdateChannel =
+    permissions === undefined || permissions.includes("server.update");
   const { api, post, downloadUrl } = useServerApi();
   const serverId = useContext(ServerScope);
   const panel = useContext(PanelScope);
@@ -753,6 +763,7 @@ export default function Launchpad({
     type,
     contentGameVersion,
     contentLoader,
+    config?.updateChannel ?? "installed",
   ]);
   const [inventory, setInventory] = useState<{
     api: typeof api;
@@ -1790,6 +1801,43 @@ export default function Launchpad({
       if (currentSession === session.current) setUndoError(messageOf(cause));
     } finally {
       if (currentSession === session.current) setUndoBusy(false);
+    }
+  }
+  async function saveUpdateChannel(updateChannel: UpdateChannel) {
+    if (pending.current || !canChangeUpdateChannel) return;
+    const currentSession = session.current;
+    pending.current = true;
+    setBusy("active");
+    try {
+      const saved = await api<{ updateChannel: UpdateChannel }>(
+        "/launchpad/update-policy",
+        {
+          method: "PATCH",
+          body: JSON.stringify({ updateChannel }),
+        },
+      );
+      if (currentSession !== session.current) return;
+      // Invalidate before publishing the policy. A prior scan must not repopulate
+      // cached Alpha offers after the user switches back to stable releases.
+      scanEpoch.current++;
+      inventoryCache.current.clear();
+      inventoryRef.current = null;
+      setInventory(null);
+      setConfig((current) =>
+        current ? { ...current, updateChannel: saved.updateChannel } : current,
+      );
+      setSelectedPaths(new Set());
+      setReload((value) => value + 1);
+      notify(
+        "Update channel saved for this server. Checking installed content again.",
+      );
+    } catch (cause) {
+      if (currentSession === session.current) notify(messageOf(cause), true);
+    } finally {
+      if (currentSession === session.current) {
+        pending.current = false;
+        setBusy(null);
+      }
     }
   }
   async function holdVersion(entry: InstalledItem) {
@@ -3270,6 +3318,43 @@ export default function Launchpad({
             : ""}
         </button>
       </div>
+      {installedOnly && (
+        <div className="management-notice">
+          <label className="launchpad-sort">
+            Update channel
+            <select
+              aria-label="Update channel"
+              value={config.updateChannel ?? "installed"}
+              disabled={
+                !canChangeUpdateChannel ||
+                Boolean(busy) ||
+                working ||
+                !!selectionBatch ||
+                configLoading
+              }
+              onChange={(event) =>
+                void saveUpdateChannel(event.target.value as UpdateChannel)
+              }
+            >
+              <option value="installed">Follow installed stability</option>
+              <option value="release">Stable releases only</option>
+              <option value="beta">Stable and beta</option>
+              <option value="alpha">Stable, beta and alpha</option>
+            </select>
+          </label>
+          <p>
+            Applies to update checks on this server. By default, stable files
+            stay stable; beta files accept stable or beta; alpha files accept
+            all channels. Unknown channels use stable releases.
+          </p>
+          {!canChangeUpdateChannel && (
+            <p>
+              Changing this preference requires permission to edit server
+              settings.
+            </p>
+          )}
+        </div>
+      )}
       {toolbar()}
       {installedOnly && type !== "modpack" && allowChanges && (
         <div
@@ -3881,6 +3966,11 @@ export default function Launchpad({
                               : "Unidentified file"}
                           </span>
                         )}
+                        {channelLabel(entry?.channel) && (
+                          <span className="launchpad-badge">
+                            {channelLabel(entry?.channel)}
+                          </span>
+                        )}
                         {entry?.updateHeld && (
                           <span className="launchpad-badge">Version held</span>
                         )}
@@ -4012,6 +4102,8 @@ export default function Launchpad({
                           <div className="launchpad-available-version">
                             Available:{" "}
                             {entry.update.version || entry.update.name}
+                            {channelLabel(entry.update.channel) &&
+                              ` · ${channelLabel(entry.update.channel)}`}
                           </div>
                         )}
                       </div>
@@ -4428,6 +4520,11 @@ export default function Launchpad({
                   </>
                 )}
               </p>
+              {channelLabel(plan.channel) && (
+                <p className="management-notice">
+                  Selected version: {channelLabel(plan.channel)} prerelease.
+                </p>
+              )}
               {type === "modpack" && (
                 <div
                   className="launchpad-pack-summary"
@@ -4476,6 +4573,11 @@ export default function Launchpad({
                         <span>
                           {file.title && <strong>{file.title}</strong>}
                           <span>{file.path}</span>
+                          {channelLabel(file.channel) && (
+                            <span className="launchpad-badge">
+                              {channelLabel(file.channel)} prerelease
+                            </span>
+                          )}
                           {(file.installedVersion || file.proposedVersion) && (
                             <small className="launchpad-previous-path">
                               {file.installedVersion || "Not installed"} →{" "}

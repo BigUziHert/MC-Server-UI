@@ -83,6 +83,7 @@ files:
   - shared/panel-connection.mjs
   - shared/launchpad-project.mjs
   - shared/launchpad-categories.mjs
+  - shared/launchpad-channels.mjs
   - desktop/main.mjs
   - desktop/runtime.mjs
   - desktop/updates.mjs

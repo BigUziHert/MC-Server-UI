@@ -2148,3 +2148,36 @@ for (const cancelAction of ["Cancel remaining", "Browse catalog"]) {
     expect(writes).toEqual(["mods/alpha.jar"]);
   });
 }
+
+test("installation review labels selected and dependency prerelease channels", async ({
+  page,
+}) => {
+  await catalog(page);
+  await page.route("**/api/launchpad/installed?**", (route) =>
+    route.fulfill({ json: { items: [], warnings: [] } }),
+  );
+  await page.route("**/api/launchpad/dependencies?**", (route) =>
+    route.fulfill({
+      json: { dependencies: [], warnings: [], declarationsAvailable: false },
+    }),
+  );
+  await page.route("**/api/launchpad/preview", (route) =>
+    route.fulfill({
+      json: {
+        ...plan,
+        channel: "beta",
+        files: [{ ...plan.files[0], channel: "alpha", title: "Library" }],
+      },
+    }),
+  );
+  await page.goto("/#launchpad");
+  await page.getByRole("button", { name: "Install Pack", exact: true }).click();
+  await page
+    .getByRole("button", { name: "Review installation", exact: true })
+    .click();
+  const dialog = page.getByRole("dialog");
+  await expect(dialog).toContainText("Selected version: Beta prerelease.");
+  await expect(
+    dialog.getByRole("list", { name: "Installation files" }),
+  ).toContainText("Alpha prerelease");
+});

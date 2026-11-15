@@ -1569,3 +1569,76 @@ test("top and bottom category filters have distinct panels and share selections 
     path: testInfo.outputPath("bottom-toolbar-filters-mobile.png"),
   });
 });
+
+test("update channel is saved on the server, refreshes offers, and survives navigation", async ({
+  page,
+}) => {
+  await catalog(page);
+  let policy = "installed";
+  const changes: unknown[] = [];
+  await page.route(/\/api\/launchpad(?:\?.*)?$/, (route) =>
+    route.fulfill({
+      json: {
+        platforms: [
+          {
+            id: "curseforge",
+            name: "CurseForge",
+            available: true,
+            types: ["mod"],
+          },
+        ],
+        gameVersion: "1.21.1",
+        loader: "neoforge",
+        status: "offline",
+        warnings: [],
+        updateChannel: policy,
+      },
+    }),
+  );
+  await page.route("**/api/launchpad/update-policy", (route) => {
+    const body = route.request().postDataJSON();
+    changes.push(body);
+    policy = body.updateChannel;
+    return route.fulfill({ json: { ok: true, updateChannel: policy } });
+  });
+  await page.route("**/api/launchpad/installed?**", (route) =>
+    route.fulfill({
+      json: {
+        items: [
+          {
+            ...installed("Example", true, true),
+            channel: "beta",
+            update: {
+              ...version,
+              channel: policy === "alpha" ? "alpha" : "beta",
+            },
+          },
+        ],
+        warnings: [],
+      },
+    }),
+  );
+  await page.goto("/#launchpad");
+  await expect(
+    page.getByRole("combobox", { name: "Update channel", exact: true }),
+  ).toHaveCount(0);
+  await page.getByRole("button", { name: /^Installed content/ }).click();
+  const channel = page.getByRole("combobox", {
+    name: "Update channel",
+    exact: true,
+  });
+  await expect(channel).toHaveValue("installed");
+  const row = page.getByRole("article", { name: "Example", exact: true });
+  await expect(row).toContainText("Beta");
+  await expect(row).toContainText("Available: 2.0 · Beta");
+  await channel.selectOption("alpha");
+  await expect.poll(() => changes).toEqual([{ updateChannel: "alpha" }]);
+  await expect(channel).toHaveValue("alpha");
+  await expect(row).toContainText("Available: 2.0 · Alpha");
+  await channel.selectOption("release");
+  await expect(channel).toHaveValue("release");
+  await expect(row).not.toContainText("Available: 2.0 · Alpha");
+  await page.getByRole("link", { name: "Console", exact: true }).click();
+  await page.getByRole("link", { name: "Launchpad", exact: true }).click();
+  await expect(channel).toHaveValue("release");
+});

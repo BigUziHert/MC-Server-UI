@@ -246,7 +246,10 @@ export function requiredPermissions(req) {
     if (route === "/api/backups/schedule") return ["backup.update"];
   }
   if (req.method === "PATCH") {
-    if (route === "/api/launchpad/update-policy") return contentChanges;
+    if (route === "/api/launchpad/update-policy")
+      return Object.hasOwn(req.body ?? {}, "updateChannel")
+        ? ["server.update"]
+        : contentChanges;
     if (["/api/server/settings", "/api/server/icon"].includes(route))
       return ["server.update"];
     if (/^\/api\/subusers\/[^/]+$/.test(route)) return ["user.update"];
