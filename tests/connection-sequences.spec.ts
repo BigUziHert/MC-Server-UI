@@ -177,7 +177,10 @@ async function openForm(page: Page, mode: Mode, newer: boolean) {
     await dialog
       .getByLabel("Password", { exact: true })
       .fill(newer ? "newer-password-value" : "abandoned-password-value");
-    await dialog.getByRole("button", { name: "Sign in", exact: true }).click();
+    await dialog
+      .getByRole("form", { name: /^Sign in/ })
+      .getByRole("button", { name: "Sign in", exact: true })
+      .click();
   } else {
     await dialog
       .getByLabel("Invitation link", { exact: true })

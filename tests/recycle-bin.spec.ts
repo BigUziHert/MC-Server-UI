@@ -1225,6 +1225,10 @@ for (const action of ["delete", "restore"] as const) {
         "keep-my-draft.txt",
       );
       await newer.getByRole("button", { name: "Cancel", exact: true }).click();
+      await newer
+        .getByRole("button", { name: "Discard changes", exact: true })
+        .click();
+      await expect(newer).not.toBeVisible();
       await openBin(page);
       await expect(progress).toContainText("Recovery action complete");
       await expect(progress).toContainText("2 of 2 items finished");

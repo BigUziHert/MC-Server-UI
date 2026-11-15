@@ -12,6 +12,7 @@ const iconData = (fill: string) =>
 
 const invitationToken = "A".repeat(43);
 const panelOrigin = "https://panel.example.test";
+const home = process.env.PANEL_E2E_BASE_URL ?? "http://127.0.0.1:3111";
 const invitationUrl = `${panelOrigin}/#invite=${invitationToken}`;
 const localServer = {
   id: "local-connection-fixture",
@@ -2494,8 +2495,7 @@ for (const invitation of [false, true]) {
     await page.route(`${panelOrigin}/api/**`, (route) => {
       const request = route.request();
       const headers = {
-        "Access-Control-Allow-Origin":
-          request.headers().origin || "http://127.0.0.1:3111",
+        "Access-Control-Allow-Origin": request.headers().origin || home,
         "Access-Control-Allow-Headers":
           "authorization,content-type,x-mc-panel-client,x-server-id",
         "Access-Control-Allow-Methods": "GET,POST,OPTIONS",
@@ -2568,7 +2568,10 @@ for (const invitation of [false, true]) {
         .fill("Fixture-only-account-password");
       expect(remoteRequests).toEqual([]);
     }
-    await dialog
+    const form = invitation
+      ? dialog
+      : dialog.getByRole("form", { name: /^Sign in/ });
+    await form
       .getByRole("button", {
         name: invitation ? "Continue with invitation" : "Sign in",
         exact: true,
@@ -2588,7 +2591,7 @@ for (const invitation of [false, true]) {
         dialog.getByLabel("Panel address", { exact: true }),
       ).toHaveValue("https://PANEL.example.test:443");
     }
-    expect(new URL(page.url()).origin).toBe("http://127.0.0.1:3111");
+    expect(new URL(page.url()).origin).toBe(home);
     // Only validation runs before the destination-specific preview or sign-in.
     expect(navigations).toEqual([]);
     expect(remoteRequests.length).toBeGreaterThan(0);
@@ -2638,6 +2641,10 @@ for (const width of [1280, 375]) {
         return route.fulfill({ json: { servers: [], defaultServerId: null } });
       if (path === "/api/panel-users")
         return route.fulfill({ json: { users: [], servers: [] } });
+      if (path === "/api/access/people")
+        return route.fulfill({
+          json: { panelName: "Empty host", users: [], servers: [] },
+        });
       if (path === "/api/access/settings")
         return route.fulfill({
           json: {
@@ -2668,8 +2675,14 @@ for (const width of [1280, 375]) {
       .getByRole("tab", { name: "Remote Access", exact: true })
       .click();
     await expect(
-      settings.getByRole("heading", { name: "Panel users", exact: true }),
+      settings.getByRole("heading", {
+        name: "People · Empty host",
+        exact: true,
+      }),
     ).toBeVisible();
+    await expect(
+      settings.getByRole("button", { name: "Invite person", exact: true }),
+    ).toBeEnabled();
     await expect
       .poll(
         () => calls.filter((call) => call.path === "/api/panel-users").length,
@@ -2700,7 +2713,7 @@ for (const width of [1280, 375]) {
       page.getByRole("heading", { name: "Welcome to MC Panel", exact: true }),
     ).toBeVisible();
     await expect(
-      page.getByRole("heading", { name: "Panel users", exact: true }),
+      page.getByRole("heading", { name: "People · Empty host", exact: true }),
     ).toHaveCount(0);
   });
 }

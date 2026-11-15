@@ -99,6 +99,7 @@ test("a copied invitation works over direct HTTPS through password setup, sign-i
       ignoreHTTPSErrors: true,
       viewport: { width: 390, height: 844 },
     });
+    context.setDefaultTimeout(10_000);
     const phone = await context.newPage();
     const remoteGet = async (url: string) =>
       context!.request.get(url, {
@@ -166,6 +167,12 @@ test("a copied invitation works over direct HTTPS through password setup, sign-i
       phone.getByRole("heading", { name: "Console", exact: true }),
     ).toBeVisible();
     await expect(phone.locator(".metric-card")).toHaveCount(4);
+    const signedInSession = await (
+      await remoteGet(`${publicUrl}/api/access/session`)
+    ).json();
+    const panelLabel = signedInSession.panelName;
+    expect(typeof panelLabel).toBe("string");
+    expect(panelLabel).not.toBe("");
     expect(
       (await context.cookies(publicUrl)).some(
         (entry) => entry.name === "__Host-mc-subuser",
@@ -202,7 +209,7 @@ test("a copied invitation works over direct HTTPS through password setup, sign-i
     });
     await connections
       .getByRole("button", {
-        name: `Sign out of 127.0.0.1:${port}`,
+        name: `Sign out of ${panelLabel}`,
         exact: true,
       })
       .click();
@@ -211,7 +218,7 @@ test("a copied invitation works over direct HTTPS through password setup, sign-i
       .click();
     await connections
       .getByRole("button", {
-        name: `Sign in to 127.0.0.1:${port}`,
+        name: `Sign in to ${panelLabel}`,
         exact: true,
       })
       .click();
@@ -269,7 +276,7 @@ test("a copied invitation works over direct HTTPS through password setup, sign-i
       phone.getByRole("heading", { name: serverName, exact: true }),
     ).toHaveCount(0);
   } finally {
-    await context?.close();
+    await context?.close().catch(() => {});
     if (owner) {
       owner.closeAllConnections();
       await new Promise<void>((resolve) => owner!.close(() => resolve()));

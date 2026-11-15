@@ -92,6 +92,7 @@ import ServerManager, {
 } from "./ServerManager";
 import "./welcome.css";
 import DesktopWorkspace from "./DesktopWorkspace";
+import { DesktopWorkspaceContext } from "./workspace-target";
 
 type Page =
   | "console"
@@ -877,6 +878,7 @@ export function EmptyFleet({
   onSignedOut?: () => void;
   notify: (message: string, error?: boolean) => void;
 }) {
+  const workspace = useContext(DesktopWorkspaceContext);
   const openLocalSetup = session
     ? window.mcPanelConnections?.openLocalServerSetup
     : undefined;
@@ -986,6 +988,16 @@ export function EmptyFleet({
                   explicitTarget={Boolean(openLocalSetup)}
                 />
               </>
+            )}
+            {workspace?.connections?.panels.some(
+              (panel) => !panel.local && !panel.temporary,
+            ) && (
+              <nav className="welcome-computers" aria-label="Saved computers">
+                <ServerSwitcher
+                  servers={workspace.localServers}
+                  onSelect={(id) => workspace.select("local", id)}
+                />
+              </nav>
             )}
             <div className="welcome-remote-account">
               {session && !showWelcome && <DesktopPanelReturn />}
@@ -1966,6 +1978,18 @@ function ConsolePage({
   const [logError, setLogError] = useState(false);
   const commandInput = useRef<HTMLInputElement>(null);
   const logContainer = useRef<HTMLDivElement>(null);
+  const logContent = useRef<HTMLDivElement>(null);
+  const followedLogLayout = useRef({ height: 0, viewport: 0, width: 0 });
+  const followLogTail = useCallback(() => {
+    const output = logContainer.current;
+    if (!output) return;
+    followedLogLayout.current = {
+      height: output.scrollHeight,
+      viewport: output.clientHeight,
+      width: output.clientWidth,
+    };
+    output.scrollTop = output.scrollHeight;
+  }, []);
   const commandHistory = useRef<Record<"command" | "message", string[]>>({
     command: [],
     message: [],
@@ -2027,9 +2051,15 @@ function ConsolePage({
     };
   }, [loadLogs, canConsole]);
   useEffect(() => {
-    if (autoScroll && logContainer.current)
-      logContainer.current.scrollTop = logContainer.current.scrollHeight;
-  }, [lines, autoScroll, levelFilter, query, showSearch]);
+    if (!autoScroll) return;
+    followLogTail();
+    // Font loading and responsive layout can rewrap unchanged log lines. Keep
+    // following those changes without depending on a new polling response.
+    const observer = new ResizeObserver(followLogTail);
+    if (logContainer.current) observer.observe(logContainer.current);
+    if (logContent.current) observer.observe(logContent.current);
+    return () => observer.disconnect();
+  }, [lines, autoScroll, levelFilter, query, showSearch, followLogTail]);
   useEffect(() => {
     const listener = (e: KeyboardEvent) => {
       if (
@@ -2439,6 +2469,16 @@ function ConsolePage({
               aria-live="off"
               onScroll={(event) => {
                 const output = event.currentTarget;
+                const layout = followedLogLayout.current;
+                if (
+                  autoScroll &&
+                  (output.scrollHeight !== layout.height ||
+                    output.clientHeight !== layout.viewport ||
+                    output.clientWidth !== layout.width)
+                ) {
+                  followLogTail();
+                  return;
+                }
                 if (
                   output.scrollHeight - output.clientHeight - output.scrollTop >
                   24
@@ -2446,40 +2486,42 @@ function ConsolePage({
                   setAutoScroll(false);
               }}
             >
-              {logError ? (
-                <div className="console-empty">
-                  Console connection unavailable. Retrying…
-                </div>
-              ) : visibleLines.length ? (
-                visibleLines.map((line) => (
-                  <div
-                    className={`log-line log-${line.level}`}
-                    // Keep retained rows mounted so scroll anchoring survives log rotation.
-                    key={line.id}
-                  >
-                    <time>
-                      {/^\d{2}:\d{2}/.test(line.time)
-                        ? line.time
-                        : new Date(line.time).toLocaleTimeString("en-GB")}
-                    </time>
-                    <span className="log-level">
-                      {line.level.toUpperCase()}
-                    </span>
-                    <span className="log-message">{line.message}</span>
+              <div ref={logContent} style={{ display: "flow-root" }}>
+                {logError ? (
+                  <div className="console-empty">
+                    Console connection unavailable. Retrying…
                   </div>
-                ))
-              ) : (
-                <div className="console-empty">
-                  <Terminal size={24} />
-                  <p>
-                    {levelFilter !== "all"
-                      ? "No logs match your filters."
-                      : search
-                        ? "No logs match your search."
-                        : "Console is ready. Server output will appear here."}
-                  </p>
-                </div>
-              )}
+                ) : visibleLines.length ? (
+                  visibleLines.map((line) => (
+                    <div
+                      className={`log-line log-${line.level}`}
+                      // Keep retained rows mounted so scroll anchoring survives log rotation.
+                      key={line.id}
+                    >
+                      <time>
+                        {/^\d{2}:\d{2}/.test(line.time)
+                          ? line.time
+                          : new Date(line.time).toLocaleTimeString("en-GB")}
+                      </time>
+                      <span className="log-level">
+                        {line.level.toUpperCase()}
+                      </span>
+                      <span className="log-message">{line.message}</span>
+                    </div>
+                  ))
+                ) : (
+                  <div className="console-empty">
+                    <Terminal size={24} />
+                    <p>
+                      {levelFilter !== "all"
+                        ? "No logs match your filters."
+                        : search
+                          ? "No logs match your search."
+                          : "Console is ready. Server output will appear here."}
+                    </p>
+                  </div>
+                )}
+              </div>
             </div>
             <div className="console-status">
               <span>

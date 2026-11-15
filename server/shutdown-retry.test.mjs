@@ -6,7 +6,11 @@ import path from "node:path";
 import { createPanel } from "./index.mjs";
 
 test("a transient server shutdown persistence failure can be retried", async (t) => {
-  const root = await fs.mkdtemp(path.join(os.tmpdir(), "mc-shutdown-retry-"));
+  // safePath canonicalizes the destination before rename. Windows runners can
+  // expose TEMP through short names or different casing, so match that path.
+  const root = await fs.realpath(
+    await fs.mkdtemp(path.join(os.tmpdir(), "mc-shutdown-retry-")),
+  );
   const panel = await createPanel({
     dataDir: root,
     useEnvironment: false,
@@ -28,7 +32,7 @@ test("a transient server shutdown persistence failure can be retried", async (t)
   t.after(async () => {
     t.mock.restoreAll();
     await panel.close();
-    assert.equal(path.dirname(root), path.resolve(os.tmpdir()));
+    assert.equal(path.dirname(root), await fs.realpath(os.tmpdir()));
     assert.ok(path.basename(root).startsWith("mc-shutdown-retry-"));
     await fs.rm(root, { recursive: true, force: true });
   });
@@ -36,9 +40,12 @@ test("a transient server shutdown persistence failure can be retried", async (t)
     panel.audit("server", "Fixture", "pending state"),
     /Temporary state disk failure/,
   );
+  assert.equal(failuresRemaining, 1, "the initial audit write was rejected");
   await assert.rejects(panel.close(), /Temporary state disk failure/);
+  assert.equal(failuresRemaining, 0, "shutdown retried the failed state write");
   await panel.close();
-  assert.ok(
-    JSON.parse(await fs.readFile(path.join(root, "panel.json"), "utf8")),
+  const saved = JSON.parse(
+    await fs.readFile(path.join(root, "panel.json"), "utf8"),
   );
+  assert.ok(saved.audit.some((entry) => entry.detail === "pending state"));
 });

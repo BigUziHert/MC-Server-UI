@@ -83,6 +83,9 @@ async function settingsFixture(
   await page.route("**/api/panel-users", (route) =>
     route.fulfill({ json: { users: [], servers } }),
   );
+  await page.route("**/api/access/people", (route) =>
+    route.fulfill({ json: { panelName: "This computer", users: [], servers } }),
+  );
   await page.route("**/api/desktop/settings", async (route) => {
     if (!settings.desktop)
       return route.fulfill({ status: 404, json: { error: "Not available" } });
@@ -232,6 +235,7 @@ test("Remote Access reports a committed save with an audit warning without retry
   await dialog.getByRole("tab", { name: "Remote Access", exact: true }).click();
   const address = dialog.getByLabel("Public panel address", { exact: true });
   await address.fill("https://saved.example.test");
+  page.once("dialog", (dialog) => dialog.accept());
   await dialog
     .getByRole("button", { name: "Save access settings", exact: true })
     .click();
@@ -465,7 +469,10 @@ test("browser Panel Settings persists host Remote Access and fits a phone", asyn
     dialog.getByRole("tab", { name: "Remote Access", exact: true }),
   ).toHaveAttribute("aria-selected", "true");
   await expect(
-    dialog.getByRole("heading", { name: "Panel users", exact: true }),
+    dialog.getByRole("heading", {
+      name: "People · This computer",
+      exact: true,
+    }),
   ).toBeVisible();
   await dialog
     .getByLabel("Public panel address", { exact: true })
@@ -476,8 +483,9 @@ test("browser Panel Settings persists host Remote Access and fits a phone", asyn
     dialog.getByLabel("Public panel address", { exact: true }),
   ).toHaveValue("https://updated-panel.example.test");
   await dialog
-    .getByRole("checkbox", { name: "Enable remote access", exact: true })
+    .getByRole("switch", { name: "Enable remote access", exact: true })
     .check();
+  page.once("dialog", (dialog) => dialog.accept());
   await dialog.getByRole("button", { name: "Save access settings" }).click();
   await expect(
     dialog.getByRole("heading", { name: "Remote access is configured" }),
@@ -509,10 +517,10 @@ test("browser Panel Settings persists host Remote Access and fits a phone", asyn
   await dialog.getByRole("tab", { name: "Remote Access", exact: true }).click();
   await dialog.getByRole("button", { name: "Edit setup" }).click();
   await expect(
-    dialog.getByRole("checkbox", { name: "Enable remote access", exact: true }),
+    dialog.getByRole("switch", { name: "Enable remote access", exact: true }),
   ).toBeChecked();
   await dialog
-    .getByRole("checkbox", { name: "Enable remote access", exact: true })
+    .getByRole("switch", { name: "Enable remote access", exact: true })
     .uncheck();
   await dialog.getByRole("button", { name: "Save access settings" }).click();
   await expect(
@@ -666,7 +674,7 @@ async function managedSettingsFixture(
   return fixture;
 }
 
-test("remote setup offers only trusted HTTPS on 443 and waits for the certificate without replacing edits", async ({
+test("remote setup offers connection modes and waits for a selected trusted certificate without replacing edits", async ({
   page,
 }, testInfo) => {
   const fixture = await managedSettingsFixture(page);
@@ -675,10 +683,18 @@ test("remote setup offers only trusted HTTPS on 443 and waits for the certificat
   const dialog = await openSettings(page);
   await dialog.getByRole("tab", { name: "Remote Access", exact: true }).click();
   const setup = dialog.getByRole("region", { name: "Remote access setup" });
-  await expect(setup.getByRole("combobox")).toHaveCount(0);
+  const method = setup.getByRole("combobox", {
+    name: "Connection method",
+    exact: true,
+  });
+  await expect(method).toHaveValue("direct");
+  await expect(method.getByRole("option")).toHaveText([
+    "Trusted HTTPS (public address)",
+    "Same network or VPN (desktop)",
+    "Existing HTTPS reverse proxy",
+  ]);
+  await method.selectOption("managed");
   await expect(setup).toContainText("Trusted HTTPS");
-  await expect(setup).not.toContainText("Self-signed HTTPS");
-  await expect(setup).not.toContainText("HTTPS handled by a proxy");
   await expect(
     setup.getByLabel("Remote access port", { exact: true }),
   ).toHaveCount(0);
@@ -699,8 +715,9 @@ test("remote setup offers only trusted HTTPS on 443 and waits for the certificat
   });
   await expect(invite).toBeDisabled();
   await setup
-    .getByRole("checkbox", { name: "Enable remote access", exact: true })
+    .getByRole("switch", { name: "Enable remote access", exact: true })
     .check();
+  page.once("dialog", (dialog) => dialog.accept());
   await setup
     .getByRole("button", { name: "Save access settings", exact: true })
     .click();
@@ -755,7 +772,7 @@ test("remote setup offers only trusted HTTPS on 443 and waits for the certificat
 });
 
 for (const transport of ["direct", "proxy"]) {
-  test(`existing ${transport} setup changes only after saving the trusted HTTPS upgrade`, async ({
+  test(`existing ${transport} setup stays intact until explicitly selecting and saving trusted HTTPS`, async ({
     page,
   }) => {
     const fixture = await managedSettingsFixture(page, {
@@ -773,17 +790,12 @@ for (const transport of ["direct", "proxy"]) {
       .click();
     let setup = dialog.getByRole("region", { name: "Remote access setup" });
     const original = { ...fixture.settings };
-    await expect(setup.getByRole("combobox")).toHaveCount(0);
     await expect(
-      setup.getByRole("note", { name: "Trusted HTTPS upgrade" }),
-    ).toContainText("https://existing.example.test:3004");
-    await expect(setup).toContainText("It stays unchanged until you save");
-    await expect(setup).toContainText(
-      "Existing accounts, passwords, and server permissions are preserved",
-    );
+      setup.getByRole("combobox", { name: "Connection method", exact: true }),
+    ).toHaveValue(transport);
     await expect(
       setup.getByLabel("Public panel address", { exact: true }),
-    ).toHaveValue("https://existing.example.test");
+    ).toHaveValue("https://existing.example.test:3004");
     await setup
       .getByText("Advanced connection options", { exact: true })
       .click();
@@ -805,7 +817,14 @@ for (const transport of ["direct", "proxy"]) {
     setup = dialog.getByRole("region", { name: "Remote access setup" });
     await expect(
       setup.getByLabel("Public panel address", { exact: true }),
-    ).toHaveValue("https://existing.example.test");
+    ).toHaveValue("https://existing.example.test:3004");
+    await setup
+      .getByRole("combobox", { name: "Connection method", exact: true })
+      .selectOption("managed");
+    await setup
+      .getByLabel("Public panel address", { exact: true })
+      .fill("https://existing.example.test");
+    page.once("dialog", (dialog) => dialog.accept());
     await setup
       .getByRole("button", { name: "Save access settings", exact: true })
       .click();
@@ -821,8 +840,8 @@ for (const transport of ["direct", "proxy"]) {
       },
     ]);
     await expect(
-      setup.getByRole("note", { name: "Trusted HTTPS upgrade" }),
-    ).toHaveCount(0);
+      setup.getByRole("combobox", { name: "Connection method", exact: true }),
+    ).toHaveValue("managed");
     await expect(
       dialog.getByRole("button", {
         name: "Create invite link for invited@example.test",

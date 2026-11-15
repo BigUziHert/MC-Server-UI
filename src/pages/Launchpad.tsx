@@ -2204,6 +2204,7 @@ export default function Launchpad({
     pending.current = true;
     setBusy("install");
     setDialogError("");
+    let submitted = false;
     try {
       if (
         backupFirst &&
@@ -2218,6 +2219,7 @@ export default function Launchpad({
         )
           return;
       }
+      submitted = true;
       const next = await post<{ job: Job }>("/launchpad/install", {
         planId: plan.planId,
         confirmed: true,
@@ -2240,12 +2242,14 @@ export default function Launchpad({
     } catch (cause) {
       // The host owns accepted work even when the transport loses its response.
       // Correlate by review, never by whichever unrelated job is retained last.
-      const accepted = await recoverAcceptedJob(
-        plan.planId,
-        job?.id,
-        currentSession,
-        currentOperation,
-      );
+      const accepted = submitted
+        ? await recoverAcceptedJob(
+            plan.planId,
+            job?.id,
+            currentSession,
+            currentOperation,
+          )
+        : null;
       if (
         currentSession === session.current &&
         currentOperation === operation.current
@@ -2254,6 +2258,7 @@ export default function Launchpad({
         else {
           setDialogError(messageOf(cause));
           if (
+            submitted &&
             [404, 409, 410].includes((cause as { status?: number }).status || 0)
           )
             setPlan(null);

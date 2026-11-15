@@ -30,6 +30,8 @@ test("browser origins isolate sign-ins, replay protection, icons and streamed do
         name: `${identity} private server`,
         publicAddress: { resolve: async () => null },
       });
+      const label = `${identity} test computer`;
+      await fleet.access.renamePanel(label);
       const tls = await createRemoteTls({
         dataDir,
         localAddresses: () => [],
@@ -77,6 +79,7 @@ test("browser origins isolate sign-ins, replay protection, icons and streamed do
       const invitation = await fleet.access.inviteAccount(account.id);
       return {
         origin,
+        label,
         email,
         account,
         id,
@@ -170,7 +173,7 @@ test("browser origins isolate sign-ins, replay protection, icons and streamed do
     });
     await connections
       .getByRole("button", {
-        name: `Sign out of ${new URL(C.origin).host}`,
+        name: `Sign out of ${C.label}`,
         exact: true,
       })
       .click();
@@ -179,7 +182,7 @@ test("browser origins isolate sign-ins, replay protection, icons and streamed do
       .click();
     await expect(
       connections.getByRole("button", {
-        name: `Sign in to ${new URL(C.origin).host}`,
+        name: `Sign in to ${C.label}`,
         exact: true,
       }),
     ).toBeVisible();
@@ -213,7 +216,13 @@ test("browser origins isolate sign-ins, replay protection, icons and streamed do
       restarted.getByRole("heading", { name: "Welcome to MC Panel" }),
     ).toBeVisible();
     await expect(
-      restarted.getByText(new URL(C.origin).host, { exact: true }),
+      restarted.getByRole("heading", { name: C.label, exact: true }),
+    ).toBeVisible();
+    await expect(
+      restarted.getByRole("button", {
+        name: "Select server C private server on C test computer",
+        exact: true,
+      }),
     ).toHaveCount(0);
     const signedOutAccount = restarted.getByRole("button", {
       name: "Account menu for Not signed in",
@@ -225,19 +234,23 @@ test("browser origins isolate sign-ins, replay protection, icons and streamed do
       .getByRole("menuitem", { name: "Manage Connections", exact: true })
       .click();
     await expect(
-      restarted.getByRole("button", {
-        name: `Sign in to ${new URL(C.origin).host}`,
-        exact: true,
-      }),
+      restarted
+        .getByRole("dialog", { name: "Manage Connections", exact: true })
+        .getByRole("button", {
+          name: `Sign in to ${C.label}`,
+          exact: true,
+        }),
     ).toBeVisible();
   } finally {
-    await context?.close();
+    await context?.close().catch(() => {});
     for (const { server, fleet } of resources) {
       server.closeAllConnections();
       await new Promise<void>((resolve) => server.close(() => resolve()));
       await fleet.close();
     }
-    expect(path.dirname(root)).toBe(path.resolve(os.tmpdir()));
+    expect(path.dirname(await fs.realpath(root))).toBe(
+      await fs.realpath(os.tmpdir()),
+    );
     expect(path.basename(root).startsWith("mc-origin-auth-")).toBe(true);
     await fs.rm(root, { recursive: true, force: true, maxRetries: 3 });
   }

@@ -194,6 +194,10 @@ for (const width of [1348, 390]) {
     append(200);
     await expect(rows.last()).toContainText("Log 2300:");
     await expect.poll(bottomGap).toBeLessThanOrEqual(1);
+    await output.evaluate((element) => {
+      element.scrollTop -= 120;
+    });
+    await expect(autoscroll).toHaveAttribute("aria-pressed", "false");
   });
 }
 

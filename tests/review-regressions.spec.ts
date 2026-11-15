@@ -486,10 +486,11 @@ for (const location of ["away", "returned", "edited"] as const) {
   });
 }
 
-test("late status and console polls cannot replace newer responses", async ({
+test("status and console polls coalesce in flight and resume after completion", async ({
   page,
   request,
 }) => {
+  await page.clock.install();
   const original = await (await request.get("/api/server")).json();
   let release!: () => void;
   const gate = new Promise<void>((resolve) => {
@@ -522,14 +523,21 @@ test("late status and console polls cannot replace newer responses", async ({
   });
   try {
     await page.goto("/#console");
+    await expect.poll(() => [statuses, logs]).toEqual([1, 1]);
+    await page.clock.fastForward(5_000);
+    expect([statuses, logs]).toEqual([1, 1]);
+    release();
+    await expect(page.locator(".server-banner .status-badge")).toHaveText(
+      "offline",
+    );
+    await expect(page.getByText("Old response", { exact: true })).toBeVisible();
+    await page.clock.fastForward(1_500);
     await expect(page.locator(".server-banner .status-badge")).toHaveText(
       "running",
     );
     await expect(
       page.getByText("Current response", { exact: true }),
     ).toBeVisible();
-    release();
-    await page.unrouteAll({ behavior: "wait" });
     await expect(page.locator(".server-banner .status-badge")).toHaveText(
       "running",
     );

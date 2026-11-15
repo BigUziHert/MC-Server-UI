@@ -450,7 +450,7 @@ test("panel audit polling refreshes in place and retains removed-server history"
     .getByRole("combobox", { name: "Audit scope" })
     .selectOption("panel");
   await expect(
-    page.getByRole("heading", { name: "Audit logs", exact: true }),
+    page.getByRole("heading", { name: "Audit Logs", exact: true }),
   ).toBeVisible();
   await expect(
     page.getByText("Removed final server: Old survival", { exact: true }),

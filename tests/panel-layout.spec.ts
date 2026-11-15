@@ -143,6 +143,14 @@ async function workspace(
               hostPermissions: [],
             },
       "/api/desktop/preferences": { desktop: true, preferences: {} },
+      "/api/desktop/settings": {
+        desktop: true,
+        startupAttempted: true,
+        startupPending: false,
+        autoStartServerIds: [],
+        missingAutoStartServerIds: [],
+        unavailableAutoStartServerIds: [],
+      },
       "/api/desktop/selection": {
         desktop: true,
         activeServerId: server.id,
@@ -276,6 +284,13 @@ async function workspace(
         ],
       },
       "/api/panel-users": { users: [] },
+      "/api/access/settings": {
+        enabled: false,
+        ready: false,
+        publicUrl: "",
+        port: 3002,
+        transport: "managed",
+      },
       "/api/backups": {
         backups: [
           {
@@ -297,8 +312,7 @@ async function workspace(
           nextRun: null,
         },
       },
-      ...((local && !proxy) ||
-      (grants.includes("backup.read") && grants.includes("backup.location"))
+      ...(local && !proxy
         ? {
             "/api/backups/location": {
               directory: "C:\\MC Panel\\Shared world\\backups",
@@ -652,13 +666,14 @@ for (const viewport of [
         ] as const) {
           await page.goto(`/#${entry.id}`);
           await expect(page.locator(entry.ready).first()).toBeVisible();
-          if (entry.id === "backups")
-            await expect(
-              page.getByRole("heading", {
-                name: "Backup location",
-                exact: true,
-              }),
-            ).toBeVisible();
+          if (entry.id === "backups") {
+            const location = page.getByRole("heading", {
+              name: "Backup location",
+              exact: true,
+            });
+            if (mode === "local") await expect(location).toBeVisible();
+            else await expect(location).toHaveCount(0);
+          }
           expect(
             await page.evaluate(() => window.mcPanelConnections?.runtime),
           ).toBe(mode === "local" ? "desktop" : "browser");
@@ -706,7 +721,7 @@ for (const viewport of [
       expect(local.unexpected).toEqual([]);
       expect(remote.unexpected).toEqual([]);
       expect(local.requests).toContain("/api/backups/location");
-      expect(remote.requests).toContain("/api/backups/location");
+      expect(remote.requests).not.toContain("/api/backups/location");
       expect(remote.requests).not.toContain("/api/panel-users");
       await testInfo.attach("page-geometry.json", {
         body: JSON.stringify(snapshots, null, 2),

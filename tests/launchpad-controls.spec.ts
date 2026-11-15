@@ -273,8 +273,8 @@ test("installed mod controls display file modification time and toggle activity 
     row.locator(`time[datetime="${item.modifiedAt}"]`),
   ).toBeVisible();
   expect(requests).toEqual([
-    { path: "mods/Example.jar", active: false },
-    { path: "mods/Example.jar.disabled", active: true },
+    { type: "mod", path: "mods/Example.jar", active: false },
+    { type: "mod", path: "mods/Example.jar.disabled", active: true },
   ]);
   await page.setViewportSize({ width: 1440, height: 960 });
   await page.screenshot({
@@ -1315,7 +1315,7 @@ test("author names open individual profiles and preserve unlinked names in both 
   await expect(page).toHaveURL(/#launchpad$/);
 });
 
-test("a saved Size sort falls back to Name without restoring removed dropdown options", async ({
+test("a saved Size sort falls back to Name while retaining mobile column sorts", async ({
   page,
   serverId,
 }) => {
@@ -1335,9 +1335,10 @@ test("a saved Size sort falls back to Name without restoring removed dropdown op
   await expect(sort).toHaveValue("name");
   await expect(
     sort.locator(
-      'option[value="active"], option[value="added"], option[value="modified"], option[value="size"]',
+      'option[value="active"], option[value="added"], option[value="modified"]',
     ),
-  ).toHaveCount(0);
+  ).toHaveCount(3);
+  await expect(sort.locator('option[value="size"]')).toHaveCount(0);
 });
 
 test("the complete bottom toolbar shares search, sort and installed state with the top toolbar", async ({
@@ -1447,9 +1448,12 @@ test("the complete bottom toolbar shares search, sort and installed state with t
   await expect(bottomInstalledSort).toHaveValue("downloads");
   await expect(
     bottomInstalledSort.locator(
-      'option[value="active"], option[value="added"], option[value="modified"], option[value="size"]',
+      'option[value="active"], option[value="added"], option[value="modified"]',
     ),
-  ).toHaveCount(0);
+  ).toHaveCount(3);
+  await expect(bottomInstalledSort.locator('option[value="size"]')).toHaveCount(
+    0,
+  );
   const topReverse = top.getByRole("button", {
     name: "Reverse installed sort order",
     exact: true,

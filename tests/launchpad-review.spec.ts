@@ -995,6 +995,15 @@ for (const switchScope of [
           });
         if (path === "/launchpad/versions")
           return route.fulfill({ json: { versions: [version] } });
+        if (path === "/launchpad/dependencies")
+          return route.fulfill({
+            json: {
+              summaryIsAdvisory: true,
+              declarationsAvailable: false,
+              dependencies: [],
+              warnings: [],
+            },
+          });
         if (path === "/launchpad/installed")
           return route.fulfill({ json: { items: [], warnings: [] } });
         if (path === "/launchpad/preview") return route.fulfill({ json: plan });
@@ -1797,7 +1806,7 @@ test("installed project links and update-all review span platforms and retry the
   ).toBeDisabled();
   await page.getByRole("button", { name: "Update all", exact: true }).click();
   await expect(
-    page.getByRole("dialog", { name: "Review installation" }),
+    page.getByRole("dialog", { name: "Review selected updates" }),
   ).toBeVisible();
   expect(updates).toMatchObject({
     updates: [
@@ -1906,7 +1915,13 @@ test("modpack installation waits for the requested backup and stops on backup fa
     .getByRole("button", { name: "Review installation", exact: true })
     .click();
   const dialog = page.getByRole("dialog", { name: "Review installation" });
-  await expect(dialog).toContainText("will move to Recycle Bin");
+  await expect(dialog).toContainText("replaced files move to Recycle Bin");
+  await expect(
+    dialog.getByRole("checkbox", {
+      name: "Keep worlds and server settings",
+      exact: true,
+    }),
+  ).toBeChecked();
   await dialog
     .getByRole("checkbox", { name: /I understand this replaces/ })
     .check();

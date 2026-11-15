@@ -473,7 +473,7 @@ test("copying the server address falls back when the clipboard API is denied and
   await expect(copy).toHaveText(expectedAddress);
   const displayed = await copy.innerText();
   await copy.click();
-  await expect(page.getByRole("status")).toContainText(
+  await expect(page.locator(".toast[role=status]")).toContainText(
     "Server address copied.",
   );
   expect(
@@ -560,7 +560,7 @@ for (const remote of [false, true]) {
       });
       await expect(copy).toHaveText(displayed);
       await copy.click();
-      await expect(page.getByRole("status")).toContainText(
+      await expect(page.locator(".toast[role=status]")).toContainText(
         "Server address copied.",
       );
       expect(

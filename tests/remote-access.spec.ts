@@ -16,6 +16,7 @@ const sister = {
 const password = "family server password";
 const browserToken = "s".repeat(43);
 const invitationOrigin = "https://invited.example.test";
+const home = process.env.PANEL_E2E_BASE_URL ?? "http://127.0.0.1:3111";
 async function signedOutSession(page: Page) {
   await page.addInitScript(() =>
     localStorage.removeItem("mc-panel.session.v1"),
@@ -44,7 +45,7 @@ async function invitation(page: Page, token: string) {
     if (url.pathname.startsWith("/api/")) return route.fallback();
     return route.fulfill({
       response: await route.fetch({
-        url: `http://127.0.0.1:3111${url.pathname}${url.search}`,
+        url: `${home}${url.pathname}${url.search}`,
       }),
     });
   });
@@ -75,12 +76,15 @@ async function openSignIn(page: Page) {
     name: `Sign in to ${new URL(page.url()).host}`,
     exact: true,
   });
-  if (await saved.isVisible()) await saved.click();
-  else
+  const address = page.getByLabel("Panel address", { exact: true });
+  if (await saved.isVisible()) {
+    await saved.click();
+    await expect(address).toHaveValue(new URL(page.url()).origin);
+  } else {
     await dialog.getByRole("button", { name: "Sign in", exact: true }).click();
-  await expect(page.getByLabel("Panel address", { exact: true })).toHaveValue(
-    new URL(page.url()).origin,
-  );
+    await expect(address).toHaveValue("");
+    await address.fill(new URL(page.url()).origin);
+  }
 }
 async function finishSignIn(page: Page) {
   await expect(page.getByLabel("Password", { exact: true })).toHaveCount(0);
@@ -268,7 +272,7 @@ test("a phone only offers granted controls and scopes every action to the shared
   ).toHaveCount(0);
   await expect(
     page.getByRole("link", { name: "Players", exact: true }),
-  ).toBeVisible();
+  ).toHaveCount(0);
   await page.evaluate(() => {
     window.location.hash = "files";
   });
@@ -370,7 +374,7 @@ for (const width of [1280, 390]) {
     await openNavigation();
     await page
       .getByRole("button", {
-        name: "Select server Family survival on 127.0.0.1:3111",
+        name: `Select server Family survival on ${new URL(home).host}`,
         exact: true,
       })
       .click();
@@ -480,9 +484,9 @@ test("a fully shared account uses the complete desktop workspace and mobile navi
   await expect(
     page.getByRole("button", { name: "Server settings", exact: true }),
   ).toBeVisible();
-  await expect(page.getByRole("button", { name: "Edit server settings" })).toHaveCount(
-    1,
-  );
+  await expect(
+    page.getByRole("button", { name: "Edit server settings" }),
+  ).toHaveCount(1);
   await page.screenshot({
     path: testInfo.outputPath("shared-desktop-workspace.png"),
     fullPage: true,
@@ -946,7 +950,10 @@ test("the mobile account menu stays onscreen and local sign-out completes when t
     .getByRole("menuitem", { name: "Manage Connections", exact: true })
     .click();
   await page
-    .getByRole("button", { name: "Sign out of 127.0.0.1:3111", exact: true })
+    .getByRole("button", {
+      name: `Sign out of ${new URL(home).host}`,
+      exact: true,
+    })
     .click();
   await page
     .getByRole("button", { name: "Sign out of this panel", exact: true })
