@@ -98,11 +98,6 @@ async function remotePanel(page: Page, granted = true) {
     if (path === "/api/console") return reply({ lines: [] });
     if (path === "/api/subusers" && method === "GET")
       return reply({ users: state.users });
-    if (path === "/api/subusers/share" && method === "POST")
-      return reply({
-        servers: [{ id: existing.id, name: existing.name }],
-        alreadyActive: true,
-      });
     if (path === "/api/subusers" && method === "POST") {
       const user = {
         ...body,
@@ -431,10 +426,13 @@ test("a remote user manager cannot grant computer permissions or edit an existin
     .getByRole("button", { name: "Grant server access", exact: true })
     .click();
   const dialog = page.getByRole("dialog", {
-    name: "Share server access",
+    name: "Grant server access",
     exact: true,
   });
-  await expect(dialog).toBeVisible();
+  await expect(dialog.locator(".subusers-permission-details")).toHaveJSProperty(
+    "open",
+    false,
+  );
   await expect(
     dialog.getByRole("checkbox", {
       name: "Create and import servers",
@@ -445,23 +443,15 @@ test("a remote user manager cannot grant computer permissions or edit an existin
     .getByLabel("Email address", { exact: true })
     .fill("helper@example.test");
   await dialog
-    .getByLabel("Permissions", { exact: true })
-    .selectOption("operator");
-  await dialog
-    .getByRole("button", { name: "Share and create invitation", exact: true })
+    .getByRole("button", { name: "Use Control preset", exact: true })
     .click();
-  await expect(dialog).toContainText(
-    "This person already has an active account.",
-  );
+  await dialog
+    .getByRole("button", { name: "Grant access", exact: true })
+    .click();
+  await expect(dialog).not.toBeVisible();
   const created = state.calls.find(
-    (call) => call.path === "/api/subusers/share" && call.method === "POST",
+    (call) => call.path === "/api/subusers" && call.method === "POST",
   )!;
   expect(created.body.email).toBe("helper@example.test");
   expect(created.body).not.toHaveProperty("hostPermissions");
-  expect(created.body.permissions).toEqual([
-    "server.view",
-    "control.console",
-    "control.start",
-    "control.stop",
-  ]);
 });

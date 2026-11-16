@@ -250,7 +250,7 @@ test("a failed desktop selection read waits for retry without opening the defaul
   );
 });
 
-test("Reconnect supersedes a pending background fleet request", async ({
+test("Retry connection supersedes a pending background fleet request", async ({
   page,
   request,
   serverId,
@@ -280,7 +280,9 @@ test("Reconnect supersedes a pending background fleet request", async ({
     await page.goto("/#console");
     await expect(page.getByRole("alert")).toContainText("Disconnected fixture");
     await expect.poll(() => calls).toBe(2);
-    await page.getByRole("button", { name: "Reconnect", exact: true }).click();
+    await page
+      .getByRole("button", { name: "Retry connection", exact: true })
+      .click();
     await expect(serverButton(page, serverId)).toHaveAttribute(
       "aria-pressed",
       "true",

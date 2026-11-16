@@ -36,7 +36,6 @@ export type PanelConnections = {
     // A durable self-removal request must be confirmed before credentials or
     // certificate trust can be removed. Only Forget retries are allowed.
     pendingLeave?: boolean;
-    leaving?: boolean;
     session?: PanelSession | null;
     sessionEpoch?: string;
     error?: string;
@@ -90,22 +89,11 @@ declare global {
       ) => Promise<{
         email: string;
         panelAddress: string;
-        panelName?: string;
-        servers?: { id: string; name: string }[];
         inviteExpiresAt: string;
       }>;
       cancelSignIn?: (panelId: string) => Promise<void | PanelConnections>;
       signOut?: (panelId: string) => Promise<PanelConnections>;
       retry?: (panelId: string) => Promise<PanelConnections>;
-      renameConnection?: (
-        panelId: string,
-        name: string,
-      ) => Promise<PanelConnections>;
-      changePassword?: (
-        panelId: string,
-        input: { currentPassword: string; newPassword: string },
-      ) => Promise<{ ok: boolean }>;
-      resetSavedConnections?: () => Promise<PanelConnections>;
       forget?: (
         panelId: string,
         expectedAccountId?: string,
@@ -278,12 +266,7 @@ export function useDesktopConnections(enabled = true) {
       void bridge
         .list()
         .then((value) => {
-          if (active && current === request)
-            setConnections((previous) =>
-              JSON.stringify(previous) === JSON.stringify(value)
-                ? previous
-                : value,
-            );
+          if (active && current === request) setConnections(value);
         })
         .catch(() => {});
     };

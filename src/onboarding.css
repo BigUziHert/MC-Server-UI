@@ -15,7 +15,7 @@
   display: flex;
   align-items: center;
   gap: 9px;
-  color: var(--accent);
+  color: #ffd900;
   font-size: 11px;
   font-weight: 650;
   letter-spacing: 1.3px;
@@ -47,7 +47,7 @@
   color: #eef0f8;
 }
 .setup-steps .reached > span {
-  color: var(--accent);
+  color: #ffda00;
   background: #ffd90013;
   border-color: #ffd90066;
 }
@@ -81,11 +81,11 @@
   min-width: 0;
 }
 .setup-source-card:hover {
-  border-color: var(--accent);
+  border-color: #ffda00;
   background: #25252b;
 }
 .setup-source-card > svg {
-  color: var(--accent);
+  color: #ffda00;
   margin-bottom: 26px;
 }
 .setup-source-card > strong {
@@ -101,7 +101,7 @@
   display: flex;
   align-items: center;
   gap: 10px;
-  color: var(--accent);
+  color: #ffda00;
   margin-top: 23px;
 }
 .setup-advanced {
@@ -235,7 +235,7 @@
   color: #c6cada;
 }
 .setup-check input {
-  accent-color: var(--accent);
+  accent-color: #ffda00;
   flex-shrink: 0;
   width: 15px;
   height: 15px;
@@ -322,7 +322,7 @@
   margin-bottom: 26px;
 }
 .setup-choice-summary > svg {
-  color: var(--accent);
+  color: #ffda00;
   flex-shrink: 0;
 }
 .setup-choice-summary > span {
@@ -404,12 +404,12 @@
 .setup-java-progress progress {
   width: 100%;
   height: 7px;
-  accent-color: var(--accent);
+  accent-color: #ffda00;
 }
 .setup-wizard .setup-memory input[type="range"] {
   flex: 1;
   padding: 0;
-  accent-color: var(--accent);
+  accent-color: #ffda00;
 }
 .setup-wizard .setup-memory input[type="number"] {
   width: 96px;
@@ -477,7 +477,7 @@
   margin-top: 24px;
 }
 .setup-eula a {
-  color: var(--accent);
+  color: #ffda00;
   display: inline-flex;
   gap: 4px;
   align-items: center;
@@ -563,7 +563,7 @@
 }
 .setup-install-progress > svg,
 .setup-complete > span {
-  color: var(--accent);
+  color: #ffda00;
 }
 .setup-install-progress strong,
 .setup-complete strong {
@@ -579,7 +579,7 @@
 .setup-install-progress progress {
   width: min(300px, 100%);
   height: 5px;
-  accent-color: var(--accent);
+  accent-color: #ffda00;
 }
 .setup-complete > span {
   border: 1px solid #7c7844;

@@ -25,7 +25,7 @@ export async function inferPackRuntime(entries, input) {
       );
     if (!name.includes("/")) {
       const forgeJar = name.match(
-        /^(forge|neoforge)-([a-z0-9.+_-]+?)(?:-(?:installer|universal|server|shim))?\.jar$/i,
+        /^(forge|neoforge)-([a-z0-9.+_-]+?)(?:-(?:installer|universal|server))?\.jar$/i,
       );
       if (forgeJar) add(forgeJar[1].toLowerCase(), forgeJar[2]);
       const fabricJar = name.match(
@@ -45,15 +45,6 @@ export async function inferPackRuntime(entries, input) {
         "start.bat",
         "start.cmd",
         "start.sh",
-        "startserver.bat",
-        "startserver.cmd",
-        "startserver.sh",
-        "start-server.bat",
-        "start-server.cmd",
-        "start-server.sh",
-        "runserver.bat",
-        "runserver.cmd",
-        "runserver.sh",
         "fabric-server-launcher.properties",
         "quilt-server-launcher.properties",
       ].includes(basename)

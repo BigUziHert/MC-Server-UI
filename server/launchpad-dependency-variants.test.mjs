@@ -90,7 +90,6 @@ test("a wrong-loader dependency pin resolves only the unique compatible variant 
     gameVersions: ["1.21.1"],
     loaders: ["neoforge"],
     publishedAt: "2026-08-01T00:00:00Z",
-    channel: "release",
     downloadable: true,
   });
   assert.equal(f.requests.length, 2);

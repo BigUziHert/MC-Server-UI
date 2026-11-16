@@ -2,9 +2,9 @@ import { ChevronLeft, ChevronRight } from "lucide-react";
 import { useState } from "react";
 import { readPreference, writePreference } from "./preferences";
 
-export const defaultPageSizes = [5, 10, 25, 50, 75, 100];
+const defaultPageSizes = [10, 25, 50, 100];
 
-export function usePageSize(id: string) {
+export function usePageSize(id: "files" | "audit" | "subusers") {
   const key = `mc-panel.${id}.rows`;
   const [pageSize, setPageSize] = useState(() => {
     try {

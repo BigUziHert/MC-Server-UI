@@ -1002,9 +1002,7 @@ async function smoke() {
           wizard.getByLabel("Server folder", { exact: true }),
         ).toHaveValue("");
       }
-      await expect(wizard.locator(".setup-host-context")).toContainText(
-        /this computer/i,
-      );
+      await expect(wizard.locator(".setup-host-context")).toHaveCount(0);
       await expect(remote.getByRole("dialog")).toHaveCount(0);
       await wizard
         .getByRole("button", { name: "Close add server", exact: true })

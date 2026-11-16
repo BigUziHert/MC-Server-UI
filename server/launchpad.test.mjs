@@ -248,11 +248,6 @@ async function fixture(t, options = {}) {
       serverDir,
       dataDir,
       safePath,
-      // Most fixtures exercise transfer/transaction behavior with raw byte
-      // payloads. Runtime integration cases opt into the real JAR inspector.
-      reviewRuntimeRequirements: options.runtimeReview
-        ? undefined
-        : async () => [],
       getServer: async () => server,
       getConfiguration: () => ({
         ...server,
@@ -337,21 +332,8 @@ async function fixture(t, options = {}) {
     },
   };
 }
-async function reviewRisk(service, input) {
-  const plan = await service.preview(input);
-  assert.ok(plan.unavailableDependencies.length, JSON.stringify(plan));
-  await assert.rejects(
-    service.install({ planId: plan.planId, confirmed: true }),
-    { status: 400 },
-  );
-  return plan;
-}
 async function finish(service, input) {
-  const result = await service.install({
-    acknowledgedUnavailableDependencies: true,
-    acknowledgedRuntimeRequirements: true,
-    ...input,
-  });
+  const result = await service.install(input);
   return waitForJob(service, result.job.id);
 }
 async function waitForJob(service, id) {
@@ -738,9 +720,7 @@ test("bulk update review shares dependencies and a failed download preserves eve
       dependency_type: "required",
     },
   ];
-  const conflictReview = await service.previewUpdates(input);
-  assert.equal(conflictReview.skippedUpdates.length, 1);
-  await service.cancelPreview(conflictReview.planId);
+  await assert.rejects(service.previewUpdates(input), /conflicting versions/);
   second.dependencies = f.versions.new.dependencies;
   f.versions.new.files[0].filename = "another.jar";
   await assert.rejects(
@@ -865,7 +845,7 @@ test("missing installed releases use verified provider dates and cache the looku
   assert.match(unverified.items[0].updateIssue, /dates could not be verified/);
 });
 
-test("modpack receipts keep update checks scoped to the installed runtime", async (t) => {
+test("modpack receipts check all releases independently of the installed runtime filters", async (t) => {
   const f = await fixture(t);
   await fs.writeFile(
     path.join(f.dataDir, "launchpad", "installed.json"),
@@ -903,8 +883,8 @@ test("modpack receipts keep update checks scoped to the installed runtime", asyn
   const result = await service.installed(input);
   assert.equal(result.items[0].update.id, "new");
   assert.equal(result.items[0].updateCheck, "checked");
-  assert.equal(calls[0].gameVersion, "1.21.1");
-  assert.equal(calls[0].loader, "neoforge");
+  assert.equal(calls[0].gameVersion, "");
+  assert.equal(calls[0].loader, "");
   await service.installed(input);
   assert.equal(calls.length, 1);
 });
@@ -1639,10 +1619,7 @@ test("failed or incomplete Modrinth rechecks retain known updates after cache ex
   t.mock.method(Date, "now", () => now);
   const f = await fixture(t, {
     request: async (url) => {
-      const pathname = new URL(url).pathname;
-      if (failure === "missing" && pathname === "/v2/project/project/version")
-        return new Response(null, { status: 503 });
-      if (pathname !== "/v2/version_files/update") return;
+      if (new URL(url).pathname !== "/v2/version_files/update") return;
       if (failure === "404") return new Response(null, { status: 404 });
       if (failure === "missing") return Response.json({});
     },
@@ -1695,18 +1672,7 @@ test("a forced refresh interrupted before update checks cannot reuse a cached up
 });
 
 test("update issues belong only to the affected mod while unidentified files stay neutral", async (t) => {
-  let now = Date.now();
-  t.mock.method(Date, "now", () => now);
-  let historyFails = true;
-  const f = await fixture(t, {
-    request: async (url) => {
-      if (
-        historyFails &&
-        new URL(url).pathname === "/v2/project/dependency/version"
-      )
-        return new Response(null, { status: 503 });
-    },
-  });
+  const f = await fixture(t);
   f.versions.dep.environment = "client_only";
   await fs.writeFile(path.join(f.serverDir, "mods", "dep.jar"), f.dependency);
   await fs.writeFile(
@@ -1735,7 +1701,7 @@ test("update issues belong only to the affected mod while unidentified files sta
   assert.equal(normal.updateCheck, "checked");
   assert.equal(normal.updateIssue, undefined);
   assert.equal(client.updateCheck, "unavailable");
-  assert.match(client.updateIssue, /provider request failed.*503/i);
+  assert.match(client.updateIssue, /client.only/i);
   assert.equal(unknown.platform, null);
   assert.equal(unknown.update, undefined);
   assert.equal(unknown.updateIssue, undefined);
@@ -1744,8 +1710,6 @@ test("update issues belong only to the affected mod while unidentified files sta
     [],
     "per-mod issues and unmatched catalog files do not generate broad warnings",
   );
-  historyFails = false;
-  now += 31_000;
   f.versions.dep.environment = "client_only_server_optional";
   const recovered = await service.installed({ ...selection, refresh: true });
   const checked = recovered.items.find((item) => item.path === "mods/dep.jar");
@@ -2293,10 +2257,7 @@ test("matching version labels do not skip a dependency with different bytes", as
     ]),
   );
   const service = await f.boot();
-  const plan = await service.preview({
-    ...selection,
-    resolutions: { "modrinth:dependency": "use-proposed" },
-  });
+  const plan = await service.preview(selection);
   assert.equal(plan.unchangedCount, 0);
   assert.equal(
     plan.files.find((file) => file.path === "mods/dep.jar").action,
@@ -3432,17 +3393,14 @@ test("JEI-style missing Modrinth dependencies require explicit acknowledgement o
     ...selection,
     replacePath: "mods/old.jar",
   });
-  assert.deepEqual(
-    plan.unavailableDependencies.map(({ issue, ...row }) => row),
-    [
-      {
-        platform: "modrinth",
-        projectId: "7tEfOcA7",
-        versionId: null,
-        requiredBy: "Just Enough Items (JEI)",
-      },
-    ],
-  );
+  assert.deepEqual(plan.unavailableDependencies, [
+    {
+      platform: "modrinth",
+      projectId: "7tEfOcA7",
+      versionId: null,
+      requiredBy: "Just Enough Items (JEI)",
+    },
+  ]);
   assert.deepEqual(
     plan.files.map((file) => file.path),
     ["mods/new.jar"],
@@ -3651,12 +3609,9 @@ test("client-only dependency exclusions preserve project identity, type, and run
       if (mismatch === "loader") f.versions.dep.loaders = ["fabric"];
       if (mismatch === "game-version")
         f.versions.dep.game_versions = ["1.20.1"];
-      if (["loader", "game-version"].includes(mismatch))
-        await reviewRisk(f.service, selection);
-      else
-        await assert.rejects(f.service.preview(selection), {
-          status: mismatch === "unpinned-project" ? 502 : 400,
-        });
+      await assert.rejects(f.service.preview(selection), {
+        status: mismatch === "unpinned-project" ? 502 : 400,
+      });
       assert.equal(f.mutations, 0);
       assert.ok(
         f.requests.every(
@@ -3696,11 +3651,13 @@ test("unavailable server dependencies remain blocked with their project and depe
           },
         ];
         if (availability === "no-download") f.versions.dep.files = [];
-        const plan = await reviewRisk(f.service, selection);
-        assert.match(
-          plan.unavailableDependencies[0].issue,
-          /Required Server Library.*Fixture Project.*no compatible downloadable version/,
-        );
+        await assert.rejects(f.service.preview(selection), (cause) => {
+          assert.equal(cause.status, 400);
+          assert.match(cause.message, /Required Server Library/);
+          assert.match(cause.message, /Fixture Project/);
+          assert.match(cause.message, /no compatible downloadable version/);
+          return true;
+        });
         assert.equal(f.mutations, 0);
         assert.ok(
           f.requests.every(
@@ -3861,9 +3818,18 @@ for (const unavailable of [
     else if (unavailable === "different-release")
       compatible.version_number = "2.0.5";
     else f.versions.dep.game_versions = ["1.20.1"];
-    await reviewRisk(f.service, selection);
+    await assert.rejects(
+      f.service.preview({
+        ...selection,
+        acknowledgedUnavailableDependencies: true,
+      }),
+      { status: 400 },
+    );
     assert.equal(f.mutations, 0);
-
+    assert.equal(
+      f.requests.some(({ url }) => url.startsWith("https://cdn.modrinth.com/")),
+      false,
+    );
     assert.deepEqual(await fs.readdir(path.join(f.serverDir, "mods")), [
       "old.jar",
     ]);
@@ -3896,7 +3862,13 @@ test("recovering a wrong-loader pin cannot downgrade an unverified installed dep
   const target = path.join(f.serverDir, "mods", "sable-neoforge-2.0.5.jar");
   await fs.writeFile(target, existingBytes);
   const before = await fs.stat(target);
-  await reviewRisk(f.service, selection);
+  await assert.rejects(
+    f.service.preview({
+      ...selection,
+      acknowledgedUnavailableDependencies: true,
+    }),
+    { status: 409 },
+  );
   assert.deepEqual(await fs.readFile(target), existingBytes);
   const after = await fs.stat(target);
   for (const field of ["ino", "size", "mtimeMs", "ctimeMs", "birthtimeMs"])
@@ -4038,20 +4010,42 @@ test("a verified installed dependency satisfying the new mod's declared range is
 });
 
 for (const environment of ["client_only", "singleplayer_only"]) {
-  test(`verified installed JAR compatibility survives inconsistent ${environment} catalog metadata`, async (t) => {
-    const { f, installedBytes, installedPath } = await installedRangeFixture(
-      t,
-      "[1.1.0,)",
-      (url) => {
+  test(`a ${environment} installed release cannot omit a required server dependency during loader recovery`, async (t) => {
+    let installedVersion;
+    const { f, existing, installedBytes, installedPath, compatible } =
+      await installedRangeFixture(t, "[1.1.0,)", (url) => {
         if (new URL(url).pathname === "/v2/version/dep-newer")
-          return Response.json({ environment });
-      },
+          return Response.json({ ...installedVersion, environment });
+      });
+    installedVersion = existing;
+    await assert.rejects(f.service.preview(selection), {
+      status: 400,
+      code: "CLIENT_ONLY_CONTENT",
+    });
+    assert.ok(
+      f.requests.some(
+        ({ url }) => new URL(url).pathname === `/v2/version/${compatible.id}`,
+      ),
+      "the compatible server release was resolved before checking the installed release",
     );
-    const plan = await f.service.preview(selection);
-    assert.equal(plan.dependencyDecisions[0].choice, "keep-installed");
-    assert.equal(plan.dependencyDecisions[0].status, "compatible");
-    assert.equal(plan.unavailableDependencies.length, 0);
+    assert.ok(
+      f.requests.some(
+        ({ url }) => new URL(url).pathname === `/v2/version/${existing.id}`,
+      ),
+    );
+    assert.equal(f.mutations, 0);
     assert.deepEqual(await fs.readFile(installedPath), installedBytes);
+    assert.deepEqual(
+      await fs.readFile(path.join(f.serverDir, "mods/old.jar")),
+      f.old,
+    );
+    assert.deepEqual(await f.bin.list(), []);
+    assert.ok(
+      f.requests.every(
+        ({ url }) =>
+          ![existing.files[0].url, compatible.files[0].url].includes(url),
+      ),
+    );
   });
 }
 
@@ -4061,7 +4055,13 @@ for (const range of ["[2.0.6,)", "[1.1.0,2.0.5)", "[2.0.3]", "unknown"])
       t,
       range,
     );
-    await reviewRisk(f.service, selection);
+    await assert.rejects(
+      f.service.preview({
+        ...selection,
+        acknowledgedUnavailableDependencies: true,
+      }),
+      { status: 409 },
+    );
     assert.equal(f.mutations, 0);
     assert.deepEqual(await fs.readFile(installedPath), installedBytes);
     assert.deepEqual(
@@ -4109,7 +4109,7 @@ side="SERVER"
     version_id: "other",
     dependency_type: "required",
   });
-  await reviewRisk(f.service, selection);
+  await assert.rejects(f.service.preview(selection), { status: 409 });
   assert.equal(f.mutations, 0);
   assert.deepEqual(await fs.readFile(installedPath), installedBytes);
 });
@@ -4167,12 +4167,14 @@ side="SERVER"
     version_id: "other",
     dependency_type: "required",
   });
-  await reviewRisk(f.service, selection);
-  assert.equal(
-    installedVersionLookups,
-    0,
-    "verified local JAR identity does not require a catalog round trip",
+  await assert.rejects(
+    f.service.preview({
+      ...selection,
+      acknowledgedUnavailableDependencies: true,
+    }),
+    { status: 400 },
   );
+  assert.equal(installedVersionLookups, 2);
   assert.equal(f.mutations, 0);
   assert.deepEqual(await fs.readFile(installedPath), installedBytes);
   assert.deepEqual(
@@ -4207,7 +4209,7 @@ test("an installed exact recovered loader sibling is omitted without redownloadi
     plan.files.map(({ path }) => path),
     ["mods/new.jar"],
   );
-  assert.equal(plan.unavailableDependencies.length, 1);
+  assert.deepEqual(plan.unavailableDependencies, []);
   const job = await finish(f.service, { planId: plan.planId, confirmed: true });
   assert.equal(job.status, "completed", job.error);
   assert.equal(job.total, 1);
@@ -4284,13 +4286,18 @@ test("a missing conflicting pin cannot bypass a resolved dependency's version co
     version_id,
     dependency_type: "required",
   }));
-  const plan = await reviewRisk(f.service, selection);
-  assert.equal(
-    plan.files.filter((file) => file.path === "mods/dep.jar").length,
-    1,
+  await assert.rejects(
+    f.service.preview({
+      ...selection,
+      acknowledgedUnavailableDependencies: true,
+    }),
+    { status: 409 },
   );
   assert.equal(f.mutations, 0);
-
+  assert.equal(
+    f.requests.some(({ url }) => url.startsWith("https://cdn.modrinth.com/")),
+    false,
+  );
   assert.deepEqual(
     await fs.readFile(path.join(f.serverDir, "mods", "old.jar")),
     f.old,
@@ -4592,7 +4599,7 @@ test("Modrinth packs replace old data with the verified runtime and server pack 
   assert.equal(plan.summary.fileCount, 3);
   await assert.rejects(
     f.service.install({ planId: plan.planId, confirmed: true }),
-    /Confirm the pack update/,
+    /Confirm the clean installation/,
   );
   assert.equal(
     (
@@ -4610,7 +4617,7 @@ test("Modrinth packs replace old data with the verified runtime and server pack 
   );
   assert.equal(
     await fs.readFile(path.join(f.serverDir, "Survival", "level.dat"), "utf8"),
-    "existing world",
+    "wrong world",
   );
   assert.match(
     await fs.readFile(path.join(f.serverDir, "eula.txt"), "utf8"),
@@ -5742,13 +5749,13 @@ test("direct pack files and ZIP overrides replace old worlds and startup files t
   );
   assert.equal(
     await fs.readFile(path.join(f.serverDir, "Survival", "level.dat"), "utf8"),
-    "original world",
+    "must not replace world",
   );
   assert.match(
     await fs.readFile(path.join(f.serverDir, "eula.txt"), "utf8"),
     /eula=false/,
   );
-  for (const name of ["run.bat", "start.sh"])
+  for (const name of ["user_jvm_args.txt", "run.bat", "start.sh"])
     await assert.rejects(fs.stat(path.join(f.serverDir, name)), {
       code: "ENOENT",
     });
@@ -6096,10 +6103,9 @@ test("reinstalling identical pack bytes still clears files outside the new pack"
     ).status,
     "completed",
   );
-  assert.equal(
-    await fs.readFile(path.join(f.serverDir, "old-world", "level.dat"), "utf8"),
-    "old world",
-  );
+  await assert.rejects(fs.stat(path.join(f.serverDir, "old-world")), {
+    code: "ENOENT",
+  });
   await assert.rejects(
     fs.stat(path.join(f.serverDir, "mods", "unrelated.jar")),
     { code: "ENOENT" },
@@ -6159,11 +6165,7 @@ test("a failed receipt write cannot prevent restoring the previous runtime confi
     cleanInstall: true,
   });
   assert.equal(job.status, "failed");
-  assert.match(
-    job.error,
-    /receipt disk failure.*Previous files were restored automatically/,
-  );
-  assert.equal(f.service.isRecoveryRequired(), false);
+  assert.match(job.error, /receipt disk failure.*Recovery needs attention/);
   assert.equal(applied.length, 2);
   assert.equal(applied[0].jar, "runtime.jar");
   assert.equal(applied[1].jar, undefined);
@@ -6278,25 +6280,14 @@ test("modpack receipts do not overwrite checksum identities across repeated scan
   assert.equal(local.items[0].update.id, "new");
 });
 
-test("review quotas belong to each owner and cancellation cannot dispose another owner's stage", async (t) => {
+test("cancelled reviews release staging and abandoned reviews cannot exhaust the eight slots", async (t) => {
   const f = await fixture(t);
   const plans = [];
-  for (let i = 0; i < 8; i++) plans.push(await f.service.preview(selection));
+  for (let i = 0; i < 10; i++) plans.push(await f.service.preview(selection));
   await assert.rejects(
-    f.service.preview(selection),
-    /eight open installation reviews/,
+    fs.stat(path.join(f.dataDir, "launchpad", plans[0].planId)),
+    { code: "ENOENT" },
   );
-  const other = await f.service.preview({
-    ...selection,
-    ownerId: "another-owner",
-  });
-  await f.service.cancelPreview(other.planId);
-  assert.ok(await fs.stat(path.join(f.dataDir, "launchpad", other.planId)));
-  await assert.rejects(
-    f.service.install({ planId: other.planId, confirmed: true }),
-    /expired/,
-  );
-  await f.service.cancelPreview(other.planId, "another-owner");
   const last = plans.at(-1);
   assert.deepEqual(await f.service.cancelPreview(last.planId), { ok: true });
   await assert.rejects(
@@ -6700,10 +6691,8 @@ test("unexpected background finalization failures terminate polling with a warni
 test("failed bulk update checks advance progress while another provider is still pending", async (t) => {
   const f = await fixture(t, {
     request: async (url) => {
-      const pathname = new URL(url).pathname;
-      if (pathname === "/v2/version_files/update") return Response.json({});
-      if (pathname === "/v2/project/project/version")
-        return new Response(null, { status: 503 });
+      if (new URL(url).pathname === "/v2/version_files/update")
+        return Response.json({});
     },
   });
   const extra = Buffer.from("another catalog's mod");
@@ -7066,7 +7055,7 @@ test("fallback update failures are isolated per project and missing installed re
     );
   assert.match(
     first.items.find((item) => item.projectId === "empty").updateIssue,
-    /installed release was not found/,
+    /No compatible/,
   );
   assert.match(
     first.items.find((item) => item.projectId === "missing-current")
@@ -8310,7 +8299,6 @@ test("mod activation preserves bytes, added and modified dates, and installed id
     ).toISOString(),
   );
   const disabled = await f.service.setActive({
-    acknowledgedDependencies: true,
     path: "mods/old.jar",
     active: false,
   });
@@ -8326,7 +8314,6 @@ test("mod activation preserves bytes, added and modified dates, and installed id
   assert.equal(inventory.items[0].projectId, "project");
   assert.equal(inventory.items[0].addedAt, before.items[0].addedAt);
   const enabled = await service.setActive({
-    acknowledgedDependencies: true,
     path: disabled.path,
     active: true,
   });
@@ -8375,39 +8362,23 @@ test("mod activation refuses running servers, invalid targets, and filename coll
     "mods/old.jar.disabled.disabled",
   ])
     await assert.rejects(
-      f.service.setActive({
-        acknowledgedDependencies: true,
-        path: invalid,
-        active: false,
-      }),
+      f.service.setActive({ path: invalid, active: false }),
       { status: 400 },
     );
   await assert.rejects(
-    f.service.setActive({
-      acknowledgedDependencies: true,
-      path: "mods/old.jar",
-      active: "false",
-    }),
+    f.service.setActive({ path: "mods/old.jar", active: "false" }),
     { status: 400 },
   );
   f.setServer({ status: "online" });
   await assert.rejects(
-    f.service.setActive({
-      acknowledgedDependencies: true,
-      path: "mods/old.jar",
-      active: false,
-    }),
+    f.service.setActive({ path: "mods/old.jar", active: false }),
     /Stop the server/,
   );
   f.setServer({ status: "offline" });
   const other = bytes("different disabled copy");
   await fs.writeFile(path.join(f.serverDir, "mods/old.jar.disabled"), other);
   await assert.rejects(
-    f.service.setActive({
-      acknowledgedDependencies: true,
-      path: "mods/old.jar",
-      active: false,
-    }),
+    f.service.setActive({ path: "mods/old.jar", active: false }),
     /already exists/,
   );
   assert.deepEqual(
@@ -8422,11 +8393,7 @@ test("mod activation refuses running servers, invalid targets, and filename coll
 
 test("disabled mods stay disabled through bulk updates and can be removed", async (t) => {
   const f = await fixture(t);
-  await f.service.setActive({
-    acknowledgedDependencies: true,
-    path: "mods/old.jar",
-    active: false,
-  });
+  await f.service.setActive({ path: "mods/old.jar", active: false });
   const plan = await f.service.previewUpdates({
     ...selection,
     updates: [
@@ -8472,11 +8439,7 @@ test("changing active state invalidates a reviewed installation", async (t) => {
     ...selection,
     replacePath: "mods/old.jar",
   });
-  await f.service.setActive({
-    acknowledgedDependencies: true,
-    path: "mods/old.jar",
-    active: false,
-  });
+  await f.service.setActive({ path: "mods/old.jar", active: false });
   const job = await finish(f.service, { planId: plan.planId, confirmed: true });
   assert.equal(job.status, "failed");
   assert.match(job.error, /changed since review/);
@@ -8508,11 +8471,7 @@ test("failed activation receipt persistence restores the original filename and r
   };
   try {
     await assert.rejects(
-      f.service.setActive({
-        acknowledgedDependencies: true,
-        path: "mods/old.jar",
-        active: false,
-      }),
+      f.service.setActive({ path: "mods/old.jar", active: false }),
       /fixture receipt write failure/,
     );
   } finally {
@@ -8526,1034 +8485,5 @@ test("failed activation receipt persistence restores the original filename and r
   await assert.rejects(
     fs.stat(path.join(f.serverDir, "mods/old.jar.disabled")),
     { code: "ENOENT" },
-  );
-});
-
-test("ordinary compatible pins retain a newer installed library unless replacement is explicitly chosen", async (t) => {
-  const { f, compatible, installedBytes, installedPath } =
-    await installedRangeFixture(t);
-  compatible.dependencies = [];
-  f.versions.new.dependencies = [
-    {
-      project_id: "dependency",
-      version_id: compatible.id,
-      dependency_type: "required",
-    },
-  ];
-  const plan = await f.service.preview(selection);
-  assert.equal(plan.dependencyDecisions[0].choice, "keep-installed");
-  assert.equal(plan.dependencyDecisions[0].status, "compatible");
-  assert.equal(plan.unavailableDependencies.length, 0);
-  assert.deepEqual(
-    plan.files.map((file) => file.path),
-    ["mods/new.jar"],
-  );
-  const job = await finish(f.service, { planId: plan.planId, confirmed: true });
-  assert.equal(job.status, "completed", job.error);
-  assert.deepEqual(await fs.readFile(installedPath), installedBytes);
-  const replacement = await f.service.preview({
-    ...selection,
-    resolutions: { "modrinth:dependency": "use-proposed" },
-  });
-  assert.equal(replacement.dependencyDecisions[0].choice, "use-proposed");
-  assert.ok(
-    replacement.files.some(
-      (file) =>
-        file.action === "replace" &&
-        file.path.endsWith(compatible.files[0].filename),
-    ),
-  );
-});
-
-test("an unidentified JAR with the same declared mod ID is retained instead of duplicating it", async (t) => {
-  const { f, compatible, identities, installedBytes, installedPath } =
-    await installedRangeFixture(t);
-  identities.delete(hashes(installedBytes).sha512);
-  compatible.dependencies = [];
-  // A valid candidate declaration lets offline IDs bridge catalog identities.
-  const candidate = zip([
-    ["META-INF/neoforge.mods.toml", '[[mods]]\nmodId="sable"\nversion="2.0.3"'],
-  ]);
-  Object.assign(compatible.files[0], {
-    hashes: hashes(candidate),
-    size: candidate.length,
-  });
-  f.downloads.set(compatible.files[0].url, candidate);
-  f.versions.new.dependencies = [
-    {
-      project_id: "dependency",
-      version_id: compatible.id,
-      dependency_type: "required",
-    },
-  ];
-  const plan = await f.service.preview(selection);
-  assert.equal(
-    plan.dependencyDecisions[0].installedPath,
-    "mods/renamed-sable.jar",
-  );
-  assert.equal(plan.dependencyDecisions[0].choice, "keep-installed");
-  assert.deepEqual(
-    plan.files.map((file) => file.path),
-    ["mods/new.jar"],
-  );
-  assert.deepEqual(await fs.readFile(installedPath), installedBytes);
-  await assert.rejects(
-    f.service.preview({
-      ...selection,
-      resolutions: { "modrinth:not-in-graph": "skip" },
-    }),
-    /not part of this review/,
-  );
-});
-
-test("runtime requirements expose incompatible loader, Minecraft and Java declarations before installation", async (t) => {
-  const f = await fixture(t, { runtimeReview: true });
-  f.setServer({ loaderVersion: "21.1.200" });
-  const archive = zip([
-    [
-      "META-INF/neoforge.mods.toml",
-      '[[mods]]\nmodId="runtimecheck"\nversion="1.0"\n' +
-        ["neoforge|[21.1.500,)", "minecraft|[1.21.2]", "java|[21,)"]
-          .map((value) => {
-            const [id, range] = value.split("|");
-            return `[[dependencies.runtimecheck]]\nmodId="${id}"\ntype="required"\nversionRange="${range}"\nside="SERVER"`;
-          })
-          .join("\n"),
-    ],
-  ]);
-  Object.assign(f.versions.new.files[0], {
-    hashes: hashes(archive),
-    size: archive.length,
-  });
-  f.downloads.set(f.versions.new.files[0].url, archive);
-  const service = await f.boot({
-    probeJava: async () => ({ available: true, majorVersion: 17 }),
-  });
-  const plan = await service.preview(selection);
-  assert.deepEqual(plan.runtimeRequirements.map((row) => row.id).sort(), [
-    "java",
-    "minecraft",
-    "neoforge",
-  ]);
-  assert.ok(
-    plan.runtimeRequirements.every((row) => row.status === "incompatible"),
-  );
-  await assert.rejects(
-    service.install({ planId: plan.planId, confirmed: true }),
-    /runtime requirements/,
-  );
-  const job = await finish(service, {
-    planId: plan.planId,
-    confirmed: true,
-    acknowledgedRuntimeRequirements: true,
-  });
-  assert.equal(job.status, "completed", job.error);
-});
-
-test("declared incompatible catalog dependencies are shown as acknowledged risks", async (t) => {
-  const { f } = await installedRangeFixture(t);
-  f.versions.new.dependencies.push({
-    project_id: "dependency",
-    version_id: null,
-    dependency_type: "incompatible",
-  });
-  const plan = await f.service.preview(selection);
-  assert.ok(
-    plan.unavailableDependencies.some((row) =>
-      /incompatibility/.test(row.issue),
-    ),
-  );
-  await assert.rejects(
-    f.service.install({ planId: plan.planId, confirmed: true }),
-    /unavailable required dependencies/,
-  );
-});
-
-test("restore duplicate checks recognize plugin names offline across unknown catalog identities", async (t) => {
-  const f = await fixture(t);
-  f.setServer({ loader: "paper" });
-  await fs.mkdir(path.join(f.serverDir, "plugins"));
-  const old = zip([
-    ["plugin.yml", "name: SharedPlugin\nversion: 1.0\nmain: example.Main"],
-  ]);
-  const newer = zip([
-    [
-      "paper-plugin.yml",
-      "name: SharedPlugin\nversion: 2.0\nmain: example.Main",
-    ],
-  ]);
-  const payload = path.join(f.root, "old-plugin.jar");
-  await fs.writeFile(payload, old);
-  await fs.writeFile(path.join(f.serverDir, "plugins/new.jar"), newer);
-  const result = await f.service.duplicateCheck({
-    path: "plugins/old.jar",
-    sha512: hashes(old).sha512,
-    payloadPath: payload,
-  });
-  assert.deepEqual(
-    result.duplicates.map((row) => row.path),
-    ["plugins/new.jar"],
-  );
-});
-
-async function seedUndoReceipt(f) {
-  f.versions.new.dependencies = [
-    {
-      project_id: "dependency",
-      version_id: "dep",
-      dependency_type: "required",
-    },
-  ];
-  const receipt = {
-    path: "mods/old.jar",
-    sha512: hashes(f.old).sha512,
-    platform: "modrinth",
-    projectId: "project",
-    versionId: "old",
-    versionName: "1.0",
-    type: "mod",
-    title: "Fixture Project",
-    installedAt: "2026-01-01T00:00:00.000Z",
-  };
-  await f.service.restoreInstalled([receipt]);
-  return receipt;
-}
-test("undo restores an update and every added dependency with receipts after a restart", async (t) => {
-  const f = await fixture(t),
-    receipt = await seedUndoReceipt(f);
-  const plan = await f.service.preview(selection);
-  const done = await finish(f.service, {
-    planId: plan.planId,
-    confirmed: true,
-  });
-  assert.equal(done.status, "completed", done.error);
-  assert.equal(done.undoAvailable, true);
-  assert.ok(
-    done.recoveryEntries.some((entry) => entry.path === "mods/old.jar"),
-  );
-  assert.ok(await fs.stat(path.join(f.serverDir, "mods/dep.jar")));
-  assert.equal(
-    f.service.snapshotInstalled().find((row) => row.path === "mods/new.jar")
-      .previousVersionId,
-    "old",
-  );
-  await f.service.close();
-  const restarted = await f.boot();
-  assert.equal((await restarted.history()).operations[0].jobId, done.id);
-  const result = await restarted.undoJob(done.id, { confirmed: true });
-  assert.equal(result.ok, true);
-  assert.deepEqual(
-    await fs.readFile(path.join(f.serverDir, "mods/old.jar")),
-    f.old,
-  );
-  for (const file of ["new.jar", "dep.jar"])
-    await assert.rejects(fs.stat(path.join(f.serverDir, "mods", file)), {
-      code: "ENOENT",
-    });
-  const local = await restarted.installed({ ...selection, local: true });
-  assert.equal(local.items[0].versionId, receipt.versionId);
-  assert.equal(local.items[0].installedAt, receipt.installedAt);
-  assert.equal(local.items[0].updateHeld, true);
-  assert.equal(local.items[0].previousVersionId, "new");
-  assert.equal((await restarted.history()).operations[0].undoAvailable, false);
-});
-test("undo refuses changed files and an online server without touching any operation output", async (t) => {
-  const f = await fixture(t);
-  await seedUndoReceipt(f);
-  const plan = await f.service.preview(selection),
-    done = await finish(f.service, { planId: plan.planId, confirmed: true });
-  assert.equal(done.status, "completed", done.error);
-  f.setServer({ status: "online" });
-  await assert.rejects(
-    f.service.undoJob(done.id, { confirmed: true }),
-    /Stop the server/,
-  );
-  f.setServer({ status: "offline" });
-  await fs.writeFile(path.join(f.serverDir, "mods/dep.jar"), "manual edits");
-  await assert.rejects(
-    f.service.undoJob(done.id, { confirmed: true }),
-    /changed after this operation/,
-  );
-  assert.equal(
-    await fs.readFile(path.join(f.serverDir, "mods/dep.jar"), "utf8"),
-    "manual edits",
-  );
-  assert.deepEqual(
-    await fs.readFile(path.join(f.serverDir, "mods/new.jar")),
-    f.newer,
-  );
-  await assert.rejects(fs.stat(path.join(f.serverDir, "mods/old.jar")), {
-    code: "ENOENT",
-  });
-  assert.equal((await f.service.history()).operations[0].undoAvailable, true);
-});
-test("failed undo restores the entire updated state and its receipts", async (t) => {
-  const f = await fixture(t);
-  await seedUndoReceipt(f);
-  const plan = await f.service.preview(selection),
-    done = await finish(f.service, { planId: plan.planId, confirmed: true });
-  assert.equal(done.status, "completed", done.error);
-  const snapshot = f.service.snapshotInstalled();
-  const copy = fs.copyFile;
-  let failed = false;
-  fs.copyFile = async (source, target, ...args) => {
-    if (!failed && target === path.join(f.serverDir, "mods/old.jar")) {
-      failed = true;
-      throw new Error("Fixture undo copy failure");
-    }
-    return copy(source, target, ...args);
-  };
-  try {
-    await assert.rejects(
-      f.service.undoJob(done.id, { confirmed: true }),
-      /Fixture undo copy failure/,
-    );
-  } finally {
-    fs.copyFile = copy;
-  }
-  assert.equal(failed, true);
-  assert.deepEqual(
-    await fs.readFile(path.join(f.serverDir, "mods/new.jar")),
-    f.newer,
-  );
-  assert.deepEqual(
-    await fs.readFile(path.join(f.serverDir, "mods/dep.jar")),
-    f.dependency,
-  );
-  await assert.rejects(fs.stat(path.join(f.serverDir, "mods/old.jar")), {
-    code: "ENOENT",
-  });
-  assert.deepEqual(f.service.snapshotInstalled(), snapshot);
-  assert.equal(f.service.isRecoveryRequired(), false);
-  assert.equal((await f.service.history()).operations[0].undoAvailable, true);
-});
-for (const persistent of [false, true])
-  test(`committed undo ${persistent ? "locks further changes until history recovery survives restart" : "reconciles a transient history write failure as completed"}`, async (t) => {
-    const f = await fixture(t);
-    await seedUndoReceipt(f);
-    const plan = await f.service.preview(selection),
-      done = await finish(f.service, { planId: plan.planId, confirmed: true });
-    assert.equal(done.status, "completed", done.error);
-    const rename = fs.rename;
-    let failures = 0;
-    fs.rename = async (source, destination, ...args) => {
-      if (
-        path.basename(destination) === "entry.json" &&
-        path.basename(path.dirname(destination)) === done.id &&
-        (persistent || !failures)
-      ) {
-        failures++;
-        throw new Error("Fixture history persistence failure");
-      }
-      return rename(source, destination, ...args);
-    };
-    try {
-      if (persistent) {
-        await assert.rejects(
-          f.service.undoJob(done.id, { confirmed: true }),
-          /needs recovery/,
-        );
-        assert.equal(f.service.isRecoveryRequired(), true);
-        await assert.rejects(
-          f.service.undoJob(done.id, { confirmed: true }),
-          /recovery before undoing/,
-        );
-        assert.equal(failures, 2);
-      } else {
-        const result = await f.service.undoJob(done.id, { confirmed: true });
-        assert.equal(result.ok, true);
-        assert.equal(result.job.status, "completed");
-        assert.equal(f.service.isRecoveryRequired(), false);
-        assert.equal(failures, 1);
-      }
-    } finally {
-      fs.rename = rename;
-    }
-    assert.deepEqual(
-      await fs.readFile(path.join(f.serverDir, "mods/old.jar")),
-      f.old,
-    );
-    for (const file of ["new.jar", "dep.jar"])
-      await assert.rejects(fs.stat(path.join(f.serverDir, "mods", file)), {
-        code: "ENOENT",
-      });
-    assert.equal(f.service.snapshotInstalled()[0].updateHeld, true);
-    await f.service.close();
-    // A committed journal must only finish metadata, never overwrite edits
-    // made after promotion while the persistence fault is being repaired.
-    await fs.writeFile(
-      path.join(f.serverDir, "mods/old.jar"),
-      "post-undo edit",
-    );
-    const restarted = await f.boot();
-    assert.equal(restarted.isRecoveryRequired(), false);
-    assert.equal(
-      (await restarted.history()).operations[0].undoAvailable,
-      false,
-    );
-    await assert.rejects(
-      restarted.undoJob(done.id, { confirmed: true }),
-      /no longer available/,
-    );
-    assert.equal(
-      await fs.readFile(path.join(f.serverDir, "mods/old.jar"), "utf8"),
-      "post-undo edit",
-    );
-  });
-test("held versions persist and are excluded from background and bulk updates", async (t) => {
-  const f = await fixture(t);
-  await seedUndoReceipt(f);
-  await f.service.updatePolicy({ path: "mods/old.jar", hold: true });
-  const restarted = await f.boot();
-  const installed = await restarted.installed(selection);
-  assert.equal(installed.items[0].updateHeld, true);
-  assert.equal(installed.items[0].update, undefined);
-  const plan = await restarted.previewUpdates({
-    ...selection,
-    updates: [
-      {
-        platform: "modrinth",
-        projectId: "project",
-        versionId: "new",
-        replacePath: "mods/old.jar",
-      },
-    ],
-  });
-  assert.equal(plan.files.length, 0);
-  assert.match(plan.skippedUpdates[0].reason, /held/);
-  await restarted.updatePolicy({ path: "mods/old.jar", hold: false });
-  const available = await restarted.installed(selection);
-  assert.equal(available.items[0].updateHeld, false);
-  assert.equal(available.items[0].update.id, "new");
-});
-for (const manual of [false, true])
-  test(`${manual ? "Recycle Bin restore" : "removal Undo"} reinstates its receipt and holds the restored version`, async (t) => {
-    const f = await fixture(t),
-      receipt = await seedUndoReceipt(f);
-    const review = await f.service.removalPreview({
-      path: "mods/old.jar",
-      type: "mod",
-    });
-    const removed = await f.service.remove({
-      planId: review.planId,
-      confirmed: true,
-      acknowledgedUnreadableDependencies: true,
-    });
-    assert.ok(removed.undoJobId);
-    assert.equal(f.service.snapshotInstalled().length, 0);
-    if (manual) {
-      await f.bin.restore(removed.recycled.id);
-      await f.service.restoreRecycledReceipt(removed.recycled.id);
-    } else await f.service.undoJob(removed.undoJobId, { confirmed: true });
-    const row = (await f.service.installed({ ...selection, local: true }))
-      .items[0];
-    assert.equal(row.versionName, receipt.versionName);
-    assert.equal(row.installedAt, receipt.installedAt);
-    assert.equal(row.updateHeld, true);
-  });
-
-test("plugin activation and removal review required plugin dependencies while preserving disabled files", async (t) => {
-  const f = await fixture(t);
-  f.setServer({ loader: "paper" });
-  await fs.mkdir(path.join(f.serverDir, "plugins"));
-  const library = zip([
-    ["plugin.yml", "name: SharedLibrary\nversion: 1.0\nmain: example.Main"],
-  ]);
-  const addon = zip([
-    [
-      "plugin.yml",
-      "name: Addon\nversion: 1.0\nmain: example.Addon\ndepend: [SharedLibrary]",
-    ],
-  ]);
-  await fs.writeFile(path.join(f.serverDir, "plugins/library.jar"), library);
-  await fs.writeFile(path.join(f.serverDir, "plugins/addon.jar"), addon);
-  const blocked = await f.service.setActive({
-    path: "plugins/library.jar",
-    type: "plugin",
-    active: false,
-  });
-  assert.equal(blocked.requiresAcknowledgement, true);
-  assert.match(blocked.warnings.join(" "), /requires sharedlibrary/);
-  assert.deepEqual(
-    await fs.readFile(path.join(f.serverDir, "plugins/library.jar")),
-    library,
-  );
-  const removed = await f.service.removalPreview({
-    path: "plugins/library.jar",
-    type: "plugin",
-  });
-  assert.equal(removed.blocked, true);
-  assert.deepEqual(
-    removed.dependents.map((row) => row.path),
-    ["plugins/addon.jar"],
-  );
-  await f.service.cancelRemovalPreview(removed.planId);
-  const changed = await f.service.setActive({
-    path: "plugins/library.jar",
-    type: "plugin",
-    active: false,
-    acknowledgedDependencies: true,
-  });
-  assert.equal(changed.path, "plugins/library.jar.disabled");
-  const local = await f.service.installed({ type: "plugin", local: true });
-  assert.equal(
-    local.items.find((row) => row.path === changed.path).active,
-    false,
-  );
-  assert.deepEqual(
-    await fs.readFile(path.join(f.serverDir, changed.path)),
-    library,
-  );
-  await f.service.setActive({
-    path: "plugins/addon.jar",
-    type: "plugin",
-    active: false,
-  });
-  const enabling = await f.service.setActive({
-    path: "plugins/addon.jar.disabled",
-    type: "plugin",
-    active: true,
-  });
-  assert.equal(enabling.requiresAcknowledgement, true);
-  assert.match(enabling.warnings.join(" "), /needs sharedlibrary/);
-  await f.service.setActive({
-    path: changed.path,
-    type: "plugin",
-    active: true,
-  });
-  assert.equal(
-    (
-      await f.service.setActive({
-        path: "plugins/addon.jar.disabled",
-        type: "plugin",
-        active: true,
-      })
-    ).ok,
-    true,
-  );
-});
-
-test("disabled plugin updates remain inactive and can be removed", async (t) => {
-  const f = await fixture(t, { type: "plugin" });
-  f.setServer({ loader: "paper" });
-  await fs.mkdir(path.join(f.serverDir, "plugins"));
-  await fs.rename(
-    path.join(f.serverDir, "mods/old.jar"),
-    path.join(f.serverDir, "plugins/old.jar"),
-  );
-  f.versions.old.loaders = f.versions.new.loaders = ["paper"];
-  await f.service.restoreInstalled([
-    {
-      path: "plugins/old.jar",
-      sha512: hashes(f.old).sha512,
-      platform: "modrinth",
-      projectId: "project",
-      versionId: "old",
-      versionName: "1.0",
-      type: "plugin",
-    },
-  ]);
-  await f.service.setActive({
-    path: "plugins/old.jar",
-    type: "plugin",
-    active: false,
-    acknowledgedDependencies: true,
-  });
-  const input = { ...selection, type: "plugin", loader: "paper" };
-  const plan = await f.service.previewUpdates({
-    ...input,
-    updates: [
-      {
-        platform: "modrinth",
-        projectId: "project",
-        versionId: "new",
-        replacePath: "plugins/old.jar.disabled",
-      },
-    ],
-  });
-  assert.equal(plan.files[0].path, "plugins/new.jar.disabled");
-  assert.equal(
-    (await finish(f.service, { planId: plan.planId, confirmed: true })).status,
-    "completed",
-  );
-  const local = await f.service.installed({ ...input, local: true });
-  assert.equal(local.items[0].active, false);
-  assert.equal(local.items[0].versionId, "new");
-  const removal = await f.service.removalPreview({
-    path: "plugins/new.jar.disabled",
-    type: "plugin",
-  });
-  assert.equal(removal.requiresAcknowledgement, false);
-  await f.service.remove({ planId: removal.planId, confirmed: true });
-  assert.equal(
-    (await f.service.installed({ ...input, local: true })).items.length,
-    0,
-  );
-});
-
-test("proxy plugins support guarded activation and unknown plugin metadata stays an acknowledged warning", async (t) => {
-  const f = await fixture(t);
-  f.setServer({ loader: "velocity" });
-  await fs.mkdir(path.join(f.serverDir, "plugins"));
-  const proxy = zip([
-    [
-      "velocity-plugin.json",
-      JSON.stringify({
-        id: "proxy-addon",
-        name: "Proxy Addon",
-        version: "1.0",
-        dependencies: [{ id: "proxy-library" }],
-      }),
-    ],
-  ]);
-  await fs.writeFile(
-    path.join(f.serverDir, "plugins/addon.jar.disabled"),
-    proxy,
-  );
-  const warning = await f.service.setActive({
-    path: "plugins/addon.jar.disabled",
-    type: "plugin",
-    active: true,
-  });
-  assert.equal(warning.requiresAcknowledgement, true);
-  assert.match(warning.warnings.join(" "), /needs proxy-library/);
-  assert.equal(
-    (
-      await f.service.setActive({
-        path: "plugins/addon.jar.disabled",
-        type: "plugin",
-        active: true,
-        acknowledgedDependencies: true,
-      })
-    ).ok,
-    true,
-  );
-  await fs.writeFile(
-    path.join(f.serverDir, "plugins/unknown.jar"),
-    "unreadable plugin metadata",
-  );
-  const unknown = await f.service.setActive({
-    path: "plugins/unknown.jar",
-    type: "plugin",
-    active: false,
-  });
-  assert.equal(unknown.requiresAcknowledgement, true);
-  assert.equal(
-    (
-      await f.service.setActive({
-        path: "plugins/unknown.jar",
-        type: "plugin",
-        active: false,
-        acknowledgedDependencies: true,
-      })
-    ).ok,
-    true,
-  );
-  assert.equal(
-    await fs.readFile(
-      path.join(f.serverDir, "plugins/unknown.jar.disabled"),
-      "utf8",
-    ),
-    "unreadable plugin metadata",
-  );
-});
-
-test("dependency summaries use only declared catalog metadata and known local identities without staging downloads", async (t) => {
-  const f = await fixture(t, {
-    request: async (url) => {
-      if (new URL(url).pathname === "/v2/projects")
-        return Response.json([
-          { id: "project", title: "Root Project" },
-          { id: "dependency", title: "Shared Library" },
-          { id: "optional-project", title: "Optional Helper" },
-        ]);
-    },
-  });
-  f.versions.new.dependencies = [
-    {
-      project_id: "dependency",
-      version_id: "dep",
-      dependency_type: "required",
-    },
-    { project_id: "optional-project", dependency_type: "optional" },
-  ];
-  await fs.writeFile(
-    path.join(f.serverDir, "mods/local-library.jar"),
-    f.dependency,
-  );
-  await f.service.restoreInstalled([
-    {
-      path: "mods/local-library.jar",
-      sha512: hashes(f.dependency).sha512,
-      platform: "modrinth",
-      projectId: "dependency",
-      versionId: "installed-newer",
-      versionName: "2.0",
-      title: "Known Library",
-      type: "mod",
-    },
-  ]);
-  const before = await fs.readdir(path.join(f.dataDir, "launchpad"));
-  const summary = await f.service.dependencies(selection);
-  assert.equal(summary.summaryIsAdvisory, true);
-  assert.equal(summary.declarationsAvailable, true);
-  assert.deepEqual(
-    summary.dependencies.map(
-      ({ title, status, installedVersion, proposedVersion, relation }) => ({
-        title,
-        status,
-        installedVersion,
-        proposedVersion,
-        relation,
-      }),
-    ),
-    [
-      {
-        title: "Shared Library",
-        status: "installed",
-        installedVersion: "2.0",
-        proposedVersion: "1.0",
-        relation: "required",
-      },
-      {
-        title: "Optional Helper",
-        status: "not-identified",
-        installedVersion: undefined,
-        proposedVersion: undefined,
-        relation: "optional",
-      },
-    ],
-  );
-  assert.match(
-    summary.warnings.join(" "),
-    /does not download files or validate/,
-  );
-  assert.equal(
-    f.requests.some(({ url }) => url.startsWith("https://cdn.modrinth.com/")),
-    false,
-  );
-  assert.equal(
-    f.requests.some(({ url }) => url.includes("/version_files")),
-    false,
-  );
-  assert.deepEqual(await fs.readdir(path.join(f.dataDir, "launchpad")), before);
-});
-test("dependency summaries retain missing-pin and external declarations as advisory unavailable rows", async (t) => {
-  const f = await fixture(t);
-  f.versions.new.dependencies = [
-    {
-      project_id: "dependency",
-      version_id: "missing-pin",
-      dependency_type: "required",
-    },
-    { file_name: "External Library.jar", dependency_type: "required" },
-  ];
-  const summary = await f.service.dependencies(selection);
-  assert.equal(summary.dependencies.length, 2);
-  assert.deepEqual(
-    summary.dependencies.map((row) => row.status),
-    ["unavailable", "unavailable"],
-  );
-  assert.equal(summary.dependencies[1].title, "External Library.jar");
-  assert.ok(
-    summary.warnings.some((value) =>
-      value.includes("declared release could not be read"),
-    ),
-  );
-  assert.equal(
-    f.requests.some(({ url }) => url.startsWith("https://cdn.modrinth.com/")),
-    false,
-  );
-});
-test("CurseForge dependency summaries retain required optional and incompatible catalog relations", async () => {
-  const provider = createCoreProviders({
-    key: async () => "fixture-key",
-    fetch: async (url) => {
-      assert.match(
-        String(url),
-        /^https:\/\/api\.curseforge\.com\/v1\/mods\/10\/files\/(?:20|21)$/,
-      );
-      return Response.json({
-        data: {
-          id: 20,
-          modId: 10,
-          dependencies: [
-            { modId: 11, relationType: 3 },
-            { modId: 12, relationType: 2 },
-            { modId: 13, relationType: 5 },
-          ],
-        },
-      });
-    },
-  }).find((provider) => provider.id === "curseforge");
-  assert.deepEqual(
-    (
-      await provider.declaredDependencies({ projectId: "10", versionId: "20" })
-    ).map((row) => [row.projectId, row.relation]),
-    [
-      ["11", "required"],
-      ["12", "optional"],
-      ["13", "incompatible"],
-    ],
-  );
-  await assert.rejects(
-    provider.declaredDependencies({ projectId: "10", versionId: "21" }),
-    /different release/,
-  );
-});
-
-test("update channel preferences persist per server and reject invalid or mixed changes", async (t) => {
-  const f = await fixture(t);
-  assert.equal((await f.service.config()).updateChannel, "installed");
-  for (const value of [
-    null,
-    [],
-    { updateChannel: "nightly" },
-    { updateChannel: "alpha", path: "mods/old.jar", hold: true },
-  ])
-    await assert.rejects(f.service.updatePolicy(value), { status: 400 });
-  const writes = await Promise.all([
-    f.service.updatePolicy({ updateChannel: "alpha" }),
-    f.service.updatePolicy({ updateChannel: "beta" }),
-  ]);
-  assert.deepEqual(
-    writes.map((row) => row.updateChannel),
-    ["alpha", "beta"],
-  );
-  assert.equal((await f.service.config()).updateChannel, "beta");
-  assert.deepEqual(
-    JSON.parse(
-      await fs.readFile(
-        path.join(f.dataDir, "launchpad", "update-policy.json"),
-        "utf8",
-      ),
-    ),
-    { version: 1, updateChannel: "beta" },
-  );
-  assert.equal(
-    (await fs.readdir(path.join(f.dataDir, "launchpad"))).filter((name) =>
-      name.endsWith(".tmp"),
-    ).length,
-    0,
-  );
-  await f.service.close();
-  const reopened = await f.boot();
-  assert.equal((await reopened.config()).updateChannel, "beta");
-  const other = await fixture(t);
-  assert.equal((await other.service.config()).updateChannel, "installed");
-});
-
-test("fallback update channels follow verified installed stability and invalidate cached offers", async (t) => {
-  const f = await fixture(t);
-  await f.service.close();
-  let reads = 0;
-  const versions = [
-    { id: "old", channel: "beta", publishedAt: "2026-01-01" },
-    { id: "stable", channel: "release", publishedAt: "2026-02-01" },
-    { id: "beta", channel: "beta", publishedAt: "2026-03-01" },
-    { id: "alpha", channel: "alpha", publishedAt: "2026-04-01" },
-  ].map((row) => ({ ...row, name: row.id, downloadable: true }));
-  await fs.writeFile(
-    path.join(f.dataDir, "launchpad", "installed.json"),
-    JSON.stringify([
-      {
-        platform: "fixturecatalog",
-        type: "mod",
-        path: "mods/old.jar",
-        sha512: hashes(f.old).sha512,
-        projectId: "project",
-        versionId: "old",
-      },
-    ]),
-  );
-  const extraProviders = [
-    {
-      id: "fixturecatalog",
-      name: "Fixture",
-      types: ["mod"],
-      versions: async () => {
-        reads++;
-        return versions;
-      },
-    },
-  ];
-  const service = await f.boot({ extraProviders });
-  let result = await service.installed({
-    ...selection,
-    updateChannel: "alpha",
-  });
-  assert.equal(result.items[0].channel, "beta");
-  assert.equal(
-    result.items[0].update.id,
-    "beta",
-    "an installed-query parameter cannot override the saved policy",
-  );
-  await service.updatePolicy({ updateChannel: "alpha" });
-  result = await service.installed(selection);
-  assert.equal(result.items[0].update.id, "alpha");
-  await service.updatePolicy({ updateChannel: "release" });
-  result = await service.installed(selection);
-  assert.equal(
-    result.items[0].update.id,
-    "stable",
-    "a previous alpha offer must not survive a policy change",
-  );
-  assert.equal(reads, 3);
-  versions[0].channel = "release";
-  await service.updatePolicy({ updateChannel: "installed" });
-  result = await service.installed(selection);
-  assert.equal(
-    result.items[0].update.id,
-    "stable",
-    "stable installations never silently accept beta/alpha",
-  );
-  versions[0].channel = "beta";
-  versions.splice(1, 1); // No stable build exists for this server target.
-  await service.updatePolicy({ updateChannel: "release" });
-  result = await service.installed(selection);
-  assert.equal(result.items[0].update, undefined);
-  assert.equal(result.items[0].updateCheck, "checked");
-  assert.deepEqual(result.warnings, []);
-});
-
-test("Modrinth old identities backfill channels and persist them without widening stable installations", async (t) => {
-  const f = await fixture(t);
-  f.versions.old.version_type = "beta";
-  f.versions.new.version_type = "beta";
-  await fs.writeFile(
-    path.join(f.dataDir, "launchpad", "installed.json"),
-    JSON.stringify([
-      {
-        platform: "modrinth",
-        type: "mod",
-        path: "mods/old.jar",
-        sha512: hashes(f.old).sha512,
-        projectId: "project",
-        versionId: "old",
-      },
-    ]),
-  );
-  await f.service.close();
-  const service = await f.boot();
-  const result = await service.installed(selection);
-  assert.equal(result.items[0].channel, "beta");
-  assert.equal(result.items[0].update?.id, "new");
-  const update = f.requests
-    .filter(({ url }) => new URL(url).pathname === "/v2/version_files/update")
-    .at(-1);
-  assert.deepEqual(JSON.parse(update.body).version_types, ["release", "beta"]);
-  await service.close();
-  const reopened = await f.boot();
-  const before = f.requests.length;
-  const local = await reopened.installed({ ...selection, local: true });
-  assert.equal(local.items[0].channel, "beta");
-  assert.equal(
-    f.requests.length,
-    before,
-    "the backfilled channel persists with the verified identity",
-  );
-});
-
-test("review and installation receipts retain selected prerelease channels", async (t) => {
-  const f = await fixture(t);
-  f.versions.new.version_type = "beta";
-  const plan = await f.service.preview(selection);
-  assert.equal(plan.channel, "beta");
-  assert.equal(
-    plan.files.find((file) => file.path === "mods/new.jar").channel,
-    "beta",
-  );
-  const job = await f.service.install({ planId: plan.planId, confirmed: true });
-  assert.equal((await waitForJob(f.service, job.job.id)).status, "completed");
-  assert.equal(
-    f.service.snapshotInstalled().find((row) => row.path === "mods/new.jar")
-      .channel,
-    "beta",
-  );
-  await f.service.close();
-  const reopened = await f.boot();
-  assert.equal(
-    (await reopened.installed({ ...selection, local: true })).items.find(
-      (row) => row.path === "mods/new.jar",
-    ).channel,
-    "beta",
-  );
-});
-
-test("unpinned dependency channels follow the saved ceiling while valid pins remain explicit", async (t) => {
-  let f;
-  f = await fixture(t, {
-    request: (url) => {
-      if (new URL(url).pathname === "/v2/project/dependency/version")
-        return Response.json([
-          f.versions.depAlpha,
-          f.versions.depBeta,
-          f.versions.dep,
-        ]);
-    },
-  });
-  f.versions.dep.version_type = "release";
-  for (const [id, channel, date] of [
-    ["depBeta", "beta", "2026-03-01"],
-    ["depAlpha", "alpha", "2026-04-01"],
-  ]) {
-    const data = bytes(`dependency ${channel}`);
-    const url = `https://cdn.modrinth.com/${id}.jar`;
-    f.downloads.set(url, data);
-    f.versions[id] = {
-      ...f.versions.dep,
-      id,
-      name: id,
-      version_type: channel,
-      date_published: date,
-      files: [
-        {
-          filename: `${id}.jar`,
-          url,
-          size: data.length,
-          hashes: hashes(data),
-          primary: true,
-        },
-      ],
-    };
-  }
-  f.versions.new.dependencies = [
-    { project_id: "dependency", version_id: null, dependency_type: "required" },
-  ];
-  let review = await f.service.preview({
-    ...selection,
-    updateChannel: "alpha",
-  });
-  assert.equal(
-    review.files.find((file) => file.path === "mods/dep.jar").channel,
-    "release",
-    "query input cannot expand the saved default",
-  );
-  await f.service.cancelPreview(review.planId);
-  await f.service.updatePolicy({ updateChannel: "beta" });
-  review = await f.service.preview(selection);
-  assert.equal(
-    review.files.find((file) => file.path === "mods/depBeta.jar").channel,
-    "beta",
-  );
-  assert.ok(
-    review.unavailableDependencies.some((row) =>
-      /beta release/.test(row.issue),
-    ),
-  );
-  assert.ok(!review.files.some((file) => file.channel === "alpha"));
-  await f.service.cancelPreview(review.planId);
-  await f.service.updatePolicy({ updateChannel: "release" });
-  f.versions.new.dependencies[0].version_id = "depAlpha";
-  review = await f.service.preview(selection);
-  assert.equal(
-    review.files.find((file) => file.path === "mods/depAlpha.jar").channel,
-    "alpha",
-    "an exact required pin remains explicit and reviewable",
-  );
-  assert.ok(
-    review.unavailableDependencies.some((row) =>
-      /alpha release/.test(row.issue),
-    ),
   );
 });

@@ -104,13 +104,9 @@ export function createPublicAddressResolver({
   };
 }
 
-export async function advertisedConnection(configuration, resolver, { remote = false, lanAddresses = [] } = {}) {
-  const lanHost = lanAddresses.find((value) => isIP(value) === 4 && !value.startsWith("127."));
-  const lan = lanHost ? { lanAddress: connectionAddress(lanHost, configuration.port) } : {};
-  const custom = configuration.connectionHost;
-  if (custom && !(remote && /^(?:localhost|127\.|::1$)/i.test(custom)))
+export async function advertisedConnection(configuration, resolver) {
+  if (configuration.connectionHost)
     return {
-      ...lan,
       address: connectionAddress(
         configuration.connectionHost,
         configuration.port,
@@ -121,19 +117,11 @@ export async function advertisedConnection(configuration, resolver, { remote = f
   const publicHost = await resolver.resolve();
   return publicHost
     ? {
-        ...lan,
         address: connectionAddress(publicHost, configuration.port),
         addressSource: "public",
         addressNote:
-          `Internet address detected. Forward TCP ${configuration.port} on the host router and allow it through the firewall. Connectivity has not been checked.`,
+          "Public IP detected. Port forwarding and firewall access have not been checked.",
       }
-    : lanHost ? {
-        ...lan,
-        address: connectionAddress(lanHost, configuration.port),
-        addressSource: "lan",
-        addressNote: "Same network or VPN only. Ask the host for an Internet address when joining from elsewhere.",
-      }
-    : remote ? { address: null, addressSource: "unavailable", addressNote: "Ask the host for the Minecraft server address. A localhost address would point to your own computer." }
     : {
         address: connectionAddress("localhost", configuration.port),
         addressSource: "local",

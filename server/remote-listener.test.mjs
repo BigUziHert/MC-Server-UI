@@ -173,7 +173,7 @@ test("a remote port change starts the replacement before closing the previous so
   assert.equal(f.remote.status().listening, true);
 });
 
-test("a conflicting port preserves enabled settings, stops the old socket, and permits recovery", async (t) => {
+test("a conflicting port disables remote access, stops the old socket, and permits recovery", async (t) => {
   const occupied = await occupy();
   t.after(() => stop(occupied));
   const conflictPort = occupied.address().port;
@@ -184,7 +184,7 @@ test("a conflicting port preserves enabled settings, stops the old socket, and p
     (error) =>
       error.status === 409 && /remote port is unavailable/.test(error.message),
   );
-  assert.equal(f.remote.status().enabled, true);
+  assert.equal(f.remote.status().enabled, false);
   assert.equal(f.remote.status().ready, false);
   assert.equal(f.remote.status().listening, false);
   assert.equal(
@@ -195,7 +195,7 @@ test("a conflicting port preserves enabled settings, stops the old socket, and p
     JSON.parse(
       await fs.readFile(path.join(f.root, "remote-access.json"), "utf8"),
     ).configuration.enabled,
-    true,
+    false,
   );
   await assert.rejects(read(f.port), { code: "ECONNREFUSED" });
   assert.equal((await read(conflictPort)).body, "occupied fixture");
@@ -210,7 +210,7 @@ test("startup port conflicts report unavailable access and saving a free port re
   t.after(() => stop(occupied));
   const f = await fixture(t, { enabled: true, port: occupied.address().port });
   await f.remote.start();
-  assert.equal(f.remote.status().enabled, true);
+  assert.equal(f.remote.status().enabled, false);
   assert.equal(f.remote.status().listening, false);
   assert.equal(f.remote.status().ready, false);
   assert.match(f.remote.status().error, /remote port is unavailable/);

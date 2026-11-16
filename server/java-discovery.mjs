@@ -425,8 +425,7 @@ export function createJavaDiscovery({
 
 // Match the runtime major specified by the official release. A newer JVM is not
 // automatically supported by older loaders (notably Forge).
-export const compatibleJava = (java, requiredMajor, selection = {}) =>
+export const compatibleJava = (java, requiredMajor) =>
   !!java.available &&
-  (!requiredMajor || java.majorVersion === requiredMajor ||
-    (selection.type !== "modpack" && ["vanilla", "paper", "purpur", "folia", "fabric", "quilt"].includes(selection.provider) && requiredMajor >= 16 && java.majorVersion >= requiredMajor && java.majorVersion <= ({ 16: 21, 17: 21, 21: 25 }[requiredMajor] ?? requiredMajor))) &&
+  (!requiredMajor || java.majorVersion === requiredMajor) &&
   !/^(?:x86|i[3-6]86|32)$/i.test(java.architecture ?? "");

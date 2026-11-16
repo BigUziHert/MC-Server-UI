@@ -38,7 +38,7 @@
 .management-notice > svg {
   flex-shrink: 0;
   margin-top: 2px;
-  color: var(--accent);
+  color: #ffd000;
 }
 .management-notice strong {
   font-size: 12px;
@@ -60,7 +60,7 @@
   background: #20212b;
   border: 1px solid #303140;
   border-radius: 10px;
-  color: var(--accent);
+  color: #ffd000;
   flex-shrink: 0;
 }
 .management-list {
@@ -218,7 +218,7 @@
   outline: none;
 }
 .management-dialog .form-field input:focus {
-  border-color: var(--accent);
+  border-color: #ffd000;
   box-shadow: 0 0 0 3px #ffd00012;
 }
 .management-dialog .form-field input::placeholder {
@@ -239,7 +239,7 @@
   gap: 8px;
   font-size: 11px;
   line-height: 1.6;
-  color: var(--danger-text);
+  color: #ecaa92;
   margin: 18px 0 0;
 }
 .management-audit-overview {
@@ -254,7 +254,7 @@
   display: flex;
   align-items: center;
   justify-content: center;
-  color: var(--accent);
+  color: #ffd000;
   background: #272833;
   border: 1px solid #303140;
   border-radius: 12px;
@@ -353,7 +353,7 @@
   flex-shrink: 0;
   background: #272833;
   border: 1px solid #303140;
-  color: var(--accent);
+  color: #ffd000;
 }
 .management-event-icon.category-file {
   background: #272833;

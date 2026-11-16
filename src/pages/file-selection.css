@@ -68,11 +68,11 @@
   width: 16px;
   height: 16px;
   margin: 0;
-  accent-color: var(--accent, var(--accent));
+  accent-color: var(--accent, #ffd000);
   cursor: pointer;
 }
 .file-selection-checkbox:focus-visible {
-  outline: 2px solid var(--accent, var(--accent));
+  outline: 2px solid var(--accent, #ffd000);
   outline-offset: 4px;
 }
 .file-selection-checkbox:disabled {
@@ -93,7 +93,7 @@
 .file-table tbody tr.file-row-selected {
   background: color-mix(
     in srgb,
-    var(--accent, var(--accent)) 6%,
+    var(--accent, #ffd000) 6%,
     var(--panel, #20212b)
   );
 }
@@ -157,11 +157,11 @@
   width: 100%;
   height: 8px;
   margin: 14px 0 8px;
-  accent-color: var(--accent, var(--accent));
+  accent-color: var(--accent, #ffd000);
 }
 .file-clipboard-notice > svg {
   flex-shrink: 0;
-  color: var(--accent, var(--accent));
+  color: var(--accent, #ffd000);
 }
 .file-clipboard-notice > span {
   flex: 1;
@@ -201,7 +201,7 @@
 .file-bulk-targets li > svg {
   flex-shrink: 0;
   margin-top: 2px;
-  color: var(--accent, var(--accent));
+  color: var(--accent, #ffd000);
 }
 .file-bulk-targets li > div {
   display: grid;

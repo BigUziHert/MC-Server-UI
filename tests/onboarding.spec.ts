@@ -333,10 +333,10 @@ async function choosePaper(page: Page) {
   ).toHaveJSProperty("disabled", true);
   await expect(
     dialog.getByRole("combobox", { name: "Build", exact: true }),
-  ).toHaveValue("151");
+  ).toHaveValue("");
   await expect(
     dialog.getByRole("button", { name: "Continue", exact: true }),
-  ).toBeEnabled();
+  ).toBeDisabled();
   await dialog
     .getByRole("combobox", { name: "Build", exact: true })
     .selectOption("151");
@@ -423,7 +423,7 @@ test("Welcome opens the import folder workflow directly and cancelling preserves
   expect(setup.catalogRequests).toEqual([]);
 });
 
-test("software builds select a stable default and reset after changing Minecraft or software", async ({
+test("software builds require an explicit choice and reset after changing Minecraft or software", async ({
   page,
   setup,
 }) => {
@@ -451,25 +451,25 @@ test("software builds select a stable default and reset after changing Minecraft
   });
   const next = dialog.getByRole("button", { name: "Continue", exact: true });
   await expect(builds).toBeEnabled();
-  await expect(builds).toHaveValue("151");
+  await expect(builds).toHaveValue("");
   await expect(builds.locator('option[value=""]')).toHaveJSProperty(
     "disabled",
     true,
   );
-  await expect(next).toBeEnabled();
+  await expect(next).toBeDisabled();
   await builds.selectOption("151");
   await expect(next).toBeEnabled();
   await versions.selectOption("1.20.1");
   await expect(builds.locator('option[value="196"]')).toHaveCount(1);
-  await expect(builds).toHaveValue("196");
-  await expect(next).toBeEnabled();
+  await expect(builds).toHaveValue("");
+  await expect(next).toBeDisabled();
   await builds.selectOption("196");
   await expect(next).toBeEnabled();
   await dialog.getByRole("button", { name: "Back", exact: true }).click();
   await dialog.getByRole("button", { name: /Paper/ }).click();
   await expect(builds.locator('option[value="151"]')).toHaveCount(1);
-  await expect(builds).toHaveValue("151");
-  await expect(next).toBeEnabled();
+  await expect(builds).toHaveValue("");
+  await expect(next).toBeDisabled();
   expect(setup.preflightRequests).toEqual([]);
   expect(setup.mutations).toEqual([]);
 });
@@ -518,7 +518,7 @@ test("Java choices group duplicate installations by major and review uses the ne
           label: option.textContent,
         })),
     ),
-  ).toEqual([{ value: "21", label: "Java 21" }]);
+  ).toEqual([{ value: "21", label: "JAVA 21" }]);
   await expect(dialog).not.toContainText(java.path);
   await expect(dialog).not.toContainText(alternateJavaPath);
   await expect(dialog).not.toContainText(staleJavaPath);
@@ -2086,115 +2086,4 @@ test("modpack creation reviews an exact release and scopes runtime and pack inst
   await expect(
     page.getByRole("heading", { name: "Guided adventure pack", exact: true }),
   ).toBeVisible();
-});
-
-test("first server setup survives roster polling and can continue in the background", async ({
-  page,
-  setup,
-}) => {
-  let complete = false;
-  await page.route("**/api/versions/install", (route) =>
-    route.fulfill({
-      status: 202,
-      json: { id: "long-setup", state: "queued" },
-    }),
-  );
-  await page.route("**/api/versions/jobs/long-setup", (route) =>
-    route.fulfill({
-      json: {
-        id: "long-setup",
-        state: complete ? "complete" : "running",
-        completed: 2,
-        total: 10,
-        message: "Downloading fixture files",
-      },
-    }),
-  );
-  await openCreate(page);
-  await choosePaper(page);
-  const dialog = await configure(page, setup, "Persistent setup");
-  await dialog
-    .getByRole("button", { name: "Create and install", exact: true })
-    .click();
-  await expect(dialog.getByRole("progressbar")).toHaveAttribute("value", "2");
-  await page.evaluate(() => window.dispatchEvent(new Event("focus")));
-  await expect(dialog).toBeVisible();
-  await dialog
-    .getByRole("button", { name: "Continue in background", exact: true })
-    .click();
-  await expect(dialog).not.toBeVisible();
-  await expect(
-    page.getByRole("button", { name: "Return to setup", exact: true }),
-  ).toBeVisible();
-  complete = true;
-  await page
-    .getByRole("button", { name: "Return to setup", exact: true })
-    .click();
-  await expect(
-    dialog.getByRole("heading", { name: "Your server is ready", exact: true }),
-  ).toBeVisible();
-  expect(setup.created).toHaveLength(1);
-  expect(setup.creationRequests).toHaveLength(1);
-});
-
-test("unfinished setup resumes after closing and reload without creating a second server", async ({
-  page,
-  setup,
-}) => {
-  const installs: { serverId?: string; body: Record<string, unknown> }[] = [];
-  await page.route("**/api/versions/install", (route) => {
-    installs.push({
-      serverId: route.request().headers()["x-server-id"],
-      body: route.request().postDataJSON(),
-    });
-    return route.fulfill({
-      json: {
-        id: `resume-install-${installs.length}`,
-        state: installs.length === 1 ? "failed" : "complete",
-        error:
-          installs.length === 1 ? "Fixture download interrupted" : undefined,
-      },
-    });
-  });
-  await openCreate(page);
-  await choosePaper(page);
-  const dialog = await configure(page, setup, "Resume this server");
-  await dialog
-    .getByRole("button", { name: "Create and install", exact: true })
-    .click();
-  await expect(dialog).toContainText("Fixture download interrupted");
-  await dialog
-    .getByRole("button", { name: "Finish later", exact: true })
-    .click();
-  await expect(
-    page.getByRole("button", { name: "Finish setup", exact: true }),
-  ).toBeVisible();
-  await page.reload();
-  await page.getByRole("button", { name: "Finish setup", exact: true }).click();
-  await page
-    .getByRole("button", {
-      name: "Resume setup: Resume this server",
-      exact: true,
-    })
-    .click();
-  await expect(dialog).toContainText("setup draft are saved");
-  await dialog
-    .getByRole("button", { name: "Retry installation", exact: true })
-    .click();
-  await expect(
-    dialog.getByRole("button", { name: "Open Console", exact: true }),
-  ).toBeEnabled();
-  expect(setup.creationRequests).toHaveLength(1);
-  expect(installs).toHaveLength(2);
-  expect(installs[1].serverId).toBe(setup.created[0].id);
-  expect(installs[1].body).toMatchObject({
-    provider: "paper",
-    version: "1.21.1",
-    build: "151",
-  });
-  expect(
-    await page.evaluate(() =>
-      JSON.parse(localStorage.getItem("mc-panel.setup-drafts.v1") || "[]"),
-    ),
-  ).toEqual([]);
 });

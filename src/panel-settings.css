@@ -57,12 +57,12 @@
 }
 .panel-settings-tabs button[aria-selected="true"] {
   background: #ffd00013;
-  color: var(--accent, var(--accent));
+  color: var(--accent, #ffd000);
   box-shadow: inset 0 0 0 1px #ffd00040;
 }
 .panel-settings-tabs button:focus-visible,
 .panel-server-trigger:focus-visible {
-  outline: 2px solid var(--accent, var(--accent));
+  outline: 2px solid var(--accent, #ffd000);
   outline-offset: 2px;
 }
 .panel-startup-settings {
@@ -186,7 +186,7 @@
   height: 17px;
   flex-shrink: 0;
   margin: 0;
-  accent-color: var(--accent, var(--accent));
+  accent-color: var(--accent, #ffd000);
 }
 .panel-server-choices span {
   min-width: 0;
@@ -259,25 +259,4 @@
   .panel-settings-dialog .subusers-setup-heading {
     flex-wrap: wrap;
   }
-}
-.panel-startup-notice {
-  position: fixed;
-  right: 24px;
-  bottom: 24px;
-  z-index: 900;
-  width: min(440px, calc(100vw - 48px));
-  padding: 18px;
-  border: 1px solid var(--border);
-  border-radius: 12px;
-  background: var(--surface, #20212b);
-  color: var(--text);
-  box-shadow: 0 12px 36px #0005;
-}
-.panel-startup-notice p {
-  white-space: pre-wrap;
-  max-height: 180px;
-  overflow-y: auto;
-}
-.panel-startup-notice .btn + .btn {
-  margin-left: 8px;
 }

@@ -151,7 +151,6 @@ async function fixture(
     serverDir,
     dataDir,
     safePath,
-    reviewRuntimeRequirements: async () => [],
     getServer: async () => state.server,
     recycle: async (relative) => {
       if (state.recycleGate) {
@@ -272,10 +271,10 @@ for (const loader of ["neoforge", "forge", "fabric", "quilt"]) {
       { path: "mods/consumer.jar", title: "consumer" },
     ]);
     assert.deepEqual(result.warnings, []);
-    assert.ok(result.planId);
+    assert.equal(result.planId, undefined);
     await assert.rejects(
       f.service.remove({ planId: result.planId, confirmed: true }),
-      { status: 400 },
+      { status: 409 },
     );
     assert.deepEqual(await f.read("mods/library.jar"), library);
     assert.deepEqual(await f.bin.list(), []);
@@ -303,14 +302,14 @@ for (const loader of ["forge", "neoforge"]) {
       assert.deepEqual(plan.warnings, []);
       assert.equal(plan.requiresAcknowledgement, false);
       if (blocked) {
-        assert.ok(plan.planId);
+        assert.equal(plan.planId, undefined);
         await assert.rejects(
           f.service.remove({
             planId: plan.planId,
             confirmed: true,
             acknowledgedUnreadableDependencies: true,
           }),
-          { status: 400 },
+          { status: 409 },
         );
         assert.deepEqual(await f.read("mods/library.jar"), library);
         assert.deepEqual(await f.bin.list(), []);
@@ -350,14 +349,14 @@ test("NeoForge clientSideOnly does not hide bundled dependents or bypass unreada
   ]);
   assert.equal(blocked.requiresAcknowledgement, true);
   assert.match(blocked.warnings.join("\n"), /broken.jar/);
-  assert.ok(blocked.planId);
+  assert.equal(blocked.planId, undefined);
   await assert.rejects(
     f.service.remove({
       planId: blocked.planId,
       confirmed: true,
       acknowledgedUnreadableDependencies: true,
     }),
-    { status: 400 },
+    { status: 409 },
   );
   const removable = await f.service.removalPreview({
     path: "mods/consumer.jar",
@@ -498,7 +497,7 @@ for (const requiresSelected of [false, true]) {
       requiresSelected ? ["mods/large-wrapper.jar"] : [],
     );
     if (requiresSelected) {
-      assert.ok(plan.planId);
+      assert.equal(plan.planId, undefined);
       assert.deepEqual(await f.read("mods/selected.jar"), selected);
       assert.deepEqual(await f.bin.list(), []);
     } else {
@@ -693,7 +692,7 @@ for (const loader of ["neoforge", "forge", "fabric", "quilt"]) {
       ["mods/createpropulsion.jar", "mods/submarine_addon.jar"],
     );
     assert.deepEqual(plan.warnings, []);
-    assert.ok(plan.planId);
+    assert.equal(plan.planId, undefined);
     assert.deepEqual(await f.read("mods/create_submarine.jar"), selected);
     assert.deepEqual(await f.bin.list(), []);
   });
@@ -764,7 +763,7 @@ test("unreadable and client-only bundles cannot satisfy a server dependency duri
   );
   assert.equal(plan.warnings.length, 1);
   assert.match(plan.warnings[0], /unreadable\.jar/);
-  assert.ok(plan.planId);
+  assert.equal(plan.planId, undefined);
   assert.deepEqual(await f.bin.list(), []);
 });
 
@@ -845,7 +844,7 @@ for (const { name, ranges, versions, blocked, splitConsumers = false } of [
     );
     assert.deepEqual(plan.warnings, []);
     if (blocked) {
-      assert.ok(plan.planId);
+      assert.equal(plan.planId, undefined);
       assert.deepEqual(await f.read("mods/selected.jar"), selected);
     } else {
       await f.service.remove({ planId: plan.planId, confirmed: true });
@@ -890,7 +889,7 @@ for (const loader of ["forge", "neoforge"]) {
       );
       assert.deepEqual(plan.warnings, []);
       if (blocked) {
-        assert.ok(plan.planId);
+        assert.equal(plan.planId, undefined);
         assert.deepEqual(
           await f.read("mods/selected.jar"),
           files["selected.jar"],
@@ -931,7 +930,7 @@ test("retaining one lower version cannot hide a higher bundled version needed by
     ["mods/consumer.jar"],
   );
   assert.deepEqual(plan.warnings, []);
-  assert.ok(plan.planId);
+  assert.equal(plan.planId, undefined);
   assert.deepEqual(await f.read("mods/selected.jar"), selected);
 });
 
@@ -1220,14 +1219,7 @@ test("plugins and datapacks can be reviewed and removed without scanning mod dep
     await fs.mkdir(path.dirname(path.join(f.serverDir, relative)), {
       recursive: true,
     });
-    await f.write(
-      relative,
-      type === "plugin"
-        ? zip([
-            ["plugin.yml", "name: Example\nversion: 1.0\nmain: example.Main"],
-          ])
-        : "installed package",
-    );
+    await f.write(relative, "installed package");
     await assert.rejects(
       f.service.removalPreview({ type, path: "mods/wrong.jar" }),
       { message: `Choose an installed ${type} to remove.` },
@@ -1294,66 +1286,4 @@ test("cancelled removal plans cannot mutate files", async (t) => {
     /expired/,
   );
   assert.ok(await f.read("mods/example.jar"));
-});
-
-test("removal can acknowledge remaining dependents or include the complete dependent chain", async (t) => {
-  for (const includeDependents of [false, true])
-    await t.test(String(includeDependents), async (t) => {
-      const files = {
-        "library.jar": mod("fabric", "library"),
-        "consumer.jar": mod("fabric", "consumer", ["library"]),
-        "addon.jar": mod("fabric", "addon", ["consumer"]),
-      };
-      const f = await fixture(t, { loader: "fabric", files });
-      const plan = await f.service.removalPreview({
-        path: "mods/library.jar",
-        includeDependents,
-      });
-      assert.equal(plan.blocked, !includeDependents);
-      assert.equal(plan.files.length, includeDependents ? 3 : 1);
-      const result = await f.service.remove({
-        planId: plan.planId,
-        confirmed: true,
-        acknowledgedDependents: true,
-      });
-      assert.equal(result.recycledEntries.length, includeDependents ? 3 : 1);
-      assert.equal((await f.bin.list()).length, includeDependents ? 3 : 1);
-      if (!includeDependents)
-        assert.deepEqual(
-          await f.read("mods/consumer.jar"),
-          files["consumer.jar"],
-        );
-    });
-});
-
-test("activation warns before breaking dependencies and supports a verified copy fallback", async (t) => {
-  const files = {
-    "library.jar": mod("fabric", "library"),
-    "consumer.jar": mod("fabric", "consumer", ["library"]),
-  };
-  const f = await fixture(t, { loader: "fabric", files });
-  const review = await f.service.setActive({
-    path: "mods/library.jar",
-    active: false,
-  });
-  assert.equal(review.requiresAcknowledgement, true);
-  assert.match(review.warnings.join(" "), /consumer.*library/);
-  assert.deepEqual(await f.read("mods/library.jar"), files["library.jar"]);
-  const link = fs.link;
-  fs.link = async () => {
-    throw Object.assign(new Error("unsupported filesystem"), {
-      code: "ENOTSUP",
-    });
-  };
-  try {
-    const result = await f.service.setActive({
-      path: "mods/library.jar",
-      active: false,
-      acknowledgedDependencies: true,
-    });
-    assert.equal(result.path, "mods/library.jar.disabled");
-    assert.deepEqual(await f.read(result.path), files["library.jar"]);
-  } finally {
-    fs.link = link;
-  }
 });

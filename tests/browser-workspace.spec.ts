@@ -1,6 +1,6 @@
 import { test, expect, type Page } from "@playwright/test";
 
-const home = process.env.PANEL_E2E_BASE_URL ?? "http://127.0.0.1:3111";
+const home = "http://127.0.0.1:3111";
 const origins = ["https://a.example.test", "https://c.example.test"];
 const permissions = ["server.view", "control.console", "control.start"];
 const server = {
@@ -228,12 +228,7 @@ async function fixture(
 }
 
 async function manage(page: Page) {
-  const account = page.getByRole("button", { name: /^Account menu for/ });
-  if (!(await account.isVisible()))
-    await page
-      .getByRole("button", { name: "Open navigation", exact: true })
-      .click();
-  await account.click();
+  await page.getByRole("button", { name: /^Account menu for/ }).click();
   await page
     .getByRole("menuitem", { name: "Manage Connections", exact: true })
     .click();
@@ -264,10 +259,7 @@ async function signIn(page: Page, origin: string) {
   await dialog
     .getByLabel("Password", { exact: true })
     .fill("browser-password-123");
-  await dialog
-    .getByRole("form", { name: /^Sign in/ })
-    .getByRole("button", { name: "Sign in", exact: true })
-    .click();
+  await dialog.getByRole("button", { name: "Sign in", exact: true }).click();
   await expect(dialog).toHaveCount(0);
   expect(
     (await page.evaluate(() => window.mcPanelConnections!.list())).panels.find(
@@ -501,18 +493,12 @@ test("browser sign-in validates only on submission and never saves failed or can
   await dialog.getByLabel("Password", { exact: true }).fill("wrong password");
   expect(calls.filter((call) => call.origin === origins[0])).toEqual([]);
   hosts.get(origins[0])!.unavailable = true;
-  await dialog
-    .getByRole("form", { name: /^Sign in/ })
-    .getByRole("button", { name: "Sign in", exact: true })
-    .click();
+  await dialog.getByRole("button", { name: "Sign in", exact: true }).click();
   await expect(dialog.getByRole("alert")).toBeVisible();
   expect(calls.filter((call) => call.path === "/api/access/login")).toEqual([]);
   expect(await saved()).toEqual([]);
   hosts.get(origins[0])!.unavailable = false;
-  await dialog
-    .getByRole("form", { name: /^Sign in/ })
-    .getByRole("button", { name: "Sign in", exact: true })
-    .click();
+  await dialog.getByRole("button", { name: "Sign in", exact: true }).click();
   await expect(dialog.getByRole("alert")).toContainText("incorrect");
   expect(await saved()).toEqual([]);
   await page.keyboard.press("Escape");
@@ -528,10 +514,7 @@ test("browser sign-in validates only on submission and never saves failed or can
   await dialog
     .getByLabel("Password", { exact: true })
     .fill("browser-password-123");
-  await dialog
-    .getByRole("form", { name: /^Sign in/ })
-    .getByRole("button", { name: "Sign in", exact: true })
-    .click();
+  await dialog.getByRole("button", { name: "Sign in", exact: true }).click();
   await expect(dialog).toHaveCount(0);
   expect(await saved()).toEqual([origins[0]]);
   const manager = await manage(page);
@@ -605,10 +588,7 @@ test("changing the sign-in address clears credentials and keeps temporary attemp
     .getByLabel("Email address", { exact: true })
     .fill("only-a@example.test");
   await dialog.getByLabel("Password", { exact: true }).fill("wrong password");
-  await dialog
-    .getByRole("form", { name: /^Sign in/ })
-    .getByRole("button", { name: "Sign in", exact: true })
-    .click();
+  await dialog.getByRole("button", { name: "Sign in", exact: true }).click();
   await expect(dialog.getByRole("alert")).toContainText("incorrect");
   await dialog.getByLabel("Panel address", { exact: true }).fill(origins[1]);
   await expect(dialog.getByLabel("Email address", { exact: true })).toHaveValue(
@@ -622,10 +602,7 @@ test("changing the sign-in address clears credentials and keeps temporary attemp
   await dialog
     .getByLabel("Password", { exact: true })
     .fill("browser-password-123");
-  await dialog
-    .getByRole("form", { name: /^Sign in/ })
-    .getByRole("button", { name: "Sign in", exact: true })
-    .click();
+  await dialog.getByRole("button", { name: "Sign in", exact: true }).click();
   await expect(dialog).toHaveCount(0);
   expect(
     calls
@@ -680,9 +657,7 @@ for (const width of [1434, 390]) {
     ).toBeVisible();
     await expect(signIn.getByLabel("Password", { exact: true })).toBeVisible();
     await expect(
-      signIn
-        .getByRole("form", { name: /^Sign in/ })
-        .getByRole("button", { name: "Sign in", exact: true }),
+      signIn.getByRole("button", { name: "Sign in", exact: true }),
     ).toBeInViewport();
     await page.screenshot({
       path: testInfo.outputPath(`sign-in-${width}.png`),
@@ -837,10 +812,7 @@ test("browser recovers a lost password-creation response through normal sign-in"
   await recovery
     .getByLabel("Password", { exact: true })
     .fill("saved-before-network-failed");
-  await recovery
-    .getByRole("form", { name: /^Sign in/ })
-    .getByRole("button", { name: "Sign in", exact: true })
-    .click();
+  await recovery.getByRole("button", { name: "Sign in", exact: true }).click();
   await expect(recovery).toHaveCount(0);
   expect(
     calls.filter((call) => call.path === "/api/access/accept"),
@@ -981,7 +953,7 @@ test("browser removes verified revoked panel while connections is open and retai
   ).toBeVisible();
   await expect(
     dialog.getByRole("button", {
-      name: `Sign in to ${new URL(home).host}`,
+      name: "Sign in to 127.0.0.1:3111",
       exact: true,
     }),
   ).toHaveCount(0);
@@ -996,10 +968,9 @@ test("browser removes verified revoked panel while connections is open and retai
   ).toBeVisible();
 });
 
-test("a signed-out panel remains visible without cached server controls", async ({
+test("a signed-out panel stays in Manage Connections and disappears from the welcome page and selector", async ({
   page,
-}, testInfo) => {
-  await page.setViewportSize({ width: 390, height: 844 });
+}) => {
   await fixture(page);
   await page.goto("/");
   await signIn(page, origins[0]);
@@ -1020,19 +991,11 @@ test("a signed-out panel remains visible without cached server controls", async 
     .getByRole("button", { name: "Close panel connections", exact: true })
     .click();
   await expect(
-    page.getByRole("heading", { name: "a.example.test", exact: true }),
-  ).toBeVisible();
-  await expect(
-    page
-      .getByRole("navigation", { name: "Saved computers", exact: true })
-      .getByRole("button", { name: "Sign in to a.example.test", exact: true }),
-  ).toBeVisible();
-  await expect(
-    page.getByRole("button", {
-      name: "Select server Shared world on a.example.test",
-      exact: true,
-    }),
+    page.getByRole("list", { name: "Servers on a.example.test", exact: true }),
   ).toHaveCount(0);
+  await expect(page.getByText("a.example.test", { exact: true })).toHaveCount(
+    0,
+  );
   await expect(
     page.getByRole("button", {
       name: "Account menu for Not signed in",
@@ -1041,23 +1004,11 @@ test("a signed-out panel remains visible without cached server controls", async 
   ).toBeVisible();
   await page.reload();
   await expect(
-    page.getByRole("heading", { name: "a.example.test", exact: true }),
-  ).toBeVisible();
-  expect(
-    await page.evaluate(
-      () => document.documentElement.scrollWidth <= window.innerWidth,
-    ),
-  ).toBe(true);
-  await page.screenshot({
-    path: testInfo.outputPath("signed-out-welcome.png"),
-    fullPage: true,
-  });
-  await expect(
-    page.getByRole("button", {
-      name: "Select server Shared world on a.example.test",
-      exact: true,
-    }),
+    page.getByRole("list", { name: "Servers on a.example.test", exact: true }),
   ).toHaveCount(0);
+  await expect(page.getByText("a.example.test", { exact: true })).toHaveCount(
+    0,
+  );
   const restored = await manage(page);
   await restored
     .getByRole("button", { name: "Sign in to a.example.test", exact: true })
@@ -1112,7 +1063,7 @@ test("browser creation and import use only the host that granted creation access
       name: "Import an existing server",
       exact: true,
     }),
-  ).toContainText("Computer: c.example.test");
+  ).toContainText("Server PC: c.example.test");
   expect(
     calls.some(
       (call) => call.path === "/api/server-setup" && call.origin === home,

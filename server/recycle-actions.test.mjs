@@ -172,13 +172,13 @@ test("restore progress survives disconnect and its settled replay never overwrit
   const entered = deferred(),
     release = deferred();
   f.releases.push(release.resolve);
-  const rename = fs.rename;
-  t.mock.method(fs, "rename", async (...args) => {
+  const copyFile = fs.copyFile;
+  t.mock.method(fs, "copyFile", async (...args) => {
     if (args[0] === payload) {
       entered.resolve();
       await release.promise;
     }
-    return rename(...args);
+    return copyFile(...args);
   });
   const abort = new AbortController();
   const route = `/api/files/recycle-bin/${item.id}/restore`;

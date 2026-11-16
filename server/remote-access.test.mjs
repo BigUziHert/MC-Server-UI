@@ -5,8 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import http from "node:http";
 import { createFleet } from "./index.mjs";
-import { createRemoteGateway, requiredPermissions } from "./remote-access.mjs";
-import { managedProxyToken } from "./managed-https.mjs";
+import { requiredPermissions } from "./remote-access.mjs";
 import { createAccessService } from "./access.mjs";
 import { processStartup } from "../tests/fixtures/process-options.mjs";
 
@@ -238,30 +237,163 @@ test("backup storage selection requires its explicit grant even with all existin
     );
 });
 
-test("explicit backup location access browses host folders and moves only the selected server's archives — now reserved for the computer owner", async (t) => {
-  const { invite } = await fixture(t);
-  const { asUser } = await invite(["backup.read", "backup.location"]);
-  for (const route of [
-    "/api/backups/location",
-    "/api/backups/location/directories",
+test("explicit backup location access browses host folders and moves only the selected server's archives", async (t) => {
+  const { local, invite, root, id, fleet } = await fixture(t, {
+    nestedData: true,
+  });
+  const first = await invite(["backup.read"]);
+  const created = await local(
+    "/api/servers",
+    json("POST", { name: "Archive location target", port: 25566 }),
+  );
+  assert.equal(created.status, 201, JSON.stringify(created.body));
+  const secondId = created.body.server.id;
+  const second = await invite(
+    ["backup.read", "backup.location"],
+    "sister@example.test",
+    secondId,
+    "Another-test-password!",
+    first.cookie,
+  );
+  const scoped = (options = {}) => ({
+    ...options,
+    headers: { "X-Server-Id": secondId, ...options.headers },
+  });
+  const firstLocation = (await local("/api/backups/location")).body;
+  const secondLocation = (
+    await second.asUser("/api/backups/location", scoped())
+  ).body;
+  assert.equal(secondLocation.canChange, true);
+  assert.notEqual(secondLocation.directory, firstLocation.directory);
+  const firstBackup = await local(
+    "/api/backups",
+    json("POST", { name: "First server archive" }),
+  );
+  const secondBackup = await local(
+    "/api/backups",
+    scoped(json("POST", { name: "Second server archive" })),
+  );
+  assert.equal(firstBackup.status, 201, JSON.stringify(firstBackup.body));
+  assert.equal(secondBackup.status, 201, JSON.stringify(secondBackup.body));
+  const archive = `${secondBackup.body.id}.tar.gz`;
+  const original = await fs.readFile(
+    path.join(secondLocation.directory, archive),
+  );
+  const directory = await fs.realpath(root);
+  const listed = await second.asUser(
+    `/api/backups/location/directories?${new URLSearchParams({ directory })}`,
+    scoped(),
+  );
+  assert.equal(listed.status, 200, JSON.stringify(listed.body));
+  assert.equal(listed.body.directory, directory);
+  assert.ok(listed.body.folders.some((folder) => folder.name === "panel"));
+  assert.equal(
+    (await second.asUser("/api/server-setup/directories", scoped())).status,
+    403,
+    "Backup storage access does not grant server provisioning.",
+  );
+  for (const target of [
+    firstLocation.directory,
+    fleet.runtimes.get(id).serverDir,
+    path.join(root, "panel", "not-for-backups"),
   ]) {
-    const response = await asUser(route);
-    assert.equal(response.status, 403);
-    assert.match(response.body.error, /computer owner/);
+    const denied = await second.asUser(
+      "/api/backups/location/preview",
+      scoped(json("POST", { directory: target })),
+    );
+    assert.equal(denied.status, 409, JSON.stringify(denied.body));
   }
+  const destination = path.join(directory, "second-server-archives");
+  const preview = await second.asUser(
+    "/api/backups/location/preview",
+    scoped(json("POST", { directory: destination })),
+  );
+  assert.equal(preview.status, 200, JSON.stringify(preview.body));
+  assert.equal(preview.body.backupCount, 1);
+  const move = json("POST", { ...preview.body, confirm: true });
+  for (const [route, options] of [
+    ["/api/backups/location", {}],
+    ["/api/backups/location/directories", {}],
+    ["/api/backups/location/preview", json("POST", { directory: destination })],
+    ["/api/backups/location/jobs", move],
+  ]) {
+    const denied = await second.asUser(route, {
+      ...options,
+      headers: { "X-Server-Id": id },
+    });
+    assert.equal(denied.status, 403, route);
+  }
+  const accepted = await second.asUser(
+    "/api/backups/location/jobs",
+    scoped(move),
+  );
+  assert.equal(accepted.status, 202, JSON.stringify(accepted.body));
+  let status;
+  for (let attempt = 0; attempt < 300; attempt++) {
+    status = await second.asUser("/api/backups/location", scoped());
+    assert.equal(status.status, 200, JSON.stringify(status.body));
+    if (status.body.job?.status !== "running") break;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  assert.equal(status.body.job.status, "completed", status.body.job.error);
+  assert.equal(status.body.directory, destination);
+  assert.deepEqual(
+    await fs.readFile(path.join(destination, archive)),
+    original,
+  );
+  await assert.rejects(fs.stat(path.join(secondLocation.directory, archive)), {
+    code: "ENOENT",
+  });
+  assert.equal(
+    (await local("/api/backups/location")).body.directory,
+    firstLocation.directory,
+  );
+  assert.ok(
+    (
+      await fs.stat(
+        path.join(firstLocation.directory, `${firstBackup.body.id}.tar.gz`),
+      )
+    ).isFile(),
+  );
+  assert.equal(
+    (await second.asUser("/api/backups", scoped())).body.backups[0].id,
+    secondBackup.body.id,
+  );
 });
 
-test("revoking backup location access blocks an already reviewed move and all further folder access — now reserved for the computer owner", async (t) => {
-  const { invite } = await fixture(t);
-  const { asUser } = await invite(["backup.read", "backup.location"]);
-  for (const route of [
-    "/api/backups/location",
-    "/api/backups/location/directories",
-  ]) {
-    const response = await asUser(route);
-    assert.equal(response.status, 403);
-    assert.match(response.body.error, /computer owner/);
-  }
+test("revoking backup location access blocks an already reviewed move and all further folder access", async (t) => {
+  const { local, invite, root } = await fixture(t, { nestedData: true });
+  const permissions = ["server.view", "backup.read", "backup.location"];
+  const { asUser, user } = await invite(permissions);
+  const directory = path.join(await fs.realpath(root), "revoked-archives");
+  const preview = await asUser(
+    "/api/backups/location/preview",
+    json("POST", { directory }),
+  );
+  assert.equal(preview.status, 200, JSON.stringify(preview.body));
+  const original = (await local("/api/backups/location")).body.directory;
+  assert.equal(
+    (
+      await local(
+        `/api/subusers/${user.id}`,
+        json("PATCH", { permissions: ["server.view", "backup.read"] }),
+      )
+    ).status,
+    200,
+  );
+  for (const [route, options] of [
+    ["/api/backups/location", {}],
+    ["/api/backups/location/directories", {}],
+    ["/api/backups/location/preview", json("POST", { directory })],
+    [
+      "/api/backups/location/jobs",
+      json("POST", { ...preview.body, confirm: true }),
+    ],
+  ])
+    assert.equal((await asUser(route, options)).status, 403, route);
+  assert.equal((await asUser("/api/backups")).status, 200);
+  assert.equal((await local("/api/backups/location")).body.directory, original);
+  await assert.rejects(fs.stat(directory), { code: "ENOENT" });
 });
 
 test("remote user managers cannot grant themselves or other users backup location access they do not hold", async (t) => {
@@ -1007,27 +1139,14 @@ test("remote file creation and download use distinct permissions and logout inva
 });
 
 test("remote route permissions fail closed for unassigned routes and distinguish destructive storage actions", () => {
-  assert.deepEqual(
-    requiredPermissions({
-      method: "PATCH",
-      path: "/api/launchpad/update-policy",
-      body: { updateChannel: "alpha" },
-    }),
-    ["server.update"],
-  );
   const routes = [
     ["GET", "/api/files/recycle-operation", ["file.read"]],
     ["HEAD", "/api/files/recycle-operation", ["file.read"]],
-    ["GET", "/api/files/recycle-bin/operation", []],
-    ["HEAD", "/api/files/recycle-bin/operation", []],
+    ["GET", "/api/files/recycle-bin/operation", ["file.read", "backup.read"]],
+    ["HEAD", "/api/files/recycle-bin/operation", ["file.read", "backup.read"]],
     ["GET", "/api/server/settings", ["server.update"]],
     ["HEAD", "/api/server/settings", ["server.update"]],
     ["PATCH", "/api/server/settings", ["server.update"]],
-    ...["POST", "PUT", "DELETE"].map((method) => [
-      method,
-      "/api/server/icon",
-      ["server.update"],
-    ]),
     ["POST", "/api/files/copy", ["file.create"]],
     ["GET", "/api/files/copy-operation", ["file.create"]],
     ["HEAD", "/api/files/copy-operation", ["file.create"]],
@@ -1036,25 +1155,12 @@ test("remote route permissions fail closed for unassigned routes and distinguish
     ["PUT", "/api/backups/schedule", ["backup.update"]],
     ["GET", "/api/backups/id/download", ["backup.download"]],
     ["DELETE", "/api/backups/id", ["backup.delete"]],
-    ["GET", "/api/players", ["players.read"]],
+    ["GET", "/api/players", []],
     ["POST", "/api/players/ban", ["control.console"]],
-    ["POST", "/api/players/whitelist/state", ["players.whitelist"]],
+    ["POST", "/api/players/whitelist/state", ["control.console"]],
     ["GET", "/api/versions", ["file.read"]],
     ["GET", "/api/versions/jobs/job-id", ["file.read"]],
     ["GET", "/api/launchpad/installed", ["file.read"]],
-    ["GET", "/api/launchpad/history", ["file.read"]],
-    ["GET", "/api/launchpad/dependencies", ["file.read"]],
-    [
-      "PATCH",
-      "/api/launchpad/update-policy",
-      [
-        "file.create",
-        "file.update",
-        "file.delete",
-        "control.start",
-        "control.stop",
-      ],
-    ],
     ["GET", "/api/launchpad/jobs/job-id", ["file.read"]],
     ["GET", "/api/minecraft/properties/file", ["file.read-content"]],
     ["POST", "/api/minecraft/properties/save", ["file.update"]],
@@ -1064,7 +1170,6 @@ test("remote route permissions fail closed for unassigned routes and distinguish
       "/api/launchpad/preview",
       "/api/launchpad/remove",
       "/api/launchpad/active",
-      "/api/launchpad/jobs/job-id/undo",
     ].map((path) => [
       "POST",
       path,
@@ -1076,8 +1181,12 @@ test("remote route permissions fail closed for unassigned routes and distinguish
         "control.stop",
       ],
     ]),
-    ["POST", "/api/files/recycle-bin/id/restore", []],
-    ["DELETE", "/api/files/recycle-bin/id", []],
+    [
+      "POST",
+      "/api/files/recycle-bin/id/restore",
+      ["file.create", "backup.create"],
+    ],
+    ["DELETE", "/api/files/recycle-bin/id", ["file.delete", "backup.delete"]],
   ];
   for (const [method, path, expected] of routes)
     assert.deepEqual(
@@ -1088,6 +1197,7 @@ test("remote route permissions fail closed for unassigned routes and distinguish
     "/api/servers",
     "/api/server-import",
     "/api/launchpad/settings",
+    "/api/server/icon",
     "/api/future-feature",
   ])
     assert.throws(
@@ -1112,7 +1222,7 @@ test("the shared panel exposes standard pages within the user's file and console
     201,
   );
   const { asUser } = await invite(["file.read", "file.read-content"]);
-  assert.equal((await asUser("/api/players")).status, 403);
+  assert.equal((await asUser("/api/players")).status, 200);
   assert.equal((await asUser("/api/versions")).status, 200);
   const properties = await asUser("/api/minecraft/properties");
   assert.equal(properties.status, 200);
@@ -1421,7 +1531,7 @@ test("remote recycle failure progress never exposes host paths or records invali
   );
 });
 
-test("Recycle Bin action progress uses item-kind read grants and remains isolated to the selected membership", async (t) => {
+test("Recycle Bin action progress requires both read grants and remains isolated to the selected membership", async (t) => {
   const { local, invite, id, fleet } = await fixture(t);
   const route = "/api/files/recycle-bin/operation";
   for (const [index, permissions] of [
@@ -1434,10 +1544,7 @@ test("Recycle Bin action progress uses item-kind read grants and remains isolate
       permissions,
       `bin-reader-${index}@example.test`,
     );
-    assert.equal(
-      (await asUser(route)).status,
-      permissions.some((id) => id.endsWith(".read")) ? 200 : 403,
-    );
+    assert.equal((await asUser(route)).status, 403);
   }
   const reader = await invite(
     ["file.read", "backup.read"],
@@ -1496,136 +1603,7 @@ test("Recycle Bin action progress uses item-kind read grants and remains isolate
   );
   assert.equal(
     (await reader.asUser(`${route}?requestId=${requestId}`)).status,
-    200,
-  );
-  await local(
-    `/api/subusers/${reader.user.id}`,
-    json("PATCH", { permissions: ["server.view", "backup.read"] }),
-  );
-  assert.equal(
-    (await reader.asUser(`${route}?requestId=${requestId}`)).body.operation,
-    null,
-  );
-});
-
-test("Recycle Bin separates file and backup listing, restoration, deletion, and request replay", async (t) => {
-  const { local, invite, id, fleet } = await fixture(t);
-  const files = await invite(
-    ["file.read", "file.create", "file.delete"],
-    "file-recovery@example.test",
-  );
-  const backups = await invite(
-    ["backup.read", "backup.create", "backup.delete"],
-    "backup-recovery@example.test",
-  );
-  await fs.writeFile(
-    path.join(fleet.runtimes.get(id).serverDir, "recover.txt"),
-    "retained file",
-  );
-  const backup = await local(
-    "/api/backups",
-    json("POST", { name: "Saved world" }),
-  );
-  assert.equal(backup.status, 201, JSON.stringify(backup.body));
-  const recycledBackup = await local(
-    `/api/backups/${backup.body.id}`,
-    json("DELETE"),
-  );
-  const recycledFile = await local(
-    "/api/files?path=recover.txt",
-    json("DELETE"),
-  );
-  const fileId = recycledFile.body.recycled.id;
-  const backupId = recycledBackup.body.recycled.id;
-  const route = (itemId) => `/api/files/recycle-bin/${itemId}`;
-  assert.deepEqual(
-    (await files.asUser("/api/files/recycle-bin")).body.items.map(
-      (item) => item.id,
-    ),
-    [fileId],
-  );
-  assert.deepEqual(
-    (await backups.asUser("/api/files/recycle-bin")).body.items.map(
-      (item) => item.id,
-    ),
-    [backupId],
-  );
-  for (const [actor, forbidden] of [
-    [files, backupId],
-    [backups, fileId],
-  ]) {
-    assert.equal(
-      (await actor.asUser(`${route(forbidden)}/restore-preview`)).status,
-      404,
-    );
-    assert.equal(
-      (await actor.asUser(`${route(forbidden)}/restore`, json("POST"))).status,
-      404,
-    );
-    assert.equal(
-      (await actor.asUser(route(forbidden), json("DELETE"))).status,
-      404,
-    );
-  }
-  assert.equal(
-    (await files.asUser(`${route(fileId)}/restore-preview`)).status,
-    200,
-  );
-  assert.equal(
-    (
-      await files.asUser(
-        `${route(fileId)}/restore`,
-        json("POST", { replaceExisting: true }),
-      )
-    ).status,
     403,
-  );
-  const requestId = "aabbccdd-1111-2222-3333-444444444444";
-  assert.equal(
-    (
-      await files.asUser(
-        `${route(fileId)}/restore`,
-        json("POST", { requestId }),
-      )
-    ).status,
-    200,
-  );
-  assert.equal(
-    await fs.readFile(
-      path.join(fleet.runtimes.get(id).serverDir, "recover.txt"),
-      "utf8",
-    ),
-    "retained file",
-  );
-  assert.equal(
-    (
-      await backups.asUser(
-        `${route(fileId)}/restore`,
-        json("POST", { requestId }),
-      )
-    ).status,
-    404,
-  );
-  assert.equal(
-    (
-      await backups.asUser(
-        `/api/files/recycle-bin/operation?requestId=${requestId}`,
-      )
-    ).body.operation,
-    null,
-  );
-  assert.equal(
-    (await backups.asUser(`${route(backupId)}/restore`, json("POST"))).status,
-    200,
-  );
-  const movedAgain = await local(
-    `/api/backups/${backup.body.id}`,
-    json("DELETE"),
-  );
-  assert.equal(
-    (await backups.asUser(route(movedAgain.body.recycled.id), json("DELETE")))
-      .status,
-    200,
   );
 });
 
@@ -2006,18 +1984,9 @@ test("remote Launchpad removals persist the subuser actor", async (t) => {
   const { fleet, id, invite } = await fixture(t);
   const runtime = fleet.runtimes.get(id);
   await fs.mkdir(path.join(runtime.serverDir, "plugins"));
-  const { ZipFile } = await import("yazl");
-  const plugin = new ZipFile();
-  plugin.addBuffer(
-    Buffer.from("name: UnmanagedFixture\nversion: '1.0'\nmain: test.Fixture\n"),
-    "plugin.yml",
-  );
-  plugin.end();
-  const pluginChunks = [];
-  for await (const chunk of plugin.outputStream) pluginChunks.push(chunk);
   await fs.writeFile(
     path.join(runtime.serverDir, "plugins", "unmanaged.jar"),
-    Buffer.concat(pluginChunks),
+    "fixture plugin",
   );
   const { user, asUser } = await invite([
     "file.create",
@@ -2049,137 +2018,5 @@ test("remote Launchpad removals persist the subuser actor", async (t) => {
   assert.equal(
     saved.audit.find((entry) => entry.action === "Plugin deleted").actor,
     user.email,
-  );
-});
-
-test("managed HTTPS trusts only its private proxy proof and isolates client failure budgets", async (t) => {
-  const app = createRemoteGateway({
-    access: {
-      status: () => ({
-        enabled: true,
-        transport: "managed",
-        publicUrl: "https://panel.example.com",
-      }),
-      login: async () => {
-        throw Object.assign(new Error("Wrong credentials"), { status: 401 });
-      },
-    },
-    runtimes: () => [],
-    distDir: os.tmpdir(),
-  });
-  const server = await new Promise((resolve) => {
-    const value = app.listen(0, "127.0.0.1", () => resolve(value));
-  });
-  t.after(
-    () =>
-      new Promise((resolve) => {
-        server.closeAllConnections();
-        server.close(resolve);
-      }),
-  );
-  const login = async (client, proof) => {
-    return new Promise((resolve, reject) => {
-      const request = http.request(
-        {
-          hostname: "127.0.0.1",
-          port: server.address().port,
-          path: "/api/access/login",
-          method: "POST",
-          headers: {
-            Host: "panel.example.com",
-            Origin: "https://panel.example.com",
-            "Content-Type": "application/json",
-            "X-MC-Client-IP": client,
-            "X-MC-Proxy": proof,
-          },
-        },
-        (response) => {
-          response.resume();
-          response.on("end", () => resolve(response.statusCode));
-        },
-      );
-      request.on("error", reject);
-      request.end(
-        JSON.stringify({
-          email: "friend@example.test",
-          password: "Incorrect password!",
-        }),
-      );
-    });
-  };
-  for (let i = 0; i < 8; i++)
-    assert.equal(await login("192.0.2.1", managedProxyToken), 401);
-  assert.equal(await login("192.0.2.1", managedProxyToken), 429);
-  assert.equal(await login("192.0.2.2", managedProxyToken), 401);
-  for (let i = 0; i < 8; i++)
-    assert.equal(await login(`192.0.2.${i + 10}`, "spoofed"), 401);
-  assert.equal(await login("192.0.2.99", "spoofed"), 429);
-});
-
-test("wrong proxy passwords cannot lock out a known email using its correct password", async (t) => {
-  const f = await fixture(t);
-  await f.invite([]);
-  for (let i = 0; i < 9; i++)
-    await f.guest(
-      "/api/access/login",
-      json("POST", {
-        email: "sister@example.test",
-        password: "Wrong-test-password!",
-      }),
-    );
-  assert.equal(
-    (
-      await f.guest(
-        "/api/access/login",
-        json("POST", {
-          email: "sister@example.test",
-          password: "Correct-test-password!",
-        }),
-      )
-    ).status,
-    200,
-  );
-});
-
-test("update channel preference requires server settings permission rather than content editor grants", async (t) => {
-  const { local, invite } = await fixture(t);
-  const editor = await invite([
-    "file.read",
-    "file.create",
-    "file.update",
-    "file.delete",
-    "control.start",
-    "control.stop",
-  ]);
-  assert.equal(
-    (
-      await editor.asUser(
-        "/api/launchpad/update-policy",
-        json("PATCH", { updateChannel: "alpha" }),
-      )
-    ).status,
-    403,
-  );
-  const manager = await invite(
-    ["file.read", "server.update"],
-    "manager@example.test",
-  );
-  assert.equal(
-    (
-      await manager.asUser(
-        "/api/launchpad/update-policy",
-        json("PATCH", { updateChannel: "beta" }),
-      )
-    ).status,
-    200,
-  );
-  assert.equal(
-    (
-      await local(
-        "/api/launchpad/update-policy",
-        json("PATCH", { updateChannel: "installed" }),
-      )
-    ).status,
-    200,
   );
 });

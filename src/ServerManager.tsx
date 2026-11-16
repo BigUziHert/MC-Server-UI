@@ -11,7 +11,6 @@ import {
 } from "lucide-react";
 import { PanelScope, ServerScope, useServerApi } from "./api";
 import AddServer from "./AddServer";
-import RecoverServerDialog from "./RecoverServerDialog";
 import { CachedServerIconImage, ServerIconImage } from "./ServerIcon";
 import { useDesktopConnections } from "./desktop-connections";
 import {
@@ -28,7 +27,6 @@ import { DesktopWorkspaceContext } from "./workspace-target";
 export type ServerRecord = {
   id: string;
   settingsRevision?: string;
-  restartOnCrash?: boolean;
   accessPermissions?: string[];
   name: string;
   status: "running" | "offline" | "starting" | "stopping";
@@ -75,18 +73,18 @@ function UnifiedServerSwitcher({
   const workspace = useContext(DesktopWorkspaceContext)!;
   const { connections, localServers } = workspace;
   const groups = (connections?.panels ?? [])
-    .filter((panel) => !panel.temporary)
+    .filter(
+      (panel) =>
+        !panel.temporary &&
+        (panel.local || (panel.signedIn === true && !panel.pendingLeave)),
+    )
     .map((panel) =>
       panel.local ? { ...panel, servers: localServers } : panel,
     );
   return (
     <div className="fleet-switcher" aria-label="All computers">
       {groups.map((panel) => {
-        const available =
-          panel.local ||
-          (panel.signedIn === true &&
-            !panel.pendingLeave &&
-            panel.connectionState === "connected");
+        const available = panel.local || panel.connectionState === "connected";
         const entries =
           panel.local || panel.signedIn === true ? (panel.servers ?? []) : [];
         return (
@@ -178,35 +176,12 @@ function UnifiedServerSwitcher({
                 );
               })}
             </ul>
-            {!panel.local && (!panel.signedIn || panel.pendingLeave) ? (
-              <div className="fleet-server-group-note">
-                <p>
-                  {panel.pendingLeave
-                    ? "Account removal needs confirmation."
-                    : "Signed out."}
-                </p>
-                <button
-                  className="btn"
-                  type="button"
-                  onClick={() =>
-                    panel.pendingLeave
-                      ? workspace.manageConnections()
-                      : workspace.signIn(panel.origin)
-                  }
-                >
-                  {panel.pendingLeave
-                    ? "Manage connection"
-                    : `Sign in to ${panel.label}`}
-                </button>
-              </div>
-            ) : (
-              !available && (
-                <p className="fleet-server-group-note">
-                  {panel.connectionState === "connecting"
-                    ? "Reconnecting…"
-                    : "Computer unavailable. Reconnect in Manage Connections."}
-                </p>
-              )
+            {!available && (
+              <p className="fleet-server-group-note">
+                {panel.connectionState === "connecting"
+                  ? "Reconnecting…"
+                  : "Computer unavailable. Reconnect in Manage Connections."}
+              </p>
             )}
             {available && !entries.length && (
               <p className="fleet-server-group-note">
@@ -223,7 +198,7 @@ function UnifiedServerSwitcher({
       {(onAdd || onSettings) && (
         <div className="fleet-actions">
           {onAdd && (
-            <button className="nav-item" onClick={() => onAdd()}>
+            <button className="nav-item" onClick={onAdd}>
               <Plus size={19} />
               Add server
             </button>
@@ -559,7 +534,7 @@ function PanelServerSwitcher({
       {(onAdd || onSettings) && (
         <div className="fleet-actions">
           {onAdd && (
-            <button className="nav-item" onClick={() => onAdd()}>
+            <button className="nav-item" onClick={onAdd}>
               <Plus size={19} />
               Add server
             </button>
@@ -584,26 +559,14 @@ function PanelServerSwitcher({
 type ServerManagerProps = {
   editing: ServerRecord | null;
   remoteHost?: string;
-  remoteUnavailable?: boolean;
-  onReconnect?: () => void;
-  onChangeHost?: () => void;
   initialStep?: "choice" | "create" | "import";
   servers: ServerRecord[];
   onClose: () => void;
-  onSaved: (server: ServerRecord, outcome?: { incomplete?: boolean }) => void;
+  onSaved: (server: ServerRecord) => void;
   onRemoved: (serverId: string) => void;
 };
 
 export default function ServerManager(props: ServerManagerProps) {
-  const [recovering, setRecovering] = useState(false);
-  if (recovering && !props.remoteHost)
-    return (
-      <RecoverServerDialog
-        onBack={() => setRecovering(false)}
-        onClose={props.onClose}
-        onSaved={props.onSaved}
-      />
-    );
   return props.editing ? (
     <ServerScope.Provider value={props.editing.id}>
       {props.remoteHost ? (
@@ -615,10 +578,6 @@ export default function ServerManager(props: ServerManagerProps) {
   ) : (
     <AddServer
       remoteHost={props.remoteHost}
-      remoteUnavailable={props.remoteUnavailable}
-      onReconnect={props.onReconnect}
-      onChangeHost={props.onChangeHost}
-      onRecover={props.remoteHost ? undefined : () => setRecovering(true)}
       initialStep={props.initialStep}
       servers={props.servers}
       onClose={props.onClose}
@@ -705,22 +664,12 @@ function ServerSettings({
   const remote = Boolean(remoteHost);
   const { api: scopedApi } = useServerApi();
   const [baseline, setBaseline] = useState(editing);
-  const [liveStatus, setLiveStatus] = useState(editing.status);
   const [name, setName] = useState(editing.name);
   const [connectionHost, setConnectionHost] = useState(
     editing.connectionHost ?? "",
   );
   const [port, setPort] = useState(String(editing.port));
   const [memory, setMemory] = useState(String(editing.memoryLimitMB));
-  const [manualSoftware, setManualSoftware] = useState(
-    editing.software || "Java",
-  );
-  const [manualMinecraft, setManualMinecraft] = useState(
-    editing.minecraftVersion || "",
-  );
-  const [restartOnCrash, setRestartOnCrash] = useState(
-    Boolean(editing.restartOnCrash),
-  );
   const [startup, setStartup] = useState(() => startupDraft(editing));
   const [motd, setMotd] = useState(
     editing.motd ?? "Welcome to our Minecraft server",
@@ -733,32 +682,7 @@ function ServerSettings({
   const removalCancel = useRef<HTMLButtonElement>(null);
   const errorMessage = useRef<HTMLDivElement>(null);
   const mounted = useRef(false);
-  const running = liveStatus !== "offline";
-  useEffect(() => {
-    let active = true,
-      pending = false;
-    const poll = async () => {
-      if (pending || document.visibilityState === "hidden") return;
-      pending = true;
-      try {
-        const server = await scopedApi<{ status: ServerRecord["status"] }>(
-          "/server",
-          { signal: AbortSignal.timeout(10_000) },
-        );
-        if (active) setLiveStatus(server.status);
-      } catch {
-        /* Keep the last verified status; writes remain host-validated. */
-      } finally {
-        pending = false;
-      }
-    };
-    void poll();
-    const timer = setInterval(poll, 3000);
-    return () => {
-      active = false;
-      clearInterval(timer);
-    };
-  }, [scopedApi]);
+  const running = baseline.status !== "offline";
   useEffect(() => {
     mounted.current = true;
     const element = dialog.current;
@@ -788,15 +712,8 @@ function ServerSettings({
       ...(startup.launchType === "jar"
         ? { memoryLimitMB: Number(memory) }
         : {}),
-      ...(!remote
-        ? {
-            ...startupPayload(startup),
-            software: manualSoftware,
-            minecraftVersion: manualMinecraft.trim() || null,
-          }
-        : {}),
+      ...(!remote ? startupPayload(startup) : {}),
       motd,
-      restartOnCrash,
     };
     const original = {
       name: baseline.name,
@@ -805,10 +722,7 @@ function ServerSettings({
       port: baseline.port,
       memoryLimitMB: baseline.memoryLimitMB,
       ...startupPayload(startupDraft(baseline)),
-      software: baseline.software || "Java",
-      minecraftVersion: baseline.minecraftVersion || null,
       motd: baseline.motd ?? "Welcome to our Minecraft server",
-      restartOnCrash: Boolean(baseline.restartOnCrash),
     };
     const changes = Object.fromEntries(
       Object.entries(settings).filter(
@@ -859,9 +773,6 @@ function ServerSettings({
       setConnectionHost(latest.connectionHost ?? "");
       setPort(String(latest.port));
       setMemory(String(latest.memoryLimitMB));
-      setManualSoftware(latest.software || "Java");
-      setManualMinecraft(latest.minecraftVersion || "");
-      setRestartOnCrash(Boolean(latest.restartOnCrash));
       setStartup(startupDraft(latest));
       setMotd(latest.motd ?? "Welcome to our Minecraft server");
       setConflict(false);
@@ -982,17 +893,6 @@ function ServerSettings({
               You can rename this server or change its displayed address now.
               Stop it from the console to change its port or in-game message.
             </span>
-            <button
-              type="button"
-              className="btn"
-              disabled={busy}
-              onClick={() => {
-                onClose();
-                window.location.hash = "console";
-              }}
-            >
-              Open Console
-            </button>
           </div>
         )}
         <fieldset disabled={busy || running} className="server-config-fields">
@@ -1031,18 +931,16 @@ function ServerSettings({
           )}
           {startup.launchType === "jar" && (
             <div className="form-field">
-              <label htmlFor="server-memory">Memory (GB)</label>
+              <label htmlFor="server-memory">Memory (MB)</label>
               <input
                 id="server-memory"
                 type="number"
-                min={0.25}
-                max={256}
-                step="any"
+                min={256}
+                max={262144}
+                step={1}
                 required
-                value={Number(memory) / 1024}
-                onChange={(e) =>
-                  setMemory(String(Number(e.target.value) * 1024))
-                }
+                value={memory}
+                onChange={(e) => setMemory(e.target.value)}
               />
             </div>
           )}
@@ -1055,69 +953,6 @@ function ServerSettings({
             />
           )}
         </fieldset>
-        {!remote && (
-          <details className="setup-advanced">
-            <summary>Runtime detection fallback</summary>
-            <p>
-              Use the server logs or launch files to identify imported software
-              when automatic detection is unavailable. Detected launcher
-              metadata takes precedence. These fields do not install or change
-              Minecraft.
-            </p>
-            <fieldset disabled={busy || running}>
-              <label className="form-field">
-                Server software
-                <select
-                  aria-label="Fallback server software"
-                  value={manualSoftware}
-                  onChange={(event) => setManualSoftware(event.target.value)}
-                >
-                  {[
-                    ...new Set([
-                      manualSoftware,
-                      "Java",
-                      "Vanilla",
-                      "Paper",
-                      "Purpur",
-                      "Folia",
-                      "Velocity",
-                      "Fabric",
-                      "Quilt",
-                      "Forge",
-                      "NeoForge",
-                      "Spigot",
-                      "Bukkit",
-                    ]),
-                  ].map((value) => (
-                    <option key={value}>{value}</option>
-                  ))}
-                </select>
-              </label>
-              <label className="form-field">
-                Minecraft version
-                <input
-                  aria-label="Fallback Minecraft version"
-                  value={manualMinecraft}
-                  onChange={(event) => setManualMinecraft(event.target.value)}
-                  placeholder="For example 1.20.1; blank clears the fallback"
-                />
-              </label>
-            </fieldset>
-          </details>
-        )}
-        <label className="checkbox-field">
-          <input
-            type="checkbox"
-            checked={restartOnCrash}
-            disabled={busy || running}
-            onChange={(event) => setRestartOnCrash(event.target.checked)}
-          />
-          <span>
-            Restart automatically after an unexpected crash. Retries after 10
-            seconds, 1 minute, and 5 minutes; stops after three attempts.
-            Startup failures and manual stops are not retried.
-          </span>
-        </label>
         <div className="server-setup-note">
           <Box size={17} />
           <p>
@@ -1169,9 +1004,7 @@ function ServerSettings({
                   <strong>{editing.name}</strong> will disappear from your
                   server list, and its scheduled backups will stop. Its
                   Minecraft server files, worlds, backups, and Recycle Bin data
-                  will stay on your computer. Shared access becomes unavailable.
-                  If you recover this server, you must explicitly select which
-                  people regain access.{" "}
+                  will stay on your computer.{" "}
                   {editing.source === "imported"
                     ? "You can import the server folder again later."
                     : "Keep the saved files if you want to use this world again."}

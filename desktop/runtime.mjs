@@ -1,5 +1,4 @@
 import http from "node:http";
-import { startSelectedServers } from "./automatic-start.mjs";
 import { randomBytes, timingSafeEqual } from "node:crypto";
 import path from "node:path";
 import { createFleet } from "../server/index.mjs";
@@ -46,8 +45,6 @@ export async function startDesktopRuntime({
   openRemotePanel,
   proxyRemotePanel,
   loginItem,
-  onUnexpectedExit,
-  autoStartOptions = {},
 } = {}) {
   if (typeof dataDir !== "string" || !path.isAbsolute(dataDir))
     throw new Error(
@@ -63,7 +60,6 @@ export async function startDesktopRuntime({
     spawnServer,
     backupFlushTimeoutMs,
     selectServerDirectory,
-    onUnexpectedExit,
   });
   const selection = createDesktopSelection({
     dataDir: fleet.dataDir,
@@ -72,8 +68,10 @@ export async function startDesktopRuntime({
   const preferences = createDesktopPreferences({ dataDir: fleet.dataDir });
   const panelSettings = createPanelSettings({
     dataDir: fleet.dataDir,
-    hasServer: (id) => fleet.runtimes.has(id),
-    describeServer: (id) => fleet.runtimes.get(id)?.descriptor(),
+    hasServer: (id) => {
+      const server = fleet.runtimes.get(id);
+      return !!server && !server.descriptor().unavailable;
+    },
     loginItem,
   });
   // A broken settings file must not stop the owner opening the panel to inspect
@@ -82,79 +80,7 @@ export async function startDesktopRuntime({
   let url;
   let host;
   let closing;
-  let closingFailed = false;
   let autoStart;
-  let autoStartPending = false;
-  let lastAutoStart;
-  const autoStartAbort = new AbortController();
-  function startConfiguredServers({
-    skipAutoStart = false,
-    retryFailures = false,
-  } = {}) {
-    if (autoStartPending) return autoStart;
-    if (autoStart && !retryFailures) return autoStart;
-    autoStartPending = true;
-    autoStart = (async () => {
-      if (skipAutoStart || closing)
-        return {
-          skipped: true,
-          startedServerIds: [],
-          failures: [],
-          warnings: [],
-        };
-      try {
-        const settings = await panelSettings.read();
-        const ids =
-          retryFailures && lastAutoStart
-            ? lastAutoStart.failures
-                .map((failure) => failure.serverId)
-                .filter((id) => settings.autoStartServerIds.includes(id))
-            : settings.autoStartServerIds;
-        lastAutoStart = await startSelectedServers({
-          ...autoStartOptions,
-          serverIds: ids,
-          runtimeFor: (id) => fleet.runtimes.get(id),
-          names: settings.autoStartServerNames,
-          signal: autoStartAbort.signal,
-          start: async (serverId) => {
-            const response = await fetch(url + "/api/server/power", {
-              method: "POST",
-              signal: autoStartAbort.signal,
-              headers: {
-                Cookie: DESKTOP_COOKIE_NAME + "=" + token,
-                "Content-Type": "application/json",
-                "X-Server-Id": serverId,
-              },
-              body: JSON.stringify({ action: "start" }),
-            });
-            if (!response.ok) {
-              const body = await response.json().catch(() => ({}));
-              throw Object.assign(
-                new Error(body.error || "The server could not start."),
-                { status: response.status },
-              );
-            }
-          },
-        });
-        panelSettings.setStartupError(
-          [
-            ...lastAutoStart.failures.map((failure) => failure.message),
-            ...lastAutoStart.warnings,
-          ].join("\n"),
-        );
-        return lastAutoStart;
-      } catch (cause) {
-        panelSettings.setStartupError(
-          cause.message ||
-            "Automatic server startup could not read its settings.",
-        );
-        throw cause;
-      }
-    })().finally(() => {
-      autoStartPending = false;
-    });
-    return autoStart;
-  }
   const listener = http.createServer((req, res) => {
     res.setHeader("Cache-Control", "no-store");
     res.setHeader("X-Content-Type-Options", "nosniff");
@@ -201,30 +127,6 @@ export async function startDesktopRuntime({
         });
       return;
     }
-    if (requestPath === "/api/desktop/startup/retry") {
-      if (req.method !== "POST")
-        return reject(405, "Use POST to retry automatic startup.");
-      void startConfiguredServers({ retryFailures: true })
-        .then((result) => {
-          res.writeHead(200, {
-            "Content-Type": "application/json; charset=utf-8",
-          });
-          res.end(
-            JSON.stringify({
-              ...result,
-              startupPending: autoStartPending,
-              startupAttempted: Boolean(autoStart),
-            }),
-          );
-        })
-        .catch((cause) =>
-          reject(
-            cause.status ?? 500,
-            cause.message || "Automatic startup could not be retried.",
-          ),
-        );
-      return;
-    }
     if (requestPath === "/api/desktop/settings") {
       if (!["GET", "PUT"].includes(req.method))
         return reject(405, "Use GET to read or PUT to save panel settings.");
@@ -236,13 +138,7 @@ export async function startDesktopRuntime({
         res.writeHead(200, {
           "Content-Type": "application/json; charset=utf-8",
         });
-        res.end(
-          JSON.stringify({
-            ...result,
-            startupPending: autoStartPending,
-            startupAttempted: Boolean(autoStart),
-          }),
-        );
+        res.end(JSON.stringify(result));
       })().catch((cause) =>
         reject(
           cause.status ?? 500,
@@ -392,7 +288,71 @@ export async function startDesktopRuntime({
     token,
     fleet,
     panelSettings,
-    startConfiguredServers,
+    startConfiguredServers({ skipAutoStart = false } = {}) {
+      // One attempt per fresh runtime, even if a caller asks again while its
+      // first attempt is pending. Tray activation never creates a new runtime.
+      autoStart ??= (async () => {
+        if (skipAutoStart || closing)
+          return { skipped: true, startedServerIds: [], failures: [] };
+        try {
+          const settings = await panelSettings.read();
+          const results = await Promise.all(
+            settings.autoStartServerIds.map(async (serverId) => {
+              const name =
+                fleet.runtimes.get(serverId)?.descriptor().name || serverId;
+              try {
+                if (closing) throw new Error("The desktop panel is closing.");
+                if (settings.missingAutoStartServerIds.includes(serverId))
+                  throw new Error(
+                    "This server is no longer available. Review its selection in Panel Settings.",
+                  );
+                // Use the normal power operation, retaining EULA, path,
+                // installation, process ownership, backup, and audit checks.
+                const response = await fetch(`${url}/api/server/power`, {
+                  method: "POST",
+                  headers: {
+                    Cookie: `${DESKTOP_COOKIE_NAME}=${token}`,
+                    "Content-Type": "application/json",
+                    "X-Server-Id": serverId,
+                  },
+                  body: JSON.stringify({ action: "start" }),
+                });
+                if (!response.ok) {
+                  const body = await response.json().catch(() => ({}));
+                  throw new Error(body.error || "The server could not start.");
+                }
+                return { serverId, started: true };
+              } catch (cause) {
+                return {
+                  serverId,
+                  message: `${name}: ${cause.message || "The server could not start."}`,
+                };
+              }
+            }),
+          );
+          const failures = results
+            .filter((result) => !result.started)
+            .map(({ serverId, message }) => ({ serverId, message }));
+          panelSettings.setStartupError(
+            failures.map((failure) => failure.message).join("\n"),
+          );
+          return {
+            skipped: false,
+            startedServerIds: results
+              .filter((result) => result.started)
+              .map((result) => result.serverId),
+            failures,
+          };
+        } catch (cause) {
+          panelSettings.setStartupError(
+            cause.message ||
+              "Automatic server startup could not read its settings.",
+          );
+          throw cause;
+        }
+      })();
+      return autoStart;
+    },
     listLocalServers() {
       return [...fleet.runtimes.values()].map((server) => {
         const { id, name, status, software, minecraftVersion } =
@@ -434,43 +394,25 @@ export async function startDesktopRuntime({
       }
     },
     close({ gracefulOnly = false } = {}) {
-      if (!closing || closingFailed) {
-        closingFailed = false;
-        autoStartAbort.abort(new Error("The desktop panel is closing."));
+      if (!closing) {
         closing = (async () => {
-          const httpClosed = new Promise((resolve) =>
-            listener.close((cause) =>
-              resolve(cause?.code === "ERR_SERVER_NOT_RUNNING" ? null : cause),
-            ),
+          const httpClosed = new Promise((resolve, reject) =>
+            listener.close((cause) => (cause ? reject(cause) : resolve())),
           );
           // The fleet sends stop to its managed Java processes and waits for their exit.
           // Stop accepting HTTP first, but keep current responses alive during that shutdown.
-          await autoStart?.catch(() => {});
-          const outcomes = await Promise.allSettled([
-            Promise.resolve().then(() => selection.close()),
-            Promise.resolve().then(() => preferences.close()),
-            Promise.resolve().then(() => panelSettings.close()),
-            Promise.resolve().then(() => fleet.close({ gracefulOnly })),
-          ]);
-          const errors = outcomes
-            .filter((result) => result.status === "rejected")
-            .map((result) => result.reason);
           try {
+            await Promise.all([
+              selection.close(),
+              preferences.close(),
+              panelSettings.close(),
+            ]);
+            await fleet.close({ gracefulOnly });
+          } finally {
             listener.closeAllConnections();
-          } catch (cause) {
-            errors.push(cause);
+            await httpClosed;
           }
-          const httpError = await httpClosed;
-          if (httpError) errors.push(httpError);
-          if (errors.length)
-            throw new AggregateError(
-              errors,
-              `Could not finish closing MC Panel: ${errors.map((cause) => cause.message || String(cause)).join("; ")}`,
-            );
-        })().catch((cause) => {
-          closingFailed = true;
-          throw cause;
-        });
+        })();
       }
       return closing;
     },

@@ -74,8 +74,7 @@ export async function readWhitelistSettings(serverDir, safePath) {
     if (!["true", "false"].includes(value))
       throw new Error("Invalid white-list value");
     return { enabled: value === "true", available: true, warning: null };
-  } catch (cause) {
-    if (cause.code === "ENOENT") return { enabled: false, available: true, warning: null };
+  } catch {
     return {
       enabled: null,
       available: false,

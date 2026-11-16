@@ -13,5 +13,4 @@ export const DesktopWorkspaceContext = createContext<{
   select: (panelId: string, serverId: string) => void;
   refresh: () => void;
   manageConnections: () => void;
-  signIn: (origin: string) => void;
 } | null>(null);

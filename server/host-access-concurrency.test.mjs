@@ -195,17 +195,7 @@ test("concurrent login skips unavailable memberships while creation owns the fle
         },
       },
     });
-    await bounded(
-      Promise.race([
-        reached,
-        created.then((result) => {
-          throw new Error(
-            "Creation completed before checkpoint: " + JSON.stringify(result),
-          );
-        }),
-      ]),
-      "Creation checkpoint",
-    );
+    await bounded(reached, "Creation checkpoint");
     const login = await bounded(
       request(true, "/api/access/login", {
         method: "POST",

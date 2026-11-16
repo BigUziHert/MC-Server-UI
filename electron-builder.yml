@@ -7,17 +7,6 @@ directories:
 files:
   - dist/**/*
   - server/index.mjs
-  - server/owned-directories.mjs
-  - server/process-ownership.mjs
-  - server/player-profiles.mjs
-  - server/runtime-snapshot.mjs
-  - server/error-details.mjs
-  - server/server-ports.mjs
-  - server/canonical-volume.mjs
-  - server/catalog-settings.mjs
-  - server/client-pack.mjs
-  - server/launchpad-plugin-metadata.mjs
-  - desktop/automatic-start.mjs
   - server/panel-recovery.mjs
   - server/access.mjs
   - server/remote-access.mjs
@@ -58,7 +47,6 @@ files:
   - server/properties.mjs
   - server/text-encoding.mjs
   - server/versions.mjs
-  - server/launchpad-history.mjs
   - server/launchpad.mjs
   - server/launchpad-transaction.mjs
   - server/launchpad-network.mjs
@@ -83,7 +71,6 @@ files:
   - shared/panel-connection.mjs
   - shared/launchpad-project.mjs
   - shared/launchpad-categories.mjs
-  - shared/launchpad-channels.mjs
   - desktop/main.mjs
   - desktop/runtime.mjs
   - desktop/updates.mjs

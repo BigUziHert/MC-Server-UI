@@ -299,7 +299,7 @@ test("confirmation and nonce validation never let a caller target another accoun
   );
   assert.ok(f.access.account(a.account.id));
   assert.ok(f.access.account(b.account.id));
-  f.advance(31 * 24 * 60 * 60 * 1000);
+  f.advance(8 * 24 * 60 * 60 * 1000);
   await assert.rejects(f.access.leave(req(a.token), confirmation()), {
     status: 401,
   });

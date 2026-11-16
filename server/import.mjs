@@ -1,6 +1,5 @@
 import fs from "node:fs/promises";
 import path from "node:path";
-import { isCanonicalVolumeAlias } from "./canonical-volume.mjs";
 import { isIP } from "node:net";
 
 const error = (status, message) =>
@@ -134,8 +133,7 @@ export async function canonicalExternalDirectory(
     requireCanonical &&
     (process.platform === "win32"
       ? canonical.toLowerCase() !== resolved.toLowerCase()
-      : canonical !== resolved) &&
-    !(await isCanonicalVolumeAlias(resolved, canonical))
+      : canonical !== resolved)
   )
     throw error(
       409,
@@ -294,11 +292,11 @@ function describeJavaArguments(args) {
     .filter((value) => value.startsWith("@"))
     .map((value) => value.slice(1).replace(/\\/g, "/").replace(/^\.\//, ""));
   const forgeArgs = argFiles.find((file) =>
-    /^libraries\/(?:net\/neoforged\/(?:neoforge|forge)|net\/minecraftforge\/forge)\/[^/]+\/(?:win|unix)_args\.txt$/i.test(
+    /^libraries\/(?:net\/neoforged\/neoforge|net\/minecraftforge\/forge)\/[^/]+\/(?:win|unix)_args\.txt$/i.test(
       file,
     ),
   );
-  const software = forgeArgs?.toLowerCase().includes("neoforged/neoforge/")
+  const software = forgeArgs?.toLowerCase().includes("neoforged")
     ? "NeoForge"
     : forgeArgs
       ? "Forge"
@@ -553,9 +551,7 @@ export async function inspectServerDirectory(
         "This folder overlaps panel storage or another managed server. Choose a separate existing server folder.",
       );
   }
-  const properties = await readProperties(canonical, "server.properties", {
-    optional: true,
-  });
+  const properties = await readProperties(canonical, "server.properties");
   const integer = (key, fallback, minimum, maximum) => {
     const raw = properties.get(key);
     if (raw === undefined) return fallback;
@@ -583,10 +579,6 @@ export async function inspectServerDirectory(
   const warnings = [
     "Import keeps the existing folder in place. Stop any separately running server before starting it from this panel.",
   ];
-  if (!entries.some((entry) => entry.name === "server.properties"))
-    warnings.push(
-      "server.properties has not been generated yet. Default port and world settings are shown; review them before the first start.",
-    );
   const launches = [];
   const detected = new Map();
   const scripts = entries

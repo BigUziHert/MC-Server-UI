@@ -8,7 +8,7 @@ const defaults = {
   autoStartServerIds: [],
   keepInTray: true,
 };
-const keys = [...Object.keys(defaults), "autoStartServerNames"];
+const keys = Object.keys(defaults);
 const legacyKeys = ["startupMode", "startupServerId", "keepInTray"];
 const settingsSizeLimit = 32768;
 const maximumAutoStartServers = 100;
@@ -20,17 +20,6 @@ const object = (value) =>
 function validate(value, partial = false) {
   if (!object(value) || Object.keys(value).some((key) => !keys.includes(key)))
     throw fail(400, "Provide supported panel settings.");
-  if (
-    value.autoStartServerNames !== undefined &&
-    (!object(value.autoStartServerNames) ||
-      Object.keys(value.autoStartServerNames).length >
-        maximumAutoStartServers ||
-      Object.entries(value.autoStartServerNames).some(
-        ([id, name]) =>
-          !validServerId(id) || typeof name !== "string" || name.length > 200,
-      ))
-  )
-    throw fail(400, "Provide valid saved server names.");
   if (
     (!partial || "startAtLogin" in value) &&
     typeof value.startAtLogin !== "boolean"
@@ -106,12 +95,7 @@ export async function readPanelSettingsBody(req) {
 
 // Kept separate from display preferences: these values control local processes
 // and the Windows login item, and never cross the remote connection bridge.
-export function createPanelSettings({
-  dataDir,
-  hasServer,
-  describeServer = () => null,
-  loginItem = {},
-}) {
+export function createPanelSettings({ dataDir, hasServer, loginItem = {} }) {
   let saved = { ...defaults, autoStartServerIds: [] };
   let loaded;
   let writes = Promise.resolve();
@@ -161,18 +145,12 @@ export function createPanelSettings({
     desktop: true,
     ...saved,
     autoStartServerIds: [...saved.autoStartServerIds],
-    ...(saved.autoStartServerNames
-      ? { autoStartServerNames: { ...saved.autoStartServerNames } }
-      : {}),
     startupSupported: loginItem.supported === true,
     startupReason:
       loginItem.reason ||
       "Starting MC Panel at Windows sign-in is available in the installed Windows desktop app.",
     missingAutoStartServerIds: saved.autoStartServerIds.filter(
       (id) => !hasServer(id),
-    ),
-    unavailableAutoStartServerIds: saved.autoStartServerIds.filter(
-      (id) => describeServer(id)?.unavailable,
     ),
     ...(startupError ? { startupError } : {}),
   });
@@ -197,16 +175,6 @@ export function createPanelSettings({
         .then(async () => {
           await load();
           const next = { ...saved, ...validated };
-          const names = Object.fromEntries(
-            next.autoStartServerIds
-              .map((id) => [
-                id,
-                describeServer(id)?.name || saved.autoStartServerNames?.[id],
-              ])
-              .filter(([, name]) => name),
-          );
-          if (Object.keys(names).length) next.autoStartServerNames = names;
-          else delete next.autoStartServerNames;
           const loginChanged = next.startAtLogin !== saved.startAtLogin;
           if (loginChanged && !loginItem.supported)
             throw fail(

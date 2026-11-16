@@ -30,12 +30,6 @@ function sessionRecord(value) {
     userId: value.userId,
     ...(text(value.accountId, 128) ? { accountId: value.accountId } : {}),
     serverId: text(value.serverId, 128) ? value.serverId : null,
-    ...(text(value.panelId, 128) ? { panelId: value.panelId } : {}),
-    ...(text(value.panelName, 100) ? { panelName: value.panelName } : {}),
-    ...(text(value.expiresAt, 64) &&
-    Number.isFinite(Date.parse(value.expiresAt))
-      ? { expiresAt: value.expiresAt }
-      : {}),
     permissions: strings(value.permissions),
     hostPermissions: strings(value.hostPermissions),
   };
@@ -100,29 +94,11 @@ export function createUnifiedPanelController({
       window.webContents.send("mc-panel-connections:changed");
     return list();
   };
-  const persist = (
-    removeId,
-    promote,
-    authentication,
-    signingOut,
-    migration,
-  ) => {
+  const persist = (removeId, promote, authentication, signingOut) => {
     const write = saving
       .catch(() => {})
       .then(async () => {
         if (!ready) await initialize();
-        if (
-          migration &&
-          (panels.get(migration.panel.id) !== migration.panel ||
-            migration.panel.epoch !== migration.epoch ||
-            migration.panel.pendingLeave ||
-            migration.panel.authenticating ||
-            migration.panel.signingOut)
-        )
-          throw failure(
-            409,
-            "The existing computer connection changed. Sign in again to update its address.",
-          );
         const authenticationCurrent = () =>
           authentication &&
           !authentication.panel.removed &&
@@ -185,9 +161,7 @@ export function createUnifiedPanelController({
             selectedServer:
               signingOut && selectedServer?.panelId === signingOut.panel.id
                 ? null
-                : migration && selectedServer?.panelId === migration.panel.id
-                  ? { ...selectedServer, panelId: promote.id }
-                  : selectedServer,
+                : selectedServer,
             ...(promote || authentication
               ? { requireCredentialFor: promote?.id ?? authentication.panel.id }
               : {}),
@@ -210,15 +184,6 @@ export function createUnifiedPanelController({
           // Remove in-memory state only after the corresponding disk write succeeds.
           // Do it inside the write queue so a later snapshot cannot resurrect it.
           if (removeId) {
-            if (migration) {
-              migration.panel.removed = true;
-              invalidate(migration.panel);
-              if (selectedServer?.panelId === removeId)
-                selectedServer = { ...selectedServer, panelId: promote.id };
-              void migration.panel.network
-                .closeAllConnections?.()
-                .catch(onError);
-            }
             panels.delete(removeId);
             return result;
           }
@@ -251,18 +216,13 @@ export function createUnifiedPanelController({
   const describe = (panel) => ({
     id: panel.id,
     origin: panel.origin,
-    label:
-      panel.nickname ||
-      panel.account?.panelName ||
-      panel.panelName ||
-      new URL(panel.origin).host,
+    label: new URL(panel.origin).host,
     local: false,
     signedIn: !panel.temporary && Boolean(panel.token && panel.account),
     connectionState: panel.temporary ? "connecting" : panel.state,
     session: panel.temporary ? undefined : panel.account,
     sessionEpoch: panel.epoch,
     pendingLeave: Boolean(panel.pendingLeave),
-    leaving: Boolean(panel.forgetting),
     servers: panel.temporary ? [] : panel.servers,
     ...(panel.temporary ? { temporary: true } : {}),
     ...(panel.error ? { error: panel.error } : {}),
@@ -363,9 +323,8 @@ export function createUnifiedPanelController({
     if (!panel.authenticating && !panel.removed && !closed)
       await removeSavedPanel(panel, panel.revokedEpoch);
   }
-  async function removeSavedPanel(panel, expectedEpoch, localOnly = false) {
-    if (panel.pendingLeave && !localOnly)
-      throw failure(409, pendingLeaveMessage);
+  async function removeSavedPanel(panel, expectedEpoch) {
+    if (panel.pendingLeave) throw failure(409, pendingLeaveMessage);
     if (
       panel.epoch !== expectedEpoch ||
       panel.removed ||
@@ -415,7 +374,7 @@ export function createUnifiedPanelController({
       token: entry.token ?? null,
       account: undefined,
       epoch: randomUUID(),
-      state: "connecting",
+      state: "unavailable",
       servers: displayRoster(entry.servers),
       network: session.fromPartition(
         `${entry.temporary ? "" : "persist:"}mc-unified-${entry.id}`,
@@ -652,7 +611,7 @@ export function createUnifiedPanelController({
     let epoch = panel.epoch;
     panel.refreshExplicit = explicit;
     panel.allowPrompt = explicit;
-    if (explicit && panel.state !== "connected") {
+    if (explicit) {
       panel.state = "connecting";
       changed();
     }
@@ -694,19 +653,8 @@ export function createUnifiedPanelController({
           panel.error = "";
         } else {
           const current = sessionRecord(account);
-          if (
-            panel.account?.expiresAt &&
-            current.expiresAt &&
-            Math.abs(
-              Date.parse(panel.account.expiresAt) -
-                Date.parse(current.expiresAt),
-            ) < 60000
-          )
-            current.expiresAt = panel.account.expiresAt;
           const fleet = await json(panel, "/api/servers");
           if (panel.epoch !== epoch || panel.removed || closed) return;
-          panel.panelName = current.panelName;
-          panel.hostIdentity = current.panelId;
           panel.account = {
             ...current,
             hostPermissions: strings(
@@ -912,17 +860,6 @@ export function createUnifiedPanelController({
         return {
           email: result.email,
           panelAddress: panel.origin,
-          ...(text(result.panelName)
-            ? { panelName: result.panelName.slice(0, 100) }
-            : {}),
-          ...(Array.isArray(result.servers)
-            ? {
-                servers: result.servers
-                  .filter((item) => text(item?.id) && text(item?.name))
-                  .slice(0, 100)
-                  .map(({ id, name }) => ({ id, name })),
-              }
-            : {}),
           inviteExpiresAt: result.inviteExpiresAt,
         };
       } finally {
@@ -1041,35 +978,6 @@ export function createUnifiedPanelController({
       await refresh(panel, true);
       return changed();
     },
-    async renameConnection(id, nickname) {
-      await initialize();
-      if (
-        typeof nickname !== "string" ||
-        nickname.length > 100 ||
-        /[\x00-\x1f]/.test(nickname)
-      )
-        throw failure(400, "Enter a name with at most 100 characters.");
-      const panel = get(id),
-        previous = panel.nickname;
-      panel.nickname = nickname.trim();
-      try {
-        await persist();
-      } catch (cause) {
-        panel.nickname = previous;
-        throw cause;
-      }
-      return changed();
-    },
-    async changePassword(id, input) {
-      await initialize();
-      const panel = get(id);
-      if (panel.pendingLeave) throw failure(409, pendingLeaveMessage);
-      return json(panel, "/api/access/password", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(input),
-      });
-    },
     async forget(id, expectedAccountId) {
       await initialize();
       const panel = get(id);
@@ -1090,8 +998,6 @@ export function createUnifiedPanelController({
           "The signed-in account changed. Review this panel's current account and confirm Forget again.",
         );
       if (panel.forgetting) return panel.forgetting;
-      const wasPending = Boolean(panel.pendingLeave);
-      let requestSent = false;
       if (!panel.pendingLeave) {
         panel.controls++;
         panel.authenticating = false;
@@ -1110,7 +1016,6 @@ export function createUnifiedPanelController({
           // revokes access, because a lost response may outlive this process.
           await persist();
           panel.allowPrompt = true;
-          requestSent = true;
           const receipt = await json(panel, "/api/access/leave", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
@@ -1122,8 +1027,6 @@ export function createUnifiedPanelController({
             timeout: 30000,
           });
           if (
-            panel.removed ||
-            panel.removing ||
             receipt.left !== true ||
             receipt.requestId !== panel.pendingLeave.requestId
           )
@@ -1139,8 +1042,6 @@ export function createUnifiedPanelController({
           panel.network.setCertificateVerifyProc(null);
           return changed();
         } catch (cause) {
-          if (panel.removed || panel.removing) throw cause;
-          if (!requestSent && !wasPending) panel.pendingLeave = undefined;
           if (
             cause.remoteResponse &&
             [400, 401, 403, 404, 405, 409].includes(cause.status)
@@ -1175,18 +1076,21 @@ export function createUnifiedPanelController({
     async removeSavedConnection(id, expectedEpoch) {
       await initialize();
       const panel = get(id);
+      if (panel.pendingLeave) throw failure(409, pendingLeaveMessage);
       if (
         panel.temporary ||
         !text(expectedEpoch, 128) ||
         !expectedEpoch ||
         panel.epoch !== expectedEpoch ||
+        panel.token ||
+        panel.account ||
         panel.authenticating
       )
         throw failure(
           409,
-          "This panel sign-in changed. Review it again before removing it from this computer.",
+          "This panel sign-in changed. Only a signed-out saved connection can be removed from this computer.",
         );
-      return removeSavedPanel(panel, expectedEpoch, true);
+      return removeSavedPanel(panel, expectedEpoch);
     },
     async selectServer(panelId, serverId) {
       try {
@@ -1509,26 +1413,7 @@ export function createUnifiedPanelController({
         panel.account = account;
         panel.servers = [];
         invalidate(panel);
-        const previous =
-          account.panelId &&
-          [...panels.values()].find(
-            (item) =>
-              item !== panel &&
-              !item.temporary &&
-              (item.hostIdentity ?? item.account?.panelId) ===
-                account.panelId &&
-              (!item.account ||
-                (item.account.accountId === account.accountId &&
-                  item.account.email === account.email)),
-          );
-        if (previous?.nickname) panel.nickname = previous.nickname;
-        panel.promoting = persist(
-          previous?.id,
-          panel,
-          undefined,
-          undefined,
-          previous ? { panel: previous, epoch: previous.epoch } : undefined,
-        );
+        panel.promoting = persist(undefined, panel);
         try {
           await panel.promoting;
         } catch (cause) {

@@ -510,10 +510,7 @@ async function smoke() {
       requests.some((request) => request.host === "c"),
       false,
     );
-    await signIn
-      .getByRole("form", { name: "Sign in to panel", exact: true })
-      .getByRole("button", { name: "Sign in", exact: true })
-      .click();
+    await signIn.getByRole("button", { name: "Sign in", exact: true }).click();
     await expect
       .poll(() =>
         application.evaluate(() =>
@@ -549,13 +546,7 @@ async function smoke() {
       const response = await fetch("/api/servers", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          name: "Local geometry fixture",
-          port: 25567,
-          // Keep connection guidance deterministic and avoid a live public-IP
-          // lookup during the viewport comparison.
-          connectionHost: "geometry.example.test",
-        }),
+        body: JSON.stringify({ name: "Local geometry fixture", port: 25567 }),
       });
       if (!response.ok) throw new Error("Geometry fixture creation failed.");
       const id = (await response.json()).server.id;
@@ -582,17 +573,8 @@ async function smoke() {
       await expect(
         page.getByRole("log", { name: "Server console output" }),
       ).toBeVisible();
-      // The heading and empty console render before /server returns. Its
-      // address guidance and resource details change the surrounding height.
-      await expect(page.locator(".server-banner .status-badge")).toHaveText(
-        panelId === "local" ? "offline" : "running",
-        { timeout: 15000 },
-      );
       const geometry = await page.evaluate(async () => {
         await document.fonts.ready;
-        await new Promise((resolve) =>
-          requestAnimationFrame(() => requestAnimationFrame(resolve)),
-        );
         const shell = document.querySelector(".main-shell");
         const content = document.querySelector(".main-content");
         const sidebar = document.querySelector(".sidebar");
@@ -691,57 +673,25 @@ async function smoke() {
       }, zoom);
       let shorterGeometry;
       for (const height of [1080, 1392]) {
-        // Electron applies native zoom to these window dimensions. Keep the
-        // intended CSS viewport genuinely tall at both zoom levels, and wait
-        // for the resize/zoom to settle before comparing available height.
-        // Production never sets the selected native zoom factor.
-        await page.setViewportSize({
-          width: Math.round(2560 * zoom),
-          height: Math.round(height * zoom),
-        });
-        await expect
-          .poll(() =>
-            page.evaluate(
-              (expectedHeight) =>
-                Math.max(
-                  Math.abs(innerWidth - 2560),
-                  Math.abs(innerHeight - expectedHeight),
-                ),
-              height,
-            ),
-          )
-          .toBeLessThanOrEqual(1);
+        // The test-only override exercises large viewports even on small CI
+        // displays. Production never sets the selected native zoom factor.
+        await page.setViewportSize({ width: 2560, height });
         const localGeometry = await measureWorkspace(
           "local",
           localServerId,
           "Local geometry fixture",
           zoom,
         );
-        // Host-specific connection guidance can wrap to a different height.
-        // All hosts still satisfy the full-height console/footer checks above
-        // and share the same horizontal layout, density and chosen zoom.
-        const sharedLayout = (geometry) =>
-          Object.fromEntries(
-            [
-              "viewport",
-              "viewportHeight",
-              "contentLeft",
-              "rightInset",
-              "sidebarWidth",
-              "fontSize",
-            ].map((key) => [key, geometry[key]]),
-          );
-        for (const [panelId, name] of [
-          [a.id, "Computer A"],
-          [c.id, "Computer C"],
-        ])
-          assert.deepEqual(
-            sharedLayout(
-              await measureWorkspace(panelId, "same-id", name, zoom),
-            ),
-            sharedLayout(localGeometry),
-            `Local and remote workspace geometry matches at ${zoom * 100}% zoom, ${height}px high`,
-          );
+        assert.deepEqual(
+          await measureWorkspace(a.id, "same-id", "Computer A", zoom),
+          localGeometry,
+          `Local and remote console geometry matches at ${zoom * 100}% zoom, ${height}px high`,
+        );
+        assert.deepEqual(
+          await measureWorkspace(c.id, "same-id", "Computer C", zoom),
+          localGeometry,
+          `A second remote panel retains geometry at ${zoom * 100}% zoom, ${height}px high`,
+        );
         if (shorterGeometry) {
           assert.ok(
             Math.abs(
@@ -749,7 +699,7 @@ async function smoke() {
                 shorterGeometry.consoleHeight -
                 (localGeometry.viewportHeight - shorterGeometry.documentHeight),
             ) < 1,
-            `The console uses the extra height when the same-width window grows: ${JSON.stringify({ zoom, shorter: shorterGeometry, taller: localGeometry })}`,
+            "The console uses the extra height when the same-width window grows",
           );
         }
         shorterGeometry = localGeometry;
@@ -950,7 +900,6 @@ async function smoke() {
       .getByLabel("Password", { exact: true })
       .fill("fixture-password");
     await reconnect
-      .getByRole("form", { name: "Sign in to panel", exact: true })
       .getByRole("button", { name: "Sign in", exact: true })
       .click();
     await expect(reconnect).toHaveCount(0);
@@ -1033,13 +982,9 @@ async function smoke() {
       .getByRole("button", { name: "Close panel connections", exact: true })
       .click();
     await expect(
-      page
-        .getByRole("list", { name: `Servers on ${labelA}`, exact: true })
-        .getByRole("button"),
+      page.getByRole("list", { name: `Servers on ${labelA}`, exact: true }),
     ).toHaveCount(0);
-    await expect(
-      page.getByRole("heading", { name: labelA, exact: true }),
-    ).toBeVisible();
+    await expect(page.getByText(labelA, { exact: true })).toHaveCount(0);
     assert.ok(
       requests.some(
         (request) =>
@@ -1108,7 +1053,7 @@ async function smoke() {
       "Switching/signing out/restarting the client must not stop a remote server",
     );
     console.log(
-      "Passed native unified workspace: invitation cancellation/reopening preserves pending password setup and grants; one-form sign-in waits for certificate confirmation; local/A/C workspace geometry fills wide displays while preserving native zoom; A/C bearer isolation with colliding IDs; streamed multipart upload and client download surviving selection changes; encrypted session restart, trust persistence, epoch rejection; signed-out computers stay visible without cached server controls and non-authenticating status proof removes confirmed revoked accounts without affecting other panels.",
+      "Passed native unified workspace: invitation cancellation/reopening preserves pending password setup and grants; one-form sign-in waits for certificate confirmation; local/A/C workspace geometry fills wide displays while preserving native zoom; A/C bearer isolation with colliding IDs; streamed multipart upload and client download surviving selection changes; encrypted session restart, trust persistence, epoch rejection; signed-out panels stay only in Manage Connections and non-authenticating status proof removes confirmed revoked accounts without affecting other panels.",
     );
   } catch (cause) {
     if (application) {

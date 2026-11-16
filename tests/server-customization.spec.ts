@@ -3,7 +3,6 @@ import {
   selectServer,
   serverButton,
   removeTestServer,
-  stopTestServer,
 } from "./server-fixtures";
 import { test as base, expect, type Page } from "@playwright/test";
 
@@ -26,52 +25,6 @@ const test = base.extend<{ serverId: string }>({
       await removeTestServer(request, server.id);
     }
   },
-});
-
-test("runtime fallback settings require a stopped server and save explicit owner metadata", async ({
-  page,
-  request,
-  serverId,
-}) => {
-  await page.addInitScript(
-    (id) => localStorage.setItem("mc-panel.active-server", id),
-    serverId,
-  );
-  let patch: Record<string, unknown> | undefined;
-  page.on("request", (request) => {
-    if (
-      request.method() === "PATCH" &&
-      new URL(request.url()).pathname === `/api/servers/${serverId}`
-    )
-      patch = request.postDataJSON();
-  });
-  await page.goto("/#console");
-  await page
-    .getByRole("button", { name: "Server settings", exact: true })
-    .click();
-  const dialog = page.getByRole("dialog", {
-    name: "Server settings",
-    exact: true,
-  });
-  await dialog.getByText("Runtime detection fallback", { exact: true }).click();
-  const software = dialog.getByLabel("Fallback server software");
-  await expect(software).toBeDisabled();
-  await stopTestServer(request, serverId);
-  await expect(software).toBeEnabled();
-  await software.selectOption("Paper");
-  await dialog.getByLabel("Fallback Minecraft version").fill("1.20.1");
-  await dialog
-    .getByRole("button", { name: "Save changes", exact: true })
-    .click();
-  await expect(dialog).not.toBeVisible();
-  const fleet = await (await request.get("/api/servers")).json();
-  expect(
-    fleet.servers.find((server: { id: string }) => server.id === serverId),
-  ).toMatchObject({ software: "Paper", minecraftVersion: "1.20.1" });
-  expect(patch).toMatchObject({
-    software: "Paper",
-    minecraftVersion: "1.20.1",
-  });
 });
 
 async function solidIcon(page: Page, color: string) {
@@ -473,7 +426,7 @@ test("copying the server address falls back when the clipboard API is denied and
   await expect(copy).toHaveText(expectedAddress);
   const displayed = await copy.innerText();
   await copy.click();
-  await expect(page.locator(".toast[role=status]")).toContainText(
+  await expect(page.getByRole("status")).toContainText(
     "Server address copied.",
   );
   expect(
@@ -560,7 +513,7 @@ for (const remote of [false, true]) {
       });
       await expect(copy).toHaveText(displayed);
       await copy.click();
-      await expect(page.locator(".toast[role=status]")).toContainText(
+      await expect(page.getByRole("status")).toContainText(
         "Server address copied.",
       );
       expect(

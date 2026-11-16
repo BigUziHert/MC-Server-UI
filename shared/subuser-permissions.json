@@ -38,7 +38,7 @@
         {
           "id": "control.start",
           "label": "Start",
-          "description": "Start the server when it is offline. Uploaded mods, plugins and scripts run with the host computer user’s access; grant file changes only to people you trust with that computer."
+          "description": "Start the server when it is offline."
         },
         {
           "id": "control.stop",
@@ -48,24 +48,7 @@
         {
           "id": "control.restart",
           "label": "Restart",
-          "description": "Restart the server. Uploaded mods, plugins and scripts run with the host computer user’s access; grant file changes only to people you trust with that computer."
-        }
-      ]
-    },
-    {
-      "id": "players",
-      "label": "Players",
-      "description": "Player lists and game access without unrestricted console commands.",
-      "permissions": [
-        {
-          "id": "players.read",
-          "label": "View player records",
-          "description": "Read player names, UUIDs, login history, whitelist, operators and ban reasons."
-        },
-        {
-          "id": "players.whitelist",
-          "label": "Manage whitelist",
-          "description": "View player records and add or remove whitelist entries, or enable the whitelist. Does not grant operators or unrestricted console commands."
+          "description": "Restart the server."
         }
       ]
     },
@@ -104,7 +87,7 @@
         {
           "id": "file.read",
           "label": "List files",
-          "description": "View folders, file information and recycled server files."
+          "description": "View folders and file information."
         },
         {
           "id": "file.read-content",
@@ -114,12 +97,12 @@
         {
           "id": "file.create",
           "label": "Create and upload files",
-          "description": "Create, upload and restore server files from Recycle Bin. Replacing existing files also requires Edit and Delete files. Together with Start or Restart, this allows uploaded mods, plugins or scripts to execute code with the host computer user’s access."
+          "description": "Create folders and files, and upload new files."
         },
         {
           "id": "file.update",
           "label": "Edit files",
-          "description": "Change the contents of existing files. Together with Start or Restart, this allows uploaded mods, plugins or scripts to execute code with the host computer user’s access."
+          "description": "Change the contents of existing files."
         },
         {
           "id": "file.delete",
@@ -136,12 +119,12 @@
         {
           "id": "backup.read",
           "label": "View backups",
-          "description": "View backup archives, their status and recycled backup archives."
+          "description": "View backup archives and their status."
         },
         {
           "id": "backup.create",
           "label": "Create backups",
-          "description": "Create backups and recover backup archives from Recycle Bin without extracting them into the server."
+          "description": "Create a new backup of the server's files."
         },
         {
           "id": "backup.download",
@@ -156,7 +139,7 @@
         {
           "id": "backup.delete",
           "label": "Delete backups",
-          "description": "Move backup archives to Recycle Bin or permanently delete recycled backup archives."
+          "description": "Permanently remove backup archives."
         },
         {
           "id": "backup.update",
@@ -166,7 +149,7 @@
         {
           "id": "backup.location",
           "label": "Change backup location",
-          "description": "Reserved for the local computer owner. Browsing host folders is not delegated with server admin permissions."
+          "description": "Browse folders on the computer hosting this server and move this server's backup archives to another disk or folder. Requires View backups."
         }
       ]
     },
@@ -206,9 +189,8 @@
       "backup.restore",
       "backup.delete",
       "backup.update",
-      "audit.read",
-      "players.read",
-      "players.whitelist"
+      "backup.location",
+      "audit.read"
     ],
     "operator": [
       "server.view",
@@ -227,9 +209,7 @@
       "backup.restore",
       "backup.delete",
       "backup.update",
-      "audit.read",
-      "players.read",
-      "players.whitelist"
+      "audit.read"
     ],
     "viewer": [
       "server.view",
@@ -237,8 +217,7 @@
       "file.read-content",
       "backup.read",
       "backup.download",
-      "audit.read",
-      "players.read"
+      "audit.read"
     ]
   }
 }

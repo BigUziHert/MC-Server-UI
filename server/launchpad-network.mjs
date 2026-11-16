@@ -61,9 +61,12 @@ async function responseFor(
   );
   if (authenticatedCdn && curseforgeKey) {
     const secret = await curseforgeKey();
-    // Public CDN files used by FTB/ATLauncher packs do not require a catalog
-    // API key. Send a configured key when available; honor HTTP restrictions.
-    if (secret) headers = { ...headers, "x-api-key": secret };
+    if (!secret)
+      throw launchpadError(
+        400,
+        "Add a CurseForge API key in Launchpad settings before downloading this file.",
+      );
+    headers = { ...headers, "x-api-key": secret };
   }
   const deadline = AbortSignal.timeout(deadlineMs);
   const signal = options.signal

@@ -1156,8 +1156,8 @@ test("lost Forget response retains original proof across restart and blocks oper
   );
   await assert.rejects(h.controller.retry(panel.id), /Retry Forget/);
   await assert.rejects(
-    h.controller.removeSavedConnection(panel.id, "stale-epoch"),
-    /sign-in changed/,
+    h.controller.removeSavedConnection(panel.id, pending.sessionEpoch),
+    /Retry Forget/,
   );
   const calls = h.calls.length;
   await h.controller.restore();
@@ -2949,62 +2949,4 @@ test("a failed native saved-address probe cannot cancel another form's queued si
     h.persisted.at(-1).panels.find((row) => row.id === panel.id).token,
     token,
   );
-});
-
-test("an offline pending Leave can be removed locally without another host request", async (t) => {
-  let offline = false;
-  const h = await harness(t, {
-    behavior: async () => {
-      if (offline) throw new Error("Host offline");
-    },
-  });
-  const panel = await h.signIn("https://a.example.test");
-  offline = true;
-  await assert.rejects(h.controller.forget(panel.id, panel.session.accountId));
-  const pending = h.controller.list().panels.find((row) => row.id === panel.id);
-  assert.equal(pending.pendingLeave, true);
-  const count = h.calls.length;
-  await h.controller.removeSavedConnection(panel.id, pending.sessionEpoch);
-  assert.equal(
-    h.controller.list().panels.some((row) => row.id === panel.id),
-    false,
-  );
-  assert.equal(h.calls.length, count);
-  assert.equal(h.persisted.at(-1).panels.length, 0);
-});
-
-test("authenticated address migration preserves nickname and selection without reusing the old bearer", async (t) => {
-  const identity = {
-    ...account,
-    panelId: "stable-host",
-    panelName: "Home computer",
-  };
-  const h = await harness(t, {
-    behavior: async (url, options) => {
-      if (url.pathname === "/api/access/login")
-        return response({ ...identity, sessionToken: token });
-      if (
-        url.pathname === "/api/access/session" &&
-        new Headers(options.headers).has("Authorization")
-      )
-        return response(identity);
-    },
-  });
-  const first = await h.signIn("https://old.example.test");
-  await h.controller.renameConnection(first.id, "My host");
-  await h.controller.selectServer(first.id, "same-id");
-  const replacement = await h.signIn("https://new.example.test");
-  const state = h.controller.list();
-  assert.equal(state.panels.filter((row) => !row.local).length, 1);
-  assert.equal(replacement.label, "My host");
-  assert.deepEqual(state.selectedServer, {
-    panelId: replacement.id,
-    serverId: "same-id",
-  });
-  const login = h.calls.find(
-    (request) =>
-      request.url.origin === replacement.origin &&
-      request.url.pathname === "/api/access/login",
-  );
-  assert.equal(login.headers.has("Authorization"), false);
 });

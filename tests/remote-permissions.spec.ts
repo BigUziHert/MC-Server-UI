@@ -244,19 +244,6 @@ async function sharedPanel(page: Page, permissions: string[]) {
         whitelistSettingsAvailable: true,
       });
     if (path === "/api/subusers" && method === "GET") return reply({ users });
-    if (path === "/api/subusers/share" && method === "POST") {
-      users.push({
-        id: "new-helper",
-        email: body.email,
-        permissions: body.permissions,
-        createdAt: stamp,
-      });
-      return reply({
-        servers: [{ id: server.id, name: server.name }],
-        invitationUrl: `https://panel.example.test/#invite=${"A".repeat(43)}`,
-        inviteExpiresAt: "2099-01-01T00:00:00.000Z",
-      });
-    }
     if (path === "/api/subusers" && method === "POST") {
       const user = {
         id: "new-helper",
@@ -316,20 +303,13 @@ test("file listing access does not fetch file contents or enable file changes", 
   ).toBeDisabled();
   await expect(
     page.getByRole("button", { name: "Open Recycle Bin" }),
-  ).toBeEnabled();
-  await page.getByRole("button", { name: "Open Recycle Bin" }).click();
-  await expect(
-    page.getByRole("button", { name: "Restore old.txt", exact: true }),
-  ).toBeDisabled();
-  await expect(
-    page.getByRole("button", {
-      name: "Permanently delete old.txt",
-      exact: true,
-    }),
-  ).toBeDisabled();
+  ).toHaveCount(0);
   expect(
     calls.filter(
-      (call) => call.path === "/api/files/content" || call.method !== "GET",
+      (call) =>
+        call.path === "/api/files/content" ||
+        call.path === "/api/files/recycle-bin" ||
+        call.method !== "GET",
     ),
   ).toEqual([]);
 });
@@ -374,7 +354,7 @@ test("large download selections explain how to download the folder instead", asy
   await expect(page).toHaveURL(/#files$/);
 });
 
-test("file readers get a read-only editor and restore uses the file-create grant", async ({
+test("file readers get a read-only editor and recycling requires both storage grants", async ({
   page,
 }) => {
   const calls = await sharedPanel(page, [
@@ -400,7 +380,7 @@ test("file readers get a read-only editor and restore uses the file-create grant
   await page.getByRole("button", { name: "Open Recycle Bin" }).click();
   await expect(
     page.getByRole("button", { name: "Restore old.txt", exact: true }),
-  ).toBeEnabled();
+  ).toBeDisabled();
   await expect(
     page.getByRole("button", {
       name: "Permanently delete old.txt",
@@ -474,7 +454,7 @@ test("catalog readers can browse Versions and Launchpad while content changes an
 test("properties and player controls stay disabled for read-only access", async ({
   page,
 }) => {
-  const calls = await sharedPanel(page, ["file.read-content", "players.read"]);
+  const calls = await sharedPanel(page, ["file.read-content"]);
   await page.goto("/#properties");
   await expect(page.getByLabel("max players", { exact: true })).toHaveValue(
     "20",
@@ -505,7 +485,7 @@ test("remote audit readers keep server filters without offering owner-only panel
   const calls = await sharedPanel(page, ["audit.read"]);
   await page.goto("/#audit");
   await expect(
-    page.getByRole("heading", { name: "Audit Logs", exact: true }),
+    page.getByRole("heading", { name: "Audit logs", exact: true }),
   ).toBeVisible();
   const row = page.getByRole("row").filter({
     hasText: "Updated shared server settings",
@@ -561,7 +541,7 @@ test("remote subuser managers grant only their own permissions and invite withou
         name: `${action} panel-managed@example.test`,
         exact: true,
       }),
-    ).toBeEnabled();
+    ).toBeDisabled();
   await expect(
     page.getByRole("button", {
       name: "Edit permissions for limited@example.test",
@@ -586,35 +566,52 @@ test("remote subuser managers grant only their own permissions and invite withou
     .getByRole("button", { name: "Grant server access", exact: true })
     .click();
   const editor = page.getByRole("dialog", {
-    name: "Share server access",
+    name: "Grant server access",
     exact: true,
   });
   await expect(editor.getByLabel("Panel account", { exact: true })).toHaveCount(
     0,
   );
-  await expect(
-    editor.getByRole("group", { name: "Servers to share" }),
-  ).toHaveCount(0);
+  await expect(editor).toContainText(
+    "Existing panel accounts and their invitations are managed by the panel owner.",
+  );
   await editor
     .getByLabel("Email address", { exact: true })
     .fill("helper@example.test");
-  await editor.getByLabel("Permissions", { exact: true }).selectOption("admin");
+  const details = editor.locator(".subusers-permission-details");
+  await expect(details).toHaveJSProperty("open", false);
+  await details.locator("summary").click();
+  await expect(
+    editor.getByRole("checkbox", { name: "Console", exact: true }),
+  ).toHaveCount(0);
+  await expect(
+    editor.getByRole("checkbox", { name: "Edit files", exact: true }),
+  ).toHaveCount(0);
   await editor
-    .getByRole("button", { name: "Share and create invitation", exact: true })
+    .getByRole("checkbox", { name: "All permissions", exact: true })
+    .check();
+  await editor
+    .getByRole("button", { name: "Grant access", exact: true })
     .click();
-  await expect(editor.getByLabel("Invitation link")).toHaveValue(
+  await expect(editor).not.toBeVisible();
+  await page
+    .getByRole("button", {
+      name: "Create invite link for helper@example.test",
+      exact: true,
+    })
+    .click();
+  const invitation = page.getByRole("dialog", {
+    name: "Share invitation link",
+    exact: true,
+  });
+  await expect(invitation.getByLabel("Invitation link")).toHaveValue(
     `https://panel.example.test/#invite=${"A".repeat(43)}`,
   );
   expect(
     calls.find(
-      (call) => call.path === "/api/subusers/share" && call.method === "POST",
+      (call) => call.path === "/api/subusers" && call.method === "POST",
     )?.body,
-  ).toEqual({
-    email: "helper@example.test",
-    permissions,
-    invite: true,
-    expiresInHours: 24,
-  });
+  ).toEqual({ email: "helper@example.test", permissions });
   expect(
     calls.filter(
       (call) =>
@@ -622,7 +619,7 @@ test("remote subuser managers grant only their own permissions and invite withou
         call.path !== "/api/access/session",
     ),
   ).toEqual([]);
-  expect(calls.filter((call) => call.path.endsWith("/share"))).toHaveLength(1);
+  expect(calls.filter((call) => call.path.endsWith("/invite"))).toHaveLength(1);
   expect(
     calls.filter((call) => call.path.startsWith("/api/panel-users")),
   ).toEqual([]);

@@ -111,7 +111,6 @@ function observe(
   type: RecoveryBatch["type"],
   send: boolean,
   onLate: (failure?: Error) => void,
-  restoreOptions?: { destinationPath?: string; replaceExisting?: boolean },
 ) {
   return new Promise<void>((resolve, reject) => {
     let settled = false;
@@ -213,9 +212,7 @@ function observe(
         : `${base}?requestId=${encodeURIComponent(requestId)}`,
       {
         method: type === "restore" ? "POST" : "DELETE",
-        ...(type === "restore"
-          ? { body: JSON.stringify({ requestId, ...restoreOptions }) }
-          : {}),
+        ...(type === "restore" ? { body: JSON.stringify({ requestId }) } : {}),
         signal: controller.signal,
       },
     )
@@ -271,11 +268,7 @@ export function startRecoveryBatch(
   type: RecoveryBatch["type"],
   targets: RecoveryItem[],
   notify: PageProps["notify"],
-  options: {
-    single?: boolean;
-    existing?: RecoveryOperation;
-    restoreOptions?: { destinationPath?: string; replaceExisting?: boolean };
-  } = {},
+  options: { single?: boolean; existing?: RecoveryOperation } = {},
 ) {
   if (!targets.length || recoveryPending(batches.get(key))) return null;
   const id = crypto.randomUUID();
@@ -313,7 +306,6 @@ export function startRecoveryBatch(
           type,
           !options.existing,
           (failure) => resolveUnconfirmed(key, id, requestId, notify, failure),
-          options.restoreOptions,
         );
         const batch = batches.get(key);
         if (batch?.id !== id) return;

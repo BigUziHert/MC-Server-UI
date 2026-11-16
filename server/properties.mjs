@@ -338,8 +338,6 @@ export function createPropertiesService(ctx) {
               replacement.value +
               content.slice(replacement.end);
         } else content = updateProperties(loaded.text, changes);
-        if (input.path === "server.properties")
-          await ctx.checkServerPorts?.(parseProperties(content), Number(parseProperties(content).get("server-port") ?? ctx.getConfiguration?.().port ?? 25565));
         if (loaded.encoding === "latin1" && /[^\x00-\xff]/.test(content)) {
           if (loaded.document)
             throw fail(

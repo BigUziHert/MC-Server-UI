@@ -1,17 +1,12 @@
 import express from "express";
-import { publicErrorDetails } from "./error-details.mjs";
 import path from "node:path";
 import { AsyncLocalStorage } from "node:async_hooks";
 import http from "node:http";
 import https from "node:https";
 import { createHash } from "node:crypto";
 import { isIP } from "node:net";
-import {
-  accessClientKey,
-  createAccessRateLimiter,
-  SUBUSER_COOKIE,
-} from "./access.mjs";
-import { createManagedHttps, managedProxyToken } from "./managed-https.mjs";
+import { createAccessRateLimiter, SUBUSER_COOKIE } from "./access.mjs";
+import { createManagedHttps } from "./managed-https.mjs";
 import {
   createRemoteTls,
   addressHost,
@@ -105,18 +100,11 @@ export function requiredPermissions(req) {
     "control.stop",
   ];
   if (read(req)) {
-    if (
-      [
-        "/api/launchpad/client-pack",
-        "/api/launchpad/client-pack/preview",
-      ].includes(route)
-    )
-      return ["file.read"];
     if (route === "/api/server/settings") return ["server.update"];
     if (route === "/api/files/copy-operation") return ["file.create"];
     if (["/api/server", "/api/server/icon"].includes(route)) return [];
     if (route === "/api/console") return ["control.console"];
-    if (route === "/api/players") return ["players.read"];
+    if (route === "/api/players") return [];
     if (
       route === "/api/versions" ||
       /^\/api\/versions\/[^/]+(?:\/[^/]+)?$/.test(route) ||
@@ -124,9 +112,7 @@ export function requiredPermissions(req) {
         "/api/launchpad",
         "/api/launchpad/search",
         "/api/launchpad/versions",
-        "/api/launchpad/dependencies",
         "/api/launchpad/installed",
-        "/api/launchpad/history",
       ].includes(route) ||
       /^\/api\/launchpad\/jobs\/[^/]+$/.test(route)
     )
@@ -141,25 +127,21 @@ export function requiredPermissions(req) {
       return ["file.read"];
     if (["/api/files/content", "/api/files/download"].includes(route))
       return ["file.read-content"];
-    // The runtime checks the saved item kind and live grants before exposing
-    // progress or touching storage; backup grants never gate ordinary files.
+    // Recycle Bin contains both server files and backup archives.
     if (
       ["/api/files/recycle-bin", "/api/files/recycle-bin/operation"].includes(
         route,
       ) ||
       /^\/api\/files\/recycle-bin\/[^/]+\/restore-preview$/.test(route)
     )
-      return [];
+      return ["file.read", "backup.read"];
     if (route === "/api/backups") return ["backup.read"];
     if (
       ["/api/backups/location", "/api/backups/location/directories"].includes(
         route,
       )
     )
-      throw failure(
-        403,
-        "Only the computer owner can browse or change backup folders.",
-      );
+      return ["backup.read", "backup.location"];
     if (/^\/api\/backups\/jobs\/[^/]+$/.test(route)) return ["backup.read"];
     if (/^\/api\/backups\/[^/]+\/download$/.test(route))
       return ["backup.download"];
@@ -167,19 +149,15 @@ export function requiredPermissions(req) {
     if (route === "/api/audit" && req.query.scope !== "panel")
       return ["audit.read"];
   }
-  if (
-    ["POST", "PUT", "DELETE"].includes(req.method) &&
-    route === "/api/server/icon"
-  )
-    return ["server.update"];
   if (req.method === "POST") {
     if (route === "/api/files/copy")
       return req.body?.mode === "move"
         ? ["file.create", "file.delete"]
         : ["file.create"];
-    if (/^\/api\/players\/whitelist\/(?:add|remove|state)$/.test(route))
-      return ["players.whitelist"];
-    if (/^\/api\/players\/(?:op|deop|kick|ban|unban)$/.test(route))
+    if (
+      /^\/api\/players\/(?:op|deop|kick|ban|unban)$/.test(route) ||
+      /^\/api\/players\/whitelist\/(?:add|remove|state)$/.test(route)
+    )
       return ["control.console"];
     if (route === "/api/minecraft/properties/save") return ["file.update"];
     if (
@@ -194,7 +172,6 @@ export function requiredPermissions(req) {
         "/api/launchpad/recovery/resolve",
       ].includes(route) ||
       /^\/api\/launchpad\/jobs\/[^/]+\/cancel$/.test(route) ||
-      /^\/api\/launchpad\/jobs\/[^/]+\/undo$/.test(route) ||
       /^\/api\/launchpad\/(?:preview|removal-preview)\/[^/]+\/cancel$/.test(
         route,
       )
@@ -216,17 +193,15 @@ export function requiredPermissions(req) {
     }
     if (["/api/files", "/api/files/upload"].includes(route))
       return ["file.create"];
-    if (/^\/api\/files\/recycle-bin\/[^/]+\/restore$/.test(route)) return [];
+    if (/^\/api\/files\/recycle-bin\/[^/]+\/restore$/.test(route))
+      return ["file.create", "backup.create"];
     if (route === "/api/backups") return ["backup.create"];
     if (
       ["/api/backups/location/preview", "/api/backups/location/jobs"].includes(
         route,
       )
     )
-      throw failure(
-        403,
-        "Only the computer owner can browse or change backup folders.",
-      );
+      return ["backup.read", "backup.location"];
     if (/^\/api\/backups\/[^/]+\/restore$/.test(route))
       return ["backup.restore"];
     if (
@@ -236,7 +211,6 @@ export function requiredPermissions(req) {
       return ["backup.create"];
     if (
       route === "/api/subusers" ||
-      route === "/api/subusers/share" ||
       /^\/api\/subusers\/[^/]+\/invite$/.test(route)
     )
       return ["user.create"];
@@ -246,17 +220,13 @@ export function requiredPermissions(req) {
     if (route === "/api/backups/schedule") return ["backup.update"];
   }
   if (req.method === "PATCH") {
-    if (route === "/api/launchpad/update-policy")
-      return Object.hasOwn(req.body ?? {}, "updateChannel")
-        ? ["server.update"]
-        : contentChanges;
-    if (["/api/server/settings", "/api/server/icon"].includes(route))
-      return ["server.update"];
+    if (route === "/api/server/settings") return ["server.update"];
     if (/^\/api\/subusers\/[^/]+$/.test(route)) return ["user.update"];
   }
   if (req.method === "DELETE") {
     if (route === "/api/files") return ["file.delete"];
-    if (/^\/api\/files\/recycle-bin\/[^/]+$/.test(route)) return [];
+    if (/^\/api\/files\/recycle-bin\/[^/]+$/.test(route))
+      return ["file.delete", "backup.delete"];
     if (/^\/api\/backups\/[^/]+$/.test(route)) return ["backup.delete"];
     if (/^\/api\/subusers\/[^/]+$/.test(route)) return ["user.delete"];
   }
@@ -441,62 +411,25 @@ export function createRemoteGateway({
     next();
   });
   app.use(express.json({ limit: "2mb" }));
-  const clientKey = (req) => {
-    const peer = accessClientKey(req.socket?.remoteAddress);
-    return access.status().transport === "managed" &&
-      ["127.0.0.1", "::1", "::ffff:127.0.0.1"].includes(
-        req.socket?.remoteAddress,
-      ) &&
-      req.headers["x-mc-proxy"] === managedProxyToken &&
-      isIP(req.headers["x-mc-client-ip"])
-      ? accessClientKey(req.headers["x-mc-client-ip"])
-      : peer;
-  };
-  // Trusted managed HTTPS supplies the real client. An arbitrary reverse proxy
-  // cannot safely identify clients, so its account buckets are independent and
-  // successful sign-ins clear their own failure history.
-  const credentialBucket = (req) =>
-    access.status().transport === "proxy"
-      ? ":" +
-        createHash("sha256")
-          .update(
-            JSON.stringify([
-              typeof req.body?.email === "string"
-                ? req.body.email.trim().toLowerCase()
-                : "",
-              req.body?.password,
-            ]),
-          )
-          .digest("hex")
-      : "";
+  // A proxy puts every visitor behind one socket peer. Keep the strict direct
+  // peer limit, and combine a generous proxy budget with a per-account limit.
+  // Forwarding headers remain untrusted in both modes.
   const loginLimit = createAccessRateLimiter({
-    limit: 30,
-    failuresOnly: true,
-    keyForRequest: (req) => clientKey(req) + credentialBucket(req),
+    limit: () => (access.status().transport === "direct" ? 8 : 240),
   });
   const accountLoginLimit = createAccessRateLimiter({
     limit: 8,
-    failuresOnly: true,
     keyForRequest: (req) =>
-      clientKey(req) +
-      ":" +
       createHash("sha256")
         .update(
           typeof req.body?.email === "string"
             ? req.body.email.trim().toLowerCase()
             : "",
         )
-        .digest("hex") +
-      credentialBucket(req),
+        .digest("hex"),
   });
   const acceptLimit = createAccessRateLimiter({
-    limit: 240,
-    keyForRequest: (req) =>
-      clientKey(req) +
-      ":" +
-      createHash("sha256")
-        .update(typeof req.body?.token === "string" ? req.body.token : "")
-        .digest("hex"),
+    limit: () => (access.status().transport === "direct" ? 30 : 240),
   });
   app.get("/api/access/session", async (req, res) => {
     // Retire credentials issued by older versions. They cannot authenticate
@@ -529,9 +462,6 @@ export function createRemoteGateway({
       });
     },
   );
-  app.post("/api/access/password", loginLimit, async (req, res) => {
-    res.json(await access.changePassword(req, req.body ?? {}));
-  });
   app.post("/api/access/accept", acceptLimit, async (req, res) => {
     const result = await access.accept(
       req.body?.token,
@@ -554,15 +484,7 @@ export function createRemoteGateway({
   app.post("/api/access/logout", async (req, res) => {
     res.json(await access.logout(req, { report: true }));
   });
-  const statusLimit = createAccessRateLimiter({
-    limit: 1200,
-    keyForRequest: (req) =>
-      clientKey(req) +
-      ":" +
-      createHash("sha256")
-        .update(typeof req.body?.token === "string" ? req.body.token : "")
-        .digest("hex"),
-  });
+  const statusLimit = createAccessRateLimiter({ limit: 1200 });
   app.post("/api/access/status", statusLimit, (req, res) => {
     res.set("Cache-Control", "no-store");
     res.json(access.accountStatus(req.body?.token));
@@ -654,16 +576,7 @@ export function createRemoteGateway({
     const required = requiredPermissions(req);
     if (
       required.some(
-        (permission) =>
-          !membership.user.permissions.includes(permission) &&
-          !(
-            permission.startsWith("players.") &&
-            membership.user.permissions.includes("control.console")
-          ) &&
-          !(
-            permission === "players.read" &&
-            membership.user.permissions.includes("players.whitelist")
-          ),
+        (permission) => !membership.user.permissions.includes(permission),
       )
     )
       throw failure(403, "You do not have permission to perform this action.");
@@ -720,7 +633,6 @@ export function createRemoteGateway({
           ? "Remote access could not complete the request. Try again or contact the panel owner."
           : cause.message,
       ...(cause.setupNotCreated === true ? { setupNotCreated: true } : {}),
-      ...(status < 500 ? publicErrorDetails(cause) : {}),
       ...(accessRevoked ? { accessRevoked: true } : {}),
     });
   });
@@ -750,7 +662,6 @@ export function createRemoteListener({
   let closed = false;
   let managed = managedHttps;
   let networkTimer;
-  let retryTimer;
   let networkWarning;
   let networkRevision = 0;
   const manager = () => (managed ??= createManagedHttps({ dataDir }));
@@ -776,7 +687,7 @@ export function createRemoteListener({
         if (closed || revision !== networkRevision) return;
         networkWarning =
           current && current !== host
-            ? `Your detected public IP is now ${current}, but the panel address uses ${host}. Check your router's public address; if it changed, save the new address and share new invitation links. A dynamic DNS hostname avoids repeated address changes. Accounts and server permissions are kept.`
+            ? `Your detected public IP is now ${current}, but the panel address uses ${host}. Check your router's public address; if it changed, use your public IP and save again, then share new invitation links. Accounts and server permissions are kept.`
             : undefined;
       } catch {
         /* Certificate state remains authoritative when IP lookup fails. */
@@ -928,26 +839,9 @@ export function createRemoteListener({
       listenerError =
         "Automatic HTTPS could not start. Check that its bundled files are installed and the internal remote port is free, then save again. Your accounts and invitations are preserved.";
       await managed?.configure({ enabled: false });
-    }
+    } else await access.configure({ enabled: false });
     await stop(listener);
     listener = undefined;
-    clearTimeout(retryTimer);
-    if (!closed && access.status().enabled) {
-      retryTimer = setTimeout(() => {
-        chain = chain
-          .catch(() => {})
-          .then(async () => {
-            if (closed || !access.status().enabled) return;
-            try {
-              await sync();
-              listenerError = "";
-            } catch (cause) {
-              await failed(cause);
-            }
-          });
-      }, 30000);
-      retryTimer.unref?.();
-    }
   };
   return {
     status,
@@ -980,7 +874,6 @@ export function createRemoteListener({
     },
     async close() {
       closed = true;
-      clearTimeout(retryTimer);
       networkRevision++;
       clearTimeout(networkTimer);
       await chain.catch(() => {});

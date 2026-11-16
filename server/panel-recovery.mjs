@@ -2,7 +2,6 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { createHash } from "node:crypto";
 import { inspectServerDirectory } from "./import.mjs";
-import { isCanonicalVolumeAlias } from "./canonical-volume.mjs";
 
 const fail = (status, message) => Object.assign(new Error(message), { status });
 const uuid = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i;
@@ -19,7 +18,7 @@ export function createPanelRecovery({ dataDir, registered = () => [] }) {
       500,
       "Server recovery requires the panel's absolute data folder.",
     );
-  let root = path.resolve(dataDir);
+  const root = path.resolve(dataDir);
   let rootIdentity;
   async function regularDirectory(directory) {
     const stat = await fs.lstat(directory);
@@ -35,10 +34,6 @@ export function createPanelRecovery({ dataDir, registered = () => [] }) {
     return stat;
   }
   async function instances() {
-    if (!rootIdentity) {
-      const canonical = await fs.realpath(root);
-      if (await isCanonicalVolumeAlias(root, canonical)) root = canonical;
-    }
     const stat = await regularDirectory(root);
     const current = digest(identity(stat));
     if (rootIdentity && current !== rootIdentity)

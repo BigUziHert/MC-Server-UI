@@ -450,7 +450,7 @@ test("panel audit polling refreshes in place and retains removed-server history"
     .getByRole("combobox", { name: "Audit scope" })
     .selectOption("panel");
   await expect(
-    page.getByRole("heading", { name: "Audit Logs", exact: true }),
+    page.getByRole("heading", { name: "Audit logs", exact: true }),
   ).toBeVisible();
   await expect(
     page.getByText("Removed final server: Old survival", { exact: true }),
@@ -705,89 +705,60 @@ test("dirty property refresh confirms reload and file changes clear the search",
   expect(reads).toBe(readsBeforeRetry + 1);
 });
 
-for (const contentType of ["mod", "plugin"] as const) {
-  test(`restoring a ${contentType} previews duplicates and can replace the installed copy`, async ({
-    page,
-  }) => {
-    let restored = false;
-    let restoreBody: Record<string, unknown> = {};
-    const directory = contentType === "plugin" ? "plugins" : "mods";
-    await page.route(/\/api\/server(?:\?.*)?$/, async (route) => {
-      const response = await route.fetch();
-      return route.fulfill({
-        response,
-        json: { ...(await response.json()), status: "offline" },
-      });
-    });
-    const item = {
-      id: "old-mod",
-      name: "sample-old.jar",
-      originalPath: `${directory}/sample-old.jar.disabled`,
-      type: "file",
-      status: "ready",
-      size: 500,
-      deletedAt: new Date().toISOString(),
-    };
-    await page.route("**/api/files/recycle-bin", (route) =>
+test("restoring a mod previews duplicate copies before writing files", async ({
+  page,
+}) => {
+  let restored = false;
+  const item = {
+    id: "old-mod",
+    name: "sample-old.jar",
+    originalPath: "mods/sample-old.jar",
+    type: "file",
+    status: "ready",
+    size: 500,
+    deletedAt: new Date().toISOString(),
+  };
+  await page.route("**/api/files/recycle-bin", (route) =>
+    route.fulfill({ json: { protected: true, items: restored ? [] : [item] } }),
+  );
+  await page.route(
+    "**/api/files/recycle-bin/old-mod/restore-preview",
+    (route) =>
       route.fulfill({
-        json: { protected: true, items: restored ? [] : [item] },
+        json: {
+          duplicates: [{ path: "mods/sample-new.jar", title: "Sample mod" }],
+          warnings: [],
+        },
       }),
-    );
-    await page.route(
-      "**/api/files/recycle-bin/old-mod/restore-preview",
-      (route) =>
-        route.fulfill({
-          json: {
-            duplicates: [
-              { path: `${directory}/sample-new.jar`, title: "Sample mod" },
-            ],
-            warnings: [],
-          },
-        }),
-    );
-    await page.route("**/api/files/recycle-bin/old-mod/restore", (route) => {
-      restoreBody = route.request().postDataJSON();
-      restored = true;
-      return route.fulfill({ json: { message: "Restored" } });
-    });
-    await page.goto("/#files");
-    await page
-      .getByRole("button", { name: "Open Recycle Bin", exact: true })
-      .click();
-    await page
-      .getByRole("button", { name: "Restore sample-old.jar", exact: true })
-      .click();
-    const dialog = page.getByRole("dialog", {
-      name: "Restore selected items?",
-      exact: true,
-    });
-    await expect(dialog).toContainText("Restore check");
-    await expect(dialog).toContainText(`${directory}/sample-new.jar`);
-    expect(restored).toBe(false);
-    await dialog.getByRole("button", { name: "Cancel", exact: true }).click();
-    expect(restored).toBe(false);
-    await page
-      .getByRole("button", { name: "Restore sample-old.jar", exact: true })
-      .click();
-    await expect(
-      dialog.getByRole("option", {
-        name: `Replace installed copy: ${directory}/sample-new.jar`,
-        exact: true,
-      }),
-    ).toHaveJSProperty("disabled", false);
-    await dialog
-      .getByRole("combobox", { name: "Restore behavior", exact: true })
-      .selectOption(`duplicate:${directory}/sample-new.jar`);
-    await dialog
-      .getByRole("button", { name: "Restore selected items", exact: true })
-      .click();
-    await expect.poll(() => restored).toBe(true);
-    expect(restoreBody).toMatchObject({
-      destinationPath: `${directory}/sample-new.jar`,
-      replaceExisting: true,
-    });
+  );
+  await page.route("**/api/files/recycle-bin/old-mod/restore", (route) => {
+    restored = true;
+    return route.fulfill({ json: { message: "Restored" } });
   });
-}
+  await page.goto("/#files");
+  await page
+    .getByRole("button", { name: "Open Recycle Bin", exact: true })
+    .click();
+  await page
+    .getByRole("button", { name: "Restore sample-old.jar", exact: true })
+    .click();
+  const dialog = page.getByRole("dialog", {
+    name: "Restore selected items?",
+    exact: true,
+  });
+  await expect(dialog).toContainText("Review duplicate mods before restoring");
+  await expect(dialog).toContainText("mods/sample-new.jar");
+  expect(restored).toBe(false);
+  await dialog.getByRole("button", { name: "Cancel", exact: true }).click();
+  expect(restored).toBe(false);
+  await page
+    .getByRole("button", { name: "Restore sample-old.jar", exact: true })
+    .click();
+  await dialog
+    .getByRole("button", { name: "Restore selected items", exact: true })
+    .click();
+  await expect.poll(() => restored).toBe(true);
+});
 
 test("shared search keeps neutral focus styling and places clear control inside the field", async ({
   page,

@@ -1,10 +1,8 @@
 import fs from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import { inspectInstalledMod } from "./launchpad-mod-metadata.mjs";
-import { inspectPluginIdentity } from "./launchpad-plugin-metadata.mjs";
-import { updateDependencySatisfies } from "./launchpad-update-dependencies.mjs";
+import { installedModVersionSatisfies } from "./launchpad-dependency-ranges.mjs";
 import { launchpadError as error } from "./launchpad-network.mjs";
-import { mapReview } from "./launchpad-transfers.mjs";
 
 export function createModRemoval(ctx) {
   const plans = new Map(),
@@ -25,11 +23,6 @@ export function createModRemoval(ctx) {
     if (closing) throw error(503, "Launchpad is shutting down.");
     if (ctx.isBusy() || busy)
       throw error(409, "Wait for the current Launchpad operation to finish.");
-    if (ctx.isRecoveryRequired?.())
-      throw error(
-        409,
-        "Resolve installation recovery before removing content.",
-      );
     const current = await ctx.getServer();
     if (current.status !== "offline")
       throw error(409, "Stop the server before removing content.");
@@ -62,7 +55,7 @@ export function createModRemoval(ctx) {
         ? /\.zip$/i
         : type === "mod"
           ? /\.jar(?:\.disabled)?$/i
-          : /\.jar(?:\.disabled)?$/i
+          : /\.jar$/i
       ).test(entry.name),
     );
     if (candidates.length > 1000)
@@ -70,86 +63,57 @@ export function createModRemoval(ctx) {
         400,
         "This folder has over 1,000 packages. Manage its files in File Manager.",
       );
-    const rows = await mapReview(
-      candidates.sort((a, b) => a.name.localeCompare(b.name)),
-      async (entry) => {
-        ctx.signal.throwIfAborted();
-        const relative = `${folder}/${entry.name}`;
-        let target, before;
+    const rows = [];
+    for (const entry of candidates.sort((a, b) =>
+      a.name.localeCompare(b.name),
+    )) {
+      ctx.signal.throwIfAborted();
+      const relative = `${folder}/${entry.name}`;
+      const target = await ctx.safePath(ctx.serverDir, relative);
+      const before = await fs.lstat(target);
+      if (!before.isFile() || before.isSymbolicLink())
+        throw error(
+          409,
+          `${entry.name} is not a regular ${type} file. Review it in File Manager.`,
+        );
+      const stamp = ctx.fileStamp(before);
+      // The selected file is always hashed afresh; other files use their full
+      // identity/timestamps to invalidate the reviewed dependency snapshot.
+      const sha512 =
+        relative === selectedPath ? await ctx.fileHash(target) : null;
+      const row = {
+        path: relative,
+        title: entry.name,
+        size: before.size,
+        sha512,
+        stamp,
+      };
+      if (inspect && type === "mod" && !/\.disabled$/i.test(entry.name)) {
         try {
-          target = await ctx.safePath(ctx.serverDir, relative);
-          before = await fs.lstat(target);
-          if (!before.isFile() || before.isSymbolicLink())
-            throw error(409, "not a regular file");
-        } catch (cause) {
-          const issue = `${entry.name}: ${cause.message}`;
-          if (
-            relative === selectedPath ||
-            (selectedPath instanceof Set && selectedPath.has(relative))
-          )
-            throw error(409, issue);
-          return {
-            path: relative,
-            title: entry.name,
-            stamp: "unreadable",
-            size: 0,
-            sha512: null,
-            issue,
-          };
-        }
-        const stamp = ctx.fileStamp(before);
-        // The selected file is always hashed afresh; other files use their full
-        // identity/timestamps to invalidate the reviewed dependency snapshot.
-        const sha512 =
-          relative === selectedPath ||
-          (selectedPath instanceof Set && selectedPath.has(relative))
-            ? await ctx.fileHash(target)
-            : null;
-        const row = {
-          path: relative,
-          title: entry.name,
-          size: before.size,
-          sha512,
-          stamp,
-          active: !/\.disabled$/i.test(entry.name),
-        };
-        if (inspect && ["mod", "plugin"].includes(type)) {
-          try {
-            const key = `${loader}:${relative}:${stamp}`;
-            let cached = metadata.get(key);
-            if (!cached) {
-              cached = await (
-                type === "plugin" ? inspectPluginIdentity : inspectInstalledMod
-              )(target, {
-                loader,
-                signal: ctx.signal,
-              });
-              metadata.set(key, cached);
-              while (metadata.size > 1000)
-                metadata.delete(metadata.keys().next().value);
-            }
-            Object.assign(row, cached);
-            if (cached.warnings?.length)
-              row.issue = `${entry.name}: ${cached.warnings.join(" ")}`;
-            row.allProvided = row.provided;
-            if (!row.active) {
-              row.providers = [];
-              row.provided = [];
-            }
-          } catch (cause) {
-            ctx.signal.throwIfAborted();
-            row.issue = `${entry.name}: ${cause.message}`;
+          const key = `${loader}:${relative}:${stamp}`;
+          let cached = metadata.get(key);
+          if (!cached) {
+            cached = await inspectInstalledMod(target, {
+              loader,
+              signal: ctx.signal,
+            });
+            metadata.set(key, cached);
+            while (metadata.size > 1000)
+              metadata.delete(metadata.keys().next().value);
           }
+          Object.assign(row, cached);
+        } catch (cause) {
+          ctx.signal.throwIfAborted();
+          row.issue = `${entry.name}: ${cause.message}`;
         }
-        if (ctx.fileStamp(before) !== ctx.fileStamp(await fs.lstat(target)))
-          throw error(
-            409,
-            "Installed content changed while its dependencies were being checked. Review removal again.",
-          );
-        return row;
-      },
-      ctx.signal,
-    );
+      }
+      if (ctx.fileStamp(before) !== ctx.fileStamp(await fs.lstat(target)))
+        throw error(
+          409,
+          "Installed content changed while its dependencies were being checked. Review removal again.",
+        );
+      rows.push(row);
+    }
     return rows;
   };
   const snapshot = (rows) =>
@@ -186,7 +150,7 @@ export function createModRemoval(ctx) {
               ? /\.zip$/i
               : type === "mod"
                 ? /\.jar(?:\.disabled)?$/i
-                : /\.jar(?:\.disabled)?$/i
+                : /\.jar$/i
           ).test(input.path)
         )
           throw error(400, `Choose an installed ${type} to remove.`);
@@ -203,150 +167,81 @@ export function createModRemoval(ctx) {
             404,
             `This installed ${type} no longer exists. Refresh installed ${type}s.`,
           );
-        const selectedPaths = new Set([selected.path]);
-        const dependentRows = (removed) => {
-          const provided = new Set(
-            rows
-              .filter((row) => removed.has(row.path))
-              .flatMap((row) => row.provided ?? []),
-          );
-          const remaining = rows.filter(
-            (row) => !removed.has(row.path) && row.active !== false,
-          );
-          return remaining.filter((row) =>
-            row.required?.some((id) => {
-              if (!provided.has(id)) return false;
-              const ranges = remaining
-                .flatMap((value) => value.requirements ?? [])
-                .filter((requirement) => requirement.id === id);
-              const removedVersions = rows
-                .filter((value) => removed.has(value.path))
-                .flatMap((value) => value.providers ?? [])
-                .filter((value) => value.id === id);
-              return !remaining
-                .flatMap((value) => value.providers ?? [])
-                .some(
-                  (provider) =>
-                    provider.id === id &&
-                    (type === "plugin" ||
-                      ranges.every(({ range }) =>
-                        updateDependencySatisfies(
-                          provider.version,
-                          range,
-                          current.loader,
-                        ),
-                      ) ||
-                      (typeof provider.version === "string" &&
-                        removedVersions.length > 0 &&
-                        removedVersions.every(
-                          (value) => value.version === provider.version,
-                        ))),
-                );
-            }),
-          );
-        };
-        const initialDependents =
-          selected.active === false ? [] : dependentRows(selectedPaths);
-        const allDependents = new Map(
-          initialDependents.map((row) => [row.path, row]),
-        );
-        const closure = new Set(selectedPaths);
-        while (true) {
-          const additional = dependentRows(closure).filter(
-            (row) => !closure.has(row.path),
-          );
-          if (!additional.length) break;
-          for (const row of additional) {
-            closure.add(row.path);
-            allDependents.set(row.path, row);
+        // A bundled library can also be supplied by a standalone mod or another
+        // bundle (including the dependent's own JAR). Keep each version: an old
+        // copy with the same ID must not hide the loss of a compatible library.
+        const remaining = new Map(),
+          requirements = new Map();
+        for (const row of rows) {
+          if (row === selected) continue;
+          for (const { id, version } of row.providers ?? []) {
+            if (!remaining.has(id)) remaining.set(id, new Set());
+            remaining.get(id).add(version);
+          }
+          for (const { id, range } of row.requirements ?? []) {
+            if (!requirements.has(id)) requirements.set(id, []);
+            requirements.get(id).push(range);
           }
         }
-        if (input.includeDependents === true)
-          for (const relative of closure) selectedPaths.add(relative);
-        const receipts = ctx.getReceipts?.() ?? [];
-        const needed = new Set(
-          rows
-            .filter((row) => !selectedPaths.has(row.path))
-            .flatMap((row) => row.required ?? []),
-        );
-        const orphanCandidates = rows
+        const provided = new Set(selected.provided ?? []);
+        const stillProvided = (id) => {
+          const ranges = requirements.get(id) ?? [];
+          const removedVersions = (selected.providers ?? []).filter(
+            (value) => value.id === id,
+          );
+          return [...(remaining.get(id) ?? [])].some((version) => {
+            if (
+              ["forge", "neoforge"].includes(current.loader) &&
+              ranges.length &&
+              ranges.every((range) =>
+                installedModVersionSatisfies(version, range),
+              )
+            )
+              return true;
+            // For other loader syntax or versions we cannot order, retaining
+            // the same known version preserves the existing requirement. All
+            // selected copies must agree so a lower bundled version cannot
+            // conceal the removal of a higher one.
+            return (
+              typeof version === "string" &&
+              version.length > 0 &&
+              !version.includes("${") &&
+              removedVersions.length > 0 &&
+              removedVersions.every((value) => value.version === version)
+            );
+          });
+        };
+        const dependents = rows
           .filter(
             (row) =>
-              !selectedPaths.has(row.path) &&
-              receipts.some(
-                (receipt) =>
-                  receipt.path === row.path &&
-                  receipt.installReason === "dependency",
-              ) &&
-              row.allProvided?.length &&
-              !row.allProvided.some((id) => needed.has(id)) &&
-              !row.issue,
+              row !== selected &&
+              row.required?.some(
+                (id) => provided.has(id) && !stillProvided(id),
+              ),
           )
-          .map(({ path, title, size }) => ({ path, title, size }));
-        if (
-          input.cleanupPaths !== undefined &&
-          (!Array.isArray(input.cleanupPaths) ||
-            input.cleanupPaths.some(
-              (relative) =>
-                !orphanCandidates.some((row) => row.path === relative),
-            ))
-        )
-          throw error(400, "Choose unused libraries from this removal review.");
-        for (const relative of input.cleanupPaths ?? [])
-          selectedPaths.add(relative);
-        const dependents = [...allDependents.values()].map(
-          ({ path, title }) => ({ path, title }),
-        );
-        const warnings =
-          selected.active === false
-            ? []
-            : rows.filter((row) => row.issue).map((row) => row.issue);
+          .map(({ path, title }) => ({ path, title }));
+        const warnings = rows
+          .filter((row) => row.issue)
+          .map((row) => row.issue);
         const result = {
           title: selected.title || selected.path,
-          files: rows
-            .filter((row) => selectedPaths.has(row.path))
-            .map(({ path, size }) => ({ path, size })),
+          files: [{ path: selected.path, size: selected.size }],
           dependents,
-          orphanCandidates,
           warnings,
-          blocked:
-            initialDependents.length > 0 && input.includeDependents !== true,
-          includesDependents: input.includeDependents === true,
+          blocked: dependents.length > 0,
           requiresAcknowledgement: warnings.length > 0,
         };
-        const reviewed = await inventory(
-          current.loader,
-          false,
-          type,
-          folder,
-          selectedPaths,
-        );
+        if (result.blocked) return result;
         prune();
-        const ownerId = input.ownerId ?? "local-owner";
-        if (
-          [...plans.values()].filter((plan) => plan.ownerId === ownerId)
-            .length >= 8
-        )
-          throw error(
-            429,
-            "You have eight open removal reviews. Close an earlier review before creating another.",
-          );
-        if (plans.size >= 64)
-          throw error(
-            429,
-            "Too many removal reviews are open. Try again after another review finishes.",
-          );
+        if (plans.size >= 8) plans.delete(plans.keys().next().value);
         const planId = randomUUID(),
           expires = Date.now() + 15 * 60 * 1000;
         plans.set(planId, {
-          ownerId,
           type,
           folder,
           path: selected.path,
           loader: current.loader,
-          paths: [...selectedPaths],
-          snapshot: snapshot(reviewed),
-          blocked: result.blocked,
+          snapshot: snapshot(rows),
           requiresAcknowledgement: result.requiresAcknowledgement,
           expires,
         });
@@ -361,23 +256,20 @@ export function createModRemoval(ctx) {
       return track(async () => {
         if (input.confirmed !== true)
           throw error(400, "Review the removal and confirm it first.");
-        prune();
-        const plan = plans.get(input.planId);
-        if (!plan || plan.ownerId !== (input.ownerId ?? "local-owner"))
-          throw error(
-            409,
-            "This removal review expired. Review the content again.",
-          );
-        await available(plan.type);
+        const planType = plans.get(input.planId)?.type ?? "mod";
+        await available(planType);
+        // Recheck after the async status read before claiming the operation.
         if (busy || ctx.isBusy())
           throw error(
             409,
             "Wait for the current Launchpad operation to finish.",
           );
-        if (plan.blocked && input.acknowledgedDependents !== true)
+        prune();
+        const plan = plans.get(input.planId);
+        if (!plan)
           throw error(
-            400,
-            "Acknowledge that remaining mods depend on this library, or review removing its dependents too.",
+            409,
+            "This removal review expired. Review the content again.",
           );
         if (
           plan.requiresAcknowledgement &&
@@ -404,7 +296,7 @@ export function createModRemoval(ctx) {
                   false,
                   plan.type,
                   plan.folder,
-                  new Set(plan.paths),
+                  plan.path,
                 ),
               ) !== plan.snapshot
             )
@@ -413,58 +305,25 @@ export function createModRemoval(ctx) {
                 "Installed content changed after this review. Review removal again.",
               );
             plans.delete(input.planId);
-            const recycled = [];
-            const undoJobId = ctx.beginRemoval ? randomUUID() : null;
+            metadata.clear();
+            const recycled = await ctx.recycle(plan.path);
             try {
-              await ctx.beginRemoval?.({
-                jobId: undoJobId,
-                paths: plan.paths,
-                type: plan.type,
-              });
-              for (const relative of plan.paths)
-                recycled.push({
-                  path: relative,
-                  entry: await ctx.recycle(relative),
-                });
-              if (ctx.onRemovedMany)
-                await ctx.onRemovedMany(
-                  plan.paths,
-                  plan.type,
-                  recycled,
-                  undoJobId,
-                );
-              else
-                for (const relative of plan.paths)
-                  await ctx.onRemoved(relative, plan.type);
-              await ctx.commitRemoval?.(undoJobId);
+              await ctx.onRemoved(plan.path, plan.type);
             } catch (cause) {
-              const failures = [];
-              for (const { entry } of [...recycled].reverse()) {
-                try {
-                  await ctx.restore(entry.id);
-                } catch (failure) {
-                  failures.push(failure);
-                }
-              }
-              await ctx.onRemovalFailed?.(cause);
-              if (failures.length)
+              try {
+                await ctx.restore(recycled.id);
+              } catch {
                 throw error(
                   409,
-                  "Removal could not finish. Original files remain in Recycle Bin; restore them before continuing.",
+                  "Removal could not finish. The original file is preserved in Recycle Bin and needs restoring.",
                 );
+              }
               throw error(
                 500,
-                `Removal could not be saved. ${plan.paths.length === 1 ? "The original file was restored." : "The original files were restored."} ${cause.message}`,
+                "Removal could not be saved. The original file was restored.",
               );
             }
-            return {
-              ok: true,
-              path: plan.path,
-              paths: plan.paths,
-              recycled: recycled[0]?.entry,
-              recycledEntries: recycled.map(({ entry }) => entry),
-              ...(undoJobId ? { undoJobId } : {}),
-            };
+            return { ok: true, path: plan.path, recycled };
           });
         } finally {
           busy = false;
@@ -472,15 +331,12 @@ export function createModRemoval(ctx) {
         }
       });
     },
-    cancel(id, ownerId = "local-owner") {
-      if (plans.get(id)?.ownerId !== ownerId) return { ok: true };
+    cancel(id) {
       plans.delete(id);
       return { ok: true };
     },
-    invalidate(relative) {
-      if (relative)
-        for (const key of metadata.keys())
-          if (key.includes(`:${relative}:`)) metadata.delete(key);
+    invalidate() {
+      metadata.clear();
     },
     async close() {
       closing = true;

@@ -716,7 +716,10 @@ test("legacy role-only subusers keep old defaults without gaining settings or ba
     );
     assert.equal(created.status, 201);
     assert.deepEqual(created.body.permissions, catalog.roleDefaults[role]);
-    assert.equal(created.body.permissions.includes("backup.location"), false);
+    assert.equal(
+      created.body.permissions.includes("backup.location"),
+      role === "admin",
+    );
   }
   const statePath = path.join(panel.runtimes.get(id).dataDir, "panel.json");
   await panel.close();

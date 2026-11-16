@@ -171,11 +171,7 @@ export function createJavaInstallation({
     ...(!supported
       ? {
           installMessage:
-            platform === "darwin"
-              ? "Install the required Java major on this Mac with Homebrew (for example: brew install --cask temurin@21), then refresh. Match the version shown for your server."
-              : platform === "linux"
-                ? "Install the required Java major using your distribution's package manager (for example on Ubuntu: sudo apt install openjdk-21-jre-headless), then refresh. Match the version shown for your server."
-                : "Automatic Java installation is available on 64-bit Windows. Install the required Java major manually, then refresh.",
+            "Automatic Java installation is available on 64-bit Windows. Install Java manually, then refresh.",
         }
       : {}),
     installJob: snapshot(latest),

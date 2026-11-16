@@ -371,7 +371,7 @@ test("Forget persists its original proof before sending and retries after a lost
   assert.equal(pending.pendingLeave, true);
   await assert.rejects(f.controller.bridge.signOut(panel.id), { status: 409 });
   await assert.rejects(
-    f.controller.bridge.removeSavedConnection(panel.id, "stale-epoch"),
+    f.controller.bridge.removeSavedConnection(panel.id, pending.sessionEpoch),
   );
   const restarted = await f.boot();
   await restarted.bridge.forget(panel.id, panel.session.accountId);
@@ -574,7 +574,7 @@ test("an offline saved host does not delay initialization or authorize its cache
   const row = (await restored.bridge.list()).panels.find(
     (item) => item.id === panel.id,
   );
-  assert.equal(row.connectionState, "connecting");
+  assert.equal(row.connectionState, "unavailable");
   assert.deepEqual(row.session.permissions, []);
   await assert.rejects(restored.fetch(virtual(row)), { status: 503 });
 });
@@ -989,13 +989,9 @@ test("network completion latency does not double the configured refresh interval
   t.mock.timers.tick(5000);
   await flush();
   assert.equal(polls.length, 3);
-  t.mock.timers.tick(4000);
+  t.mock.timers.tick(29000);
   await flush();
-  assert.equal(
-    polls.length,
-    3,
-    "failed hosts retry after the five-second cooldown",
-  );
+  assert.equal(polls.length, 3, "failed hosts retain their 30-second cooldown");
   t.mock.timers.tick(1000);
   await flush();
   assert.equal(polls.length, 4);
@@ -1837,63 +1833,4 @@ test("an older browser open never adopts another form's newly saved panel at the
   );
   const reopened = await f.controller.bridge.open(remote);
   assert.equal(reopened.openedPanelId, target.id);
-});
-
-test("local removal remains available with an interrupted Leave and never contacts the offline host", async (t) => {
-  const f = await fixture(t),
-    panel = await f.connect();
-  f.handler((url) => {
-    if (url.origin === remote) throw new TypeError("Host offline");
-  });
-  await assert.rejects(
-    f.controller.bridge.forget(panel.id, panel.session.accountId),
-  );
-  const pending = (await f.controller.bridge.list()).panels.find(
-    (row) => row.id === panel.id,
-  );
-  assert.equal(pending.pendingLeave, true);
-  const count = f.requests.length;
-  await f.controller.bridge.removeSavedConnection(
-    panel.id,
-    pending.sessionEpoch,
-  );
-  assert.equal(
-    (await f.controller.bridge.list()).panels.some(
-      (row) => row.id === panel.id,
-    ),
-    false,
-  );
-  assert.equal(f.requests.length, count);
-});
-
-test("fresh sign-in to a changed address replaces the matching host and preserves its nickname and selection", async (t) => {
-  const session = {
-      ...account(),
-      panelId: "stable-host",
-      panelName: "Home server",
-    },
-    bearer = "z".repeat(43);
-  const f = await fixture(t);
-  f.sessions.set(bearer, session);
-  f.handler((url, _init, token) => {
-    if (url.pathname === "/api/access/login")
-      return response({ ...session, sessionToken: bearer });
-    if (url.pathname === "/api/access/session" && token)
-      return response(session);
-  });
-  const first = await f.connect();
-  await f.controller.bridge.renameConnection(first.id, "My host");
-  await f.controller.bridge.selectServer(first.id, "server");
-  const replacement = await f.connect("https://changed.example.test");
-  const state = await f.controller.bridge.list();
-  assert.equal(state.panels.filter((row) => !row.local).length, 1);
-  assert.equal(replacement.label, "My host");
-  assert.equal(state.selectedServer.panelId, replacement.id);
-  assert.equal(state.selectedServer.serverId, "server");
-  const login = f.requests.find(
-    (request) =>
-      request.url.origin === replacement.origin &&
-      request.url.pathname === "/api/access/login",
-  );
-  assert.equal(login.headers.has("Authorization"), false);
 });

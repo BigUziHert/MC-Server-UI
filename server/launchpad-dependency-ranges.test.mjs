@@ -210,8 +210,12 @@ test("Maven ignores inclusivity on an absent bound, as used by Supplementaries",
     );
 });
 
-test("malformed, overlapping, and unsupported range expressions cannot prove compatibility", async () => {
+test("soft, malformed, overlapping, and unsupported range expressions cannot prove compatibility", async () => {
   for (const range of [
+    "",
+    " ",
+    "2.0.5",
+    "*",
     "^2.0.0",
     "(,)",
     "[,]",
@@ -238,11 +242,6 @@ test("malformed, overlapping, and unsupported range expressions cannot prove com
     null,
   ])
     assert.equal(await proof(parent(range)), false, String(range));
-});
-
-test("Maven soft and absent ranges impose no version restriction", async () => {
-  for (const range of ["", " ", "2.0.3", "*", undefined])
-    assert.equal(await proof(parent(range)), true, String(range));
 });
 
 test("unknown or malformed installed versions are never inferred from labels", async () => {

@@ -509,7 +509,7 @@ test("panel accounts can be prepared before remote setup, searched, and removed 
   page,
   request,
 }) => {
-  await openPage(page, "subusers", "Server access");
+  await openPage(page, "subusers", "Subusers");
   await expect(
     page.getByRole("button", { name: "Invite person", exact: true }),
   ).toHaveCount(0);
@@ -542,7 +542,6 @@ test("panel accounts can be prepared before remote setup, searched, and removed 
     .click();
   await expect(dialog).not.toBeVisible();
   const row = settings
-    .getByRole("region", { name: "People records", exact: true })
     .getByRole("row")
     .filter({ hasText: "operator@example.com" });
   await expect(row).toContainText("Not invited");
@@ -655,7 +654,7 @@ test("audit filters show file, server and player actions", async ({
       })
       .toMatchObject(state);
   }
-  await openPage(page, "audit", "Audit Logs");
+  await openPage(page, "audit", "Audit logs");
   const filters = page.getByRole("group", {
     name: "Filter by activity category",
   });
@@ -732,10 +731,10 @@ test("all pages fit a mobile viewport and navigation remains usable", async ({
   const pages = [
     { hash: "console", heading: "Console" },
     { hash: "files", heading: "File Manager" },
-    { hash: "subusers", heading: "Server access" },
+    { hash: "subusers", heading: "Subusers" },
     { hash: "players", heading: "Players" },
     { hash: "backups", heading: "Backups" },
-    { hash: "audit", heading: "Audit Logs" },
+    { hash: "audit", heading: "Audit logs" },
   ];
   for (const destination of pages) {
     await test.step(destination.heading, async () => {
@@ -1139,7 +1138,7 @@ test("server workspaces isolate files, commands and backups while panel users re
     (await scopedGet(request, defaultServerId, "/backups")).schedule,
   ).toEqual(originalSchedule);
 
-  await openPage(page, "subusers", "Server access");
+  await openPage(page, "subusers", "Subusers");
   await expect(
     page.getByRole("button", { name: /Grant OP|Revoke OP|Remove OP/ }),
   ).toHaveCount(0);
@@ -1346,7 +1345,7 @@ test("Players grants and removes OP through the subprocess independently of pane
   await page.reload();
   await expect(removeButton).toHaveCount(0);
 
-  await openPage(page, "subusers", "Server access");
+  await openPage(page, "subusers", "Subusers");
   await expect(
     page.getByRole("button", { name: /Grant OP|Remove OP|Revoke OP/ }),
   ).toHaveCount(0);
@@ -1608,7 +1607,7 @@ test("Minecraft heads use UUIDs or usernames and Players polling updates joins a
   await expect(page.locator(".online-players")).toHaveCount(0);
   await openPage(page, "players", "Players");
   const onlineRoster = page.getByRole("region", {
-    name: "Online players",
+    name: "Online Players",
     exact: true,
   });
   const playerRows = onlineRoster.getByRole("listitem");
@@ -1681,7 +1680,7 @@ test("failed skin requests use local Minecraft heads and changing a player ident
   );
   await page.goto("/#players");
   const onlineRoster = page.getByRole("region", {
-    name: "Online players",
+    name: "Online Players",
     exact: true,
   });
   let fallback = onlineRoster.getByRole("img", {
@@ -1700,7 +1699,7 @@ test("failed skin requests use local Minecraft heads and changing a player ident
   expect(failedRequests).toHaveLength(1);
   await expect(
     onlineRoster.getByRole("listitem", {
-      name: "Online players OfflineSkin",
+      name: "Online Players OfflineSkin",
       exact: true,
     }),
   ).toBeVisible();
@@ -2514,7 +2513,7 @@ test("detects NeoForge with joined nogui%* and preserves its script, JVM argumen
     await expect(dialog.getByLabel("Server JAR", { exact: true })).toHaveCount(
       0,
     );
-    await expect(dialog.getByLabel("Memory (GB)", { exact: true })).toHaveCount(
+    await expect(dialog.getByLabel("Memory (MB)", { exact: true })).toHaveCount(
       0,
     );
     await expect(
@@ -2577,7 +2576,7 @@ test("detects NeoForge with joined nogui%* and preserves its script, JVM argumen
     await expect(dialog.getByLabel("Server JAR", { exact: true })).toHaveCount(
       0,
     );
-    await expect(dialog.getByLabel("Memory (GB)", { exact: true })).toHaveCount(
+    await expect(dialog.getByLabel("Memory (MB)", { exact: true })).toHaveCount(
       0,
     );
     await dialog
@@ -2694,7 +2693,7 @@ test("imports a custom startup script without requiring a JAR or executing its c
     await expect(dialog.getByLabel("Server JAR", { exact: true })).toHaveCount(
       0,
     );
-    await expect(dialog.getByLabel("Memory (GB)", { exact: true })).toHaveCount(
+    await expect(dialog.getByLabel("Memory (MB)", { exact: true })).toHaveCount(
       0,
     );
     await dialog.getByText("Advanced settings", { exact: true }).click();

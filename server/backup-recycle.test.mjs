@@ -420,11 +420,7 @@ test("an interrupted final recycle journal can restore in-session despite its st
     },
   });
   await assert.rejects(
-    bin.recycle(`backups/${backup.id}.tar.gz`, {
-      backup: JSON.parse(
-        await fs.readFile(path.join(dataDir, "panel.json"), "utf8"),
-      ).backups.find((item) => item.id === backup.id),
-    }),
+    bin.recycle(`backups/${backup.id}.tar.gz`, { backup }),
     /final journal unavailable/,
   );
   assert.equal(

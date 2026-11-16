@@ -51,19 +51,6 @@
   flex-direction: column;
   gap: 14px;
 }
-.welcome-computers {
-  width: 100%;
-  margin: 24px 0;
-}
-.welcome-computers .fleet-server-group {
-  padding: 12px;
-  border: 1px solid #404356;
-  border-radius: 10px;
-  background: #20212b;
-}
-.welcome-computers .fleet-server-group-heading {
-  font-size: 13px;
-}
 .fleet-setup-target {
   margin: 24px 0 12px;
   color: var(--muted);
@@ -98,12 +85,12 @@
 }
 
 .fleet-welcome-choice:hover {
-  border-color: var(--accent);
+  border-color: #ffd000;
   background: #272833;
 }
 
 .fleet-welcome-choice:focus-visible {
-  outline: 2px solid var(--accent);
+  outline: 2px solid #ffd000;
   outline-offset: 4px;
 }
 
@@ -115,7 +102,7 @@
   flex-shrink: 0;
   border-radius: 10px;
   background: #303140;
-  color: var(--accent);
+  color: #ffd000;
 }
 
 .fleet-welcome-choice > span:nth-child(2) {

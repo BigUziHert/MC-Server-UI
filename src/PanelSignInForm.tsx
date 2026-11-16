@@ -15,7 +15,6 @@ export default function PanelSignInForm({
   initialEmail = "",
   onComplete,
   onBusyChange,
-  onCancel,
 }: {
   panel?: Panel;
   token?: string;
@@ -23,7 +22,6 @@ export default function PanelSignInForm({
   initialEmail?: string;
   onComplete: () => void;
   onBusyChange?: (busy: boolean) => void;
-  onCancel?: () => void;
 }) {
   const id = useId();
   const pending = useRef(false);
@@ -163,9 +161,9 @@ export default function PanelSignInForm({
       {token ? (
         <p>
           Set a password for <strong>{initialEmail}</strong> on{" "}
-          <strong>{panel?.origin}</strong>. The invitation preview lists the
-          servers shared with this account. Server permissions are managed by
-          the host.
+          <strong>{panel?.origin}</strong>. Joining this panel grants no
+          additional server access. The owner manages server permissions
+          separately.
         </p>
       ) : (
         <>
@@ -188,7 +186,6 @@ export default function PanelSignInForm({
               setError("");
             }}
             disabled={busy}
-            readOnly={Boolean(panel)}
             autoFocus={!address}
           />
           <label htmlFor={`${id}-email`}>Email address</label>
@@ -274,11 +271,6 @@ export default function PanelSignInForm({
         </p>
       )}
       <div className="panel-connections-actions">
-        {onCancel && (
-          <button type="button" className="btn" onClick={onCancel}>
-            Cancel
-          </button>
-        )}
         <button type="submit" className="btn primary" disabled={busy}>
           {busy && <LoaderCircle size={16} className="spin" />}
           {token ? "Set password and continue" : "Sign in"}

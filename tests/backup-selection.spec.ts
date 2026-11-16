@@ -252,12 +252,7 @@ test("restore retries retain the confirmation ID after a lost response and a new
   });
   await open.click();
   const dialog = page.getByRole("dialog", { name: "Restore this backup?" });
-  await dialog
-    .getByRole("checkbox", {
-      name: "I understand this will replace my current server files.",
-      exact: true,
-    })
-    .check();
+  await dialog.getByRole("checkbox").check();
   await dialog
     .getByRole("button", { name: "Restore backup", exact: true })
     .click();
@@ -275,12 +270,7 @@ test("restore retries retain the confirmation ID after a lost response and a new
   expect(later.status()).toBe(200);
   expect((await later.json()).content).toBe("keep this");
   await open.click();
-  await dialog
-    .getByRole("checkbox", {
-      name: "I understand this will replace my current server files.",
-      exact: true,
-    })
-    .check();
+  await dialog.getByRole("checkbox").check();
   await dialog
     .getByRole("button", { name: "Restore backup", exact: true })
     .click();
@@ -316,7 +306,7 @@ test("restoring a backup requires a stopped server and explicit confirmation", a
   const dialog = page.getByRole("dialog", { name: "Restore this backup?" });
   await expect(
     dialog.getByText(
-      "Stop the server before restoring. This dialog checks its status automatically.",
+      "Stop the server from Console, then return here to restore this backup.",
     ),
   ).toBeVisible();
   await expect(
@@ -1525,58 +1515,4 @@ test("Recycle Bin restores archive bytes and backup history without changing ser
       await request.get("/api/files/recycle-bin", { headers: otherHeaders })
     ).json(),
   ).toEqual(otherBefore);
-});
-
-test("failed initial backup load cannot replace an unknown saved schedule", async ({
-  page,
-  request,
-  backups,
-}) => {
-  const headers = { "X-Server-Id": backups.id };
-  const baseline = (
-    await (await request.get("/api/backups", { headers })).json()
-  ).schedule;
-  expect(
-    (
-      await request.put("/api/backups/schedule", {
-        headers,
-        data: { ...baseline, enabled: true, intervalHours: 24 },
-      })
-    ).ok(),
-  ).toBeTruthy();
-  let fail = true,
-    writes = 0;
-  await page.route("**/api/backups", (route) =>
-    fail
-      ? route.fulfill({ status: 503, json: { error: "Fixture unavailable" } })
-      : route.continue(),
-  );
-  await page.route("**/api/backups/schedule", (route) => {
-    writes++;
-    return route.continue();
-  });
-  await page.addInitScript(
-    (id) => localStorage.setItem("mc-panel.active-server", id),
-    backups.id,
-  );
-  await page.goto("/#backups");
-  await expect(
-    page.getByRole("heading", { name: "Unable to load backups" }),
-  ).toBeVisible();
-  await expect(
-    page.getByRole("button", { name: "Save schedule", exact: true }),
-  ).toBeDisabled();
-  await expect(
-    page.getByText("Backup schedule unavailable", { exact: true }),
-  ).toBeVisible();
-  expect(writes).toBe(0);
-  fail = false;
-  await page.getByRole("button", { name: "Try again", exact: true }).click();
-  await expect(page.getByLabel("Back up every")).toHaveValue("24");
-  await expect(
-    page.getByRole("switch", { name: "Enable automatic backups" }),
-  ).toBeChecked();
-  await expect(
-    page.getByRole("button", { name: "Save schedule", exact: true }),
-  ).toBeEnabled();
 });

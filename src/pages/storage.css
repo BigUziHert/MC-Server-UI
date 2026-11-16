@@ -253,7 +253,7 @@
   width: 5px;
   height: 5px;
   border-radius: 50%;
-  background: var(--accent);
+  background: #ffd000;
   display: inline-block;
 }
 .storage-hint {
@@ -426,7 +426,7 @@
   border-radius: 6px;
   border: 1px solid #773c38;
   background: #422320;
-  color: var(--danger-text);
+  color: #ffc1b7;
   font-size: 12px;
   line-height: 1.7;
 }
@@ -450,7 +450,7 @@
   display: grid;
   place-items: center;
   background: #ffd00008;
-  color: var(--accent);
+  color: #ffd000;
   flex-shrink: 0;
 }
 .backup-stat-label {
@@ -591,7 +591,7 @@
   max-height: 150px;
   overflow-y: auto;
   overflow-wrap: anywhere;
-  color: var(--danger-text);
+  color: #ffc1b7;
   font-size: 11px;
   line-height: 1.7;
   padding-left: 20px;
@@ -646,7 +646,7 @@
   font-size: 9px;
 }
 .backup-complete {
-  color: var(--accent);
+  color: #ffd000;
 }
 .backup-trigger {
   color: var(--storage-muted);
@@ -742,7 +742,7 @@
 }
 .schedule-fields select:focus,
 .schedule-fields input:focus {
-  outline: 1px solid var(--accent);
+  outline: 1px solid #ffd000;
   outline-offset: 1px;
 }
 .input-with-unit {
@@ -821,7 +821,7 @@
   background: #15151d;
 }
 .backup-next-run.active .next-run-icon {
-  color: var(--accent);
+  color: #ffd000;
 }
 .backup-schedule-note {
   display: flex;
@@ -893,7 +893,7 @@
   width: 100%;
   height: 8px;
   margin-top: 12px;
-  accent-color: var(--accent);
+  accent-color: #ffd000;
 }
 .backup-job .backup-job-file {
   overflow: hidden;

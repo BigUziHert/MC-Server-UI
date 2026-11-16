@@ -73,9 +73,9 @@ export function createRemoteTls({
       if (
         !cert ||
         Date.parse(cert.validTo) < now() + 30 * 86400_000 ||
-        !(isIP(publicHost)
-          ? cert.checkIP(publicHost)
-          : cert.checkHost(publicHost))
+        hosts.some(
+          (host) => !(isIP(host) ? cert.checkIP(host) : cert.checkHost(host)),
+        )
       ) {
         const generated = await selfsigned.generate(
           [{ name: "commonName", value: "MC Panel remote access" }],

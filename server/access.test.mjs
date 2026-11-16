@@ -6,7 +6,6 @@ import os from "node:os";
 import path from "node:path";
 import {
   createAccessService,
-  accessClientKey,
   createAccessRateLimiter,
   validateAccessConfiguration,
   SUBUSER_COOKIE,
@@ -89,10 +88,6 @@ test("direct IP access needs only HTTPS address and port, with no email service"
     port: 3002,
     transport: "direct",
     ready: true,
-    panelId: f.access.status().panelId,
-    panelName: f.access.status().panelName,
-    activeSessions: 0,
-    pendingInvitations: 0,
   });
   assert.deepEqual(validateAccessConfiguration({}), {
     enabled: false,
@@ -241,15 +236,12 @@ test("invitations persist only token hashes, accept once, and preserve live perm
     role: "subuser",
     email: "sister@example.com",
     ...scopeA,
-    expiresAt: "2026-10-19T00:00:00.000Z",
-    panelId: f.access.status().panelId,
-    panelName: f.access.status().panelName,
     permissions: ["control.start", "control.stop"],
     memberships: [scopeA],
   });
   assert.match(
     cookie,
-    /^__Host-mc-subuser=[\w-]{43}; Path=\/; HttpOnly; SameSite=Strict; Secure; Max-Age=2592000$/,
+    /^__Host-mc-subuser=[\w-]{43}; Path=\/; HttpOnly; SameSite=Strict; Secure; Max-Age=604800$/,
   );
   const saved = await f.read();
   assert.equal(JSON.stringify(saved).includes(token), false);
@@ -362,7 +354,7 @@ test("expired invitations and sessions reject authentication; password login sti
     message: /ask the server owner/,
   });
   const signedIn = await f.enroll();
-  f.advance(30 * 24 * 60 * 60 * 1000);
+  f.advance(7 * 24 * 60 * 60 * 1000);
   assert.equal(await f.access.authenticate(request(signedIn.cookie)), null);
   assert.ok((await f.login()).session);
 });
@@ -492,7 +484,7 @@ test("an invitation never retains another account's session or invalid cookie sc
       let cookie = first.cookie;
       if (invalidation === "different-email")
         memberB.user.email = "other@example.com";
-      if (invalidation === "expired") f.advance(30 * 24 * 60 * 60 * 1000);
+      if (invalidation === "expired") f.advance(7 * 24 * 60 * 60 * 1000);
       if (invalidation === "revoked")
         await f.access.revoke("server-a", "user-a");
       if (invalidation === "forged")
@@ -653,13 +645,12 @@ test("unsafe settings are rejected and retired mail fields are dropped", async (
   await assert.rejects(f.invite(), { status: 409 });
 });
 
-test("pausing preserves sessions while origin and transport changes invalidate them", async (t) => {
+test("disable, origin changes and transport changes invalidate sessions and links", async (t) => {
   const f = await fixture(t);
   const first = await f.enroll();
   await f.access.configure({ enabled: false });
-  assert.equal(await f.access.authenticate(request(first.cookie)), null);
   await f.access.configure({ enabled: true });
-  assert.ok(await f.access.authenticate(request(first.cookie)));
+  assert.equal(await f.access.authenticate(request(first.cookie)), null);
   const second = await f.login();
   await f.access.configure({ publicUrl: "https://203.0.113.18:3002" });
   assert.equal(await f.access.authenticate(request(second.cookie)), null);
@@ -901,54 +892,8 @@ test("rate limiter ignores spoofed forwarding headers, caps memory, and recovers
   assert.equal(response.headers["Retry-After"], "10");
   attempt("192.0.2.1", "");
   attempt("192.0.2.2", "");
-  assert.equal(
-    allowed,
-    4,
-    "new clients evict the oldest bucket instead of locking out the whole table",
-  );
+  assert.equal(allowed, 3);
   now += 10_000;
   attempt("127.0.0.1", "4.5.6.7");
-  assert.equal(allowed, 5);
-});
-
-test("rate limiter groups IPv6 privacy addresses and successes do not consume failure budgets", () => {
-  assert.equal(
-    accessClientKey("2001:db8:1234:5678::1"),
-    accessClientKey("2001:db8:1234:5678:abcd:ffff:1111:2222"),
-  );
-  assert.notEqual(
-    accessClientKey("2001:db8:1234:5678::1"),
-    accessClientKey("2001:db8:1234:5679::1"),
-  );
-  const limiter = createAccessRateLimiter({ limit: 2, failuresOnly: true });
-  let allowed = 0;
-  const run = (status) => {
-    let finish;
-    const response = {
-      statusCode: status,
-      once: (_event, fn) => {
-        finish = fn;
-      },
-      setHeader() {},
-      status(code) {
-        this.statusCode = code;
-        return this;
-      },
-      json() {},
-    };
-    limiter(
-      { socket: { remoteAddress: "192.0.2.1" } },
-      response,
-      () => allowed++,
-    );
-    finish?.();
-    return response.statusCode;
-  };
-  for (let i = 0; i < 20; i++) assert.equal(run(200), 200);
-  assert.equal(run(401), 401);
-  assert.equal(run(200), 200);
-  assert.equal(run(401), 401);
-  assert.equal(run(401), 401);
-  assert.equal(run(401), 429);
-  assert.equal(allowed, 24);
+  assert.equal(allowed, 4);
 });

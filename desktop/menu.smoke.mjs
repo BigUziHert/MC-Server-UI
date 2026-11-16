@@ -88,9 +88,9 @@ try {
   await expect(
     addPanel.getByLabel("Invitation link", { exact: true }),
   ).toBeVisible();
-  await expect(
-    addPanel.getByRole("button", { name: "Sign in", exact: true }),
-  ).toBeVisible();
+  await expect(addPanel.getByRole("button", { name: /sign in/i })).toHaveCount(
+    0,
+  );
   const screenshotDir = path.join(project, "release", "smoke-results");
   await fs.mkdir(screenshotDir, { recursive: true });
   await page.screenshot({
@@ -154,7 +154,6 @@ try {
     .getByLabel("Panel address", { exact: true })
     .fill("http://uncontacted.example.test");
   await signIn
-    .getByRole("form", { name: "Sign in to panel", exact: true })
     .getByRole("button", {
       name: "Sign in",
       exact: true,

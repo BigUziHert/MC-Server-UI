@@ -14,9 +14,6 @@ async function settingsFixture(
     startupSupported?: boolean;
     startupReason?: string;
     missingAutoStartServerIds?: string[];
-    unavailableAutoStartServerIds?: string[];
-    autoStartServerNames?: Record<string, string>;
-    startupError?: string;
     servers?: typeof startupServers;
     remoteWarning?: string;
   } = {},
@@ -29,11 +26,6 @@ async function settingsFixture(
     startupSupported: options.startupSupported ?? true,
     startupReason: options.startupReason,
     missingAutoStartServerIds: options.missingAutoStartServerIds ?? [],
-    unavailableAutoStartServerIds: options.unavailableAutoStartServerIds ?? [],
-    autoStartServerNames: options.autoStartServerNames ?? {},
-    startupError: options.startupError,
-    startupAttempted: true,
-    startupPending: false,
   };
   const servers = options.servers ?? startupServers;
   let remote = {
@@ -50,7 +42,6 @@ async function settingsFixture(
     },
   };
   const writes: unknown[] = [];
-  const startupRetries: unknown[] = [];
   const remoteWrites: unknown[] = [];
   await page.route("**/api/access/session", (route) =>
     route.fulfill({ json: { role: "owner" } }),
@@ -83,9 +74,6 @@ async function settingsFixture(
   await page.route("**/api/panel-users", (route) =>
     route.fulfill({ json: { users: [], servers } }),
   );
-  await page.route("**/api/access/people", (route) =>
-    route.fulfill({ json: { panelName: "This computer", users: [], servers } }),
-  );
   await page.route("**/api/desktop/settings", async (route) => {
     if (!settings.desktop)
       return route.fulfill({ status: 404, json: { error: "Not available" } });
@@ -94,13 +82,6 @@ async function settingsFixture(
       settings = { ...settings, ...route.request().postDataJSON() };
     }
     return route.fulfill({ json: settings });
-  });
-  await page.route("**/api/desktop/startup/retry", (route) => {
-    startupRetries.push(route.request().method());
-    settings = { ...settings, startupError: undefined };
-    return route.fulfill({
-      json: { failures: [], startedServerIds: ["survival"] },
-    });
   });
   await page.route("**/api/access/settings", async (route) => {
     if (route.request().method() === "PUT") {
@@ -126,7 +107,7 @@ async function settingsFixture(
       },
     });
   });
-  return { writes, remoteWrites, startupRetries };
+  return { writes, remoteWrites };
 }
 
 async function openSettings(page: Page) {
@@ -135,53 +116,6 @@ async function openSettings(page: Page) {
     .click();
   return page.getByRole("dialog", { name: "Panel Settings", exact: true });
 }
-
-test("automatic startup failures appear on launch and can be reviewed and retried", async ({
-  page,
-}) => {
-  await page.addInitScript(() => {
-    let bridge: Window["mcPanelConnections"];
-    Object.defineProperty(window, "mcPanelConnections", {
-      configurable: true,
-      get: () => bridge,
-      set: (value) => {
-        bridge = { ...value, runtime: "desktop" };
-      },
-    });
-  });
-  const fixture = await settingsFixture(page, {
-    startupError: "Survival world: accept the Minecraft EULA before starting.",
-    autoStartServerIds: ["survival", "removed-world"],
-    missingAutoStartServerIds: ["removed-world"],
-    autoStartServerNames: { "removed-world": "Old survival world" },
-  });
-  await page.goto("/");
-  const notice = page.locator(".panel-startup-notice");
-  await expect(notice).toContainText("accept the Minecraft EULA");
-  await notice.getByRole("button", { name: "Review", exact: true }).click();
-  const dialog = page.getByRole("dialog", {
-    name: "Panel Settings",
-    exact: true,
-  });
-  await dialog
-    .getByRole("button", {
-      name: "Servers to start when the panel opens",
-      exact: true,
-    })
-    .click();
-  await expect(
-    dialog.getByRole("checkbox", { name: /Old survival world \(removed\)/ }),
-  ).toBeChecked();
-  await page.keyboard.press("Escape");
-  await dialog
-    .getByRole("button", { name: "Retry failed starts", exact: true })
-    .click();
-  await expect(
-    dialog.getByRole("button", { name: "Retry failed starts", exact: true }),
-  ).toHaveCount(0);
-  expect(fixture.startupRetries).toEqual(["POST"]);
-  await expect(notice).toHaveCount(0);
-});
 
 test("startup roster failures can retry without discarding settings edits", async ({
   page,
@@ -235,7 +169,6 @@ test("Remote Access reports a committed save with an audit warning without retry
   await dialog.getByRole("tab", { name: "Remote Access", exact: true }).click();
   const address = dialog.getByLabel("Public panel address", { exact: true });
   await address.fill("https://saved.example.test");
-  page.once("dialog", (dialog) => dialog.accept());
   await dialog
     .getByRole("button", { name: "Save access settings", exact: true })
     .click();
@@ -469,10 +402,7 @@ test("browser Panel Settings persists host Remote Access and fits a phone", asyn
     dialog.getByRole("tab", { name: "Remote Access", exact: true }),
   ).toHaveAttribute("aria-selected", "true");
   await expect(
-    dialog.getByRole("heading", {
-      name: "People · This computer",
-      exact: true,
-    }),
+    dialog.getByRole("heading", { name: "Panel users", exact: true }),
   ).toBeVisible();
   await dialog
     .getByLabel("Public panel address", { exact: true })
@@ -483,9 +413,8 @@ test("browser Panel Settings persists host Remote Access and fits a phone", asyn
     dialog.getByLabel("Public panel address", { exact: true }),
   ).toHaveValue("https://updated-panel.example.test");
   await dialog
-    .getByRole("switch", { name: "Enable remote access", exact: true })
+    .getByRole("checkbox", { name: "Enable remote access", exact: true })
     .check();
-  page.once("dialog", (dialog) => dialog.accept());
   await dialog.getByRole("button", { name: "Save access settings" }).click();
   await expect(
     dialog.getByRole("heading", { name: "Remote access is configured" }),
@@ -517,10 +446,10 @@ test("browser Panel Settings persists host Remote Access and fits a phone", asyn
   await dialog.getByRole("tab", { name: "Remote Access", exact: true }).click();
   await dialog.getByRole("button", { name: "Edit setup" }).click();
   await expect(
-    dialog.getByRole("switch", { name: "Enable remote access", exact: true }),
+    dialog.getByRole("checkbox", { name: "Enable remote access", exact: true }),
   ).toBeChecked();
   await dialog
-    .getByRole("switch", { name: "Enable remote access", exact: true })
+    .getByRole("checkbox", { name: "Enable remote access", exact: true })
     .uncheck();
   await dialog.getByRole("button", { name: "Save access settings" }).click();
   await expect(
@@ -674,7 +603,7 @@ async function managedSettingsFixture(
   return fixture;
 }
 
-test("remote setup offers connection modes and waits for a selected trusted certificate without replacing edits", async ({
+test("remote setup offers only trusted HTTPS on 443 and waits for the certificate without replacing edits", async ({
   page,
 }, testInfo) => {
   const fixture = await managedSettingsFixture(page);
@@ -683,18 +612,10 @@ test("remote setup offers connection modes and waits for a selected trusted cert
   const dialog = await openSettings(page);
   await dialog.getByRole("tab", { name: "Remote Access", exact: true }).click();
   const setup = dialog.getByRole("region", { name: "Remote access setup" });
-  const method = setup.getByRole("combobox", {
-    name: "Connection method",
-    exact: true,
-  });
-  await expect(method).toHaveValue("direct");
-  await expect(method.getByRole("option")).toHaveText([
-    "Trusted HTTPS (public address)",
-    "Same network or VPN (desktop)",
-    "Existing HTTPS reverse proxy",
-  ]);
-  await method.selectOption("managed");
+  await expect(setup.getByRole("combobox")).toHaveCount(0);
   await expect(setup).toContainText("Trusted HTTPS");
+  await expect(setup).not.toContainText("Self-signed HTTPS");
+  await expect(setup).not.toContainText("HTTPS handled by a proxy");
   await expect(
     setup.getByLabel("Remote access port", { exact: true }),
   ).toHaveCount(0);
@@ -715,9 +636,8 @@ test("remote setup offers connection modes and waits for a selected trusted cert
   });
   await expect(invite).toBeDisabled();
   await setup
-    .getByRole("switch", { name: "Enable remote access", exact: true })
+    .getByRole("checkbox", { name: "Enable remote access", exact: true })
     .check();
-  page.once("dialog", (dialog) => dialog.accept());
   await setup
     .getByRole("button", { name: "Save access settings", exact: true })
     .click();
@@ -772,7 +692,7 @@ test("remote setup offers connection modes and waits for a selected trusted cert
 });
 
 for (const transport of ["direct", "proxy"]) {
-  test(`existing ${transport} setup stays intact until explicitly selecting and saving trusted HTTPS`, async ({
+  test(`existing ${transport} setup changes only after saving the trusted HTTPS upgrade`, async ({
     page,
   }) => {
     const fixture = await managedSettingsFixture(page, {
@@ -790,12 +710,17 @@ for (const transport of ["direct", "proxy"]) {
       .click();
     let setup = dialog.getByRole("region", { name: "Remote access setup" });
     const original = { ...fixture.settings };
+    await expect(setup.getByRole("combobox")).toHaveCount(0);
     await expect(
-      setup.getByRole("combobox", { name: "Connection method", exact: true }),
-    ).toHaveValue(transport);
+      setup.getByRole("note", { name: "Trusted HTTPS upgrade" }),
+    ).toContainText("https://existing.example.test:3004");
+    await expect(setup).toContainText("It stays unchanged until you save");
+    await expect(setup).toContainText(
+      "Existing accounts, passwords, and server permissions are preserved",
+    );
     await expect(
       setup.getByLabel("Public panel address", { exact: true }),
-    ).toHaveValue("https://existing.example.test:3004");
+    ).toHaveValue("https://existing.example.test");
     await setup
       .getByText("Advanced connection options", { exact: true })
       .click();
@@ -817,14 +742,7 @@ for (const transport of ["direct", "proxy"]) {
     setup = dialog.getByRole("region", { name: "Remote access setup" });
     await expect(
       setup.getByLabel("Public panel address", { exact: true }),
-    ).toHaveValue("https://existing.example.test:3004");
-    await setup
-      .getByRole("combobox", { name: "Connection method", exact: true })
-      .selectOption("managed");
-    await setup
-      .getByLabel("Public panel address", { exact: true })
-      .fill("https://existing.example.test");
-    page.once("dialog", (dialog) => dialog.accept());
+    ).toHaveValue("https://existing.example.test");
     await setup
       .getByRole("button", { name: "Save access settings", exact: true })
       .click();
@@ -840,8 +758,8 @@ for (const transport of ["direct", "proxy"]) {
       },
     ]);
     await expect(
-      setup.getByRole("combobox", { name: "Connection method", exact: true }),
-    ).toHaveValue("managed");
+      setup.getByRole("note", { name: "Trusted HTTPS upgrade" }),
+    ).toHaveCount(0);
     await expect(
       dialog.getByRole("button", {
         name: "Create invite link for invited@example.test",

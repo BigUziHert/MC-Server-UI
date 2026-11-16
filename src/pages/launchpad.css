@@ -551,7 +551,7 @@
   margin: 3px 0 0;
 }
 .launchpad-error {
-  color: var(--danger-text);
+  color: #efb3a4;
   border-color: #704338;
   background: #40282230;
 }
@@ -723,7 +723,7 @@
   overflow-wrap: anywhere;
 }
 .launchpad-clean-warning {
-  color: var(--danger-text);
+  color: #efb3a4;
   border-color: #704338;
   background: #40282230;
   margin-top: 18px;
@@ -889,110 +889,4 @@
   .launchpad-dialog .management-dialog-actions {
     flex-wrap: wrap;
   }
-}
-
-.launchpad-badge.duplicate {
-  color: var(--danger-text);
-  border-color: var(--danger-border);
-  background: var(--danger-surface);
-}
-.launchpad-review-warning {
-  padding: 10px 12px;
-  border-left: 3px solid var(--accent);
-  background: var(--panel);
-}
-.launchpad-update-selection {
-  max-height: 260px;
-  overflow: auto;
-  margin-block: 12px;
-}
-.launchpad-dependency-decisions {
-  margin-block: 16px;
-}
-.launchpad-dependency-decisions .form-field {
-  padding-block: 10px;
-  border-bottom: 1px solid var(--border);
-}
-.address-note {
-  font-size: 12px;
-  color: var(--muted);
-  margin: 4px 0;
-}
-.launchpad-view-tabs {
-  display: flex;
-  gap: 8px;
-  margin-bottom: 12px;
-}
-.launchpad-installed-row .launchpad-create-server {
-  grid-column: 1 / -1;
-  justify-self: start;
-  white-space: normal;
-}
-@media (max-width: 700px) {
-  .launchpad-installed-list {
-    overflow-x: visible;
-  }
-  .launchpad-installed-list .launchpad-installed-header {
-    display: none;
-  }
-  .launchpad-installed-list .launchpad-installed-row,
-  .launchpad-installed-list.has-active .launchpad-installed-row {
-    min-width: 0;
-    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
-    grid-template-areas: "name name" "author author" "action remove" "active active" "added modified";
-    gap: 12px;
-    padding: 16px 14px;
-  }
-  .launchpad-installed-row .launchpad-installed-author::before {
-    content: "By ";
-  }
-  .launchpad-installed-row .launchpad-active {
-    justify-self: start;
-  }
-  .launchpad-installed-row .launchpad-active::before {
-    content: "Active";
-    margin-right: 8px;
-  }
-  .launchpad-installed-date time {
-    white-space: normal;
-  }
-}
-
-@media (max-width: 700px) {
-  .launchpad-date-added::before,
-  .launchpad-date-modified::before {
-    display: block;
-    color: var(--muted);
-    font-size: 10px;
-    margin-bottom: 4px;
-  }
-  .launchpad-date-added::before {
-    content: "Added";
-  }
-  .launchpad-date-modified::before {
-    content: "Modified";
-  }
-  .launchpad-installed-list[aria-label="Catalog content list"]
-    .launchpad-date-added::before {
-    content: "Published";
-  }
-  .launchpad-installed-list[aria-label="Catalog content list"]
-    .launchpad-date-modified::before {
-    content: "Updated";
-  }
-}
-
-.launchpad-dependency-summary {
-  margin: 12px 0;
-  padding: 12px;
-  border: 1px solid var(--border);
-  border-radius: 8px;
-}
-.launchpad-dependency-summary p {
-  color: var(--muted);
-  font-size: 12px;
-}
-.launchpad-dependency-summary li {
-  margin: 8px 0;
-  overflow-wrap: anywhere;
 }

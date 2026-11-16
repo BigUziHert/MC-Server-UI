@@ -12,7 +12,6 @@ const iconData = (fill: string) =>
 
 const invitationToken = "A".repeat(43);
 const panelOrigin = "https://panel.example.test";
-const home = process.env.PANEL_E2E_BASE_URL ?? "http://127.0.0.1:3111";
 const invitationUrl = `${panelOrigin}/#invite=${invitationToken}`;
 const localServer = {
   id: "local-connection-fixture",
@@ -376,7 +375,7 @@ async function remoteAccount(
   return { writes };
 }
 
-test("saved connections expose unavailable and signed-out panels and remove only the confirmed destination", async ({
+test("saved connections expose unavailable and signed-out panels and forget only the confirmed destination", async ({
   page,
 }) => {
   await desktopBridge(page, {
@@ -404,14 +403,10 @@ test("saved connections expose unavailable and signed-out panels and remove only
     "This saved panel is offline.",
   );
   await dialog
-    .getByRole("button", {
-      name: "Remove from this device pc-one.example:3002",
-    })
+    .getByRole("button", { name: "Forget pc-one.example:3002" })
     .click();
   await expect(
-    dialog.getByRole("heading", {
-      name: "Remove from this device: pc-one.example:3002?",
-    }),
+    dialog.getByRole("heading", { name: "Forget pc-one.example:3002?" }),
   ).toBeVisible();
   await expect(dialog).toContainText(
     "Minecraft servers on that panel stay on their host and keep running",
@@ -421,12 +416,10 @@ test("saved connections expose unavailable and signed-out panels and remove only
     dialog.getByRole("button", { name: "Retry pc-one.example:3002" }),
   ).toBeVisible();
   await dialog
-    .getByRole("button", {
-      name: "Remove from this device pc-one.example:3002",
-    })
+    .getByRole("button", { name: "Forget pc-one.example:3002" })
     .click();
   await dialog
-    .getByRole("button", { name: "Remove from this device", exact: true })
+    .getByRole("button", { name: "Forget connection", exact: true })
     .click();
   await expect(
     dialog.getByRole("button", { name: "Retry pc-one.example:3002" }),
@@ -446,7 +439,7 @@ test("saved connections expose unavailable and signed-out panels and remove only
   await expect(account).toBeFocused();
 });
 
-test("the remote sign-in screen can remove its saved connection without contacting the host", async ({
+test("the remote sign-in screen can forget its saved connection without contacting the host", async ({
   page,
 }) => {
   await desktopBridge(page, {
@@ -470,17 +463,13 @@ test("the remote sign-in screen can remove its saved connection without contacti
   await page.getByRole("button", { name: "Manage panel connections" }).click();
   const dialog = page.getByRole("dialog", { name: "Panel connections" });
   await dialog
-    .getByRole("button", {
-      name: "Remove from this device pc-one.example:3002",
-    })
+    .getByRole("button", { name: "Forget pc-one.example:3002" })
     .click();
   await dialog
-    .getByRole("button", { name: "Remove from this device", exact: true })
+    .getByRole("button", { name: "Forget connection", exact: true })
     .click();
   await expect(
-    dialog.getByRole("button", {
-      name: "Remove from this device pc-one.example:3002",
-    }),
+    dialog.getByRole("button", { name: "Forget pc-one.example:3002" }),
   ).toHaveCount(0);
   await expect(
     dialog.getByRole("button", { name: "Open pc-two.example:3002" }),
@@ -2495,7 +2484,8 @@ for (const invitation of [false, true]) {
     await page.route(`${panelOrigin}/api/**`, (route) => {
       const request = route.request();
       const headers = {
-        "Access-Control-Allow-Origin": request.headers().origin || home,
+        "Access-Control-Allow-Origin":
+          request.headers().origin || "http://127.0.0.1:3111",
         "Access-Control-Allow-Headers":
           "authorization,content-type,x-mc-panel-client,x-server-id",
         "Access-Control-Allow-Methods": "GET,POST,OPTIONS",
@@ -2568,10 +2558,7 @@ for (const invitation of [false, true]) {
         .fill("Fixture-only-account-password");
       expect(remoteRequests).toEqual([]);
     }
-    const form = invitation
-      ? dialog
-      : dialog.getByRole("form", { name: /^Sign in/ });
-    await form
+    await dialog
       .getByRole("button", {
         name: invitation ? "Continue with invitation" : "Sign in",
         exact: true,
@@ -2591,7 +2578,7 @@ for (const invitation of [false, true]) {
         dialog.getByLabel("Panel address", { exact: true }),
       ).toHaveValue("https://PANEL.example.test:443");
     }
-    expect(new URL(page.url()).origin).toBe(home);
+    expect(new URL(page.url()).origin).toBe("http://127.0.0.1:3111");
     // Only validation runs before the destination-specific preview or sign-in.
     expect(navigations).toEqual([]);
     expect(remoteRequests.length).toBeGreaterThan(0);
@@ -2641,10 +2628,6 @@ for (const width of [1280, 375]) {
         return route.fulfill({ json: { servers: [], defaultServerId: null } });
       if (path === "/api/panel-users")
         return route.fulfill({ json: { users: [], servers: [] } });
-      if (path === "/api/access/people")
-        return route.fulfill({
-          json: { panelName: "Empty host", users: [], servers: [] },
-        });
       if (path === "/api/access/settings")
         return route.fulfill({
           json: {
@@ -2675,14 +2658,8 @@ for (const width of [1280, 375]) {
       .getByRole("tab", { name: "Remote Access", exact: true })
       .click();
     await expect(
-      settings.getByRole("heading", {
-        name: "People · Empty host",
-        exact: true,
-      }),
+      settings.getByRole("heading", { name: "Panel users", exact: true }),
     ).toBeVisible();
-    await expect(
-      settings.getByRole("button", { name: "Invite person", exact: true }),
-    ).toBeEnabled();
     await expect
       .poll(
         () => calls.filter((call) => call.path === "/api/panel-users").length,
@@ -2713,7 +2690,7 @@ for (const width of [1280, 375]) {
       page.getByRole("heading", { name: "Welcome to MC Panel", exact: true }),
     ).toBeVisible();
     await expect(
-      page.getByRole("heading", { name: "People · Empty host", exact: true }),
+      page.getByRole("heading", { name: "Panel users", exact: true }),
     ).toHaveCount(0);
   });
 }

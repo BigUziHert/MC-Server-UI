@@ -399,9 +399,7 @@ export default function Properties({
           value={search}
           onValueChange={setSearch}
         />
-        <span>
-          {filtered.length} {filtered.length === 1 ? "property" : "properties"}
-        </span>
+        <span>{filtered.length} properties</span>
         <RefreshButton
           label="Refresh properties"
           disabled={loading || saving || missingDraft}

@@ -56,7 +56,7 @@ async function openSubusers(page: Page, id: string) {
   await page.goto("/#subusers");
   await selectServer(page, id);
   await expect(
-    page.getByRole("heading", { name: "Server access", exact: true }),
+    page.getByRole("heading", { name: "Subusers", exact: true }),
   ).toBeVisible();
 }
 
@@ -72,7 +72,7 @@ async function openPanelUsers(page: Page) {
     .getByRole("tab", { name: "Remote Access", exact: true })
     .click();
   await expect(
-    settings.getByRole("heading", { name: /^People · / }),
+    settings.getByRole("heading", { name: "Panel users", exact: true }),
   ).toBeVisible();
   return settings;
 }
@@ -156,13 +156,9 @@ for (const view of ["accounts", "server"] as const) {
     }
     await openSubusers(page, server.id);
     if (view === "accounts") await openPanelUsers(page);
-    const list = page
-      .locator(
-        view === "accounts"
-          ? ".panel-users"
-          : ".subusers-page:not(.panel-users)",
-      )
-      .getByRole("region", { name: "People records", exact: true });
+    const list = page.locator(
+      view === "accounts" ? ".panel-users" : ".subusers-page:not(.panel-users)",
+    );
     await expect(
       list.getByRole("row").filter({ hasText: departed.email }),
     ).toBeVisible();
@@ -258,7 +254,7 @@ for (const action of [
         action === "grant"
           ? "Grant server access"
           : action === "edit"
-            ? "Edit server permissions"
+            ? "Edit subuser permissions"
             : action === "remove"
               ? "Remove access record?"
               : action === "reset"
@@ -272,10 +268,7 @@ for (const action of [
         .getByLabel("Panel account", { exact: true })
         .selectOption(account.id);
       await dialog
-        .getByRole("button", {
-          name: "Use Read files and backups preset",
-          exact: true,
-        })
+        .getByRole("button", { name: "Use Viewer preset", exact: true })
         .click();
     }
     if (action === "edit") {
@@ -561,7 +554,7 @@ test("an account invite grants no server access, and grant/edit/revoke affect on
     .click();
   await expect(dialog).not.toBeVisible();
   await expect(
-    settings.getByRole("heading", { name: /^People · / }),
+    settings.getByRole("heading", { name: "Panel users", exact: true }),
   ).toBeVisible();
   const account = (await users(request)).find(
     (user) => user.email === "separate-account@example.test",
@@ -639,7 +632,7 @@ test("an account invite grants no server access, and grant/edit/revoke affect on
     })
     .click();
   dialog = page.getByRole("dialog", {
-    name: "Edit server permissions",
+    name: "Edit subuser permissions",
     exact: true,
   });
   await showPermissionDetails(dialog);
@@ -760,10 +753,7 @@ test("permission presets and mixed groups preserve automatic server access when 
     .getByLabel("Panel account", { exact: true })
     .selectOption(account.id);
   await dialog
-    .getByRole("button", {
-      name: "Use Read files and backups preset",
-      exact: true,
-    })
+    .getByRole("button", { name: "Use Viewer preset", exact: true })
     .click();
   await showPermissionDetails(dialog);
   await expect(
@@ -814,7 +804,7 @@ test("permission presets and mixed groups preserve automatic server access when 
     })
     .click();
   const edit = page.getByRole("dialog", {
-    name: "Edit server permissions",
+    name: "Edit subuser permissions",
     exact: true,
   });
   await showPermissionDetails(edit);
@@ -962,11 +952,7 @@ test("panel account changes preserve legacy server mappings and show saved acces
   });
   await openSubusers(page, server.id);
   await openPanelUsers(page);
-  const row = page
-    .locator(".panel-users")
-    .getByRole("region", { name: "People records", exact: true })
-    .getByRole("row")
-    .filter({ hasText: account.email });
+  const row = page.getByRole("row").filter({ hasText: account.email });
   await expect(row).toContainText(account.accessReview.message);
   await expect(row).toContainText(
     "Existing sign-ins keep their previous server access",
@@ -1096,7 +1082,7 @@ test("a failed account invitation preserves zero grants and clipboard retries re
   await expect(dialog).toBeVisible();
   const link = dialog.getByLabel("Invitation link", { exact: true });
   await expect(link).toHaveValue(invitationUrl);
-  await expect(dialog).toContainText("No servers have been shared yet.");
+  await expect(dialog).toContainText("This invitation grants no server access");
   await expect(dialog).toContainText("at least 12 characters");
   await dialog.getByRole("button", { name: "Copy link", exact: true }).click();
   await expect(dialog.getByRole("status")).toContainText(
@@ -1234,15 +1220,6 @@ test("trusted remote setup detects the public IP on request and surfaces listene
   page,
   server,
 }, testInfo) => {
-  let migrationConfirmations = 0;
-  page.on("dialog", async (dialog) => {
-    expect(dialog.type()).toBe("confirm");
-    expect(dialog.message()).toContain(
-      "Changing the address or connection mode signs out",
-    );
-    migrationConfirmations++;
-    await dialog.accept();
-  });
   const changes: Record<string, unknown>[] = [];
   let configured = {
     enabled: true,
@@ -1300,9 +1277,7 @@ test("trusted remote setup detects the public IP on request and surfaces listene
     exact: true,
   });
   expect(discoveries).toBe(0);
-  await expect(
-    setup.getByRole("combobox", { name: "Connection method", exact: true }),
-  ).toHaveValue("managed");
+  await expect(setup.getByRole("combobox")).toHaveCount(0);
   await expect(
     setup.getByLabel("Certificate SHA-256 fingerprint", { exact: true }),
   ).toHaveCount(0);
@@ -1331,7 +1306,7 @@ test("trusted remote setup detects the public IP on request and surfaces listene
   });
   await expect(
     setup.getByRole("button", { name: "Save access settings", exact: true }),
-  ).toBeDisabled();
+  ).toBeEnabled();
   await page.screenshot({
     path: testInfo.outputPath("subusers-access-setup-desktop.png"),
     fullPage: true,
@@ -1349,7 +1324,6 @@ test("trusted remote setup detects the public IP on request and surfaces listene
     .getByRole("button", { name: "Save access settings", exact: true })
     .click();
   await expect.poll(() => changes.length).toBe(2);
-  expect(migrationConfirmations).toBe(2);
   await expect(setup.getByRole("alert")).toContainText(
     "Internal service port is already in use.",
   );

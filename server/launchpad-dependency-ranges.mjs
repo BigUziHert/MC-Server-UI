@@ -28,17 +28,8 @@ const numericVersion = (value) => {
 // recommendations and cannot prove a required range.
 // https://maven.apache.org/pom.html#Dependency_Version_Requirement_Specification
 function permittedByRange(version, value) {
-  // Forge's empty/default and Maven recommendation-only ranges impose no
-  // hard bound. Unknown objects and malformed bracket expressions still fail.
-  if (value === undefined || (typeof value === "string" && !value.trim()))
-    return true;
   if (typeof value !== "string" || value.length > 4096) unverifiable();
   let remainder = value.trim();
-  if (remainder === "*") return true;
-  if (!/[\[\](),]/.test(remainder)) {
-    mavenVersion(remainder);
-    return true;
-  }
   const ranges = [];
   while (remainder) {
     const match = /^([[(])([^\[\]()]*)([\])])/.exec(remainder);
@@ -194,34 +185,6 @@ export async function installedDependencySatisfies(
   { loader, signal } = {},
 ) {
   signal?.throwIfAborted();
-  if (["fabric", "quilt"].includes(loader)) {
-    try {
-      const { inspectInstalledMod } =
-        await import("./launchpad-mod-metadata.mjs");
-      const { updateDependencySatisfies } =
-        await import("./launchpad-update-dependencies.mjs");
-      const [parent, installed] = await Promise.all([
-        inspectInstalledMod(parentArchive, { loader, signal }),
-        inspectInstalledMod(installedArchive, { loader, signal }),
-      ]);
-      const ids = new Set(installed.provided);
-      const requirements = parent.requirements.filter(({ id }) => ids.has(id));
-      return (
-        requirements.some(({ id }) => parent.required.includes(id)) &&
-        requirements.every(({ id, range }) =>
-          installed.providers.some(
-            (provider) =>
-              provider.id === id &&
-              updateDependencySatisfies(provider.version, range, loader),
-          ),
-        )
-      );
-    } catch (cause) {
-      signal?.throwIfAborted();
-      if (cause?.name === "AbortError") throw cause;
-      return false;
-    }
-  }
   if (loader !== "forge" && loader !== "neoforge") return false;
   try {
     const installed = new Map();
@@ -284,10 +247,7 @@ export async function installedDependencySatisfies(
               unverifiable();
             let type;
             if (modern) {
-              type =
-                typeof dependency.type === "string"
-                  ? dependency.type.toLowerCase()
-                  : (dependency.type ?? "required");
+              type = dependency.type ?? "required";
               if (
                 ![
                   "required",

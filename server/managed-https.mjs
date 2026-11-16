@@ -7,9 +7,6 @@ import { spawn as spawnProcess } from "node:child_process";
 import https from "node:https";
 import { checkServerIdentity } from "node:tls";
 
-// Private per-process proof: never use the public health-check marker as authentication.
-export const managedProxyToken = randomUUID();
-
 const issuanceMessage =
   "Waiting for a trusted certificate. Forward TCP port 443 to this computer and allow MC Panel HTTPS through the firewall. Your public address must point here. MC Panel retries automatically.";
 const error = (message, code) => Object.assign(new Error(message), { code });
@@ -83,14 +80,6 @@ export function createCaddyConfig({
                     ...(instanceId
                       ? {
                           headers: {
-                            request: {
-                              set: {
-                                "X-MC-Client-IP": [
-                                  "{http.request.remote.host}",
-                                ],
-                                "X-MC-Proxy": [managedProxyToken],
-                              },
-                            },
                             response: {
                               set: { "X-MC-Panel-HTTPS": [instanceId] },
                             },

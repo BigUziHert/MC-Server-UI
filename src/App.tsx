@@ -1,4 +1,3 @@
-import { SetupAccountContext, UnfinishedSetupNotice } from "./setup-drafts";
 import {
   useCallback,
   useContext,
@@ -9,11 +8,11 @@ import {
 } from "react";
 import {
   ArrowDown,
-  AlertCircle,
   ArrowDownToLine,
   ArrowRight,
   Box,
   Check,
+  CheckCheck,
   ChevronRight,
   CircleHelp,
   Clock3,
@@ -92,7 +91,6 @@ import ServerManager, {
 } from "./ServerManager";
 import "./welcome.css";
 import DesktopWorkspace from "./DesktopWorkspace";
-import { DesktopWorkspaceContext } from "./workspace-target";
 
 type Page =
   | "console"
@@ -105,17 +103,8 @@ type Page =
   | "backups"
   | "audit";
 type Server = {
-  orphaned?: boolean;
-  orphanedUnresolved?: boolean;
-  lastExit?: {
-    at: string;
-    code: number | null;
-    reason?: string;
-    unexpected?: boolean;
-    startupFailed?: boolean;
-  } | null;
   name: string;
-  address: string | null;
+  address: string;
   status: "running" | "offline" | "starting" | "stopping";
   mode: "live";
   version: string | null;
@@ -129,8 +118,7 @@ type Server = {
   iconVersion?: string | null;
   serverIconVersion?: string | null;
   iconPreference?: "server" | "default";
-  addressSource?: "public" | "custom" | "local" | "lan" | "unavailable";
-  lanAddress?: string | null;
+  addressSource?: "public" | "custom" | "local";
   addressNote?: string;
   memoryLimit: number | null;
   memoryLimitSource?: "panel" | "launch" | "unknown";
@@ -316,17 +304,15 @@ function Sparkline({
   );
 }
 
-export default function App(props: Parameters<typeof LegacyHostedPanelApp>[0]) {
+export default function App(props: Parameters<typeof PanelApp>[0]) {
   return window.mcPanelConnections?.unified ? (
     <DesktopWorkspace />
   ) : (
-    <LegacyHostedPanelApp {...props} />
+    <PanelApp {...props} />
   );
 }
 
-// Host-served compatibility for pre-unified released desktop shells.
-// This branch is intentionally retained; see docs/legacy-desktop-compatibility.md.
-function LegacyHostedPanelApp({
+function PanelApp({
   session,
   onSignedOut,
   requestedRemoteServer,
@@ -677,7 +663,7 @@ function LegacyHostedPanelApp({
     else if (!active)
       document.title = `${loading ? "Opening" : error ? "Connection error" : "Welcome"} · MC Panel`;
   }, [active, error, firstServerSetup, loading]);
-  const saved = (server: ServerRecord, outcome?: { incomplete?: boolean }) => {
+  const saved = (server: ServerRecord) => {
     fleetRequest.current++;
     fleetInFlight.current = false;
     setLoading(false);
@@ -690,13 +676,11 @@ function LegacyHostedPanelApp({
     setActiveId(server.id);
     if (!manager?.editing) window.location.hash = "console";
     setNotice(
-      outcome?.incomplete
-        ? "Server created, but installation did not finish. Open Versions or Launchpad to finish setup before starting."
-        : manager?.editing
-          ? "Server settings saved."
-          : server.source === "imported"
-            ? "Server imported. Your files stay in their original folder."
-            : "Server created. Your new workspace is ready.",
+      manager?.editing
+        ? "Server settings saved."
+        : server.source === "imported"
+          ? "Server imported. Your files stay in their original folder."
+          : "Server created. Your new workspace is ready.",
     );
     setManager(null);
     void loadServers();
@@ -742,8 +726,7 @@ function LegacyHostedPanelApp({
             onConnect={setConnection}
             onAdd={
               canAddServer
-                ? (initialStep = "choice") =>
-                    setManager({ editing: null, initialStep })
+                ? () => setManager({ editing: null, initialStep: "choice" })
                 : undefined
             }
             onSettings={
@@ -831,7 +814,7 @@ function LegacyHostedPanelApp({
           className={`toast ${!active || firstServerSetup ? "fleet-empty-toast" : ""}`}
           role="status"
         >
-          <MessageSquare size={18} />
+          <CheckCheck size={18} />
           <span>{notice}</span>
           <button
             aria-label="Dismiss server notification"
@@ -846,18 +829,9 @@ function LegacyHostedPanelApp({
   return (
     <SessionActiveContext.Provider value={isSessionActive}>
       <SessionScopeContext.Provider value={sessionScope}>
-        <SetupAccountContext.Provider
-          value={
-            session?.accountId ||
-            session?.userId ||
-            session?.email ||
-            "local-owner"
-          }
-        >
-          <PropertyDraftsContext.Provider value={propertyDrafts.current}>
-            {workspace}
-          </PropertyDraftsContext.Provider>
-        </SetupAccountContext.Provider>
+        <PropertyDraftsContext.Provider value={propertyDrafts.current}>
+          {workspace}
+        </PropertyDraftsContext.Provider>
       </SessionScopeContext.Provider>
     </SessionActiveContext.Provider>
   );
@@ -878,7 +852,6 @@ export function EmptyFleet({
   onSignedOut?: () => void;
   notify: (message: string, error?: boolean) => void;
 }) {
-  const workspace = useContext(DesktopWorkspaceContext);
   const openLocalSetup = session
     ? window.mcPanelConnections?.openLocalServerSetup
     : undefined;
@@ -989,16 +962,6 @@ export function EmptyFleet({
                 />
               </>
             )}
-            {workspace?.connections?.panels.some(
-              (panel) => !panel.local && !panel.temporary,
-            ) && (
-              <nav className="welcome-computers" aria-label="Saved computers">
-                <ServerSwitcher
-                  servers={workspace.localServers}
-                  onSelect={(id) => workspace.select("local", id)}
-                />
-              </nav>
-            )}
             <div className="welcome-remote-account">
               {session && !showWelcome && <DesktopPanelReturn />}
               <PanelAccount
@@ -1104,7 +1067,7 @@ export function ServerWorkspace({
   servers: ServerRecord[];
   selected: ServerRecord;
   onSelect: (id: string) => void;
-  onAdd?: (step?: "choice" | "create" | "import") => void;
+  onAdd?: () => void;
   onSettings?: (status?: ServerRecord["status"]) => void;
   onConnect: (mode: ConnectionMode) => void;
   session?: PanelSession;
@@ -1115,14 +1078,8 @@ export function ServerWorkspace({
   const panelTarget = useContext(PanelScope);
   const can = (permission: string) =>
     !permissions || permissions.includes(permission);
-  const allowedNavigation = navigation.filter((item) =>
-    item.id === "files"
-      ? can("file.read") || can("backup.read")
-      : item.id === "players"
-        ? can("players.read") ||
-          can("players.whitelist") ||
-          can("control.console")
-        : !pagePermissions[item.id] || can(pagePermissions[item.id]!),
+  const allowedNavigation = navigation.filter(
+    (item) => !pagePermissions[item.id] || can(pagePermissions[item.id]!),
   );
   const [requestedPage, setPage] = useState<Page>(getPage);
   const page = allowedNavigation.some((item) => item.id === requestedPage)
@@ -1230,22 +1187,10 @@ export function ServerWorkspace({
   }, [api]);
   const controls = useServerPower(server, refresh, notify, permissions);
   useEffect(() => {
-    let running = false;
-    const poll = async () => {
-      if (running || document.visibilityState === "hidden") return;
-      running = true;
-      try {
-        await refresh();
-      } finally {
-        running = false;
-      }
-    };
-    void poll();
-    const timer = window.setInterval(poll, 3000);
-    document.addEventListener("visibilitychange", poll);
+    void refresh();
+    const timer = window.setInterval(refresh, 3000);
     return () => {
       clearInterval(timer);
-      document.removeEventListener("visibilitychange", poll);
       latestStatusResponse.current = ++statusRequest.current;
     };
   }, [refresh]);
@@ -1529,49 +1474,6 @@ export function ServerWorkspace({
           </div>
         </header>
         <main className="main-content">
-          {onAdd && (
-            <UnfinishedSetupNotice
-              serverId={selected.id}
-              onResume={() => onAdd("choice")}
-            />
-          )}
-          {server?.orphaned && (
-            <div className="management-notice warning" role="alert">
-              <AlertCircle size={18} />
-              <span>
-                {server.orphanedUnresolved
-                  ? "The previous launcher exited, and its remaining server processes cannot be identified safely. Stop this server's Java processes on the host before confirming below."
-                  : "A server process from a previous panel session is still running. Settings stay locked until it stops. Force stop can recover control, but unsaved game progress may be lost."}
-              </span>
-              {server.orphanedUnresolved && !permissions && (
-                <button
-                  className="btn"
-                  onClick={() => controls.setConfirmPower("resolve-orphan")}
-                >
-                  Confirm already stopped
-                </button>
-              )}
-            </div>
-          )}
-          {server?.status === "offline" &&
-            (server.lastExit?.unexpected || server.lastExit?.startupFailed) && (
-              <div className="connection-error" role="alert">
-                <strong>
-                  {server.lastExit.startupFailed
-                    ? "Server startup failed."
-                    : "The server stopped unexpectedly."}
-                </strong>{" "}
-                {server.lastExit.reason ||
-                  `Exit code ${server.lastExit.code ?? "unknown"}.`}{" "}
-                <a className="btn" href="#console">
-                  Review Console logs
-                </a>
-                <span>
-                  Check the latest error, Java version, and installed mods
-                  before restarting.
-                </span>
-              </div>
-            )}
           {connectionError && (
             <div className="connection-error" role="alert">
               {selected.sourceError
@@ -1612,18 +1514,10 @@ export function ServerWorkspace({
             <Players notify={notify} permissions={permissions} />
           )}
           {page === "versions" && (
-            <Versions
-              notify={notify}
-              permissions={permissions}
-              serverData={server}
-            />
+            <Versions notify={notify} permissions={permissions} />
           )}
           {page === "launchpad" && (
-            <Launchpad
-              notify={notify}
-              permissions={permissions}
-              onCreateServer={onAdd ? () => onAdd("create") : undefined}
-            />
+            <Launchpad notify={notify} permissions={permissions} />
           )}
           {page === "properties" && (
             <Properties notify={notify} permissions={permissions} />
@@ -1657,11 +1551,7 @@ export function ServerWorkspace({
           className={`toast ${toast.error ? "error" : ""}`}
           role={toast.error ? "alert" : "status"}
         >
-          {toast.error ? (
-            <AlertCircle size={18} />
-          ) : (
-            <MessageSquare size={18} />
-          )}
+          {toast.error ? <CircleHelp size={18} /> : <CheckCheck size={18} />}
           <span>{toast.message}</span>
           <button
             aria-label="Dismiss notification"
@@ -1756,30 +1646,25 @@ function useServerPower(
   const [commandBusy, setCommandBusy] = useState(false);
   const commandRequest = useRef(0);
   const [powerAction, setPowerAction] = useState<
-    "start" | "stop" | "restart" | "force-stop" | "resolve-orphan" | null
+    "start" | "stop" | "restart" | "force-stop" | null
   >(null);
   const activePowerAction = useRef<typeof powerAction>(null);
   const powerRequest = useRef(0);
   const busy = commandBusy || powerAction !== null;
-  const canPower = (
-    action: "start" | "stop" | "restart" | "force-stop" | "resolve-orphan",
-  ) =>
+  const canPower = (action: "start" | "stop" | "restart" | "force-stop") =>
     !permissions ||
-    (action !== "resolve-orphan" &&
-      permissions.includes(
-        `control.${action === "force-stop" ? "stop" : action}`,
-      ));
+    permissions.includes(
+      `control.${action === "force-stop" ? "stop" : action}`,
+    );
   const [confirmPower, setConfirmPower] = useState<
-    "restart" | "force-stop" | "resolve-orphan" | null
+    "restart" | "force-stop" | null
   >(null);
   useDialogFocus(confirmPower !== null, () => setConfirmPower(null));
   useEffect(() => {
     if (confirmPower === "force-stop" && server?.status !== "stopping")
       setConfirmPower(null);
   }, [confirmPower, server?.status]);
-  async function power(
-    action: "start" | "stop" | "restart" | "force-stop" | "resolve-orphan",
-  ) {
+  async function power(action: "start" | "stop" | "restart" | "force-stop") {
     if (!canPower(action)) return;
     // Block repeated clicks before React updates both sets of controls. A
     // confirmed force stop can still replace a graceful stop that is stuck.
@@ -1800,9 +1685,7 @@ function useServerPower(
     try {
       await post("/server/power", {
         action,
-        ...(["force-stop", "resolve-orphan"].includes(action)
-          ? { confirmed: true }
-          : {}),
+        ...(action === "force-stop" ? { confirmed: true } : {}),
       });
       if (token !== powerRequest.current) return;
       await refresh();
@@ -1877,7 +1760,7 @@ function PowerButtons({
           }}
         >
           <Square size={12} fill="currentColor" />
-          {server?.status === "stopping" ? "Force stop" : "Stop"}
+          {server?.status === "stopping" ? "Force Stop" : "Stop"}
         </button>
       )}
     </div>
@@ -1901,16 +1784,13 @@ function PowerConfirmation({
             aria-labelledby="power-title"
           >
             <h2 id="power-title">
-              {confirmPower === "resolve-orphan"
-                ? "Confirm the server is already stopped?"
-                : `${confirmPower === "force-stop" ? "Force stop" : "Restart"} your server?`}
+              {confirmPower === "force-stop" ? "Force stop" : "Restart"} your
+              server?
             </h2>
             <p>
-              {confirmPower === "resolve-orphan"
-                ? "Confirm only after checking the host and stopping every Java process belonging to this server. The panel checks its game port before unlocking files. Other servers must remain untouched."
-                : confirmPower === "force-stop"
-                  ? "This immediately ends the server process without waiting for saving to finish. Unsaved progress may be lost or world files damaged. Use this only if the server is stuck stopping. The server will stay stopped."
-                  : "Connected players will be disconnected. The server will receive a graceful stop command to save its world."}
+              {confirmPower === "force-stop"
+                ? "This immediately ends the server process without waiting for saving to finish. Unsaved progress may be lost or world files damaged. Use this only if the server is stuck stopping. The server will stay stopped."
+                : "Connected players will be disconnected. The server will receive a graceful stop command to save its world."}
             </p>
             <div className="modal-actions">
               <button className="btn" onClick={() => setConfirmPower(null)}>
@@ -1920,11 +1800,9 @@ function PowerConfirmation({
                 className={`btn ${confirmPower === "restart" ? "restart-button" : "danger"}`}
                 onClick={() => power(confirmPower)}
               >
-                {confirmPower === "resolve-orphan"
-                  ? "I stopped this server's processes"
-                  : confirmPower === "force-stop"
-                    ? "Force stop server"
-                    : "Restart server"}
+                {confirmPower === "force-stop"
+                  ? "Force stop server"
+                  : "Restart server"}
               </button>
             </div>
           </section>
@@ -1978,18 +1856,6 @@ function ConsolePage({
   const [logError, setLogError] = useState(false);
   const commandInput = useRef<HTMLInputElement>(null);
   const logContainer = useRef<HTMLDivElement>(null);
-  const logContent = useRef<HTMLDivElement>(null);
-  const followedLogLayout = useRef({ height: 0, viewport: 0, width: 0 });
-  const followLogTail = useCallback(() => {
-    const output = logContainer.current;
-    if (!output) return;
-    followedLogLayout.current = {
-      height: output.scrollHeight,
-      viewport: output.clientHeight,
-      width: output.clientWidth,
-    };
-    output.scrollTop = output.scrollHeight;
-  }, []);
   const commandHistory = useRef<Record<"command" | "message", string[]>>({
     command: [],
     message: [],
@@ -2008,20 +1874,7 @@ function ConsolePage({
       const latest = Number(result.lines.at(-1)?.id ?? 0);
       if (latest && latest < lastLogId.current) setHiddenUntil(null);
       if (latest) lastLogId.current = latest;
-      setLines((previous) =>
-        previous.length === result.lines.length &&
-        previous.every((line, index) => {
-          const next = result.lines[index];
-          return (
-            line.id === next.id &&
-            line.time === next.time &&
-            line.level === next.level &&
-            line.message === next.message
-          );
-        })
-          ? previous
-          : result.lines,
-      );
+      setLines(result.lines);
       setLogError(false);
     } catch {
       if (request < latestLogResponse.current) return;
@@ -2031,35 +1884,17 @@ function ConsolePage({
   }, [api, canConsole]);
   useEffect(() => {
     if (!canConsole) return;
-    let running = false;
-    const poll = async () => {
-      if (running || document.visibilityState === "hidden") return;
-      running = true;
-      try {
-        await loadLogs();
-      } finally {
-        running = false;
-      }
-    };
-    void poll();
-    const timer = setInterval(poll, 1500);
-    document.addEventListener("visibilitychange", poll);
+    void loadLogs();
+    const timer = setInterval(loadLogs, 1500);
     return () => {
       clearInterval(timer);
-      document.removeEventListener("visibilitychange", poll);
       latestLogResponse.current = ++logRequest.current;
     };
   }, [loadLogs, canConsole]);
   useEffect(() => {
-    if (!autoScroll) return;
-    followLogTail();
-    // Font loading and responsive layout can rewrap unchanged log lines. Keep
-    // following those changes without depending on a new polling response.
-    const observer = new ResizeObserver(followLogTail);
-    if (logContainer.current) observer.observe(logContainer.current);
-    if (logContent.current) observer.observe(logContent.current);
-    return () => observer.disconnect();
-  }, [lines, autoScroll, levelFilter, query, showSearch, followLogTail]);
+    if (autoScroll && logContainer.current)
+      logContainer.current.scrollTop = logContainer.current.scrollHeight;
+  }, [lines, autoScroll, levelFilter, query, showSearch]);
   useEffect(() => {
     const listener = (e: KeyboardEvent) => {
       if (
@@ -2120,7 +1955,6 @@ function ConsolePage({
     }
   }
   function downloadLogs() {
-    if (!lines.length) return;
     const blob = new Blob(
       [
         lines
@@ -2136,10 +1970,8 @@ function ConsolePage({
     const anchor = document.createElement("a");
     anchor.href = url;
     anchor.download = "server-console.log";
-    document.body.appendChild(anchor);
     anchor.click();
-    anchor.remove();
-    setTimeout(() => URL.revokeObjectURL(url), 60_000);
+    URL.revokeObjectURL(url);
     notify("Console log download started.");
   }
   const isRunning = server?.status === "running";
@@ -2194,14 +2026,16 @@ function ConsolePage({
               {onSettings && (
                 <button
                   className="rename-server-button"
-                  aria-label="Edit server settings"
-                  title="Server settings (including name)"
+                  aria-label="Rename server"
+                  title="Rename server"
                   onClick={onSettings}
                 >
                   <Pencil size={14} />
                 </button>
               )}
-              <span className={`status-badge ${server?.status || "offline"}`}>
+              <span
+                className={`status-badge ${isRunning ? "running" : "offline"}`}
+              >
                 <i />
                 {server?.status || "Connecting"}
               </span>
@@ -2216,17 +2050,6 @@ function ConsolePage({
               <span>{gameAddress || "Loading address…"}</span>
               <Copy size={12} />
             </button>
-            {server?.addressNote && (
-              <p className="address-note" role="status">
-                {server.addressNote}
-              </p>
-            )}
-            {server?.lanAddress &&
-              formatGameAddress(server.lanAddress) !== gameAddress && (
-                <p className="address-note">
-                  On the same network: {formatGameAddress(server.lanAddress)}
-                </p>
-              )}
           </div>
         </div>
         {server?.sourceError && <p role="status">{server.sourceError}</p>}
@@ -2334,18 +2157,11 @@ function ConsolePage({
           <div className="storage-progress">
             <div
               style={{
-                width:
-                  server?.diskLimit && server.disk != null
-                    ? `${Math.min(100, (server.disk / server.diskLimit) * 100)}%`
-                    : "0%",
+                width: `${Math.max(1, Math.min(100, ((server?.disk || 0) / (server?.diskLimit || 1024 ** 3)) * 100))}%`,
               }}
             />
           </div>
-          <div className="metric-footnote">
-            {server?.diskLimit
-              ? "Filesystem storage"
-              : "Filesystem capacity unavailable"}
-          </div>
+          <div className="metric-footnote">Filesystem storage</div>
         </div>
         <div className="metric-card players-metric">
           <div className="metric-label">
@@ -2354,7 +2170,7 @@ function ConsolePage({
           </div>
           <div className="metric-value">
             {playersUnavailable ? "—" : server?.players.length || 0}
-            <span>/ {server?.maxPlayers ?? "—"}</span>
+            <span>/ {server?.maxPlayers || 20}</span>
           </div>
           <div className="metric-subtitle">
             {playersUnavailable
@@ -2411,7 +2227,6 @@ function ConsolePage({
                   className="tool-button"
                   aria-label="Download console logs"
                   title="Download logs"
-                  disabled={!lines.length}
                   onClick={downloadLogs}
                 >
                   <ArrowDownToLine size={16} />
@@ -2467,61 +2282,41 @@ function ConsolePage({
               role="log"
               aria-label="Server console output"
               aria-live="off"
-              onScroll={(event) => {
-                const output = event.currentTarget;
-                const layout = followedLogLayout.current;
-                if (
-                  autoScroll &&
-                  (output.scrollHeight !== layout.height ||
-                    output.clientHeight !== layout.viewport ||
-                    output.clientWidth !== layout.width)
-                ) {
-                  followLogTail();
-                  return;
-                }
-                if (
-                  output.scrollHeight - output.clientHeight - output.scrollTop >
-                  24
-                )
-                  setAutoScroll(false);
-              }}
             >
-              <div ref={logContent} style={{ display: "flow-root" }}>
-                {logError ? (
-                  <div className="console-empty">
-                    Console connection unavailable. Retrying…
+              {logError ? (
+                <div className="console-empty">
+                  Console connection unavailable. Retrying…
+                </div>
+              ) : visibleLines.length ? (
+                visibleLines.map((line) => (
+                  <div
+                    className={`log-line log-${line.level}`}
+                    // Keep retained rows mounted so scroll anchoring survives log rotation.
+                    key={line.id}
+                  >
+                    <time>
+                      {/^\d{2}:\d{2}/.test(line.time)
+                        ? line.time
+                        : new Date(line.time).toLocaleTimeString("en-GB")}
+                    </time>
+                    <span className="log-level">
+                      {line.level.toUpperCase()}
+                    </span>
+                    <span className="log-message">{line.message}</span>
                   </div>
-                ) : visibleLines.length ? (
-                  visibleLines.map((line) => (
-                    <div
-                      className={`log-line log-${line.level}`}
-                      // Keep retained rows mounted so scroll anchoring survives log rotation.
-                      key={line.id}
-                    >
-                      <time>
-                        {/^\d{2}:\d{2}/.test(line.time)
-                          ? line.time
-                          : new Date(line.time).toLocaleTimeString("en-GB")}
-                      </time>
-                      <span className="log-level">
-                        {line.level.toUpperCase()}
-                      </span>
-                      <span className="log-message">{line.message}</span>
-                    </div>
-                  ))
-                ) : (
-                  <div className="console-empty">
-                    <Terminal size={24} />
-                    <p>
-                      {levelFilter !== "all"
-                        ? "No logs match your filters."
-                        : search
-                          ? "No logs match your search."
-                          : "Console is ready. Server output will appear here."}
-                    </p>
-                  </div>
-                )}
-              </div>
+                ))
+              ) : (
+                <div className="console-empty">
+                  <Terminal size={24} />
+                  <p>
+                    {levelFilter !== "all"
+                      ? "No logs match your filters."
+                      : search
+                        ? "No logs match your search."
+                        : "Console is ready. Server output will appear here."}
+                  </p>
+                </div>
+              )}
             </div>
             <div className="console-status">
               <span>

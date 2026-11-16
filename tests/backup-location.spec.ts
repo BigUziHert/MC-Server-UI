@@ -206,12 +206,7 @@ test("a typed folder moves real archives and preserves downloads, restores, and 
     name: "Restore this backup?",
     exact: true,
   });
-  await restore
-    .getByRole("checkbox", {
-      name: "I understand this will replace my current server files.",
-      exact: true,
-    })
-    .check();
+  await restore.getByRole("checkbox").check();
   await restore
     .getByRole("button", { name: "Restore backup", exact: true })
     .click();
@@ -556,50 +551,107 @@ async function sharedBackupSession(
   return storageRequests;
 }
 
-test("legacy backup location grants cannot expose host folders to a shared account", async ({
+test("an explicitly authorized shared account browses the host and moves its backups", async ({
   page,
   request,
   backups,
-}) => {
+}, testInfo) => {
   const requests = await sharedBackupSession(page, backups, () => [
     "server.view",
     "backup.read",
     "backup.location",
   ]);
-  const initial = await location(request, backups.id);
   await page.goto("/#backups");
-  await expect(
-    page.getByRole("heading", { name: "Backups", exact: true }),
-  ).toBeVisible();
-  await expect(
-    page.getByRole("button", { name: "Change location", exact: true }),
-  ).toHaveCount(0);
-  await expect(
-    page.getByRole("heading", { name: "Backup location", exact: true }),
-  ).toHaveCount(0);
   await expect(
     page.getByRole("button", { name: "Dismiss backup status", exact: true }),
   ).toHaveCount(0);
-  expect(requests).toEqual([]);
+  await page
+    .getByRole("button", { name: "Change location", exact: true })
+    .click();
+  const dialog = changeDialog(page);
+  await expect(dialog).toContainText("computer hosting this server");
+  await dialog
+    .getByRole("button", { name: "Browse folders", exact: true })
+    .click();
+  const picker = dialog.getByRole("region", {
+    name: "Choose backup folder",
+    exact: true,
+  });
+  await picker
+    .getByLabel("Folder path", { exact: true })
+    .fill(path.dirname(backups.destination));
+  await picker.getByRole("button", { name: "Open", exact: true }).click();
+  await picker
+    .getByLabel("New folder name (optional)", { exact: true })
+    .fill(path.basename(backups.destination));
+  await picker
+    .getByRole("button", { name: "Use new folder", exact: true })
+    .click();
+  await dialog
+    .getByRole("button", { name: "Review move", exact: true })
+    .click();
+  await expect(dialog).toContainText(backups.destination);
+  await expect(dialog).toContainText("1 backup");
+  await page.screenshot({
+    path: testInfo.outputPath("remote-backup-location-review.png"),
+    fullPage: true,
+  });
+  await dialog
+    .getByRole("button", { name: "Move backups", exact: true })
+    .click();
+  await expect
+    .poll(async () => (await location(request, backups.id)).job?.status)
+    .toBe("completed");
+  await expect(dialog).not.toBeVisible();
   expect((await location(request, backups.id)).directory).toBe(
-    initial.directory,
+    backups.destination,
   );
+  expect(
+    (
+      await readFile(
+        path.join(backups.destination, `${backups.backup.id}.tar.gz`),
+      )
+    ).length,
+  ).toBeGreaterThan(0);
+  expect(requests.some((item) => item.path.endsWith("/directories"))).toBe(
+    true,
+  );
+  expect(
+    requests.filter((item) => item.method === "POST").map((item) => item.path),
+  ).toEqual(["/api/backups/location/preview", "/api/backups/location/jobs"]);
+  expect(requests.every((item) => item.serverId === backups.id)).toBe(true);
 });
 
-test("removing a legacy location grant leaves shared host storage inaccessible", async ({
+test("revoking remote backup location access blocks a reviewed move and hides the control", async ({
   page,
+  request,
   backups,
 }) => {
   let permissions = ["server.view", "backup.read", "backup.location"];
-  const requests = await sharedBackupSession(page, backups, () => permissions);
+  await sharedBackupSession(page, backups, () => permissions);
+  const initial = await location(request, backups.id);
   await page.goto("/#backups");
+  await page
+    .getByRole("button", { name: "Change location", exact: true })
+    .click();
+  const dialog = changeDialog(page);
+  await dialog
+    .getByLabel("Backup folder", { exact: true })
+    .fill(backups.destination);
+  await dialog
+    .getByRole("button", { name: "Review move", exact: true })
+    .click();
   await expect(
-    page.getByRole("heading", { name: "Backups", exact: true }),
-  ).toBeVisible();
-  await expect(
-    page.getByRole("button", { name: "Change location", exact: true }),
-  ).toHaveCount(0);
+    dialog.getByRole("button", { name: "Move backups", exact: true }),
+  ).toBeEnabled();
   permissions = ["server.view", "backup.read"];
+  await dialog
+    .getByRole("button", { name: "Move backups", exact: true })
+    .click();
+  await expect(dialog).not.toBeVisible();
+  expect((await location(request, backups.id)).directory).toBe(
+    initial.directory,
+  );
   await page.reload();
   await expect(
     page.getByRole("heading", { name: "Backups", exact: true }),
@@ -610,7 +662,6 @@ test("removing a legacy location grant leaves shared host storage inaccessible",
   await expect(
     page.getByRole("button", { name: "Change location", exact: true }),
   ).toHaveCount(0);
-  expect(requests).toEqual([]);
 });
 
 test("ordinary backup permissions cannot browse or change host backup storage", async ({

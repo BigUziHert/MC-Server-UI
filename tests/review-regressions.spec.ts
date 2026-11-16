@@ -486,11 +486,10 @@ for (const location of ["away", "returned", "edited"] as const) {
   });
 }
 
-test("status and console polls coalesce in flight and resume after completion", async ({
+test("late status and console polls cannot replace newer responses", async ({
   page,
   request,
 }) => {
-  await page.clock.install();
   const original = await (await request.get("/api/server")).json();
   let release!: () => void;
   const gate = new Promise<void>((resolve) => {
@@ -523,21 +522,14 @@ test("status and console polls coalesce in flight and resume after completion", 
   });
   try {
     await page.goto("/#console");
-    await expect.poll(() => [statuses, logs]).toEqual([1, 1]);
-    await page.clock.fastForward(5_000);
-    expect([statuses, logs]).toEqual([1, 1]);
-    release();
-    await expect(page.locator(".server-banner .status-badge")).toHaveText(
-      "offline",
-    );
-    await expect(page.getByText("Old response", { exact: true })).toBeVisible();
-    await page.clock.fastForward(1_500);
     await expect(page.locator(".server-banner .status-badge")).toHaveText(
       "running",
     );
     await expect(
       page.getByText("Current response", { exact: true }),
     ).toBeVisible();
+    release();
+    await page.unrouteAll({ behavior: "wait" });
     await expect(page.locator(".server-banner .status-badge")).toHaveText(
       "running",
     );
@@ -572,7 +564,7 @@ test("settings conflicts retain the draft and require explicit reload before ove
     );
     await page.goto("/#console");
     await page
-      .getByRole("button", { name: "Edit server settings", exact: true })
+      .getByRole("button", { name: "Rename server", exact: true })
       .click();
     await page
       .getByRole("textbox", { name: "Server name", exact: true })
@@ -873,61 +865,3 @@ test("signing out clears private clipboard metadata before another account opens
     page.getByText("Private customer project", { exact: true }),
   ).toHaveCount(0);
 });
-
-for (const dismissal of ["Escape", "backdrop"] as const) {
-  test(`file edits survive an accidental ${dismissal} dismissal`, async ({
-    page,
-  }) => {
-    await page.route("**/api/files?*", (route) =>
-      route.fulfill({
-        json: {
-          path: "",
-          entries: [
-            {
-              name: "review-draft.txt",
-              path: "review-draft.txt",
-              type: "file",
-              size: 5,
-              modified: "2026-11-15T00:00:00Z",
-            },
-          ],
-        },
-      }),
-    );
-    await page.route("**/api/files/content?*", (route) =>
-      route.fulfill({ json: { content: "saved", revision: "original" } }),
-    );
-    await page.goto("/#files");
-    await page
-      .getByRole("button", { name: "Edit review-draft.txt", exact: true })
-      .click();
-    const dialog = page.getByRole("dialog");
-    await dialog
-      .getByLabel("File contents", { exact: true })
-      .fill("keep my work");
-    if (dismissal === "Escape") await page.keyboard.press("Escape");
-    else await page.mouse.click(2, 2);
-    await expect(
-      dialog.getByText("Discard your unsaved changes?", { exact: true }),
-    ).toBeVisible();
-    await dialog
-      .getByRole("button", { name: "Keep editing", exact: true })
-      .click();
-    await expect(
-      dialog.getByLabel("File contents", { exact: true }),
-    ).toHaveValue("keep my work");
-    await dialog
-      .getByRole("button", { name: "Close dialog", exact: true })
-      .click();
-    await dialog
-      .getByRole("button", { name: "Discard changes", exact: true })
-      .click();
-    await expect(dialog).toHaveCount(0);
-    await page
-      .getByRole("button", { name: "Edit review-draft.txt", exact: true })
-      .click();
-    await expect(page.getByLabel("File contents", { exact: true })).toHaveValue(
-      "saved",
-    );
-  });
-}

@@ -3,7 +3,6 @@ import path from "node:path";
 import os from "node:os";
 import { createHash } from "node:crypto";
 import { parseProperties } from "./import.mjs";
-import { updateProperties } from "./properties.mjs";
 
 const fail = (status, message) => Object.assign(new Error(message), { status });
 const inside = (root, target) => {
@@ -46,30 +45,6 @@ export async function prepareCleanSettings(result, ctx) {
   } catch (cause) {
     if (cause.code !== "ENOENT") throw cause;
   }
-  let previousProperties = "";
-  try {
-    previousProperties = await fs.readFile(
-      await ctx.safePath(ctx.serverDir, "server.properties"),
-      "utf8",
-    );
-  } catch (cause) {
-    if (cause.code !== "ENOENT") throw cause;
-  }
-  const previousValues = parseProperties(previousProperties);
-  const securityDefaults = {
-    "online-mode": "true",
-    "white-list": "false",
-    "enforce-whitelist": "false",
-    "enable-rcon": "false",
-    "enable-query": "false",
-    "rcon.password": "",
-    "server-ip": "",
-  };
-  const retainedSettings = ctx.preserveWorld
-    ? Object.fromEntries(previousValues)
-    : {};
-  for (const [key, fallback] of Object.entries(securityDefaults))
-    retainedSettings[key] = previousValues.get(key) ?? fallback;
   let properties = "level-name=world\nmotd=A Minecraft Server\n";
   try {
     properties = await fs.readFile(
@@ -79,96 +54,6 @@ export async function prepareCleanSettings(result, ctx) {
   } catch (cause) {
     if (cause.code !== "ENOENT") throw cause;
   }
-  properties = updateProperties(
-    properties,
-    new Map(Object.entries(retainedSettings)),
-    { appendMissing: true },
-  );
-  const preserved = new Set();
-  const actualNames = await fs.readdir(ctx.serverDir);
-  const actualName = (relative) =>
-    actualNames.find((name) => name === relative) ??
-    (process.platform === "win32"
-      ? actualNames.find(
-          (name) => name.toLowerCase() === relative.toLowerCase(),
-        )
-      : undefined) ??
-    relative;
-  const protectedFiles = [
-    "whitelist.json",
-    "ops.json",
-    "banned-players.json",
-    "banned-ips.json",
-  ];
-  for (const relative of protectedFiles) {
-    // Pack authors must never supply the host's player access policy.
-    result.files = result.files.filter(
-      (file) => file.path.toLowerCase() !== relative,
-    );
-    const stat = await fs
-      .lstat(await ctx.safePath(ctx.serverDir, relative))
-      .catch((cause) => {
-        if (cause.code === "ENOENT") return null;
-        throw cause;
-      });
-    if (stat) {
-      if (!stat.isFile() || stat.isSymbolicLink())
-        throw fail(
-          409,
-          `${relative} must be a regular file before installation.`,
-        );
-      preserved.add(actualName(relative));
-    }
-  }
-  if (ctx.preserveWorld) {
-    const level = previousValues.get("level-name") || "world";
-    const candidates = new Set([level, `${level}_nether`, `${level}_the_end`]);
-    for (const entry of await fs.readdir(ctx.serverDir, {
-      withFileTypes: true,
-    })) {
-      if (
-        entry.isDirectory() &&
-        (await fs.stat(path.join(ctx.serverDir, entry.name, "level.dat")).then(
-          (s) => s.isFile(),
-          () => false,
-        ))
-      )
-        candidates.add(entry.name);
-    }
-    for (const relative of candidates) {
-      if (
-        !relative ||
-        relative.includes("/") ||
-        relative.includes("\\") ||
-        relative === "." ||
-        relative === ".."
-      )
-        throw fail(
-          400,
-          "The existing world must use a direct child folder before it can be preserved.",
-        );
-      const stat = await fs
-        .lstat(await ctx.safePath(ctx.serverDir, relative))
-        .catch((cause) => {
-          if (cause.code === "ENOENT") return null;
-          throw cause;
-        });
-      if (stat) {
-        if (!stat.isDirectory() || stat.isSymbolicLink())
-          throw fail(409, `${relative} must be a regular world folder.`);
-        preserved.add(actualName(relative));
-      }
-    }
-  }
-  result.files = result.files.filter(
-    (file) =>
-      ![...preserved].some(
-        (relative) =>
-          file.path.toLowerCase() === relative.toLowerCase() ||
-          file.path.toLowerCase().startsWith(`${relative.toLowerCase()}/`),
-      ),
-  );
-  result.preserveExistingPaths = [...preserved];
   const values = parseProperties(properties);
   const maxPlayers = Number(values.get("max-players") ?? 20);
   const motd = (values.get("motd") ?? "A Minecraft Server")
@@ -187,18 +72,9 @@ export async function prepareCleanSettings(result, ctx) {
     "server.properties": `${properties.trimEnd()}\nserver-port=${config.port ?? 25565}\n`,
     "eula.txt": `# Minecraft EULA: https://aka.ms/MinecraftEULA\neula=${accepted}\n`,
   };
-  if (result.configuration.launchType === "java-args") {
+  if (result.configuration.launchType === "java-args")
     settings["user_jvm_args.txt"] =
       `-Xms${Math.min(1024, config.memoryLimitMB)}M\n-Xmx${config.memoryLimitMB}M\n`;
-    try {
-      settings["user_jvm_args.txt"] = await fs.readFile(
-        await ctx.safePath(ctx.serverDir, "user_jvm_args.txt"),
-        "utf8",
-      );
-    } catch (cause) {
-      if (cause.code !== "ENOENT") throw cause;
-    }
-  }
   for (const [relative, content] of Object.entries(settings)) {
     await fs.writeFile(await ctx.safePath(result.stageDir, relative), content);
     if (!result.files.some((file) => file.path === relative))
@@ -287,37 +163,7 @@ export async function cleanInstall(result, ctx) {
     written = [],
     directories = [];
   let pendingOriginal;
-  const preserved = new Set(result.preserveExistingPaths ?? []);
-  for (const name of preserved)
-    if (
-      typeof name !== "string" ||
-      !name ||
-      name.includes("/") ||
-      name.includes("\\") ||
-      name === "." ||
-      name === ".."
-    )
-      throw fail(400, "Invalid preserved server path.");
-  const preservedKeys = new Set(
-    [...preserved].map((name) => name.toLowerCase()),
-  );
-  if (
-    sources.some((file) =>
-      preservedKeys.has(file.path.split("/")[0].toLowerCase()),
-    )
-  )
-    throw fail(400, "Installer files overlap a preserved server path.");
-  const allOriginalNames = await fs.readdir(root);
-  const originalNames = allOriginalNames.filter(
-    (name) => !preservedKeys.has(name.toLowerCase()),
-  );
-  const preservedStats = new Map();
-  for (const name of preserved) {
-    const stat = await fs.lstat(await ctx.safePath(root, name));
-    if (stat.isSymbolicLink())
-      throw fail(409, "Preserved server paths must not be symbolic links.");
-    preservedStats.set(name, stamp(stat));
-  }
+  const originalNames = await fs.readdir(root);
   const originalStats = new Map();
   for (const name of originalNames)
     originalStats.set(
@@ -351,11 +197,7 @@ export async function cleanInstall(result, ctx) {
       }
     }
     await checkRoot();
-    if (
-      (await fs.readdir(root)).some(
-        (name) => !preservedKeys.has(name.toLowerCase()),
-      )
-    )
+    if ((await fs.readdir(root)).length)
       throw fail(
         409,
         "New files appeared in the server folder. They were left untouched; retry after external edits finish.",
@@ -405,7 +247,6 @@ export async function cleanInstall(result, ctx) {
         withFileTypes: true,
       })) {
         const relative = prefix + entry.name;
-        if (!prefix && preservedKeys.has(entry.name.toLowerCase())) continue;
         if (entry.isSymbolicLink())
           throw fail(409, "An external link appeared during installation.");
         if (entry.isDirectory()) {
@@ -437,9 +278,6 @@ export async function cleanInstall(result, ctx) {
         );
     }
     await checkRoot();
-    for (const [name, identity] of preservedStats)
-      if (stamp(await fs.lstat(await ctx.safePath(root, name))) !== identity)
-        throw fail(409, `${name} changed during installation. Review again.`);
     await ctx.commit();
     return {
       backupPath: await ctx.safePath(data, "recycle-bin"),
@@ -453,10 +291,7 @@ export async function cleanInstall(result, ctx) {
         const target = await ctx.safePath(root, file.path);
         if (stamp(await fs.lstat(target)) !== file.identity)
           throw new Error("External replacement");
-        const source = sources.find((entry) => entry.path === file.path);
-        if (source && (await hash(target)) === source.sha512)
-          await fs.unlink(target);
-        else await ctx.recycle(file.path);
+        await ctx.recycle(file.path);
       } catch {
         failures.push(file.path);
       }

@@ -29,12 +29,6 @@ export function browserSession(value) {
     userId: value.userId,
     ...(text(value.accountId, 128) ? { accountId: value.accountId } : {}),
     serverId: text(value.serverId, 128) ? value.serverId : null,
-    ...(text(value.panelId, 128) ? { panelId: value.panelId } : {}),
-    ...(text(value.panelName, 100) ? { panelName: value.panelName } : {}),
-    ...(text(value.expiresAt, 64) &&
-    Number.isFinite(Date.parse(value.expiresAt))
-      ? { expiresAt: value.expiresAt }
-      : {}),
     permissions: stringList(value.permissions),
     hostPermissions: stringList(value.hostPermissions),
   };
@@ -157,11 +151,6 @@ function decodeSnapshot(raw, home) {
       id: item.id,
       epoch: item.epoch,
       origin: item.origin,
-      ...(text(item.nickname, 100) ? { nickname: item.nickname } : {}),
-      ...(text(item.hostIdentity, 128)
-        ? { hostIdentity: item.hostIdentity }
-        : {}),
-      ...(text(item.panelName, 100) ? { panelName: item.panelName } : {}),
       token: item.token,
       ...(item.revocationToken
         ? { revocationToken: item.revocationToken }
@@ -346,15 +335,12 @@ export function createBrowserConnectionController({
           account: item.session ? browserSession(item.session) : undefined,
           servers: browserRoster(item.servers),
           requests: new Set(),
-          state: "connecting",
+          state: "unavailable",
           nextRefresh: 0,
           controls: 0,
         };
         panels.set(item.id, panel);
       } else {
-        panel.nickname = item.nickname;
-        panel.panelName = item.panelName;
-        panel.hostIdentity = item.hostIdentity;
         panel.pendingLeave = item.pendingLeave;
         panel.revocationToken = item.revocationToken;
         if (panel.state !== "connected")
@@ -390,7 +376,6 @@ export function createBrowserConnectionController({
             throw fail(409, "This panel sign-in changed.");
           const next = structuredClone(snapshot);
           update(next);
-          if (JSON.stringify(next) === JSON.stringify(snapshot)) return;
           next.revision++;
           const raw = JSON.stringify(next);
           if (raw.length > 4 * 1024 * 1024)
@@ -428,23 +413,16 @@ export function createBrowserConnectionController({
   const describe = (panel) => ({
     id: panel.id,
     origin: panel.origin,
-    label:
-      panel.nickname ||
-      panel.account?.panelName ||
-      panel.panelName ||
-      new URL(panel.origin).host,
+    label: new URL(panel.origin).host,
     local: false,
     signedIn: Boolean(panel.token && panel.account),
     session: panel.account,
     sessionEpoch: panel.epoch,
     pendingLeave: Boolean(panel.pendingLeave),
-    leaving: Boolean(panel.forgetting),
     connectionState: panel.temporary ? "connecting" : panel.state,
     servers: panel.servers,
     ...(panel.temporary ? { temporary: true } : {}),
-    ...(panel.logoutWarning || panel.error
-      ? { error: panel.logoutWarning || panel.error }
-      : {}),
+    ...(panel.error ? { error: panel.error } : {}),
   });
   const list = () => ({
     runtime: "browser",
@@ -474,15 +452,15 @@ export function createBrowserConnectionController({
       ...[...panels.values()].map(describe),
     ],
   });
-  async function remove(panel, epoch, localOnly = false) {
-    if (panel.pendingLeave && !localOnly) throw fail(409, pendingMessage);
+  async function remove(panel, epoch) {
+    if (panel.pendingLeave) throw fail(409, pendingMessage);
     requireCurrent(panel, epoch);
     panel.removing = true;
     invalidate(panel);
     try {
       await commit((next) => {
         const entry = updateRecord(next, panel.id);
-        if (entry.epoch !== epoch || (entry.pendingLeave && !localOnly))
+        if (entry.epoch !== epoch || entry.pendingLeave)
           throw fail(409, "This panel sign-in changed.");
         next.panels = next.panels.filter((item) => item.id !== panel.id);
         if (next.selectedServer?.panelId === panel.id)
@@ -721,19 +699,7 @@ export function createBrowserConnectionController({
         await commit(
           (next) => {
             const entry = updateRecord(next, panel.id);
-            const nextIdentity = identity(session);
-            if (
-              entry.session?.expiresAt &&
-              nextIdentity.expiresAt &&
-              Math.abs(
-                Date.parse(nextIdentity.expiresAt) -
-                  Date.parse(entry.session.expiresAt),
-              ) < 60000
-            )
-              nextIdentity.expiresAt = entry.session.expiresAt;
-            entry.session = nextIdentity;
-            entry.panelName = session.panelName;
-            entry.hostIdentity = session.panelId;
+            entry.session = identity(session);
             entry.servers = browserRoster(servers);
             if (
               next.selectedServer?.panelId === panel.id &&
@@ -767,11 +733,9 @@ export function createBrowserConnectionController({
         panel.state = "unavailable";
         panel.servers = browserRoster(panel.servers);
         panel.error =
-          cause.message === "Failed to fetch"
-            ? "Unable to reach this computer. Browser connections require a trusted HTTPS certificate; for a self-signed LAN/VPN host use the desktop app and verify its fingerprint."
-            : cause.message ||
-              "The computer is unavailable. Check its address, certificate and connection.";
-        panel.nextRefresh = Date.now() + Math.min(5000, pollMs);
+          cause.message ||
+          "The panel is unavailable. Check its address, certificate and connection.";
+        panel.nextRefresh = Date.now() + 30000;
       } finally {
         panel.refreshing = null;
         changed();
@@ -997,34 +961,6 @@ export function createBrowserConnectionController({
       await commit(
         (next) => {
           let entry;
-          // Migrate only after fresh authentication proves the same panel and
-          // account. Never send an old-origin bearer to an unverified address.
-          const previous =
-            session.panelId &&
-            next.panels.find(
-              (item) =>
-                item.id !== id &&
-                (item.hostIdentity ?? item.session?.panelId) ===
-                  session.panelId &&
-                (!item.session ||
-                  (item.session.accountId === session.accountId &&
-                    item.session.email === session.email)),
-            );
-          if (previous) {
-            const live = panels.get(previous.id);
-            if (
-              previous.pendingLeave ||
-              live?.authenticating ||
-              live?.previewing
-            )
-              throw fail(
-                409,
-                "Finish the existing computer connection action before changing its address.",
-              );
-            next.panels = next.panels.filter((item) => item.id !== previous.id);
-            if (next.selectedServer?.panelId === previous.id)
-              next.selectedServer.panelId = id;
-          }
           if (panel.temporary) {
             if (next.panels.some((item) => item.origin === panel.origin))
               throw fail(
@@ -1039,16 +975,13 @@ export function createBrowserConnectionController({
             entry = { id, origin: panel.origin };
             next.panels.push(entry);
           } else entry = updateRecord(next, id);
-          if (previous?.nickname) entry.nickname = previous.nickname;
-          entry.panelName = session.panelName;
-          entry.hostIdentity = session.panelId;
           entry.token = result.sessionToken;
           if (result.revocationToken)
             entry.revocationToken = result.revocationToken;
           else delete entry.revocationToken;
           entry.session = identity(session);
           entry.epoch = newId();
-          entry.servers = previous?.servers ?? [];
+          entry.servers = [];
         },
         { panel, epoch, operation },
       );
@@ -1066,54 +999,6 @@ export function createBrowserConnectionController({
   const bridge = {
     runtime: "browser",
     unified: true,
-    async resetSavedConnections() {
-      await writing.catch(() => {});
-      const previous = storage.getItem(browserConnectionsKey);
-      if (previous !== null)
-        storage.setItem(
-          `${browserConnectionsKey}:recovery:${Date.now()}`,
-          previous,
-        );
-      storage.removeItem(browserConnectionsKey);
-      for (const panel of panels.values()) {
-        panel.removed = true;
-        invalidate(panel);
-      }
-      panels.clear();
-      drafts.clear();
-      clearInterval(timer);
-      initializing = null;
-      ready = false;
-      error = "";
-      return initialize();
-    },
-    async renameConnection(id, nickname) {
-      await initialize();
-      if (
-        typeof nickname !== "string" ||
-        nickname.length > 100 ||
-        /[\x00-\x1f]/.test(nickname)
-      )
-        throw fail(400, "Enter a name with at most 100 characters.");
-      const panel = get(id);
-      await commit(
-        (next) => {
-          updateRecord(next, id).nickname = nickname.trim();
-        },
-        { panel, epoch: panel.epoch },
-      );
-      return list();
-    },
-    async changePassword(id, input) {
-      await initialize();
-      const panel = get(id);
-      if (panel.pendingLeave) throw fail(409, pendingMessage);
-      return json(panel, "/api/access/password", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(input),
-      });
-    },
     async list() {
       await initialize();
       if (ready) sync();
@@ -1141,7 +1026,7 @@ export function createBrowserConnectionController({
           token: null,
           servers: [],
           requests: new Set(),
-          state: "connecting",
+          state: "unavailable",
           nextRefresh: 0,
           controls: 0,
           temporary: true,
@@ -1233,17 +1118,6 @@ export function createBrowserConnectionController({
         return {
           email: result.email,
           panelAddress: panel.origin,
-          ...(text(result.panelName)
-            ? { panelName: result.panelName.slice(0, 100) }
-            : {}),
-          ...(Array.isArray(result.servers)
-            ? {
-                servers: result.servers
-                  .filter((item) => text(item?.id) && text(item?.name))
-                  .slice(0, 100)
-                  .map(({ id, name }) => ({ id, name })),
-              }
-            : {}),
           inviteExpiresAt: result.inviteExpiresAt,
         };
       } finally {
@@ -1300,13 +1174,7 @@ export function createBrowserConnectionController({
                   { panel: signedOut, epoch: signedOutEpoch },
                 );
             })
-            .catch(() => {
-              if (current(signedOut, signedOutEpoch)) {
-                signedOut.logoutWarning =
-                  "Signed out on this device, but the host could not confirm sign-out. Its old session may remain active until it expires or the owner signs everyone out.";
-                changed();
-              }
-            });
+            .catch(() => {});
         }
         return list();
       })().finally(() => {
@@ -1324,12 +1192,9 @@ export function createBrowserConnectionController({
     async removeSavedConnection(id, epoch) {
       await initialize();
       const panel = get(id);
-      if (panel.authenticating)
-        throw fail(
-          409,
-          "Wait for sign-in to finish before removing this connection.",
-        );
-      return remove(panel, epoch, true);
+      if (panel.token || panel.account || panel.authenticating)
+        throw fail(409, "Sign out before removing this saved connection.");
+      return remove(panel, epoch);
     },
     async forget(id, accountId) {
       await initialize();

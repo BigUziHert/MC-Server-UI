@@ -1,9 +1,3 @@
-import {
-  createOwnedDirectories,
-  removeOwnedEmptyDirectories,
-} from "./owned-directories.mjs";
-import { catalogSettings } from "./catalog-settings.mjs";
-import { publicErrorDetails } from "./error-details.mjs";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
@@ -42,9 +36,40 @@ export async function createServerSetup({ dataDir, safePath, ...options }) {
     });
   const versions =
     options.versionsService ?? createVersionsService(options.versionsOptions);
-  const platformConfig = catalogSettings(dataDir, safePath, [
-    await safePath(dataDir, "setup-catalog-settings.json"),
-  ]);
+  const settingsPath = () => safePath(dataDir, "setup-catalog-settings.json");
+  const platformConfig = {
+    async get() {
+      try {
+        const value = JSON.parse(
+          await fs.readFile(await settingsPath(), "utf8"),
+        );
+        return {
+          curseforgeApiKey:
+            typeof value.curseforgeApiKey === "string"
+              ? value.curseforgeApiKey
+              : null,
+        };
+      } catch (cause) {
+        if (cause.code === "ENOENT") return { curseforgeApiKey: null };
+        throw cause;
+      }
+    },
+    async set(value) {
+      const temporary = await safePath(
+        dataDir,
+        `setup-catalog-${randomUUID()}.tmp`,
+      );
+      try {
+        await fs.writeFile(temporary, JSON.stringify(value), {
+          flag: "wx",
+          mode: 0o600,
+        });
+        await fs.rename(temporary, await settingsPath());
+      } finally {
+        await fs.rm(temporary, { force: true });
+      }
+    },
+  };
   const extraProviders =
     options.extraProviders ??
     (await createExtraProviders({
@@ -73,10 +98,8 @@ export async function createServerSetup({ dataDir, safePath, ...options }) {
     const hostMemoryMB = Math.floor(
       (options.totalMemory?.() ?? totalmem()) / 1024 ** 2,
     );
-    const runningAllocatedMemoryMB = options.runningAllocatedMemoryMB?.() ?? 0;
     return {
       hostMemoryMB,
-      runningAllocatedMemoryMB,
       freeMemoryMB: Math.floor(
         (options.freeMemory?.() ?? freemem()) / 1024 ** 2,
       ),
@@ -84,9 +107,7 @@ export async function createServerSetup({ dataDir, safePath, ...options }) {
         256,
         Math.min(
           8192,
-          Math.floor(
-            Math.max(256, hostMemoryMB - runningAllocatedMemoryMB - 2048) / 512,
-          ) * 512,
+          Math.floor(Math.max(256, hostMemoryMB - 2048) / 512) * 512,
           Math.floor((hostMemoryMB * 0.4) / 256) * 256,
         ),
       ),
@@ -225,28 +246,17 @@ export async function createServerSetup({ dataDir, safePath, ...options }) {
       allJava(input.refresh === true),
       javaRequirement(input),
     ]);
-    const validated = detected
-      .sort(
-        (a, b) =>
-          Number(b.majorVersion === requirement.requiredJavaVersion) -
-          Number(a.majorVersion === requirement.requiredJavaVersion),
-      )
-      .filter(
-        (java) =>
-          java.available && Number.isInteger(java.majorVersion) && java.path,
-      );
+    const validated = detected.filter(
+      (java) =>
+        java.available && Number.isInteger(java.majorVersion) && java.path,
+    );
     const installations = (
       input.gameVersion && !requirement.requiredJavaVersion
         ? []
         : validated.filter((java) =>
-            compatibleJava(java, requirement.requiredJavaVersion, input),
+            compatibleJava(java, requirement.requiredJavaVersion),
           )
     ).map(({ path, version, majorVersion, vendor, architecture }) => ({
-      compatibility:
-        !requirement.requiredJavaVersion ||
-        majorVersion === requirement.requiredJavaVersion
-          ? "recommended"
-          : "compatible",
       path,
       version,
       majorVersion,
@@ -284,7 +294,7 @@ export async function createServerSetup({ dataDir, safePath, ...options }) {
     else {
       const detected = await allJava();
       java = detected.find((entry) =>
-        compatibleJava(entry, requiredJavaVersion, input),
+        compatibleJava(entry, requiredJavaVersion),
       ) ?? {
         path: null,
         available: false,
@@ -298,7 +308,7 @@ export async function createServerSetup({ dataDir, safePath, ...options }) {
     if (
       requiredJavaVersion &&
       java.available &&
-      !compatibleJava(java, requiredJavaVersion, input)
+      !compatibleJava(java, requiredJavaVersion)
     )
       warnings.push(
         `This release requires Java ${requiredJavaVersion} (64-bit); the selected executable is Java ${java.majorVersion}${java.architecture ? ` (${java.architecture})` : ""}. Choose a compatible runtime from the list.`,
@@ -311,33 +321,13 @@ export async function createServerSetup({ dataDir, safePath, ...options }) {
       warnings.push(
         "Less than 2 GB of host RAM would remain for the operating system and other applications.",
       );
-    if (
-      memoryLimitMB + memory.runningAllocatedMemoryMB >
-      memory.hostMemoryMB - 2048
-    )
-      warnings.push(
-        "This allocation plus other running servers leaves less than 2 GB for the host. Stop another server or reduce memory before starting.",
-      );
     if (memoryLimitMB > memory.freeMemoryMB)
       warnings.push(
         "The selected allocation is above currently available RAM. Close other applications or lower the allocation before starting.",
       );
-    const advancedJava =
-      input.acknowledgedJavaCompatibility === true &&
-      java.available &&
-      java.majorVersion >= (requiredJavaVersion ?? 8) &&
-      !["x86", "i386", "i686"].includes(java.architecture);
     const compatible =
-      (compatibleJava(java, requiredJavaVersion, input) || advancedJava) &&
+      compatibleJava(java, requiredJavaVersion) &&
       (!input.gameVersion || !!requiredJavaVersion);
-    let portAvailable = true;
-    if (input.port !== undefined && options.checkPort)
-      try {
-        await options.checkPort(input.port);
-      } catch (cause) {
-        portAvailable = false;
-        warnings.push(cause.message);
-      }
     return {
       ...memory,
       installationDirectory: installation?.directory ?? null,
@@ -348,8 +338,7 @@ export async function createServerSetup({ dataDir, safePath, ...options }) {
       memoryLimitMB,
       warnings,
       compatible,
-      portAvailable,
-      ready: compatible && portAvailable && memoryLimitMB < memory.hostMemoryMB,
+      ready: compatible && memoryLimitMB < memory.hostMemoryMB,
     };
   }
   async function reviewPack(input, signal) {
@@ -373,7 +362,7 @@ export async function createServerSetup({ dataDir, safePath, ...options }) {
               input.installationDirectory,
             );
       const scratchBase = installation?.supportRoot ?? dataDir;
-      const createdParents = await createOwnedDirectories(scratchBase);
+      await fs.mkdir(scratchBase, { recursive: true });
       const root = await safePath(scratchBase, `setup-preview-${id}`);
       let preview, closePromise;
       const stopPreview = () => {
@@ -406,7 +395,6 @@ export async function createServerSetup({ dataDir, safePath, ...options }) {
           recursive: true,
           force: true,
         });
-        await removeOwnedEmptyDirectories(createdParents);
       }
     })();
     pendingReviews.add(pending);
@@ -428,9 +416,7 @@ export async function createServerSetup({ dataDir, safePath, ...options }) {
       } catch (cause) {
         if (controller.signal.aborted || res.destroyed) return;
         if (cause.status)
-          res
-            .status(cause.status)
-            .json({ error: cause.message, ...publicErrorDetails(cause) });
+          res.status(cause.status).json({ error: cause.message });
         else next(cause);
       } finally {
         res.off("close", disconnect);
@@ -451,7 +437,6 @@ export async function createServerSetup({ dataDir, safePath, ...options }) {
           managedServersDir: path.join(dataDir, "instances"),
           canBrowse: typeof options.selectServerDirectory === "function",
           managedJavaDirectory: path.join(dataDir, "java-runtimes"),
-          suggestedPort: (await options.suggestedPort?.()) ?? 25565,
         });
       }),
     );
@@ -494,12 +479,6 @@ export async function createServerSetup({ dataDir, safePath, ...options }) {
             refresh: req.query.refresh === "1",
           }),
         ),
-      ),
-    );
-    app.post(
-      "/api/server-setup/java/probe",
-      endpoint(async (req, res) =>
-        res.json({ java: await javaProbe(req.body?.javaPath) }),
       ),
     );
     app.post(
@@ -548,7 +527,15 @@ export async function createServerSetup({ dataDir, safePath, ...options }) {
   }
   return {
     mount,
-
+    async copySettings(instanceDir) {
+      const settings = await platformConfig.get();
+      if (settings.curseforgeApiKey)
+        await fs.writeFile(
+          await safePath(instanceDir, "catalog-settings.json"),
+          JSON.stringify(settings),
+          { flag: "wx", mode: 0o600 },
+        );
+    },
     async close() {
       lifetime.abort(fail(503, "Server setup is shutting down."));
       await javaInstaller.close();

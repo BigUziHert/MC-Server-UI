@@ -38,10 +38,6 @@ type DesktopSettings = {
   startupReason?: string;
   startupError?: string;
   missingAutoStartServerIds?: string[];
-  unavailableAutoStartServerIds?: string[];
-  autoStartServerNames?: Record<string, string>;
-  startupPending?: boolean;
-  startupAttempted?: boolean;
 };
 type StartupServer = { id: string; name: string; unavailable?: boolean };
 const ignoreSettings = () => {};
@@ -57,58 +53,8 @@ export default function PanelSettings({
     ? workspace.connections?.panels.some((panel) => panel.local) === true
     : !remote;
   const native = window.mcPanelConnections?.runtime !== "browser";
-  const [startupNotice, setStartupNotice] = useState("");
-  useEffect(() => {
-    if (!owner || !native) return;
-    const controller = new AbortController();
-    let timer: ReturnType<typeof setTimeout>;
-    const check = async () => {
-      try {
-        const current = await api<DesktopSettings>("/desktop/settings", {
-          signal: controller.signal,
-        });
-        if (controller.signal.aborted) return;
-        if (current.startupError && !current.startupPending)
-          setStartupNotice(current.startupError);
-        if (
-          current.desktop &&
-          (current.startupPending || current.startupAttempted === false)
-        )
-          timer = setTimeout(() => void check(), 3000);
-      } catch {
-        /* Older/browser hosts do not have desktop startup settings. */
-      }
-    };
-    void check();
-    return () => {
-      controller.abort();
-      clearTimeout(timer);
-    };
-  }, [owner, native]);
   return (
     <>
-      {startupNotice && (
-        <aside className="panel-startup-notice" role="status">
-          <strong>Automatic server startup needs attention</strong>
-          <p>{startupNotice}</p>
-          <button
-            className="btn"
-            onClick={() => {
-              setStartupNotice("");
-              setOpen(true);
-            }}
-          >
-            Review
-          </button>
-          <button
-            className="btn icon"
-            aria-label="Dismiss startup notice"
-            onClick={() => setStartupNotice("")}
-          >
-            <X size={16} />
-          </button>
-        </aside>
-      )}
       <button
         className="help-button"
         aria-label="Panel Settings"
@@ -342,7 +288,6 @@ function SettingsDialog({
                   <ServerChecklist
                     servers={servers}
                     selected={draft.autoStartServerIds}
-                    names={settings.autoStartServerNames}
                     onChange={(autoStartServerIds) =>
                       setDraft({ ...draft, autoStartServerIds })
                     }
@@ -373,50 +318,14 @@ function SettingsDialog({
                   </p>
                 </div>
                 {settings.startupError && (
-                  <div className="panel-settings-warning" role="status">
-                    <p>Last automatic start: {settings.startupError}</p>
-                    <button
-                      type="button"
-                      className="btn"
-                      disabled={busy}
-                      onClick={() => {
-                        setBusy(true);
-                        void api<{ failures: { message: string }[] }>(
-                          "/desktop/startup/retry",
-                          { method: "POST" },
-                        )
-                          .then(async (result) => {
-                            const current =
-                              await api<DesktopSettings>("/desktop/settings");
-                            setSettings(current);
-                            notify(
-                              result.failures.length
-                                ? result.failures
-                                    .map((failure) => failure.message)
-                                    .join("\n")
-                                : "Automatic startup retried.",
-                              result.failures.length > 0,
-                            );
-                          })
-                          .catch((cause) => notify(cause.message, true))
-                          .finally(() => setBusy(false));
-                      }}
-                    >
-                      Retry failed starts
-                    </button>
-                  </div>
+                  <p className="panel-settings-warning" role="status">
+                    Last automatic start: {settings.startupError}
+                  </p>
                 )}
                 {!!settings.missingAutoStartServerIds?.length && (
                   <p className="panel-settings-warning" role="status">
-                    A selected server was removed from the panel. Uncheck it in
-                    the list above.
-                  </p>
-                )}
-                {!!settings.unavailableAutoStartServerIds?.length && (
-                  <p className="panel-settings-warning" role="status">
-                    A selected server folder is unreachable. Reconnect its drive
-                    and retry automatic startup. MC Panel also retries briefly
-                    when it first opens.
+                    A selected server is unavailable. Restore its files or
+                    uncheck it in the list above.
                   </p>
                 )}
                 <div className="panel-settings-actions">
@@ -527,12 +436,10 @@ function SettingsDialog({
 function ServerChecklist({
   servers,
   selected,
-  names,
   onChange,
 }: {
   servers: StartupServer[];
   selected: string[];
-  names?: Record<string, string>;
   onChange: (ids: string[]) => void;
 }) {
   const [open, setOpen] = useState(false);
@@ -553,7 +460,7 @@ function ServerChecklist({
       .filter((value) => !servers.some((server) => server.id === value))
       .map((value) => ({
         id: value,
-        name: `${names?.[value] || value} (removed)`,
+        name: `Unavailable server (${value})`,
         unavailable: true,
       })),
   ];

@@ -17,18 +17,9 @@ export function updateDependencySatisfies(version, range, loader) {
   if (typeof range !== "string" || range.length > 4096) return false;
   if (range === "*" || range === version || range === `=${version}`)
     return true;
-  const parse = (value) => {
-    const match =
-      /^(\d+(?:\.\d+){0,31})(?:-([0-9A-Za-z.-]*))?(?:\+[^\s]+)?$/.exec(value);
-    return match
-      ? { numbers: match[1].split(".").map(BigInt), pre: match[2] }
-      : null;
-  };
-  const actualVersion = parse(version);
-  if (!actualVersion) return false;
-  const actual = actualVersion.numbers;
-  const compare = (expectedVersion) => {
-    const expected = expectedVersion.numbers;
+  if (!/^\d+(?:\.\d+){0,31}$/.test(version)) return false;
+  const actual = version.split(".").map(BigInt);
+  const compare = (expected) => {
     for (
       let index = 0;
       index < Math.max(actual.length, expected.length);
@@ -38,23 +29,6 @@ export function updateDependencySatisfies(version, range, loader) {
         right = expected[index] ?? 0n;
       if (left !== right) return left < right ? -1 : 1;
     }
-    const left = actualVersion.pre,
-      right = expectedVersion.pre;
-    if (left === right) return 0;
-    if (left === undefined) return 1;
-    if (right === undefined) return -1;
-    const a = left.split("."),
-      b = right.split(".");
-    for (let index = 0; index < Math.max(a.length, b.length); index++) {
-      if (a[index] === b[index]) continue;
-      if (a[index] === undefined) return -1;
-      if (b[index] === undefined) return 1;
-      const an = /^\d+$/.test(a[index]),
-        bn = /^\d+$/.test(b[index]);
-      if (an && bn) return BigInt(a[index]) < BigInt(b[index]) ? -1 : 1;
-      if (an !== bn) return an ? -1 : 1;
-      return a[index] < b[index] ? -1 : 1;
-    }
     return 0;
   };
   return range
@@ -62,15 +36,13 @@ export function updateDependencySatisfies(version, range, loader) {
     .split(/\s+/)
     .every((part) => {
       const match =
-        /^(>=|<=|>|<|=|\^|~)?(\d+(?:\.\d+){0,31}(?:-[0-9A-Za-z.-]*)?(?:\+[^\s]+)?)(\.(?:x|X|\*)(?:\.(?:x|X|\*))*)?$/.exec(
+        /^(>=|<=|>|<|=|\^|~)?(\d+(?:\.\d+){0,31})(\.(?:x|X|\*)(?:\.(?:x|X|\*))*)?$/.exec(
           part,
         );
       if (!match) return false;
       const [, operator = "=", numeric, wildcard] = match;
-      const expectedVersion = parse(numeric);
-      if (!expectedVersion) return false;
-      const expected = expectedVersion.numbers,
-        order = compare(expectedVersion);
+      const expected = numeric.split(".").map(BigInt),
+        order = compare(expected);
       if (wildcard)
         return (
           operator === "=" &&

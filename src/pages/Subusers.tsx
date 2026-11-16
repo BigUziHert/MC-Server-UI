@@ -32,8 +32,6 @@ import { copyText } from "../clipboard";
 import Pagination, { usePageSize } from "../Pagination";
 import catalog from "../../shared/subuser-permissions.json";
 import "./subusers.css";
-import ServerShareDialog, { type PeopleSnapshot } from "./ServerShareDialog";
-import Switch from "../Switch";
 
 type Subuser = {
   id: string;
@@ -55,14 +53,8 @@ type Subuser = {
   createdAt?: string;
   inviteStatus?: "pending" | "accepted" | "expired" | "not-invited";
   invitedAt?: string;
-  inviteExpiresAt?: string;
   acceptedAt?: string;
-  accessReview?: {
-    message: string;
-    serverIds?: string[];
-    previousPolicy?: unknown;
-    duplicateLegacyIdentities?: boolean;
-  };
+  accessReview?: { message: string };
 };
 type AccessSettings = {
   enabled: boolean;
@@ -70,9 +62,6 @@ type AccessSettings = {
   transport: "managed" | "direct" | "proxy";
   port: number;
   ready: boolean;
-  panelName?: string;
-  activeSessions?: number;
-  pendingInvitations?: number;
   listening?: boolean;
   error?: string;
   warning?: string;
@@ -81,9 +70,6 @@ type AccessSettings = {
   managedHttps?: {
     state: "disabled" | "starting" | "provisioning" | "ready" | "error";
     ready: boolean;
-    panelName?: string;
-    activeSessions?: number;
-    pendingInvitations?: number;
     message: string;
     certificate?: { validTo: string };
   };
@@ -114,6 +100,20 @@ const permissionIds = catalog.groups.flatMap((group) =>
   group.permissions.map((permission) => permission.id),
 );
 
+function trustedAddress(settings: AccessSettings) {
+  if (settings.transport === "managed" || !settings.publicUrl)
+    return settings.publicUrl || "";
+  // Preparing an upgrade draft must not change the saved listener or its origin.
+  try {
+    const address = new URL(settings.publicUrl);
+    address.protocol = "https:";
+    address.port = "";
+    return address.origin;
+  } catch {
+    return settings.publicUrl;
+  }
+}
+
 function permissionsFor(user: Subuser) {
   const defaults =
     catalog.roleDefaults[
@@ -136,7 +136,6 @@ export function RemoteAccessSetup({
     enabled: false,
     publicUrl: "",
     port: "3002",
-    transport: "managed" as AccessSettings["transport"],
   });
   const [loading, setLoading] = useState(true);
   const [hidden, setHidden] = useState(false);
@@ -147,15 +146,6 @@ export function RemoteAccessSetup({
   const [networkError, setNetworkError] = useState("");
   const [pollError, setPollError] = useState("");
   const settingsRevision = useRef(0);
-  const dirty =
-    !!settings &&
-    (draft.enabled !== settings.enabled ||
-      draft.publicUrl.trim() !== settings.publicUrl ||
-      Number(draft.port) !== settings.port ||
-      draft.transport !== settings.transport);
-  const [panelName, setPanelName] = useState("");
-  const [reissueAvailable, setReissueAvailable] = useState(false);
-  const [replacementLinks, setReplacementLinks] = useState<Invitation[]>([]);
 
   const publishSettings = useCallback(
     (value: AccessSettings) => {
@@ -171,11 +161,9 @@ export function RemoteAccessSetup({
   const applySettings = useCallback(
     (value: AccessSettings) => {
       publishSettings(value);
-      setPanelName(value.panelName ?? "");
       setDraft({
         enabled: value.enabled,
-        publicUrl: value.publicUrl,
-        transport: value.transport,
+        publicUrl: trustedAddress(value),
         port: String(value.port || 3002),
       });
     },
@@ -230,10 +218,6 @@ export function RemoteAccessSetup({
     let timer: ReturnType<typeof setTimeout>;
     async function poll() {
       const revision = settingsRevision.current;
-      if (document.visibilityState !== "visible") {
-        timer = setTimeout(() => void poll(), 3000);
-        return;
-      }
       try {
         const value = await panelApi<AccessSettings>("/access/settings", {
           signal: controller.signal,
@@ -305,15 +289,6 @@ export function RemoteAccessSetup({
   async function save(event: FormEvent) {
     event.preventDefault();
     if (saving) return;
-    if (
-      settings &&
-      (draft.publicUrl.trim() !== settings.publicUrl ||
-        draft.transport !== settings.transport) &&
-      !window.confirm(
-        `Changing the address or connection mode signs out ${settings.activeSessions ?? 0} sessions and invalidates ${settings.pendingInvitations ?? 0} invitation links. Continue?`,
-      )
-    )
-      return;
     const revision = ++settingsRevision.current;
     setSaving(true);
     setError("");
@@ -324,18 +299,11 @@ export function RemoteAccessSetup({
         body: JSON.stringify({
           enabled: draft.enabled,
           publicUrl: draft.publicUrl.trim(),
-          transport: draft.transport,
+          transport: "managed",
           port: Number(draft.port),
         }),
       });
       if (revision !== settingsRevision.current) return;
-      if (
-        settings &&
-        (draft.publicUrl.trim() !== settings.publicUrl ||
-          draft.transport !== settings.transport) &&
-        (settings.pendingInvitations ?? 0) > 0
-      )
-        setReissueAvailable(true);
       applySettings(result);
       if (result.error && result.transport !== "managed")
         setError(result.error);
@@ -415,17 +383,26 @@ export function RemoteAccessSetup({
           {expanded ? "Hide setup" : "Edit setup"}
         </button>
       </div>
-      {settings.transport === "direct" && settings.certificate && (
-        <div className="subusers-https-status" role="note">
-          <strong>Same network or VPN</strong>
+      {settings.transport !== "managed" && settings.publicUrl && (
+        <div
+          className="subusers-https-status"
+          role="note"
+          aria-label="Trusted HTTPS upgrade"
+        >
+          <strong>Upgrade your saved remote access setup</strong>
           <p>
-            Share this certificate fingerprint with the invitation. Verify it in
-            the desktop app before signing in.
+            Your saved address is <code>{settings.publicUrl}</code>. It stays
+            unchanged until you save.
           </p>
-          <code>{settings.certificate.fingerprint256}</code>
           <p>
-            Browsers need an independently trusted certificate. The desktop app
-            supports certificate verification for this connection.
+            Saving switches this panel to trusted HTTPS on port 443. Forward TCP
+            port 443 to this computer first, and stop any other service using
+            that port. Wait for the trusted certificate, then share the new
+            address and invitation links. People using an old address must sign
+            in at the new one.
+          </p>
+          <p>
+            Existing accounts, passwords, and server permissions are preserved.
           </p>
         </div>
       )}
@@ -473,69 +450,6 @@ export function RemoteAccessSetup({
           )}
         </div>
       )}
-      {reissueAvailable && (
-        <div role="status" className="subusers-https-status">
-          <p>
-            The address changed. Create replacement links for people whose
-            invitations were still pending.
-          </p>
-          <button
-            className="btn"
-            disabled={saving || !accessReady(settings)}
-            onClick={() => {
-              setSaving(true);
-              setError("");
-              void (async () => {
-                const { users } = await panelApi<{ users: Subuser[] }>(
-                  "/panel-users",
-                );
-                const links: Invitation[] = [];
-                for (const user of users.filter(
-                  (item) => item.invitedAt && !item.acceptedAt,
-                )) {
-                  const link = await panelApi<Invitation>(
-                    `/panel-users/${encodeURIComponent(user.id)}/invite`,
-                    {
-                      method: "POST",
-                      body: JSON.stringify({ expiresInHours: 24 }),
-                    },
-                  );
-                  links.push(link);
-                  setReplacementLinks([...links]);
-                }
-                setReissueAvailable(false);
-                notify("Replacement invitation links created.");
-              })()
-                .catch((cause) => setError(cause.message))
-                .finally(() => setSaving(false));
-            }}
-          >
-            Create replacement links
-          </button>
-        </div>
-      )}
-      {replacementLinks.map((link) => (
-        <div key={link.user.id} className="subusers-https-status">
-          <strong>{link.user.email}</strong>
-          <input
-            readOnly
-            aria-label={`Replacement link for ${link.user.email}`}
-            value={link.invitationUrl}
-            onFocus={(event) => event.target.select()}
-          />
-          <button
-            type="button"
-            className="btn"
-            onClick={() =>
-              void copyText(link.invitationUrl)
-                .then(() => notify("Invitation copied."))
-                .catch(() => notify("Select and copy the link manually.", true))
-            }
-          >
-            Copy link
-          </button>
-        </div>
-      ))}
       {expanded && (
         <form
           id="subusers-access-settings"
@@ -543,97 +457,17 @@ export function RemoteAccessSetup({
           onSubmit={save}
         >
           <fieldset disabled={saving || discovering}>
-            <label htmlFor="remote-computer-name">Computer name</label>
-            <input
-              id="remote-computer-name"
-              value={panelName}
-              maxLength={100}
-              onChange={(event) => setPanelName(event.target.value)}
-            />
-            <button
-              type="button"
-              className="btn"
-              disabled={
-                !panelName.trim() || panelName.trim() === settings.panelName
-              }
-              onClick={() => {
-                setSaving(true);
-                void panelApi<AccessSettings>("/access/panel", {
-                  method: "PATCH",
-                  body: JSON.stringify({ name: panelName }),
-                })
-                  .then((value) => {
-                    publishSettings(value);
-                    notify("Computer name saved.");
-                  })
-                  .catch((cause) => setError(cause.message))
-                  .finally(() => setSaving(false));
-              }}
-            >
-              Save name
-            </button>
-            <Switch
+            <PermissionCheckbox
               label="Enable remote access"
+              description="Allow invited people to sign in through the public panel address."
               checked={draft.enabled}
-              onCheckedChange={(enabled) => setDraft({ ...draft, enabled })}
+              onChange={() => setDraft({ ...draft, enabled: !draft.enabled })}
             />
-            <p>
-              Pausing remote access preserves accounts, sessions and invitation
-              links. Use Sign everyone out to end existing sessions.
-            </p>
-            <button
-              type="button"
-              className="btn"
-              onClick={() => {
-                if (
-                  !window.confirm(
-                    "Sign everyone out of this computer? Accounts, server grants and unused invitations will remain.",
-                  )
-                )
-                  return;
-                setSaving(true);
-                void panelApi<AccessSettings>("/access/sign-out-all", {
-                  method: "POST",
-                })
-                  .then((value) => {
-                    publishSettings(value);
-                    notify("Remote sessions signed out.");
-                  })
-                  .catch((cause) => setError(cause.message))
-                  .finally(() => setSaving(false));
-              }}
-            >
-              Sign everyone out ({settings.activeSessions ?? 0})
-            </button>
-            <label htmlFor="remote-transport">Connection method</label>
-            <select
-              id="remote-transport"
-              value={draft.transport}
-              onChange={(event) =>
-                setDraft({
-                  ...draft,
-                  transport: event.target.value as AccessSettings["transport"],
-                })
-              }
-            >
-              <option value="managed">Trusted HTTPS (public address)</option>
-              <option value="direct">Same network or VPN (desktop)</option>
-              <option value="proxy">Existing HTTPS reverse proxy</option>
-            </select>
             <div className="subusers-setup-guidance">
-              <strong>
-                {draft.transport === "managed"
-                  ? "Trusted HTTPS"
-                  : draft.transport === "direct"
-                    ? "Same network or VPN"
-                    : "HTTPS reverse proxy"}
-              </strong>
+              <strong>Trusted HTTPS</strong>
               <p>
-                {draft.transport === "managed"
-                  ? "MC Panel obtains and renews a trusted certificate for your public address."
-                  : draft.transport === "direct"
-                    ? "Use the host computer’s LAN, Tailscale or ZeroTier HTTPS address and service port. Direct mode listens on all network interfaces; keep access limited to people and networks you trust."
-                    : "Use the trusted HTTPS address of your existing reverse proxy."}
+                MC Panel runs bundled Caddy to obtain and renew a trusted
+                certificate. No separate installation or domain is required.
               </p>
             </div>
             <div className="subusers-setup-field">
@@ -649,9 +483,8 @@ export function RemoteAccessSetup({
                 }
               />
               <small>
-                {draft.transport === "managed"
-                  ? "Public IP or domain, starting with https://, on port 443."
-                  : "HTTPS address reachable from the other computer, including the service port when needed."}
+                Your public IP or domain, starting with https://. Trusted HTTPS
+                uses port 443.
               </small>
               <button
                 type="button"
@@ -684,62 +517,52 @@ export function RemoteAccessSetup({
                   }
                 />
                 <small>
-                  {draft.transport === "direct"
-                    ? "Desktop connections use this HTTPS port. Include it in the address."
-                    : "Your HTTPS proxy connects on this local port. Do not forward the internal service port."}
+                  Caddy connects to MC Panel on this local port. Change it only
+                  if another app uses it. Do not forward it on your router.
                 </small>
               </div>
             </details>
-            {draft.transport === "managed" && (
-              <div className="subusers-setup-guidance">
-                <strong>Connect securely from outside your home</strong>
-                <ol>
-                  <li>
-                    Forward TCP port <code>443</code> on your router to this
-                    computer’s local IP on port <code>443</code>. Reserve that
-                    local IP and allow Caddy through Windows Firewall if
-                    prompted.
-                  </li>
-                  <li>
-                    Enable remote access and save. MC Panel automatically
-                    requests the trusted certificate and renews it while
-                    running.
-                  </li>
-                  <li>
-                    When the certificate is ready, check the public address on
-                    your phone using mobile data, then share invitations.
-                  </li>
-                </ol>
-                <p>
-                  Use a DNS or dynamic DNS hostname when your public IP changes
-                  frequently. Keeping the same hostname avoids address migration
-                  and new invitation links.
-                </p>
-                <p>
-                  Keep this computer and MC Panel running. Update this address
-                  if your public IP changes. Valid trusted certificates remove
-                  certificate warnings in desktop and phone browsers.
-                </p>
-                <p>
-                  These settings do not open router or firewall ports. A shared
-                  ISP address (CGNAT) or blocked incoming port 443 may require a
-                  public IP from your provider. Port 443 must be available on
-                  this computer and forwarded to it.
-                </p>
-                <p>
-                  Enabling and saving requests certificates from Let’s Encrypt
-                  for this public address under its{" "}
-                  <a
-                    href="https://letsencrypt.org/repository/"
-                    target="_blank"
-                    rel="noopener noreferrer"
-                  >
-                    Subscriber Agreement
-                  </a>
-                  .
-                </p>
-              </div>
-            )}
+            <div className="subusers-setup-guidance">
+              <strong>Connect securely from outside your home</strong>
+              <ol>
+                <li>
+                  Forward TCP port <code>443</code> on your router to this
+                  computer’s local IP on port <code>443</code>. Reserve that
+                  local IP and allow Caddy through Windows Firewall if prompted.
+                </li>
+                <li>
+                  Enable remote access and save. MC Panel automatically requests
+                  the trusted certificate and renews it while running.
+                </li>
+                <li>
+                  When the certificate is ready, check the public address on
+                  your phone using mobile data, then share invitations.
+                </li>
+              </ol>
+              <p>
+                Keep this computer and MC Panel running. Update this address if
+                your public IP changes. Valid trusted certificates remove
+                certificate warnings in desktop and phone browsers.
+              </p>
+              <p>
+                These settings do not open router or firewall ports. A shared
+                ISP address (CGNAT) or blocked incoming port 443 may require a
+                public IP from your provider. Port 443 must be available on this
+                computer and forwarded to it.
+              </p>
+              <p>
+                Enabling and saving requests certificates from Let’s Encrypt for
+                this public address under its{" "}
+                <a
+                  href="https://letsencrypt.org/repository/"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                >
+                  Subscriber Agreement
+                </a>
+                .
+              </p>
+            </div>
             {(error || settings.error) && (
               <p className="subusers-form-error" role="alert">
                 <AlertCircle size={16} />
@@ -748,23 +571,13 @@ export function RemoteAccessSetup({
             )}
             <div className="subusers-setup-actions">
               <span>
-                {dirty
-                  ? "Unsaved changes"
-                  : accessReady(settings)
-                    ? "Remote access settings saved."
-                    : settings.enabled && settings.transport === "managed"
-                      ? "Waiting for a trusted certificate before sharing invitation links."
-                      : "Save the setup, then create an invitation link below."}
+                {accessReady(settings)
+                  ? "Remote access settings saved."
+                  : settings.enabled && settings.transport === "managed"
+                    ? "Waiting for a trusted certificate before sharing invitation links."
+                    : "Save the setup, then create an invitation link below."}
               </span>
-              <button
-                className="btn primary"
-                type="submit"
-                disabled={
-                  !dirty &&
-                  !settings.error &&
-                  settings.managedHttps?.state !== "error"
-                }
-              >
+              <button className="btn primary" type="submit">
                 {saving
                   ? "Saving…"
                   : settings.transport === "managed" &&
@@ -878,10 +691,7 @@ function InvitationDialog({
           <p className="subusers-editor-notice">
             Send this link privately to <strong>{invitation.user.email}</strong>{" "}
             using your own text or email app. MC Panel does not send an email.
-            {panelWide &&
-              (invitation.user.serverIds?.length
-                ? ` Shared servers: ${invitation.user.serverIds.length}.`
-                : " No servers have been shared yet.")}
+            {panelWide && " This invitation grants no server access."}
           </p>
           <div className="subusers-setup-field">
             <label htmlFor={`${invitationId}-url`}>Invitation link</label>
@@ -975,8 +785,7 @@ function AccessManagement({
   const remote = permissions !== undefined;
   const accountsView = scope === "accounts";
   const can = (permission: string) =>
-    (!remote || permission !== "backup.location") &&
-    (permissions === undefined || permissions.includes(permission));
+    permissions === undefined || permissions.includes(permission);
   const canRead = can("user.read");
   const canCreate = can("user.create");
   const canUpdate = can("user.update");
@@ -987,7 +796,7 @@ function AccessManagement({
   const manageable = (user: Subuser) =>
     !ownAccess(user) &&
     permissionsFor(user).every(can) &&
-    (!remote || !user.hostPermissions?.length);
+    (!remote || (!user.hostPermissions?.length && !user.panelAccount));
   const grantablePermissions = permissionIds.filter(can);
   const optionalPermissions = grantablePermissions.filter(
     (permission) => permission !== "server.view",
@@ -1005,10 +814,6 @@ function AccessManagement({
   const api = accountsView ? panelApi : serverApi;
   const basePath = accountsView ? "/panel-users" : "/subusers";
   const [users, setUsers] = useState<Subuser[]>([]);
-  const [sharing, setSharing] = useState(false);
-  const [people, setPeople] = useState<PeopleSnapshot | null>(null);
-  const [invitationExpiry, setInvitationExpiry] = useState(24);
-  const [codeAcknowledged, setCodeAcknowledged] = useState(false);
   const [accounts, setAccounts] = useState<Subuser[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
@@ -1092,34 +897,16 @@ function AccessManagement({
                 signal: controller.signal,
               })
             : Promise.resolve(null),
-          !remote && (!background || !accountsView)
+          accountsView
             ? panelApi<AccessSettings>("/access/settings", {
                 signal: controller.signal,
               }).catch(() => null)
             : Promise.resolve(null),
         ]);
         if (controller.signal.aborted) return false;
-        setUsers((previous) => {
-          if (loaded.current && background) {
-            const removed = previous.filter(
-              (person) => !result.users.some((next) => next.id === person.id),
-            );
-            if (removed.length)
-              notify(
-                `${removed.map((person) => person.email).join(", ")} no longer has access.`,
-                true,
-              );
-          }
-          return result.users;
-        });
-        if (accountsView && !remote)
-          void panelApi<PeopleSnapshot>("/access/people", {
-            signal: controller.signal,
-          })
-            .then(setPeople)
-            .catch(() => {});
+        setUsers(result.users);
         setAccounts(panelResult?.users ?? (accountsView ? result.users : []));
-        if (settings) setAccessSettings(settings);
+        setAccessSettings(settings);
         setError("");
         loaded.current = true;
         return true;
@@ -1243,8 +1030,6 @@ function AccessManagement({
   }
   function openEditor(user?: Subuser, invite = false) {
     if (user ? !canUpdate || !manageable(user) : !canCreate) return;
-    setCodeAcknowledged(false);
-    setInvitationExpiry(24);
     setEmail(user?.email ?? "");
     setAccountId("");
     setSelected(
@@ -1274,10 +1059,7 @@ function AccessManagement({
     try {
       const result = await (panelAccount ? panelApi : serverApi)<Invitation>(
         `${panelAccount ? "/panel-users" : "/subusers"}/${encodeURIComponent(user.id)}/invite`,
-        {
-          method: "POST",
-          body: JSON.stringify({ expiresInHours: invitationExpiry }),
-        },
+        { method: "POST", body: "{}" },
       );
       setUsers((previous) =>
         previous.map((item) => (item.id === user.id ? result.user : item)),
@@ -1332,21 +1114,6 @@ function AccessManagement({
     event.preventDefault();
     if (busy || !canSubmitRecord || !selected.every(can)) return;
     if (
-      !deleting &&
-      !resetting &&
-      !accountEditor &&
-      selected.some((id) => ["file.create", "file.update"].includes(id)) &&
-      selected.some((id) =>
-        ["control.start", "control.restart"].includes(id),
-      ) &&
-      !codeAcknowledged
-    ) {
-      setFormError(
-        "Acknowledge that file changes and server start can execute code on this computer.",
-      );
-      return;
-    }
-    if (
       !accountEditor &&
       !deleting &&
       !resetting &&
@@ -1361,10 +1128,7 @@ function AccessManagement({
     setFormError("");
     try {
       if (resetting) {
-        await createInvitation(
-          resetting,
-          accountsView || !!resetting.panelAccount,
-        );
+        await createInvitation(resetting);
         setResetting(null);
         return;
       }
@@ -1400,7 +1164,7 @@ function AccessManagement({
           result.warning ||
             (accountsView
               ? "Account updated."
-              : "Server permissions updated. Changes take effect immediately."),
+              : "Subuser permissions updated. Changes take effect immediately."),
           !!result.warning,
         );
       } else if (invitingAccount) {
@@ -1419,7 +1183,7 @@ function AccessManagement({
         ];
         setAccounts(includeAccount);
         if (accountsView) setUsers(includeAccount);
-        // Keep the editor mounted until the one-time link has been obtained.
+        setEditor(null);
         // Show the saved identity even if the separate invitation request fails.
         await refresh();
         window.dispatchEvent(new Event("mc-panel-accounts-changed"));
@@ -1432,7 +1196,6 @@ function AccessManagement({
                 : "Account created with no server access. Enable Remote Access in Panel Settings to share an invitation."),
             !!result.warning,
           );
-        setEditor(null);
         return;
       } else {
         const result = await serverApi<{ warning?: string }>("/subusers", {
@@ -1486,31 +1249,15 @@ function AccessManagement({
     <div className={`subusers-page${accountsView ? " panel-users" : ""}`}>
       <header className="page-heading">
         <div>
-          {accountsView ? (
-            <h2>
-              People
-              {people?.panelName
-                ? ` · ${people.panelName}`
-                : " · This computer"}
-            </h2>
-          ) : (
-            <h1>Server access</h1>
-          )}
+          {accountsView ? <h3>Panel users</h3> : <h1>Subusers</h1>}
           {accountsView && (
             <p className="subusers-page-description">
-              Share selected servers and manage who can reach them on this
-              computer.
+              Invite people to create an account and sign in. Invitations grant
+              no server access.
             </p>
           )}
         </div>
         <div className="subusers-heading-actions">
-          <button
-            className="btn primary"
-            disabled={!canCreate || busy || !!inviting}
-            onClick={() => setSharing(true)}
-          >
-            <Plus size={16} /> Share server access
-          </button>
           {accountsView && (
             <button
               className="btn"
@@ -1524,7 +1271,7 @@ function AccessManagement({
             <button
               className="btn primary"
               disabled={!canCreate || busy || !!inviting || loading}
-              onClick={() => (remote ? setSharing(true) : openEditor())}
+              onClick={() => openEditor()}
             >
               <Plus size={16} /> Grant server access
             </button>
@@ -1546,98 +1293,7 @@ function AccessManagement({
           {invitationError}
         </p>
       )}
-      {accountsView && people && people.servers.length > 0 && (
-        <section aria-label="People and server access">
-          <h3>Server access</h3>
-          <div style={{ overflowX: "auto" }}>
-            <table className="subusers-table">
-              <thead>
-                <tr>
-                  <th>Person</th>
-                  {people.servers.map((server) => (
-                    <th key={server.id}>{server.name}</th>
-                  ))}
-                </tr>
-              </thead>
-              <tbody>
-                {people.users.map((person) => (
-                  <tr key={person.id}>
-                    <th>{person.email}</th>
-                    {people.servers.map((server) => (
-                      <td key={server.id}>
-                        {person.serverOverrides?.[
-                          server.id
-                        ]?.permissions.includes("server.view")
-                          ? `${person.serverOverrides[server.id].permissions.length} permissions`
-                          : "No access"}
-                      </td>
-                    ))}
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-        </section>
-      )}
-      {accountsView &&
-        people &&
-        people.users.some((person) =>
-          person.serverIds?.some(
-            (id) => !people.servers.some((server) => server.id === id),
-          ),
-        ) && (
-          <section aria-label="Access to removed servers">
-            <h3>Removed or unavailable servers</h3>
-            <p>
-              These saved grants are inactive while the server is removed.
-              Review them before recovery, or revoke them here.
-            </p>
-            {people.users.flatMap((person) =>
-              (person.serverIds ?? [])
-                .filter(
-                  (id) => !people.servers.some((server) => server.id === id),
-                )
-                .map((id) => (
-                  <div key={person.id + ":" + id}>
-                    <span>
-                      {person.email} · {id}
-                    </span>
-                    <button
-                      className="btn"
-                      onClick={() => {
-                        if (
-                          !window.confirm(
-                            "Revoke this person's saved access to the removed server?",
-                          )
-                        )
-                          return;
-                        void panelApi(
-                          `/panel-users/${encodeURIComponent(person.id)}/servers/${encodeURIComponent(id)}`,
-                          { method: "DELETE" },
-                        )
-                          .then(() => refresh())
-                          .catch((cause) => notify(cause.message, true));
-                      }}
-                    >
-                      Revoke saved grant
-                    </button>
-                  </div>
-                )),
-            )}
-          </section>
-        )}
-      {sharing && (
-        <ServerShareDialog
-          notify={notify}
-          permissions={permissions}
-          onClose={() => setSharing(false)}
-          onShared={() => {
-            void refresh();
-            window.dispatchEvent(new Event("mc-panel-accounts-changed"));
-          }}
-        />
-      )}
-      <section className="subusers-list" aria-label="People records">
+      <section className="subusers-list" aria-label="Subuser records">
         <div className="subusers-toolbar">
           <div className="subusers-list-title">
             <Users size={17} />
@@ -1682,7 +1338,7 @@ function AccessManagement({
                 ? "No matching people"
                 : accountsView
                   ? "No panel accounts"
-                  : "No people"
+                  : "No subusers"
             }
             message={
               search
@@ -1706,9 +1362,7 @@ function AccessManagement({
             </thead>
             <tbody>
               {visible.map((user) => {
-                const count = permissionsFor(user).filter(
-                  (id) => id !== "server.view",
-                ).length;
+                const count = permissionsFor(user).length;
                 const createdAt =
                   user.createdAt && Number.isFinite(Date.parse(user.createdAt))
                     ? user.createdAt
@@ -1731,56 +1385,14 @@ function AccessManagement({
                                   ? "Invitation expired · create a new link"
                                   : "Not invited"}
                           </span>
-                          {user.inviteStatus === "pending" &&
-                            user.inviteExpiresAt && (
-                              <span>
-                                Expires{" "}
-                                {new Date(
-                                  user.inviteExpiresAt,
-                                ).toLocaleString()}
-                              </span>
-                            )}
+                          {accountsView && (
+                            <span>
+                              Server access is managed from each server’s
+                              Subusers page.
+                            </span>
+                          )}
                           {user.accessReview && (
-                            <div role="note">
-                              {user.accessReview.message}
-                              {user.accessReview.serverIds?.length ? (
-                                <p>
-                                  Unmapped servers:{" "}
-                                  {user.accessReview.serverIds.join(", ")}
-                                </p>
-                              ) : null}
-                              {user.accessReview.previousPolicy ? (
-                                <details>
-                                  <summary>Previous access to review</summary>
-                                  <pre>
-                                    {JSON.stringify(
-                                      user.accessReview.previousPolicy,
-                                      null,
-                                      2,
-                                    )}
-                                  </pre>
-                                </details>
-                              ) : null}
-                              {accountsView &&
-                                !user.accessReview
-                                  .duplicateLegacyIdentities && (
-                                  <button
-                                    className="btn"
-                                    onClick={() =>
-                                      void panelApi(
-                                        `/panel-users/${encodeURIComponent(user.id)}/access-review/dismiss`,
-                                        { method: "POST" },
-                                      )
-                                        .then(() => refresh())
-                                        .catch((cause) =>
-                                          notify(cause.message, true),
-                                        )
-                                    }
-                                  >
-                                    Dismiss reviewed note
-                                  </button>
-                                )}
-                            </div>
+                            <span role="note">{user.accessReview.message}</span>
                           )}
                           {accountsView &&
                             (user.legacy || user.legacyPending) && (
@@ -1832,7 +1444,7 @@ function AccessManagement({
                     </td>
                     <td className="subuser-row-actions">
                       <div>
-                        {(accountsView || remote || user.panelAccount) && (
+                        {(accountsView || remote) && (
                           <button
                             className="btn subuser-invite"
                             aria-label={`${user.inviteStatus === "accepted" ? "Reset access for" : "Create invite link for"} ${user.email}`}
@@ -1853,10 +1465,7 @@ function AccessManagement({
                             onClick={() =>
                               user.inviteStatus === "accepted"
                                 ? setResetting(user)
-                                : void createInvitation(
-                                    user,
-                                    accountsView || !!user.panelAccount,
-                                  )
+                                : void createInvitation(user)
                             }
                           >
                             <Link size={14} />
@@ -1865,28 +1474,6 @@ function AccessManagement({
                               : user.inviteStatus === "accepted"
                                 ? "Reset access"
                                 : "Create invite link"}
-                          </button>
-                        )}
-                        {accountsView && user.inviteStatus === "pending" && (
-                          <button
-                            className="btn"
-                            disabled={busy || !!inviting}
-                            onClick={() => {
-                              if (
-                                !window.confirm(
-                                  `Revoke the unused invitation for ${user.email}? Their account and server access remain.`,
-                                )
-                              )
-                                return;
-                              void panelApi(
-                                `/panel-users/${encodeURIComponent(user.id)}/revoke-invitation`,
-                                { method: "POST" },
-                              )
-                                .then(() => refresh())
-                                .catch((cause) => notify(cause.message, true));
-                            }}
-                          >
-                            Revoke link
                           </button>
                         )}
                         <button
@@ -1941,7 +1528,7 @@ function AccessManagement({
             total={filtered.length}
             onPageChange={setPage}
             onPageSizeChange={setPageSize}
-            label="people"
+            label="subusers"
           />
         )}
       </section>
@@ -1969,7 +1556,7 @@ function AccessManagement({
                     : editing
                       ? accountsView
                         ? "Edit account"
-                        : "Edit server permissions"
+                        : "Edit subuser permissions"
                       : "Grant server access"}
             </h2>
             <button
@@ -1984,27 +1571,12 @@ function AccessManagement({
           </header>
           <div className="subusers-editor-body">
             {resetting ? (
-              <>
-                <label>
-                  Invitation expiry{" "}
-                  <select
-                    value={invitationExpiry}
-                    onChange={(event) =>
-                      setInvitationExpiry(Number(event.target.value))
-                    }
-                  >
-                    <option value={1}>1 hour</option>
-                    <option value={24}>1 day</option>
-                    <option value={168}>7 days</option>
-                  </select>
-                </label>
-                <p className="subusers-delete-description">
-                  Reset access for <strong>{resetting.email}</strong>? Their
-                  current password and sessions stop working immediately. Share
-                  the new link so they can choose a new password. Their existing
-                  server grants stay the same.
-                </p>
-              </>
+              <p className="subusers-delete-description">
+                Reset access for <strong>{resetting.email}</strong>? Their
+                current password and sessions stop working immediately. Share
+                the new link so they can choose a new password. Their existing
+                server grants stay the same.
+              </p>
             ) : deleting ? (
               <p className="subusers-delete-description">
                 {accountsView ? (
@@ -2081,21 +1653,6 @@ function AccessManagement({
                     )}
                   </div>
                 )}
-                {(invitingAccount || resetting) && (
-                  <label>
-                    Invitation expiry{" "}
-                    <select
-                      value={invitationExpiry}
-                      onChange={(event) =>
-                        setInvitationExpiry(Number(event.target.value))
-                      }
-                    >
-                      <option value={1}>1 hour</option>
-                      <option value={24}>1 day</option>
-                      <option value={168}>7 days</option>
-                    </select>
-                  </label>
-                )}
                 {invitingAccount && (
                   <div className="subusers-invitation-choice">
                     <PermissionCheckbox
@@ -2125,30 +1682,6 @@ function AccessManagement({
                     <legend className="subusers-sr-only">
                       Server permissions
                     </legend>
-                    <p>
-                      Mod installs and updates need file read, create, update
-                      and delete plus server start/stop. Server admins can
-                      invite others within their own permissions. Host folder
-                      browsing remains owner-only.
-                    </p>
-                    {selected.some((id) =>
-                      ["file.create", "file.update"].includes(id),
-                    ) &&
-                      selected.some((id) =>
-                        ["control.start", "control.restart"].includes(id),
-                      ) && (
-                        <label>
-                          <input
-                            type="checkbox"
-                            checked={codeAcknowledged}
-                            onChange={(event) =>
-                              setCodeAcknowledged(event.target.checked)
-                            }
-                          />{" "}
-                          I trust this person to run code on the host computer
-                          through uploaded mods, plugins or startup files.
-                        </label>
-                      )}
                     <div className="subusers-preset">
                       <div>
                         <strong>Server controls</strong>
@@ -2174,7 +1707,7 @@ function AccessManagement({
                     <div className="subusers-all-permissions">
                       <PermissionCheckbox
                         label="All permissions"
-                        description="Includes inviting people and executing uploaded mods or plugins with the host computer’s user access."
+                        description="Grant every listed permission for this server."
                         checked={
                           optionalPermissions.length > 0 &&
                           selectedOptionalCount === optionalPermissions.length
@@ -2195,13 +1728,6 @@ function AccessManagement({
                       role="group"
                       aria-label="Permission presets"
                     >
-                      <button
-                        type="button"
-                        className="btn"
-                        onClick={() => setSelected(["server.view"])}
-                      >
-                        Status only
-                      </button>
                       {(["admin", "operator", "viewer"] as const).map(
                         (role) => (
                           <button
@@ -2227,7 +1753,7 @@ function AccessManagement({
                               ? "Admin"
                               : role === "operator"
                                 ? "Operator"
-                                : "Read files and backups"}{" "}
+                                : "Viewer"}{" "}
                             preset
                           </button>
                         ),
