@@ -272,10 +272,7 @@ modpack: {
       },
     ],
   });
-  assert.doesNotMatch(
-    review.warnings.join("\n"),
-    /content rules could not be verified/i,
-  );
+  assert.deepEqual(review.warnings, []);
   assert.deepEqual(planned(review), [`${folder}/compat-2.jar`]);
   await finish(service, review);
   assert.deepEqual(

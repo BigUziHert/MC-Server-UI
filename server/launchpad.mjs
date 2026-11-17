@@ -2319,9 +2319,6 @@ export async function createLaunchpad(ctx) {
           await checkParentRange(parentFiles, source, fail);
       }
       reusedDependencies.set(existing.path, existing);
-      warnings.push(
-        `Using ${result.title || value.projectId} from ${existing.path}, already included by AutoModpack.`,
-      );
       return { ...result, regularItem: existing };
     }
     async function visit(
