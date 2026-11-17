@@ -109,7 +109,7 @@ type InstalledItem = {
   authorLinks?: Project["authorLinks"];
   update?: Version | null;
   url?: string;
-  updateCheck?: "checked" | "unavailable" | "pending";
+  updateCheck?: "checked" | "unavailable" | "pending" | "unlisted";
   updateIssue?: string;
   active?: boolean;
   modifiedAt?: string;
@@ -473,6 +473,7 @@ function updateCheckLabel(
   refreshing: boolean,
 ) {
   if (!enabled || !entry.platform || !entry.projectId) return null;
+  if (entry.updateCheck === "unlisted") return "No release listed";
   if (entry.updateCheck === "unavailable") return "Update check unavailable";
   if (entry.updateCheck === "pending")
     return refreshing ? "Checking updates…" : "Update check unavailable";
@@ -3226,7 +3227,13 @@ export default function Launchpad({
                             updateFiltersReady,
                             scanRefreshing,
                           ) && (
-                            <span>
+                            <span
+                              className={
+                                entry.updateCheck === "unlisted"
+                                  ? "launchpad-badge"
+                                  : undefined
+                              }
+                            >
                               {updateCheckLabel(
                                 entry,
                                 updateFiltersReady,
@@ -3245,7 +3252,8 @@ export default function Launchpad({
                       {entry?.updateIssue &&
                         entry.platform &&
                         entry.projectId &&
-                        entry.updateCheck === "unavailable" &&
+                        (entry.updateCheck === "unavailable" ||
+                          entry.updateCheck === "unlisted") &&
                         updateFiltersReady && (
                           <div className="launchpad-project-issue">
                             {entry.updateIssue}

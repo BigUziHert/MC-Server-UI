@@ -1148,11 +1148,12 @@ export async function createLaunchpad(ctx) {
           },
         );
     };
-    const apply = (item, value) => {
+    const apply = (item, value, unlisted) => {
       if (value) item.update = value;
       else delete item.update;
-      item.updateCheck = "checked";
-      delete item.updateIssue;
+      item.updateCheck = unlisted ? "unlisted" : "checked";
+      if (unlisted) item.updateIssue = unlisted;
+      else delete item.updateIssue;
     };
     await Promise.all(
       providers.map(async (found) => {
@@ -1171,7 +1172,7 @@ export async function createLaunchpad(ctx) {
             cached = updateCache.get(key);
           if (cached?.value) item.update = cached.value;
           if (!enabled(input.refresh) && cached?.expiresAt > Date.now())
-            apply(item, cached.value);
+            apply(item, cached.value, cached.unlisted);
           else {
             item.updateCheck = "pending";
             if (updateFlights.has(key))
@@ -1205,25 +1206,31 @@ export async function createLaunchpad(ctx) {
                 !accepting ||
                 input.signal?.aborted ||
                 cacheGeneration !== metadataCache?.generation ||
-                !result?.updates ||
-                typeof result.updates !== "object"
+                !result ||
+                (typeof result.updates !== "object" &&
+                  typeof result.unlisted !== "object")
               )
                 return;
               for (const item of missing) {
                 const key = updateKey(input, item);
-                if (
-                  checked.has(key) ||
-                  !Object.hasOwn(result.updates, providerHash(item))
-                )
-                  continue;
-                const value = result.updates[providerHash(item)];
+                if (checked.has(key)) continue;
+                const hash = providerHash(item);
+                const hasUpdate =
+                  result.updates && Object.hasOwn(result.updates, hash);
+                const unlisted =
+                  !hasUpdate && typeof result.unlisted?.[hash] === "string"
+                    ? result.unlisted[hash]
+                    : undefined;
+                if (!hasUpdate && !unlisted) continue;
+                const value = hasUpdate ? result.updates[hash] : null;
                 const normalized = value ? publicVersion(value) : null;
+                const outcome = { value: normalized, unlisted };
                 remember(updateCache, key, {
-                  value: normalized,
+                  ...outcome,
                   expiresAt: Date.now() + 5 * 60_000,
                 });
-                checked.set(key, normalized);
-                apply(item, normalized);
+                checked.set(key, outcome);
+                apply(item, normalized, unlisted);
               }
             };
             try {
@@ -1255,7 +1262,7 @@ export async function createLaunchpad(ctx) {
             const key = updateKey(input, item);
             const value = work.then((result) =>
               result.checked?.has(key)
-                ? { value: result.checked.get(key) }
+                ? result.checked.get(key)
                 : {
                     issue: result.issues?.[providerHash(item)] ?? result.issue,
                   },
@@ -1424,7 +1431,7 @@ export async function createLaunchpad(ctx) {
               pending.push({ item, work });
               const result = await work;
               if (result && Object.hasOwn(result, "value"))
-                apply(item, result.value);
+                apply(item, result.value, result.unlisted);
               else {
                 item.updateCheck = "unavailable";
                 if (result?.issue) item.updateIssue = result.issue;
@@ -1437,7 +1444,7 @@ export async function createLaunchpad(ctx) {
           pending.map(async ({ item, work }) => {
             const result = await abortable(work, input.signal);
             if (result && Object.hasOwn(result, "value"))
-              apply(item, result.value);
+              apply(item, result.value, result.unlisted);
             else {
               item.updateCheck = "unavailable";
               if (result?.issue) item.updateIssue = result.issue;
@@ -1523,8 +1530,11 @@ export async function createLaunchpad(ctx) {
       if (cached?.value) item.update = cached.value;
       item.updateCheck =
         !enabled(input.refresh) && cached?.expiresAt > Date.now()
-          ? "checked"
+          ? cached.unlisted
+            ? "unlisted"
+            : "checked"
           : "pending";
+      if (item.updateCheck === "unlisted") item.updateIssue = cached.unlisted;
     }
     markDuplicates(items);
     if (enabled(input.local)) return { items, warnings: scanWarnings };
@@ -1555,6 +1565,7 @@ export async function createLaunchpad(ctx) {
           if (checked.update) item.update = checked.update;
           else delete item.update;
           if (checked.updateIssue) item.updateIssue = checked.updateIssue;
+          else delete item.updateIssue;
         }
         markDuplicates(items);
         return structuredClone({
@@ -1611,7 +1622,8 @@ export async function createLaunchpad(ctx) {
           ),
         ];
         for (const item of items) {
-          if (item.updateCheck !== "checked") item.updateCheck = "unavailable";
+          if (!["checked", "unlisted"].includes(item.updateCheck))
+            item.updateCheck = "unavailable";
           if (!item.sha512) continue;
           if (item.platform)
             metadataCache?.rememberIdentity(

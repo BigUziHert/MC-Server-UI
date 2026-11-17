@@ -1113,7 +1113,14 @@ test("a 120-second background check deadline preserves completed rows and fails 
       updateCheck: "unavailable",
       updateIssue: "Provider is temporarily unavailable (503).",
     },
-    ...Array.from({ length: 170 }, (_, index) => ({
+    {
+      ...installed("No Listed Release"),
+      update: null,
+      updateCheck: "unlisted",
+      updateIssue:
+        "Modrinth does not list a release for Minecraft 1.21.1 and NeoForge.",
+    },
+    ...Array.from({ length: 169 }, (_, index) => ({
       ...installed(`Z verified ${index}`),
       update: null,
     })),
@@ -1169,6 +1176,23 @@ test("a 120-second background check deadline preserves completed rows and fails 
     }),
   ).toBeEnabled();
   await expect(verified.getByText("Update check unavailable")).toHaveCount(0);
+  const unlisted = page.getByRole("article", {
+    name: "No Listed Release",
+    exact: true,
+  });
+  await expect(
+    unlisted.getByText("No release listed", { exact: true }),
+  ).toBeVisible();
+  await expect(
+    unlisted.getByText(
+      "Modrinth does not list a release for Minecraft 1.21.1 and NeoForge.",
+      { exact: true },
+    ),
+  ).toBeVisible();
+  await expect(unlisted.getByText("Up to date", { exact: true })).toHaveCount(
+    0,
+  );
+  await expect(unlisted.getByText("Update check unavailable")).toHaveCount(0);
   await expect(
     page
       .getByRole("article", { name: "Pending Mod", exact: true })

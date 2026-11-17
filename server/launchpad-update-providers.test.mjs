@@ -279,38 +279,116 @@ test("unverified current identity or publication dates remain unknown instead of
   assert.match(result.issues[rows[3].sha512], /did not return metadata/);
 });
 
-test("confirmed current hashes become null while omitted hashes remain unknown, and duplicate hashes are coalesced", async () => {
-  const row = item(0),
-    unknown = item(1);
+test("partial successful batches recover only omitted hashes and coalesce duplicates", async () => {
+  const rows = [item(0), item(1), item(2)];
+  const reads = [];
+  const progress = {};
   let calls = 0;
-  const p = provider(async (url, options) => {
+  const p = historyProvider(async (url, options) => {
     calls++;
-    assert.ok(url.endsWith("/version_files/update"));
-    assert.deepEqual(JSON.parse(options.body).hashes, [
-      row.sha512,
-      unknown.sha512,
-    ]);
-    return json({ [row.sha512]: current(row) });
+    if (url.endsWith("/version_files/update")) {
+      assert.deepEqual(
+        JSON.parse(options.body).hashes,
+        rows.map((row) => row.sha512),
+      );
+      return json({ [rows[0].sha512]: current(rows[0]) });
+    }
+    assert.deepEqual(
+      progress[rows[0].sha512],
+      null,
+      "primary result publishes before recovery",
+    );
+    reads.push(new URL(url).pathname);
+    if (url.includes("/project/project1/version"))
+      return json([current(rows[1])]);
+    if (url.includes("/project/project2/version"))
+      return json([current(rows[2]), raw(rows[2])]);
+    assert.fail(`Unexpected request: ${url}`);
   });
-  const result = await p.updates(input, [row, row, unknown]);
-  assert.deepEqual(result.updates, { [row.sha512]: null });
-  assert.deepEqual(result.warnings, []);
-  assert.match(
-    result.issues[unknown.sha512],
-    /did not return an update result/,
+  const result = await p.updates(
+    { ...input, onProgress: (value) => Object.assign(progress, value.updates) },
+    [rows[0], ...rows],
   );
-  assert.equal(Object.keys(result.issues).length, 1);
-  assert.equal(calls, 1);
+  assert.deepEqual(result.updates[rows[0].sha512], null);
+  assert.deepEqual(result.updates[rows[1].sha512], null);
+  assert.equal(result.updates[rows[2].sha512].id, raw(rows[2]).id);
+  assert.deepEqual(result.warnings, []);
+  assert.deepEqual(result.issues, {});
+  assert.deepEqual(result.unlisted, {});
+  assert.deepEqual(progress, result.updates);
+  assert.equal(reads.length, 2);
+  assert.equal(calls, 3);
   await assert.rejects(
-    p.updates(input, [row, { ...row, versionId: "conflicting" }]),
+    p.updates(input, [rows[0], { ...rows[0], versionId: "conflicting" }]),
     /conflicting version identities/,
   );
   await assert.rejects(
-    p.updates(input, [{ ...row, sha512: "invalid" }]),
+    p.updates(input, [{ ...rows[0], sha512: "invalid" }]),
     /valid SHA512/,
   );
-  assert.equal(calls, 1);
+  assert.equal(calls, 3);
 });
+
+for (const scenario of [
+  "valid",
+  "wrong-project",
+  "wrong-version",
+  "wrong-hash",
+  "missing",
+  "history-failure",
+]) {
+  test(`omitted checksum with no listed release verifies identity: ${scenario}`, async () => {
+    const row = item(0),
+      good = item(1);
+    const installed = current(row, {
+      game_versions: ["1.21"],
+      environment: "client_only",
+    });
+    if (scenario === "wrong-project") installed.project_id = "other";
+    if (scenario === "wrong-version") installed.id = "other";
+    if (scenario === "wrong-hash") installed.files = raw(row).files;
+    const progress = { updates: {}, unlisted: {} };
+    const p = historyProvider(async (url, options) => {
+      if (options.method === "POST")
+        return json({ [good.sha512]: current(good) });
+      if (url.includes("/project/")) {
+        const query = new URL(url).searchParams;
+        assert.deepEqual(JSON.parse(query.get("game_versions")), ["1.21.1"]);
+        assert.deepEqual(JSON.parse(query.get("loaders")), ["neoforge"]);
+        return scenario === "history-failure"
+          ? new Response("denied", { status: 403 })
+          : json([]);
+      }
+      assert.equal(new URL(url).pathname, `/v2/version/${row.versionId}`);
+      return json(scenario === "missing" ? null : installed);
+    });
+    const result = await p.updates(
+      {
+        ...input,
+        target: "automodpack",
+        onProgress: (value) => {
+          Object.assign(progress.updates, value.updates);
+          Object.assign(progress.unlisted, value.unlisted);
+        },
+      },
+      [row, good],
+    );
+    assert.deepEqual(result.updates, { [good.sha512]: null });
+    assert.deepEqual(progress.updates, result.updates);
+    if (scenario === "valid") {
+      assert.match(
+        result.unlisted[row.sha512],
+        /No release listed for Minecraft 1\.21\.1 \/ neoforge on Modrinth/,
+      );
+      assert.deepEqual(progress.unlisted, result.unlisted);
+      assert.deepEqual(result.issues, {});
+      assert.deepEqual(result.warnings, []);
+    } else {
+      assert.deepEqual(result.unlisted, {});
+      assert.ok(result.issues[row.sha512]);
+    }
+  });
+}
 
 test("rate limits stop queued batches and cool down subsequent callers without caching failed hashes as current", async (t) => {
   let now = Date.now(),
@@ -334,13 +412,12 @@ test("rate limits stop queued batches and cool down subsequent callers without c
   assert.equal(calls, before + 1);
 });
 
-test("missing or invalid later responses cannot overwrite a previously discovered update with a false no-update result", async () => {
+test("null or invalid later responses cannot overwrite a previously discovered update with a false no-update result", async () => {
   const row = item(0);
   let response = raw(row),
     currentFails = false;
   const p = provider(async (url) => {
-    if (url.endsWith("/update"))
-      return json(response ? { [row.sha512]: response } : {});
+    if (url.endsWith("/update")) return json({ [row.sha512]: response });
     return currentFails
       ? new Response("", { status: 404 })
       : json([current(row)]);
@@ -1152,7 +1229,7 @@ test("indexed recovery obeys cancellation and rate limits without launching indi
   }
 });
 
-for (const status of [503, 403])
+for (const status of [503, 403, 200])
   test(`GET recovery after bulk ${status} verifies an installed release outside the filtered history and rejects forged metadata`, async () => {
     const row = item(0);
     for (const scenario of [
@@ -1186,10 +1263,12 @@ for (const status of [503, 403])
         candidate.date_published = "2026-01-01T00:00:00Z";
       const p = historyProvider(async (url, options) => {
         if (options.method === "POST")
-          return new Response("<html><h1>Request blocked at edge</h1></html>", {
-            status,
-            headers: { "Content-Type": "text/html" },
-          });
+          return status === 200
+            ? json({})
+            : new Response("<html><h1>Request blocked at edge</h1></html>", {
+                status,
+                headers: { "Content-Type": "text/html" },
+              });
         if (url.includes("/project/")) return json([candidate]);
         assert.equal(new URL(url).pathname, "/v2/version/old0");
         currentReads++;
@@ -1337,7 +1416,8 @@ test("caller cancellation aborts in-flight batch requests, skips queued batches,
   });
   const p = provider(async (url, options) => {
     calls++;
-    if (controller.signal.aborted) return json({});
+    if (controller.signal.aborted)
+      return json({ [item(0).sha512]: current(item(0)) });
     if (calls === 2) entered();
     return new Promise((resolve, reject) => {
       options.signal.addEventListener(
@@ -1356,12 +1436,9 @@ test("caller cancellation aborts in-flight batch requests, skips queued batches,
   await assert.rejects(operation, /caller cancelled/);
   const result = await p.updates(input, [item(0)]);
   assert.equal(calls, 3);
-  assert.deepEqual(result.updates, {});
+  assert.deepEqual(result.updates, { [item(0).sha512]: null });
   assert.deepEqual(result.warnings, []);
-  assert.match(
-    result.issues[item(0).sha512],
-    /did not return an update result/,
-  );
+  assert.deepEqual(result.issues, {});
 });
 
 for (const stalled of ["request", "response body"])
@@ -1443,10 +1520,22 @@ test("caller cancellation releases uncooperative update requests so the next cal
   const ready = new Promise((resolve) => {
     entered = resolve;
   });
-  const p = provider(async () => {
+  const p = provider(async (url, options) => {
     calls++;
     if (calls === 2) entered();
-    if (controller.signal.aborted) return json({});
+    if (controller.signal.aborted)
+      return json(
+        Object.fromEntries(
+          JSON.parse(options.body).hashes.map((sha) => [
+            sha,
+            current(
+              Array.from({ length: 101 }, (_, i) => item(i)).find(
+                (row) => row.sha512 === sha,
+              ),
+            ),
+          ]),
+        ),
+      );
     return new Promise(() => {});
   });
   const cancelled = p.updates(
@@ -1461,9 +1550,9 @@ test("caller cancellation releases uncooperative update requests so the next cal
     Array.from({ length: 101 }, (_, index) => item(index)),
   );
   assert.equal(calls, 4);
-  assert.deepEqual(retry.updates, {});
+  assert.equal(Object.keys(retry.updates).length, 101);
   assert.deepEqual(retry.warnings, []);
-  assert.equal(Object.keys(retry.issues).length, 101);
+  assert.deepEqual(retry.issues, {});
 });
 
 test("optional caller cancellation reaches existing Modrinth and CurseForge version and identification helpers", async () => {

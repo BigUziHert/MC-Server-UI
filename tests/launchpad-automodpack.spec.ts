@@ -80,6 +80,7 @@ type Item = {
   active: boolean;
   update: typeof version | null;
   updateCheck: string;
+  updateIssue?: string;
 };
 const item = (path: string, release = "1.0"): Item => ({
   path,
@@ -242,6 +243,110 @@ async function catalog(page: Page, supportsAutoModpack = true) {
   });
   return { reads, writes, inventories, folder };
 }
+
+test("AutoModpack shows unlisted releases as neutral results and keeps real failures and regular Mods separate", async ({
+  page,
+}) => {
+  const state = await catalog(page);
+  const note =
+    "Modrinth does not list a release for Minecraft 1.21.1 and NeoForge. The installed file is recognized, but its compatibility is not confirmed by this listing.";
+  const releases = [
+    {
+      title: "Eating Animations",
+      projectId: "X8CISwXp",
+      filename: "eatinganimation-1.21.0-6.0.1.jar",
+      version: "6.0.1",
+    },
+    {
+      title: "GroovyModLoader (GML)",
+      projectId: "zg2tT2Vu",
+      filename: "gml-6.0.2.jar",
+      version: "6.0.2",
+    },
+  ];
+  const staged = releases.map((release) => ({
+    ...item(
+      `automodpack/host-modpack/main/mods/${release.filename}`,
+      release.version,
+    ),
+    title: release.title,
+    projectId: release.projectId,
+    updateCheck: "unlisted",
+    updateIssue: note,
+  }));
+  state.inventories.set("automodpack:mod", staged);
+  state.inventories.set(
+    "server:mod",
+    releases.map((release, index) => ({
+      ...item(`mods/${release.filename}`, "1.0"),
+      title: release.title,
+      projectId: release.projectId,
+      update: index === 0 ? update : null,
+    })),
+  );
+  await page.goto("/#launchpad");
+  await page.getByRole("tab", { name: "AutoModpack", exact: true }).click();
+  await page.getByRole("switch", { name: "Show installed content" }).check();
+  for (const release of releases) {
+    const row = page.getByRole("article", { name: release.title, exact: true });
+    await expect(
+      row.locator(".launchpad-badge", { hasText: "No release listed" }),
+    ).toBeVisible();
+    await expect(row.getByText(note, { exact: true })).toBeVisible();
+    await expect(row.getByText("Up to date", { exact: true })).toHaveCount(0);
+    await expect(
+      row.getByText("Update available", { exact: true }),
+    ).toHaveCount(0);
+    await expect(
+      row.getByRole("button", { name: `Update ${release.title}`, exact: true }),
+    ).toHaveCount(0);
+    await expect(
+      row.getByRole("button", {
+        name: `Choose version for ${release.title}`,
+        exact: true,
+      }),
+    ).toBeEnabled();
+  }
+  await expect(page.locator(".launchpad-update-warning")).toHaveCount(0);
+  state.inventories.set("automodpack:mod", [
+    ...staged,
+    {
+      ...item("automodpack/host-modpack/main/mods/failed.jar"),
+      title: "Provider Failure",
+      projectId: "failure",
+      updateCheck: "unavailable",
+      updateIssue: "Provider is temporarily unavailable (503).",
+    },
+  ]);
+  const refresh = page.getByRole("button", {
+    name: "Refresh Launchpad and check updates",
+    exact: true,
+  });
+  await expect(refresh).toBeEnabled();
+  await refresh.click();
+  const warning = page.locator(".launchpad-update-warning");
+  await expect(warning).toContainText(
+    "Could not check updates for 1 installed item.",
+  );
+  await warning.getByText("View affected files", { exact: true }).click();
+  await expect(warning).toContainText("Provider Failure");
+  await expect(warning).not.toContainText("Eating Animations");
+  await expect(warning).not.toContainText("GroovyModLoader");
+  await page.getByRole("tab", { name: "Mods", exact: true }).click();
+  await expect(
+    page.getByRole("button", { name: "Update Eating Animations", exact: true }),
+  ).toBeEnabled();
+  await expect(
+    page
+      .getByRole("article", { name: "GroovyModLoader (GML)", exact: true })
+      .getByText("Up to date", { exact: true }),
+  ).toBeVisible();
+  await expect(
+    page.getByText("No release listed", { exact: true }),
+  ).toHaveCount(0);
+  await expect(page.locator(".launchpad-update-warning")).toHaveCount(0);
+  expect(state.writes).toEqual([]);
+});
 
 for (const kind of kinds) {
   test(`AutoModpack ${kind.label} reuses reviews and scopes every operation independently`, async ({

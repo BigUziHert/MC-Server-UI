@@ -1619,7 +1619,10 @@ test("failed or incomplete Modrinth rechecks retain known updates after cache ex
   t.mock.method(Date, "now", () => now);
   const f = await fixture(t, {
     request: async (url) => {
-      if (new URL(url).pathname !== "/v2/version_files/update") return;
+      const pathname = new URL(url).pathname;
+      if (failure === "missing" && pathname === "/v2/project/project/version")
+        return new Response(null, { status: 503 });
+      if (pathname !== "/v2/version_files/update") return;
       if (failure === "404") return new Response(null, { status: 404 });
       if (failure === "missing") return Response.json({});
     },
@@ -6693,6 +6696,8 @@ test("failed bulk update checks advance progress while another provider is still
     request: async (url) => {
       if (new URL(url).pathname === "/v2/version_files/update")
         return Response.json({});
+      if (new URL(url).pathname === "/v2/project/project/version")
+        return new Response(null, { status: 503 });
     },
   });
   const extra = Buffer.from("another catalog's mod");

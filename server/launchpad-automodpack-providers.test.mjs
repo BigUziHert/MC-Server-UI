@@ -208,44 +208,50 @@ test("Modrinth client-only update checks are independent from the regular Mods e
 });
 
 for (const type of ["mod", "resourcepack", "shader"]) {
-  test(`AutoModpack ${type} updates recover through indexed GETs without excluding client releases`, async () => {
-    const scoped = {
-      ...input,
-      type,
-      loader: type === "shader" ? "iris" : type === "mod" ? "fabric" : "",
-    };
-    const oldHash = hash("old");
-    const old = release(type, {
-      id: "old",
-      date_published: "2026-07-01T00:00:00Z",
-      files: [{ ...release(type).files[0], hashes: { sha512: oldHash } }],
+  for (const status of [403, 200])
+    test(`AutoModpack ${type} updates recover through indexed GETs after bulk ${status} without excluding client releases`, async () => {
+      const scoped = {
+        ...input,
+        type,
+        loader: type === "shader" ? "iris" : type === "mod" ? "fabric" : "",
+      };
+      const oldHash = hash("old");
+      const old = release(type, {
+        id: "old",
+        date_published: "2026-07-01T00:00:00Z",
+        files: [{ ...release(type).files[0], hashes: { sha512: oldHash } }],
+      });
+      let searchFacets;
+      const provider = mr(async (url) => {
+        const parsed = new URL(url);
+        if (parsed.pathname === "/v2/version_files/update")
+          return status === 200
+            ? json({})
+            : new Response("denied", {
+                status: 403,
+                headers: { "Content-Type": "text/html" },
+              });
+        if (parsed.pathname === "/v2/search") {
+          searchFacets = JSON.parse(parsed.searchParams.get("facets")).flat();
+          return json({
+            hits: [{ project_id: "project", latest_version: "new" }],
+          });
+        }
+        if (parsed.pathname === "/v2/projects")
+          return json([{ id: "project", versions: ["old", "new"] }]);
+        if (parsed.pathname === "/v2/versions")
+          return json([old, release(type)]);
+        assert.fail(`Unexpected request: ${url}`);
+      });
+      const result = await provider.updates(scoped, [
+        { projectId: "project", versionId: "old", sha512: oldHash },
+      ]);
+      assert.equal(result.updates[oldHash].id, "new");
+      assert.deepEqual(result.issues, {});
+      assert.ok(
+        !searchFacets.some((facet) => facet.startsWith("environment:")),
+      );
     });
-    let searchFacets;
-    const provider = mr(async (url) => {
-      const parsed = new URL(url);
-      if (parsed.pathname === "/v2/version_files/update")
-        return new Response("denied", {
-          status: 403,
-          headers: { "Content-Type": "text/html" },
-        });
-      if (parsed.pathname === "/v2/search") {
-        searchFacets = JSON.parse(parsed.searchParams.get("facets")).flat();
-        return json({
-          hits: [{ project_id: "project", latest_version: "new" }],
-        });
-      }
-      if (parsed.pathname === "/v2/projects")
-        return json([{ id: "project", versions: ["old", "new"] }]);
-      if (parsed.pathname === "/v2/versions") return json([old, release(type)]);
-      assert.fail(`Unexpected request: ${url}`);
-    });
-    const result = await provider.updates(scoped, [
-      { projectId: "project", versionId: "old", sha512: oldHash },
-    ]);
-    assert.equal(result.updates[oldHash].id, "new");
-    assert.deepEqual(result.issues, {});
-    assert.ok(!searchFacets.some((facet) => facet.startsWith("environment:")));
-  });
 }
 
 test("installed pack metadata preserves the selected type's categories across provider caches", async () => {
