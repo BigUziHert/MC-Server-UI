@@ -31,6 +31,7 @@ import {
   LoaderCircle,
   LockKeyhole,
   Pencil,
+  TextCursorInput,
   Trash2,
   Undo2,
   Upload,
@@ -240,6 +241,7 @@ type FileResult = {
   nextCursor?: string | null;
   uploadFilesPerBatch?: number;
   supportsFileMoves?: boolean;
+  supportsFileRename?: boolean;
 };
 type RecycledItem = {
   id: string;
@@ -255,6 +257,7 @@ type RecycledItem = {
 type FileDialog =
   | { type: "create"; kind: "file" | "directory" }
   | { type: "edit"; entry: Entry }
+  | { type: "rename"; entry: Entry }
   | { type: "delete"; entry: Entry }
   | {
       type: "delete-many";
@@ -748,21 +751,21 @@ export default function FileManager({
   const [loading, setLoading] = useState(true);
   const [searchProgress, setSearchProgress] = useState(0);
   const [uploadLimit, setUploadLimit] = useState({ scope: "", value: 20 });
-  const [moveCapability, setMoveCapability] = useState({
+  const [fileCapabilities, setFileCapabilities] = useState({
     scope: "",
-    supported: false,
+    move: false,
+    rename: false,
   });
   const supportsMoves =
-    moveCapability.scope === transferKey && moveCapability.supported;
+    fileCapabilities.scope === transferKey && fileCapabilities.move;
+  const canRename =
+    fileCapabilities.scope === transferKey &&
+    fileCapabilities.rename &&
+    canCreate &&
+    canDelete;
   const [error, setError] = useState("");
   const [dragging, setDragging] = useState(false);
   const [dialog, setDialog] = useState<FileDialog | null>(null);
-  const canSubmitDialog =
-    dialog?.type === "create"
-      ? canCreate
-      : dialog?.type === "edit"
-        ? canContent && canUpdate
-        : canDelete;
   const [name, setName] = useState("");
   const [content, setContent] = useState("");
   const [encoding, setEncoding] = useState<"utf8" | "latin1">("utf8");
@@ -791,6 +794,19 @@ export default function FileManager({
   const moving = Boolean(moveBatch?.running);
   const movePending = moving || Boolean(moveBatch?.unconfirmed);
   const [checkingMove, setCheckingMove] = useState(true);
+  const renameBusy =
+    loading || saving || !!error || transferring || movePending || checkingMove;
+  const canSubmitDialog =
+    dialog?.type === "create"
+      ? canCreate
+      : dialog?.type === "edit"
+        ? canContent && canUpdate
+        : dialog?.type === "rename"
+          ? canRename &&
+            !renameBusy &&
+            !!name.trim() &&
+            name !== dialog.entry.name
+          : canDelete;
   const [dialogMoveId, setDialogMoveId] = useState<string | null>(null);
   const uploadInput = useRef<HTMLInputElement>(null);
   const folderInput = useRef<HTMLInputElement>(null);
@@ -870,9 +886,10 @@ export default function FileManager({
             ? previous
             : { scope: transferKey, value },
         );
-        setMoveCapability({
+        setFileCapabilities({
           scope: transferKey,
-          supported: result.supportsFileMoves === true,
+          move: result.supportsFileMoves === true,
+          rename: result.supportsFileRename === true,
         });
         if (
           debouncedQuery &&
@@ -1074,6 +1091,11 @@ export default function FileManager({
         "input:not(:disabled), textarea:not(:disabled)",
       )
       ?.focus();
+    if (dialog.type === "rename") {
+      const input = element?.querySelector("input");
+      const dot = dialog.entry.name.lastIndexOf(".");
+      input?.setSelectionRange(0, dot > 0 ? dot : dialog.entry.name.length);
+    }
     return () => {
       element?.close();
       if (!focusSearchAfterClose.current && previous?.isConnected)
@@ -1116,6 +1138,12 @@ export default function FileManager({
     setReading(false);
     setDialogError("");
     setDialog({ type: "delete", entry });
+  }
+  function openRename(entry: Entry) {
+    if (!canRename || entry.type !== "file" || renameBusy) return;
+    setName(entry.name);
+    setDialogError("");
+    setDialog({ type: "rename", entry });
   }
   function openDeleteSelected() {
     if (!canDelete || movePending || checkingMove) return;
@@ -1222,9 +1250,9 @@ export default function FileManager({
           onProgress: (progress) =>
             report({
               message: "Uploading files…",
-              completedFiles: progress.uploadedFiles,
+              completedFiles: progress.uploadedFiles + progress.skippedFiles,
               totalFiles: progress.totalFiles,
-              completedBytes: progress.uploadedBytes,
+              completedBytes: progress.uploadedBytes + progress.skippedBytes,
               totalBytes: progress.totalBytes,
             }),
         });
@@ -1235,7 +1263,10 @@ export default function FileManager({
             result.message ||
               `Upload stopped after ${result.uploadedFiles} files. Check the destination before retrying.`,
           );
-        return `${result.uploadedFiles} ${result.uploadedFiles === 1 ? "file uploaded" : "files uploaded"}${result.totalDirectories ? ` with ${result.totalDirectories} folders` : ""} to /${uploadPath || "server"}.`;
+        const summary = `${result.uploadedFiles} ${result.uploadedFiles === 1 ? "file uploaded" : "files uploaded"}${result.totalDirectories ? ` with ${result.totalDirectories} folders` : ""} to /${uploadPath || "server"}.`;
+        return result.skippedFiles
+          ? `${summary} Skipped ${result.skippedFiles} identical ${result.skippedFiles === 1 ? "file" : "files"}.`
+          : summary;
       },
       notify,
     );
@@ -1440,6 +1471,17 @@ export default function FileManager({
       } else if (
         !modifier &&
         !event.altKey &&
+        !event.shiftKey &&
+        key === "f2" &&
+        canRename &&
+        !renameBusy &&
+        selectedFile
+      ) {
+        event.preventDefault();
+        openRename(selectedFile);
+      } else if (
+        !modifier &&
+        !event.altKey &&
         key === "delete" &&
         selected.size &&
         canDelete &&
@@ -1524,6 +1566,20 @@ export default function FileManager({
           content,
         });
         notify(`${dialog.kind === "directory" ? "Folder" : "File"} created.`);
+      } else if (dialog.type === "rename") {
+        const renamed = await post<{ path: string }>("/files/rename", {
+          path: dialog.entry.path,
+          name,
+        });
+        setSelected((previous) => {
+          if (!previous.has(dialog.entry.path)) return previous;
+          const next = new Set(previous);
+          next.delete(dialog.entry.path);
+          next.add(renamed.path);
+          return next;
+        });
+        focusSearchAfterClose.current = true;
+        notify(`Renamed ${dialog.entry.name} to ${name}.`);
       } else if (dialog.type === "edit") {
         await api("/files/content", {
           method: "PUT",
@@ -1603,6 +1659,10 @@ export default function FileManager({
     () => entries.filter((entry) => selected.has(entry.path)),
     [entries, selected],
   );
+  const selectedFile =
+    selectedEntries.length === 1 && selectedEntries[0].type === "file"
+      ? selectedEntries[0]
+      : null;
   const visibleSelectedCount = visible.filter((entry) =>
     selected.has(entry.path),
   ).length;
@@ -1776,7 +1836,13 @@ export default function FileManager({
               : null;
           setContextMenu({
             x: Math.max(8, Math.min(event.clientX, window.innerWidth - 228)),
-            y: Math.max(8, Math.min(event.clientY, window.innerHeight - 234)),
+            y: Math.max(
+              8,
+              Math.min(
+                event.clientY,
+                window.innerHeight - (canRename ? 272 : 234),
+              ),
+            ),
           });
         }}
         onDragEnter={(event) => {
@@ -2240,6 +2306,17 @@ export default function FileManager({
                             <Download size={15} />
                           </DownloadButton>
                         )}
+                        {canRename && entry.type === "file" && (
+                          <button
+                            className="btn icon"
+                            aria-label={`Rename ${requestedQuery ? entry.path : entry.name}`}
+                            title="Rename file"
+                            disabled={renameBusy}
+                            onClick={() => openRename(entry)}
+                          >
+                            <TextCursorInput size={15} />
+                          </button>
+                        )}
                         <button
                           className="btn icon delete-action"
                           aria-label={`Delete ${requestedQuery ? entry.path : entry.name}`}
@@ -2413,6 +2490,21 @@ export default function FileManager({
             >
               <FileIcon size={15} /> Select all <kbd>Ctrl+A</kbd>
             </button>
+            {canRename && (
+              <button
+                role="menuitem"
+                aria-label="Rename"
+                aria-keyshortcuts="F2"
+                disabled={!selectedFile || renameBusy}
+                onClick={() => {
+                  contextMenuTrigger.current?.focus({ preventScroll: true });
+                  setContextMenu(null);
+                  if (selectedFile) openRename(selectedFile);
+                }}
+              >
+                <TextCursorInput size={15} /> Rename <kbd>F2</kbd>
+              </button>
+            )}
             <button
               role="menuitem"
               disabled={
@@ -2507,14 +2599,16 @@ export default function FileManager({
                     ? `New ${dialog.kind === "directory" ? "folder" : "file"}`
                     : dialog.type === "edit"
                       ? dialog.entry.name
-                      : dialog.type === "delete-many"
-                        ? "Move selected items to Recycle Bin?"
-                        : "Move this item to Recycle Bin?"}
+                      : dialog.type === "rename"
+                        ? "Rename file"
+                        : dialog.type === "delete-many"
+                          ? "Move selected items to Recycle Bin?"
+                          : "Move this item to Recycle Bin?"}
                 </h2>
                 <p id="file-dialog-description">
                   {dialog.type === "create"
                     ? `Create in /${path || "server"}`
-                    : dialog.type === "edit"
+                    : dialog.type === "edit" || dialog.type === "rename"
                       ? `/${dialog.entry.path}`
                       : "You can restore these items from Recycle Bin."}
                 </p>
@@ -2529,15 +2623,17 @@ export default function FileManager({
                 <X size={18} />
               </button>
             </div>
-            {dialog.type === "create" && (
+            {(dialog.type === "create" || dialog.type === "rename") && (
               <label className="form-field">
-                {dialog.kind === "directory" ? "Folder name" : "File name"}
+                {dialog.type === "create" && dialog.kind === "directory"
+                  ? "Folder name"
+                  : "File name"}
                 <input
                   required
                   value={name}
                   onChange={(event) => setName(event.target.value)}
                   placeholder={
-                    dialog.kind === "directory"
+                    dialog.type === "create" && dialog.kind === "directory"
                       ? "my-plugins"
                       : "server.properties"
                   }
@@ -2673,7 +2769,9 @@ export default function FileManager({
                       : "Move to Recycle Bin"
                     : dialog.type === "edit"
                       ? "Save changes"
-                      : `Create ${dialog.kind === "directory" ? "folder" : "file"}`}
+                      : dialog.type === "rename"
+                        ? "Rename"
+                        : `Create ${dialog.kind === "directory" ? "folder" : "file"}`}
               </button>
             </div>
           </form>

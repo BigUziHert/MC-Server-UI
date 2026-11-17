@@ -83,6 +83,28 @@ const loaders = [
 const shaderLoaders = ["iris", "optifine", "canvas", "vanilla"];
 const missing = (cause) => cause.code === "ENOENT" || cause.code === "ENOTDIR";
 const enabled = (value) => value === true || value === "true";
+const otherModCatalog = (platform) =>
+  platform === "modrinth"
+    ? "curseforge"
+    : platform === "curseforge"
+      ? "modrinth"
+      : null;
+
+// A catalog's project and release IDs must always travel together.
+function inCatalog(item, platform) {
+  const alias = item.catalogAliases?.find(
+    (value) => value.platform === platform,
+  );
+  return alias ? { ...item, ...alias } : item;
+}
+
+function projectFiles(items, { platform, projectId }) {
+  return items
+    .map((item) => inCatalog(item, platform))
+    .filter(
+      (item) => item.platform === platform && item.projectId === projectId,
+    );
+}
 const fileStamp = (stat) =>
   [
     stat.dev,
@@ -364,6 +386,9 @@ export async function createLaunchpad(ctx) {
   const fileCache = new Map(),
     hashFlights = new Map(),
     identities = new Map();
+  // Alternate catalog identities and short-lived misses are memory-only and
+  // keyed to the bytes. Each server retains its own installation receipts.
+  const catalogLookups = new Map();
   const updateCache = new Map(),
     updateFlights = new Map(),
     updateFailures = new Map();
@@ -971,7 +996,7 @@ export async function createLaunchpad(ctx) {
         const receipt = sha512
           ? receiptIndex.get(`${relativePath}\0${sha512}`)
           : undefined;
-        const known =
+        const cachedIdentity =
           identities.get(sha512)?.value ??
           // A later explicit installation may choose another provider for the
           // same bytes. Persisted inferred metadata cannot replace its receipt.
@@ -979,6 +1004,15 @@ export async function createLaunchpad(ctx) {
           !(receipt?.platform && receipt.projectId && receipt.versionId)
             ? metadataCache?.identity(sha512)
             : undefined);
+        const known =
+          receipt?.platform && cachedIdentity?.platform !== receipt.platform
+            ? undefined
+            : cachedIdentity;
+        const other = otherModCatalog(known?.platform ?? receipt?.platform);
+        const alias =
+          type === "mod" &&
+          other &&
+          catalogLookups.get(`${other}:${sha512}`)?.identity;
         rows[index] = {
           path: relativePath,
           name: file.name,
@@ -986,9 +1020,12 @@ export async function createLaunchpad(ctx) {
           sha512,
           platform: null,
           ...Object.fromEntries(
-            Object.entries(receipt ?? {}).filter(([, value]) => value != null),
+            Object.entries(receipt ?? {}).filter(
+              ([key, value]) => key !== "catalogAliases" && value != null,
+            ),
           ),
           ...(known?.platform ? known : {}),
+          ...(alias ? { catalogAliases: [alias] } : {}),
           ...(canActivateContent({ type, target: contentScope })
             ? { active: !/\.disabled$/i.test(file.name) }
             : {}),
@@ -1495,17 +1532,24 @@ export async function createLaunchpad(ctx) {
   function markDuplicates(items) {
     for (const item of items) delete item.duplicates;
     const groups = new Map();
-    for (const item of items)
-      if (item.platform && item.projectId) {
-        const key = `${item.platform}:${item.projectId}`;
+    for (const item of items) {
+      if (!item.platform || !item.projectId) continue;
+      for (const identity of [item, ...(item.catalogAliases ?? [])]) {
+        const key = `${identity.platform}:${identity.projectId}`;
         groups.set(key, [...(groups.get(key) ?? []), item]);
       }
+    }
     for (const group of groups.values())
       if (group.length > 1)
         for (const item of group)
-          item.duplicates = group
-            .filter((other) => other !== item)
-            .map((other) => other.path);
+          item.duplicates = [
+            ...new Set([
+              ...(item.duplicates ?? []),
+              ...group
+                .filter((other) => other !== item)
+                .map((other) => other.path),
+            ]),
+          ];
   }
   async function installed(input) {
     input = selection(input);
@@ -1775,26 +1819,71 @@ export async function createLaunchpad(ctx) {
       )
         warnings.push(...cached.warnings);
     }
+    const wantsAlias = (item, platform) => {
+      if (
+        input.type !== "mod" ||
+        !item.sha512 ||
+        otherModCatalog(item.platform) !== platform
+      )
+        return false;
+      const cached = catalogLookups.get(`${platform}:${item.sha512}`);
+      if (cached?.identity) {
+        item.catalogAliases = [cached.identity];
+        return false;
+      }
+      return enabled(input.refresh) || !(cached?.retryAt > Date.now());
+    };
+    const noteLookup = (
+      item,
+      platform,
+      identity,
+      versionName,
+      retryMs = 600_000,
+    ) => {
+      if (
+        input.type === "mod" &&
+        cacheGeneration === metadataCache?.generation
+      ) {
+        const key = `${platform}:${item.sha512}`;
+        if (identity || !catalogLookups.get(key)?.identity)
+          remember(
+            catalogLookups,
+            key,
+            identity ? { identity } : { retryAt: Date.now() + retryMs },
+          );
+      }
+      if (!identity) return;
+      if (!item.platform)
+        Object.assign(item, identity, { versionName, title: versionName });
+      else if (item.platform !== platform) item.catalogAliases = [identity];
+    };
     const modrinth = providers.find((value) => value.id === "modrinth");
-    if (unknown.length) {
+    const modrinthItems = [
+      ...unknown,
+      ...items.filter((item) => wantsAlias(item, "modrinth")),
+    ];
+    if (modrinthItems.length) {
       const applyIdentities = (matches) => {
         if (input.signal.aborted) return;
-        for (const item of unknown) {
+        for (const item of modrinthItems) {
           const version = matches[item.sha512];
           if (version)
-            Object.assign(item, {
-              platform: "modrinth",
-              projectId: String(version.project_id),
-              versionId: String(version.id),
-              versionName: version.name,
-              title: version.name,
-            });
+            noteLookup(
+              item,
+              "modrinth",
+              {
+                platform: "modrinth",
+                projectId: String(version.project_id),
+                versionId: String(version.id),
+              },
+              version.name,
+            );
         }
       };
       try {
         const result = await abortable(
           (modrinth.identifyInstalled ?? modrinth.identify)(
-            [...new Set(unknown.map((item) => item.sha512))],
+            [...new Set(modrinthItems.map((item) => item.sha512))],
             {
               signal: input.signal,
               refresh: enabled(input.refresh),
@@ -1813,8 +1902,20 @@ export async function createLaunchpad(ctx) {
             ),
           );
         applyIdentities(matches);
+        for (const item of modrinthItems) {
+          if (!matches[item.sha512])
+            noteLookup(
+              item,
+              "modrinth",
+              null,
+              undefined,
+              result.warnings?.length ? 30_000 : 600_000,
+            );
+        }
       } catch (cause) {
         input.signal.throwIfAborted();
+        for (const item of modrinthItems)
+          noteLookup(item, "modrinth", null, undefined, 30_000);
         warnings.push(`Modrinth identification: ${cause.message}`);
       }
     }
@@ -1822,9 +1923,9 @@ export async function createLaunchpad(ctx) {
     if (await key()) {
       const candidates = items.filter(
         (item) =>
-          unknown.includes(item) &&
-          !item.platform &&
-          item.size <= 128 * 1024 ** 2,
+          item.size <= 128 * 1024 ** 2 &&
+          ((unknown.includes(item) && !item.platform) ||
+            wantsAlias(item, "curseforge")),
       );
       if (candidates.length) {
         try {
@@ -1878,7 +1979,7 @@ export async function createLaunchpad(ctx) {
             input.signal,
           );
           for (const [item, digest] of fingerprints) {
-            const match = result.exactMatches?.find(
+            const matches = result.exactMatches?.filter(
               (value) =>
                 value.file?.fileFingerprint === digest.fingerprint &&
                 value.file.hashes?.some(
@@ -1887,17 +1988,25 @@ export async function createLaunchpad(ctx) {
                     hash.value?.toLowerCase() === digest.sha1,
                 ),
             );
-            if (match)
-              Object.assign(item, {
-                platform: "curseforge",
-                projectId: String(match.file.modId ?? match.id),
-                versionId: String(match.file.id),
-                versionName: match.file.displayName,
-                title: match.file.displayName,
-              });
+            const file = matches?.length === 1 ? matches[0].file : null;
+            const projectId = file && (file.modId ?? matches[0].id);
+            noteLookup(
+              item,
+              "curseforge",
+              projectId && file.id
+                ? {
+                    platform: "curseforge",
+                    projectId: String(projectId),
+                    versionId: String(file.id),
+                  }
+                : null,
+              file?.displayName,
+            );
           }
         } catch (cause) {
           input.signal.throwIfAborted();
+          for (const item of candidates)
+            noteLookup(item, "curseforge", null, undefined, 30_000);
           warnings.push(`CurseForge identification: ${cause.message}`);
         }
       }
@@ -2047,11 +2156,8 @@ export async function createLaunchpad(ctx) {
     };
   }
   async function resolveTree(input, stage, local, shared) {
-    const rootIsActive = !local.some(
-      (item) =>
-        item.platform === input.platform &&
-        item.projectId === input.projectId &&
-        item.active === false,
+    const rootIsActive = !projectFiles(local, input).some(
+      (item) => item.active === false,
     );
     const files = [],
       warnings = [],
@@ -2161,11 +2267,7 @@ export async function createLaunchpad(ctx) {
       parentFiles,
       inventory = local,
     ) {
-      const matches = inventory.filter(
-        (item) =>
-          item.platform === value.platform &&
-          item.projectId === value.projectId,
-      );
+      const matches = projectFiles(inventory, value);
       if (matches.length > 1)
         throw error(
           409,
@@ -2213,11 +2315,7 @@ export async function createLaunchpad(ctx) {
       if (
         !shared ||
         shared.rootKeys.has(project) ||
-        local.some(
-          (item) =>
-            item.platform === value.platform &&
-            item.projectId === value.projectId,
-        )
+        projectFiles(local, value).length
       )
         return null;
       await shared.load();
@@ -2226,7 +2324,7 @@ export async function createLaunchpad(ctx) {
       const checksum = artifact && strongestHash(artifact.hashes);
       const matches = (
         await mapReview(
-          shared.items,
+          shared.items.map((item) => inCatalog(item, value.platform)),
           async (item) => {
             if (item.platform === value.platform) {
               if (item.projectId !== value.projectId) return null;
@@ -2384,11 +2482,8 @@ export async function createLaunchpad(ctx) {
         }
         const key = `${value.platform}:${value.projectId}`;
         if (depth && rootIsActive) {
-          const inactive = local.find(
-            (item) =>
-              item.platform === value.platform &&
-              item.projectId === value.projectId &&
-              item.active === false,
+          const inactive = projectFiles(local, value).find(
+            (item) => item.active === false,
           );
           if (inactive)
             throw error(
@@ -3274,7 +3369,9 @@ export async function createLaunchpad(ctx) {
           alternatives(platform) {
             if (!alternatives.has(platform)) {
               const candidates = shared.items.filter(
-                (item) => item.platform !== platform && item.sha512,
+                (item) =>
+                  inCatalog(item, platform).platform !== platform &&
+                  item.sha512,
               );
               alternatives.set(
                 platform,
@@ -3331,11 +3428,8 @@ export async function createLaunchpad(ctx) {
       for (const root of roots) {
         if (
           bulk &&
-          !local.some(
-            (item) =>
-              item.path === root.replacePath &&
-              item.platform === root.platform &&
-              item.projectId === root.projectId,
+          !projectFiles(local, root).some(
+            (item) => item.path === root.replacePath,
           )
         )
           throw error(
@@ -3494,11 +3588,7 @@ export async function createLaunchpad(ctx) {
               },
             };
           }
-          const matches = local.filter(
-            (item) =>
-              item.platform === file.platform &&
-              item.projectId === file.projectId,
-          );
+          const matches = projectFiles(local, file);
           if (matches.length > 1)
             throw error(
               409,
@@ -3980,6 +4070,7 @@ export async function createLaunchpad(ctx) {
       const clearCaches = () => {
         fileCache.clear();
         identities.clear();
+        catalogLookups.clear();
         metadataCache?.clear();
         updateCache.clear();
         updateFailures.clear();
@@ -4398,6 +4489,8 @@ export async function createLaunchpad(ctx) {
         )
         .catch(() => {});
       identities.clear();
+      catalogLookups.clear();
+      backgroundChecks.clear();
       metadataCache?.clear();
       updateCache.clear();
       versionCache.clear();
@@ -4479,6 +4572,7 @@ export async function createLaunchpad(ctx) {
       await saveReceipts();
       fileCache.clear();
       identities.clear();
+      catalogLookups.clear();
       updateCache.clear();
       updateFailures.clear();
     },
@@ -4490,6 +4584,7 @@ export async function createLaunchpad(ctx) {
       await saveReceipts();
       fileCache.clear();
       identities.clear();
+      catalogLookups.clear();
       updateCache.clear();
       updateFailures.clear();
     },
@@ -4543,13 +4638,8 @@ export async function createLaunchpad(ctx) {
       );
       signal.throwIfAborted();
       return {
-        duplicates: items
-          .filter(
-            (item) =>
-              item.path !== originalPath &&
-              item.platform === known.platform &&
-              item.projectId === known.projectId,
-          )
+        duplicates: projectFiles(items, known)
+          .filter((item) => item.path !== originalPath)
           .map(({ path, title }) => ({ path, title })),
         warnings,
       };

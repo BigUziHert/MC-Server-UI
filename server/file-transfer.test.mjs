@@ -141,6 +141,86 @@ test("advertised upload capacity accepts a complete 100-file batch", async (t) =
   assert.equal((await fs.readdir(f.serverDir)).length, 100);
 });
 
+test("upload retries skip only unchanged bytes and preserve the existing file's modification time", async (t) => {
+  const f = await fixture(t);
+  const incoming = path.join(f.root, "incoming.jar");
+  const installed = path.join(f.serverDir, "existing.jar");
+  const originalTime = new Date("2022-01-01T00:00:00Z");
+  await fs.writeFile(incoming, "original bytes");
+  await fs.writeFile(installed, "original bytes");
+  await fs.utimes(installed, originalTime, originalTime);
+  const options = {
+    serverDir: f.serverDir,
+    files: ["new.jar", "existing.jar"].map((originalname) => ({
+      originalname,
+      path: incoming,
+    })),
+    fields: {
+      skipIdentical: "true",
+      modified: JSON.stringify([Date.now(), Date.now()]),
+    },
+    safePath,
+  };
+  const uploaded = [];
+  const result = await uploadServerFiles({
+    ...options,
+    onUploaded: (relative) => uploaded.push(relative),
+  });
+  assert.deepEqual(result, {
+    uploaded: 1,
+    directories: 0,
+    skippedPaths: ["existing.jar"],
+  });
+  assert.deepEqual(uploaded, ["new.jar"]);
+  assert.equal((await fs.stat(installed)).mtimeMs, originalTime.getTime());
+
+  // Same size, same destination, different bytes. The conflict must still be
+  // detected before publishing any of the other files in this batch.
+  await fs.writeFile(installed, "modified bytes");
+  await assert.rejects(
+    uploadServerFiles({
+      ...options,
+      files: [
+        { originalname: "another.jar", path: incoming },
+        options.files[1],
+      ],
+    }),
+    { status: 409 },
+  );
+  await missing(path.join(f.serverDir, "another.jar"));
+  assert.equal(await fs.readFile(installed, "utf8"), "modified bytes");
+});
+
+test("an identical file created between upload preflight and exclusive publish can be skipped", async (t) => {
+  const f = await fixture(t);
+  const incoming = path.join(f.root, "incoming.jar");
+  await fs.writeFile(incoming, "mod bytes");
+  const result = await uploadServerFiles({
+    serverDir: f.serverDir,
+    files: [{ path: incoming, originalname: "race.jar" }],
+    fields: { skipIdentical: "true" },
+    safePath,
+    fileSystem: {
+      ...fs,
+      link: async (source, destination) => {
+        await fs.writeFile(destination, "mod bytes", { flag: "wx" });
+        await fs.link(source, destination);
+      },
+    },
+    onUploaded: () =>
+      assert.fail("A skipped file must not be audited as uploaded."),
+  });
+  assert.deepEqual(result, {
+    uploaded: 0,
+    directories: 0,
+    skippedPaths: ["race.jar"],
+  });
+  assert.equal(
+    await fs.readFile(path.join(f.serverDir, "race.jar"), "utf8"),
+    "mod bytes",
+  );
+});
+
 test("upload publication is bounded and drains started files before returning partial failure", async (t) => {
   const f = await fixture(t);
   const temporary = path.join(f.root, "temporary-upload");
@@ -797,6 +877,75 @@ async function apiFixture(t) {
   };
   return { ...f, fleet, request, first, second, close };
 }
+
+test("file rename preserves nested file contents and supports case-only changes", async (t) => {
+  const f = await apiFixture(t);
+  try {
+    const dir = path.join(f.fleet.runtimes.get(f.first).serverDir, "pack");
+    await fs.mkdir(dir);
+    const bytes = Buffer.from([0x50, 0x4b, 0, 0xff]);
+    await fs.writeFile(path.join(dir, "old.jar"), bytes);
+    const listing = await f.request("/api/files?path=pack", {}, f.first);
+    assert.equal(listing.body.supportsFileRename, true);
+    for (const [source, name] of [
+      ["old.jar", "new.jar"],
+      ["new.jar", "New.jar"],
+      ["New.jar", "New.jar"],
+    ]) {
+      const renamed = await f.request(
+        "/api/files/rename",
+        json({ path: `pack/${source}`, name }),
+        f.first,
+      );
+      assert.equal(renamed.status, 200, JSON.stringify(renamed.body));
+      assert.equal(renamed.body.path, `pack/${name}`);
+      assert.deepEqual(await fs.readdir(dir), [name]);
+      assert.deepEqual(await fs.readFile(path.join(dir, name)), bytes);
+    }
+  } finally {
+    await f.close();
+  }
+});
+
+test("file rename rejects invalid names, directories and occupied destinations including hard links", async (t) => {
+  const f = await apiFixture(t);
+  try {
+    const dir = path.join(f.fleet.runtimes.get(f.first).serverDir, "pack");
+    await fs.mkdir(path.join(dir, "folder"), { recursive: true });
+    await fs.writeFile(path.join(dir, "first.jar"), "first");
+    await fs.writeFile(path.join(dir, "second.jar"), "second");
+    await fs.link(path.join(dir, "first.jar"), path.join(dir, "alias.jar"));
+    const rename = (source, name) =>
+      f.request(
+        "/api/files/rename",
+        json({ path: `pack/${source}`, name }),
+        f.first,
+      );
+    for (const name of ["../escape.jar", "child/name.jar", "CON", ""]) {
+      assert.equal((await rename("first.jar", name)).status, 400, name);
+    }
+    assert.equal((await rename("folder", "new-folder")).status, 400);
+    for (const name of ["second.jar", "alias.jar", "folder"]) {
+      assert.equal((await rename("first.jar", name)).status, 409, name);
+    }
+    assert.deepEqual((await fs.readdir(dir)).sort(), [
+      "alias.jar",
+      "first.jar",
+      "folder",
+      "second.jar",
+    ]);
+    assert.equal(
+      await fs.readFile(path.join(dir, "first.jar"), "utf8"),
+      "first",
+    );
+    assert.equal(
+      await fs.readFile(path.join(dir, "second.jar"), "utf8"),
+      "second",
+    );
+  } finally {
+    await f.close();
+  }
+});
 
 test("fleet copy supports two local servers, request history and no overwrite on replay", async (t) => {
   const f = await apiFixture(t);

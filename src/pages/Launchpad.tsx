@@ -102,6 +102,7 @@ type InstalledItem = {
   platform: string | null;
   projectId?: string;
   versionId?: string;
+  catalogAliases?: { platform: string; projectId: string; versionId: string }[];
   versionName?: string;
   title?: string;
   iconUrl?: string;
@@ -197,6 +198,7 @@ function mergeLocalInventory(
         platform: old.platform || item.platform,
         projectId: old.projectId ?? item.projectId,
         versionId: old.versionId ?? item.versionId,
+        catalogAliases: item.catalogAliases ?? old.catalogAliases,
         versionName: old.versionName ?? item.versionName,
         title: old.title ?? item.title,
         iconUrl: old.iconUrl ?? item.iconUrl,
@@ -2212,6 +2214,28 @@ export default function Launchpad({
             (!scanRefreshing && item.updateCheck === "pending")),
       )
     : [];
+  const installedProjects = new Map<string, InstalledItem>();
+  const duplicateProjects = new Set<string>();
+  function indexInstalledProject(item: InstalledItem) {
+    if (!item.platform || !item.projectId) return;
+    const key = `${item.platform}:${item.projectId}`;
+    const previous = installedProjects.get(key);
+    if (!previous) installedProjects.set(key, item);
+    else if (previous.path !== item.path) duplicateProjects.add(key);
+  }
+  for (const item of installed?.items ?? []) {
+    indexInstalledProject(item);
+    for (const alias of item.catalogAliases ?? []) {
+      // Update checks and release IDs belong to the file's primary provider.
+      indexInstalledProject({
+        ...item,
+        ...alias,
+        update: undefined,
+        updateCheck: undefined,
+        updateIssue: undefined,
+      });
+    }
+  }
   const visibleProjects: { project: Project; entry?: InstalledItem }[] =
     installedOnly
       ? entries.slice(currentOffset, currentOffset + limit).map((entry) => ({
@@ -2232,21 +2256,8 @@ export default function Launchpad({
             ...project,
             url: projectPageUrl({ ...project, projectId: project.id }),
           },
-          entry: installed?.items.find(
-            (entry) =>
-              entry.platform === project.platform &&
-              entry.projectId === project.id,
-          ),
+          entry: installedProjects.get(`${project.platform}:${project.id}`),
         }));
-  const duplicateProjects = new Set<string>();
-  const projectCounts = new Map<string, number>();
-  for (const item of installed?.items ?? []) {
-    if (!item.platform || !item.projectId) continue;
-    const key = `${item.platform}:${item.projectId}`;
-    const count = (projectCounts.get(key) ?? 0) + 1;
-    projectCounts.set(key, count);
-    if (count > 1) duplicateProjects.add(key);
-  }
   const warnings = [
     ...new Set(
       [

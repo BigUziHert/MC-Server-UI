@@ -83,6 +83,90 @@ async function fileNames(request: APIRequestContext, fixture: FileFixture) {
   return result.entries.map((entry: { name: string }) => entry.name).sort();
 }
 
+test("renaming a file preserves its bytes and lets you retry when a name is taken", async ({
+  page,
+  files,
+  request,
+}) => {
+  const headers = { "X-Server-Id": files.id };
+  const original = "client.jar";
+  const renamed = "client.jar.disabled";
+  const bytes = Buffer.from([0x50, 0x4b, 0x03, 0x04, 0, 0xff, 0x80]);
+  const uploaded = await request.post(
+    `/api/files/upload?path=${files.folder}`,
+    {
+      headers,
+      multipart: {
+        files: {
+          name: original,
+          mimeType: "application/octet-stream",
+          buffer: bytes,
+        },
+      },
+    },
+  );
+  expect(uploaded.status(), await uploaded.text()).toBe(201);
+  await openFiles(page, files);
+  await page
+    .getByRole("checkbox", { name: `Select ${original}`, exact: true })
+    .check();
+  const dialog = page.getByRole("dialog", { name: "Rename file", exact: true });
+  const name = dialog.getByRole("textbox", { name: "File name", exact: true });
+  await page.keyboard.press("F2");
+  await expect(name).toBeFocused();
+  expect(
+    await name.evaluate((element: HTMLInputElement) =>
+      element.value.slice(element.selectionStart!, element.selectionEnd!),
+    ),
+  ).toBe("client");
+  await page.keyboard.press("Escape");
+  const source = page.getByRole("button", { name: original, exact: true });
+  await source.click({ button: "right" });
+  await page
+    .getByRole("menu", { name: "File actions" })
+    .getByRole("menuitem", { name: "Rename", exact: true })
+    .click();
+  await expect(name).toHaveValue(original);
+  await dialog.getByRole("button", { name: "Cancel", exact: true }).click();
+  const renameAction = page.getByRole("button", {
+    name: `Rename ${original}`,
+    exact: true,
+  });
+  await renameAction.click();
+  await expect(name).toHaveValue(original);
+  await name.fill("alpha.txt");
+  await dialog.getByRole("button", { name: "Rename", exact: true }).click();
+  await expect(dialog).toContainText(/already exists|already in use/i);
+  await name.fill(renamed);
+  await name.press("Enter");
+  await expect(dialog).toHaveCount(0);
+  await expect(renameAction).toHaveCount(0);
+  await expect(
+    page.getByRole("button", { name: renamed, exact: true }),
+  ).toBeVisible();
+  await expect(
+    page.getByRole("checkbox", { name: `Select ${renamed}`, exact: true }),
+  ).toBeChecked();
+  expect(await fileNames(request, files)).toEqual([
+    "alpha-two.txt",
+    "alpha.txt",
+    "archive",
+    "beta.txt",
+    renamed,
+  ]);
+  for (const [filename, expected] of [
+    [renamed, bytes],
+    ["alpha.txt", Buffer.from("Fixture contents\n")],
+  ] as const) {
+    const response = await request.get(
+      `/api/files/download?path=${files.folder}/${filename}`,
+      { headers },
+    );
+    expect(response.status()).toBe(200);
+    expect(await response.body()).toEqual(expected);
+  }
+});
+
 test("file context menu and shortcuts copy, select all, and confirm deletion without intercepting text", async ({
   page,
   files,
@@ -254,6 +338,95 @@ test("Ctrl+V reads copied desktop folders and files and newer server copies take
   );
   expect(names).toContain("beta.txt");
   expect(names).not.toContain("desktop-folder");
+});
+
+test("pasting 43 desktop JARs into AutoModpack skips the two already dropped there", async ({
+  page,
+  files,
+  request,
+}) => {
+  const folder = "automodpack/host-modpack/main/mods";
+  const headers = { "X-Server-Id": files.id };
+  let parent = "";
+  for (const name of folder.split("/")) {
+    const created = await request.post("/api/files", {
+      headers,
+      data: { path: parent, name, type: "directory" },
+    });
+    expect(created.ok(), await created.text()).toBe(true);
+    parent = [parent, name].filter(Boolean).join("/");
+  }
+  const jars = Array.from({ length: 43 }, (_, index) => ({
+    name: `client-${String(index + 1).padStart(2, "0")}.jar`,
+    bytes: [0x50, 0x4b, 0, index, 0xff],
+  }));
+  await page.addInitScript((copied) => {
+    window.mcPanelClipboard = {
+      readFiles: async () => ({
+        id: "desktop-selection",
+        files: copied.map((jar, index) => ({
+          id: String(index),
+          name: jar.name,
+          path: jar.name,
+          size: jar.bytes.length,
+          lastModified: 1672531200000,
+        })),
+        directories: [],
+      }),
+      readFile: async (_, id, offset) =>
+        Uint8Array.from(copied[Number(id)].bytes.slice(offset)),
+      releaseFiles: async () => {},
+      markInternalCopy: async () => {},
+    };
+  }, jars);
+  await page.goto("/#files");
+  await selectServer(page, files.id);
+  for (const name of folder.split("/"))
+    await page.getByRole("button", { name, exact: true }).click();
+  await expect(
+    page.getByRole("button", { name: "Paste", exact: true }),
+  ).toBeEnabled();
+  await page
+    .getByRole("region", { name: "Server files", exact: true })
+    .evaluate(
+      (element, firstTwo) => {
+        const dataTransfer = new DataTransfer();
+        for (const jar of firstTwo)
+          dataTransfer.items.add(
+            new File([Uint8Array.from(jar.bytes)], jar.name),
+          );
+        element.dispatchEvent(
+          new DragEvent("drop", {
+            bubbles: true,
+            cancelable: true,
+            dataTransfer,
+          }),
+        );
+      },
+      jars.slice(0, 2),
+    );
+  const progress = page.getByRole("status", { name: "File transfer progress" });
+  await expect(progress).toContainText("2 files uploaded");
+  await expect(
+    page.getByRole("checkbox", { name: `Select ${jars[0].name}`, exact: true }),
+  ).toBeVisible();
+  await page.keyboard.press("Control+v");
+  await expect(progress).toContainText("41 files uploaded");
+  await expect(progress).toContainText("Skipped 2 identical files");
+  await page.getByRole("button", { name: "Paste", exact: true }).click();
+  await expect(progress).toContainText("Skipped 43 identical files");
+  await expect(progress).toContainText("Transfer complete");
+  expect(await fileNames(request, { ...files, folder })).toEqual(
+    jars.map((jar) => jar.name),
+  );
+  for (const jar of jars) {
+    const response = await request.get(
+      `/api/files/download?path=${folder}/${jar.name}`,
+      { headers },
+    );
+    expect(response.ok()).toBe(true);
+    expect(await response.body()).toEqual(Buffer.from(jar.bytes));
+  }
 });
 
 test("cut and paste moves selected server files and consumes the cut selection", async ({

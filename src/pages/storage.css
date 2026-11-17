@@ -101,9 +101,6 @@
   width: 100%;
   min-width: 820px;
 }
-.file-table th:first-child {
-  width: 39%;
-}
 .file-table th:nth-child(2) {
   width: 11%;
 }
@@ -114,7 +111,7 @@
   width: 19%;
 }
 .file-table th:last-child {
-  width: 15%;
+  width: max(15%, 165px);
 }
 .file-table td,
 .file-table th {
@@ -996,6 +993,9 @@
   }
   .file-table td:last-child {
     padding-right: 9px;
+  }
+  .file-table th:last-child {
+    width: 15%;
   }
   .file-table td {
     font-size: 11px;

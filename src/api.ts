@@ -24,6 +24,15 @@ export function messageOf(
   return cause instanceof Error ? cause.message : fallback;
 }
 
+function validUploadPaths(paths: unknown) {
+  return (
+    paths === undefined ||
+    (Array.isArray(paths) &&
+      paths.length <= 100 &&
+      paths.every((path) => typeof path === "string"))
+  );
+}
+
 export async function api<T = any>(
   path: string,
   options: RequestInit = {},
@@ -59,13 +68,15 @@ export async function api<T = any>(
       {
         status: response.status,
         ...(body.setupNotCreated === true ? { setupNotCreated: true } : {}),
-        ...(Number.isSafeInteger(body.uploaded) && body.uploaded >= 0
-          ? { uploaded: body.uploaded }
-          : {}),
-        ...(Array.isArray(body.uploadedPaths) &&
-        body.uploadedPaths.length <= 100 &&
-        body.uploadedPaths.every((path: unknown) => typeof path === "string")
-          ? { uploadedPaths: body.uploadedPaths }
+        ...(Number.isSafeInteger(body.uploaded) &&
+        body.uploaded >= 0 &&
+        validUploadPaths(body.uploadedPaths) &&
+        validUploadPaths(body.skippedPaths)
+          ? {
+              uploaded: body.uploaded,
+              uploadedPaths: body.uploadedPaths,
+              skippedPaths: body.skippedPaths,
+            }
           : {}),
         ...(Number.isSafeInteger(body.directories) && body.directories >= 0
           ? { directories: body.directories }

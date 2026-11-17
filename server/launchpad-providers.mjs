@@ -2004,12 +2004,7 @@ export function createCoreProviders({
               projectId: String(dep.modId),
               type: input.type,
             })),
-          warnings:
-            input.type === "mod" && input.target !== "automodpack"
-              ? [
-                  "CurseForge does not declare client/server support for individual mods. Check the author's server requirements before installing.",
-                ]
-              : [],
+          warnings: [],
         };
       },
     },

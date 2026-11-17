@@ -1,5 +1,6 @@
 import fs from "node:fs/promises";
 import { constants } from "node:fs";
+import { createHash } from "node:crypto";
 import path from "node:path";
 
 export const MAX_UPLOAD_FILES_PER_BATCH = 100;
@@ -119,13 +120,14 @@ async function boundary(root, safePath, io) {
   };
 }
 
-/** Copy or move selected trees without overwriting existing destinations. */
+/** Copy or move selected trees, or rename one file in its current directory. */
 export async function copyServerFiles({
   sourceDir,
   serverDir,
   destinationPath = "",
   paths,
   mode = "copy",
+  renameTo,
   safePath,
   fileSystem = fs,
   onProgress,
@@ -143,6 +145,17 @@ export async function copyServerFiles({
         "Select between 1 and 5,000 files or folders to copy.",
       );
     const selected = [...new Set(paths.map((item) => normalize(item)))];
+    const renaming = renameTo !== undefined;
+    if (renaming) {
+      if (
+        mode !== "move" ||
+        selected.length !== 1 ||
+        normalize(renameTo) !== renameTo ||
+        renameTo.includes("/")
+      )
+        throw failure(400, "Choose one file and a new filename.");
+      destinationPath = selected[0].split("/").slice(0, -1).join("/");
+    }
     const roots = selected.filter(
       (item) =>
         !selected.some(
@@ -189,6 +202,8 @@ export async function copyServerFiles({
         );
       await assertAccess();
       const stat = await io.lstat(await source(relative));
+      if (renaming && !stat.isFile())
+        throw failure(400, "Choose a regular file to rename.");
       if (stat.isSymbolicLink() || (!stat.isFile() && !stat.isDirectory()))
         throw failure(
           400,
@@ -208,22 +223,49 @@ export async function copyServerFiles({
           await walk(`${relative}/${name}`, `${destinationRelative}/${name}`);
       }
     };
-    for (const relative of roots) {
-      const destinationRelative = [
-        destinationPath,
-        path.posix.basename(relative),
-      ]
+    const destinationFor = (relative) =>
+      [destinationPath, renameTo ?? path.posix.basename(relative)]
         .filter(Boolean)
         .join("/");
-      if (sameServer && inside(relative, destinationRelative))
+    for (const relative of roots) {
+      const destinationRelative = destinationFor(relative);
+      if (!renaming && sameServer && inside(relative, destinationRelative))
         throw failure(
           409,
           "A file or folder cannot be copied into itself or one of its subfolders.",
         );
-      if (await statOrNull(io, await target(destinationRelative)))
+      const existing = await statOrNull(io, await target(destinationRelative));
+      if (
+        renaming &&
+        existing?.isFile() &&
+        relative.toLowerCase() === destinationRelative.toLowerCase()
+      ) {
+        if (relative === destinationRelative) return result;
+        // On a case-insensitive volume both spellings can resolve to the one
+        // directory entry. An existing hard link has its own name and must
+        // still be treated as a conflict.
+        if (identity(await io.lstat(await source(relative)), existing)) {
+          const names = await io.readdir(destination);
+          if (
+            names.includes(path.posix.basename(relative)) &&
+            !names.includes(renameTo)
+          ) {
+            await io.rename(
+              await source(relative),
+              await target(destinationRelative),
+            );
+            result.paths.push(destinationRelative);
+            result.copiedFiles++;
+            return result;
+          }
+        }
+      }
+      if (existing)
         throw failure(
           409,
-          `“${destinationRelative}” already exists. Choose another folder or rename the existing item.`,
+          renaming
+            ? `“${renameTo}” already exists. Choose another name.`
+            : `“${destinationRelative}” already exists. Choose another folder or rename the existing item.`,
         );
       await walk(relative, destinationRelative);
     }
@@ -376,9 +418,7 @@ export async function copyServerFiles({
             bytesProcessed += row.stat.size;
           }
           const root = roots.find((relative) => inside(relative, row.relative));
-          const movedPath = [destinationPath, path.posix.basename(root)]
-            .filter(Boolean)
-            .join("/");
+          const movedPath = destinationFor(root);
           if (!result.paths.includes(movedPath)) result.paths.push(movedPath);
           report();
         }
@@ -428,6 +468,15 @@ export async function copyServerFiles({
         }
         if (retainedWarnings.length)
           throw failure(409, [cause.message, ...retainedWarnings].join(" "));
+        if (
+          renaming &&
+          !removing &&
+          ["ENOTSUP", "EOPNOTSUPP", "EPERM", "EBUSY"].includes(cause.code)
+        )
+          throw failure(
+            409,
+            "The filesystem could not rename this file. Check whether another program is using it and that the folder allows file moves.",
+          );
         if (["EXDEV", "ENOTSUP", "EOPNOTSUPP", "EPERM"].includes(cause.code))
           throw failure(
             409,
@@ -588,6 +637,36 @@ function arrayField(value, label, limit) {
   return parsed;
 }
 
+const unchangedUpload = (current, expected) =>
+  unchangedFile(current, expected) && current.ctimeMs === expected.ctimeMs;
+
+async function uploadDigest(io, target, expected) {
+  const handle = await io.open(
+    target,
+    constants.O_RDONLY |
+      (constants.O_NOFOLLOW ?? 0) |
+      (constants.O_NONBLOCK ?? 0),
+  );
+  try {
+    if (!unchangedUpload(await handle.stat(), expected)) return null;
+    const hash = createHash("sha256");
+    const buffer = Buffer.allocUnsafe(Math.min(expected.size, 128 * 1024));
+    let offset = 0;
+    while (offset < expected.size) {
+      const length = Math.min(buffer.length, expected.size - offset);
+      const { bytesRead } = await handle.read(buffer, 0, length, offset);
+      if (!bytesRead) return null;
+      hash.update(buffer.subarray(0, bytesRead));
+      offset += bytesRead;
+    }
+    return unchangedUpload(await handle.stat(), expected)
+      ? hash.digest("hex")
+      : null;
+  } finally {
+    await handle.close();
+  }
+}
+
 /** A bounded upload batch. Relative paths preserve folder and empty-folder drops. */
 export async function uploadServerFiles({
   serverDir,
@@ -597,6 +676,7 @@ export async function uploadServerFiles({
   safePath,
   fileSystem = fs,
   onUploaded,
+  onSkipped,
   onDirectory,
 }) {
   const io = fileSystem;
@@ -658,14 +738,53 @@ export async function uploadServerFiles({
   )
     throw failure(409, "An uploaded file and folder have the same path.");
   const join = (relative) => [directory, relative].filter(Boolean).join("/");
+  const skipIdentical = fields.skipIdentical === "true";
+  const verified = new Map();
+  const existingUpload = async (i) => {
+    const relative = join(names[i]);
+    const target = await resolve(relative);
+    const existing = await statOrNull(io, target);
+    if (!existing) return false;
+    const conflict = () =>
+      failure(409, `“${names[i]}” already exists. Rename it before uploading.`);
+    if (!skipIdentical || !existing.isFile() || existing.isSymbolicLink())
+      throw conflict();
+    const temporary = files[i].path;
+    const source = await io.lstat(temporary);
+    if (
+      !source.isFile() ||
+      source.isSymbolicLink() ||
+      source.size !== existing.size
+    )
+      throw conflict();
+    const previous = verified.get(i);
+    if (
+      previous &&
+      unchangedUpload(existing, previous.existing) &&
+      unchangedUpload(source, previous.source)
+    )
+      return true;
+    const incoming = await uploadDigest(io, temporary, source);
+    let destination;
+    try {
+      destination = await uploadDigest(io, target, existing);
+    } catch (cause) {
+      if (cause.code !== "ENOENT") throw cause;
+    }
+    const current = await statOrNull(io, await resolve(relative));
+    if (!current) return false;
+    if (
+      !incoming ||
+      incoming !== destination ||
+      !unchangedUpload(current, existing) ||
+      !unchangedUpload(await io.lstat(temporary), source)
+    )
+      throw conflict();
+    verified.set(i, { source, existing });
+    return true;
+  };
   // Check the full batch before creating anything; writes still use exclusive opens.
-  await eachUploadEntry(names, async (relative) => {
-    if (await statOrNull(io, await resolve(join(relative))))
-      throw failure(
-        409,
-        `“${relative}” already exists. Rename it before uploading.`,
-      );
-  });
+  await eachUploadEntry(names, (_, i) => existingUpload(i));
   await eachUploadEntry([...directories], async (relative) => {
     const existing = await statOrNull(io, await resolve(join(relative)));
     if (existing && !existing.isDirectory())
@@ -688,9 +807,27 @@ export async function uploadServerFiles({
         throw cause;
     }
   }
+  const skipped = new Set();
+  const skip = (relative) => {
+    skipped.add(relative);
+    onSkipped?.(relative);
+  };
+  // Confirm preflight matches before publication; a disappeared file belongs
+  // in the exclusive upload path along with the other missing files.
+  await eachUploadEntry([...verified.keys()], async (i) => {
+    if (await existingUpload(i)) skip(join(names[i]));
+  });
   await eachUploadEntry(files, async (file, i) => {
     const relative = join(names[i]);
-    await publishUpload(io, file.path, await resolve(relative));
+    if (skipped.has(relative)) return;
+    try {
+      await publishUpload(io, file.path, await resolve(relative));
+    } catch (cause) {
+      if (!skipIdentical || cause.code !== "EEXIST") throw cause;
+      if (await existingUpload(i)) return skip(relative);
+      // The competing destination disappeared. Publish only if the path is still free.
+      await publishUpload(io, file.path, await resolve(relative));
+    }
     onUploaded?.(relative);
     if (modified)
       await io.utimes(
@@ -699,5 +836,15 @@ export async function uploadServerFiles({
         new Date(modified[i]),
       );
   });
-  return { uploaded: files.length, directories: createdDirectories };
+  return {
+    uploaded: files.length - skipped.size,
+    directories: createdDirectories,
+    ...(skipped.size
+      ? {
+          skippedPaths: names
+            .map(join)
+            .filter((relative) => skipped.has(relative)),
+        }
+      : {}),
+  };
 }

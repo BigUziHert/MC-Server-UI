@@ -382,6 +382,39 @@ test("cross-site simple forms and unmarked requests cannot log in or mutate, whi
   assert.equal(unmarkedRead.headers["access-control-allow-origin"], undefined);
 });
 
+test("remote file rename requires both create and delete permission on the server", async (t) => {
+  const f = await fixture(t);
+  const member = await f.enroll(["file.create"]);
+  const dir = f.fleet.runtimes.get(f.serverId).serverDir;
+  await fs.writeFile(path.join(dir, "before.txt"), "contents");
+  const rename = () =>
+    f.request("/api/files/rename", {
+      method: "POST",
+      headers: {
+        ...browserHeaders,
+        Authorization: `Bearer ${member.token}`,
+        "X-Server-Id": f.serverId,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ path: "before.txt", name: "after.txt" }),
+    });
+  assert.equal((await rename()).status, 403);
+  await f.fleet.access.grantServer(f.serverId, member.account.id, {
+    permissions: ["server.view", "file.delete"],
+  });
+  assert.equal((await rename()).status, 403);
+  await f.fleet.access.grantServer(f.serverId, member.account.id, {
+    permissions: ["server.view", "file.create", "file.delete"],
+  });
+  const allowed = await rename();
+  assert.equal(allowed.status, 200, JSON.stringify(allowed.body));
+  assert.equal(allowed.body.path, "after.txt");
+  assert.equal(
+    await fs.readFile(path.join(dir, "after.txt"), "utf8"),
+    "contents",
+  );
+});
+
 test("authenticated browser multipart uploads and streaming downloads keep their transfer headers", async (t) => {
   const f = await fixture(t);
   const member = await f.enroll(["file.create", "file.read-content"]);
@@ -392,17 +425,29 @@ test("authenticated browser multipart uploads and streaming downloads keep their
     "Sec-Fetch-Site": "cross-site",
   };
   const boundary = "mc-cors-fixture-boundary";
-  const multipart = `--${boundary}\r\nContent-Disposition: form-data; name="path"\r\n\r\n\r\n--${boundary}\r\nContent-Disposition: form-data; name="files"; filename="cors-upload.txt"\r\nContent-Type: text/plain\r\n\r\nBrowser upload bytes\r\n--${boundary}--\r\n`;
-  const uploaded = await f.request("/api/files/upload", {
-    method: "POST",
-    headers: {
-      ...headers,
-      "Content-Type": `multipart/form-data; boundary=${boundary}`,
-    },
-    body: multipart,
-  });
+  const multipart = `--${boundary}\r\nContent-Disposition: form-data; name="skipIdentical"\r\n\r\ntrue\r\n--${boundary}\r\nContent-Disposition: form-data; name="files"; filename="cors-upload.txt"\r\nContent-Type: text/plain\r\n\r\nBrowser upload bytes\r\n--${boundary}--\r\n`;
+  const upload = (token) =>
+    f.request("/api/files/upload", {
+      method: "POST",
+      headers: {
+        ...headers,
+        Authorization: `Bearer ${token}`,
+        "Content-Type": `multipart/form-data; boundary=${boundary}`,
+      },
+      body: multipart,
+    });
+  const uploaded = await upload(member.token);
   assert.equal(uploaded.status, 201, JSON.stringify(uploaded.body));
   assertCors(uploaded);
+  const duplicate = await upload(member.token);
+  assert.equal(duplicate.status, 201);
+  assert.deepEqual(duplicate.body, {
+    uploaded: 0,
+    directories: 0,
+    skippedPaths: ["cors-upload.txt"],
+  });
+  const creator = await f.enroll(["file.create"], "creator@example.test");
+  assert.equal((await upload(creator.token)).status, 409);
   const download = await f.request("/api/files/download?path=cors-upload.txt", {
     headers,
   });

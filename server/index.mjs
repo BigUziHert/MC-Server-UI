@@ -2138,7 +2138,11 @@ export async function createPanel(options = {}) {
       const recycling =
         req.panelOfflinePlayerMutation ||
         (req.method === "POST" &&
-          ["/api/files/copy", "/api/files/upload"].includes(req.path)) ||
+          [
+            "/api/files/copy",
+            "/api/files/upload",
+            "/api/files/rename",
+          ].includes(req.path)) ||
         (req.method === "DELETE" && req.path === "/api/files") ||
         (req.method === "DELETE" && /^\/api\/backups\/[^/]+$/.test(req.path)) ||
         (req.method === "DELETE" &&
@@ -3046,6 +3050,7 @@ export async function createPanel(options = {}) {
         ...result,
         uploadFilesPerBatch: MAX_UPLOAD_FILES_PER_BATCH,
         supportsFileMoves: true,
+        supportsFileRename: true,
       });
     } catch (cause) {
       if (disconnected.signal.aborted) res.destroy();
@@ -3104,18 +3109,27 @@ export async function createPanel(options = {}) {
     trackOperation(async (req, res) => {
       const files = req.files ?? [];
       const uploadedPaths = [],
+        skippedPaths = [],
         createdDirectories = [];
       let result, uploadFailure;
       try {
         let auditStarted = false;
         try {
+          // Comparing existing bytes uses the same access as reading the file.
+          // A create-only account can still upload files to unused paths.
+          const principal = req[remotePrincipal];
+          const fields =
+            principal && !principal.permissions?.includes("file.read-content")
+              ? { ...req.body, skipIdentical: "false" }
+              : req.body;
           result = await uploadServerFiles({
             serverDir,
             directory: req.query.path ?? "",
             files,
-            fields: req.body,
+            fields,
             safePath,
             onUploaded: (relative) => uploadedPaths.push(relative),
+            onSkipped: (relative) => skippedPaths.push(relative),
             onDirectory: (relative) => createdDirectories.push(relative),
           });
           auditStarted = true;
@@ -3150,9 +3164,40 @@ export async function createPanel(options = {}) {
           error: uploadFailure.error,
           uploaded: uploadedPaths.length,
           uploadedPaths,
+          ...(skippedPaths.length ? { skippedPaths } : {}),
           directories: createdDirectories.length,
         });
       else res.status(201).json(result);
+    }),
+  );
+  app.post(
+    "/api/files/rename",
+    trackOperation(async (req, res) => {
+      const { path: relative, name } = req.body ?? {};
+      validateName(name);
+      const result = await copyServerFiles({
+        sourceDir: serverDir,
+        serverDir,
+        paths: [relative],
+        mode: "move",
+        renameTo: name,
+        safePath,
+      }).catch((cause) => {
+        if (cause.code === "ENOENT")
+          throw error(
+            404,
+            "The file or its folder no longer exists. Refresh File Manager.",
+          );
+        if (cause.code === "EEXIST")
+          throw error(409, `“${name}” already exists. Choose another name.`);
+        throw cause;
+      });
+      const renamed = result.paths[0] ?? relative;
+      if (result.copiedFiles)
+        await audit("file", "File renamed", `${relative} → ${renamed}`).catch(
+          () => {},
+        );
+      res.json({ path: renamed });
     }),
   );
   const copyOperations = new Map();

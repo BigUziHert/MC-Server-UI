@@ -147,6 +147,7 @@ async function sharedPanel(page: Page, permissions: string[]) {
     if (path === "/api/files")
       return reply({
         path: "",
+        supportsFileRename: true,
         entries: [
           {
             name: "notes.txt",
@@ -377,6 +378,9 @@ test("file readers get a read-only editor and recycling requires both storage gr
     editor.getByRole("button", { name: "Save changes", exact: true }),
   ).toBeDisabled();
   await editor.getByRole("button", { name: "Cancel", exact: true }).click();
+  await expect(
+    page.getByRole("button", { name: "Rename notes.txt", exact: true }),
+  ).toHaveCount(0);
   await page.getByRole("button", { name: "Open Recycle Bin" }).click();
   await expect(
     page.getByRole("button", { name: "Restore old.txt", exact: true }),

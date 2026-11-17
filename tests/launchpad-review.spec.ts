@@ -127,6 +127,145 @@ async function reviewInstallation(page: Page) {
   return page.getByRole("dialog", { name: "Review installation", exact: true });
 }
 
+test("switching catalogs recognizes the same installed file and reviews versions from the selected platform", async ({
+  page,
+}) => {
+  await catalog(page);
+  const file = {
+    ...installed("Original"),
+    path: "mods/renamed.jar",
+    active: true,
+  };
+  const alias = { platform: "curseforge", projectId: "42", versionId: "100" };
+  let changed = false;
+  let releaseOnline!: () => void;
+  const holdOnline = new Promise<void>((resolve) => {
+    releaseOnline = resolve;
+  });
+  await page.route("**/api/launchpad/installed?**", async (route) => {
+    const local = new URL(route.request().url()).searchParams.has("local");
+    if (changed && !local) await holdOnline;
+    const entry = changed
+      ? { ...file, sha512: "changed" }
+      : { ...file, catalogAliases: [alias] };
+    await route.fulfill({ json: { items: [entry], warnings: [] } });
+  });
+  await page.route("**/api/launchpad/search?**", (route) => {
+    const platform = new URL(route.request().url()).searchParams.get(
+      "platform",
+    );
+    const projects =
+      platform === "curseforge"
+        ? [
+            { id: "42", title: "Other listing" },
+            { id: "99", title: "Original" },
+          ]
+        : [{ id: file.projectId, title: file.title }];
+    return route.fulfill({
+      json: {
+        projects: projects.map((project) => ({
+          ...project,
+          platform,
+          description: "",
+        })),
+        total: projects.length,
+        offset: 0,
+        limit: 10,
+      },
+    });
+  });
+  await page.route("**/api/launchpad/versions?**", (route) => {
+    const query = new URL(route.request().url()).searchParams;
+    expect(query.get("platform")).toBe(alias.platform);
+    expect(query.get("projectId")).toBe(alias.projectId);
+    return route.fulfill({
+      json: { versions: [{ ...version, id: "101" }, version] },
+    });
+  });
+  await page.route("**/api/launchpad/preview", (route) => {
+    expect(route.request().postDataJSON()).toMatchObject({
+      platform: alias.platform,
+      projectId: alias.projectId,
+      versionId: "101",
+      replacePath: file.path,
+    });
+    return route.fulfill({ json: plan });
+  });
+  await page.route("**/api/launchpad/active", (route) => {
+    expect(route.request().postDataJSON()).toMatchObject({
+      path: file.path,
+      active: false,
+    });
+    file.path += ".disabled";
+    file.active = false;
+    return route.fulfill({ json: { path: file.path, active: false } });
+  });
+  await page.route("**/api/launchpad/removal-preview", (route) => {
+    expect(route.request().postDataJSON()).toMatchObject({ path: file.path });
+    return route.fulfill({
+      json: {
+        title: file.title,
+        files: [{ path: file.path, size: file.size }],
+        blocked: true,
+        warnings: [],
+        dependents: [],
+      },
+    });
+  });
+  await page.goto("/#launchpad");
+  const installedOnly = page.getByRole("switch", {
+    name: "Show installed content",
+  });
+  const primary = page.getByRole("article", { name: file.title, exact: true });
+  await expect(
+    primary.getByRole("button", { name: "Update Original" }),
+  ).toBeVisible();
+  await installedOnly.check();
+  await expect(
+    primary.getByRole("button", { name: "Update Original" }),
+  ).toBeVisible();
+  await installedOnly.uncheck();
+  await page
+    .getByLabel("Platform", { exact: true })
+    .selectOption(alias.platform);
+  const linked = page.getByRole("article", { name: "Other listing" });
+  await expect(linked.getByText("Installed", { exact: true })).toBeVisible();
+  await expect(
+    primary.getByRole("button", { name: "Install Original" }),
+  ).toBeVisible();
+  await linked
+    .getByRole("button", { name: "Choose version for Other listing" })
+    .click();
+  await page
+    .getByRole("button", { name: "Review installation", exact: true })
+    .click();
+  const review = page.getByRole("dialog", { name: "Review installation" });
+  await expect(review).toBeVisible();
+  await review
+    .getByRole("button", { name: "Close installation dialog" })
+    .click();
+  const active = linked.getByRole("switch");
+  await active.click();
+  await expect(active).not.toBeChecked();
+  await linked.getByRole("button", { name: "Remove Other listing" }).click();
+  await page
+    .getByRole("dialog")
+    .getByRole("button", { name: "Cancel", exact: true })
+    .click();
+
+  changed = true;
+  try {
+    await page
+      .getByRole("button", { name: "Refresh Launchpad and check updates" })
+      .click();
+    await expect(
+      linked.getByRole("button", { name: "Install Other listing" }),
+    ).toBeVisible();
+  } finally {
+    releaseOnline();
+  }
+});
+
 for (const bulk of [false, true]) {
   test(`closing a pending ${bulk ? "bulk update" : "installation"} review aborts preparation and permits a fresh review`, async ({
     page,
@@ -1370,6 +1509,9 @@ test("project names link to project pages in the list and installation dialog", 
     page.getByRole("link", { name: "Open Alpha project page" }),
   ).toHaveText("Alpha");
   await expect(
+    page.getByRole("link", { name: "Open Alpha project page" }),
+  ).toHaveCSS("text-decoration-line", "underline");
+  await expect(
     page.getByRole("heading", { name: "Alpha", exact: true }),
   ).toBeVisible();
   await expect(
@@ -1392,6 +1534,11 @@ test("project names link to project pages in the list and installation dialog", 
       .getByRole("dialog")
       .getByRole("link", { name: "Open Alpha project page" }),
   ).toHaveText("Alpha");
+  await expect(
+    page
+      .getByRole("dialog")
+      .getByRole("link", { name: "Open Alpha project page" }),
+  ).toHaveCSS("text-decoration-line", "underline");
   await expect(
     page.getByText("Open project page", { exact: true }),
   ).toHaveCount(0);

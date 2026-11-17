@@ -174,6 +174,57 @@ test("advertised upload capacity reduces 205 small files to three requests", asy
   expect(result.uploadedFiles).toBe(205);
 });
 
+test("upload batches report new files and identical files independently", async () => {
+  const source = collectSelectedUpload(
+    [1, 2, 3, 4, 5].map((size) => new File(["x".repeat(size)], `${size}.jar`)),
+  );
+  const result = await uploadInBatches({
+    source,
+    destination: "mods",
+    maxFilesPerBatch: 2,
+    request: async (_url, options) => {
+      const form = options.body as FormData;
+      expect(form.get("skipIdentical")).toBe("true");
+      const paths: string[] = JSON.parse(form.get("paths") as string);
+      const skippedPaths = paths
+        .filter((path) => path !== "3.jar")
+        .map((path) => `mods/${path}`);
+      return { uploaded: paths.length - skippedPaths.length, skippedPaths };
+    },
+  });
+  expect(result).toMatchObject({
+    phase: "completed",
+    uploadedFiles: 1,
+    uploadedBytes: 3,
+    skippedFiles: 4,
+    skippedBytes: 12,
+  });
+});
+
+test("an upload receipt must account for distinct paths in the submitted batch", async () => {
+  const source = collectSelectedUpload(
+    ["a", "b"].map((name) => new File(["x"], name)),
+  );
+  for (const receipt of [
+    { uploaded: 0, skippedPaths: ["mods/a", "mods/a"] },
+    { uploaded: 1, skippedPaths: ["other/b"] },
+    { uploaded: 1, skippedPaths: ["mods/b"], uploadedPaths: ["mods/b"] },
+    { uploaded: 1 },
+  ]) {
+    const result = await uploadInBatches({
+      source,
+      destination: "mods",
+      request: async () => receipt,
+    });
+    expect(result).toMatchObject({
+      phase: "uncertain",
+      uploadedFiles: 0,
+      skippedFiles: 0,
+      uncertainPaths: ["a", "b"],
+    });
+  }
+});
+
 test("larger upload batches still bound binary bytes and UTF-8 path metadata", async () => {
   const parent = Array.from({ length: 20 }, () => "a".repeat(180)).join("/");
   const files = Array.from({ length: 70 }, (_, index) => ({
@@ -384,12 +435,15 @@ test("partial parallel publications count bytes from confirmed paths instead of 
         uploaded: 2,
         directories: 0,
         uploadedPaths: ["mods/3.jar", "mods/1.jar"],
+        skippedPaths: ["mods/2.jar"],
       });
     },
   });
   expect(result.phase).toBe("failed");
   expect(result.uploadedFiles).toBe(2);
   expect(result.uploadedBytes).toBe(6);
+  expect(result.skippedFiles).toBe(1);
+  expect(result.skippedBytes).toBe(3);
 });
 
 async function uploadServer(request: APIRequestContext) {

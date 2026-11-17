@@ -150,6 +150,7 @@ export function requiredPermissions(req) {
       return ["audit.read"];
   }
   if (req.method === "POST") {
+    if (route === "/api/files/rename") return ["file.create", "file.delete"];
     if (route === "/api/files/copy")
       return req.body?.mode === "move"
         ? ["file.create", "file.delete"]

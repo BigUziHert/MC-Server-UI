@@ -15,8 +15,10 @@ export type UploadCollectionOptions = {
 export type UploadProgress = {
   phase: "uploading" | "completed" | "cancelled" | "failed" | "uncertain";
   uploadedFiles: number;
+  skippedFiles: number;
   totalFiles: number;
   uploadedBytes: number;
+  skippedBytes: number;
   totalBytes: number;
   completedDirectories: number;
   totalDirectories: number;
@@ -27,10 +29,16 @@ export type UploadResult = UploadProgress & {
   cancelled?: boolean;
   uncertainPaths: string[];
 };
+type UploadReceipt = {
+  uploaded: number;
+  directories?: number;
+  uploadedPaths?: string[];
+  skippedPaths?: string[];
+};
 export type UploadRequest = (
   path: string,
   options: RequestInit,
-) => Promise<{ uploaded: number; directories?: number }>;
+) => Promise<UploadReceipt>;
 
 function relativePath(value: string) {
   const segments = value.split("/");
@@ -266,6 +274,67 @@ function fileBatches(files: UploadFile[], maxFilesPerBatch: number) {
   return batches;
 }
 
+function recordConfirmedFiles(
+  progress: UploadProgress,
+  files: UploadFile[],
+  destination: string,
+  receipt: UploadReceipt,
+  partial = false,
+) {
+  const { uploaded, uploadedPaths, skippedPaths = [] } = receipt;
+  if (
+    !Number.isInteger(uploaded) ||
+    uploaded < 0 ||
+    !Array.isArray(skippedPaths) ||
+    uploaded + skippedPaths.length > files.length ||
+    (!partial && uploaded + skippedPaths.length !== files.length) ||
+    (uploadedPaths !== undefined &&
+      (!Array.isArray(uploadedPaths) || uploadedPaths.length !== uploaded))
+  )
+    return false;
+
+  const skipped = new Set(skippedPaths);
+  const written = uploadedPaths && new Set(uploadedPaths);
+  // Older hosts report only a count and publish in order. Partial uploads
+  // with skips need the actual written paths to determine their byte count.
+  if (
+    !written &&
+    skipped.size &&
+    uploaded &&
+    uploaded + skipped.size < files.length
+  )
+    return false;
+  const counts = {
+    uploadedFiles: 0,
+    uploadedBytes: 0,
+    skippedFiles: 0,
+    skippedBytes: 0,
+  };
+  for (const { path, file } of files) {
+    const target = destination ? `${destination}/${path}` : path;
+    if (skipped.has(target)) {
+      if (written?.has(target)) return false;
+      counts.skippedFiles++;
+      counts.skippedBytes += file.size;
+    } else if (
+      written ? written.has(target) : counts.uploadedFiles < uploaded
+    ) {
+      counts.uploadedFiles++;
+      counts.uploadedBytes += file.size;
+    }
+  }
+  if (
+    counts.uploadedFiles !== uploaded ||
+    counts.skippedFiles !== skippedPaths.length
+  )
+    return false;
+  progress.uploadedFiles += counts.uploadedFiles;
+  progress.uploadedBytes += counts.uploadedBytes;
+  progress.skippedFiles += counts.skippedFiles;
+  progress.skippedBytes += counts.skippedBytes;
+  return true;
+}
+
 /** Each acknowledged batch is final. Failed or interrupted batches are never retried. */
 export async function uploadInBatches({
   source: input,
@@ -286,8 +355,10 @@ export async function uploadInBatches({
   const progress: UploadProgress = {
     phase: "uploading",
     uploadedFiles: 0,
+    skippedFiles: 0,
     totalFiles: input.files.length,
     uploadedBytes: 0,
+    skippedBytes: 0,
     totalBytes: input.files.reduce(
       (total, entry) => total + entry.file.size,
       0,
@@ -349,6 +420,7 @@ export async function uploadInBatches({
     if (batch.directories.length)
       form.append("directories", JSON.stringify(batch.directories));
     if (batch.files.length) {
+      form.append("skipIdentical", "true");
       for (const entry of batch.files)
         form.append("files", entry.file, entry.file.name);
       form.append(
@@ -370,49 +442,19 @@ export async function uploadInBatches({
         `/files/upload?path=${encodeURIComponent(destination)}`,
         { method: "POST", body: form, signal },
       );
-      if (result.uploaded !== batch.files.length)
+      if (!recordConfirmedFiles(progress, batch.files, destination, result))
         throw new Error("The server did not confirm every file in the batch.");
-      progress.uploadedFiles += batch.files.length;
-      progress.uploadedBytes += batch.files.reduce(
-        (total, entry) => total + entry.file.size,
-        0,
-      );
       progress.completedDirectories += batch.directories.length;
       onProgress?.({ ...progress, currentPaths: [...progress.currentPaths] });
     } catch (cause) {
-      const failure = cause as {
-        status?: number;
-        uploaded?: number;
-        directories?: number;
-        uploadedPaths?: string[];
-      };
-      const confirmedPaths = failure?.uploadedPaths;
-      const confirmedFiles = Array.isArray(confirmedPaths)
-        ? batch.files.filter(({ path }) =>
-            confirmedPaths.includes(
-              [destination, path].filter(Boolean).join("/"),
-            ),
-          )
-        : batch.files.slice(0, failure?.uploaded);
+      const failure = cause as UploadReceipt & { status?: number };
       if (
         !signal?.aborted &&
         failure?.status &&
-        Number.isInteger(failure.uploaded) &&
-        failure.uploaded! >= 0 &&
-        failure.uploaded! <= batch.files.length &&
-        (confirmedPaths === undefined ||
-          (Array.isArray(confirmedPaths) &&
-            confirmedPaths.length === failure.uploaded &&
-            confirmedFiles.length === failure.uploaded &&
-            new Set(confirmedPaths).size === confirmedPaths.length)) &&
         Number.isInteger(failure.directories) &&
-        failure.directories! >= 0
+        failure.directories! >= 0 &&
+        recordConfirmedFiles(progress, batch.files, destination, failure, true)
       ) {
-        progress.uploadedFiles += failure.uploaded!;
-        progress.uploadedBytes += confirmedFiles.reduce(
-          (total, entry) => total + entry.file.size,
-          0,
-        );
         progress.completedDirectories += Math.min(
           failure.directories!,
           batch.directories.length,
