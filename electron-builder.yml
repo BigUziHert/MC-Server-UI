@@ -49,6 +49,7 @@ files:
   - server/versions.mjs
   - server/launchpad.mjs
   - server/launchpad-target.mjs
+  - server/launchpad-automodpack-sources.mjs
   - server/launchpad-transaction.mjs
   - server/launchpad-network.mjs
   - server/launchpad-recovery.mjs

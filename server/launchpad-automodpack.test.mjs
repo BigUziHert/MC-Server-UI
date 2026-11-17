@@ -316,12 +316,13 @@ test("regular Mods and AutoModpack retain separate versions, update checks, acti
   );
 });
 
-test("AutoModpack resolves client-only dependencies locally and protects them during removal", async (t) => {
+test("AutoModpack updates its explicit client-only dependency copy and protects it during removal", async (t) => {
   const { service, resolved } = await fixture(t);
   await install(
     service,
     input("mod", { target: "server", projectId: "clientlib" }),
   );
+  await install(service, input("mod", { projectId: "clientlib" }));
   const review = await install(
     service,
     input("mod", { projectId: "dependent" }),

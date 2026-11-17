@@ -9,6 +9,7 @@ import { inspectBundledDependencies } from "./launchpad-bundled.mjs";
 import { installedDependencySatisfies } from "./launchpad-dependency-ranges.mjs";
 import { inspectInstalledMod } from "./launchpad-mod-metadata.mjs";
 import { updatedModDependencyWarnings } from "./launchpad-update-dependencies.mjs";
+import { readAutoModpackSources } from "./launchpad-automodpack-sources.mjs";
 import { createModRemoval } from "./launchpad-removal.mjs";
 import { createModActivation } from "./launchpad-activation.mjs";
 import {
@@ -824,6 +825,35 @@ export async function createLaunchpad(ctx) {
         409,
         `${folder === reviewedFolder && changed ? `${folder}/${changed}` : "Installed content"} changed since review. Refresh installed files and review the installation again.`,
       );
+    }
+    if (plan.reusedDependencies?.length) {
+      await assertReviewedInventory(
+        {
+          input: { type: "mod", target: "server" },
+          inventorySnapshot: plan.sharedInventorySnapshot,
+        },
+        signal,
+      );
+      const sources = await readAutoModpackSources({
+        serverDir,
+        safePath,
+        signal,
+      });
+      if (sources.snapshot !== plan.sharedSourcesSnapshot)
+        throw error(
+          409,
+          "AutoModpack's pack rules changed since review. Review the installation again.",
+        );
+      for (const item of plan.reusedDependencies) {
+        signal.throwIfAborted();
+        if (
+          (await fileHash(await safePath(serverDir, item.path))) !== item.sha512
+        )
+          throw error(
+            409,
+            `${item.path} changed since review. Review the installation again.`,
+          );
+      }
     }
   }
   async function scan(
@@ -2012,7 +2042,7 @@ export async function createLaunchpad(ctx) {
           : null,
     };
   }
-  async function resolveTree(input, stage, local) {
+  async function resolveTree(input, stage, local, shared) {
     const rootIsActive = !local.some(
       (item) =>
         item.platform === input.platform &&
@@ -2025,56 +2055,16 @@ export async function createLaunchpad(ctx) {
       recoveredDependencies = new Set(),
       attempted = new Set(),
       visited = new Map(),
-      preservedDependencies = new Set();
+      preservedDependencies = new Set(),
+      reusedDependencies = new Map();
     let inspectedParents = 0,
       inspectionBytes = 0;
     let rootResult;
-    async function preserveInstalled(found, value, parentFiles) {
-      const matches = local.filter(
-        (item) =>
-          item.platform === value.platform &&
-          item.projectId === value.projectId,
-      );
-      if (matches.length > 1)
-        throw error(
-          409,
-          `Multiple installed files match this project: ${matches.map((item) => item.path).join(", ")}. Remove the duplicate before updating.`,
-        );
-      const existing = matches[0];
-      const key = `${value.platform}:${value.projectId}`;
+    async function readVerifiedInstalled(existing, artifact, fail) {
       if (
-        !existing ||
-        (existing.versionId === value.versionId &&
-          !preservedDependencies.has(key))
-      )
-        return null;
-      const fail = () =>
-        error(
-          409,
-          `${existing.title || "The dependency"} is already installed, but its version could not be verified against this mod's requirements. Review the required dependency versions before installing.`,
-        );
-      if (
-        !parentFiles ||
-        parentFiles.length !== 1 ||
-        !["forge", "neoforge"].includes(input.loader)
-      )
-        throw fail();
-      const result = await found.resolve({
-        ...value,
-        stage,
-        versionId: existing.versionId,
-      });
-      if (result.archive || result.files?.length !== 1) throw fail();
-      const artifact = result.files[0],
-        parent = parentFiles[0];
-      const limit = 64 * 1024 ** 2;
-      if (
-        ![artifact, parent].every(
-          (file) =>
-            Number.isSafeInteger(file.size) &&
-            file.size >= 0 &&
-            file.size <= limit,
-        )
+        !Number.isSafeInteger(artifact.size) ||
+        artifact.size < 0 ||
+        artifact.size > 64 * 1024 ** 2
       )
         throw fail();
       const handle = await fs.open(
@@ -2110,6 +2100,62 @@ export async function createLaunchpad(ctx) {
       } finally {
         await handle.close();
       }
+      return source;
+    }
+    async function preserveInstalled(
+      found,
+      value,
+      parentFiles,
+      inventory = local,
+    ) {
+      const matches = inventory.filter(
+        (item) =>
+          item.platform === value.platform &&
+          item.projectId === value.projectId,
+      );
+      if (matches.length > 1)
+        throw error(
+          409,
+          `Multiple installed files match this project: ${matches.map((item) => item.path).join(", ")}. Remove the duplicate before updating.`,
+        );
+      const existing = matches[0];
+      const dependencyKey = `${value.platform}:${value.projectId}`;
+      if (
+        !existing ||
+        (existing.versionId === value.versionId &&
+          !preservedDependencies.has(dependencyKey))
+      )
+        return null;
+      const fail = () =>
+        error(
+          409,
+          `${existing.title || "The dependency"} is already installed, but its version could not be verified against this mod's requirements. Review the required dependency versions before installing.`,
+        );
+      if (
+        !parentFiles ||
+        parentFiles.length !== 1 ||
+        !["forge", "neoforge"].includes(input.loader)
+      )
+        throw fail();
+      const result = await found.resolve({
+        ...value,
+        stage,
+        versionId: existing.versionId,
+      });
+      if (result.archive || result.files?.length !== 1) throw fail();
+      const artifact = result.files[0],
+        parent = parentFiles[0];
+      const limit = 64 * 1024 ** 2;
+      if (
+        ![artifact, parent].every(
+          (file) =>
+            Number.isSafeInteger(file.size) &&
+            file.size >= 0 &&
+            file.size <= limit,
+        )
+      )
+        throw fail();
+      const source = await readVerifiedInstalled(existing, artifact, fail);
       if (!parent.stagedPath) {
         if (
           ++inspectedParents > 16 ||
@@ -2137,7 +2183,7 @@ export async function createLaunchpad(ctx) {
         }))
       )
         throw fail();
-      preservedDependencies.add(key);
+      preservedDependencies.add(dependencyKey);
       value.versionId = existing.versionId;
       // Keep the exact installed path, including locally renamed JARs. It must
       // pass the ordinary unchanged-byte and pre-promotion snapshot checks.
@@ -2145,6 +2191,67 @@ export async function createLaunchpad(ctx) {
         ...result,
         files: [{ ...artifact, path: existing.path, preserveInstalled: true }],
       };
+    }
+    async function reuseRegularDependency(found, value, result, parentFiles) {
+      const project = `${value.platform}:${value.projectId}`;
+      if (
+        !shared ||
+        shared.rootKeys.has(project) ||
+        local.some(
+          (item) =>
+            item.platform === value.platform &&
+            item.projectId === value.projectId,
+        )
+      )
+        return null;
+      await shared.load();
+      const candidates = shared.items.filter(
+        (item) =>
+          item.platform === value.platform &&
+          item.projectId === value.projectId,
+      );
+      const matches = (
+        await mapReview(
+          candidates,
+          async (item) =>
+            (await shared.includes(item, input.loader)) ? item : null,
+          input.signal,
+        )
+      ).filter(Boolean);
+      if (!matches.length) return null;
+      if (matches.length > 1)
+        throw error(
+          409,
+          `Multiple active files in regular Mods match ${result.title || value.projectId}. Remove the duplicate before reviewing this installation.`,
+        );
+      const existing = matches[0];
+      const fail = () =>
+        error(
+          409,
+          `${existing.title || existing.path} is already supplied by regular Mods, but its version could not be verified against this dependency. Update it in the Mods tab or adjust AutoModpack's pack rules before reviewing this installation.`,
+        );
+      if (result.archive || result.files?.length !== 1) throw fail();
+      if (
+        String(existing.versionId) !== String(value.versionId) ||
+        preservedDependencies.has(project)
+      ) {
+        try {
+          result = await preserveInstalled(found, value, parentFiles, [
+            existing,
+          ]);
+          if (!result) throw fail();
+        } catch (cause) {
+          input.signal?.throwIfAborted();
+          throw error(409, `${fail().message} ${cause.message}`);
+        }
+      } else {
+        await readVerifiedInstalled(existing, result.files[0], fail);
+      }
+      reusedDependencies.set(existing.path, existing);
+      warnings.push(
+        `Using ${result.title || value.projectId} from ${existing.path}, already included by AutoModpack.`,
+      );
+      return result;
     }
     async function visit(
       value,
@@ -2171,6 +2278,7 @@ export async function createLaunchpad(ctx) {
           "This provider does not support the selected content type.",
         );
       let result;
+      let reused = false;
       let recoveringDependency = false;
       const skipClientDependency = (title) => {
         warnings.push(
@@ -2270,6 +2378,18 @@ export async function createLaunchpad(ctx) {
         )
           result =
             (await preserveInstalled(found, value, parentFiles)) ?? result;
+        if (depth) {
+          const retained = await reuseRegularDependency(
+            found,
+            value,
+            result,
+            parentFiles,
+          );
+          if (retained) {
+            result = retained;
+            reused = true;
+          }
+        }
         if (visited.has(key)) {
           if (visited.get(key) !== String(value.versionId))
             throw error(
@@ -2324,10 +2444,13 @@ export async function createLaunchpad(ctx) {
       const prefix = await destination(value.type, input.target);
       const nodeFiles = [];
       for (const file of result.files ?? []) {
+        // Reused server files never enter the write plan. A virtual staged
+        // artifact lets their own dependencies use the usual verified resolver.
+        const relative = reused ? path.posix.basename(file.path) : file.path;
         const target = safeInstallPath(
-          file.path.includes("/") || !prefix
-            ? file.path
-            : `${prefix}/${file.path}`,
+          relative.includes("/") || !prefix
+            ? relative
+            : `${prefix}/${relative}`,
         );
         if (
           input.target === "automodpack" &&
@@ -2352,7 +2475,7 @@ export async function createLaunchpad(ctx) {
           type: value.type,
           hosts: found.downloadHosts,
         };
-        files.push(planned);
+        if (!reused) files.push(planned);
         nodeFiles.push(planned);
       }
       for (const dependency of result.dependencies ?? [])
@@ -2399,6 +2522,7 @@ export async function createLaunchpad(ctx) {
       warnings,
       unavailableDependencies,
       recoveredDependencies,
+      reusedDependencies: [...reusedDependencies.values()],
     };
   }
   async function inspectUnavailableDependencies(result, input, stage) {
@@ -3071,6 +3195,37 @@ export async function createLaunchpad(ctx) {
           ? { items: [], warnings: [] }
           : await installed({ ...input, identityOnly: true });
       const local = identified.items;
+      let shared;
+      if (input.target === "automodpack" && input.type === "mod") {
+        let loading;
+        shared = {
+          rootKeys: new Set(rootKeys),
+          load: () =>
+            (loading ??= (async () => {
+              shared.inventorySnapshot = await snapshotInventory(
+                "mod",
+                input.signal,
+                "server",
+              );
+              const sources = await readAutoModpackSources({
+                serverDir,
+                safePath,
+                signal: input.signal,
+              });
+              shared.sourcesSnapshot = sources.snapshot;
+              shared.warnings = sources.warnings;
+              shared.includes = sources.includes;
+              const regular = await installed({
+                ...input,
+                target: "server",
+                identityOnly: true,
+              });
+              shared.items = regular.items.filter(
+                (item) => item.active !== false,
+              );
+            })()),
+        };
+      }
       for (const root of roots) {
         if (
           bulk &&
@@ -3092,7 +3247,7 @@ export async function createLaunchpad(ctx) {
         async (root, index) => {
           const rootStage = bulk ? path.join(stage, `item-${index}`) : stage;
           if (bulk) await fs.mkdir(rootStage);
-          const tree = await resolveTree(root, rootStage, local);
+          const tree = await resolveTree(root, rootStage, local, shared);
           if (bulk && tree.archive)
             throw error(
               400,
@@ -3106,6 +3261,20 @@ export async function createLaunchpad(ctx) {
         input.signal,
       );
       const result = trees[0];
+      const reusedDependencies = [
+        ...new Map(
+          trees
+            .flatMap((tree) => tree.reusedDependencies)
+            .map((item) => [item.path, item]),
+        ).values(),
+      ];
+      const sharedReview = reusedDependencies.length
+        ? {
+            reusedDependencies,
+            sharedInventorySnapshot: shared.inventorySnapshot,
+            sharedSourcesSnapshot: shared.sourcesSnapshot,
+          }
+        : {};
       if (bulk) {
         const files = new Map(),
           versions = new Map();
@@ -3149,6 +3318,7 @@ export async function createLaunchpad(ctx) {
         );
       }
       result.warnings.push(...identified.warnings);
+      result.warnings.push(...(shared?.warnings ?? []));
       if (result.archive) {
         const pack = await unpackPack(result, input, stage);
         result.files.push(
@@ -3369,12 +3539,15 @@ export async function createLaunchpad(ctx) {
       await reviewUpdatedDependencies(
         input,
         stage,
-        local,
+        [...local, ...reusedDependencies],
         files,
         result.warnings,
       );
       await inspectUnavailableDependencies(result, input, stage);
-      await assertReviewedInventory({ input, inventorySnapshot }, input.signal);
+      await assertReviewedInventory(
+        { input, inventorySnapshot, ...sharedReview },
+        input.signal,
+      );
       const expiresAt = new Date(Date.now() + 15 * 60 * 1000).toISOString();
       const plan = {
         id: planId,
@@ -3383,6 +3556,7 @@ export async function createLaunchpad(ctx) {
         files,
         unchanged,
         inventorySnapshot,
+        ...sharedReview,
         title: result.title,
         url: result.url,
         iconUrl: result.iconUrl,
