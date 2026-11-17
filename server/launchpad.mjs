@@ -1218,7 +1218,10 @@ export async function createLaunchpad(ctx) {
                 const hasUpdate =
                   result.updates && Object.hasOwn(result.updates, hash);
                 const unlisted =
-                  !hasUpdate && typeof result.unlisted?.[hash] === "string"
+                  !hasUpdate &&
+                  result.unlisted &&
+                  Object.hasOwn(result.unlisted, hash) &&
+                  typeof result.unlisted[hash] === "string"
                     ? result.unlisted[hash]
                     : undefined;
                 if (!hasUpdate && !unlisted) continue;

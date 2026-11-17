@@ -17,7 +17,12 @@ const modFolder = "automodpack/host-modpack/main/mods";
 const message = "No release is listed for Minecraft 1.21.1 and NeoForge.";
 const safePath = (root, relative = "") =>
   relative ? containedSourcePath(root, relative) : fs.realpath(root);
-async function fixture(t, updates, files = [`${modFolder}/fixture.jar`]) {
+async function fixture(
+  t,
+  updates,
+  files = [`${modFolder}/fixture.jar`],
+  providerOverrides = {},
+) {
   const root = await fs.realpath(
     await fs.mkdtemp(path.join(os.tmpdir(), "mc-update-status-test-")),
   );
@@ -61,6 +66,7 @@ async function fixture(t, updates, files = [`${modFolder}/fixture.jar`]) {
         name: "Fixture",
         types: ["mod", "resourcepack", "shader"],
         updates,
+        ...providerOverrides,
       },
     ],
     fetch: async (url) => assert.fail(`Unexpected provider request: ${url}`),
@@ -212,25 +218,43 @@ test("unlisted progress survives background inventory completion and later local
 test("overlapping refreshes preserve unlisted flight results after a later provider failure", async (t) => {
   let release,
     entered,
-    calls = 0;
+    enteredSecond,
+    calls = 0,
+    metadataCalls = 0;
   const gate = new Promise((resolve) => {
     release = resolve;
   });
   const ready = new Promise((resolve) => {
     entered = resolve;
   });
-  t.after(() => release());
-  const { service } = await fixture(t, async (input, items) => {
-    calls++;
-    input.onProgress({ updates: {}, unlisted: { [items[0].sha512]: message } });
-    entered();
-    await gate;
-    throw new Error("A later batch failed");
+  const secondReady = new Promise((resolve) => {
+    enteredSecond = resolve;
   });
+  t.after(() => release());
+  const { service } = await fixture(
+    t,
+    async (input, items) => {
+      calls++;
+      input.onProgress({
+        updates: {},
+        unlisted: { [items[0].sha512]: message },
+      });
+      entered();
+      await gate;
+      throw new Error("A later batch failed");
+    },
+    undefined,
+    {
+      async projectMetadata() {
+        if (++metadataCalls === 2) enteredSecond();
+        return { projects: [], warnings: [] };
+      },
+    },
+  );
   const first = service.installed(selection);
   await ready;
   const second = service.installed({ ...selection, refresh: true });
-  await new Promise((resolve) => setTimeout(resolve, 20));
+  await secondReady;
   release();
   const results = await Promise.all([first, second]);
   assert.equal(calls, 1);
