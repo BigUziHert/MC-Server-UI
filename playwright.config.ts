@@ -54,6 +54,7 @@ export default defineConfig({
     "minecraft.spec.ts",
     "launchpad-review.spec.ts",
     "launchpad-controls.spec.ts",
+    "launchpad-automodpack.spec.ts",
     "navigation.spec.ts",
     "sidebar-files.spec.ts",
     "ui-consistency.spec.ts",

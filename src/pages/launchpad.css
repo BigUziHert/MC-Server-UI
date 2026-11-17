@@ -47,6 +47,32 @@
   border-color: var(--accent);
   background: #ffd00005;
 }
+.launchpad-automodpack-selector {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  width: fit-content;
+  max-width: 100%;
+  padding: 4px;
+  margin-bottom: -10px;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: var(--bg);
+}
+.launchpad-automodpack-selector button {
+  padding: 7px 12px;
+  border: 1px solid transparent;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--muted);
+  font-size: 12px;
+  cursor: pointer;
+}
+.launchpad-automodpack-selector button[aria-pressed="true"] {
+  border-color: var(--border);
+  color: var(--accent);
+  background: #ffd0000a;
+}
 .launchpad-toolbar.panel {
   overflow: visible;
 }

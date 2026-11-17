@@ -11,6 +11,13 @@ import { inspectInstalledMod } from "./launchpad-mod-metadata.mjs";
 import { updatedModDependencyWarnings } from "./launchpad-update-dependencies.mjs";
 import { createModRemoval } from "./launchpad-removal.mjs";
 import { createModActivation } from "./launchpad-activation.mjs";
+import {
+  autoModpackFolder,
+  canActivateContent,
+  contentFilePattern,
+  contentTarget,
+  isContentPath,
+} from "./launchpad-target.mjs";
 import { categoryIds } from "../shared/launchpad-categories.mjs";
 import { createLaunchpadMetadataCache } from "./launchpad-metadata-cache.mjs";
 import { createLaunchpadCatalogCache } from "./launchpad-catalog-cache.mjs";
@@ -33,7 +40,14 @@ import {
 } from "./launchpad-network.mjs";
 export { providerJson };
 
-const types = ["mod", "modpack", "datapack", "plugin"];
+const types = [
+  "mod",
+  "modpack",
+  "datapack",
+  "plugin",
+  "resourcepack",
+  "shader",
+];
 const sorts = new Set([
   "relevance",
   "downloads",
@@ -61,6 +75,7 @@ const loaders = [
   "bungeecord",
   "datapack",
 ];
+const shaderLoaders = ["iris", "optifine", "canvas", "vanilla"];
 const missing = (cause) => cause.code === "ENOENT" || cause.code === "ENOTDIR";
 const enabled = (value) => value === true || value === "true";
 const fileStamp = (stat) =>
@@ -386,6 +401,7 @@ export async function createLaunchpad(ctx) {
     );
   const updateKey = (input, item) =>
     JSON.stringify([
+      input.target,
       input.type,
       input.type === "modpack" ? "" : input.gameVersion,
       input.type === "modpack" ? "" : input.loader,
@@ -574,18 +590,22 @@ export async function createLaunchpad(ctx) {
   };
   function selection(input = {}, strict = false) {
     if (!types.includes(input.type))
-      throw error(400, "Choose Mods, Modpacks, Datapacks, or Plugins.");
+      throw error(400, "Choose a supported Launchpad content type.");
+    const target = contentTarget(input);
     const gameVersion =
       typeof input.gameVersion === "string" ? input.gameVersion.trim() : "";
     const loader =
-      input.type === "datapack"
-        ? "datapack"
-        : typeof input.loader === "string"
-          ? input.loader.toLowerCase()
-          : "";
+      input.type === "resourcepack"
+        ? ""
+        : input.type === "datapack"
+          ? "datapack"
+          : typeof input.loader === "string"
+            ? input.loader.toLowerCase()
+            : "";
     if (
       (gameVersion && !/^[A-Za-z0-9._+-]{1,40}$/.test(gameVersion)) ||
-      (loader && !loaders.includes(loader))
+      (loader &&
+        !(input.type === "shader" ? shaderLoaders : loaders).includes(loader))
     )
       throw error(400, "Choose a valid Minecraft version and loader.");
     if (
@@ -606,7 +626,11 @@ export async function createLaunchpad(ctx) {
         400,
         "Plugins require a compatible plugin server such as Paper or Spigot. Use the Mods tab for mod loaders.",
       );
-    if (strict && (!gameVersion || !loader))
+    if (
+      strict &&
+      (!gameVersion ||
+        (!loader && !["resourcepack", "shader"].includes(input.type)))
+    )
       throw error(
         400,
         "Choose the target Minecraft version and loader before reviewing an install.",
@@ -620,6 +644,7 @@ export async function createLaunchpad(ctx) {
     const limit = Math.min(100, Math.max(1, Number(input.limit) || 20));
     return {
       ...input,
+      target,
       signal:
         input.signal instanceof AbortSignal
           ? AbortSignal.any([lifetime.signal, input.signal])
@@ -640,7 +665,7 @@ export async function createLaunchpad(ctx) {
         `This server uses Minecraft ${current.gameVersion}. Select that version or change the server version first.`,
       );
     if (
-      input.type !== "datapack" &&
+      !["datapack", "resourcepack", "shader"].includes(input.type) &&
       current.loader &&
       current.loader !== input.loader
     )
@@ -720,7 +745,9 @@ export async function createLaunchpad(ctx) {
       software: listing.provider?.name ?? required.loader,
     };
   }
-  async function destination(type) {
+  async function destination(type, target) {
+    const autoFolder = autoModpackFolder({ type, target });
+    if (autoFolder) return autoFolder;
     if (type === "mod") return "mods";
     if (type === "plugin") return "plugins";
     if (type === "datapack")
@@ -747,23 +774,16 @@ export async function createLaunchpad(ctx) {
       return true;
     return lower === "eula.txt";
   }
-  async function snapshotInventory(type, signal = lifetime.signal) {
+  async function snapshotInventory(type, signal = lifetime.signal, target) {
     if (type === "modpack") return null;
-    const folder = await destination(type);
+    const folder = await destination(type, target);
     const directory = await safePath(serverDir, folder);
     const entries = await fs.readdir(directory).catch((cause) => {
       if (missing(cause)) return [];
       throw cause;
     });
     const packages = entries
-      .filter((name) =>
-        (type === "datapack"
-          ? /\.zip$/i
-          : type === "mod"
-            ? /\.jar(?:\.disabled)?$/i
-            : /\.jar$/i
-        ).test(name),
-      )
+      .filter((name) => contentFilePattern({ type, target }).test(name))
       .sort();
     if (packages.length > 1000)
       throw error(
@@ -785,7 +805,11 @@ export async function createLaunchpad(ctx) {
     return JSON.stringify([folder, rows]);
   }
   async function assertReviewedInventory(plan, signal = lifetime.signal) {
-    const current = await snapshotInventory(plan.input.type, signal);
+    const current = await snapshotInventory(
+      plan.input.type,
+      signal,
+      plan.input.target,
+    );
     if (current !== plan.inventorySnapshot) {
       const [folder, entries] = JSON.parse(current);
       const [reviewedFolder, reviewedEntries] = JSON.parse(
@@ -808,10 +832,11 @@ export async function createLaunchpad(ctx) {
     warnings = [],
     isolated = false,
     quick = false,
+    contentScope = "server",
   ) {
     signal.throwIfAborted();
     if (type === "modpack") return [];
-    const relative = await destination(type);
+    const relative = await destination(type, contentScope);
     const directory = await safePath(serverDir, relative);
     const entries = await fs
       .readdir(directory, { withFileTypes: true })
@@ -823,12 +848,7 @@ export async function createLaunchpad(ctx) {
       (entry) =>
         entry.isFile() &&
         !entry.isSymbolicLink() &&
-        (type === "datapack"
-          ? /\.zip$/i
-          : type === "mod"
-            ? /\.jar(?:\.disabled)?$/i
-            : /\.jar$/i
-        ).test(entry.name),
+        contentFilePattern({ type, target: contentScope }).test(entry.name),
     );
     if (files.length > 1000)
       throw error(
@@ -906,7 +926,7 @@ export async function createLaunchpad(ctx) {
             name: file.name,
             size: stat?.size ?? 0,
             platform: null,
-            ...(type === "mod"
+            ...(canActivateContent({ type, target: contentScope })
               ? { active: !/\.disabled$/i.test(file.name) }
               : {}),
             modifiedAt: stat?.mtime.toISOString(),
@@ -935,7 +955,7 @@ export async function createLaunchpad(ctx) {
             Object.entries(receipt ?? {}).filter(([, value]) => value != null),
           ),
           ...(known?.platform ? known : {}),
-          ...(type === "mod"
+          ...(canActivateContent({ type, target: contentScope })
             ? { active: !/\.disabled$/i.test(file.name) }
             : {}),
           modifiedAt: stat.mtime.toISOString(),
@@ -995,6 +1015,7 @@ export async function createLaunchpad(ctx) {
     signal = lifetime.signal,
     urlField = "url",
     cacheGeneration = metadataCache?.generation,
+    contentType = "mod",
   ) {
     const apply = (item, project) => {
       if (typeof project?.title === "string" && project.title.trim())
@@ -1041,7 +1062,10 @@ export async function createLaunchpad(ctx) {
         if (!known.length) return;
         try {
           const result = await abortable(
-            found.projectMetadata(known.map((item) => item.projectId)),
+            found.projectMetadata(
+              known.map((item) => item.projectId),
+              { type: contentType },
+            ),
             signal,
           );
           signal.throwIfAborted();
@@ -1074,7 +1098,11 @@ export async function createLaunchpad(ctx) {
     );
   }
   async function checkUpdates(input, items, warnings) {
-    if (input.type !== "modpack" && (!input.gameVersion || !input.loader)) {
+    if (
+      input.type !== "modpack" &&
+      (!input.gameVersion ||
+        (!input.loader && !["resourcepack", "shader"].includes(input.type)))
+    ) {
       warnings.push(
         "Choose this server's Minecraft version and loader above to check for updates.",
       );
@@ -1258,6 +1286,7 @@ export async function createLaunchpad(ctx) {
                   try {
                     const versionKey = JSON.stringify([
                       found.id,
+                      input.target,
                       input.type,
                       input.gameVersion,
                       input.loader,
@@ -1321,6 +1350,8 @@ export async function createLaunchpad(ctx) {
                     if (!current && found.installedVersion) {
                       const installedKey = JSON.stringify([
                         found.id,
+                        input.target,
+                        input.type,
                         "installed",
                         item.projectId,
                         item.versionId,
@@ -1435,7 +1466,12 @@ export async function createLaunchpad(ctx) {
   async function installed(input) {
     input = selection(input);
     const cacheGeneration = metadataCache?.generation;
-    const scope = JSON.stringify([input.type, input.gameVersion, input.loader]);
+    const scope = JSON.stringify([
+      input.target,
+      input.type,
+      input.gameVersion,
+      input.loader,
+    ]);
     const existingCheck = backgroundChecks.get(scope);
     if (
       !enabled(input.local) &&
@@ -1476,6 +1512,7 @@ export async function createLaunchpad(ctx) {
             scanWarnings,
             false,
             enabled(input.local) && enabled(input.quick),
+            input.target,
           );
     for (const item of items) {
       const url = projectPageUrl(item);
@@ -1530,6 +1567,7 @@ export async function createLaunchpad(ctx) {
     }
     const flightKey = JSON.stringify([
       cacheGeneration,
+      input.target,
       input.type,
       input.gameVersion,
       input.loader,
@@ -1656,6 +1694,7 @@ export async function createLaunchpad(ctx) {
           input.signal,
           "url",
           cacheGeneration,
+          input.type,
         ),
         ...(input.identityOnly
           ? []
@@ -1825,6 +1864,7 @@ export async function createLaunchpad(ctx) {
           input.signal,
           "url",
           cacheGeneration,
+          input.type,
         ),
         checkUpdates(input, entries, warnings),
       ]);
@@ -1942,6 +1982,9 @@ export async function createLaunchpad(ctx) {
             : value.reason,
       })),
       types,
+      // Older remote panels ignore unknown request fields. The shared UI must
+      // see explicit target support before sending any AutoModpack requests.
+      targets: ["server", "automodpack"],
       loaders,
       gameVersions: versionsCache ?? [],
       gameVersion: current.gameVersion ?? null,
@@ -2075,6 +2118,7 @@ export async function createLaunchpad(ctx) {
         !(await installedDependencySatisfies(parent.stagedPath, source, {
           loader: input.loader,
           signal: input.signal,
+          includeClient: input.target === "automodpack",
         }))
       )
         throw fail();
@@ -2128,7 +2172,10 @@ export async function createLaunchpad(ctx) {
             depth && value.type === "mod"
               ? await found.dependencyInfo?.(value)
               : null;
-          if (dependency?.clientOnly === true) {
+          if (
+            dependency?.clientOnly === true &&
+            input.target !== "automodpack"
+          ) {
             skipClientDependency(dependency.title);
             return;
           }
@@ -2171,6 +2218,7 @@ export async function createLaunchpad(ctx) {
           if (
             depth &&
             value.type === "mod" &&
+            input.target !== "automodpack" &&
             cause.code === "CLIENT_ONLY_CONTENT"
           ) {
             skipClientDependency(cause.title);
@@ -2247,13 +2295,18 @@ export async function createLaunchpad(ctx) {
       if (!rootResult) rootResult = result;
       warnings.push(...(result.warnings ?? []));
       if (result.archive) {
+        if (input.target === "automodpack")
+          throw error(
+            400,
+            "AutoModpack stages individual content files, not modpack archives.",
+          );
         if (depth)
           throw error(
             400,
             "A required dependency unexpectedly contains a modpack.",
           );
       }
-      const prefix = await destination(value.type);
+      const prefix = await destination(value.type, input.target);
       const nodeFiles = [];
       for (const file of result.files ?? []) {
         const target = safeInstallPath(
@@ -2261,6 +2314,14 @@ export async function createLaunchpad(ctx) {
             ? file.path
             : `${prefix}/${file.path}`,
         );
+        if (
+          input.target === "automodpack" &&
+          !isContentPath(target, prefix, input)
+        )
+          throw error(
+            400,
+            "AutoModpack content must stay in its selected content folder.",
+          );
         const planned = {
           ...file,
           path: target,
@@ -2288,6 +2349,9 @@ export async function createLaunchpad(ctx) {
             platform: value.platform,
             type: value.type,
             ...dependency,
+            ...(input.target === "automodpack"
+              ? { target: input.target, type: input.type }
+              : {}),
           },
           depth + 1,
           result.title,
@@ -2308,6 +2372,8 @@ export async function createLaunchpad(ctx) {
       warnings,
       input.signal,
       "projectUrl",
+      metadataCache?.generation,
+      input.type,
     );
     return {
       ...rootResult,
@@ -2428,7 +2494,11 @@ export async function createLaunchpad(ctx) {
         for (let offset = 0; offset < bundles.length; offset += 100) {
           const batch = bundles
             .slice(offset, offset + 100)
-            .filter((item) => item.serverCompatible === true);
+            .filter(
+              (item) =>
+                input.target === "automodpack" ||
+                item.serverCompatible === true,
+            );
           if (!batch.length) continue;
           if (found.identify) {
             const matches = await abortable(
@@ -2830,6 +2900,7 @@ export async function createLaunchpad(ctx) {
             ...(await inspectInstalledMod(source, {
               loader: input.loader,
               signal: input.signal,
+              includeClient: input.target === "automodpack",
             })),
           },
         };
@@ -2943,6 +3014,7 @@ export async function createLaunchpad(ctx) {
             ...selection(
               {
                 type: raw.type,
+                target: raw.target,
                 gameVersion: raw.gameVersion,
                 loader: raw.loader,
                 platform: value.platform,
@@ -2977,6 +3049,7 @@ export async function createLaunchpad(ctx) {
       const inventorySnapshot = await snapshotInventory(
         input.type,
         input.signal,
+        input.target,
       );
       const identified =
         input.type === "modpack"
@@ -3171,9 +3244,9 @@ export async function createLaunchpad(ctx) {
           }
           // Updating an inactive mod keeps the new release inactive too.
           if (
-            input.type === "mod" &&
+            canActivateContent(input) &&
             matches[0]?.active === false &&
-            /\.jar$/i.test(file.path)
+            /\.(?:jar|zip)$/i.test(file.path)
           )
             file.path += ".disabled";
           const target = await safePath(serverDir, file.path);
@@ -4056,13 +4129,13 @@ export async function createLaunchpad(ctx) {
         throw error(400, "Choose a sort order supported by this provider.");
       input.sort ||= undefined;
       try {
-        input.categories = categoryIds(input.categories);
+        input.categories = categoryIds(input.categories, input.type);
       } catch (cause) {
         throw error(400, cause.message);
       }
       if (
         input.categories.length &&
-        (input.type !== "mod" ||
+        (!["mod", "resourcepack", "shader"].includes(input.type) ||
           !["modrinth", "curseforge"].includes(input.platform))
       )
         throw error(
@@ -4071,6 +4144,7 @@ export async function createLaunchpad(ctx) {
         );
       const cacheKey = JSON.stringify([
         input.platform,
+        input.target,
         input.type,
         input.query,
         input.gameVersion,

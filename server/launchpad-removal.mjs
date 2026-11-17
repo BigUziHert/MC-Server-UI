@@ -3,6 +3,12 @@ import { randomUUID } from "node:crypto";
 import { inspectInstalledMod } from "./launchpad-mod-metadata.mjs";
 import { installedModVersionSatisfies } from "./launchpad-dependency-ranges.mjs";
 import { launchpadError as error } from "./launchpad-network.mjs";
+import {
+  autoModpackFolder,
+  contentFilePattern,
+  contentTarget,
+  isContentPath,
+} from "./launchpad-target.mjs";
 
 export function createModRemoval(ctx) {
   const plans = new Map(),
@@ -42,6 +48,7 @@ export function createModRemoval(ctx) {
     type = "mod",
     folder = "mods",
     selectedPath,
+    contentScope = "server",
   ) => {
     const directory = await ctx.safePath(ctx.serverDir, folder);
     const entries = await fs
@@ -51,12 +58,7 @@ export function createModRemoval(ctx) {
         throw cause;
       });
     const candidates = entries.filter((entry) =>
-      (type === "datapack"
-        ? /\.zip$/i
-        : type === "mod"
-          ? /\.jar(?:\.disabled)?$/i
-          : /\.jar$/i
-      ).test(entry.name),
+      contentFilePattern({ type, target: contentScope }).test(entry.name),
     );
     if (candidates.length > 1000)
       throw error(
@@ -90,12 +92,13 @@ export function createModRemoval(ctx) {
       };
       if (inspect && type === "mod" && !/\.disabled$/i.test(entry.name)) {
         try {
-          const key = `${loader}:${relative}:${stamp}`;
+          const key = `${contentScope}:${loader}:${relative}:${stamp}`;
           let cached = metadata.get(key);
           if (!cached) {
             cached = await inspectInstalledMod(target, {
               loader,
               signal: ctx.signal,
+              includeClient: contentScope === "automodpack",
             });
             metadata.set(key, cached);
             while (metadata.size > 1000)
@@ -131,28 +134,22 @@ export function createModRemoval(ctx) {
     preview(input = {}) {
       return track(async () => {
         const type = input.type ?? "mod";
-        if (!["mod", "plugin", "datapack"].includes(type))
+        const target = contentTarget({ ...input, type });
+        if (
+          !["mod", "plugin", "datapack", "resourcepack", "shader"].includes(
+            type,
+          )
+        )
           throw error(400, "Choose installed content to remove.");
         const current = await available(type);
         const folder =
-          type === "mod"
+          autoModpackFolder({ type, target }) ??
+          (type === "mod"
             ? "mods"
             : type === "plugin"
               ? "plugins"
-              : `${current.world || "world"}/datapacks`;
-        if (
-          typeof input.path !== "string" ||
-          !input.path.startsWith(`${folder}/`) ||
-          input.path.slice(folder.length + 1).includes("/") ||
-          input.path.includes("\\") ||
-          !(
-            type === "datapack"
-              ? /\.zip$/i
-              : type === "mod"
-                ? /\.jar(?:\.disabled)?$/i
-                : /\.jar$/i
-          ).test(input.path)
-        )
+              : `${current.world || "world"}/datapacks`);
+        if (!isContentPath(input.path, folder, { type, target }))
           throw error(400, `Choose an installed ${type} to remove.`);
         const rows = await inventory(
           current.loader,
@@ -160,6 +157,7 @@ export function createModRemoval(ctx) {
           type,
           folder,
           input.path,
+          target,
         );
         const selected = rows.find((row) => row.path === input.path);
         if (!selected)
@@ -238,6 +236,7 @@ export function createModRemoval(ctx) {
           expires = Date.now() + 15 * 60 * 1000;
         plans.set(planId, {
           type,
+          target,
           folder,
           path: selected.path,
           loader: current.loader,
@@ -297,6 +296,7 @@ export function createModRemoval(ctx) {
                   plan.type,
                   plan.folder,
                   plan.path,
+                  plan.target,
                 ),
               ) !== plan.snapshot
             )

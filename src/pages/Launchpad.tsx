@@ -51,7 +51,7 @@ import {
   safeProjectUrl,
 } from "../../shared/launchpad-project.mjs";
 import {
-  allModCategories,
+  allCategoriesFor,
   matchesCategories,
   supportsCategory,
 } from "../../shared/launchpad-categories.mjs";
@@ -59,7 +59,9 @@ import LaunchpadCategoryFilters from "./LaunchpadCategoryFilters";
 import "./management.css";
 import "./launchpad.css";
 
-type ContentType = "modpack" | "mod" | "datapack" | "plugin";
+type ContentType =
+  "modpack" | "mod" | "datapack" | "plugin" | "resourcepack" | "shader";
+type LaunchpadTab = "modpack" | "mod" | "datapack" | "plugin" | "automodpack";
 type Platform = {
   id: string;
   name: string;
@@ -144,6 +146,7 @@ type Job = {
 };
 type Config = {
   platforms: Platform[];
+  targets?: string[];
   gameVersion: string | null;
   loader: string | null;
   status: string;
@@ -271,6 +274,12 @@ const kinds = [
   { id: "mod", label: "Mods", icon: Puzzle },
   { id: "datapack", label: "Datapacks", icon: FileCode2 },
   { id: "plugin", label: "Plugins", icon: Package },
+  { id: "automodpack", label: "AutoModpack", icon: Layers3 },
+] as const;
+const autoModpackKinds = [
+  { id: "mod", label: "Mods" },
+  { id: "resourcepack", label: "Resource Packs" },
+  { id: "shader", label: "Shader Packs" },
 ] as const;
 const rowsOptions = [5, 10, 25, 50, 75, 100];
 const installedSortOptions = [
@@ -306,7 +315,7 @@ function rememberDismissedJob(scope: string, id: string) {
 }
 type SavedView = {
   platform?: string;
-  type?: ContentType;
+  type?: LaunchpadTab;
   gameVersion?: string;
   loader?: string;
   installedOnly?: boolean;
@@ -326,7 +335,7 @@ function readSavedView(key: string): SavedView {
       platform:
         typeof values.platform === "string" ? values.platform : undefined,
       type: kinds.some((kind) => kind.id === values.type)
-        ? (values.type as ContentType)
+        ? (values.type as LaunchpadTab)
         : undefined,
       gameVersion:
         typeof values.gameVersion === "string" &&
@@ -356,7 +365,9 @@ function readSavedView(key: string): SavedView {
             .filter(
               (value): value is string =>
                 typeof value === "string" &&
-                allModCategories.some((item) => item.id === value),
+                ["mod", "resourcepack", "shader"].some((type) =>
+                  allCategoriesFor(type).some((item) => item.id === value),
+                ),
             )
             .slice(0, 10)
         : undefined,
@@ -371,6 +382,7 @@ function compareInstalled(
   sort: InstalledSort,
   direction: SortDirection,
   query = "",
+  type: ContentType = "mod",
 ) {
   const alphabetical = (left: string, right: string) =>
     left.localeCompare(right, undefined, {
@@ -434,8 +446,9 @@ function compareInstalled(
     order = number(date(a[key]), date(b[key]));
   } else if (sort === "category") {
     const category = (item: InstalledItem) =>
-      allModCategories.find((category) => category.id === item.mainCategory)
-        ?.label ?? item.mainCategory;
+      allCategoriesFor(type).find(
+        (category) => category.id === item.mainCategory,
+      )?.label ?? item.mainCategory;
     order = text(category(a), category(b));
   } else if (sort === "gameVersion") {
     const latest = (item: InstalledItem) =>
@@ -478,11 +491,15 @@ const pluginLoaders = [
   "bungeecord",
 ];
 const loadersFor = (type: ContentType) =>
-  type === "datapack"
-    ? ["datapack"]
-    : type === "plugin"
-      ? pluginLoaders
-      : modLoaders;
+  type === "resourcepack"
+    ? []
+    : type === "shader"
+      ? ["iris", "optifine", "canvas", "vanilla"]
+      : type === "datapack"
+        ? ["datapack"]
+        : type === "plugin"
+          ? pluginLoaders
+          : modLoaders;
 const loaderNames: Record<string, string> = {
   fabric: "Fabric",
   forge: "Forge",
@@ -498,6 +515,10 @@ const loaderNames: Record<string, string> = {
   bungeecord: "BungeeCord",
   sponge: "Sponge",
   datapack: "Datapack",
+  iris: "Iris",
+  optifine: "OptiFine",
+  canvas: "Canvas",
+  vanilla: "Vanilla",
 };
 const loaderName = (value: string) => loaderNames[value] ?? value;
 const queryString = (values: Record<string, string | number | undefined>) => {
@@ -612,6 +633,16 @@ export default function Launchpad({
   const [configLoading, setConfigLoading] = useState(true);
   const [platform, setPlatform] = useState("modrinth");
   const [type, setType] = useState<ContentType>("modpack");
+  const [target, setTarget] = useState<"automodpack" | undefined>();
+  const targetSupported = !target || Boolean(config?.targets?.includes(target));
+  const activeTab: LaunchpadTab =
+    target === "automodpack" ? "automodpack" : (type as LaunchpadTab);
+  const contentKey = `${target ?? "server"}:${type}`;
+  const hasActive = type === "mod" || target === "automodpack";
+  const needsLoader = type !== "resourcepack" && type !== "shader";
+  const contentLabel =
+    (target ? autoModpackKinds : kinds).find((item) => item.id === type)
+      ?.label ?? "content";
   const [gameVersion, setGameVersion] = useState("");
   const [loader, setLoader] = useState("");
   const [status, setStatus] = useState<string | null>(null);
@@ -624,12 +655,11 @@ export default function Launchpad({
     useState<SortDirection>("asc");
   const [installedOnly, setInstalledOnly] = useState(false);
   const [categories, setCategories] = useState<string[]>([]);
-  const categoryKey =
-    type === "mod"
-      ? categories
-          .filter((id) => installedOnly || supportsCategory(id, platform))
-          .join(",")
-      : "";
+  const categoryKey = ["mod", "resourcepack", "shader"].includes(type)
+    ? categories
+        .filter((id) => installedOnly || supportsCategory(id, platform, type))
+        .join(",")
+    : "";
   const [offset, setOffset] = useState(0);
   const [limit, setLimit] = useState(() => {
     try {
@@ -645,8 +675,13 @@ export default function Launchpad({
   const [searchLoading, setSearchLoading] = useState(false);
   const [searchError, setSearchError] = useState("");
   const loaders = loadersFor(type).filter(
-    (value) => !config?.loaders || config.loaders.includes(value),
+    (value) =>
+      type === "shader" || !config?.loaders || config.loaders.includes(value),
   );
+  const shaderCatalogLoaderUnavailable =
+    type === "shader" && platform === "curseforge";
+  const catalogLoader =
+    type === "resourcepack" || shaderCatalogLoaderUnavailable ? "" : loader;
   // Installed updates and individual content installs target this server, even
   // when catalog filters are set to another Minecraft version or loader.
   const contentGameVersion =
@@ -654,12 +689,15 @@ export default function Launchpad({
       ? config.gameVersion
       : gameVersion.trim();
   const contentLoader =
-    config?.loader && loaders.includes(config.loader)
-      ? config.loader
-      : type === "datapack"
-        ? "datapack"
-        : loader;
+    type === "resourcepack"
+      ? ""
+      : config?.loader && loaders.includes(config.loader)
+        ? config.loader
+        : type === "datapack"
+          ? "datapack"
+          : loader;
   const inventoryScope = JSON.stringify([
+    target,
     type,
     contentGameVersion,
     contentLoader,
@@ -668,18 +706,19 @@ export default function Launchpad({
     api: typeof api;
     scope: string;
     type: ContentType;
+    key: string;
     result: InstalledResult;
   } | null>(null);
   const inventoryRef = useRef<typeof inventory>(null);
   const inventoryCache = useRef(
-    new Map<ContentType, NonNullable<typeof inventory>>(),
+    new Map<string, NonNullable<typeof inventory>>(),
   );
   const visibleInventory =
-    inventory?.api === api && inventory.type === type
+    inventory?.api === api && inventory.key === contentKey
       ? inventory
-      : inventoryCache.current.get(type);
+      : inventoryCache.current.get(contentKey);
   const installed =
-    visibleInventory?.api === api
+    targetSupported && visibleInventory?.api === api
       ? visibleInventory.scope === inventoryScope
         ? visibleInventory.result
         : pendingInventory(visibleInventory.result)
@@ -745,12 +784,12 @@ export default function Launchpad({
   const tabs = useRef<HTMLDivElement>(null);
   const completedJob = useRef<{ scope: string; id: string } | null>(null);
   const source = config?.platforms.find((item) => item.id === platform);
-  const inventoryReady = Boolean(config);
+  const inventoryReady = Boolean(config) && targetSupported;
   const sortOptions = source?.sortOptions ?? [];
   const catalogSort = sortOptions.some((item) => item.id === sort)
     ? sort
     : (sortOptions[0]?.id ?? "");
-  const supported = Boolean(source?.types.includes(type));
+  const supported = targetSupported && Boolean(source?.types.includes(type));
   const working = Boolean(job && ["queued", "running"].includes(job.status));
   const availableUpdates = (installed?.items ?? []).filter(
     (item) =>
@@ -760,11 +799,19 @@ export default function Launchpad({
       !pendingPaths.has(item.path),
   );
   const canRecover = allowChanges && status === "offline" && !working;
-  const canInstall = canRecover && !job?.recoveryRequired;
+  const canInstall = canRecover && !job?.recoveryRequired && targetSupported;
   const canDismissJob =
     permissions === undefined || permissions.includes("file.update");
   const contentName =
-    type === "plugin" ? "plugin" : type === "datapack" ? "datapack" : "mod";
+    type === "resourcepack"
+      ? "resource pack"
+      : type === "shader"
+        ? "shader pack"
+        : type === "plugin"
+          ? "plugin"
+          : type === "datapack"
+            ? "datapack"
+            : "mod";
   const minecraftVersions = [
     ...new Set(
       [
@@ -814,25 +861,38 @@ export default function Launchpad({
         }
         if (initial) {
           const saved = readSavedView(viewKey);
+          const compatiblePlatform = (item: Platform) =>
+            saved.type !== "automodpack" || item.types.includes("mod");
           const first =
-            next.platforms.find((item) => item.id === saved.platform) ??
             next.platforms.find(
-              (item) => item.id === "modrinth" && item.available,
+              (item) => item.id === saved.platform && compatiblePlatform(item),
             ) ??
-            next.platforms.find((item) => item.available) ??
+            next.platforms.find(
+              (item) =>
+                item.id === "modrinth" &&
+                item.available &&
+                compatiblePlatform(item),
+            ) ??
+            next.platforms.find(
+              (item) => item.available && compatiblePlatform(item),
+            ) ??
+            next.platforms.find(compatiblePlatform) ??
             next.platforms[0];
           setPlatform(first?.id ?? "modrinth");
           const initialType =
-            saved.type &&
-            (saved.installedOnly || first?.types.includes(saved.type))
-              ? saved.type
-              : pluginLoaders.includes(next.loader ?? "") &&
-                  first?.types.includes("plugin")
-                ? "plugin"
-                : first?.types.includes("modpack")
-                  ? "modpack"
-                  : (first?.types[0] ?? "modpack");
+            saved.type === "automodpack"
+              ? "mod"
+              : saved.type &&
+                  (saved.installedOnly || first?.types.includes(saved.type))
+                ? saved.type
+                : pluginLoaders.includes(next.loader ?? "") &&
+                    first?.types.includes("plugin")
+                  ? "plugin"
+                  : first?.types.includes("modpack")
+                    ? "modpack"
+                    : (first?.types[0] ?? "modpack");
           setType(initialType);
+          setTarget(saved.type === "automodpack" ? "automodpack" : undefined);
           setGameVersion(
             saved.gameVersion !== undefined
               ? saved.gameVersion
@@ -863,7 +923,9 @@ export default function Launchpad({
             saved.installedDirection ??
               defaultInstalledDirection(saved.installedSort ?? "name"),
           );
-          setCategories(saved.categories ?? []);
+          setCategories(
+            saved.type === "automodpack" ? [] : (saved.categories ?? []),
+          );
           setViewReady(viewKey);
         }
         return true;
@@ -1042,7 +1104,7 @@ export default function Launchpad({
         viewKey,
         JSON.stringify({
           platform,
-          type,
+          type: activeTab,
           gameVersion,
           loader,
           installedOnly,
@@ -1062,6 +1124,7 @@ export default function Launchpad({
     viewKey,
     platform,
     type,
+    activeTab,
     gameVersion,
     loader,
     installedOnly,
@@ -1089,10 +1152,11 @@ export default function Launchpad({
     const controller = new AbortController();
     const scope = JSON.stringify([
       platform,
+      target,
       type,
       query.trim(),
       gameVersion.trim(),
-      loader,
+      catalogLoader,
       catalogSort,
       categoryKey,
       offset,
@@ -1107,7 +1171,7 @@ export default function Launchpad({
     const refresh = catalogRefresh.current;
     catalogRefresh.current = false;
     void api<SearchResult>(
-      `/launchpad/search?${queryString({ platform, type, query: query.trim(), gameVersion: gameVersion.trim(), loader, sort: catalogSort, ...(categoryKey ? { categories: categoryKey } : {}), offset, limit, ...(refresh ? { refresh: "true" } : {}) })}`,
+      `/launchpad/search?${queryString({ platform, type, target, query: query.trim(), gameVersion: gameVersion.trim(), loader: catalogLoader, sort: catalogSort, ...(categoryKey ? { categories: categoryKey } : {}), offset, limit, ...(refresh ? { refresh: "true" } : {}) })}`,
       { signal: controller.signal },
     )
       .then((next) => {
@@ -1134,19 +1198,28 @@ export default function Launchpad({
     installedOnly,
     platform,
     type,
+    target,
     query,
     filteredQuery,
     catalogSort,
     categoryKey,
     gameVersion,
-    loader,
+    catalogLoader,
     offset,
     limit,
     reload,
   ]);
 
   useEffect(() => {
-    if (!inventoryReady) return;
+    if (!inventoryReady) {
+      setScanLoading(false);
+      setScanRefreshing(false);
+      setManualRefreshing(false);
+      forceScan.current = null;
+      manualCompletion.current?.(true);
+      manualCompletion.current = null;
+      return;
+    }
     const epoch = ++scanEpoch.current;
     const currentSession = session.current;
     const controller = new AbortController();
@@ -1154,10 +1227,11 @@ export default function Launchpad({
       !controller.signal.aborted &&
       epoch === scanEpoch.current &&
       currentSession === session.current;
-    const cached = inventoryCache.current.get(type);
+    const cached = inventoryCache.current.get(contentKey);
     inventoryRef.current = cached?.api === api ? cached : null;
     let hasSnapshot =
-      inventoryRef.current?.api === api && inventoryRef.current.type === type;
+      inventoryRef.current?.api === api &&
+      inventoryRef.current.key === contentKey;
     setScanLoading(!hasSnapshot);
     setScanRefreshing(true);
     setScanError("");
@@ -1169,10 +1243,11 @@ export default function Launchpad({
         api,
         scope: inventoryScope,
         type,
+        key: contentKey,
         result: pendingInventory(inventoryRef.current!.result),
       };
       inventoryRef.current = next;
-      inventoryCache.current.set(type, next);
+      inventoryCache.current.set(contentKey, next);
       setInventory(next);
     }
     const publish = (result: InstalledResult, local = false) => {
@@ -1181,12 +1256,13 @@ export default function Launchpad({
         api,
         scope: inventoryScope,
         type,
+        key: contentKey,
         result: local
           ? mergeLocalInventory(result, inventoryRef.current?.result)
           : result,
       };
       inventoryRef.current = next;
-      inventoryCache.current.set(type, next);
+      inventoryCache.current.set(contentKey, next);
       setInventory(next);
       hasSnapshot = true;
       if (local) setPendingPaths(new Set());
@@ -1224,6 +1300,7 @@ export default function Launchpad({
           api<InstalledResult>(
             `/launchpad/installed?${queryString({
               type,
+              target,
               gameVersion: contentGameVersion,
               loader: contentLoader,
               local: local ? "true" : undefined,
@@ -1291,7 +1368,7 @@ export default function Launchpad({
             const snapshot = inventoryRef.current;
             if (
               contentGameVersion &&
-              contentLoader &&
+              (!needsLoader || contentLoader) &&
               snapshot?.api === api &&
               snapshot.scope === inventoryScope
             ) {
@@ -1347,6 +1424,9 @@ export default function Launchpad({
     inventoryReady,
     inventoryScope,
     type,
+    target,
+    contentKey,
+    needsLoader,
     contentGameVersion,
     contentLoader,
     reload,
@@ -1365,7 +1445,7 @@ export default function Launchpad({
     else removalDialog.current?.close();
   }, [removal]);
   useEffect(() => {
-    if (!selection || selection.bulk) return;
+    if (!targetSupported || !selection || selection.bulk) return;
     const controller = new AbortController();
     setVersionsLoading(true);
     setVersionsError("");
@@ -1373,7 +1453,7 @@ export default function Launchpad({
     setVersionId("");
     const timer = window.setTimeout(() => {
       void api<{ versions: Version[] }>(
-        `/launchpad/versions?${queryString({ platform: selection.project.platform, projectId: selection.project.id, type, gameVersion: targetVersion.trim(), loader: targetLoader })}`,
+        `/launchpad/versions?${queryString({ platform: selection.project.platform, projectId: selection.project.id, type, target, gameVersion: targetVersion.trim(), loader: targetLoader })}`,
         { signal: controller.signal },
       )
         .then((next) => {
@@ -1398,7 +1478,16 @@ export default function Launchpad({
       window.clearTimeout(timer);
       controller.abort();
     };
-  }, [api, selection, type, targetVersion, targetLoader, versionReload]);
+  }, [
+    api,
+    selection,
+    type,
+    target,
+    targetSupported,
+    targetVersion,
+    targetLoader,
+    versionReload,
+  ]);
 
   useEffect(() => {
     if (!job || !["queued", "running"].includes(job.status)) return;
@@ -1497,7 +1586,7 @@ export default function Launchpad({
   }
 
   function chooseProject(project: Project, entry?: InstalledItem) {
-    if (!allowChanges) return;
+    if (!allowChanges || !targetSupported) return;
     operation.current++;
     previewRequest.current?.abort();
     setDialogError("");
@@ -1549,6 +1638,7 @@ export default function Launchpad({
       const next = await post<RemovalPlan>("/launchpad/removal-preview", {
         path: entry.path,
         type,
+        target,
       });
       if (
         currentSession === session.current &&
@@ -1594,6 +1684,7 @@ export default function Launchpad({
     try {
       await post("/launchpad/remove", {
         planId: removalPlan.planId,
+        ...(target ? { target, type } : {}),
         confirmed: true,
         ...(removalAcknowledged
           ? { acknowledgedUnreadableDependencies: true }
@@ -1619,7 +1710,7 @@ export default function Launchpad({
           },
         };
         inventoryRef.current = next;
-        inventoryCache.current.set(next.type, next);
+        inventoryCache.current.set(next.key, next);
         setInventory(next);
       }
       reloadContent();
@@ -1668,7 +1759,7 @@ export default function Launchpad({
       );
       return;
     }
-    if (!targetLoader) {
+    if (needsLoader && !targetLoader) {
       setDialogError(
         "Choose your server’s loader before reviewing this installation.",
       );
@@ -1692,6 +1783,7 @@ export default function Launchpad({
         projectId: selection.project.id,
         versionId,
         type,
+        target,
         gameVersion: targetVersion.trim(),
         loader: targetLoader,
         ...(selection.installed
@@ -1768,6 +1860,7 @@ export default function Launchpad({
       }
       const next = await post<{ job: Job }>("/launchpad/install", {
         planId: plan.planId,
+        ...(target ? { target, type } : {}),
         confirmed: true,
         ...(type === "modpack" || plan.cleanInstall
           ? { cleanInstall: true }
@@ -1858,6 +1951,7 @@ export default function Launchpad({
     try {
       const next = await prepareReview("/launchpad/updates/preview", {
         type,
+        target,
         gameVersion: contentGameVersion,
         loader: contentLoader,
         updates: updates.map((item) => ({
@@ -1975,7 +2069,7 @@ export default function Launchpad({
     }
   }
   async function setModActive(entry: InstalledItem, active: boolean) {
-    if (pending.current || !canInstall || type !== "mod") return;
+    if (pending.current || !canInstall || !hasActive) return;
     const currentSession = session.current;
     pending.current = true;
     setBusy("active");
@@ -1985,9 +2079,13 @@ export default function Launchpad({
         active: boolean;
         modifiedAt: string;
         addedAt: string;
-      }>("/launchpad/active", { path: entry.path, active });
+      }>("/launchpad/active", {
+        path: entry.path,
+        active,
+        ...(target ? { type, target } : {}),
+      });
       if (currentSession !== session.current) return;
-      const previous = inventoryCache.current.get("mod");
+      const previous = inventoryCache.current.get(contentKey);
       if (previous?.api === api) {
         const next = {
           ...previous,
@@ -2004,8 +2102,8 @@ export default function Launchpad({
             ),
           },
         };
-        inventoryCache.current.set("mod", next);
-        if (inventoryRef.current?.type === "mod") {
+        inventoryCache.current.set(contentKey, next);
+        if (inventoryRef.current?.key === contentKey) {
           scanEpoch.current++;
           inventoryRef.current = next;
           setInventory(next);
@@ -2025,6 +2123,7 @@ export default function Launchpad({
     }
   }
   function changeType(next: ContentType) {
+    if (busy || selection || removal) return;
     setType(next);
     setCategories([]);
     setLoader((current) =>
@@ -2032,10 +2131,35 @@ export default function Launchpad({
         ? current
         : next === "datapack"
           ? "datapack"
-          : "",
+          : loadersFor(next).includes(config?.loader ?? "")
+            ? config!.loader!
+            : "",
     );
     setQuery("");
     setOffset(0);
+    if (next !== type) {
+      setResults(null);
+      setSearchError("");
+    }
+  }
+  function changeTab(next: LaunchpadTab) {
+    if (busy || selection || removal) return;
+    const nextTarget = next === "automodpack" ? "automodpack" : undefined;
+    const nextType = next === "automodpack" ? "mod" : next;
+    setTarget(nextTarget);
+    if (nextTarget) selectAutoModpackType(nextType);
+    else changeType(nextType);
+  }
+  function selectAutoModpackType(next: ContentType) {
+    if (busy || selection || removal) return;
+    changeType(next);
+    if (!source?.types.includes(next)) {
+      const compatible =
+        config?.platforms.find(
+          (item) => item.available && item.types.includes(next),
+        ) ?? config?.platforms.find((item) => item.types.includes(next));
+      if (compatible) setPlatform(compatible.id);
+    }
   }
   const entries = (installed?.items ?? [])
     .filter((entry) =>
@@ -2046,7 +2170,7 @@ export default function Launchpad({
     .filter(
       (entry) =>
         !categoryKey ||
-        matchesCategories(entry.categories, categoryKey.split(",")),
+        matchesCategories(entry.categories, categoryKey.split(","), type),
     )
     .sort((a, b) =>
       compareInstalled(
@@ -2055,6 +2179,7 @@ export default function Launchpad({
         installedSort,
         installedDirection,
         filteredQuery.trim().toLowerCase(),
+        type,
       ),
     );
   const total = installedOnly ? entries.length : (results?.total ?? 0);
@@ -2072,9 +2197,11 @@ export default function Launchpad({
     : !results && searchLoading;
   const failed = installedOnly ? !installed && scanError : searchError;
   const keySource = config?.platforms.find((item) => item.id === "curseforge");
-  const updateFiltersReady = Boolean(contentGameVersion && contentLoader);
+  const updateFiltersReady = Boolean(
+    contentGameVersion && (!needsLoader || contentLoader),
+  );
   const listedGameVersion = installedOnly ? contentGameVersion : gameVersion;
-  const listedLoader = installedOnly ? contentLoader : loader;
+  const listedLoader = installedOnly ? contentLoader : catalogLoader;
   const unavailableUpdates = updateFiltersReady
     ? entries.filter(
         (item) =>
@@ -2182,7 +2309,7 @@ export default function Launchpad({
           grow
           aria-label={bottom ? "Search bottom Launchpad" : "Search Launchpad"}
           clearLabel={bottom ? "Clear bottom search" : "Clear search"}
-          placeholder={`Search ${kinds.find((item) => item.id === type)?.label.toLowerCase()}…`}
+          placeholder={`Search ${contentLabel.toLowerCase()}…`}
           value={query}
           onValueChange={(value) => {
             setQuery(value);
@@ -2274,14 +2401,16 @@ export default function Launchpad({
           </label>
         ) : null}
         <div className="launchpad-toolbar-actions">
-          {type === "mod" &&
+          {["mod", "resourcepack", "shader"].includes(type) &&
             (installedOnly ||
               (source?.available &&
                 supported &&
-                allModCategories.some((category) =>
-                  supportsCategory(category.id, platform),
+                allCategoriesFor(type).some((category) =>
+                  supportsCategory(category.id, platform, type),
                 ))) && (
               <LaunchpadCategoryFilters
+                key={`${contentKey}:${bottom}`}
+                type={type}
                 bottom={bottom}
                 selected={categoryKey ? categoryKey.split(",") : []}
                 platform={installedOnly ? undefined : platform}
@@ -2320,7 +2449,7 @@ export default function Launchpad({
               setInstalledOnly(checked);
               setOffset(0);
               setQuery("");
-              if (!checked && !source?.types.includes(type))
+              if (!checked && !target && !source?.types.includes(type))
                 changeType(source?.types[0] ?? "modpack");
             }}
           />
@@ -2469,18 +2598,22 @@ export default function Launchpad({
                 (item) => item.id === event.target.value,
               );
               setPlatform(event.target.value);
+              if (type === "shader" && event.target.value === "curseforge")
+                setLoader("");
               setQuery("");
               setOffset(0);
-              if (next && !next.types.includes(type))
+              if (!target && next && !next.types.includes(type))
                 changeType(next.types[0] ?? "modpack");
             }}
           >
             {installedOnly && <option value="all">All platforms</option>}
-            {config.platforms.map((item) => (
-              <option key={item.id} value={item.id}>
-                {item.name}
-              </option>
-            ))}
+            {config.platforms
+              .filter((item) => !target || item.types.includes(type))
+              .map((item) => (
+                <option key={item.id} value={item.id}>
+                  {item.name}
+                </option>
+              ))}
           </select>
         </label>
         <label>
@@ -2515,22 +2648,36 @@ export default function Launchpad({
           <select
             aria-label="Loader"
             disabled={
-              installedOnly &&
-              Boolean(config.loader && loaders.includes(config.loader))
+              type === "resourcepack" ||
+              (!installedOnly && shaderCatalogLoaderUnavailable) ||
+              (installedOnly &&
+                Boolean(config.loader && loaders.includes(config.loader)))
             }
             aria-describedby={
               installedOnly && !updateFiltersReady && type !== "modpack"
                 ? "launchpad-update-target"
                 : undefined
             }
-            aria-invalid={installedOnly && type !== "modpack" && !contentLoader}
-            value={installedOnly ? contentLoader : loader}
+            aria-invalid={
+              installedOnly &&
+              needsLoader &&
+              type !== "modpack" &&
+              !contentLoader
+            }
+            value={installedOnly ? contentLoader : catalogLoader}
+            title={
+              !installedOnly && shaderCatalogLoaderUnavailable
+                ? "CurseForge does not offer shader loader search filters."
+                : undefined
+            }
             onChange={(event) => {
               setLoader(event.target.value);
               setOffset(0);
             }}
           >
-            <option value="">All loaders</option>
+            <option value="">
+              {type === "resourcepack" ? "Not applicable" : "All loaders"}
+            </option>
             {loaders.map((value) => (
               <option key={value} value={value}>
                 {loaderName(value)}
@@ -2550,16 +2697,23 @@ export default function Launchpad({
             key={id}
             role="tab"
             id={`launchpad-tab-${id}`}
-            aria-selected={type === id}
+            aria-selected={activeTab === id}
             aria-controls="launchpad-results"
-            tabIndex={type === id ? 0 : -1}
-            disabled={!installedOnly && !source?.types.includes(id)}
+            tabIndex={activeTab === id ? 0 : -1}
+            disabled={
+              Boolean(busy) ||
+              (id !== "automodpack" &&
+                !installedOnly &&
+                !source?.types.includes(id))
+            }
             title={
-              !installedOnly && !source?.types.includes(id)
+              id !== "automodpack" &&
+              !installedOnly &&
+              !source?.types.includes(id)
                 ? `${source?.name ?? "This platform"} does not offer ${label.toLowerCase()}.`
                 : undefined
             }
-            onClick={() => changeType(id)}
+            onClick={() => changeTab(id)}
             onKeyDown={(event) => {
               if (
                 !["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)
@@ -2567,10 +2721,13 @@ export default function Launchpad({
                 return;
               event.preventDefault();
               const supportedKinds = kinds.filter(
-                (item) => installedOnly || source?.types.includes(item.id),
+                (item) =>
+                  item.id === "automodpack" ||
+                  installedOnly ||
+                  source?.types.includes(item.id),
               );
               const current = supportedKinds.findIndex(
-                (item) => item.id === type,
+                (item) => item.id === activeTab,
               );
               const index =
                 event.key === "Home"
@@ -2583,7 +2740,7 @@ export default function Launchpad({
                       supportedKinds.length;
               const next = supportedKinds[index];
               if (next) {
-                changeType(next.id);
+                changeTab(next.id);
                 tabs.current
                   ?.querySelector<HTMLButtonElement>(
                     `#launchpad-tab-${next.id}`,
@@ -2614,8 +2771,8 @@ export default function Launchpad({
         >
           <Info size={17} />
           <span>
-            Choose this server’s Minecraft version and loader above to check for
-            updates.
+            Choose this server’s Minecraft version
+            {needsLoader ? " and loader" : ""} above to check for updates.
           </span>
         </div>
       )}
@@ -2628,6 +2785,25 @@ export default function Launchpad({
               : "Server status is unavailable. Installation will be available once the panel reconnects."}{" "}
             <a href="#console">Open Console</a>
           </div>
+        </div>
+      )}
+      {target === "automodpack" && (
+        <div
+          className="launchpad-automodpack-selector"
+          role="group"
+          aria-label="AutoModpack content"
+        >
+          {autoModpackKinds.map(({ id, label }) => (
+            <button
+              type="button"
+              key={id}
+              aria-pressed={type === id}
+              disabled={Boolean(busy)}
+              onClick={() => selectAutoModpackType(id)}
+            >
+              {label}
+            </button>
+          ))}
         </div>
       )}
       {toolbar()}
@@ -2784,7 +2960,7 @@ export default function Launchpad({
           )}
         </div>
       )}
-      {scanRefreshing && (!installedOnly || installed) && (
+      {targetSupported && scanRefreshing && (!installedOnly || installed) && (
         <div
           className="launchpad-scan-status"
           role="status"
@@ -2854,10 +3030,17 @@ export default function Launchpad({
         id="launchpad-results"
         className="launchpad-results"
         role="tabpanel"
-        aria-labelledby={`launchpad-tab-${type}`}
+        aria-labelledby={`launchpad-tab-${activeTab}`}
         aria-busy={loading}
       >
-        {!installedOnly && (!source?.available || !supported) ? (
+        {!targetSupported ? (
+          <StatePanel
+            variant="empty"
+            icon={<Info size={27} />}
+            title="Update this MC Panel to use AutoModpack"
+            message="The selected panel needs an update before it can manage AutoModpack folders. Install the latest MC Panel update on that computer, then refresh Launchpad."
+          />
+        ) : !installedOnly && (!source?.available || !supported) ? (
           <StatePanel
             variant="empty"
             icon={<SlidersHorizontal size={25} />}
@@ -2931,7 +3114,7 @@ export default function Launchpad({
               {installedOnly && <span> · Updates always appear first.</span>}
             </div>
             <div
-              className={`launchpad-installed-list${type === "mod" ? " has-active" : ""}`}
+              className={`launchpad-installed-list${hasActive ? " has-active" : ""}`}
               tabIndex={0}
               role="region"
               aria-label={
@@ -2952,7 +3135,7 @@ export default function Launchpad({
                 {columnHeading("name", "Name", "name")}
                 <span className="launchpad-column-action">Action</span>
                 {columnHeading("author", "Author", "author")}
-                {type === "mod" && columnHeading("active", "Active", "active")}
+                {hasActive && columnHeading("active", "Active", "active")}
                 {columnHeading("added", "Date added", "added", "newest")}
                 {columnHeading(
                   "modified",
@@ -2998,7 +3181,7 @@ export default function Launchpad({
                             Update available
                           </span>
                         )}
-                        {entry?.active === false && type === "mod" && (
+                        {entry?.active === false && hasActive && (
                           <span className="launchpad-badge">Disabled</span>
                         )}
                         {installedOnly && entry?.platform && (
@@ -3111,7 +3294,7 @@ export default function Launchpad({
                     )}
                     {entry && type !== "modpack" && (
                       <>
-                        {type === "mod" && (
+                        {hasActive && (
                           <Switch
                             className="launchpad-active"
                             aria-label={`Active: ${project.title}`}
@@ -3124,7 +3307,7 @@ export default function Launchpad({
                             }
                             title={
                               status !== "offline"
-                                ? "Stop the server before enabling or disabling mods."
+                                ? `Stop the server before enabling or disabling ${contentName}s.`
                                 : `${entry.active === false ? "Enable" : "Disable"} ${project.title}`
                             }
                             onCheckedChange={(active) =>
@@ -3152,7 +3335,7 @@ export default function Launchpad({
                         </button>
                       </>
                     )}
-                    {type === "mod" && !entry && (
+                    {hasActive && !entry && (
                       <span
                         className="launchpad-active launchpad-empty-cell"
                         aria-label="Not installed"
@@ -3251,22 +3434,30 @@ export default function Launchpad({
                 <select
                   id="launchpad-target-loader"
                   value={targetLoader}
-                  required
-                  aria-invalid={!targetLoader}
+                  required={needsLoader}
+                  aria-invalid={needsLoader && !targetLoader}
                   aria-describedby={
-                    !targetLoader ? "launchpad-loader-notice" : undefined
+                    needsLoader && !targetLoader
+                      ? "launchpad-loader-notice"
+                      : undefined
                   }
-                  disabled={Boolean(busy)}
+                  disabled={Boolean(busy) || type === "resourcepack"}
                   onChange={(event) => setTargetLoader(event.target.value)}
                 >
-                  <option value="">Not selected</option>
+                  <option value="">
+                    {type === "resourcepack"
+                      ? "Not applicable"
+                      : needsLoader
+                        ? "Not selected"
+                        : "All loaders"}
+                  </option>
                   {loaders.map((value) => (
                     <option key={value} value={value}>
                       {loaderName(value)}
                     </option>
                   ))}
                 </select>
-                {!targetLoader && (
+                {needsLoader && !targetLoader && (
                   <p
                     id="launchpad-loader-notice"
                     className="management-warning"
@@ -3663,7 +3854,7 @@ export default function Launchpad({
                   Boolean(busy) ||
                   !canInstall ||
                   !targetVersion.trim() ||
-                  !targetLoader ||
+                  (needsLoader && !targetLoader) ||
                   (!selection?.bulk &&
                     (!selectedVersion?.downloadable || versionsLoading))
                 }

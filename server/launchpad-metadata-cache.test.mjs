@@ -43,7 +43,7 @@ test("metadata cache retains bounded taxonomy and sort metadata without unsafe f
     "project",
     {
       title: "Display",
-      categories: ["technology", "automation", "unknown"],
+      categories: ["technology", "automation", "fonts", "bloom", "unknown"],
       mainCategory: "technology",
       downloads: 123,
       follows: 45,
@@ -57,7 +57,12 @@ test("metadata cache retains bounded taxonomy and sort metadata without unsafe f
   await cache.close();
   const reopened = await createLaunchpadMetadataCache(cacheOptions(root));
   const saved = reopened.project("modrinth", "project").value;
-  assert.deepEqual(saved.categories, ["technology", "automation"]);
+  assert.deepEqual(saved.categories, [
+    "technology",
+    "automation",
+    "fonts",
+    "bloom",
+  ]);
   assert.equal(saved.mainCategory, "technology");
   assert.equal(saved.downloads, 123);
   assert.equal(saved.follows, 45);

@@ -1,5 +1,10 @@
 import fs from "node:fs/promises";
 import { launchpadError as error } from "./launchpad-network.mjs";
+import {
+  autoModpackFolder,
+  contentTarget,
+  isContentPath,
+} from "./launchpad-target.mjs";
 
 // A disabled JAR keeps its bytes and metadata beside its enabled filename.
 // Hard links provide an exclusive destination on Windows and Unix, unlike
@@ -8,9 +13,12 @@ export function createModActivation(ctx) {
   let operation = null;
   const sameFile = (a, b) => a.ino === b.ino && a.dev === b.dev;
   const change = async (input) => {
+    input = { ...input, type: input?.type ?? "mod" };
+    const target = contentTarget(input);
+    const folder = autoModpackFolder(input) ?? "mods";
     if (
-      typeof input?.path !== "string" ||
-      !/^mods\/[^/\\]+\.jar(?:\.disabled)?$/i.test(input.path) ||
+      (target !== "automodpack" && input.type !== "mod") ||
+      !isContentPath(input.path, folder, input) ||
       typeof input.active !== "boolean"
     )
       throw error(400, "Choose an installed mod and whether it is active.");
@@ -28,7 +36,10 @@ export function createModActivation(ctx) {
             409,
             "Stop the server before enabling or disabling mods.",
           );
-        if (!["forge", "neoforge", "fabric", "quilt"].includes(current.loader))
+        if (
+          input.type === "mod" &&
+          !["forge", "neoforge", "fabric", "quilt"].includes(current.loader)
+        )
           throw error(400, "Choose a server with a supported mod loader.");
         const source = await ctx.safePath(ctx.serverDir, input.path);
         const before = await fs.lstat(source).catch((cause) => {

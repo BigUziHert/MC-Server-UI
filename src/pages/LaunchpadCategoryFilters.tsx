@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { ChevronDown, ChevronRight, Filter, X } from "lucide-react";
 import {
-  modCategories,
+  categoriesFor,
   supportsCategory,
 } from "../../shared/launchpad-categories.mjs";
 
@@ -10,11 +10,13 @@ export default function LaunchpadCategoryFilters({
   platform,
   onChange,
   bottom = false,
+  type = "mod",
 }: {
   selected: string[];
   platform?: string;
   onChange: (categories: string[]) => void;
   bottom?: boolean;
+  type?: string;
 }) {
   const panelId = bottom
     ? "launchpad-bottom-category-panel"
@@ -23,12 +25,12 @@ export default function LaunchpadCategoryFilters({
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
   const root = useRef<HTMLDivElement>(null);
   const trigger = useRef<HTMLButtonElement>(null);
-  const availableCategories = modCategories
+  const availableCategories = categoriesFor(type)
     .map((category) => ({
       ...category,
-      supported: !platform || supportsCategory(category.id, platform),
+      supported: !platform || supportsCategory(category.id, platform, type),
       children: category.children?.filter(
-        (child) => !platform || supportsCategory(child.id, platform),
+        (child) => !platform || supportsCategory(child.id, platform, type),
       ),
     }))
     .filter((category) => category.supported || category.children?.length);

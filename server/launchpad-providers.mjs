@@ -9,7 +9,7 @@ import { createInstalledIdentification } from "./launchpad-identification.mjs";
 import { createModrinthRecovery } from "./launchpad-recovery.mjs";
 import { normalizeAuthorLinks } from "../shared/launchpad-project.mjs";
 import {
-  allModCategories,
+  allCategoriesFor,
   categoryIds,
   curseforgeCategoryId,
   modrinthCategoryFacets,
@@ -33,6 +33,10 @@ const id = (value) => {
 // https://modrinth.com/news/article/new-environments/#new-system
 const serverEnvironment = (value) =>
   !["client_only", "singleplayer_only"].includes(value);
+const supportsEnvironment = (value, input) =>
+  input.target === "automodpack" || serverEnvironment(value);
+const zipContent = (type) =>
+  ["datapack", "resourcepack", "shader"].includes(type);
 const fileName = (value) => {
   const name = safeInstallPath(value);
   if (name.includes("/"))
@@ -40,14 +44,20 @@ const fileName = (value) => {
   return name;
 };
 const compatibleLoaders = (input) =>
-  input.loader === "quilt" && input.type === "mod"
-    ? ["quilt", "fabric"]
-    : input.loader
-      ? [input.loader]
-      : [];
+  input.type === "resourcepack"
+    ? []
+    : input.type === "shader"
+      ? ["iris", "optifine", "canvas", "vanilla"].includes(input.loader)
+        ? [input.loader]
+        : []
+      : input.loader === "quilt" && input.type === "mod"
+        ? ["quilt", "fabric"]
+        : input.loader
+          ? [input.loader]
+          : [];
 const fits = (version, input) =>
   (!input.gameVersion || version.gameVersions.includes(input.gameVersion)) &&
-  (!input.loader ||
+  (!compatibleLoaders(input).length ||
     compatibleLoaders(input).some((loader) =>
       version.loaders.includes(loader),
     ));
@@ -91,19 +101,20 @@ const catalogDate = (value) =>
   typeof value === "string" && Number.isFinite(Date.parse(value))
     ? new Date(value).toISOString()
     : undefined;
-function catalogFields(project, platform) {
+function catalogFields(project, platform, type = "mod") {
   const fields = {};
   if (Array.isArray(project.categories)) {
     fields.categories =
       platform === "modrinth"
-        ? normalizeModrinthCategories(project.categories)
-        : normalizeCurseforgeCategories(project.categories);
+        ? normalizeModrinthCategories(project.categories, type)
+        : normalizeCurseforgeCategories(project.categories, type);
     const primary =
       platform === "curseforge"
         ? curseforgeCategoryId(
             project.categories.find(
               (row) => row.id === project.primaryCategoryId,
             ),
+            type,
           )
         : fields.categories[0];
     if (primary) fields.mainCategory = primary;
@@ -242,7 +253,18 @@ function projectMetadataLookup(loadBatch, normalize) {
     };
   };
 }
-function mrVersion(value) {
+function contentMetadataLookup(loadBatch, normalize) {
+  const lookups = new Map();
+  return (ids, { type = "mod" } = {}) => {
+    if (!lookups.has(type))
+      lookups.set(
+        type,
+        projectMetadataLookup(loadBatch, (project) => normalize(project, type)),
+      );
+    return lookups.get(type)(ids);
+  };
+}
+function mrVersion(value, input = {}) {
   return {
     id: String(value.id),
     name: value.name,
@@ -251,7 +273,7 @@ function mrVersion(value) {
     loaders: value.loaders ?? [],
     publishedAt: value.date_published,
     downloadable:
-      serverEnvironment(value.environment) &&
+      supportsEnvironment(value.environment, input) &&
       Array.isArray(value.files) &&
       value.files.some(
         (file) => file.url && (file.hashes?.sha512 || file.hashes?.sha1),
@@ -262,7 +284,7 @@ function mrUpdateFile(value, input) {
   const extension =
     input.type === "modpack"
       ? /\.mrpack$/i
-      : input.type === "datapack"
+      : zipContent(input.type)
         ? /\.zip$/i
         : /\.jar$/i;
   const files = value.files.filter((file) => extension.test(file.filename));
@@ -328,10 +350,16 @@ async function mrIndexedUpdates(
   const facets = [
     projects.map((projectId) => `project_id:${projectId}`),
     ...(input.gameVersion ? [[`versions:${input.gameVersion}`]] : []),
-    ...(input.loader
+    ...(compatibleLoaders(input).length
       ? [compatibleLoaders(input).map((loader) => `categories:${loader}`)]
       : []),
-    mrServerEnvironments.map((environment) => `environment:${environment}`),
+    ...(input.target === "automodpack"
+      ? []
+      : [
+          mrServerEnvironments.map(
+            (environment) => `environment:${environment}`,
+          ),
+        ]),
   ];
   const [search, records] = await Promise.all([
     recovery.read(
@@ -419,7 +447,8 @@ async function mrIndexedUpdates(
         continue;
       const compatible = suffix.filter(
         (value) =>
-          fits(mrVersion(value), input) && mrVersion(value).downloadable,
+          fits(mrVersion(value, input), input) &&
+          mrVersion(value, input).downloadable,
       );
       const latest = compatible.at(-1);
       if (!latest) continue;
@@ -485,6 +514,7 @@ function modrinthUpdates(json, recovery) {
   const failureKey = (input, item) =>
     JSON.stringify([
       input.type,
+      input.target,
       input.loader,
       input.gameVersion,
       item.sha512,
@@ -614,12 +644,12 @@ function modrinthUpdates(json, recovery) {
                 502,
                 "Modrinth returned an invalid update version ID.",
               );
-            const version = mrVersion(value);
+            const version = mrVersion(value, input);
             if (value.project_id !== item.projectId)
               throw new Error(
                 "Modrinth returned an update for a different project.",
               );
-            if (!serverEnvironment(value.environment))
+            if (!supportsEnvironment(value.environment, input))
               throw new Error(
                 value.environment === "singleplayer_only"
                   ? "The returned version is marked singleplayer-only and does not support a dedicated server."
@@ -633,7 +663,7 @@ function modrinthUpdates(json, recovery) {
                 `The returned version does not support Minecraft ${input.gameVersion}.`,
               );
             if (
-              input.loader &&
+              compatibleLoaders(input).length &&
               !compatibleLoaders(input).some((loader) =>
                 version.loaders.includes(loader),
               )
@@ -771,7 +801,7 @@ function modrinthUpdates(json, recovery) {
                     try {
                       const query = new URLSearchParams({
                         include_changelog: "false",
-                        ...(input.loader
+                        ...(compatibleLoaders(input).length
                           ? {
                               loaders: JSON.stringify(compatibleLoaders(input)),
                             }
@@ -821,14 +851,14 @@ function modrinthUpdates(json, recovery) {
                         recoveredCurrent.set(item.versionId, installed);
                       const compatible = versions.filter(
                         (value) =>
-                          serverEnvironment(value.environment) &&
+                          supportsEnvironment(value.environment, input) &&
                           (!input.gameVersion ||
                             value.game_versions.includes(input.gameVersion)) &&
-                          (!input.loader ||
+                          (!compatibleLoaders(input).length ||
                             compatibleLoaders(input).some((loader) =>
                               value.loaders.includes(loader),
                             )) &&
-                          mrVersion(value).downloadable,
+                          mrVersion(value, input).downloadable,
                       );
                       if (!compatible.length)
                         throw launchpadError(
@@ -1010,7 +1040,11 @@ function cfVersion(value, type) {
             })()
           : versions
               .map((value) => value.toLowerCase())
-              .filter((value) => Object.hasOwn(cfLoaders, value)),
+              .filter((value) =>
+                type === "shader"
+                  ? ["iris", "optifine", "canvas", "vanilla"].includes(value)
+                  : Object.hasOwn(cfLoaders, value),
+              ),
     publishedAt: value.fileDate,
     downloadable:
       value.isAvailable !== false &&
@@ -1063,7 +1097,7 @@ export function createCoreProviders({
     const query = new URLSearchParams();
     if (input.gameVersion)
       query.set("game_versions", JSON.stringify([input.gameVersion]));
-    if (input.loader)
+    if (compatibleLoaders(input).length)
       query.set("loaders", JSON.stringify(compatibleLoaders(input)));
     return json(`${mr}/project/${enc(id(input.projectId))}/version?${query}`, {
       signal: input.signal,
@@ -1084,19 +1118,19 @@ export function createCoreProviders({
   // Official batch endpoints avoid one request per installed JAR:
   // https://docs.modrinth.com/api/operations/getprojects/
   // https://docs.curseforge.com/rest-api/#get-mods
-  const mrMetadata = projectMetadataLookup(
+  const mrMetadata = contentMetadataLookup(
     (ids, signal) =>
       json(
         `${mr}/projects?${new URLSearchParams({ ids: JSON.stringify(ids) })}`,
         { signal },
       ),
-    (project) => ({
+    (project, type) => ({
       id: String(project.id),
       title: project.title,
       url: `https://modrinth.com/project/${enc(project.slug ?? project.id)}`,
       iconUrl: iconUrl(project.icon_url),
       teamId: project.team,
-      ...catalogFields(project, "modrinth"),
+      ...catalogFields(project, "modrinth", type),
     }),
   );
   // /teams returns members for multiple teams; associate by team_id rather
@@ -1131,8 +1165,8 @@ export function createCoreProviders({
     },
     (team) => team,
   );
-  const mrProjectMetadata = async (ids) => {
-    const result = await mrMetadata(ids);
+  const mrProjectMetadata = async (ids, input) => {
+    const result = await mrMetadata(ids, input);
     const teamIds = result.projects
       .map((project) => project.teamId)
       .filter(
@@ -1159,7 +1193,7 @@ export function createCoreProviders({
       ],
     };
   };
-  const cfMetadata = projectMetadataLookup(
+  const cfMetadata = contentMetadataLookup(
     async (ids, signal) =>
       (
         await curseJson("/mods", {
@@ -1176,7 +1210,7 @@ export function createCoreProviders({
           }),
         })
       ).data,
-    (project) =>
+    (project, type) =>
       project.gameId === 432
         ? {
             id: String(project.id),
@@ -1185,7 +1219,7 @@ export function createCoreProviders({
             iconUrl: iconUrl(project.logo?.thumbnailUrl ?? project.logo?.url),
             author: projectAuthors(project),
             authorLinks: normalizeAuthorLinks(project.authors),
-            ...catalogFields(project, "curseforge"),
+            ...catalogFields(project, "curseforge", type),
           }
         : undefined,
   );
@@ -1203,6 +1237,13 @@ export function createCoreProviders({
       modpack: ["modpacks"],
       plugin: ["bukkit-plugins", "bukkit plugins"],
       datapack: ["data-packs", "datapacks", "data packs"],
+      resourcepack: [
+        "texture-packs",
+        "resource-packs",
+        "resourcepacks",
+        "resource packs",
+      ],
+      shader: ["shaders", "shader-packs", "shaderpacks", "shader packs"],
     }[type];
     const category = rows.find(
       (row) =>
@@ -1216,44 +1257,48 @@ export function createCoreProviders({
       );
     return category.id;
   }
-  let modCategoryLookup;
-  async function cfCategoryIds(selected, signal) {
+  const categoryLookups = new Map();
+  async function cfCategoryIds(selected, signal, type) {
     if (!selected.length) return [];
-    modCategoryLookup ??= (async () => {
-      const classId = await cfClass("mod");
-      const result = await curseJson(
-        `/categories?${new URLSearchParams({ gameId: "432", classId: String(classId) })}`,
-        {
-          signal: lookupSignal(AbortSignal.timeout(8000)),
-        },
+    if (!categoryLookups.has(type))
+      categoryLookups.set(
+        type,
+        (async () => {
+          const classId = await cfClass(type);
+          const result = await curseJson(
+            `/categories?${new URLSearchParams({ gameId: "432", classId: String(classId) })}`,
+            {
+              signal: lookupSignal(AbortSignal.timeout(8000)),
+            },
+          );
+          if (!Array.isArray(result.data))
+            throw launchpadError(
+              502,
+              "CurseForge returned invalid content categories.",
+            );
+          return new Map(
+            result.data
+              .filter(
+                (row) =>
+                  Number.isSafeInteger(row.id) &&
+                  row.id > 0 &&
+                  (row.classId == null || row.classId === classId),
+              )
+              .map((row) => [curseforgeCategoryId(row, type), row.id])
+              .filter(([key]) => key),
+          );
+        })().catch((cause) => {
+          categoryLookups.delete(type);
+          throw cause;
+        }),
       );
-      if (!Array.isArray(result.data))
-        throw launchpadError(
-          502,
-          "CurseForge returned invalid mod categories.",
-        );
-      return new Map(
-        result.data
-          .filter(
-            (row) =>
-              Number.isSafeInteger(row.id) &&
-              row.id > 0 &&
-              (row.classId == null || row.classId === classId),
-          )
-          .map((row) => [curseforgeCategoryId(row), row.id])
-          .filter(([key]) => key),
-      );
-    })().catch((cause) => {
-      modCategoryLookup = undefined;
-      throw cause;
-    });
-    const available = await modCategoryLookup;
+    const available = await categoryLookups.get(type);
     signal?.throwIfAborted();
     return selected.map((selectedId) => {
       if (!available.has(selectedId))
         throw launchpadError(
           400,
-          `CurseForge does not currently expose the ${allModCategories.find((row) => row.id === selectedId)?.label ?? selectedId} category.`,
+          `CurseForge does not currently expose the ${allCategoriesFor(type).find((row) => row.id === selectedId)?.label ?? selectedId} category.`,
         );
       return available.get(selectedId);
     });
@@ -1266,7 +1311,9 @@ export function createCoreProviders({
     const requested =
       input.loader === "quilt" && input.type === "mod"
         ? ["quilt", "fabric"]
-        : [input.loader];
+        : compatibleLoaders(input).length
+          ? compatibleLoaders(input)
+          : [undefined];
     for (const loader of requested) {
       for (let index = 0; ; index += 50) {
         input.signal?.throwIfAborted();
@@ -1307,7 +1354,7 @@ export function createCoreProviders({
     {
       id: "modrinth",
       name: "Modrinth",
-      types: ["mod", "modpack", "datapack", "plugin"],
+      types: ["mod", "modpack", "datapack", "plugin", "resourcepack", "shader"],
       available: true,
       sortOptions: mrSortOptions,
       downloadHosts: ["cdn.modrinth.com"],
@@ -1318,22 +1365,27 @@ export function createCoreProviders({
           items,
         ),
       async search(input) {
-        const selected = categoryIds(input.categories);
-        if (selected.some((id) => !supportsCategory(id, "modrinth")))
+        const selected = categoryIds(input.categories, input.type);
+        if (
+          selected.some((id) => !supportsCategory(id, "modrinth", input.type))
+        )
           throw launchpadError(
             400,
             "Modrinth does not expose one of the selected categories. Choose an available category or switch to CurseForge.",
           );
         const facets = [
           [`all_project_types:${input.type}`],
-          ["server_side!=unsupported"],
+          ...(input.target === "automodpack"
+            ? []
+            : [["server_side!=unsupported"]]),
         ];
         if (input.gameVersion) facets.push([`versions:${input.gameVersion}`]);
-        if (input.loader)
+        if (compatibleLoaders(input).length)
           facets.push(
             compatibleLoaders(input).map((loader) => `categories:${loader}`),
           );
-        if (selected.length) facets.push(modrinthCategoryFacets(selected));
+        if (selected.length)
+          facets.push(modrinthCategoryFacets(selected, input.type));
         const query = new URLSearchParams({
           query: input.query,
           facets: JSON.stringify(facets),
@@ -1359,7 +1411,7 @@ export function createCoreProviders({
             author: value.author,
             authorLinks: modrinthAuthorLinks([value.author]),
             url: `https://modrinth.com/${input.type}/${value.slug ?? value.project_id}`,
-            ...catalogFields(value, "modrinth"),
+            ...catalogFields(value, "modrinth", input.type),
           })),
           total: result.total_hits,
           offset: result.offset,
@@ -1368,7 +1420,7 @@ export function createCoreProviders({
       },
       async versions(input) {
         return (await mrVersions(input))
-          .map(mrVersion)
+          .map((value) => mrVersion(value, input))
           .filter((version) => fits(version, input));
       },
       async dependencyInfo(input) {
@@ -1383,6 +1435,7 @@ export function createCoreProviders({
         return {
           title: project.title,
           clientOnly:
+            input.target !== "automodpack" &&
             input.type === "mod" &&
             supportedTypes.includes("mod") &&
             project.server_side === "unsupported",
@@ -1442,7 +1495,7 @@ export function createCoreProviders({
             row.files.some((file) => !file || typeof file !== "object")
           )
             continue;
-          const version = mrVersion(row);
+          const version = mrVersion(row, input);
           if (!fits(version, input) || !version.downloadable) continue;
           try {
             if (mrUpdateFile(row, input)) candidates.push(version);
@@ -1483,7 +1536,7 @@ export function createCoreProviders({
             400,
             "The required dependency's release metadata changed while it was being checked. Review the installation again.",
           );
-        const version = mrVersion(value);
+        const version = mrVersion(value, input);
         if (!fits(version, input))
           throw Object.assign(
             launchpadError(
@@ -1493,8 +1546,9 @@ export function createCoreProviders({
             { code: "INCOMPATIBLE_VERSION" },
           );
         if (
-          project.server_side === "unsupported" ||
-          !serverEnvironment(value.environment)
+          input.target !== "automodpack" &&
+          (project.server_side === "unsupported" ||
+            !serverEnvironment(value.environment))
         )
           throw Object.assign(
             launchpadError(
@@ -1506,7 +1560,7 @@ export function createCoreProviders({
         const extension =
           input.type === "modpack"
             ? /\.mrpack$/i
-            : input.type === "datapack"
+            : zipContent(input.type)
               ? /\.zip$/i
               : /\.jar$/i;
         const candidates = value.files.filter((file) =>
@@ -1686,7 +1740,8 @@ export function createCoreProviders({
       },
       compatibleBundledVersion(value, input) {
         return (
-          fits(mrVersion(value), input) && serverEnvironment(value.environment)
+          fits(mrVersion(value, input), input) &&
+          supportsEnvironment(value.environment, input)
         );
       },
       async version(versionId) {
@@ -1711,7 +1766,7 @@ export function createCoreProviders({
     {
       id: "curseforge",
       name: "CurseForge",
-      types: ["mod", "modpack", "datapack", "plugin"],
+      types: ["mod", "modpack", "datapack", "plugin", "resourcepack", "shader"],
       available: true,
       requiresKey: true,
       sortOptions: cfSortOptions,
@@ -1720,11 +1775,11 @@ export function createCoreProviders({
         "mediafilez.forgecdn.net",
         "media.forgecdn.net",
       ],
-      async projectMetadata(ids) {
+      async projectMetadata(ids, input) {
         // A newly configured key should work immediately instead of reusing a
         // cached missing-key failure from a previous installed-files poll.
         if (!(await key())) return { projects: [], warnings: [] };
-        return cfMetadata(ids);
+        return cfMetadata(ids, input);
       },
       async search(input) {
         input.signal?.throwIfAborted();
@@ -1750,12 +1805,13 @@ export function createCoreProviders({
             : "desc",
         });
         const selected = await cfCategoryIds(
-          categoryIds(input.categories),
+          categoryIds(input.categories, input.type),
           input.signal,
+          input.type,
         );
         if (selected.length) query.set("categoryIds", JSON.stringify(selected));
         if (input.gameVersion) query.set("gameVersion", input.gameVersion);
-        if (cfLoaders[input.loader])
+        if (compatibleLoaders(input).length && cfLoaders[input.loader])
           query.set("modLoaderType", String(cfLoaders[input.loader]));
         const result = await curseJson(`/mods/search?${query}`, {
           signal: input.signal,
@@ -1779,7 +1835,7 @@ export function createCoreProviders({
             author: projectAuthors(value),
             authorLinks: normalizeAuthorLinks(value.authors),
             url: iconUrl(value.links?.websiteUrl),
-            ...catalogFields(value, "curseforge"),
+            ...catalogFields(value, "curseforge", input.type),
           })),
           total: Math.min(
             10000,
@@ -1889,7 +1945,7 @@ export function createCoreProviders({
             archive: { ...download, format: "server-zip" },
             warnings: [],
           };
-        const extension = input.type === "datapack" ? /\.zip$/i : /\.jar$/i;
+        const extension = zipContent(input.type) ? /\.zip$/i : /\.jar$/i;
         if (!extension.test(file.fileName))
           throw launchpadError(
             400,
@@ -1909,9 +1965,12 @@ export function createCoreProviders({
               projectId: String(dep.modId),
               type: input.type,
             })),
-          warnings: [
-            "CurseForge does not declare client/server support for individual mods. Check the author's server requirements before installing.",
-          ],
+          warnings:
+            input.type === "mod" && input.target !== "automodpack"
+              ? [
+                  "CurseForge does not declare client/server support for individual mods. Check the author's server requirements before installing.",
+                ]
+              : [],
         };
       },
     },

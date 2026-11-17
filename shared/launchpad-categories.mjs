@@ -67,69 +67,212 @@ export const allModCategories = modCategories.flatMap((row) => [
   row,
   ...(row.children ?? []),
 ]);
-const byId = new Map(allModCategories.map((row) => [row.id, row]));
+// Pack taxonomies come from Modrinth's /v2/tag/category and CurseForge's
+// texture-packs/shaders catalog. Explicit aliases preserve each provider's
+// terminology; unsupported mappings never silently broaden a filter.
+export const resourcePackCategories = [
+  ...["16x", "32x", "64x", "128x", "256x"].map((id) => ({
+    id,
+    label: id,
+    modrinth: [id],
+    curseforge: [id],
+  })),
+  {
+    id: "512x-plus",
+    label: "512x and Higher",
+    modrinth: ["512x+"],
+    curseforge: ["512x and Higher"],
+  },
+  { id: "8x-minus", label: "8x and Lower", modrinth: ["8x-"], curseforge: [] },
+  { id: "48x", label: "48x", modrinth: ["48x"], curseforge: [] },
+  { id: "animated", label: "Animated", curseforge: ["Animated"] },
+  {
+    id: "fonts",
+    label: "Fonts",
+    modrinth: ["fonts"],
+    curseforge: ["Font Packs"],
+  },
+  {
+    id: "modded",
+    label: "Mod Support",
+    modrinth: ["modded"],
+    curseforge: ["Mod Support"],
+  },
+  {
+    id: "realistic",
+    label: "Realistic",
+    modrinth: ["realistic"],
+    curseforge: ["Photo Realistic"],
+  },
+  {
+    id: "vanilla-like",
+    label: "Vanilla-like",
+    modrinth: ["vanilla-like"],
+    curseforge: ["Traditional"],
+  },
+  ...["Medieval", "Miscellaneous", "Modern", "ModJam 2025", "Steampunk"].map(
+    (label) => ({
+      id: label.toLowerCase().replaceAll(" ", "-"),
+      label,
+      curseforge: [label],
+    }),
+  ),
+  ...[
+    ["audio", "Audio"],
+    ["blocks", "Blocks"],
+    ["combat", "Combat"],
+    ["core-shaders", "Core Shaders"],
+    ["cursed", "Cursed"],
+    ["decoration", "Decoration"],
+    ["entities", "Entities"],
+    ["environment", "Environment"],
+    ["equipment", "Equipment"],
+    ["gui", "GUI"],
+    ["items", "Items"],
+    ["locale", "Translations"],
+    ["models", "Models"],
+    ["simplistic", "Simplistic"],
+    ["themed", "Themed"],
+    ["tweaks", "Tweaks"],
+    ["utility", "Utility"],
+  ].map(([id, label]) => ({ id, label, modrinth: [id], curseforge: [] })),
+];
+export const shaderCategories = [
+  {
+    id: "fantasy",
+    label: "Fantasy",
+    modrinth: ["fantasy"],
+    curseforge: ["Fantasy"],
+  },
+  {
+    id: "realistic",
+    label: "Realistic",
+    modrinth: ["realistic"],
+    curseforge: ["Realistic"],
+  },
+  {
+    id: "vanilla-like",
+    label: "Vanilla-like",
+    modrinth: ["vanilla-like"],
+    curseforge: ["Vanilla"],
+  },
+  ...[
+    ["cartoon", "Cartoon"],
+    ["cursed", "Cursed"],
+    ["semi-realistic", "Semi-realistic"],
+    ["atmosphere", "Atmosphere"],
+    ["bloom", "Bloom"],
+    ["colored-lighting", "Colored Lighting"],
+    ["foliage", "Foliage"],
+    ["path-tracing", "Path Tracing"],
+    ["pbr", "PBR"],
+    ["reflections", "Reflections"],
+    ["shadows", "Shadows"],
+    ["potato", "Minimal Performance Impact"],
+    ["low", "Low Performance Impact"],
+    ["medium", "Medium Performance Impact"],
+    ["high", "High Performance Impact"],
+    ["screenshot", "Screenshot Quality"],
+  ].map(([id, label]) => ({ id, label, modrinth: [id], curseforge: [] })),
+];
+export function categoriesFor(type = "mod") {
+  return type === "resourcepack"
+    ? resourcePackCategories
+    : type === "shader"
+      ? shaderCategories
+      : type === "mod"
+        ? modCategories
+        : [];
+}
+export function allCategoriesFor(type = "mod") {
+  return categoriesFor(type).flatMap((row) => [row, ...(row.children ?? [])]);
+}
+const categoryMaps = new Map(
+  ["mod", "resourcepack", "shader"].map((type) => [
+    type,
+    new Map(allCategoriesFor(type).map((row) => [row.id, row])),
+  ]),
+);
+const categoryMap = (type) => categoryMaps.get(type) ?? new Map();
 const normalized = (value) =>
   String(value ?? "")
     .toLowerCase()
     .replace(/[^a-z0-9]/g, "");
 
-export function categoryIds(value) {
+export function categoryIds(value, type = "mod") {
   if (value === undefined || value === "") return [];
   const values = typeof value === "string" ? value.split(",") : value;
   if (
     !Array.isArray(values) ||
     values.length > 10 ||
-    values.some((entry) => typeof entry !== "string" || !byId.has(entry))
+    values.some(
+      (entry) => typeof entry !== "string" || !categoryMap(type).has(entry),
+    )
   )
-    throw new Error("Choose up to 10 valid mod categories.");
+    throw new Error(`Choose up to 10 valid ${type} categories.`);
   return [...new Set(values)].sort();
 }
 
-export function supportsCategory(id, platform) {
-  const row = byId.get(id);
+export function supportsCategory(id, platform, type = "mod") {
+  const row = categoryMap(type).get(id);
   return Boolean(
     row &&
-    (platform === "curseforge" ||
+    ((platform === "curseforge" &&
+      (row.curseforge === undefined || row.curseforge.length)) ||
       (platform === "modrinth" && row.modrinth?.length)),
   );
 }
 
-export function matchesCategories(categories, selected) {
+export function matchesCategories(categories, selected, type = "mod") {
   if (!selected.length) return true;
   const known = new Set(categories ?? []);
   return selected.some(
     (id) =>
       known.has(id) ||
-      byId.get(id)?.children?.some((child) => known.has(child.id)),
+      categoryMap(type)
+        .get(id)
+        ?.children?.some((child) => known.has(child.id)),
   );
 }
 
-export function modrinthCategoryFacets(selected) {
+export function modrinthCategoryFacets(selected, type = "mod") {
   return [
-    ...new Set(selected.flatMap((id) => byId.get(id)?.modrinth ?? [])),
+    ...new Set(
+      selected.flatMap((id) => categoryMap(type).get(id)?.modrinth ?? []),
+    ),
   ].map((name) => `categories:${name}`);
 }
 
-export function normalizeModrinthCategories(values) {
+export function normalizeModrinthCategories(values, type = "mod") {
   if (!Array.isArray(values)) return [];
-  return allModCategories
+  return allCategoriesFor(type)
     .filter((row) => row.modrinth?.some((name) => values.includes(name)))
     .map((row) => row.id);
 }
 
-export function curseforgeCategoryId(value) {
+export function curseforgeCategoryId(value, type = "mod") {
   const name = normalized(value?.name);
   const slug = normalized(value?.slug);
-  return allModCategories.find(
+  return allCategoriesFor(type).find(
     (row) =>
-      normalized(row.label) === name ||
-      normalized(row.id) === slug ||
-      normalized(row.label) === slug,
+      row.curseforge?.some(
+        (alias) => normalized(alias) === name || normalized(alias) === slug,
+      ) ||
+      (row.curseforge === undefined &&
+        (normalized(row.label) === name ||
+          normalized(row.id) === slug ||
+          normalized(row.label) === slug)),
   )?.id;
 }
 
-export function normalizeCurseforgeCategories(values) {
+export function normalizeCurseforgeCategories(values, type = "mod") {
   return Array.isArray(values)
-    ? [...new Set(values.map(curseforgeCategoryId).filter(Boolean))]
+    ? [
+        ...new Set(
+          values
+            .map((value) => curseforgeCategoryId(value, type))
+            .filter(Boolean),
+        ),
+      ]
     : [];
 }

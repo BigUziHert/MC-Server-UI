@@ -182,7 +182,7 @@ function modMetadata(metadata, loader) {
 export async function installedDependencySatisfies(
   parentArchive,
   installedArchive,
-  { loader, signal } = {},
+  { loader, signal, includeClient = false } = {},
 ) {
   signal?.throwIfAborted();
   if (loader !== "forge" && loader !== "neoforge") return false;
@@ -196,7 +196,9 @@ export async function installedDependencySatisfies(
         const model = modMetadata(metadata, loader);
         if (
           !model ||
-          (loader === "forge" && model.value.clientSideOnly === true)
+          (!includeClient &&
+            loader === "forge" &&
+            model.value.clientSideOnly === true)
         )
           unverifiable();
         for (const mod of model.value.mods) {
@@ -221,8 +223,9 @@ export async function installedDependencySatisfies(
         const { value, ids, modern } = model;
         if (!depth) recognized = true;
         if (
-          !serverCompatible ||
-          (loader === "forge" && value.clientSideOnly === true)
+          !includeClient &&
+          (!serverCompatible ||
+            (loader === "forge" && value.clientSideOnly === true))
         ) {
           if (!depth) unverifiable();
           return;
@@ -261,7 +264,11 @@ export async function installedDependencySatisfies(
               if (typeof dependency.mandatory !== "boolean") unverifiable();
               type = dependency.mandatory ? "required" : "optional";
             }
-            if (dependency.side === "CLIENT" || !installed.has(id)) continue;
+            if (
+              (!includeClient && dependency.side === "CLIENT") ||
+              !installed.has(id)
+            )
+              continue;
             // Optional requirements also apply when the dependency is present.
             // Do not prove retention against a declared conflict or warning.
             if (type !== "required" && type !== "optional") unverifiable();

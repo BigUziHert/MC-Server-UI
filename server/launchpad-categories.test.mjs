@@ -2,14 +2,64 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import {
   allModCategories,
+  allCategoriesFor,
   categoryIds,
   matchesCategories,
+  modrinthCategoryFacets,
   modCategories,
   normalizeCurseforgeCategories,
   normalizeModrinthCategories,
   supportsCategory,
 } from "../shared/launchpad-categories.mjs";
 import { createCoreProviders } from "./launchpad-providers.mjs";
+
+test("pack categories preserve provider mappings and stay separate from mod categories", () => {
+  for (const type of ["resourcepack", "shader"]) {
+    const categories = allCategoriesFor(type);
+    assert.equal(
+      categories.length,
+      new Set(categories.map((row) => row.id)).size,
+    );
+    assert.deepEqual(categoryIds("realistic,vanilla-like", type), [
+      "realistic",
+      "vanilla-like",
+    ]);
+    assert.throws(() => categoryIds("technology", type), /valid .* categories/);
+    assert.equal(supportsCategory("vanilla-like", "curseforge", type), true);
+    assert.deepEqual(modrinthCategoryFacets(["vanilla-like"], type), [
+      "categories:vanilla-like",
+    ]);
+    assert.equal(matchesCategories(["realistic"], ["realistic"], type), true);
+  }
+  assert.deepEqual(
+    normalizeCurseforgeCategories(
+      [{ name: "Photo Realistic" }, { name: "Font Packs" }],
+      "resourcepack",
+    ),
+    ["realistic", "fonts"],
+  );
+  assert.deepEqual(
+    normalizeCurseforgeCategories(
+      [{ name: "Vanilla" }, { name: "Fantasy" }],
+      "shader",
+    ),
+    ["vanilla-like", "fantasy"],
+  );
+  assert.deepEqual(normalizeModrinthCategories(["iris", "bloom"], "shader"), [
+    "bloom",
+  ]);
+  assert.deepEqual(
+    normalizeModrinthCategories(["fonts", "512x+"], "resourcepack"),
+    ["512x-plus", "fonts"],
+  );
+  assert.equal(supportsCategory("bloom", "curseforge", "shader"), false);
+  assert.equal(supportsCategory("bloom", "modrinth", "shader"), true);
+  assert.equal(supportsCategory("medieval", "modrinth", "resourcepack"), false);
+  assert.equal(
+    supportsCategory("medieval", "curseforge", "resourcepack"),
+    true,
+  );
+});
 
 test("mod category filters validate canonical IDs and include parent descendants", () => {
   assert.deepEqual(categoryIds("mobs,technology,mobs"), ["mobs", "technology"]);

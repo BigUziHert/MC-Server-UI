@@ -4,7 +4,7 @@ import {
   normalizeAuthorLinks,
   safeProjectUrl,
 } from "../shared/launchpad-project.mjs";
-import { allModCategories } from "../shared/launchpad-categories.mjs";
+import { allCategoriesFor } from "../shared/launchpad-categories.mjs";
 
 const maximumBytes = 4 * 1024 ** 2;
 const maximumEntries = 4000;
@@ -15,7 +15,11 @@ const checksum = (value) =>
   typeof value === "string" && /^[a-f0-9]{128}$/.test(value);
 const plain = (value) =>
   value && typeof value === "object" && !Array.isArray(value);
-const categoryNames = new Set(allModCategories.map((row) => row.id));
+const categoryNames = new Set(
+  ["mod", "resourcepack", "shader"].flatMap((type) =>
+    allCategoriesFor(type).map((row) => row.id),
+  ),
+);
 function displayFields(value) {
   const result = {};
   const authorLinks = normalizeAuthorLinks(value.authorLinks);

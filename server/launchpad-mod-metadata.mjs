@@ -38,7 +38,10 @@ const libraryWrapper = (metadata) => {
  * `required` lists mandatory IDs; `requirements` also records constraints from
  * optional dependencies that apply while a replacement provider is installed.
  */
-export async function inspectInstalledMod(archive, { loader, signal } = {}) {
+export async function inspectInstalledMod(
+  archive,
+  { loader, signal, includeClient = false } = {},
+) {
   const provided = new Set(),
     required = new Set(),
     providers = [],
@@ -91,7 +94,7 @@ export async function inspectInstalledMod(archive, { loader, signal } = {}) {
           invalid();
         const mod = metadata.quilt.quilt_loader;
         if (!depth) recognized = true;
-        if (!serverCompatible) return;
+        if (!serverCompatible && !includeClient) return;
         provide(mod.id, mod.version);
         named(mod.metadata?.name ?? mod.id);
         for (const alias of list(mod.provides))
@@ -106,7 +109,10 @@ export async function inspectInstalledMod(archive, { loader, signal } = {}) {
               dependency(alternative, depth + 1, true);
           } else if (typeof value === "string") require(value);
           else if (object(value)) {
-            if (value.optional === true || value.environment === "client")
+            if (
+              value.optional === true ||
+              (!includeClient && value.environment === "client")
+            )
               return;
             if (
               value.optional !== undefined &&
@@ -129,7 +135,7 @@ export async function inspectInstalledMod(archive, { loader, signal } = {}) {
         const mod = metadata.fabric;
         if (mod.schemaVersion !== 1) invalid();
         if (!depth) recognized = true;
-        if (!serverCompatible) return;
+        if (!serverCompatible && !includeClient) return;
         provide(mod.id, mod.version);
         named(mod.name ?? mod.id);
         for (const alias of list(mod.provides)) provide(alias, mod.version);
@@ -158,11 +164,12 @@ export async function inspectInstalledMod(archive, { loader, signal } = {}) {
           if (mod.clientSideOnly === true) clientOnlyPaths.push(path);
         }
         if (
-          !serverCompatible ||
-          clientOnlyPaths.some(
-            (parent) =>
-              !parent || path === parent || path.startsWith(`${parent}!/`),
-          )
+          !includeClient &&
+          (!serverCompatible ||
+            clientOnlyPaths.some(
+              (parent) =>
+                !parent || path === parent || path.startsWith(`${parent}!/`),
+            ))
         )
           return;
         for (const value of mods) {
@@ -193,7 +200,7 @@ export async function inspectInstalledMod(archive, { loader, signal } = {}) {
               !["CLIENT", "SERVER", "BOTH"].includes(value.side)
             )
               invalid();
-            if (value.side === "CLIENT") continue;
+            if (value.side === "CLIENT" && !includeClient) continue;
             if (loader === "neoforge" && value.type !== undefined) {
               // NeoForge's ModInfo accepts dependency types in any case.
               // Unknown values still fail, rather than hiding real requirements.

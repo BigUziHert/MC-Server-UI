@@ -48,6 +48,7 @@ files:
   - server/text-encoding.mjs
   - server/versions.mjs
   - server/launchpad.mjs
+  - server/launchpad-target.mjs
   - server/launchpad-transaction.mjs
   - server/launchpad-network.mjs
   - server/launchpad-recovery.mjs
