@@ -27,7 +27,7 @@ const numericVersion = (value) => {
 // Maven hard requirements, including qualified mod versions. Bare versions are
 // recommendations and cannot prove a required range.
 // https://maven.apache.org/pom.html#Dependency_Version_Requirement_Specification
-function permittedByRange(version, value) {
+function parseRanges(value) {
   if (typeof value !== "string" || value.length > 4096) unverifiable();
   let remainder = value.trim();
   const ranges = [];
@@ -73,14 +73,20 @@ function permittedByRange(version, value) {
     }
   }
   if (!ranges.length) unverifiable();
-  return ranges.some(({ lower, upper, includeLower, includeUpper }) => {
-    const from = lower ? compare(version, lower) : 1,
-      to = upper ? compare(version, upper) : -1;
-    return (
-      (from > 0 || (from === 0 && includeLower)) &&
-      (to < 0 || (to === 0 && includeUpper))
-    );
-  });
+  return ranges;
+}
+
+function permittedByRange(version, value) {
+  return parseRanges(value).some(
+    ({ lower, upper, includeLower, includeUpper }) => {
+      const from = lower ? compare(version, lower) : 1,
+        to = upper ? compare(version, upper) : -1;
+      return (
+        (from > 0 || (from === 0 && includeLower)) &&
+        (to < 0 || (to === 0 && includeUpper))
+      );
+    },
+  );
 }
 
 // Only the main manifest section supplies file.jarVersion. Folded lines belong
@@ -170,6 +176,111 @@ function modMetadata(metadata, loader) {
     ids.add(id);
   }
   return { value, ids, modern };
+}
+
+// Comparing two releases without a catalog identity is limited to a single
+// mod with only FML, Minecraft and feature requirements. Decline extensions
+// such as conditional mixins and custom language loaders whose requirements
+// this review cannot resolve.
+function standaloneForgeRules(model, metadata, loader) {
+  const { value, ids, modern } = model;
+  const [mod] = value.mods;
+  const onlyKeys = (table, allowed) =>
+    object(table) && Object.keys(table).every((key) => allowed.includes(key));
+  if (
+    ids.size !== 1 ||
+    !["javafml", "lowcodefml"].includes(value.modLoader) ||
+    !onlyKeys(value, [
+      "modLoader",
+      "loaderVersion",
+      "license",
+      "issueTrackerURL",
+      "showAsResourcePack",
+      "showAsDataPack",
+      "clientSideOnly",
+      "mods",
+      "features",
+      "dependencies",
+    ]) ||
+    (value.clientSideOnly !== undefined &&
+      typeof value.clientSideOnly !== "boolean") ||
+    (mod.displayTest !== undefined && typeof mod.displayTest !== "string") ||
+    /^(?:Class-Path|ContainedDeps|FMLCorePlugin|MixinConfigs):|^FMLModType: (?!MOD\s*$)/im.test(
+      metadata.raw.get("META-INF/MANIFEST.MF") ?? "",
+    )
+  )
+    return null;
+  mavenVersion(
+    mod.version === "${file.jarVersion}"
+      ? manifestVersion(metadata.raw.get("META-INF/MANIFEST.MF"))
+      : mod.version,
+  );
+  parseRanges(value.loaderVersion);
+  if (
+    !onlyKeys(value.features ?? {}, [mod.modId]) ||
+    !onlyKeys(value.dependencies ?? {}, [mod.modId])
+  )
+    return null;
+  const features = value.features?.[mod.modId] ?? {};
+  if (!onlyKeys(features, ["javaVersion", "openGLVersion"])) return null;
+  for (const range of Object.values(features)) parseRanges(range);
+  const declarations = value.dependencies?.[mod.modId] ?? [];
+  if (!Array.isArray(declarations) || declarations.length > 2) return null;
+  const dependencies = {};
+  for (const dep of declarations) {
+    if (
+      !object(dep) ||
+      !["minecraft", loader].includes(dep.modId) ||
+      Object.hasOwn(dependencies, dep.modId) ||
+      (modern
+        ? (dep.type ?? "required") !== "required"
+        : dep.mandatory !== true) ||
+      (dep.mandatory !== undefined && dep.mandatory !== true) ||
+      (!modern && dep.type !== undefined) ||
+      !["BOTH", "CLIENT", "SERVER"].includes(dep.side ?? "BOTH") ||
+      !["NONE", "BEFORE", "AFTER"].includes(dep.ordering ?? "NONE")
+    )
+      return null;
+    parseRanges(dep.versionRange);
+    dependencies[dep.modId] = dep;
+  }
+  // Compare the full declarations so additional fields cannot silently differ.
+  const { version, description, displayName, ...modRules } = mod;
+  return {
+    modern,
+    ...value,
+    mods: [modRules],
+    dependencies,
+  };
+}
+
+/** Root mod IDs can detect a collision even when the two releases cannot be
+ * interchanged. Nested mod IDs are never an identity for the outer JAR. */
+export async function inspectForgeDependency(archive, { loader, signal } = {}) {
+  signal?.throwIfAborted();
+  const result = { ids: [], standaloneRules: null };
+  if (loader !== "forge" && loader !== "neoforge") return result;
+  try {
+    await inspectBundledDependencies(archive, {
+      loader,
+      signal,
+      metadataOnly: true,
+      visitMetadata(metadata, { depth }) {
+        if (depth) {
+          result.standaloneRules = null;
+          return;
+        }
+        const model = modMetadata(metadata, loader);
+        if (!model) return;
+        result.ids = [...model.ids];
+        result.standaloneRules = standaloneForgeRules(model, metadata, loader);
+      },
+    });
+  } catch {
+    signal?.throwIfAborted();
+    result.standaloneRules = null;
+  }
+  return result;
 }
 
 /** Prove that a retained Forge/NeoForge JAR satisfies this parent's declared

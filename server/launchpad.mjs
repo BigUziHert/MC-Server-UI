@@ -3,10 +3,14 @@ import { createLaunchpadRecovery } from "./launchpad-transaction.mjs";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { createHash, randomUUID } from "node:crypto";
+import { isDeepStrictEqual } from "node:util";
 import { createCoreProviders } from "./launchpad-providers.mjs";
 import { safeInstallPath, unpackProviderZip } from "./launchpad-archives.mjs";
 import { inspectBundledDependencies } from "./launchpad-bundled.mjs";
-import { installedDependencySatisfies } from "./launchpad-dependency-ranges.mjs";
+import {
+  inspectForgeDependency,
+  installedDependencySatisfies,
+} from "./launchpad-dependency-ranges.mjs";
 import { inspectInstalledMod } from "./launchpad-mod-metadata.mjs";
 import { updatedModDependencyWarnings } from "./launchpad-update-dependencies.mjs";
 import { readAutoModpackSources } from "./launchpad-automodpack-sources.mjs";
@@ -2057,14 +2061,15 @@ export async function createLaunchpad(ctx) {
       visited = new Map(),
       preservedDependencies = new Set(),
       reusedDependencies = new Map();
-    let inspectedParents = 0,
+    let inspectedFiles = 0,
       inspectionBytes = 0;
     let rootResult;
     async function readVerifiedInstalled(existing, artifact, fail) {
+      const sizeLimit = artifact ? artifact.size : existing.size;
       if (
-        !Number.isSafeInteger(artifact.size) ||
-        artifact.size < 0 ||
-        artifact.size > 64 * 1024 ** 2
+        !Number.isSafeInteger(sizeLimit) ||
+        sizeLimit < 0 ||
+        sizeLimit > 64 * 1024 ** 2
       )
         throw fail();
       const handle = await fs.open(
@@ -2074,24 +2079,29 @@ export async function createLaunchpad(ctx) {
       let source;
       try {
         const before = await handle.stat();
-        if (!before.isFile() || before.size !== artifact.size) throw fail();
+        if (!before.isFile() || before.size !== sizeLimit) throw fail();
         const chunks = [];
         let size = 0;
         for await (const chunk of handle.createReadStream({
           autoClose: false,
         })) {
           input.signal?.throwIfAborted();
-          if ((size += chunk.length) > artifact.size) throw fail();
+          if ((size += chunk.length) > sizeLimit) throw fail();
           chunks.push(chunk);
         }
         source = Buffer.concat(chunks);
-        const [algorithm, expectedHash] = strongestHash(artifact.hashes);
+        const [algorithm, expectedHash] = artifact
+          ? strongestHash(artifact.hashes)
+          : ["sha512", existing.sha512];
+        const sha512 = createHash("sha512").update(source).digest("hex");
         if (
           fileStamp(before) !== fileStamp(await handle.stat()) ||
-          source.length !== artifact.size ||
-          createHash("sha512").update(source).digest("hex") !==
-            existing.sha512 ||
-          createHash(algorithm).update(source).digest("hex") !== expectedHash
+          source.length !== sizeLimit ||
+          sha512 !== existing.sha512 ||
+          (algorithm === "sha512"
+            ? sha512
+            : createHash(algorithm).update(source).digest("hex")) !==
+            expectedHash
         )
           throw error(
             409,
@@ -2101,6 +2111,49 @@ export async function createLaunchpad(ctx) {
         await handle.close();
       }
       return source;
+    }
+    async function archiveForCompatibility(file, hosts) {
+      if (
+        !Number.isSafeInteger(file.size) ||
+        file.size < 0 ||
+        file.size > 64 * 1024 ** 2
+      )
+        return null;
+      if (!file.stagedPath) {
+        if (
+          inspectedFiles >= 16 ||
+          inspectionBytes + file.size > 128 * 1024 ** 2
+        )
+          return null;
+        inspectionBytes += file.size;
+        const target = path.join(
+          stage,
+          `compatibility-${++inspectedFiles}.jar`,
+        );
+        await downloadVerified(file, target, hosts, request, {
+          signal: input.signal,
+          curseforgeKey: key,
+        });
+        file.stagedPath = target;
+      }
+      await verifyStaged(file, stage, input.signal);
+      return file.stagedPath;
+    }
+    async function checkParentRange(parentFiles, source, fail) {
+      if (parentFiles?.length !== 1) throw fail();
+      const [parent] = parentFiles;
+      const archive = parent.regularItem
+        ? await readVerifiedInstalled(parent.regularItem, parent, fail)
+        : await archiveForCompatibility(parent, parent.hosts);
+      if (
+        !archive ||
+        !(await installedDependencySatisfies(archive, source, {
+          loader: input.loader,
+          signal: input.signal,
+          includeClient: input.target === "automodpack",
+        }))
+      )
+        throw fail();
     }
     async function preserveInstalled(
       found,
@@ -2143,46 +2196,9 @@ export async function createLaunchpad(ctx) {
         versionId: existing.versionId,
       });
       if (result.archive || result.files?.length !== 1) throw fail();
-      const artifact = result.files[0],
-        parent = parentFiles[0];
-      const limit = 64 * 1024 ** 2;
-      if (
-        ![artifact, parent].every(
-          (file) =>
-            Number.isSafeInteger(file.size) &&
-            file.size >= 0 &&
-            file.size <= limit,
-        )
-      )
-        throw fail();
+      const artifact = result.files[0];
       const source = await readVerifiedInstalled(existing, artifact, fail);
-      if (!parent.stagedPath) {
-        if (
-          ++inspectedParents > 16 ||
-          (inspectionBytes += parent.size) > 128 * 1024 ** 2
-        )
-          throw fail();
-        parent.stagedPath = path.join(
-          stage,
-          `compatibility-${inspectedParents}.jar`,
-        );
-        await downloadVerified(
-          parent,
-          parent.stagedPath,
-          parent.hosts,
-          request,
-          { signal: input.signal, curseforgeKey: key },
-        );
-      }
-      if (
-        !(await verifyStaged(parent, stage, input.signal)) ||
-        !(await installedDependencySatisfies(parent.stagedPath, source, {
-          loader: input.loader,
-          signal: input.signal,
-          includeClient: input.target === "automodpack",
-        }))
-      )
-        throw fail();
+      await checkParentRange(parentFiles, source, fail);
       preservedDependencies.add(dependencyKey);
       value.versionId = existing.versionId;
       // Keep the exact installed path, including locally renamed JARs. It must
@@ -2205,19 +2221,54 @@ export async function createLaunchpad(ctx) {
       )
         return null;
       await shared.load();
-      const candidates = shared.items.filter(
-        (item) =>
-          item.platform === value.platform &&
-          item.projectId === value.projectId,
-      );
+      const artifact =
+        !result.archive && result.files?.length === 1 ? result.files[0] : null;
+      const checksum = artifact && strongestHash(artifact.hashes);
       const matches = (
         await mapReview(
-          candidates,
-          async (item) =>
-            (await shared.includes(item, input.loader)) ? item : null,
+          shared.items,
+          async (item) => {
+            if (item.platform === value.platform) {
+              if (item.projectId !== value.projectId) return null;
+            } else {
+              if (!item.sha512 || !artifact || item.size !== artifact.size)
+                return null;
+              const [algorithm, expected] = checksum;
+              const actual =
+                algorithm === "sha512"
+                  ? item.sha512
+                  : await fileHash(
+                      await safePath(serverDir, item.path),
+                      algorithm,
+                      input.signal,
+                    );
+              if (actual !== expected) return null;
+            }
+            return (await shared.includes(item, input.loader)) ? item : null;
+          },
           input.signal,
         )
       ).filter(Boolean);
+      let catalogMetadata;
+      if (
+        !matches.length &&
+        artifact &&
+        ["forge", "neoforge"].includes(input.loader)
+      ) {
+        const alternatives = await shared.alternatives(value.platform);
+        if (alternatives.length) {
+          const archive = await archiveForCompatibility(
+            artifact,
+            found.downloadHosts,
+          );
+          if (archive) {
+            catalogMetadata = await inspectForgeDependency(archive, input);
+            for (const { item, metadata } of alternatives)
+              if (metadata.ids.some((id) => catalogMetadata.ids.includes(id)))
+                matches.push(item);
+          }
+        }
+      }
       if (!matches.length) return null;
       if (matches.length > 1)
         throw error(
@@ -2230,10 +2281,28 @@ export async function createLaunchpad(ctx) {
           409,
           `${existing.title || existing.path} is already supplied by regular Mods, but its version could not be verified against this dependency. Update it in the Mods tab or adjust AutoModpack's pack rules before reviewing this installation.`,
         );
-      if (result.archive || result.files?.length !== 1) throw fail();
-      if (
-        String(existing.versionId) !== String(value.versionId) ||
-        preservedDependencies.has(project)
+      if (!artifact) throw fail();
+      if (catalogMetadata) {
+        // A release missing from the catalog has no known dependency graph.
+        // Reuse a standalone library only when both JARs declare equivalent
+        // runtime requirements and the parent accepts the actual local version.
+        const source = await readVerifiedInstalled(existing, null, fail);
+        const verified = await inspectForgeDependency(source, input);
+        if (
+          !catalogMetadata.standaloneRules ||
+          result.dependencies?.length ||
+          !isDeepStrictEqual(
+            verified.standaloneRules,
+            catalogMetadata.standaloneRules,
+          )
+        )
+          throw fail();
+        await checkParentRange(parentFiles, source, fail);
+        preservedDependencies.add(project);
+      } else if (
+        existing.platform === value.platform &&
+        (String(existing.versionId) !== String(value.versionId) ||
+          preservedDependencies.has(project))
       ) {
         try {
           result = await preserveInstalled(found, value, parentFiles, [
@@ -2245,13 +2314,15 @@ export async function createLaunchpad(ctx) {
           throw error(409, `${fail().message} ${cause.message}`);
         }
       } else {
-        await readVerifiedInstalled(existing, result.files[0], fail);
+        const source = await readVerifiedInstalled(existing, artifact, fail);
+        if (preservedDependencies.has(project))
+          await checkParentRange(parentFiles, source, fail);
       }
       reusedDependencies.set(existing.path, existing);
       warnings.push(
         `Using ${result.title || value.projectId} from ${existing.path}, already included by AutoModpack.`,
       );
-      return result;
+      return { ...result, regularItem: existing };
     }
     async function visit(
       value,
@@ -2476,7 +2547,9 @@ export async function createLaunchpad(ctx) {
           hosts: found.downloadHosts,
         };
         if (!reused) files.push(planned);
-        nodeFiles.push(planned);
+        nodeFiles.push(
+          reused ? { ...planned, regularItem: result.regularItem } : planned,
+        );
       }
       for (const dependency of result.dependencies ?? [])
         await visit(
@@ -3198,8 +3271,40 @@ export async function createLaunchpad(ctx) {
       let shared;
       if (input.target === "automodpack" && input.type === "mod") {
         let loading;
+        const alternatives = new Map();
         shared = {
           rootKeys: new Set(rootKeys),
+          alternatives(platform) {
+            if (!alternatives.has(platform)) {
+              const candidates = shared.items.filter(
+                (item) => item.platform !== platform && item.sha512,
+              );
+              alternatives.set(
+                platform,
+                mapReview(
+                  candidates,
+                  async (item) => {
+                    try {
+                      const metadata = await inspectForgeDependency(
+                        await safePath(serverDir, item.path),
+                        input,
+                      );
+                      if (
+                        metadata.ids.length &&
+                        (await shared.includes(item, input.loader))
+                      )
+                        return { item, metadata };
+                    } catch {
+                      input.signal.throwIfAborted();
+                    }
+                    return null;
+                  },
+                  input.signal,
+                ).then((rows) => rows.filter(Boolean)),
+              );
+            }
+            return alternatives.get(platform);
+          },
           load: () =>
             (loading ??= (async () => {
               shared.inventorySnapshot = await snapshotInventory(

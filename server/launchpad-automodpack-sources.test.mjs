@@ -93,6 +93,7 @@ test("current HOCON factory syntax handles comments, unquoted brace globs and ca
   const f = await fixture(
     t,
     `# AutoModpack\ngenerate-modpack-on-start: true
+nag-clickable-link: https://example.org:8443/download?pack=main # custom pack URL
 modpack {
   name: "My server"
   "General content" {

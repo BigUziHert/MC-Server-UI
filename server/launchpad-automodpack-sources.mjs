@@ -36,7 +36,7 @@ function parseConfig(source) {
       } else break;
     }
   };
-  const word = () => {
+  const word = (readingKey = false) => {
     space();
     if (++tokens > 8192) unsupported();
     const start = at;
@@ -52,7 +52,10 @@ function parseConfig(source) {
     let braces = 0;
     while (at < source.length) {
       const c = source[at];
-      if (!braces && /[\s\[\],}:=#]/.test(c)) break;
+      if (!braces && /[\s\[\],}#]/.test(c)) break;
+      // Reconf writes bare values such as https://modrinth.com/project/automodpack.
+      // A colon or equals sign separates a key, but can occur inside a value.
+      if ((readingKey || at === start) && (c === ":" || c === "=")) break;
       if (c === "{") {
         if (at === start) break;
         braces++;
@@ -102,7 +105,7 @@ function parseConfig(source) {
         at++;
         return result;
       }
-      const key = word();
+      const key = word(true);
       if (
         typeof key !== "string" ||
         !/^[A-Za-z0-9 _-]+$/.test(key) ||

@@ -33,21 +33,22 @@ const staged = (projectId, versionId = "1", disabled = false) => ({
   path: `${folder}/${projectId}-${versionId}.jar${disabled ? ".disabled" : ""}`,
 });
 
-async function archive(projectId, versionId, dependencies) {
+async function archive(projectId, version, dependencies, modIds = {}) {
+  const modId = modIds[projectId] ?? projectId;
   const zip = new yazl.ZipFile();
   zip.addBuffer(
     Buffer.from(`modLoader="javafml"
 loaderVersion="[1,)"
 license="MIT"
 [[mods]]
-modId="${projectId}"
-version="${versionId}.0.0"
-displayName="${projectId}"
+modId="${modId}"
+version="${version}"
+displayName="${modId}"
 ${dependencies
   .map(
     ({ projectId: dependency, range }) => `
-[[dependencies.${projectId}]]
-modId="${dependency}"
+[[dependencies.${modId}]]
+modId="${modIds[dependency] ?? dependency}"
 type="required"
 versionRange="${range}"
 side="BOTH"
@@ -69,7 +70,7 @@ side="BOTH"
 async function fixture(
   t,
   installed = [],
-  { watutPin = "1", range = "[1,)", graph = {} } = {},
+  { watutPin = "1", range = "[1,)", graph = {}, modIds = {} } = {},
 ) {
   const root = await fs.realpath(
     await fs.mkdtemp(path.join(os.tmpdir(), "mc-automodpack-dependencies-")),
@@ -94,7 +95,12 @@ async function fixture(
   ]))
     for (const versionId of ["1", "2"])
       artifacts.set(`${projectId}:${versionId}`, {
-        bytes: await archive(projectId, versionId, dependencies(projectId)),
+        bytes: await archive(
+          projectId,
+          `${versionId}.0.0`,
+          dependencies(projectId),
+          modIds,
+        ),
         projectId,
         versionId,
         filename: `${projectId}-${versionId}.jar`,
@@ -176,6 +182,11 @@ async function fixture(
     extraProviders: [provider],
     fetch: async (url) => {
       const address = new URL(url);
+      if (address.hostname === "api.modrinth.com") {
+        if (address.pathname === "/v2/version_files") return Response.json({});
+        if (address.pathname.startsWith("/v2/version_file/"))
+          return new Response(null, { status: 404 });
+      }
       const artifact = [...artifacts.values()].find(
         (value) =>
           address.hostname === "cdn.modrinth.com" &&
@@ -233,6 +244,23 @@ test("AutoModpack updates reuse regular WATUT and transitive CoroUtil without ad
     regular("watut"),
     regular("coroutil"),
   ]);
+  await fs.writeFile(
+    path.join(serverDir, "automodpack", "server.conf"),
+    `nag-clickable-link: https://modrinth.com/project/automodpack
+modpack: {
+  name: "Test pack"
+  General: {
+    main: {
+      selection: REQUIRED
+      from-server: [mods/*.jar, kubejs/**, emotes/*]
+      exclude: [**/.*, **/.*/**, "**/*.{tmp,disabled,bak}", kubejs/server_scripts/**]
+      editable: [options.txt, config/**]
+      auto-exclude-server-side-mods: METADATA
+      compatible-platforms: []
+    }
+  }
+}`,
+  );
   const review = await service.previewUpdates({
     ...selection(),
     updates: [
@@ -244,6 +272,10 @@ test("AutoModpack updates reuse regular WATUT and transitive CoroUtil without ad
       },
     ],
   });
+  assert.doesNotMatch(
+    review.warnings.join("\n"),
+    /content rules could not be verified/i,
+  );
   assert.deepEqual(planned(review), [`${folder}/compat-2.jar`]);
   await finish(service, review);
   assert.deepEqual(
@@ -349,6 +381,91 @@ test("a missing transitive dependency is staged while its regular parent is reus
   assert.deepEqual(planned(review), [
     `${folder}/compat-2.jar`,
     `${folder}/coroutil-1.jar`,
+  ]);
+});
+
+test("an exact regular WATUT without a receipt is reused and its missing CoroUtil is staged", async (t) => {
+  const { service, serverDir, artifacts } = await fixture(t);
+  const mods = path.join(serverDir, "mods");
+  await fs.mkdir(mods);
+  const bytes = artifacts.get("watut:1").bytes;
+  await fs.writeFile(path.join(mods, "renamed.jar"), bytes);
+  const review = await service.preview(selection());
+  assert.deepEqual(planned(review), [
+    `${folder}/compat-2.jar`,
+    `${folder}/coroutil-1.jar`,
+  ]);
+  await finish(service, review);
+  assert.deepEqual(await fs.readFile(path.join(mods, "renamed.jar")), bytes);
+});
+
+async function unlistedDependency(t, modId = "coroutil", version = "1.3.9") {
+  const state = await fixture(t, [staged("compat"), regular("watut")], {
+    graph: {
+      watut: [{ projectId: "x8LW9rQ2", versionId: "1", range: "[1,2)" }],
+      x8LW9rQ2: [],
+    },
+    modIds: { x8LW9rQ2: "coroutil" },
+  });
+  // The provider's project ID, archive filename and loader mod ID are independent.
+  const local = path.join(state.serverDir, "mods", "coroutil-local.jar");
+  const bytes = await archive(modId, version, []);
+  await fs.writeFile(local, bytes);
+  const preview = () =>
+    state.service.preview(
+      selection("compat", "2", { replacePath: staged("compat").path }),
+    );
+  return { ...state, local, bytes, preview };
+}
+
+test("a manually installed CoroUtil 1.3.9 satisfies WATUT's NeoForge range during an AutoModpack update", async (t) => {
+  const { service, serverDir, local, bytes, preview } =
+    await unlistedDependency(t);
+  const review = await preview();
+  assert.deepEqual(planned(review), [`${folder}/compat-2.jar`]);
+  await finish(service, review);
+  assert.deepEqual(await fs.readdir(path.join(serverDir, folder)), [
+    "compat-2.jar",
+  ]);
+  assert.deepEqual(await fs.readFile(local), bytes);
+});
+
+test("changing a reused unlisted CoroUtil after review blocks the update", async (t) => {
+  const { service, serverDir, local, preview } = await unlistedDependency(t);
+  const review = await preview();
+  assert.deepEqual(planned(review), [`${folder}/compat-2.jar`]);
+  await fs.appendFile(local, "changed");
+  const job = await finish(service, review, "failed");
+  assert.match(job.error, /changed|review/i);
+  assert.deepEqual(await fs.readdir(path.join(serverDir, folder)), [
+    "compat-1.jar",
+  ]);
+});
+
+test("an unlisted CoroUtil outside WATUT's declared range blocks a duplicate", async (t) => {
+  const { preview } = await unlistedDependency(t, "coroutil", "2.0.0");
+  await assert.rejects(preview(), (cause) => cause.status === 409);
+});
+
+test("an unlisted CoroUtil with an additional required mod blocks the update", async (t) => {
+  const { local, preview } = await unlistedDependency(t);
+  await fs.writeFile(
+    local,
+    await archive("coroutil", "1.3.9", [
+      { projectId: "extra_library", range: "[1,)" },
+    ]),
+  );
+  await assert.rejects(
+    preview(),
+    (cause) => cause.status === 409 && /regular Mods/i.test(cause.message),
+  );
+});
+
+test("a regular JAR named CoroUtil with an unrelated mod ID leaves the real dependency in the plan", async (t) => {
+  const { preview } = await unlistedDependency(t, "other_library");
+  assert.deepEqual(planned(await preview()), [
+    `${folder}/compat-2.jar`,
+    `${folder}/x8LW9rQ2-1.jar`,
   ]);
 });
 
