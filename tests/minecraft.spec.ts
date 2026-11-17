@@ -1396,7 +1396,7 @@ test("Versions offers older stable Fabric loaders and requires opting in to expe
   await dialog.getByRole("button", { name: "Cancel", exact: true }).click();
   await expect(dialog).not.toBeVisible();
 });
-test("Launchpad exposes six platforms, only four content tabs, and a reviewed installed-mod update", async ({
+test("Launchpad exposes six platforms, five content tabs, and a reviewed installed-mod update", async ({
   page,
   serverId,
 }, testInfo) => {
@@ -1518,6 +1518,7 @@ test("Launchpad exposes six platforms, only four content tabs, and a reviewed in
     "Mods",
     "Datapacks",
     "Plugins",
+    "AutoModpack",
   ]);
   await page.getByRole("tab", { name: "Mods", exact: true }).click();
   await page.getByRole("switch", { name: "Show installed content" }).check();
