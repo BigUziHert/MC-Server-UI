@@ -442,7 +442,7 @@ test(
       if (args[0] !== filename) return handle;
       sourceHandle = handle;
       return {
-        stat: () => handle.stat(),
+        stat: (...options) => handle.stat(...options),
         close: () => handle.close(),
         createReadStream: (options) => {
           source = handle.createReadStream(options);
@@ -530,6 +530,56 @@ test("ZIP streaming rejects a replaced file after planning before opening its co
     assert.equal(contentOpens, 0);
     assert.equal(destination.destroyed, true);
   } finally {
+    mockedOpen.mock.restore();
+  }
+});
+
+test("ZIP streaming rejects distinct file IDs that round to the same Number with retained creation times", async (t) => {
+  const { root, serverDir } = await fixture(t);
+  const directory = path.join(serverDir, "folder");
+  await fs.mkdir(directory);
+  const filename = path.join(directory, "content.bin");
+  await fs.writeFile(filename, "original content");
+  const beforeId = 9007199254740992n,
+    afterId = beforeId + 1n;
+  assert.equal(Number(beforeId), Number(afterId));
+  const creationNs = 1730000000000000000n;
+  let replaced = false,
+    contentOpens = 0;
+  const originalStat = fs.lstat,
+    originalOpen = fs.open;
+  const mockedStat = t.mock.method(fs, "lstat", async (...args) => {
+    const stat = await originalStat(...args);
+    if (args[0] === filename) {
+      const exact = args[1]?.bigint === true;
+      const id = replaced ? afterId : beforeId;
+      stat.ino = exact ? id : Number(id);
+      stat.birthtimeMs = exact
+        ? creationNs / 1000000n
+        : Number(creationNs) / 1000000;
+      if (exact) stat.birthtimeNs = creationNs;
+    }
+    return stat;
+  });
+  const mockedOpen = t.mock.method(fs, "open", (...args) => {
+    if (args[0] === filename) contentOpens++;
+    return originalOpen(...args);
+  });
+  const destination = new Writable({
+    write(_chunk, _encoding, done) {
+      done();
+    },
+  });
+  try {
+    const plan = await planFileDownload(serverDir, ["folder"], { safePath });
+    await fs.rename(filename, path.join(root, "original.bin"));
+    await fs.writeFile(filename, "replaced content");
+    replaced = true;
+    await assert.rejects(streamFileArchive(plan, destination), { status: 409 });
+    assert.equal(contentOpens, 0);
+    assert.equal(destination.destroyed, true);
+  } finally {
+    mockedStat.mock.restore();
     mockedOpen.mock.restore();
   }
 });

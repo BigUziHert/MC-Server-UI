@@ -9,7 +9,10 @@ const failure = (status, message) =>
 const canonical = (value) =>
   process.platform === "win32" ? value.toLowerCase() : value;
 const sameFile = (a, b) =>
-  a.dev === b.dev && a.ino === b.ino && a.birthtimeMs === b.birthtimeMs;
+  a.dev === b.dev && a.ino === b.ino && a.birthtimeNs === b.birthtimeNs;
+// Windows file IDs can exceed Number's exact range, and replacing a filename
+// can retain its creation time through NTFS tunneling. Keep identities exact.
+const identityStat = (target) => fs.lstat(target, { bigint: true });
 const inside = (parent, child) => {
   const relative = path.relative(parent, child);
   return (
@@ -54,14 +57,14 @@ export async function planFileDownload(root, requested, { safePath, signal }) {
   )
     throw failure(400, "Choose files or folders to download.");
   root = await fs.realpath(root);
-  const rootStat = await fs.lstat(root);
+  const rootStat = await identityStat(root);
   const selected = new Map();
   for (let offset = 0; offset < paths.length; offset += SCAN_CONCURRENCY) {
     const outcomes = await Promise.allSettled(
       paths.slice(offset, offset + SCAN_CONCURRENCY).map(async (relative) => {
         signal?.throwIfAborted();
         const target = await safePath(root, relative);
-        const stat = await fs.lstat(target);
+        const stat = await identityStat(target);
         if (stat.isSymbolicLink() || (!stat.isDirectory() && !stat.isFile()))
           throw failure(400, "Choose regular files or folders to download.");
         return { target, stat };
@@ -90,8 +93,8 @@ export async function planFileDownload(root, requested, { safePath, signal }) {
     while (!inside(parent, entry.target)) parent = path.dirname(parent);
   const checked = async (target, previous) => {
     signal?.throwIfAborted();
-    const currentRoot = await fs.lstat(root);
-    const stat = await fs.lstat(target);
+    const currentRoot = await identityStat(root);
+    const stat = await identityStat(target);
     if (
       currentRoot.isSymbolicLink() ||
       !sameFile(rootStat, currentRoot) ||
@@ -106,7 +109,7 @@ export async function planFileDownload(root, requested, { safePath, signal }) {
   const pending = [...roots];
   const scan = async ({ target, stat }) => {
     signal?.throwIfAborted();
-    stat ??= await fs.lstat(target);
+    stat ??= await identityStat(target);
     // Links and devices are also hidden from the File Manager listing.
     if (stat.isSymbolicLink() || (!stat.isFile() && !stat.isDirectory()))
       return;
@@ -162,15 +165,23 @@ export async function streamFileArchive(plan, destination, { signal } = {}) {
     for (const entry of plan.entries) {
       const { target, stat, name } = entry;
       if (stat.isDirectory()) {
-        zip.addEmptyDirectory(name, { mtime: stat.mtime, mode: stat.mode });
+        zip.addEmptyDirectory(name, {
+          mtime: stat.mtime,
+          mode: Number(stat.mode),
+        });
         continue;
       }
+      // ZIP/stream APIs require numbers; only display metadata crosses this
+      // boundary. File identity and the opened-file size check stay exact.
+      const size = Number(stat.size);
+      if (!Number.isSafeInteger(size) || size < 0)
+        throw failure(400, "A selected file is too large for a ZIP download.");
       zip.addReadStreamLazy(
         name,
         {
           mtime: stat.mtime,
-          mode: stat.mode,
-          size: stat.size,
+          mode: Number(stat.mode),
+          size,
           compressionLevel: STORED_EXTENSIONS.has(
             path.extname(name).toLowerCase(),
           )
@@ -187,7 +198,7 @@ export async function streamFileArchive(plan, destination, { signal } = {}) {
                 target,
                 constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0),
               );
-              const opened = await handle.stat();
+              const opened = await handle.stat({ bigint: true });
               await plan.checked(target, opened);
               if (
                 !opened.isFile() ||
@@ -199,7 +210,7 @@ export async function streamFileArchive(plan, destination, { signal } = {}) {
               const source = handle.createReadStream({
                 autoClose: true,
                 highWaterMark: 256 * 1024,
-                ...(stat.size ? { end: stat.size - 1 } : {}),
+                ...(size ? { end: size - 1 } : {}),
                 signal,
               });
               handle = undefined; // The stream now owns the descriptor.
