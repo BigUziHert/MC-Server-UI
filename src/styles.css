@@ -1130,6 +1130,29 @@ input:disabled {
   border-color: #9a5b4e;
   color: #ffd8cc;
 }
+.toast:has(> .dismiss-countdown) {
+  overflow: hidden;
+}
+.dismiss-countdown {
+  position: absolute;
+  inset: auto 0 0;
+  height: 3px;
+  background: var(--accent);
+  pointer-events: none;
+  transform-origin: left;
+  animation: dismiss-countdown linear forwards;
+}
+.toast.error .dismiss-countdown {
+  background: currentColor;
+}
+@keyframes dismiss-countdown {
+  from {
+    transform: scaleX(1);
+  }
+  to {
+    transform: scaleX(0);
+  }
+}
 .toast button {
   background: none;
   padding: 2px;

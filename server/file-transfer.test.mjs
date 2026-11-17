@@ -317,6 +317,115 @@ test("native copy preserves nested files, empty folders, source bytes and modifi
   );
 });
 
+test("pasting into AutoModpack copies missing files and skips identical files on repeated paste", async (t) => {
+  const f = await fixture(t);
+  const destinationPath = "automodpack/host-modpack/main/mods";
+  const destination = path.join(f.sourceDir, destinationPath);
+  await fs.mkdir(destination, { recursive: true });
+  const names = ["already-a.jar", "already-b.jar", "new.jar"];
+  for (const name of names)
+    await fs.writeFile(path.join(f.sourceDir, name), name);
+  const timestamp = new Date("2020-01-02T00:00:00Z");
+  for (const name of names.slice(0, 2)) {
+    const existing = path.join(destination, name);
+    await fs.writeFile(existing, name);
+    await fs.utimes(existing, timestamp, timestamp);
+  }
+  const options = { serverDir: f.sourceDir, destinationPath, paths: names };
+  const events = [];
+  assert.deepEqual(
+    await f.copy({ ...options, onProgress: (event) => events.push(event) }),
+    {
+      copiedFiles: 1,
+      copiedDirectories: 0,
+      skippedFiles: 2,
+      paths: [destinationPath + "/new.jar"],
+    },
+  );
+  assert.equal(events.at(-1).filesProcessed, 3);
+  assert.equal(events.at(-1).bytesProcessed, events.at(-1).totalBytes);
+  assert.deepEqual(await f.copy(options), {
+    copiedFiles: 0,
+    copiedDirectories: 0,
+    skippedFiles: 3,
+    paths: [],
+  });
+  for (const name of names.slice(0, 2))
+    assert.equal(
+      (await fs.stat(path.join(destination, name))).mtimeMs,
+      timestamp.getTime(),
+    );
+});
+
+test("copy merges matching folder trees and checks every nested conflict before publishing", async (t) => {
+  const f = await fixture(t);
+  for (const directory of [f.sourceDir, f.serverDir]) {
+    await fs.mkdir(path.join(directory, "packs/sub"), { recursive: true });
+    await fs.writeFile(path.join(directory, "packs/sub/old.zip"), "AA");
+  }
+  const oldTarget = path.join(f.serverDir, "packs/sub/old.zip");
+  const newTarget = path.join(f.serverDir, "packs/new.zip");
+  await fs.writeFile(path.join(f.sourceDir, "packs/new.zip"), "new");
+  await fs.writeFile(oldTarget, "BB");
+  await assert.rejects(f.copy({ paths: ["packs"] }), { status: 409 });
+  await missing(newTarget);
+  assert.equal(await fs.readFile(oldTarget, "utf8"), "BB");
+  await fs.writeFile(oldTarget, "AA");
+  await fs.writeFile(path.join(f.serverDir, "packs/extra.zip"), "kept");
+  const dirTimestamp = new Date("2021-01-02T00:00:00Z");
+  const existingSub = path.join(f.serverDir, "packs/sub");
+  await fs.utimes(existingSub, dirTimestamp, dirTimestamp);
+  assert.deepEqual(await f.copy({ paths: ["packs"] }), {
+    copiedFiles: 1,
+    copiedDirectories: 0,
+    skippedFiles: 1,
+    paths: ["packs"],
+  });
+  assert.equal((await fs.stat(existingSub)).mtimeMs, dirTimestamp.getTime());
+  assert.equal(
+    await fs.readFile(path.join(f.serverDir, "packs/extra.zip"), "utf8"),
+    "kept",
+  );
+});
+
+test("copying a file back into its current folder counts as an identical skip", async (t) => {
+  const f = await fixture(t);
+  await fs.writeFile(path.join(f.sourceDir, "same.zip"), "zip bytes");
+  const options = { serverDir: f.sourceDir, paths: ["same.zip"] };
+  assert.deepEqual(await f.copy(options), {
+    copiedFiles: 0,
+    copiedDirectories: 0,
+    skippedFiles: 1,
+    paths: [],
+  });
+  await assert.rejects(f.copy({ ...options, mode: "move" }), /itself/);
+  assert.equal(
+    await fs.readFile(path.join(f.sourceDir, "same.zip"), "utf8"),
+    "zip bytes",
+  );
+});
+
+test("concurrent identical publication counts as skipped, changed preflight bytes still conflict", async (t) => {
+  const f = await fixture(t);
+  await fs.writeFile(path.join(f.sourceDir, "copy.bin"), "source");
+  const out = path.join(f.serverDir, "copy.bin");
+  let bytes = "source";
+  const options = {
+    paths: ["copy.bin"],
+    fileSystem: {
+      ...fs,
+      open: async (target, flags, ...args) => {
+        if (target === out && flags === "wx") await fs.writeFile(out, bytes);
+        return fs.open(target, flags, ...args);
+      },
+    },
+  };
+  assert.equal((await f.copy(options)).skippedFiles, 1);
+  bytes = "edited";
+  await assert.rejects(f.copy(options), { status: 409 });
+  assert.equal(await fs.readFile(out, "utf8"), bytes);
+});
+
 test("same-server cut preserves nested contents, empty folders and file identity", async (t) => {
   const f = await fixture(t);
   await fs.mkdir(path.join(f.sourceDir, "pack", "empty"), { recursive: true });
@@ -659,7 +768,7 @@ test("cut rollback preserves destination replacements and reports retained recov
   }
 });
 
-test("same-server copy rejects its source and descendants, duplicates and existing destinations before writing", async (t) => {
+test("same-server copy rejects its source and descendants, unsafe names and file/folder collisions before writing", async (t) => {
   const f = await fixture(t);
   await fs.mkdir(path.join(f.sourceDir, "mods", "nested"), { recursive: true });
   await fs.writeFile(path.join(f.sourceDir, "mods", "proof"), "original");
@@ -668,9 +777,12 @@ test("same-server copy rejects its source and descendants, duplicates and existi
       f.copy({ serverDir: f.sourceDir, paths: ["mods"], destinationPath }),
       { status: 409 },
     );
-  await fs.mkdir(path.join(f.serverDir, "mods"));
+  await fs.writeFile(path.join(f.serverDir, "mods"), "existing file");
   await assert.rejects(f.copy({ paths: ["mods"] }), { status: 409 });
-  assert.deepEqual(await fs.readdir(path.join(f.serverDir, "mods")), []);
+  assert.equal(
+    await fs.readFile(path.join(f.serverDir, "mods"), "utf8"),
+    "existing file",
+  );
   for (const paths of [
     ["../outside"],
     ["/outside"],
@@ -907,7 +1019,107 @@ test("file rename preserves nested file contents and supports case-only changes"
   }
 });
 
-test("file rename rejects invalid names, directories and occupied destinations including hard links", async (t) => {
+test("folder rename preserves nested files and empty folders across name and case changes", async (t) => {
+  const f = await apiFixture(t);
+  try {
+    const pack = path.join(f.fleet.runtimes.get(f.first).serverDir, "pack");
+    const nested = path.join(pack, "client.mods", "nested");
+    const bytes = Buffer.from([0x50, 0x4b, 0, 0xff]);
+    await fs.mkdir(path.join(nested, "empty"), { recursive: true });
+    await fs.writeFile(path.join(nested, "mod.jar"), bytes);
+    const original = await fs.stat(path.dirname(nested));
+    const listing = await f.request("/api/files?path=pack", {}, f.first);
+    assert.equal(listing.body.supportsFolderRename, true);
+    for (const [source, name] of [
+      ["client.mods", "mods"],
+      ["mods", "Mods"],
+      ["Mods", "Mods"],
+    ]) {
+      const response = await f.request(
+        "/api/files/rename",
+        json({ path: `pack/${source}`, name, type: "directory" }),
+        f.first,
+      );
+      assert.equal(response.status, 200, JSON.stringify(response.body));
+      assert.equal(response.body.path, `pack/${name}`);
+      assert.deepEqual(await fs.readdir(pack), [name]);
+      assert.equal((await fs.stat(path.join(pack, name))).ino, original.ino);
+      const contents = path.join(pack, name, "nested");
+      assert.deepEqual(await fs.readdir(path.join(contents, "empty")), []);
+      assert.deepEqual(
+        await fs.readFile(path.join(contents, "mod.jar")),
+        bytes,
+      );
+    }
+    const empty = await f.request(
+      "/api/files/rename",
+      json({
+        path: "pack/Mods/nested/empty",
+        name: "vacant",
+        type: "directory",
+      }),
+      f.first,
+    );
+    assert.equal(empty.status, 200, JSON.stringify(empty.body));
+    assert.equal(empty.body.path, "pack/Mods/nested/vacant");
+    assert.deepEqual(
+      (await fs.readdir(path.join(pack, "Mods", "nested"))).sort(),
+      ["mod.jar", "vacant"],
+    );
+  } finally {
+    await f.close();
+  }
+});
+
+test("folder rename refuses existing files and folders, invalid names and linked paths", async (t) => {
+  const f = await apiFixture(t);
+  try {
+    const pack = path.join(f.fleet.runtimes.get(f.first).serverDir, "pack");
+    const outside = path.join(f.root, "outside");
+    const sourceFile = path.join(pack, "source", "first.jar");
+    const occupiedFile = path.join(pack, "occupied", "second.jar");
+    await fs.mkdir(path.join(outside, "safe"), { recursive: true });
+    await fs.mkdir(path.join(pack, "source"), { recursive: true });
+    await fs.writeFile(sourceFile, "source bytes");
+    await fs.mkdir(path.join(pack, "empty"));
+    await fs.mkdir(path.join(pack, "occupied"));
+    await fs.writeFile(occupiedFile, "other bytes");
+    await fs.writeFile(path.join(pack, "existing.jar"), "existing bytes");
+    await fs.symlink(
+      outside,
+      path.join(pack, "linked"),
+      process.platform === "win32" ? "junction" : "dir",
+    );
+    const rename = (source, name, type = "directory") =>
+      f.request(
+        "/api/files/rename",
+        json({ path: `pack/${source}`, name, type }),
+        f.first,
+      );
+    for (const name of ["empty", "occupied", "existing.jar"])
+      assert.equal((await rename("source", name)).status, 409, name);
+    assert.equal((await rename("source", "../moved")).status, 400);
+    assert.equal((await rename("existing.jar", "moved")).status, 409);
+    assert.equal((await rename("source", "moved", "file")).status, 409);
+    assert.equal((await rename("linked", "moved")).status, 400);
+    assert.equal((await rename("linked/safe", "moved")).status, 400);
+    assert.deepEqual(await fs.readdir(path.join(pack, "empty")), []);
+    assert.deepEqual(await fs.readdir(path.join(pack, "occupied")), [
+      "second.jar",
+    ]);
+    assert.equal(await fs.readFile(sourceFile, "utf8"), "source bytes");
+    assert.equal(await fs.readFile(occupiedFile, "utf8"), "other bytes");
+    assert.equal(
+      await fs.readFile(path.join(pack, "existing.jar"), "utf8"),
+      "existing bytes",
+    );
+    assert.deepEqual(await fs.readdir(outside), ["safe"]);
+  } finally {
+    await f.close();
+  }
+});
+
+test("legacy file rename rejects directories, invalid names and occupied destinations including hard links", async (t) => {
   const f = await apiFixture(t);
   try {
     const dir = path.join(f.fleet.runtimes.get(f.first).serverDir, "pack");
@@ -924,7 +1136,7 @@ test("file rename rejects invalid names, directories and occupied destinations i
     for (const name of ["../escape.jar", "child/name.jar", "CON", ""]) {
       assert.equal((await rename("first.jar", name)).status, 400, name);
     }
-    assert.equal((await rename("folder", "new-folder")).status, 400);
+    assert.equal((await rename("folder", "new-folder")).status, 409);
     for (const name of ["second.jar", "alias.jar", "folder"]) {
       assert.equal((await rename("first.jar", name)).status, 409, name);
     }

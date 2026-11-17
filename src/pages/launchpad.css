@@ -279,9 +279,12 @@
   background: var(--panel);
 }
 .launchpad-installed-list.has-active {
-  --installed-columns: minmax(280px, 1fr) 104px minmax(120px, 0.35fr) 60px 80px
-    130px 130px;
+  --installed-columns: minmax(280px, 1fr) var(--launchpad-action-width, 104px)
+    minmax(120px, 0.35fr) 60px 80px 130px 130px;
   --installed-areas: "name action author active remove added modified";
+}
+.launchpad-installed-list:has(.launchpad-manage-pack) {
+  --launchpad-action-width: 190px;
 }
 .launchpad-installed-list:focus-visible {
   outline: 2px solid var(--accent);
@@ -299,7 +302,7 @@
 }
 .launchpad-installed-list.has-active .launchpad-installed-header,
 .launchpad-installed-list.has-active .launchpad-installed-row {
-  min-width: 1036px;
+  min-width: calc(932px + var(--launchpad-action-width, 104px));
 }
 .launchpad-installed-header {
   background: #292a35;
@@ -656,6 +659,7 @@
   line-height: 1.7;
 }
 .launchpad-job {
+  position: relative;
   padding: 18px 20px;
   display: grid;
   gap: 12px;

@@ -1,10 +1,14 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs/promises";
+import { createWriteStream } from "node:fs";
+import { Readable } from "node:stream";
+import { pipeline } from "node:stream/promises";
 import path from "node:path";
 import os from "node:os";
 import { createHash } from "node:crypto";
 import { crc32, deflateRawSync } from "node:zlib";
+import yazl from "yazl";
 import {
   createLaunchpad,
   curseFingerprint,
@@ -947,17 +951,18 @@ test("unknown unchanged JAR fingerprints survive negative identification cache e
     },
   });
   await f.service.settings({ curseforgeApiKey: "fixture" });
-  const readFile = fs.readFile;
-  let reads = 0;
-  t.mock.method(fs, "readFile", (...args) => {
-    if (String(args[0]) === path.join(f.serverDir, "mods", "old.jar")) reads++;
-    return readFile(...args);
+  const open = fs.open;
+  let opens = 0;
+  t.mock.method(fs, "open", (...args) => {
+    if (String(args[0]) === path.join(f.serverDir, "mods", "old.jar")) opens++;
+    return open(...args);
   });
   await f.service.installed(selection);
-  assert.equal(reads, 1);
+  assert.ok(opens >= 2, "the cold scan hashes and fingerprints the JAR");
+  const initialOpens = opens;
   now += 60_001;
   await f.service.installed(selection);
-  assert.equal(reads, 1);
+  assert.equal(opens, initialOpens, "an unchanged file reuses its fingerprint");
   assert.equal(
     f.requests.filter(
       ({ url }) => new URL(url).pathname === "/v1/fingerprints/432",
@@ -5161,138 +5166,436 @@ test("CurseForge packs require author server packs and honor restricted download
   );
 });
 
-test("checksum-verified catalog aliases recognize the installed mod and replace its old file across platforms", async (t) => {
-  const project = { id: 11, gameId: 432, classId: 6, name: "Cross-listed mod" };
-  let correctSha1 = false;
+test("AutoModpack catalog browsing identifies staged files and aliases without checking updates", async (t) => {
+  const f = await fixture(t, {
+    request: (url, init) => {
+      if (new URL(url).pathname !== "/v1/fingerprints/432") return;
+      const fingerprint = curseFingerprint(f.old);
+      return Response.json({
+        data: {
+          exactMatches: JSON.parse(init.body).fingerprints.includes(fingerprint)
+            ? [
+                {
+                  id: 11,
+                  file: {
+                    id: 21,
+                    modId: 11,
+                    fileFingerprint: fingerprint,
+                    hashes: [{ algo: 1, value: hashes(f.old).sha1 }],
+                  },
+                },
+              ]
+            : [],
+        },
+      });
+    },
+  });
+  await f.service.settings({ curseforgeApiKey: "fixture-key" });
+  const folder = "automodpack/host-modpack/main/mods";
+  const dir = path.join(f.serverDir, folder);
+  await fs.mkdir(dir, { recursive: true });
+  await fs.writeFile(path.join(dir, "renamed.jar.disabled"), f.old);
+  const official = zip([["example.class", "verified mod bytes"]]);
+  const staged = Buffer.from(official);
+  staged.writeUInt16LE(1234, 10);
+  staged.writeUInt16LE(
+    1234,
+    staged.indexOf(Buffer.from([0x50, 0x4b, 0x01, 0x02])) + 12,
+  );
+  Object.assign(f.versions.new.files[0], {
+    hashes: hashes(official),
+    size: official.length,
+  });
+  f.downloads.set(f.versions.new.files[0].url, official);
+  await fs.writeFile(path.join(dir, "new.jar"), staged);
+
+  const input = { ...selection, target: "automodpack", identityOnly: "true" };
+  const { items } = await f.service.installed(input);
+  assert.equal(items.length, 2);
+  const disabled = items.find(
+    (item) => item.path === `${folder}/renamed.jar.disabled`,
+  );
+  assert.equal(disabled.active, false);
+  assert.equal(disabled.projectId, "project");
+  assert.deepEqual(disabled.catalogAliases, [
+    { platform: "curseforge", projectId: "11", versionId: "21" },
+  ]);
+  const repacked = items.find((item) => item.path === `${folder}/new.jar`);
+  assert.equal(repacked.projectId, "project");
+  assert.equal(repacked.versionId, "new");
+  assert.equal(repacked.canonicalSha512, hashes(official).sha512);
+  assert.deepEqual(repacked.duplicates, [disabled.path]);
+  const called = (pathname) =>
+    f.requests.some(({ url }) => new URL(url).pathname === pathname);
+  for (const pathname of [
+    "/v2/version_files/update",
+    "/v2/projects",
+    "/v2/teams",
+  ])
+    assert.equal(called(pathname), false, pathname);
+  assert.deepEqual(await fs.readFile(path.join(dir, "new.jar")), staged);
+  assert.equal(f.mutations, 0);
+
+  const full = await f.service.installed({ ...input, identityOnly: "false" });
+  assert.equal(
+    full.items.find((item) => item.path === disabled.path).update.id,
+    "new",
+  );
+  assert.ok(called("/v2/version_files/update"));
+  assert.ok(called("/v2/projects"));
+  await fs.writeFile(path.join(dir, "renamed.jar.disabled"), "different JAR");
+  const changed = (await f.service.installed(input)).items.find(
+    (item) => item.path === disabled.path,
+  );
+  assert.equal(changed.platform, null);
+  assert.equal(changed.catalogAliases, undefined);
+});
+
+for (const [type, folder, classId, slug, loader] of [
+  ["mod", "mods", 6, "mc-mods", "neoforge"],
+  [
+    "resourcepack",
+    "automodpack/host-modpack/main/resourcepacks",
+    12,
+    "texture-packs",
+    "",
+  ],
+  [
+    "shader",
+    "automodpack/host-modpack/main/shaderpacks",
+    6552,
+    "shaders",
+    "iris",
+  ],
+  ["datapack", "Survival/datapacks", 6945, "data-packs", "datapack"],
+  ["plugin", "plugins", 5, "bukkit-plugins", "paper"],
+])
+  test(`checksum-verified catalog aliases recognize the installed ${type} and replace its old file across platforms`, async (t) => {
+    const target = folder.startsWith("automodpack/") ? "automodpack" : "server";
+    const extension = ["mod", "plugin"].includes(type) ? "jar" : "zip";
+    const disabled = target === "automodpack" ? ".disabled" : "";
+    const previous = `${folder}/renamed.${extension}${disabled}`;
+    const newName = `forge-new.${extension}${disabled}`;
+    const input = { ...selection, type, loader, target };
+    const project = {
+      id: 11,
+      gameId: 432,
+      classId,
+      name: "Cross-listed project",
+    };
+    let correctSha1 = false;
+    const f = await fixture(t, {
+      type,
+      request: async (url, init) => {
+        const { pathname } = new URL(url);
+        if (pathname === "/v2/version_files") {
+          const versions = [f.versions.old, f.versions.new];
+          const requested = JSON.parse(init.body).hashes;
+          return Response.json(
+            Object.fromEntries(
+              versions
+                .filter((version) =>
+                  requested.includes(version.files[0].hashes.sha512),
+                )
+                .map((version) => [version.files[0].hashes.sha512, version]),
+            ),
+          );
+        }
+        if (pathname === "/v1/categories")
+          return Response.json({
+            data: [{ id: classId, slug, name: type }],
+          });
+        if (pathname === "/v1/mods") return Response.json({ data: [project] });
+        if (pathname === "/v1/mods/11") return Response.json({ data: project });
+        const files = [f.old, f.newer].map((content, index) => ({
+          modId: project.id,
+          id: 21 + index,
+          fileName: `forge-${index ? "new" : "old"}.${extension}`,
+          displayName: index ? "Release 2" : "Release 1",
+          gameVersions: ["1.21.1", loader],
+          fileDate: index ? "2026-02-01" : "2026-01-01",
+          downloadUrl: `https://edge.forgecdn.net/file-${21 + index}.${extension}`,
+          fileLength: content.length,
+          fileFingerprint: curseFingerprint(content),
+          hashes: [{ algo: 1, value: hashes(content).sha1 }],
+        }));
+        if (pathname === "/v1/fingerprints/432") {
+          const requested = JSON.parse(init.body).fingerprints;
+          return Response.json({
+            data: {
+              exactMatches: files
+                .filter((file) => requested.includes(file.fileFingerprint))
+                .map((file) => ({
+                  id: file.modId,
+                  file: correctSha1
+                    ? file
+                    : { ...file, hashes: [{ algo: 1, value: "0".repeat(40) }] },
+                })),
+            },
+          });
+        }
+        if (pathname === "/v1/mods/11/files")
+          return Response.json({ data: files });
+        if (pathname.startsWith("/v1/mods/11/files/"))
+          return Response.json({
+            data: files.find(
+              (file) => String(file.id) === pathname.split("/").at(-1),
+            ),
+          });
+      },
+    });
+    const directory = path.join(f.serverDir, folder);
+    await fs.mkdir(directory, { recursive: true });
+    await fs.rename(
+      path.join(f.serverDir, "mods/old.jar"),
+      path.join(f.serverDir, previous),
+    );
+    if (type === "plugin")
+      f.setServer({
+        status: "offline",
+        mode: "live",
+        gameVersion: "1.21.1",
+        loader,
+        world: "Survival",
+      });
+    f.downloads.set(`https://edge.forgecdn.net/file-22.${extension}`, f.newer);
+    const viaCurseForge = {
+      ...input,
+      platform: "curseforge",
+      projectId: "11",
+      versionId: "22",
+      replacePath: previous,
+    };
+    await f.service.settings({ curseforgeApiKey: "fixture-key" });
+    const mismatch = (await f.service.installed(viaCurseForge)).items[0];
+    assert.equal(mismatch.platform, "modrinth");
+    assert.ok(
+      !mismatch.catalogAliases?.some(
+        (alias) => alias.platform === "curseforge",
+      ),
+    );
+    await assert.rejects(f.service.preview(viaCurseForge), { status: 409 });
+
+    correctSha1 = true;
+    const [verified] = (
+      await f.service.installed({ ...viaCurseForge, refresh: true })
+    ).items;
+    assert.equal(verified.platform, "modrinth");
+    assert.equal(verified.projectId, "project");
+    assert.equal(verified.versionId, "old");
+    assert.deepEqual(verified.catalogAliases, [
+      { platform: "curseforge", projectId: "11", versionId: "21" },
+    ]);
+    const sameRelease = await f.service.preview({
+      ...viaCurseForge,
+      versionId: "21",
+      replacePath: undefined,
+    });
+    assert.deepEqual(sameRelease.files, []);
+    assert.equal(sameRelease.unchangedCount, 1);
+    const local = await f.service.installed({
+      ...input,
+      local: true,
+      quick: true,
+    });
+    assert.deepEqual(local.items[0].catalogAliases, verified.catalogAliases);
+    await f.service.close();
+    assert.doesNotMatch(
+      await fs.readFile(
+        path.join(f.dataDir, "launchpad/metadata-cache.json"),
+        "utf8",
+      ),
+      /"curseforge"/,
+    );
+    const service = await f.boot();
+    const plan = await service.preview(viaCurseForge);
+    assert.deepEqual(
+      plan.files.map(({ path, action, previousPath }) => ({
+        path,
+        action,
+        previousPath,
+      })),
+      [
+        {
+          path: `${folder}/${newName}`,
+          action: "replace",
+          previousPath: previous,
+        },
+      ],
+    );
+    const job = await finish(service, { planId: plan.planId, confirmed: true });
+    assert.equal(job.status, "completed", job.error);
+    assert.deepEqual(await fs.readdir(directory), [newName]);
+    assert.deepEqual(await fs.readFile(path.join(directory, newName)), f.newer);
+
+    await service.close();
+    const restarted = await f.boot();
+    const [updated] = (await restarted.installed(input)).items;
+    assert.equal(updated.platform, "curseforge");
+    assert.equal(updated.projectId, "11");
+    assert.equal(updated.versionId, "22");
+    assert.deepEqual(updated.catalogAliases, [
+      { platform: "modrinth", projectId: "project", versionId: "new" },
+    ]);
+  });
+
+test("a file removed during catalog checks does not hide another verified resource pack", async (t) => {
+  let directory;
   const f = await fixture(t, {
     request: async (url, init) => {
       const { pathname } = new URL(url);
       if (pathname === "/v2/version_files") {
-        const versions = [f.versions.old, f.versions.new];
-        const requested = JSON.parse(init.body).hashes;
-        return Response.json(
-          Object.fromEntries(
-            versions
-              .filter((version) =>
-                requested.includes(version.files[0].hashes.sha512),
-              )
-              .map((version) => [version.files[0].hashes.sha512, version]),
-          ),
-        );
-      }
-      if (pathname === "/v1/categories")
+        await fs.unlink(path.join(directory, "removed.zip"));
         return Response.json({
-          data: [{ id: 6, slug: "mc-mods", name: "Mods" }],
+          [hashes(f.old).sha512]: f.versions.old,
+          [hashes(f.newer).sha512]: f.versions.new,
         });
-      if (pathname === "/v1/mods") return Response.json({ data: [project] });
-      if (pathname === "/v1/mods/11") return Response.json({ data: project });
-      const files = [f.old, f.newer].map((content, index) => ({
-        modId: project.id,
-        id: 21 + index,
-        fileName: index ? "forge-new.jar" : "forge-old.jar",
-        displayName: index ? "Release 2" : "Release 1",
-        gameVersions: ["1.21.1", "NeoForge"],
-        fileDate: index ? "2026-02-01" : "2026-01-01",
-        downloadUrl: `https://edge.forgecdn.net/file-${21 + index}.jar`,
-        fileLength: content.length,
-        fileFingerprint: curseFingerprint(content),
-        hashes: [{ algo: 1, value: hashes(content).sha1 }],
-      }));
+      }
       if (pathname === "/v1/fingerprints/432") {
-        const requested = JSON.parse(init.body).fingerprints;
+        const fingerprint = curseFingerprint(f.newer);
+        assert.deepEqual(JSON.parse(init.body).fingerprints, [fingerprint]);
         return Response.json({
           data: {
-            exactMatches: files
-              .filter((file) => requested.includes(file.fileFingerprint))
-              .map((file) => ({
-                id: file.modId,
-                file: correctSha1
-                  ? file
-                  : { ...file, hashes: [{ algo: 1, value: "0".repeat(40) }] },
-              })),
+            exactMatches: [
+              {
+                id: 11,
+                file: {
+                  modId: 11,
+                  id: 21,
+                  fileFingerprint: fingerprint,
+                  hashes: [{ algo: 1, value: hashes(f.newer).sha1 }],
+                },
+              },
+            ],
           },
         });
       }
-      if (pathname === "/v1/mods/11/files")
-        return Response.json({ data: files });
-      if (pathname.startsWith("/v1/mods/11/files/"))
-        return Response.json({
-          data: files.find(
-            (file) => String(file.id) === pathname.split("/").at(-1),
-          ),
-        });
     },
   });
-  f.downloads.set("https://edge.forgecdn.net/file-22.jar", f.newer);
-  const viaCurseForge = {
-    ...selection,
-    platform: "curseforge",
-    projectId: "11",
-    versionId: "22",
-    replacePath: "mods/old.jar",
-  };
+  directory = path.join(
+    f.serverDir,
+    "automodpack/host-modpack/main/resourcepacks",
+  );
+  await fs.mkdir(directory, { recursive: true });
+  await fs.writeFile(path.join(directory, "removed.zip"), f.old);
+  await fs.writeFile(path.join(directory, "surviving.zip"), f.newer);
   await f.service.settings({ curseforgeApiKey: "fixture-key" });
-  const mismatch = (await f.service.installed(viaCurseForge)).items[0];
-  assert.equal(mismatch.platform, "modrinth");
-  assert.ok(
-    !mismatch.catalogAliases?.some((alias) => alias.platform === "curseforge"),
-  );
-  await assert.rejects(f.service.preview(viaCurseForge), { status: 409 });
-
-  correctSha1 = true;
-  const [verified] = (
-    await f.service.installed({ ...viaCurseForge, refresh: true })
-  ).items;
-  assert.equal(verified.platform, "modrinth");
-  assert.equal(verified.projectId, "project");
-  assert.equal(verified.versionId, "old");
-  assert.deepEqual(verified.catalogAliases, [
-    { platform: "curseforge", projectId: "11", versionId: "21" },
-  ]);
-  const local = await f.service.installed({ ...selection, local: true });
-  assert.deepEqual(local.items[0].catalogAliases, verified.catalogAliases);
-  await f.service.close();
-  assert.doesNotMatch(
-    await fs.readFile(
-      path.join(f.dataDir, "launchpad/metadata-cache.json"),
-      "utf8",
-    ),
-    /"curseforge"/,
-  );
-  const service = await f.boot();
-  const plan = await service.preview(viaCurseForge);
+  const { items, warnings } = await f.service.installed({
+    type: "resourcepack",
+    target: "automodpack",
+    identityOnly: true,
+  });
   assert.deepEqual(
-    plan.files.map(({ path, action, previousPath }) => ({
-      path,
-      action,
-      previousPath,
-    })),
-    [
-      {
-        path: "mods/forge-new.jar",
-        action: "replace",
-        previousPath: "mods/old.jar",
-      },
-    ],
+    items.find((item) => item.name === "surviving.zip")?.catalogAliases,
+    [{ platform: "curseforge", projectId: "11", versionId: "21" }],
   );
-  const job = await finish(service, { planId: plan.planId, confirmed: true });
-  assert.equal(job.status, "completed", job.error);
-  assert.deepEqual(await fs.readdir(path.join(f.serverDir, "mods")), [
-    "forge-new.jar",
-  ]);
-  assert.deepEqual(
-    await fs.readFile(path.join(f.serverDir, "mods/forge-new.jar")),
-    f.newer,
+  assert.equal(
+    items.find((item) => item.name === "removed.zip")?.catalogAliases,
+    undefined,
   );
+  assert.ok(warnings.some((message) => message.includes("removed.zip")));
+});
 
-  await service.close();
-  const restarted = await f.boot();
-  const [updated] = (await restarted.installed(selection)).items;
-  assert.equal(updated.platform, "curseforge");
-  assert.equal(updated.projectId, "11");
-  assert.equal(updated.versionId, "22");
-  assert.deepEqual(updated.catalogAliases, [
-    { platform: "modrinth", projectId: "project", versionId: "new" },
+test("a resource ZIP larger than 128 MiB is verified in both catalogs", async (t) => {
+  let sha512, sha1, fingerprint;
+  const f = await fixture(t, {
+    request: (url, init) => {
+      const { pathname } = new URL(url);
+      if (pathname === "/v2/version_files") {
+        assert.deepEqual(JSON.parse(init.body).hashes, [sha512]);
+        return Response.json({
+          [sha512]: {
+            project_id: "textures",
+            id: "edition",
+            name: "Texture pack",
+            files: [{ hashes: { sha512 } }],
+          },
+        });
+      }
+      if (pathname === "/v1/fingerprints/432") {
+        assert.deepEqual(JSON.parse(init.body).fingerprints, [fingerprint]);
+        return Response.json({
+          data: {
+            exactMatches: [
+              {
+                id: 15,
+                file: {
+                  modId: 15,
+                  id: 42,
+                  fileFingerprint: fingerprint,
+                  hashes: [{ algo: 1, value: sha1 }],
+                },
+              },
+            ],
+          },
+        });
+      }
+    },
+  });
+  const folder = path.join(
+    f.serverDir,
+    "automodpack/host-modpack/main/resourcepacks",
+  );
+  await fs.mkdir(folder, { recursive: true });
+  // Whitespace is present in both cryptographic hashes but absent from the
+  // CurseForge fingerprint. Keep only a few hundred non-space bytes in RAM.
+  const blank = Buffer.alloc(1024 ** 2, 32);
+  const archive = new yazl.ZipFile();
+  // These headers and the "abc" prefix leave three bytes in an unfinished
+  // MurmurHash word while the next 128 MiB of whitespace is streamed.
+  const archiveOptions = {
+    compress: false,
+    mtime: new Date(2026, 0, 1),
+    forceDosTimestamp: true,
+  };
+  archive.addBuffer(
+    Buffer.from('{"pack":{"pack_format":34,"description":"Large pack"}}'),
+    "pack.mcmeta",
+    archiveOptions,
+  );
+  archive.addReadStream(
+    Readable.from([
+      Buffer.from("abc"),
+      ...Array(128).fill(blank),
+      Buffer.from("defg"),
+    ]),
+    "assets/example/large.txt",
+    archiveOptions,
+  );
+  archive.end();
+  const sha1Hash = createHash("sha1"),
+    sha512Hash = createHash("sha512");
+  const significant = [];
+  const localPath = path.join(folder, "renamed.zip.disabled");
+  await pipeline(
+    archive.outputStream,
+    async function* (chunks) {
+      for await (const chunk of chunks) {
+        sha1Hash.update(chunk);
+        sha512Hash.update(chunk);
+        if (!chunk.equals(blank))
+          for (const byte of chunk) if (byte !== 32) significant.push(byte);
+        yield chunk;
+      }
+    },
+    createWriteStream(localPath),
+  );
+  sha1 = sha1Hash.digest("hex");
+  sha512 = sha512Hash.digest("hex");
+  fingerprint = curseFingerprint(significant);
+  assert.ok((await fs.stat(localPath)).size > 128 * 1024 ** 2);
+  await f.service.settings({ curseforgeApiKey: "fixture-key" });
+  const { items, warnings } = await f.service.installed({
+    target: "automodpack",
+    type: "resourcepack",
+    identityOnly: true,
+  });
+  assert.deepEqual(warnings, []);
+  assert.equal(items.length, 1);
+  assert.equal(items[0].active, false);
+  assert.equal(items[0].platform, "modrinth");
+  assert.deepEqual(items[0].catalogAliases, [
+    { platform: "curseforge", projectId: "15", versionId: "42" },
   ]);
 });
 

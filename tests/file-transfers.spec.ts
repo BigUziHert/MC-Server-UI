@@ -310,13 +310,38 @@ test("Copy and Paste retain nested files across folder and server navigation wit
     expect(empty.ok()).toBe(true);
     expect((await empty.json()).entries).toEqual([]);
 
+    await create(
+      "transfer-pack",
+      "new.txt",
+      "file",
+      "added after the first paste",
+    );
+    await page.getByRole("button", { name: "Paste", exact: true }).click();
+    await expect(
+      page.getByRole("status", { name: "File transfer progress" }),
+    ).toContainText("Skipped 1 identical file.");
+    expect(await content(targetId, "transfer-pack/new.txt")).toBe(
+      "added after the first paste",
+    );
+    const targetPath = "transfer-pack/nested/settings.txt";
+    const headers = { "X-Server-Id": targetId };
+    const saved = await (
+      await request.get(`/api/files/content?path=${targetPath}`, { headers })
+    ).json();
+    const edit = await request.put("/api/files/content", {
+      headers,
+      data: {
+        path: targetPath,
+        content: "edited destination",
+        revision: saved.revision,
+      },
+    });
+    expect(edit.ok(), await edit.text()).toBe(true);
     await page.getByRole("button", { name: "Paste", exact: true }).click();
     await expect(
       page.getByRole("status", { name: "File transfer progress" }),
     ).toContainText("already exists");
-    expect(await content(targetId, "transfer-pack/nested/settings.txt")).toBe(
-      "keep original settings\n",
-    );
+    expect(await content(targetId, targetPath)).toBe("edited destination");
     await page.setViewportSize({ width: 390, height: 844 });
     await page
       .getByRole("checkbox", { name: "Select transfer-pack", exact: true })

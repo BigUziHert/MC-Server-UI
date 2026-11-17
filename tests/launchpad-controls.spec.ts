@@ -119,27 +119,53 @@ async function catalog(
   );
 }
 
-test("completed installation notices expire after ten seconds and stay dismissed on refresh", async ({
+test("completed installations show five- and ten-second countdowns and stay dismissed on refresh", async ({
   page,
 }) => {
-  await page.clock.install();
-  await catalog(page, {
+  await page.clock.install({ time: new Date("2026-11-01T12:00:00Z") });
+  await page.clock.pauseAt(new Date("2026-11-01T12:01:00Z"));
+  const job = {
     id: "finished",
-    status: "completed",
-    message: "Example installed successfully.",
-    completed: 1,
+    status: "running",
+    message: "Updating Example.",
+    completed: 0,
     total: 1,
+  };
+  await catalog(page, job);
+  await page.route("**/api/launchpad/jobs/finished", (route) => {
+    Object.assign(job, {
+      status: "completed",
+      message: "Example updated.",
+      completed: 1,
+    });
+    return route.fulfill({ json: { job } });
   });
   await page.route("**/api/launchpad/jobs/finished/dismiss", (route) =>
     route.fulfill({ json: { dismissed: true } }),
   );
   await page.goto("/#launchpad");
   const banner = page.getByRole("status", { name: "Installation status" });
+  const toast = page.locator(".toast").filter({ hasText: "Example updated." });
   await expect(banner).toContainText("Installation completed");
-  await page.clock.fastForward(9_000);
+  for (const [notice, duration] of [
+    [toast, "5s"],
+    [banner, "10s"],
+  ] as const) {
+    const bar = notice.locator(".dismiss-countdown");
+    await expect(bar).toBeVisible();
+    await expect(bar).toHaveAttribute("aria-hidden", "true");
+    await expect(bar).toHaveCSS("animation-duration", duration);
+    await expect(bar).not.toHaveCSS("animation-name", "none");
+  }
+  await page.clock.fastForward(4_000);
+  await expect(toast).toBeVisible();
+  await page.clock.fastForward(1_100);
+  await expect(toast).toHaveCount(0);
+  await page.clock.fastForward(3_900);
   await expect(banner).toBeVisible();
   await page.clock.fastForward(1_100);
   await expect(banner).toHaveCount(0);
+  await page.clock.resume();
   await page
     .getByRole("button", { name: "Refresh Launchpad and check updates" })
     .click();
@@ -190,6 +216,7 @@ test("running installations keep their status after ten seconds", async ({
   await page.goto("/#launchpad");
   const banner = page.getByRole("status", { name: "Installation status" });
   await expect(banner).toContainText("Installing server content");
+  await expect(banner.locator(".dismiss-countdown")).toHaveCount(0);
   await page.clock.fastForward(11_000);
   await expect(banner).toContainText("Downloading example.jar");
 });
@@ -218,6 +245,7 @@ for (const recoveryRequired of [false, true]) {
     await page.goto("/#launchpad");
     const banner = page.getByRole("status", { name: "Installation status" });
     await expect(banner).toContainText("This installation needs attention.");
+    await expect(banner.locator(".dismiss-countdown")).toHaveCount(0);
     await page.clock.fastForward(11_000);
     await expect(banner).toBeVisible();
     await page.getByRole("link", { name: "Console", exact: true }).click();
@@ -230,6 +258,7 @@ for (const recoveryRequired of [false, true]) {
 test("installed mod controls display file modification time and toggle activity in both directions", async ({
   page,
 }, testInfo) => {
+  await page.clock.install();
   await catalog(page);
   let item = installed("Example");
   const requests: unknown[] = [];
@@ -265,9 +294,16 @@ test("installed mod controls display file modification time and toggle activity 
   await active.click();
   await expect(active).not.toBeChecked();
   await expect(row).toContainText("mods/Example.jar.disabled");
+  const toast = page.locator(".toast");
+  await expect(toast).toHaveText("Example disabled.");
+  await page.clock.fastForward(3_000);
   await active.click();
   await expect(active).toBeChecked();
   await expect(row).toContainText("mods/Example.jar");
+  await page.clock.fastForward(2_100);
+  await expect(toast).toHaveText("Example enabled.");
+  await toast.getByRole("button", { name: "Dismiss notification" }).click();
+  await expect(toast).toHaveCount(0);
   await expect(row.locator(`time[datetime="${item.addedAt}"]`)).toBeVisible();
   await expect(
     row.locator(`time[datetime="${item.modifiedAt}"]`),

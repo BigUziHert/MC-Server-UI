@@ -3051,6 +3051,7 @@ export async function createPanel(options = {}) {
         uploadFilesPerBatch: MAX_UPLOAD_FILES_PER_BATCH,
         supportsFileMoves: true,
         supportsFileRename: true,
+        supportsFolderRename: true,
       });
     } catch (cause) {
       if (disconnected.signal.aborted) res.destroy();
@@ -3173,7 +3174,7 @@ export async function createPanel(options = {}) {
   app.post(
     "/api/files/rename",
     trackOperation(async (req, res) => {
-      const { path: relative, name } = req.body ?? {};
+      const { path: relative, name, type = "file" } = req.body ?? {};
       validateName(name);
       const result = await copyServerFiles({
         sourceDir: serverDir,
@@ -3181,22 +3182,25 @@ export async function createPanel(options = {}) {
         paths: [relative],
         mode: "move",
         renameTo: name,
+        renameType: type,
         safePath,
       }).catch((cause) => {
         if (cause.code === "ENOENT")
           throw error(
             404,
-            "The file or its folder no longer exists. Refresh File Manager.",
+            "The file or folder no longer exists. Refresh File Manager.",
           );
-        if (cause.code === "EEXIST")
+        if (["EEXIST", "ENOTEMPTY"].includes(cause.code))
           throw error(409, `“${name}” already exists. Choose another name.`);
         throw cause;
       });
       const renamed = result.paths[0] ?? relative;
-      if (result.copiedFiles)
-        await audit("file", "File renamed", `${relative} → ${renamed}`).catch(
-          () => {},
-        );
+      if (result.copiedFiles || result.copiedDirectories)
+        await audit(
+          "file",
+          result.copiedDirectories ? "Folder renamed" : "File renamed",
+          `${relative} → ${renamed}`,
+        ).catch(() => {});
       res.json({ path: renamed });
     }),
   );
@@ -3329,6 +3333,16 @@ export async function createPanel(options = {}) {
             paths: normalizedPaths,
             mode,
             safePath,
+            canReadDestination: () => {
+              if (!principal) return true;
+              const user = currentAccessUser(principal);
+              return Boolean(
+                user &&
+                userWithPermissions(user).permissions.includes(
+                  "file.read-content",
+                ),
+              );
+            },
             assertAccess: async () => {
               if ((await getSource()) !== source)
                 throw error(409, "The source server changed during the copy.");
@@ -3352,7 +3366,7 @@ export async function createPanel(options = {}) {
         void audit(
           "file",
           mode === "move" ? "Files moved" : "Files copied",
-          `${result.copiedFiles} files and ${result.copiedDirectories} folders ${mode === "move" ? "moved" : "copied"} to ${destination || "the server root"}.`,
+          `${result.copiedFiles} files and ${result.copiedDirectories} folders ${mode === "move" ? "moved" : "copied"} to ${destination || "the server root"}.${result.skippedFiles ? ` Skipped ${result.skippedFiles} identical ${result.skippedFiles === 1 ? "file" : "files"}.` : ""}`,
         ).catch(() => {});
         res.status(201).json(result);
       } catch (cause) {

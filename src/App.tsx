@@ -63,6 +63,7 @@ import Versions from "./pages/Versions";
 import Launchpad from "./pages/Launchpad";
 import Properties from "./pages/Properties";
 import SearchField, { useDebouncedValue } from "./SearchField";
+import { DismissCountdown } from "./DismissCountdown";
 import Switch from "./Switch";
 import DesktopUpdates from "./DesktopUpdates";
 import PanelSettings from "./PanelSettings";
@@ -91,6 +92,8 @@ import ServerManager, {
 } from "./ServerManager";
 import "./welcome.css";
 import DesktopWorkspace from "./DesktopWorkspace";
+
+const TOAST_DURATION_MS = 5_000;
 
 type Page =
   | "console"
@@ -1091,7 +1094,9 @@ export function ServerWorkspace({
   );
   const [server, setServer] = useState<Server | null>(null);
   const [connectionError, setConnectionError] = useState("");
+  const toastSequence = useRef(0);
   const [toast, setToast] = useState<{
+    id: number;
     message: string;
     error?: boolean;
   } | null>(null);
@@ -1161,7 +1166,8 @@ export function ServerWorkspace({
     memory: [],
   });
   const notify = useCallback(
-    (message: string, error?: boolean) => setToast({ message, error }),
+    (message: string, error?: boolean) =>
+      setToast({ id: ++toastSequence.current, message, error }),
     [],
   );
   const statusRequest = useRef(0);
@@ -1210,7 +1216,10 @@ export function ServerWorkspace({
   }, []);
   useEffect(() => {
     if (!toast) return;
-    const timer = window.setTimeout(() => setToast(null), 5000);
+    const timer = window.setTimeout(
+      () => setToast((current) => (current === toast ? null : current)),
+      TOAST_DURATION_MS,
+    );
     return () => clearTimeout(timer);
   }, [toast]);
   useEffect(() => {
@@ -1559,6 +1568,7 @@ export function ServerWorkspace({
           >
             <X size={16} />
           </button>
+          <DismissCountdown key={toast.id} durationMs={TOAST_DURATION_MS} />
         </div>
       )}
       <PowerConfirmation controls={controls} />

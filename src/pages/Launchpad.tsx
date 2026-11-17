@@ -41,6 +41,7 @@ import RefreshButton from "../RefreshButton";
 import StatePanel from "../StatePanel";
 import Pagination from "../Pagination";
 import Switch from "../Switch";
+import { DismissCountdown } from "../DismissCountdown";
 import {
   readPreference,
   writePreference,
@@ -169,6 +170,29 @@ type InstalledResult = {
   checkingUpdates?: boolean;
   progress?: { completed: number; total: number };
 };
+function installedProjectKeys(item: InstalledItem) {
+  const keys = (item.catalogAliases ?? []).map(
+    (alias) => `${alias.platform}:${alias.projectId}`,
+  );
+  if (item.platform && item.projectId)
+    keys.push(`${item.platform}:${item.projectId}`);
+  return keys;
+}
+
+function autoModpackProjectIndex(items: InstalledItem[]) {
+  const projects = new Map<string, Set<string>>();
+  for (const item of items) {
+    for (const key of installedProjectKeys(item)) {
+      let hashes = projects.get(key);
+      if (!hashes) {
+        hashes = new Set();
+        projects.set(key, hashes);
+      }
+      if (item.sha512) hashes.add(item.sha512);
+    }
+  }
+  return projects;
+}
 function pendingInventory(result: InstalledResult): InstalledResult {
   return {
     ...result,
@@ -304,6 +328,7 @@ type SortDirection = "asc" | "desc";
 const defaultInstalledDirection = (sort: InstalledSort): SortDirection =>
   ["name", "author", "category"].includes(sort) ? "asc" : "desc";
 
+const completedJobNoticeMs = 10_000;
 // Retain dismissals across page navigation, including a slow or offline remote
 // panel. Scope them to the server/account rather than hiding another panel's job.
 const dismissedJobs = new Map<string, Set<string>>();
@@ -650,7 +675,17 @@ export default function Launchpad({
   const [loader, setLoader] = useState("");
   const [status, setStatus] = useState<string | null>(null);
   const [statusStale, setStatusStale] = useState(false);
-  const [query, setQuery] = useState("");
+  // Opening a catalog match filters by its identity even when the installed
+  // JAR was renamed or its other catalog uses a different display name.
+  const [search, setQuery] = useState<
+    | string
+    | {
+        title: string;
+        projectKey: string;
+        hashes: Set<string>;
+      }
+  >("");
+  const query = typeof search === "string" ? search : search.title;
   const filteredQuery = useDebouncedValue(query, 150);
   const [sort, setSort] = useState("downloads");
   const [installedSort, setInstalledSort] = useState<InstalledSort>("name");
@@ -730,6 +765,14 @@ export default function Launchpad({
   const [scanRefreshing, setScanRefreshing] = useState(false);
   const [scanError, setScanError] = useState("");
   const [reload, setReload] = useState(0);
+  const browseAutoModpackMods =
+    activeTab === "mod" &&
+    !installedOnly &&
+    config?.targets?.includes("automodpack") === true;
+  const [packIndex, setPackIndex] = useState<{
+    api: typeof api;
+    projects: ReturnType<typeof autoModpackProjectIndex>;
+  } | null>(null);
   const catalogRefresh = useRef(false);
   const scanEpoch = useRef(0);
   const forceScan = useRef<{ api: typeof api; token: number } | null>(null);
@@ -794,6 +837,8 @@ export default function Launchpad({
     : (sortOptions[0]?.id ?? "");
   const supported = targetSupported && Boolean(source?.types.includes(type));
   const working = Boolean(job && ["queued", "running"].includes(job.status));
+  const timedJobId =
+    job?.status === "completed" && !job.recoveryRequired ? job.id : null;
   const availableUpdates = (installed?.items ?? []).filter(
     (item) =>
       item.update &&
@@ -981,25 +1026,17 @@ export default function Launchpad({
   );
 
   useEffect(() => {
-    completedJob.current =
-      job?.status === "completed" && !job.recoveryRequired
-        ? { scope: viewKey, id: job.id }
-        : null;
-    if (!completedJob.current) return;
-    const id = completedJob.current.id;
+    completedJob.current = timedJobId
+      ? { scope: viewKey, id: timedJobId }
+      : null;
+    if (!timedJobId) return;
     const timer = window.setTimeout(() => {
-      dismissCompletedJob(id);
+      dismissCompletedJob(timedJobId);
       jobEpoch.current++;
-      setJob((current) => (current?.id === id ? null : current));
-    }, 10_000);
+      setJob((current) => (current?.id === timedJobId ? null : current));
+    }, completedJobNoticeMs);
     return () => window.clearTimeout(timer);
-  }, [
-    job?.id,
-    job?.status,
-    job?.recoveryRequired,
-    viewKey,
-    dismissCompletedJob,
-  ]);
+  }, [timedJobId, viewKey, dismissCompletedJob]);
 
   useEffect(
     () => () => {
@@ -1212,6 +1249,47 @@ export default function Launchpad({
     limit,
     reload,
   ]);
+
+  useEffect(() => {
+    if (!browseAutoModpackMods) {
+      setPackIndex(null);
+      return;
+    }
+    const controller = new AbortController();
+    const force = forceScan.current?.api === api;
+    async function read(local: boolean) {
+      const result = await api<InstalledResult>(
+        `/launchpad/installed?${queryString({
+          type: "mod",
+          target: "automodpack",
+          gameVersion: contentGameVersion,
+          loader: contentLoader,
+          local: local ? "true" : undefined,
+          quick: local ? "true" : undefined,
+          identityOnly: "true",
+          refresh: !local && force ? "true" : undefined,
+        })}`,
+        {
+          signal: AbortSignal.any([
+            controller.signal,
+            AbortSignal.timeout(local ? 30_000 : 120_000),
+          ]),
+        },
+      );
+      if (!controller.signal.aborted)
+        setPackIndex({ api, projects: autoModpackProjectIndex(result.items) });
+      return result;
+    }
+    void (async () => {
+      const local = await read(true).catch(() => null);
+      if (controller.signal.aborted || local?.items.length === 0) return;
+      // Keep confirmed local matches available if the provider is offline.
+      await read(false).catch(() => {
+        if (!local && !controller.signal.aborted) setPackIndex(null);
+      });
+    })();
+    return () => controller.abort();
+  }, [api, browseAutoModpackMods, contentGameVersion, contentLoader, reload]);
 
   useEffect(() => {
     if (!inventoryReady) {
@@ -2166,9 +2244,12 @@ export default function Launchpad({
   }
   const entries = (installed?.items ?? [])
     .filter((entry) =>
-      `${entry.title ?? ""} ${entry.name} ${entry.path} ${entry.author ?? ""}`
-        .toLowerCase()
-        .includes(filteredQuery.trim().toLowerCase()),
+      typeof search === "string"
+        ? `${entry.title ?? ""} ${entry.name} ${entry.path} ${entry.author ?? ""}`
+            .toLowerCase()
+            .includes(filteredQuery.trim().toLowerCase())
+        : installedProjectKeys(entry).includes(search.projectKey) ||
+          Boolean(entry.sha512 && search.hashes.has(entry.sha512)),
     )
     .filter(
       (entry) =>
@@ -2236,28 +2317,44 @@ export default function Launchpad({
       });
     }
   }
-  const visibleProjects: { project: Project; entry?: InstalledItem }[] =
-    installedOnly
-      ? entries.slice(currentOffset, currentOffset + limit).map((entry) => ({
-          project: {
-            id: entry.projectId ?? entry.path,
-            platform: entry.platform ?? "",
-            title: entry.title ?? entry.name,
-            description: entry.path,
-            iconUrl: entry.iconUrl,
-            author: entry.author,
-            authorLinks: entry.authorLinks,
-            url: projectPageUrl(entry),
-          },
-          entry,
-        }))
-      : (results?.projects ?? []).map((project) => ({
-          project: {
-            ...project,
-            url: projectPageUrl({ ...project, projectId: project.id }),
-          },
-          entry: installedProjects.get(`${project.platform}:${project.id}`),
-        }));
+  const visibleProjects: {
+    project: Project;
+    entry?: InstalledItem;
+    packHashes?: Set<string>;
+  }[] = installedOnly
+    ? entries.slice(currentOffset, currentOffset + limit).map((entry) => ({
+        project: {
+          id: entry.projectId ?? entry.path,
+          platform: entry.platform ?? "",
+          title: entry.title ?? entry.name,
+          description: entry.path,
+          iconUrl: entry.iconUrl,
+          author: entry.author,
+          authorLinks: entry.authorLinks,
+          url: projectPageUrl(entry),
+        },
+        entry,
+      }))
+    : (results?.projects ?? []).map((project) => ({
+        project: {
+          ...project,
+          url: projectPageUrl({ ...project, projectId: project.id }),
+        },
+        entry: installedProjects.get(`${project.platform}:${project.id}`),
+        packHashes:
+          browseAutoModpackMods && packIndex?.api === api
+            ? packIndex.projects.get(`${project.platform}:${project.id}`)
+            : undefined,
+      }));
+  function manageInAutoModpack(project: Project, hashes: Set<string>) {
+    changeTab("automodpack");
+    setInstalledOnly(true);
+    setQuery({
+      title: project.title,
+      projectKey: `${project.platform}:${project.id}`,
+      hashes,
+    });
+  }
   const warnings = [
     ...new Set(
       [
@@ -2918,6 +3015,12 @@ export default function Launchpad({
               value={job.total > 0 ? job.completed : undefined}
             />
           )}
+          {timedJobId && (
+            <DismissCountdown
+              key={`${viewKey}:${timedJobId}:${canDismissJob}`}
+              durationMs={completedJobNoticeMs}
+            />
+          )}
           {jobError && (
             <div className="launchpad-error" role="alert">
               <span>{jobError} The installation may still be running.</span>
@@ -3156,7 +3259,7 @@ export default function Launchpad({
                   "updated",
                 )}
               </div>
-              {visibleProjects.map(({ project, entry }) => (
+              {visibleProjects.map(({ project, entry, packHashes }) => (
                 <article
                   className="panel launchpad-project launchpad-installed-row"
                   key={entry?.path ?? `${project.platform}:${project.id}`}
@@ -3186,6 +3289,11 @@ export default function Launchpad({
                             {entry.platform && entry.projectId
                               ? "Installed"
                               : "Unidentified file"}
+                          </span>
+                        )}
+                        {packHashes && (
+                          <span className="launchpad-badge">
+                            Installed in AutoModpack
                           </span>
                         )}
                         {entry?.update && (
@@ -3276,38 +3384,58 @@ export default function Launchpad({
                     <ProjectAuthors project={project} />
                   </div>
                   <div className="launchpad-project-action">
-                    {(!entry || (entry.platform && entry.projectId)) && (
+                    {(packHashes ||
+                      !entry ||
+                      (entry.platform && entry.projectId)) && (
                       <div className="launchpad-version-action">
-                        <button
-                          className={`btn ${entry && !entry.update ? "" : "primary"}`}
-                          aria-label={`${entry?.update ? "Update" : entry ? "Choose version for" : "Install"} ${project.title}`}
-                          disabled={
-                            !allowChanges ||
-                            working ||
-                            Boolean(busy) ||
-                            Boolean(entry && pendingPaths.has(entry.path)) ||
-                            !config.platforms.find(
-                              (item) => item.id === project.platform,
-                            )?.available
-                          }
-                          onClick={() => chooseProject(project, entry)}
-                        >
-                          {entry?.update ? (
-                            <RefreshCw size={15} />
-                          ) : (
-                            <Download size={15} />
-                          )}
-                          {entry?.update
-                            ? "Update"
-                            : entry
-                              ? "Versions"
-                              : "Install"}
-                        </button>
+                        {(!packHashes || entry) && (
+                          <button
+                            className={`btn ${entry && !entry.update ? "" : "primary"}`}
+                            aria-label={`${entry?.update ? "Update" : entry ? "Choose version for" : "Install"} ${project.title}`}
+                            disabled={
+                              !allowChanges ||
+                              working ||
+                              Boolean(busy) ||
+                              Boolean(entry && pendingPaths.has(entry.path)) ||
+                              !config.platforms.find(
+                                (item) => item.id === project.platform,
+                              )?.available
+                            }
+                            onClick={() => chooseProject(project, entry)}
+                          >
+                            {entry?.update ? (
+                              <RefreshCw size={15} />
+                            ) : (
+                              <Download size={15} />
+                            )}
+                            {entry?.update
+                              ? "Update"
+                              : entry
+                                ? "Versions"
+                                : "Install"}
+                          </button>
+                        )}
                         {entry?.update && (
                           <div className="launchpad-available-version">
                             Available:{" "}
                             {entry.update.version || entry.update.name}
                           </div>
+                        )}
+                        {packHashes && (
+                          <button
+                            type="button"
+                            className="btn launchpad-manage-pack"
+                            disabled={
+                              Boolean(busy) ||
+                              Boolean(selection) ||
+                              Boolean(removal)
+                            }
+                            onClick={() =>
+                              manageInAutoModpack(project, packHashes)
+                            }
+                          >
+                            <Layers3 size={15} /> Manage in AutoModpack
+                          </button>
                         )}
                       </div>
                     )}
@@ -3357,7 +3485,11 @@ export default function Launchpad({
                     {hasActive && !entry && (
                       <span
                         className="launchpad-active launchpad-empty-cell"
-                        aria-label="Not installed"
+                        aria-label={
+                          packHashes
+                            ? "Not installed in server Mods"
+                            : "Not installed"
+                        }
                       >
                         —
                       </span>
@@ -3410,9 +3542,11 @@ export default function Launchpad({
           <h2 id="launchpad-install-title">
             {plan
               ? "Review installation"
-              : selection?.installed?.update
+              : selection?.bulk || selection?.installed?.update
                 ? "Update content"
-                : "Install content"}
+                : selection?.installed
+                  ? "Choose version"
+                  : "Install content"}
           </h2>
           <div className="launchpad-step">
             <span>Step {plan ? "2" : "1"} of 2</span>
@@ -3541,6 +3675,9 @@ export default function Launchpad({
                         disabled={!version.downloadable}
                       >
                         {version.name || version.version}
+                        {version.id === selection?.installed?.versionId
+                          ? " · Installed"
+                          : ""}
                         {!version.downloadable
                           ? " · Manual download required"
                           : ""}

@@ -656,12 +656,15 @@ test("remote copy checks proven source read access and destination create access
     targetId,
     "Destination-test-password!",
   );
-  const request = (paths = ["source.txt"]) => ({
+  const request = (
+    paths = ["source.txt"],
+    requestId = "cccccccc-cccc-cccc-cccc-cccccccccccc",
+  ) => ({
     ...json("POST", {
       sourceServerId: id,
       paths,
       destinationPath: "",
-      requestId: "cccccccc-cccc-cccc-cccc-cccccccccccc",
+      requestId,
     }),
     headers: {
       "X-Server-Id": targetId,
@@ -704,6 +707,16 @@ test("remote copy checks proven source read access and destination create access
   });
   assert.equal(progress.status, 200);
   assert.equal(progress.body.operation.status, "completed");
+  const repeat = await asBoth(
+    "/api/files/copy",
+    request(["source.txt"], "dddddddd-dddd-dddd-dddd-dddddddddddd"),
+  );
+  assert.equal(
+    repeat.status,
+    409,
+    "Comparing destination bytes requires read-content permission on that server.",
+  );
+  assert.equal(repeat.body.skippedFiles, undefined);
   assert.equal(
     (
       await asBoth("/api/files/copy-operation", {

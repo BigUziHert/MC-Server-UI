@@ -120,7 +120,68 @@ async function boundary(root, safePath, io) {
   };
 }
 
-/** Copy or move selected trees, or rename one file in its current directory. */
+// Rename the directory entry itself so even a large world moves in one
+// operation, preserving its contents, directory identity and permissions.
+async function renameFolder(
+  io,
+  resolve,
+  relative,
+  renamed,
+  original,
+  caseOnly,
+) {
+  let reservation;
+  try {
+    // Windows refuses to replace another directory. POSIX rename can replace
+    // an empty one, so first claim the new name exclusively on those hosts.
+    if (!caseOnly && process.platform !== "win32") {
+      const to = await resolve(renamed);
+      await io.mkdir(to, { mode: 0o700 });
+      reservation = await io.lstat(to);
+    }
+    const from = await resolve(relative);
+    const destination = await resolve(renamed);
+    const source = await io.lstat(from);
+    if (!source.isDirectory() || !identity(source, original))
+      throw failure(
+        409,
+        "The folder changed. Refresh File Manager and try again.",
+      );
+    const expected = caseOnly ? original : reservation;
+    const current = await statOrNull(io, destination);
+    if (
+      expected
+        ? !current?.isDirectory() || !identity(expected, current)
+        : current
+    )
+      throw failure(
+        409,
+        "The destination changed. Refresh File Manager and try again.",
+      );
+    await io.rename(from, destination);
+    reservation = undefined;
+  } catch (cause) {
+    if (["EBUSY", "EPERM", "EACCES"].includes(cause.code))
+      throw failure(
+        409,
+        "The folder could not be renamed. Check its permissions and close any program using it.",
+      );
+    throw cause;
+  } finally {
+    if (reservation) {
+      try {
+        const reserved = await resolve(renamed);
+        const current = await statOrNull(io, reserved);
+        if (current?.isDirectory() && identity(reservation, current))
+          await io.rmdir(reserved);
+      } catch {
+        // Keep any externally changed entry and report the original error.
+      }
+    }
+  }
+}
+
+/** Copy or move selected trees, or rename one entry in its current directory. */
 export async function copyServerFiles({
   sourceDir,
   serverDir,
@@ -128,10 +189,12 @@ export async function copyServerFiles({
   paths,
   mode = "copy",
   renameTo,
+  renameType = "file",
   safePath,
   fileSystem = fs,
   onProgress,
   assertAccess = async () => {},
+  canReadDestination = () => true,
 }) {
   const io = fileSystem;
   const result = { copiedFiles: 0, copiedDirectories: 0, paths: [] };
@@ -150,10 +213,11 @@ export async function copyServerFiles({
       if (
         mode !== "move" ||
         selected.length !== 1 ||
+        !["file", "directory"].includes(renameType) ||
         normalize(renameTo) !== renameTo ||
         renameTo.includes("/")
       )
-        throw failure(400, "Choose one file and a new filename.");
+        throw failure(400, "Choose one file or folder and a new name.");
       destinationPath = selected[0].split("/").slice(0, -1).join("/");
     }
     const roots = selected.filter(
@@ -194,7 +258,51 @@ export async function copyServerFiles({
       bytesProcessed: 0,
       totalBytes: null,
     });
-    const walk = async (relative, destinationRelative) => {
+    const verifyExistingCopy = async (row, existing) => {
+      const conflict = () =>
+        Object.assign(
+          failure(
+            409,
+            `“${row.destinationRelative}” already exists. Choose another folder or rename the existing item.`,
+          ),
+          { code: "EEXIST" },
+        );
+      if (!canReadDestination() || existing.isSymbolicLink()) throw conflict();
+      if (row.stat.isDirectory() && existing.isDirectory()) return;
+      if (
+        !row.stat.isFile() ||
+        !existing.isFile() ||
+        row.stat.size !== existing.size
+      )
+        throw conflict();
+      const from = await source(row.relative);
+      if (!unchangedContent(await io.lstat(from), row.stat)) throw conflict();
+      const to = await target(row.destinationRelative);
+      if (from === to) return;
+      // Reuse the preflight comparison only while both files are unchanged.
+      if (row.verified && unchangedContent(existing, row.verified)) return;
+      const assertRead = async () => {
+        await assertAccess();
+        if (!canReadDestination()) throw conflict();
+      };
+      const incoming = await fileDigest(io, from, row.stat, assertRead);
+      const present = await fileDigest(io, to, existing, assertRead);
+      await assertRead();
+      const current = await statOrNull(
+        io,
+        await target(row.destinationRelative),
+      );
+      if (
+        !incoming ||
+        incoming !== present ||
+        !current ||
+        !unchangedContent(current, existing) ||
+        !unchangedContent(await io.lstat(await source(row.relative)), row.stat)
+      )
+        throw conflict();
+      row.verified = existing;
+    };
+    const walk = async (relative, destinationRelative, existing) => {
       if (rows.length >= 100_000)
         throw failure(
           400,
@@ -203,13 +311,18 @@ export async function copyServerFiles({
       await assertAccess();
       const stat = await io.lstat(await source(relative));
       if (renaming && !stat.isFile())
-        throw failure(400, "Choose a regular file to rename.");
+        throw failure(
+          409,
+          "The file changed. Refresh File Manager and try again.",
+        );
       if (stat.isSymbolicLink() || (!stat.isFile() && !stat.isDirectory()))
         throw failure(
           400,
           "File copies do not follow symbolic links or special files.",
         );
-      rows.push({ relative, destinationRelative, stat });
+      const row = { relative, destinationRelative, stat };
+      if (existing) await verifyExistingCopy(row, existing);
+      rows.push(row);
       if (stat.isFile()) {
         totalFiles++;
         totalBytes += stat.size;
@@ -219,8 +332,14 @@ export async function copyServerFiles({
         bytesProcessed: totalBytes,
       });
       if (stat.isDirectory()) {
-        for (const name of (await io.readdir(await source(relative))).sort())
-          await walk(`${relative}/${name}`, `${destinationRelative}/${name}`);
+        for (const name of (await io.readdir(await source(relative))).sort()) {
+          const child = `${destinationRelative}/${name}`;
+          await walk(
+            `${relative}/${name}`,
+            child,
+            existing && (await statOrNull(io, await target(child))),
+          );
+        }
       }
     };
     const destinationFor = (relative) =>
@@ -229,51 +348,80 @@ export async function copyServerFiles({
         .join("/");
     for (const relative of roots) {
       const destinationRelative = destinationFor(relative);
-      if (!renaming && sameServer && inside(relative, destinationRelative))
+      const existing = await statOrNull(io, await target(destinationRelative));
+      const sameFile =
+        mode === "copy" &&
+        key(relative) === key(destinationRelative) &&
+        existing?.isFile();
+      if (
+        !renaming &&
+        sameServer &&
+        inside(relative, destinationRelative) &&
+        !sameFile
+      )
         throw failure(
           409,
           "A file or folder cannot be copied into itself or one of its subfolders.",
         );
-      const existing = await statOrNull(io, await target(destinationRelative));
-      if (
-        renaming &&
-        existing?.isFile() &&
-        relative.toLowerCase() === destinationRelative.toLowerCase()
-      ) {
+      if (renaming) {
+        const item = await io.lstat(await source(relative));
+        const folder = renameType === "directory";
+        if (folder ? !item.isDirectory() : !item.isFile())
+          throw failure(
+            409,
+            "The item type changed. Refresh File Manager and try again.",
+          );
         if (relative === destinationRelative) return result;
-        // On a case-insensitive volume both spellings can resolve to the one
-        // directory entry. An existing hard link has its own name and must
-        // still be treated as a conflict.
-        if (identity(await io.lstat(await source(relative)), existing)) {
+        let caseOnly = false;
+        if (
+          existing &&
+          identity(item, existing) &&
+          relative.toLowerCase() === destinationRelative.toLowerCase()
+        ) {
+          // A second hard link with the requested spelling is a conflict.
           const names = await io.readdir(destination);
-          if (
+          caseOnly =
             names.includes(path.posix.basename(relative)) &&
-            !names.includes(renameTo)
-          ) {
+            !names.includes(renameTo);
+        }
+        if (existing && !caseOnly)
+          throw failure(
+            409,
+            `“${renameTo}” already exists. Choose another name.`,
+          );
+        if (folder || caseOnly) {
+          if (folder) {
+            await renameFolder(
+              io,
+              target,
+              relative,
+              destinationRelative,
+              item,
+              caseOnly,
+            );
+            result.copiedDirectories++;
+          } else {
             await io.rename(
               await source(relative),
               await target(destinationRelative),
             );
-            result.paths.push(destinationRelative);
             result.copiedFiles++;
-            return result;
           }
+          result.paths.push(destinationRelative);
+          return result;
         }
-      }
-      if (existing)
+      } else if (mode === "move" && existing)
         throw failure(
           409,
-          renaming
-            ? `“${renameTo}” already exists. Choose another name.`
-            : `“${destinationRelative}” already exists. Choose another folder or rename the existing item.`,
+          `“${destinationRelative}” already exists. Choose another folder or rename the existing item.`,
         );
-      await walk(relative, destinationRelative);
+      await walk(relative, destinationRelative, mode === "copy" && existing);
     }
     let bytesProcessed = 0;
     const report = () =>
       notify(onProgress, {
         phase: "copying",
-        filesProcessed: result.copiedFiles,
+        filesProcessed: result.copiedFiles + (result.skippedFiles ?? 0),
         totalFiles,
         bytesProcessed,
         totalBytes,
@@ -487,6 +635,17 @@ export async function copyServerFiles({
         throw cause;
       }
     }
+    // Each publication is still exclusive. A destination appearing since the
+    // scan must pass the same comparison before it can count as a skip.
+    const verifyCollision = async (row, cause) => {
+      if (cause.code !== "EEXIST") throw cause;
+      const current = await statOrNull(
+        io,
+        await target(row.destinationRelative),
+      );
+      if (!current) throw cause;
+      await verifyExistingCopy(row, current);
+    };
     for (const row of rows) {
       await assertAccess();
       const from = await source(row.relative),
@@ -504,7 +663,13 @@ export async function copyServerFiles({
           "A source item changed during the copy. Completed copies have been retained.",
         );
       if (row.stat.isDirectory()) {
-        await io.mkdir(to); // Exclusive: existing folders are never merged by Paste.
+        try {
+          await io.mkdir(to);
+        } catch (cause) {
+          await verifyCollision(row, cause);
+          continue;
+        }
+        row.createdDirectory = true;
         result.copiedDirectories++;
       } else {
         const input = await io.open(from, "r");
@@ -516,7 +681,15 @@ export async function copyServerFiles({
               "A source file changed before it could be copied.",
             );
           await source(row.relative);
-          output = await io.open(await target(row.destinationRelative), "wx");
+          try {
+            output = await io.open(await target(row.destinationRelative), "wx");
+          } catch (cause) {
+            await verifyCollision(row, cause);
+            result.skippedFiles = (result.skippedFiles ?? 0) + 1;
+            bytesProcessed += row.stat.size;
+            report();
+            continue;
+          }
           created = await output.stat();
           const checkDestination = async () => {
             const currentTarget = await io.lstat(
@@ -613,7 +786,7 @@ export async function copyServerFiles({
     }
     // Directory times/modes are restored after writing their descendants.
     for (const row of [...rows].reverse()) {
-      if (!row.stat.isDirectory()) continue;
+      if (!row.createdDirectory) continue;
       await assertAccess();
       const to = await target(row.destinationRelative);
       await io.chmod(to, row.stat.mode & 0o777);
@@ -637,10 +810,10 @@ function arrayField(value, label, limit) {
   return parsed;
 }
 
-const unchangedUpload = (current, expected) =>
+const unchangedContent = (current, expected) =>
   unchangedFile(current, expected) && current.ctimeMs === expected.ctimeMs;
 
-async function uploadDigest(io, target, expected) {
+async function fileDigest(io, target, expected, assertRead) {
   const handle = await io.open(
     target,
     constants.O_RDONLY |
@@ -648,18 +821,19 @@ async function uploadDigest(io, target, expected) {
       (constants.O_NONBLOCK ?? 0),
   );
   try {
-    if (!unchangedUpload(await handle.stat(), expected)) return null;
+    if (!unchangedContent(await handle.stat(), expected)) return null;
     const hash = createHash("sha256");
-    const buffer = Buffer.allocUnsafe(Math.min(expected.size, 128 * 1024));
+    const buffer = Buffer.allocUnsafe(Math.min(expected.size, 1024 * 1024));
     let offset = 0;
     while (offset < expected.size) {
+      if (assertRead) await assertRead();
       const length = Math.min(buffer.length, expected.size - offset);
       const { bytesRead } = await handle.read(buffer, 0, length, offset);
       if (!bytesRead) return null;
       hash.update(buffer.subarray(0, bytesRead));
       offset += bytesRead;
     }
-    return unchangedUpload(await handle.stat(), expected)
+    return unchangedContent(await handle.stat(), expected)
       ? hash.digest("hex")
       : null;
   } finally {
@@ -760,14 +934,14 @@ export async function uploadServerFiles({
     const previous = verified.get(i);
     if (
       previous &&
-      unchangedUpload(existing, previous.existing) &&
-      unchangedUpload(source, previous.source)
+      unchangedContent(existing, previous.existing) &&
+      unchangedContent(source, previous.source)
     )
       return true;
-    const incoming = await uploadDigest(io, temporary, source);
+    const incoming = await fileDigest(io, temporary, source);
     let destination;
     try {
-      destination = await uploadDigest(io, target, existing);
+      destination = await fileDigest(io, target, existing);
     } catch (cause) {
       if (cause.code !== "ENOENT") throw cause;
     }
@@ -776,8 +950,8 @@ export async function uploadServerFiles({
     if (
       !incoming ||
       incoming !== destination ||
-      !unchangedUpload(current, existing) ||
-      !unchangedUpload(await io.lstat(temporary), source)
+      !unchangedContent(current, existing) ||
+      !unchangedContent(await io.lstat(temporary), source)
     )
       throw conflict();
     verified.set(i, { source, existing });

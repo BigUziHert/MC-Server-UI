@@ -83,7 +83,7 @@ const loaders = [
 const shaderLoaders = ["iris", "optifine", "canvas", "vanilla"];
 const missing = (cause) => cause.code === "ENOENT" || cause.code === "ENOTDIR";
 const enabled = (value) => value === true || value === "true";
-const otherModCatalog = (platform) =>
+const otherCatalog = (platform) =>
   platform === "modrinth"
     ? "curseforge"
     : platform === "curseforge"
@@ -193,11 +193,13 @@ async function statOrNull(target) {
     throw cause;
   }
 }
+const maxPackageFileSize = 512 * 1024 ** 2;
+
 async function fileHash(
   target,
   algorithm = "sha512",
   signal,
-  maximum = 512 * 1024 ** 2,
+  maximum = maxPackageFileSize,
 ) {
   return (await fileHashes(target, [algorithm], signal, maximum))[algorithm];
 }
@@ -205,7 +207,7 @@ async function fileHashes(
   target,
   algorithms,
   signal,
-  maximum = 512 * 1024 ** 2,
+  maximum = maxPackageFileSize,
 ) {
   signal?.throwIfAborted();
   const before = await fs.lstat(target);
@@ -215,35 +217,50 @@ async function fileHashes(
       "Only regular files under 512 MB can be managed by Launchpad.",
     );
   const handle = await fs.open(target, "r");
-  const hashes = new Map(
-    [...new Set(algorithms)].map((algorithm) => [
-      algorithm,
-      createHash(algorithm),
-    ]),
-  );
   try {
     const opened = await handle.stat();
-    if (opened.ino !== before.ino || opened.dev !== before.dev)
+    if (fileStamp(opened) !== fileStamp(before))
       throw error(
         409,
         "A file changed while it was being checked. Refresh and try again.",
       );
-    for await (const chunk of handle.createReadStream({
-      autoClose: false,
-      signal,
-    })) {
+    const read = () =>
+      handle.createReadStream({
+        autoClose: false,
+        start: 0,
+        end: Math.max(0, before.size - 1),
+        signal,
+      });
+    const hashes = new Map();
+    const fingerprint = algorithms.includes("fingerprint");
+    for (const algorithm of new Set(algorithms))
+      if (algorithm !== "fingerprint")
+        hashes.set(algorithm, createHash(algorithm));
+    let length = 0;
+    for await (const chunk of read()) {
       signal?.throwIfAborted();
       for (const hash of hashes.values()) hash.update(chunk);
+      if (fingerprint) length += fingerprintLength(chunk);
     }
-    const after = await handle.stat();
-    if (after.size !== before.size || after.mtimeMs !== before.mtimeMs)
+    const result = Object.fromEntries(
+      [...hashes].map(([algorithm, hash]) => [algorithm, hash.digest("hex")]),
+    );
+    if (fingerprint) {
+      // CurseForge seeds MurmurHash2 with the count of non-whitespace bytes.
+      // Rewind the same handle and carry partial words across chunk boundaries.
+      const murmur = createCurseFingerprint(length);
+      for await (const chunk of read()) {
+        signal?.throwIfAborted();
+        murmur.update(chunk);
+      }
+      result.fingerprint = murmur.digest();
+    }
+    if (fileStamp(await handle.stat()) !== fileStamp(before))
       throw error(
         409,
         "A file changed while it was being checked. Refresh and try again.",
       );
-    return Object.fromEntries(
-      [...hashes].map(([algorithm, hash]) => [algorithm, hash.digest("hex")]),
-    );
+    return result;
   } finally {
     await handle.close();
   }
@@ -259,29 +276,43 @@ const publicVersion = (value) => ({
 });
 // CurseForge's fingerprint is only a lookup hint. Matches below are additionally
 // verified against the API's SHA-1 file hash before an update can be offered.
-export function curseFingerprint(bytes) {
-  const whitespace = (byte) =>
-    byte === 9 || byte === 10 || byte === 13 || byte === 32;
+const fingerprintWhitespace = (byte) =>
+  byte === 9 || byte === 10 || byte === 13 || byte === 32;
+function fingerprintLength(bytes) {
   let length = 0;
-  for (const byte of bytes) if (!whitespace(byte)) length++;
+  for (const byte of bytes) if (!fingerprintWhitespace(byte)) length++;
+  return length;
+}
+function createCurseFingerprint(length) {
   let hash = 1 ^ length,
     value = 0,
     shift = 0;
-  for (const byte of bytes) {
-    if (whitespace(byte)) continue;
-    value |= byte << shift;
-    shift += 8;
-    if (shift === 32) {
-      value = Math.imul(value, 0x5bd1e995);
-      value ^= value >>> 24;
-      hash = Math.imul(hash, 0x5bd1e995) ^ Math.imul(value, 0x5bd1e995);
-      value = 0;
-      shift = 0;
-    }
-  }
-  if (shift) hash = Math.imul(hash ^ value, 0x5bd1e995);
-  hash = Math.imul(hash ^ (hash >>> 13), 0x5bd1e995);
-  return (hash ^ (hash >>> 15)) >>> 0;
+  return {
+    update(bytes) {
+      for (const byte of bytes) {
+        if (fingerprintWhitespace(byte)) continue;
+        value |= byte << shift;
+        shift += 8;
+        if (shift === 32) {
+          value = Math.imul(value, 0x5bd1e995);
+          value ^= value >>> 24;
+          hash = Math.imul(hash, 0x5bd1e995) ^ Math.imul(value, 0x5bd1e995);
+          value = 0;
+          shift = 0;
+        }
+      }
+    },
+    digest() {
+      const tail = shift ? Math.imul(hash ^ value, 0x5bd1e995) : hash;
+      const final = Math.imul(tail ^ (tail >>> 13), 0x5bd1e995);
+      return (final ^ (final >>> 15)) >>> 0;
+    },
+  };
+}
+export function curseFingerprint(bytes) {
+  const murmur = createCurseFingerprint(fingerprintLength(bytes));
+  murmur.update(bytes);
+  return murmur.digest();
 }
 
 export async function createLaunchpad(ctx) {
@@ -889,9 +920,12 @@ export async function createLaunchpad(ctx) {
     type,
     signal = lifetime.signal,
     warnings = [],
-    isolated = false,
-    quick = false,
-    contentScope = "server",
+    {
+      isolated = false,
+      quick = false,
+      contentScope = "server",
+      prune = !isolated,
+    } = {},
   ) {
     signal.throwIfAborted();
     if (type === "modpack") return [];
@@ -1008,11 +1042,9 @@ export async function createLaunchpad(ctx) {
           receipt?.platform && cachedIdentity?.platform !== receipt.platform
             ? undefined
             : cachedIdentity;
-        const other = otherModCatalog(known?.platform ?? receipt?.platform);
+        const other = otherCatalog(known?.platform ?? receipt?.platform);
         const alias =
-          type === "mod" &&
-          other &&
-          catalogLookups.get(`${other}:${sha512}`)?.identity;
+          other && catalogLookups.get(`${other}:${sha512}`)?.identity;
         rows[index] = {
           path: relativePath,
           name: file.name,
@@ -1036,9 +1068,9 @@ export async function createLaunchpad(ctx) {
       signal,
     );
     signal.throwIfAborted();
-    // Restore previews are bounded, read-only checks; leave receipt cleanup to
-    // the regular inventory rather than starting a save after their deadline.
-    if (!isolated) await pruneReceipts(confirmedFiles);
+    // The regular inventory owns receipt cleanup. A lookup for another tab or
+    // a bounded restore preview only needs to identify the files it scanned.
+    if (prune) await pruneReceipts(confirmedFiles);
     return rows.filter(Boolean);
   }
   async function pruneReceipts(confirmedFiles = new Set()) {
@@ -1551,7 +1583,10 @@ export async function createLaunchpad(ctx) {
             ]),
           ];
   }
-  async function installed(input) {
+  async function installed(
+    input,
+    mode = enabled(input?.identityOnly) ? "identities" : "full",
+  ) {
     input = selection(input);
     const cacheGeneration = metadataCache?.generation;
     const scope = JSON.stringify([
@@ -1563,7 +1598,7 @@ export async function createLaunchpad(ctx) {
     const existingCheck = backgroundChecks.get(scope);
     if (
       !enabled(input.local) &&
-      !input.identityOnly &&
+      mode === "full" &&
       existingCheck &&
       !existingCheck.done
     ) {
@@ -1580,7 +1615,7 @@ export async function createLaunchpad(ctx) {
       });
     }
     const completedCheck =
-      !enabled(input.local) && !input.identityOnly && existingCheck?.done
+      !enabled(input.local) && mode === "full" && existingCheck?.done
         ? existingCheck
         : null;
     if (completedCheck) backgroundChecks.delete(scope);
@@ -1594,17 +1629,15 @@ export async function createLaunchpad(ctx) {
               name: item.title,
               addedAt: item.installedAt,
             }))
-        : await scan(
-            input.type,
-            input.signal,
-            scanWarnings,
-            false,
-            enabled(input.local) && enabled(input.quick),
-            input.target,
-          );
+        : await scan(input.type, input.signal, scanWarnings, {
+            quick: enabled(input.local) && enabled(input.quick),
+            contentScope: input.target,
+            prune: mode !== "identities",
+          });
     for (const item of items) {
       const url = projectPageUrl(item);
       if (url) item.url = url;
+      if (mode !== "full") continue;
       const cached = updateCache.get(updateKey(input, item));
       // Keep the last verified update visible if the provider is temporarily
       // unavailable. Its expiry controls rechecking, not erasing known updates.
@@ -1664,7 +1697,7 @@ export async function createLaunchpad(ctx) {
       input.gameVersion,
       input.loader,
       enabled(input.refresh),
-      Boolean(input.identityOnly),
+      mode,
       items.map((item) => [
         item.path,
         item.sha512,
@@ -1688,6 +1721,7 @@ export async function createLaunchpad(ctx) {
             { ...input, signal },
             items,
             warnings,
+            mode,
             cacheGeneration,
           );
         } catch (cause) {
@@ -1703,16 +1737,30 @@ export async function createLaunchpad(ctx) {
           ),
         ];
         for (const item of items) {
-          if (!["checked", "unlisted"].includes(item.updateCheck))
+          if (
+            mode === "full" &&
+            !["checked", "unlisted"].includes(item.updateCheck)
+          )
             item.updateCheck = "unavailable";
-          if (!item.sha512) continue;
-          if (item.platform)
+          if (!item.sha512 || cacheGeneration !== metadataCache?.generation)
+            continue;
+          const previous = identities.get(item.sha512);
+          // A lookup must not replace richer metadata from a concurrent full
+          // inventory, or cache an unknown result before JAR recovery ran.
+          if (
+            (mode !== "full" && previous?.value?.platform) ||
+            (mode === "exact" && !item.platform)
+          )
+            continue;
+          if (
+            item.platform &&
+            (mode === "full" || !metadataCache?.identity(item.sha512))
+          )
             metadataCache?.rememberIdentity(
               item.sha512,
               identityFields(item),
               cacheGeneration,
             );
-          const previous = identities.get(item.sha512);
           // Polling an unchanged negative result must not renew its retry
           // deadline forever while a provider recovers in the background.
           if (
@@ -1743,7 +1791,7 @@ export async function createLaunchpad(ctx) {
         () => inventoryFlights.delete(flightKey),
       );
     }
-    if (enabled(input.background)) {
+    if (mode === "full" && enabled(input.background)) {
       const entry = { items, warnings: scanWarnings, done: false, task };
       backgroundChecks.set(scope, entry);
       void task.then(
@@ -1773,13 +1821,42 @@ export async function createLaunchpad(ctx) {
     }
     return structuredClone(await abortable(task, input.signal));
   }
+
+  async function curseFileIdentity(item, signal) {
+    const target = await safePath(serverDir, item.path);
+    const stamp = fileStamp(await fs.lstat(target));
+    const cached = fileCache.get(item.path);
+    if (
+      cached?.stamp === stamp &&
+      cached.sha512 === item.sha512 &&
+      cached.sha1 &&
+      cached.fingerprint !== undefined
+    )
+      return cached;
+
+    const digest = await fileHashes(
+      target,
+      ["sha512", "sha1", "fingerprint"],
+      signal,
+    );
+    if (
+      digest.sha512 !== item.sha512 ||
+      fileStamp(await fs.lstat(target)) !== stamp
+    )
+      throw error(409, "The file changed while checking its identity.");
+    remember(fileCache, item.path, { stamp, ...digest });
+    return digest;
+  }
+
   async function installedDetails(
     input,
     items,
     warnings,
+    mode,
     cacheGeneration = metadataCache?.generation,
   ) {
     if (input.type === "modpack") {
+      if (mode !== "full") return;
       await Promise.all([
         enrichProjectMetadata(
           items,
@@ -1789,15 +1866,11 @@ export async function createLaunchpad(ctx) {
           cacheGeneration,
           input.type,
         ),
-        ...(input.identityOnly
-          ? []
-          : [
-              checkUpdates(
-                { ...input, gameVersion: "", loader: "" },
-                items,
-                warnings,
-              ),
-            ]),
+        checkUpdates(
+          { ...input, gameVersion: "", loader: "" },
+          items,
+          warnings,
+        ),
       ]);
       input.signal.throwIfAborted();
       for (const item of items) item.name = item.title;
@@ -1820,11 +1893,7 @@ export async function createLaunchpad(ctx) {
         warnings.push(...cached.warnings);
     }
     const wantsAlias = (item, platform) => {
-      if (
-        input.type !== "mod" ||
-        !item.sha512 ||
-        otherModCatalog(item.platform) !== platform
-      )
+      if (!item.sha512 || otherCatalog(item.platform) !== platform)
         return false;
       const cached = catalogLookups.get(`${platform}:${item.sha512}`);
       if (cached?.identity) {
@@ -1840,10 +1909,7 @@ export async function createLaunchpad(ctx) {
       versionName,
       retryMs = 600_000,
     ) => {
-      if (
-        input.type === "mod" &&
-        cacheGeneration === metadataCache?.generation
-      ) {
+      if (cacheGeneration === metadataCache?.generation) {
         const key = `${platform}:${item.sha512}`;
         if (identity || !catalogLookups.get(key)?.identity)
           remember(
@@ -1923,59 +1989,33 @@ export async function createLaunchpad(ctx) {
     if (await key()) {
       const candidates = items.filter(
         (item) =>
-          item.size <= 128 * 1024 ** 2 &&
+          item.size <= maxPackageFileSize &&
           ((unknown.includes(item) && !item.platform) ||
             wantsAlias(item, "curseforge")),
       );
-      if (candidates.length) {
+      const fingerprints = new Map();
+      for (const item of candidates) {
+        input.signal.throwIfAborted();
         try {
-          const fingerprints = new Map();
-          for (const item of candidates) {
-            input.signal.throwIfAborted();
-            const target = await safePath(serverDir, item.path);
-            const stamp = fileStamp(await fs.lstat(target));
-            const cached = fileCache.get(item.path);
-            if (
-              cached?.stamp === stamp &&
-              cached.sha512 === item.sha512 &&
-              cached.sha1 &&
-              cached.fingerprint !== undefined
-            ) {
-              fingerprints.set(item, {
-                fingerprint: cached.fingerprint,
-                sha1: cached.sha1,
-              });
-              continue;
-            }
-            const bytes = await fs.readFile(target, { signal: input.signal });
-            input.signal.throwIfAborted();
-            if (
-              createHash("sha512").update(bytes).digest("hex") !==
-                item.sha512 ||
-              fileStamp(await fs.lstat(target)) !== stamp
-            )
-              throw error(
-                409,
-                `${item.name} changed while checking its identity.`,
-              );
-            const digest = {
-              fingerprint: curseFingerprint(bytes),
-              sha1: createHash("sha1").update(bytes).digest("hex"),
-            };
-            fingerprints.set(item, digest);
-            remember(fileCache, item.path, {
-              stamp,
-              sha512: item.sha512,
-              ...digest,
-            });
-          }
+          const digest = await curseFileIdentity(item, input.signal);
+          fingerprints.set(item, digest);
+        } catch (cause) {
+          input.signal.throwIfAborted();
+          noteLookup(item, "curseforge", null, undefined, 30_000);
+          warnings.push(
+            `CurseForge identification: ${item.name}: ${cause.message}`,
+          );
+        }
+      }
+      if (fingerprints.size) {
+        try {
+          const lookup = new Set(
+            [...fingerprints.values()].map((digest) => digest.fingerprint),
+          );
           const result = await abortable(
             providers
               .find((value) => value.id === "curseforge")
-              .identifyFingerprints(
-                [...fingerprints.values()].map((value) => value.fingerprint),
-                { signal: input.signal },
-              ),
+              .identifyFingerprints([...lookup], { signal: input.signal }),
             input.signal,
           );
           for (const [item, digest] of fingerprints) {
@@ -2005,17 +2045,20 @@ export async function createLaunchpad(ctx) {
           }
         } catch (cause) {
           input.signal.throwIfAborted();
-          for (const item of candidates)
+          for (const item of fingerprints.keys())
             noteLookup(item, "curseforge", null, undefined, 30_000);
           warnings.push(`CurseForge identification: ${cause.message}`);
         }
       }
     }
     input.signal.throwIfAborted();
-    if (input.identityOnly) return;
+    // Mutation previews use exact identifiers, whereas catalog browsing can
+    // also recognize a repackaged JAR by its verified archive contents.
+    if (mode === "exact") return;
     const known = new Set(items.filter((item) => item.platform));
-    const details = (entries) =>
-      Promise.all([
+    const details = async (entries) => {
+      if (mode !== "full") return;
+      await Promise.all([
         enrichProjectMetadata(
           entries,
           warnings,
@@ -2026,6 +2069,7 @@ export async function createLaunchpad(ctx) {
         ),
         checkUpdates(input, entries, warnings),
       ]);
+    };
     const recoverMissing = async () => {
       if (input.type === "mod" && modrinth.installedCandidates) {
         let downloadBytes = 0;
@@ -3358,7 +3402,7 @@ export async function createLaunchpad(ctx) {
       const identified =
         input.type === "modpack"
           ? { items: [], warnings: [] }
-          : await installed({ ...input, identityOnly: true });
+          : await installed(input, "exact");
       const local = identified.items;
       let shared;
       if (input.target === "automodpack" && input.type === "mod") {
@@ -3414,11 +3458,10 @@ export async function createLaunchpad(ctx) {
               shared.sourcesSnapshot = sources.snapshot;
               shared.warnings = sources.warnings;
               shared.includes = sources.includes;
-              const regular = await installed({
-                ...input,
-                target: "server",
-                identityOnly: true,
-              });
+              const regular = await installed(
+                { ...input, target: "server" },
+                "exact",
+              );
               shared.items = regular.items.filter(
                 (item) => item.active !== false,
               );
@@ -4624,17 +4667,17 @@ export async function createLaunchpad(ctx) {
         };
       const current = await abortable(getServer(), signal);
       const warnings = [];
-      const items = await scan("mod", signal, warnings, true);
+      const items = await scan("mod", signal, warnings, { isolated: true });
       await installedDetails(
         {
           type: "mod",
           loader: current.loader,
           gameVersion: current.gameVersion,
-          identityOnly: true,
           signal,
         },
         items,
         warnings,
+        "exact",
       );
       signal.throwIfAborted();
       return {

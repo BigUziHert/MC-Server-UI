@@ -77,6 +77,7 @@ type Item = {
   projectId: string;
   versionId: string;
   versionName: string;
+  catalogAliases?: { platform: string; projectId: string; versionId: string }[];
   active: boolean;
   update: typeof version | null;
   updateCheck: string;
@@ -97,10 +98,16 @@ const item = (path: string, release = "1.0"): Item => ({
   updateCheck: "checked",
 });
 
-async function catalog(page: Page, supportsAutoModpack = true) {
+async function catalog(
+  page: Page,
+  supportsAutoModpack = true,
+  platform = "modrinth",
+  platforms = [platform],
+) {
   const inventories = new Map<string, Item[]>([
-    ["server:mod", [item("mods/shared.jar")]],
+    ["server:mod", [{ ...item("mods/shared.jar"), platform }]],
   ]);
+  const projects = [{ ...project, platform }];
   const reads: URL[] = [];
   const writes: { path: string; body: Record<string, unknown> }[] = [];
   let reviewedType = "mod";
@@ -113,25 +120,23 @@ async function catalog(page: Page, supportsAutoModpack = true) {
     route.fulfill({
       json: {
         ...(supportsAutoModpack ? { targets: ["server", "automodpack"] } : {}),
-        platforms: [
-          {
-            id: "modrinth",
-            name: "Modrinth",
-            available: true,
-            types: [
-              "modpack",
-              "mod",
-              "datapack",
-              "plugin",
-              "resourcepack",
-              "shader",
-            ],
-            sortOptions: [
-              { id: "downloads", label: "Total Downloads" },
-              { id: "updated", label: "Latest Update" },
-            ],
-          },
-        ],
+        platforms: platforms.map((id) => ({
+          id,
+          name: id === "curseforge" ? "CurseForge" : "Modrinth",
+          available: true,
+          types: [
+            "modpack",
+            "mod",
+            "datapack",
+            "plugin",
+            "resourcepack",
+            "shader",
+          ],
+          sortOptions: [
+            { id: "downloads", label: "Total Downloads" },
+            { id: "updated", label: "Latest Update" },
+          ],
+        })),
         status: "offline",
         gameVersion: "1.21.1",
         loader: "neoforge",
@@ -144,8 +149,11 @@ async function catalog(page: Page, supportsAutoModpack = true) {
   await page.route("**/api/launchpad/search?**", (route) => {
     const url = new URL(route.request().url());
     reads.push(url);
+    const matches = projects.filter(
+      (entry) => entry.platform === url.searchParams.get("platform"),
+    );
     return route.fulfill({
-      json: { projects: [project], total: 1, offset: 0, limit: 10 },
+      json: { projects: matches, total: matches.length, offset: 0, limit: 10 },
     });
   });
   await page.route("**/api/launchpad/installed?**", (route) => {
@@ -241,8 +249,242 @@ async function catalog(page: Page, supportsAutoModpack = true) {
     inventories.set(`automodpack:${body.type}`, []);
     return route.fulfill({ json: { removed: true } });
   });
-  return { reads, writes, inventories, folder };
+  return { reads, writes, inventories, folder, projects };
 }
+
+test("switching catalogs keeps resource packs, shaders, datapacks and plugins marked installed", async ({
+  page,
+}) => {
+  const state = await catalog(page, true, "modrinth", [
+    "modrinth",
+    "curseforge",
+  ]);
+  const other = {
+    ...project,
+    id: "491",
+    title: "Alternate catalog title",
+    platform: "curseforge",
+  };
+  state.projects.push(other);
+  const targets = [
+    {
+      label: "Resource Packs",
+      type: "resourcepack",
+      target: "automodpack",
+      path: "automodpack/host-modpack/main/resourcepacks/local.zip.disabled",
+    },
+    {
+      label: "Shader Packs",
+      type: "shader",
+      target: "automodpack",
+      path: "automodpack/host-modpack/main/shaderpacks/local.zip.disabled",
+    },
+    {
+      label: "Datapacks",
+      type: "datapack",
+      target: "server",
+      path: "world/datapacks/local.zip",
+    },
+    {
+      label: "Plugins",
+      type: "plugin",
+      target: "server",
+      path: "plugins/local.jar",
+    },
+  ];
+  for (const { type, target, path } of targets)
+    state.inventories.set(`${target}:${type}`, [
+      {
+        ...item(path),
+        active: !path.endsWith(".disabled"),
+        catalogAliases: [
+          { platform: other.platform, projectId: other.id, versionId: "621" },
+        ],
+      },
+    ]);
+  await page.goto("/#launchpad");
+  const tabs = page.getByRole("tablist", { name: "Content type" });
+  for (const { label, target } of targets) {
+    if (target === "automodpack") {
+      await tabs.getByRole("tab", { name: "AutoModpack", exact: true }).click();
+      await page
+        .getByRole("group", { name: "AutoModpack content" })
+        .getByRole("button", { name: label, exact: true })
+        .click();
+    } else {
+      await tabs.getByRole("tab", { name: label, exact: true }).click();
+    }
+    for (const listing of [project, other]) {
+      await page
+        .getByRole("combobox", { name: "Platform", exact: true })
+        .selectOption(listing.platform);
+      const row = page.getByRole("article", {
+        name: listing.title,
+        exact: true,
+      });
+      await expect(row.getByText("Installed", { exact: true })).toBeVisible();
+      await expect(
+        row.getByRole("button", {
+          name: `Choose version for ${listing.title}`,
+          exact: true,
+        }),
+      ).toBeVisible();
+      await expect(row.getByRole("button", { name: /^Install / })).toHaveCount(
+        0,
+      );
+      if (target === "automodpack")
+        await expect(row.getByText("Disabled", { exact: true })).toBeVisible();
+    }
+  }
+  expect(state.writes).toEqual([]);
+});
+
+test("Mods catalog recognizes AutoModpack projects across providers and opens the matching installed file", async ({
+  page,
+}) => {
+  const state = await catalog(page, true, "curseforge");
+  const [listing] = state.projects;
+  const matching = {
+    ...item("automodpack/host-modpack/main/mods/renamed.jar.disabled"),
+    title: "Client bindings",
+    platform: "modrinth",
+    projectId: "84",
+    active: false,
+    catalogAliases: [
+      { platform: listing.platform, projectId: "491", versionId: "621" },
+    ],
+  };
+  const native = {
+    ...item("automodpack/host-modpack/main/mods/mouse.jar"),
+    title: "Mouse Tweaks",
+    platform: listing.platform,
+    projectId: "500",
+  };
+  state.inventories.set("automodpack:mod", [
+    matching,
+    native,
+    { ...item(state.folder("mod"), "2.0"), platform: listing.platform },
+    // The requested file would be on the second installed page without navigation.
+    ...Array.from({ length: 11 }, (_, n) => ({
+      ...item(`automodpack/host-modpack/main/mods/addon-${n}.jar`),
+      title: `Addon ${n}`,
+      projectId: `addon-${n}`,
+    })),
+  ]);
+  state.projects.push(
+    { ...listing, id: "491", title: "Controlling" },
+    { ...listing, id: native.projectId, title: native.title },
+    { ...listing, id: matching.projectId, title: matching.title },
+  );
+  // A freshly dropped pack JAR has no cached project identity on the quick scan.
+  await page.route("**/api/launchpad/installed?**", (route) => {
+    const params = new URL(route.request().url()).searchParams;
+    if (params.get("target") === "automodpack" && params.has("local"))
+      return route.fulfill({
+        json: {
+          items: [
+            {
+              ...matching,
+              platform: null,
+              projectId: null,
+              catalogAliases: [],
+            },
+          ],
+          warnings: [],
+        },
+      });
+    return route.fallback();
+  });
+  await page.goto("/#launchpad");
+  const row = (name: string) =>
+    page.getByRole("article", { name, exact: true });
+  const badge = (name: string) =>
+    row(name).getByText("Installed in AutoModpack", { exact: true });
+  const manage = (name: string) =>
+    row(name).getByRole("button", {
+      name: "Manage in AutoModpack",
+      exact: true,
+    });
+  for (const title of ["Controlling", native.title]) {
+    await expect(badge(title)).toBeVisible();
+    await expect(manage(title)).toBeEnabled();
+    await expect(
+      row(title).getByRole("button", { name: /^Install / }),
+    ).toHaveCount(0);
+    await expect(row(title).getByRole("switch")).toHaveCount(0);
+    await expect(
+      row(title).getByRole("button", { name: /^Remove / }),
+    ).toHaveCount(0);
+  }
+  // A project present in both locations keeps the controls for its server file.
+  await expect(badge(project.title)).toBeVisible();
+  await expect(manage(project.title)).toBeEnabled();
+  await expect(row(project.title)).toContainText("Installed: 1.0");
+  await expect(row(project.title).getByRole("switch")).toBeChecked();
+  await expect(
+    row(project.title).getByRole("button", { name: /^Remove / }),
+  ).toBeEnabled();
+  // Same title and numeric ID as the Modrinth file on a different platform.
+  await expect(badge(matching.title)).toHaveCount(0);
+  await expect(
+    row(matching.title).getByRole("button", {
+      name: `Install ${matching.title}`,
+    }),
+  ).toBeEnabled();
+
+  const installedOnly = page.getByRole("switch", {
+    name: "Show installed content",
+    exact: true,
+  });
+  await installedOnly.check();
+  await expect(row(project.title)).toContainText("mods/shared.jar");
+  await expect(row(native.title)).toHaveCount(0);
+  await expect(row(matching.title)).toHaveCount(0);
+  await installedOnly.uncheck();
+  await page
+    .getByRole("textbox", { name: "Search Launchpad", exact: true })
+    .fill("Controlling");
+  await manage("Controlling").click();
+  await expect(
+    page.getByRole("tab", { name: "AutoModpack", exact: true }),
+  ).toHaveAttribute("aria-selected", "true");
+  await expect(
+    page
+      .getByRole("group", { name: "AutoModpack content" })
+      .getByRole("button", { name: "Mods", exact: true }),
+  ).toHaveAttribute("aria-pressed", "true");
+  await expect(installedOnly).toBeChecked();
+  await expect(row(matching.title)).toContainText(matching.path);
+  await expect(row(matching.title).getByRole("switch")).not.toBeChecked();
+  await expect(page.getByRole("article")).toHaveCount(1);
+  await page.getByRole("button", { name: "Clear search", exact: true }).click();
+  await expect(row("Addon 0")).toBeVisible();
+  expect(state.writes).toEqual([]);
+});
+
+test("refreshing the Mods catalog clears the AutoModpack badge after the staged file is removed", async ({
+  page,
+}) => {
+  const state = await catalog(page);
+  state.inventories.set("server:mod", []);
+  state.inventories.set("automodpack:mod", [item(state.folder("mod"))]);
+  await page.goto("/#launchpad");
+  const row = page.getByRole("article", { name: project.title, exact: true });
+  const badge = row.getByText("Installed in AutoModpack", { exact: true });
+  await expect(badge).toBeVisible();
+  state.inventories.set("automodpack:mod", []);
+  await page
+    .getByRole("button", {
+      name: "Refresh Launchpad and check updates",
+      exact: true,
+    })
+    .click();
+  await expect(
+    row.getByRole("button", { name: `Install ${project.title}` }),
+  ).toBeEnabled();
+  await expect(badge).toHaveCount(0);
+  expect(state.writes).toEqual([]);
+});
 
 test("AutoModpack shows unlisted releases as neutral results and keeps real failures and regular Mods separate", async ({
   page,

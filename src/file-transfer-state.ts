@@ -86,6 +86,7 @@ export function startFileTransfer(
 
 type CopyResult = {
   copiedFiles: number;
+  skippedFiles?: number;
   copiedDirectories: number;
   paths: string[];
   mode?: "move";
@@ -115,13 +116,23 @@ export async function pasteFiles(
 ) {
   const moving = body.mode === "move";
   const verb = moving ? "moved" : "copied";
+  const skippedMessage = (skipped = 0) =>
+    skipped
+      ? ` Skipped ${skipped} identical ${skipped === 1 ? "file" : "files"}.`
+      : "";
   const completeMessage = (result: CopyResult) =>
-    `${result.copiedFiles} ${result.copiedFiles === 1 ? "file" : "files"} and ${result.copiedDirectories} ${result.copiedDirectories === 1 ? "folder" : "folders"} ${verb} to /${body.destinationPath || "server"}.`;
+    `${result.copiedFiles} ${result.copiedFiles === 1 ? "file" : "files"} and ${result.copiedDirectories} ${result.copiedDirectories === 1 ? "folder" : "folders"} ${verb} to /${body.destinationPath || "server"}.${skippedMessage(result.skippedFiles)}`;
   const partialFailure = (cause: Error, result?: Partial<CopyResult>) => {
-    if (result?.copiedFiles || result?.copiedDirectories) {
-      report({ completedFiles: result.copiedFiles ?? 0 });
+    if (
+      result?.copiedFiles ||
+      result?.copiedDirectories ||
+      result?.skippedFiles
+    ) {
+      report({
+        completedFiles: (result.copiedFiles ?? 0) + (result.skippedFiles ?? 0),
+      });
       return new Error(
-        `${cause.message} ${result.copiedFiles ?? 0} files and ${result.copiedDirectories ?? 0} folders were ${verb} before the operation stopped.`,
+        `${cause.message} ${result.copiedFiles ?? 0} files and ${result.copiedDirectories ?? 0} folders were ${verb} before the operation stopped.${skippedMessage(result.skippedFiles)}`,
       );
     }
     return cause;
@@ -142,7 +153,7 @@ export async function pasteFiles(
           report({
             status: "completed",
             message: completeMessage(result),
-            completedFiles: result.copiedFiles,
+            completedFiles: result.copiedFiles + (result.skippedFiles ?? 0),
           });
         } else if (
           unconfirmed &&
@@ -231,5 +242,6 @@ export async function pasteFiles(
         }
       });
   });
+  report({ completedFiles: result.copiedFiles + (result.skippedFiles ?? 0) });
   return completeMessage(result);
 }

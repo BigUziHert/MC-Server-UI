@@ -167,6 +167,99 @@ test("renaming a file preserves its bytes and lets you retry when a name is take
   }
 });
 
+test("F2 renames a folder with its contents and keeps the existing folder on a name conflict", async ({
+  page,
+  files,
+  request,
+}) => {
+  const headers = { "X-Server-Id": files.id };
+  const original = "client.mods";
+  const renamed = "client-mods";
+  const created = await request.post("/api/files", {
+    headers,
+    data: { path: files.folder, name: original, type: "directory" },
+  });
+  expect(created.status()).toBe(201);
+  const child = await request.post("/api/files", {
+    headers,
+    data: {
+      path: `${files.folder}/${original}`,
+      name: "notes.txt",
+      type: "file",
+      content: "Client pack",
+    },
+  });
+  expect(child.status()).toBe(201);
+  await openFiles(page, files);
+  await expect(
+    page.getByRole("button", { name: `Rename ${original}`, exact: true }),
+  ).toBeVisible();
+  await page
+    .getByRole("checkbox", { name: `Select ${original}`, exact: true })
+    .check();
+  await page.keyboard.press("F2");
+  const dialog = page.getByRole("dialog", {
+    name: "Rename folder",
+    exact: true,
+  });
+  const name = dialog.getByRole("textbox", {
+    name: "Folder name",
+    exact: true,
+  });
+  await expect(name).toBeFocused();
+  expect(
+    await name.evaluate((input: HTMLInputElement) =>
+      input.value.slice(input.selectionStart!, input.selectionEnd!),
+    ),
+  ).toBe(original);
+  await name.fill("archive");
+  await name.press("Enter");
+  await expect(dialog).toContainText(/already exists|already in use/i);
+  await name.fill(renamed);
+  await name.press("Enter");
+  await expect(dialog).toHaveCount(0);
+  await expect(
+    page.getByRole("button", { name: original, exact: true }),
+  ).toHaveCount(0);
+  await expect(
+    page.getByRole("checkbox", { name: `Select ${renamed}`, exact: true }),
+  ).toBeChecked();
+  await page.getByRole("button", { name: renamed, exact: true }).click();
+  await expect(
+    page.getByRole("button", { name: "notes.txt", exact: true }),
+  ).toBeVisible();
+  for (const [path, content] of [
+    [`${renamed}/notes.txt`, "Client pack"],
+    ["archive/nested/keep.txt", "Fixture contents\n"],
+  ]) {
+    const response = await request.get(
+      `/api/files/content?path=${files.folder}/${path}`,
+      { headers },
+    );
+    expect(response.status()).toBe(200);
+    expect((await response.json()).content).toBe(content);
+  }
+});
+
+test("a host supporting only file renames offers Rename on files only", async ({
+  page,
+  files,
+}) => {
+  await page.route("**/api/files?**", async (route) => {
+    const response = await route.fetch();
+    const body = await response.json();
+    delete body.supportsFolderRename;
+    await route.fulfill({ response, json: body });
+  });
+  await openFiles(page, files);
+  await expect(
+    page.getByRole("button", { name: "Rename beta.txt", exact: true }),
+  ).toBeEnabled();
+  await expect(
+    page.getByRole("button", { name: "Rename archive", exact: true }),
+  ).toHaveCount(0);
+});
+
 test("file context menu and shortcuts copy, select all, and confirm deletion without intercepting text", async ({
   page,
   files,
@@ -198,6 +291,13 @@ test("file context menu and shortcuts copy, select all, and confirm deletion wit
     { headers: { "X-Server-Id": files.id } },
   );
   expect((await response.json()).content).toBe("Fixture contents\n");
+  await expect(
+    page.getByRole("button", { name: "beta.txt", exact: true }),
+  ).toBeVisible();
+  await page.keyboard.press("Control+v");
+  await expect(
+    page.getByRole("status", { name: "File transfer progress" }),
+  ).toContainText("Skipped 1 identical file.");
   await page.keyboard.press("Backspace");
   await expect(beta).toBeVisible();
   await page.keyboard.press("Control+a");

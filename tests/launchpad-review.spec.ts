@@ -179,7 +179,12 @@ test("switching catalogs recognizes the same installed file and reviews versions
     expect(query.get("platform")).toBe(alias.platform);
     expect(query.get("projectId")).toBe(alias.projectId);
     return route.fulfill({
-      json: { versions: [{ ...version, id: "101" }, version] },
+      json: {
+        versions: [
+          { ...version, id: "101" },
+          { ...version, id: alias.versionId },
+        ],
+      },
     });
   });
   await page.route("**/api/launchpad/preview", (route) => {
@@ -236,7 +241,18 @@ test("switching catalogs recognizes the same installed file and reviews versions
   await linked
     .getByRole("button", { name: "Choose version for Other listing" })
     .click();
-  await page
+  const chooser = page.getByRole("dialog", {
+    name: "Choose version",
+    exact: true,
+  });
+  await expect(
+    chooser.getByLabel("Project version").locator("option"),
+  ).toHaveText([
+    "Select a version",
+    version.name,
+    `${version.name} · Installed`,
+  ]);
+  await chooser
     .getByRole("button", { name: "Review installation", exact: true })
     .click();
   const review = page.getByRole("dialog", { name: "Review installation" });
@@ -324,7 +340,9 @@ for (const bulk of [false, true]) {
     };
     await start();
     const dialog = page.getByRole("dialog", {
-      name: /^(?:Install content|Review installation)$/,
+      name: bulk
+        ? /^(?:Update content|Review installation)$/
+        : /^(?:Install content|Review installation)$/,
     });
     await expect(
       dialog.getByRole("button", { name: "Preparing review...", exact: true }),
