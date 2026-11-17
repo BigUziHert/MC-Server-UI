@@ -248,10 +248,13 @@ test("switching catalogs recognizes the same installed file and reviews versions
   await active.click();
   await expect(active).not.toBeChecked();
   await linked.getByRole("button", { name: "Remove Other listing" }).click();
-  await page
-    .getByRole("dialog")
-    .getByRole("button", { name: "Cancel", exact: true })
-    .click();
+  const removal = page.getByRole("dialog", {
+    name: "Dependency check incomplete",
+  });
+  await expect(
+    removal.getByRole("list", { name: "Files to remove" }),
+  ).toContainText(file.path);
+  await removal.getByRole("button", { name: "Close", exact: true }).click();
 
   changed = true;
   try {
