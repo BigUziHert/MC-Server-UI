@@ -127,6 +127,7 @@ test("FTB sorts every matching pack before paging and preserves the default cach
     versions: [
       { ...version, released: 1 },
       ...(index === 3 ? [{ ...version, released: 99 }] : []),
+      { ...version, private: true, updated: 9999 },
     ],
   }));
   packs.push({ ...packs[0], id: 9, private: true, installs: 1000 });
@@ -151,6 +152,16 @@ test("FTB sorts every matching pack before paging and preserves the default cach
     for (const offset of [0, 3, 6]) {
       const result = await provider("ftb").search({ ...input, sort, offset });
       assert.equal(result.total, 8);
+      if (sort === "updated" && offset === 0) {
+        assert.equal(
+          result.projects[0].addedAt,
+          new Date(700_000).toISOString(),
+        );
+        assert.equal(
+          result.projects[0].updatedAt,
+          new Date(99_000).toISOString(),
+        );
+      }
       pages.push(...result.projects.map((project) => Number(project.id)));
     }
     assert.deepEqual(pages, order, sort);
@@ -251,6 +262,15 @@ test("ATLauncher sorts the complete filtered catalog by latest published version
         offset,
       });
       assert.equal(result.total, 8);
+      if (sort === "updated" && offset === 0) {
+        assert.equal(result.projects[0].addedAt, undefined);
+        assert.equal(
+          result.projects[0].updatedAt,
+          new Date(80_000).toISOString(),
+        );
+      }
+      if (sort === "updated" && offset === 6)
+        assert.equal(result.projects.at(-1).updatedAt, undefined);
       titles.push(...result.projects.map(({ title }) => title));
     }
     assert.deepEqual(titles, expected, sort);
@@ -577,9 +597,20 @@ test("Spigot project paging uses provider totals and never fabricates download c
   const { provider, requests } = fixture(
     {},
     () =>
-      new Response(JSON.stringify([{ id: 1, name: "One", tag: "Sample" }]), {
-        headers: { "x-total": "24" },
-      }),
+      new Response(
+        JSON.stringify([
+          {
+            id: 1,
+            name: "One",
+            tag: "Sample",
+            releaseDate: 100,
+            updateDate: 200,
+          },
+        ]),
+        {
+          headers: { "x-total": "24" },
+        },
+      ),
   );
   const result = await provider("spigot").search({
     type: "plugin",
@@ -592,6 +623,10 @@ test("Spigot project paging uses provider totals and never fabricates download c
   assert.equal(result.total, 24);
   assert.equal(result.offset, 10);
   assert.equal(result.projects[0].downloads, undefined);
+  assert.equal(result.projects[0].addedAt, new Date(100_000).toISOString());
+  assert.equal(result.projects[0].updatedAt, new Date(200_000).toISOString());
+  const fields = new URL(requests[0]).searchParams.get("fields").split(",");
+  assert.ok(fields.includes("releaseDate") && fields.includes("updateDate"));
   assert.match(requests[0], /page=3/);
   assert.equal(new URL(requests[0]).searchParams.get("sort"), "-downloads");
 });
@@ -616,6 +651,134 @@ test("Spigot search never reports zero results when the total header is absent o
     assert.equal(result.total, 11);
     assert.equal(result.projects.length, 1);
   }
+});
+
+test("Spigot fills version-filtered matches from cached resource details only for sparse rows on the requested page", async () => {
+  const detail = `${SPIGOT}/resources/8`;
+  const { provider, requests } = fixture(
+    { [detail]: { id: 8, name: "Eight", downloads: 234, updateDate: 400 } },
+    () =>
+      Response.json(
+        {
+          check: ["1.21"],
+          method: "any",
+          match: [
+            {
+              id: 8,
+              name: "Eight",
+              releaseDate: 300,
+              testedVersions: ["1.21"],
+            },
+            { id: 3, name: "Three", releaseDate: 10, updateDate: 20 },
+            { id: 9, name: "Outside page" },
+          ],
+        },
+        { headers: { "x-total": "500" } },
+      ),
+  );
+  const spigot = provider("spigot");
+  const input = {
+    type: "plugin",
+    query: "",
+    gameVersion: "1.21",
+    loader: "paper",
+    offset: 0,
+    limit: 2,
+  };
+  for (const sort of ["newest", "updated"]) {
+    const result = await spigot.search({ ...input, sort });
+    assert.equal(result.total, 500);
+    assert.deepEqual(
+      result.projects.map(({ id, addedAt, updatedAt }) => [
+        id,
+        addedAt,
+        updatedAt,
+      ]),
+      [
+        ["8", new Date(300_000).toISOString(), new Date(400_000).toISOString()],
+        ["3", new Date(10_000).toISOString(), new Date(20_000).toISOString()],
+      ],
+    );
+    assert.equal(result.projects[0].downloads, 234);
+  }
+  assert.equal(requests.filter((url) => url === detail).length, 1);
+  assert.equal(requests.length, 3);
+});
+
+test("Spigot retains sparse matches on failed detail lookups and stops scheduling them when rate-limited", async () => {
+  const match = Array.from({ length: 12 }, (_, i) => ({
+    id: i + 1,
+    name: `Plugin ${i + 1}`,
+  }));
+  const input = {
+    type: "plugin",
+    query: "",
+    gameVersion: "1.21",
+    loader: "paper",
+    offset: 0,
+    limit: 12,
+  };
+  for (const status of [502, 429]) {
+    const data = Object.fromEntries(
+      match.map((pack) => [
+        `${SPIGOT}/resources/${pack.id}`,
+        () => {
+          if (status === 429 || pack.id === 1)
+            throw Object.assign(new Error("Unavailable"), { status });
+          return { ...pack, releaseDate: 10, updateDate: 25 };
+        },
+      ]),
+    );
+    const { provider, requests } = fixture(data, () =>
+      Response.json({ match }),
+    );
+    const { projects } = await provider("spigot").search(input);
+    assert.deepEqual(
+      projects.map(({ title }) => title),
+      match.map(({ name }) => name),
+    );
+    assert.equal(projects[0].addedAt, undefined);
+    assert.equal(projects[0].updatedAt, undefined);
+    if (status === 429) {
+      assert.ok(
+        requests.length <= 6,
+        "one page and at most five concurrent detail requests",
+      );
+      assert.equal(projects.at(-1).updatedAt, undefined);
+    } else {
+      assert.equal(projects.at(-1).updatedAt, new Date(25_000).toISOString());
+    }
+  }
+});
+
+test("Spigot accepts its empty version-filter response while surfacing unrelated provider errors", async () => {
+  const input = {
+    type: "plugin",
+    query: "",
+    gameVersion: "1.21.1",
+    loader: "paper",
+    offset: 0,
+    limit: 5,
+  };
+  const empty = fixture({}, () =>
+    Response.json(
+      { check: ["1.21.1"], method: "any", match: [] },
+      { status: 404 },
+    ),
+  );
+  const result = await empty.provider("spigot").search(input);
+  assert.deepEqual(result.projects, []);
+  assert.equal(result.total, 0);
+  const missing = fixture({}, () =>
+    Response.json({ error: "not found" }, { status: 404 }),
+  );
+  await assert.rejects(missing.provider("spigot").search(input), {
+    status: 404,
+  });
+  await assert.rejects(
+    empty.provider("spigot").search({ ...input, query: "anything" }),
+    { status: 404 },
+  );
 });
 
 test("Spigot delegates each advertised sort to the upstream catalog before pagination on every search route", async () => {
@@ -718,6 +881,8 @@ test("Voids Wrath sorts all matching names before pagination without inventing c
     ["Golf Pack", "Alpha Pack", "Echo Pack"],
   );
   assert.equal(original.projects[0].publishedAt, undefined);
+  assert.equal(original.projects[0].addedAt, undefined);
+  assert.equal(original.projects[0].updatedAt, undefined);
   assert.equal(original.projects[0].downloads, undefined);
   assert.equal(requests.length, 1);
 });

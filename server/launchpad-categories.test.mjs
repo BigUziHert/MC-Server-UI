@@ -145,6 +145,7 @@ test("Modrinth sends supported category facets before pagination and rejects uns
   ]);
   assert.equal(requests[0].searchParams.get("offset"), "50");
   assert.deepEqual(result.projects[0].categories, ["technology"]);
+  assert.equal(result.projects[0].addedAt, "2025-01-01T00:00:00.000Z");
   assert.equal(result.projects[0].updatedAt, "2026-01-02T00:00:00.000Z");
   assert.equal(result.projects[0].releasedAt, "2025-01-01T00:00:00.000Z");
   await assert.rejects(provider.search({ categories: ["automation"] }), {
@@ -177,6 +178,7 @@ test("CurseForge resolves live category IDs and applies them to both pages witho
           primaryCategoryId: 123,
           isFeatured: true,
           downloadCount: 100,
+          dateCreated: i === 0 ? "2020-02-03" : undefined,
           dateModified: "2026-01-02",
           dateReleased: "2025-01-01",
           latestFilesIndexes: [{ gameVersion: "1.21.1" }],
@@ -208,6 +210,11 @@ test("CurseForge resolves live category IDs and applies them to both pages witho
   assert.deepEqual(result.projects[0].categories, ["automation"]);
   assert.equal(result.projects[0].mainCategory, "automation");
   assert.equal(result.projects[0].featured, true);
+  assert.equal(result.projects[0].addedAt, "2020-02-03T00:00:00.000Z");
+  assert.equal(result.projects[0].releasedAt, "2025-01-01T00:00:00.000Z");
+  assert.equal(result.projects[0].updatedAt, "2026-01-02T00:00:00.000Z");
+  assert.equal(result.projects[1].addedAt, undefined);
+  assert.equal(result.projects[1].releasedAt, "2025-01-01T00:00:00.000Z");
   await assert.rejects(
     provider.search({
       type: "mod",
@@ -250,6 +257,7 @@ test("provider project metadata includes category and sorting fields for install
               primaryCategoryId: 3,
               downloadCount: 50,
               isFeatured: true,
+              dateCreated: "2020-02-03",
               dateModified: "2026-01-02",
               dateReleased: "2025-01-01",
               latestFilesIndexes: [{ gameVersion: "1.20.1" }],
@@ -268,4 +276,6 @@ test("provider project metadata includes category and sorting fields for install
   assert.deepEqual(cf.categories, ["world-gen"]);
   assert.equal(cf.mainCategory, "world-gen");
   assert.deepEqual(cf.gameVersions, ["1.20.1"]);
+  assert.equal(cf.releasedAt, "2025-01-01T00:00:00.000Z");
+  assert.equal(cf.addedAt, undefined);
 });

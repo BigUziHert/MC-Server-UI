@@ -726,6 +726,8 @@ test("Modrinth shows only supported catalog sorts, headers and category children
             platform: "modrinth",
             title: `Result ${offset + index + 1}`,
             description: "Provider-backed catalog result",
+            addedAt: "2025-02-14T08:00:00.000Z",
+            updatedAt: "2026-10-30T16:00:00.000Z",
           }),
         ),
         total: 23,
@@ -747,6 +749,15 @@ test("Modrinth shows only supported catalog sorts, headers and category children
     "Date added",
     "Date modified",
   ]);
+  const row = page.getByRole("article", { name: "Result 1", exact: true });
+  await expect(row.locator(".launchpad-date-added time")).toHaveAttribute(
+    "datetime",
+    "2025-02-14T08:00:00.000Z",
+  );
+  await expect(row.locator(".launchpad-date-modified time")).toHaveAttribute(
+    "datetime",
+    "2026-10-30T16:00:00.000Z",
+  );
   await expect(
     header.getByRole("button", { name: "Sort by Name", exact: true }),
   ).toHaveCount(0);
@@ -831,7 +842,8 @@ test("catalog and installed rows share columns with compact headers and update v
   await page.setViewportSize({ width: 1920, height: 1080 });
   await catalog(page);
   const entry = { ...installed("Alpha", true, true), author: "Mod Maker" };
-  const published = "2025-12-01T12:00:00.000Z";
+  const created = "2025-09-18T12:00:00.000Z";
+  const released = "2025-12-01T12:00:00.000Z";
   const updated = "2026-10-30T16:00:00.000Z";
   const searches: URL[] = [];
   await page.route("**/api/launchpad/installed?**", (route) =>
@@ -849,7 +861,7 @@ test("catalog and installed rows share columns with compact headers and update v
             title: "Zulu",
             description: "Uninstalled project",
             author: "Another Author",
-            releasedAt: published,
+            releasedAt: released,
             updatedAt: updated,
           },
           {
@@ -858,7 +870,8 @@ test("catalog and installed rows share columns with compact headers and update v
             title: "Alpha",
             description: "Installed project",
             author: "Mod Maker",
-            releasedAt: published,
+            addedAt: created,
+            releasedAt: released,
             updatedAt: updated,
           },
         ],
@@ -878,9 +891,9 @@ test("catalog and installed rows share columns with compact headers and update v
   await expect(header.getByRole("button")).toHaveText([
     "Name",
     "Author",
-    "Date added",
     "Date modified",
   ]);
+  await expect(header.getByText("Date added", { exact: true })).toBeVisible();
   await expect(
     row.getByRole("switch", { name: "Active: Alpha", exact: true }),
   ).toBeChecked();
@@ -909,8 +922,19 @@ test("catalog and installed rows share columns with compact headers and update v
   expect(versionBounds!.y).toBeGreaterThanOrEqual(
     buttonBounds!.y + buttonBounds!.height,
   );
-  await expect(row.locator(`time[datetime="${published}"]`)).toBeVisible();
-  await expect(row.locator(`time[datetime="${updated}"]`)).toBeVisible();
+  await expect(row.locator(".launchpad-date-added time")).toHaveAttribute(
+    "datetime",
+    created,
+  );
+  await expect(row.locator(".launchpad-date-modified time")).toHaveAttribute(
+    "datetime",
+    updated,
+  );
+  await expect(
+    page
+      .getByRole("article", { name: "Zulu", exact: true })
+      .locator(".launchpad-date-added"),
+  ).toContainText("Unavailable");
   const catalogColumns = await header.evaluate(
     (element) => getComputedStyle(element).gridTemplateColumns,
   );
@@ -942,6 +966,12 @@ test("catalog and installed rows share columns with compact headers and update v
     }
   };
   await assertTightArrows("catalog");
+  await header
+    .getByRole("button", { name: "Sort by Date modified", exact: true })
+    .click();
+  await expect
+    .poll(() => searches.at(-1)?.searchParams.get("sort"))
+    .toBe("updated");
   await header
     .getByRole("button", { name: "Sort by Name", exact: true })
     .click();

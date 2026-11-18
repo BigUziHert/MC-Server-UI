@@ -92,6 +92,7 @@ type Project = {
   author?: string;
   authorLinks?: { name: string; url?: string }[];
   url?: string;
+  addedAt?: string;
   releasedAt?: string;
   updatedAt?: string;
 };
@@ -2355,6 +2356,10 @@ export default function Launchpad({
     : (results?.projects ?? []).map((project) => ({
         project: {
           ...project,
+          // Older panels returned Modrinth's original publication as releasedAt.
+          addedAt:
+            project.addedAt ??
+            (project.platform === "modrinth" ? project.releasedAt : undefined),
           url: projectPageUrl({ ...project, projectId: project.id }),
         },
         entry: installedProjects.get(`${project.platform}:${project.id}`),
@@ -3258,7 +3263,13 @@ export default function Launchpad({
                 <span className="launchpad-column-action">Action</span>
                 {columnHeading("author", "Author", "author")}
                 {hasActive && columnHeading("active", "Active", "active")}
-                {columnHeading("added", "Date added", "added", "newest")}
+                {columnHeading(
+                  "added",
+                  "Date added",
+                  "added",
+                  // CurseForge's "newest" orders releases, not project creation.
+                  platform === "curseforge" ? "added" : "newest",
+                )}
                 {columnHeading(
                   "modified",
                   "Date modified",
@@ -3502,9 +3513,7 @@ export default function Launchpad({
                       </span>
                     )}
                     <InstalledDate
-                      value={
-                        installedOnly ? entry?.addedAt : project.releasedAt
-                      }
+                      value={installedOnly ? entry?.addedAt : project.addedAt}
                       kind="added"
                     />
                     <InstalledDate

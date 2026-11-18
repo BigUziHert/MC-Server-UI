@@ -135,6 +135,7 @@ async function catalog(
           sortOptions: [
             { id: "downloads", label: "Total Downloads" },
             { id: "updated", label: "Latest Update" },
+            { id: "newest", label: "Release Date" },
           ],
         })),
         status: "offline",
@@ -251,6 +252,70 @@ async function catalog(
   });
   return { reads, writes, inventories, folder, projects };
 }
+
+test("AutoModpack resource packs use the selected catalog's dates and available date sorts", async ({
+  page,
+}) => {
+  const state = await catalog(page, true, "modrinth", [
+    "modrinth",
+    "curseforge",
+  ]);
+  const modrinth = { ...project, releasedAt: "2024-02-20T12:00:00.000Z" };
+  const curseforge = {
+    ...project,
+    platform: "curseforge",
+    addedAt: "2024-03-01T12:00:00.000Z",
+    releasedAt: "2026-08-20T12:00:00.000Z",
+    updatedAt: "2026-11-01T12:00:00.000Z",
+  };
+  state.projects.splice(0, 1, modrinth, curseforge);
+  await page.goto("/#launchpad");
+  await page.getByRole("tab", { name: "AutoModpack", exact: true }).click();
+  await page
+    .getByRole("group", { name: "AutoModpack content" })
+    .getByRole("button", { name: "Resource Packs", exact: true })
+    .click();
+  const row = page.getByRole("article", { name: project.title, exact: true });
+  const header = page.getByRole("group", {
+    name: "Sort catalog content columns",
+  });
+  await expect(row.locator(".launchpad-date-added time")).toHaveAttribute(
+    "datetime",
+    modrinth.releasedAt,
+  );
+  await expect(
+    header.getByRole("button", { name: "Sort by Date added" }),
+  ).toBeVisible();
+  await page
+    .getByRole("combobox", { name: "Platform", exact: true })
+    .selectOption("curseforge");
+  await expect(row.locator(".launchpad-date-added time")).toHaveAttribute(
+    "datetime",
+    curseforge.addedAt,
+  );
+  await expect(row.locator(".launchpad-date-modified time")).toHaveAttribute(
+    "datetime",
+    curseforge.updatedAt,
+  );
+  await expect(header.getByText("Date added", { exact: true })).toBeVisible();
+  await expect(
+    header.getByRole("button", { name: "Sort by Date added" }),
+  ).toHaveCount(0);
+  await header.getByRole("button", { name: "Sort by Date modified" }).click();
+  await expect
+    .poll(() => {
+      const query = state.reads.findLast((url) =>
+        url.pathname.endsWith("/search"),
+      )?.searchParams;
+      return query && Object.fromEntries(query);
+    })
+    .toMatchObject({
+      platform: "curseforge",
+      type: "resourcepack",
+      target: "automodpack",
+      sort: "updated",
+    });
+});
 
 test("switching catalogs keeps resource packs, shaders, datapacks and plugins marked installed", async ({
   page,

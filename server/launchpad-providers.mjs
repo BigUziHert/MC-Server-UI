@@ -1450,6 +1450,7 @@ export function createCoreProviders({
             author: value.author,
             authorLinks: modrinthAuthorLinks([value.author]),
             url: `https://modrinth.com/${input.type}/${value.slug ?? value.project_id}`,
+            addedAt: catalogDate(value.date_created),
             ...catalogFields(value, "modrinth", input.type),
           })),
           total: result.total_hits,
@@ -1874,6 +1875,7 @@ export function createCoreProviders({
             author: projectAuthors(value),
             authorLinks: normalizeAuthorLinks(value.authors),
             url: iconUrl(value.links?.websiteUrl),
+            addedAt: catalogDate(value.dateCreated),
             ...catalogFields(value, "curseforge", input.type),
           })),
           total: Math.min(

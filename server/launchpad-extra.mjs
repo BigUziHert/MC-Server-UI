@@ -76,10 +76,10 @@ const numeric = (value) => {
     throw error(400, "Choose a valid catalog project or version.");
   return String(value);
 };
-const date = (seconds) =>
-  Number.isFinite(Number(seconds)) && Number(seconds) > 0
-    ? new Date(Number(seconds) * 1000).toISOString()
-    : "";
+const date = (seconds) => {
+  const value = new Date(Number(seconds) * 1000);
+  return value.getTime() > 0 ? value.toISOString() : "";
+};
 const text = (value) =>
   String(value ?? "")
     .replace(/<[^>]*>/g, " ")
@@ -105,6 +105,15 @@ const latestTimestamp = (values) =>
     (latest, value) => Math.max(latest, sortNumber(value)),
     -Infinity,
   );
+const ftbUpdated = (pack) =>
+  latestTimestamp([
+    pack.updated,
+    ...(pack.versions ?? [])
+      .filter((version) => !version.private)
+      .flatMap((version) => [version.updated, version.released]),
+  ]);
+const atUpdated = (pack) =>
+  latestTimestamp((pack.versions ?? []).map((version) => version.published));
 // Decorate the complete matching catalog before paging, without changing cached
 // provider order. Names and IDs break ties so page boundaries remain stable.
 function sortCatalog(entries, sort, numericValues = {}) {
@@ -179,7 +188,13 @@ export function createExtraProviders({
 } = {}) {
   const cache = new Map();
   const requests = new AsyncLocalStorage();
-  async function response(url, hosts, method = "GET", callerSignal) {
+  async function response(
+    url,
+    hosts,
+    method = "GET",
+    callerSignal,
+    allowNotFound = false,
+  ) {
     let address = checkedProviderUrl(url, hosts);
     const authenticatedCdn = curseforgeDownloadHosts.includes(
       new URL(address).hostname,
@@ -231,7 +246,7 @@ export function createExtraProviders({
           );
         continue;
       }
-      if (!reply.ok) {
+      if (!reply.ok && !(allowNotFound && reply.status === 404)) {
         await reply.body?.cancel();
         throw error(
           reply.status === 404 ? 404 : reply.status === 429 ? 429 : 502,
@@ -244,10 +259,16 @@ export function createExtraProviders({
     }
     throw error(502, "The platform redirected this download too many times.");
   }
-  async function read(url, hosts) {
+  async function read(url, hosts, allowNotFound = false) {
     const deadline = createDownloadDeadline(requests.getStore()?.signal);
     try {
-      const { reply } = await response(url, hosts, "GET", deadline.signal);
+      const { reply } = await response(
+        url,
+        hosts,
+        "GET",
+        deadline.signal,
+        allowNotFound,
+      );
       const chunks = [];
       let size = 0;
       for await (const chunk of reply.body) {
@@ -262,6 +283,7 @@ export function createExtraProviders({
       return {
         body: Buffer.concat(chunks).toString("utf8"),
         headers: reply.headers,
+        status: reply.status,
       };
     } catch (cause) {
       throw deadline.reason(cause);
@@ -561,13 +583,7 @@ export function createExtraProviders({
       const projects = sortCatalog(matching, input.sort, {
         downloads: (pack) => pack.installs,
         popular: (pack) => pack.plays,
-        updated: (pack) =>
-          latestTimestamp([
-            pack.updated,
-            ...(pack.versions ?? [])
-              .filter((version) => !version.private)
-              .flatMap((version) => [version.updated, version.released]),
-          ]),
+        updated: ftbUpdated,
         newest: (pack) => pack.released,
       }).map((pack) => ({
         id: String(pack.id),
@@ -576,6 +592,8 @@ export function createExtraProviders({
         description: text(pack.synopsis),
         iconUrl: pack.art?.find((art) => art.type === "square")?.url,
         downloads: pack.installs,
+        addedAt: date(pack.released) || undefined,
+        updatedAt: date(ftbUpdated(pack)) || undefined,
         ...ftbAuthors(pack),
         url: `https://www.feed-the-beast.com/modpacks/${pack.id}`,
       }));
@@ -715,15 +733,13 @@ export function createExtraProviders({
           ),
       );
       const projects = sortCatalog(packs, input.sort, {
-        updated: (pack) =>
-          latestTimestamp(
-            (pack.versions ?? []).map((version) => version.published),
-          ),
+        updated: atUpdated,
       }).map((pack) => ({
         id: pack.safeName,
         platform: "atlauncher",
         title: pack.name,
         description: text(pack.description),
+        updatedAt: date(atUpdated(pack)) || undefined,
         iconUrl: `${ATL_CDN}packs/${enc(token(pack.safeName))}/Images/300x150.png`,
         url: `https://atlauncher.com/pack/${pack.safeName}`,
       }));
@@ -945,7 +961,8 @@ export function createExtraProviders({
       if (input.loader && !pluginLoaders.includes(input.loader))
         return resultPage([], input);
       const fields =
-        "id,name,tag,downloads,icon.url,external,premium,testedVersions,version.id,file.type";
+        "id,name,tag,downloads,icon.url,external,premium,testedVersions,version.id,file.type,releaseDate,updateDate";
+      const filterByVersion = !input.query && Boolean(input.gameVersion);
       const route = input.query
         ? `/search/resources/${enc(input.query)}?field=name`
         : input.gameVersion
@@ -960,20 +977,53 @@ export function createExtraProviders({
         }[input.sort] ?? "-downloads";
       const url = `${SPIGOT}${route}${route.endsWith("?") ? "" : "&"}size=${input.limit}&page=${Math.floor(input.offset / input.limit) + 1}&sort=${sort}&fields=${enc(fields)}`;
       const loaded = await remember(url, async () => {
-        const reply = await read(url, ["api.spiget.org"]);
+        const reply = await read(url, ["api.spiget.org"], filterByVersion);
+        let data;
         try {
-          return {
-            values: JSON.parse(reply.body),
-            total: reply.headers.has("x-total")
-              ? Number(reply.headers.get("x-total"))
-              : null,
-          };
+          data = JSON.parse(reply.body);
         } catch {
           throw error(502, "Spigot returned invalid catalog data.");
         }
+        const matches = filterByVersion && Array.isArray(data?.match);
+        if (reply.status === 404 && !(matches && data.match.length === 0))
+          throw error(404, "Spigot could not find the requested catalog page.");
+        if (!matches && !Array.isArray(data))
+          throw error(502, "Spigot returned invalid catalog data.");
+        // The version index usually projects only ID, name and tested versions.
+        // Look up the projects on this page using the same cache as Versions.
+        let throttled = false;
+        const values = matches
+          ? await pooled(data.match.slice(0, input.limit), async (pack) => {
+              if (
+                throttled ||
+                (pack.releaseDate != null && pack.updateDate != null)
+              )
+                return pack;
+              try {
+                const details = await resource(pack.id);
+                if (String(details?.id) !== String(pack.id)) return pack;
+                return {
+                  ...pack,
+                  ...details,
+                  releaseDate: details.releaseDate ?? pack.releaseDate,
+                  updateDate: details.updateDate ?? pack.updateDate,
+                };
+              } catch (cause) {
+                requests.getStore()?.signal?.throwIfAborted();
+                if (cause.status === 429) throttled = true;
+                if (throttled || cause.status === 404 || cause.status >= 500)
+                  return pack;
+                throw cause;
+              }
+            })
+          : data;
+        return {
+          values,
+          total: reply.headers.has("x-total")
+            ? Number(reply.headers.get("x-total"))
+            : null,
+        };
       });
-      if (!Array.isArray(loaded.values))
-        throw error(502, "Spigot returned invalid catalog data.");
       return {
         projects: loaded.values.map((pack) => ({
           id: String(pack.id),
@@ -984,6 +1034,8 @@ export function createExtraProviders({
             ? new URL(pack.icon.url, "https://www.spigotmc.org/").href
             : undefined,
           downloads: pack.downloads,
+          addedAt: date(pack.releaseDate) || undefined,
+          updatedAt: date(pack.updateDate) || undefined,
           url: `https://www.spigotmc.org/resources/${pack.id}/`,
         })),
         total:
