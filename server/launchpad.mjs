@@ -125,6 +125,24 @@ const fileAddedAt = (stat) => {
     ? new Date(milliseconds).toISOString()
     : undefined;
 };
+const receiptDate = (value) => {
+  const time = typeof value === "string" ? Date.parse(value) : NaN;
+  return Number.isFinite(time) ? new Date(time).toISOString() : undefined;
+};
+function receiptAddedAt(receipt, createdAt) {
+  const original = receiptDate(receipt?.addedAt);
+  if (original) return original;
+  // A legacy receipt can predate the current file, for example after a restore.
+  const installed = receiptDate(receipt?.installedAt);
+  return installed &&
+    (!createdAt || Date.parse(installed) < Date.parse(createdAt))
+    ? installed
+    : createdAt;
+}
+const unverifiedAddedAt = (candidates, createdAt) =>
+  candidates.some((item) => receiptAddedAt(item, createdAt) !== createdAt)
+    ? undefined
+    : createdAt;
 function abortable(work, signal) {
   if (!signal) return work;
   return new Promise((resolve, reject) => {
@@ -601,7 +619,27 @@ export async function createLaunchpad(ctx) {
   const activation = createModActivation({
     serverDir,
     safePath,
-    fileAddedAt,
+    async addedAt(relative, source, stat) {
+      const createdAt = fileAddedAt(stat);
+      const candidates = receipts.filter((item) => item.path === relative);
+      if (unverifiedAddedAt(candidates, createdAt) !== undefined)
+        return createdAt;
+      const stamp = fileStamp(stat);
+      const cached = fileCache.get(relative);
+      const sha512 =
+        cached?.stamp === stamp
+          ? cached.sha512
+          : await fileHash(source, "sha512", lifetime.signal);
+      if (fileStamp(await fs.lstat(source)) !== stamp)
+        throw error(
+          409,
+          "The mod changed while its active state was being checked. Refresh and try again.",
+        );
+      return receiptAddedAt(
+        candidates.find((item) => item.sha512 === sha512),
+        createdAt,
+      );
+    },
     getServer,
     withMinecraftMutation,
     signal: lifetime.signal,
@@ -950,11 +988,7 @@ export async function createLaunchpad(ctx) {
       );
     const rows = new Array(files.length),
       confirmedFiles = new Set(),
-      receiptIndex = new Map();
-    for (const receipt of receipts) {
-      const key = `${receipt.path}\0${receipt.sha512}`;
-      if (!receiptIndex.has(key)) receiptIndex.set(key, receipt);
-    }
+      receiptsByPath = Map.groupBy(receipts, (receipt) => receipt.path);
     await parallel(
       files,
       4,
@@ -1023,13 +1057,18 @@ export async function createLaunchpad(ctx) {
               ? { active: !/\.disabled$/i.test(file.name) }
               : {}),
             modifiedAt: stat?.mtime.toISOString(),
-            addedAt: fileAddedAt(stat),
+            addedAt: unverifiedAddedAt(
+              receiptsByPath.get(relativePath) ?? [],
+              fileAddedAt(stat),
+            ),
           };
           return;
         }
+        const candidates = receiptsByPath.get(relativePath) ?? [];
         const receipt = sha512
-          ? receiptIndex.get(`${relativePath}\0${sha512}`)
+          ? candidates.find((item) => item.sha512 === sha512)
           : undefined;
+        const createdAt = fileAddedAt(stat);
         const cachedIdentity =
           identities.get(sha512)?.value ??
           // A later explicit installation may choose another provider for the
@@ -1062,7 +1101,11 @@ export async function createLaunchpad(ctx) {
             ? { active: !/\.disabled$/i.test(file.name) }
             : {}),
           modifiedAt: stat.mtime.toISOString(),
-          addedAt: fileAddedAt(stat),
+          // Cold quick scans never read bytes. Defer a historical date until
+          // the full scan verifies that its receipt still belongs to this file.
+          addedAt: sha512
+            ? receiptAddedAt(receipt, createdAt)
+            : unverifiedAddedAt(candidates, createdAt),
         };
       },
       signal,
@@ -1627,7 +1670,8 @@ export async function createLaunchpad(ctx) {
             .map((item) => ({
               ...item,
               name: item.title,
-              addedAt: item.installedAt,
+              addedAt: receiptAddedAt(item),
+              modifiedAt: receiptDate(item.installedAt),
             }))
         : await scan(input.type, input.signal, scanWarnings, {
             quick: enabled(input.local) && enabled(input.quick),
@@ -3738,6 +3782,7 @@ export async function createLaunchpad(ctx) {
               ...file,
               author: file.author || matches[0]?.author,
               authorLinks: file.authorLinks || matches[0]?.authorLinks,
+              addedAt: matches[0]?.addedAt,
               expected,
               previous,
               action: expected || previous ? "replace" : "install",
@@ -3977,6 +4022,7 @@ export async function createLaunchpad(ctx) {
               authorLinks: file.authorLinks,
               url: file.projectUrl,
               type: file.type,
+              addedAt: file.addedAt ?? fileAddedAt(identity),
               installedAt: new Date().toISOString(),
             },
           ]);
@@ -4131,6 +4177,13 @@ export async function createLaunchpad(ctx) {
             mode: "live",
             minecraftVersion: runtime.summary.version,
           });
+          const installedAt = new Date().toISOString();
+          const previousPack = previousReceipts.find(
+            (item) =>
+              item.pack &&
+              item.platform === plan.input.platform &&
+              item.projectId === plan.input.projectId,
+          );
           replaceReceipts(
             packFiles.map((file) => ({
               path: file.path,
@@ -4139,7 +4192,7 @@ export async function createLaunchpad(ctx) {
               packPlatform: plan.input.platform,
               packProjectId: plan.input.projectId,
               packVersionId: plan.input.versionId,
-              installedAt: new Date().toISOString(),
+              installedAt,
             })),
           );
           replaceReceipts([
@@ -4157,7 +4210,8 @@ export async function createLaunchpad(ctx) {
               url: plan.url,
               versionName: plan.versionName,
               path: "",
-              installedAt: new Date().toISOString(),
+              addedAt: receiptAddedAt(previousPack, installedAt),
+              installedAt,
             },
           ]);
           await saveReceipts();

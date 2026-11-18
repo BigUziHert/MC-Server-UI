@@ -567,9 +567,6 @@
   border: 1px solid #404356;
   border-radius: 18px;
 }
-.fleet-empty-toast {
-  left: 50%;
-}
 .fleet-welcome-shell {
   min-height: 100vh;
   background:

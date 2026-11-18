@@ -11,6 +11,7 @@ import {
 } from "react";
 import { createPortal } from "react-dom";
 import { SessionScopeContext } from "../session-scope";
+import { notificationHost } from "../NotificationBanner";
 import {
   ArrowDown,
   ArrowUp,
@@ -1559,12 +1560,23 @@ export default function FileManager({
       if (movePending || checkingMove) return;
       setDialogError("");
       moveSelectionScope.current = listScope;
+      const origin = dialogRef.current;
+      const request = editRequestId.current;
       setDialogMoveId(
         startMoveBatch(
           api,
           moveKey,
           dialog.type === "delete" ? [dialog.entry] : dialog.entries,
-          notify,
+          (message, failed) => {
+            // The originating dialog owns the failure details while it is in front.
+            if (
+              failed &&
+              request === editRequestId.current &&
+              origin === notificationHost()
+            )
+              return;
+            notify(message, failed);
+          },
         ),
       );
       return;

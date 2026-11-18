@@ -1,3 +1,5 @@
+export const notificationDurationMs = 5_000;
+
 export function DismissCountdown({ durationMs }: { durationMs: number }) {
   return (
     <span

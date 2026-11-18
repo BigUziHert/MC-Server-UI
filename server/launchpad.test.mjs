@@ -6558,6 +6558,42 @@ test("reinstalling identical pack bytes still clears files outside the new pack"
   );
 });
 
+test("modpack updates retain the previous pack's install date only for the same project", async (t) => {
+  const f = await cleanPackFixture(t);
+  const local = { ...f.input, local: true };
+  const originalDate = "2023-04-05T06:07:08.000Z";
+  await f.service.restoreInstalled([
+    {
+      pack: true,
+      path: "",
+      type: "modpack",
+      platform: f.input.platform,
+      projectId: f.input.projectId,
+      versionId: "old",
+      installedAt: originalDate,
+    },
+  ]);
+  for (const projectId of [f.input.projectId, "unrelated-pack"]) {
+    const started = Date.now();
+    const review = await f.service.preview({ ...f.input, projectId });
+    const result = await finish(f.service, {
+      planId: review.planId,
+      confirmed: true,
+      cleanInstall: true,
+    });
+    assert.equal(result.status, "completed", result.error);
+    const { items } = await f.service.installed(local);
+    assert.equal(items.length, 1);
+    assert.equal(items[0].projectId, projectId);
+    assert.ok(Date.parse(items[0].modifiedAt) >= started);
+    if (projectId === f.input.projectId) {
+      assert.equal(items[0].addedAt, originalDate);
+    } else {
+      assert.ok(Date.parse(items[0].addedAt) >= started);
+    }
+  }
+});
+
 test("a failed required runtime download leaves all old server files untouched", async (t) => {
   const f = await cleanPackFixture(t, {
     versionsService: {
@@ -8837,7 +8873,10 @@ test("mod activation refuses running servers, invalid targets, and filename coll
 
 test("disabled mods stay disabled through bulk updates and can be removed", async (t) => {
   const f = await fixture(t);
-  await f.service.setActive({ path: "mods/old.jar", active: false });
+  const original = await f.service.setActive({
+    path: "mods/old.jar",
+    active: false,
+  });
   const plan = await f.service.previewUpdates({
     ...selection,
     updates: [
@@ -8865,6 +8904,7 @@ test("disabled mods stay disabled through bulk updates and can be removed", asyn
   const inventory = await f.service.installed({ ...selection, local: true });
   assert.equal(inventory.items[0].active, false);
   assert.equal(inventory.items[0].versionId, "new");
+  assert.equal(inventory.items[0].addedAt, original.addedAt);
   const removal = await f.service.removalPreview({
     type: "mod",
     path: "mods/new.jar.disabled",
@@ -8874,6 +8914,61 @@ test("disabled mods stay disabled through bulk updates and can be removed", asyn
   assert.equal(
     (await f.service.installed({ ...selection, local: true })).items.length,
     0,
+  );
+});
+
+test("same-name mod updates retain the verified original date across restarts and toggles", async (t) => {
+  const f = await fixture(t);
+  const relative = "mods/old.jar";
+  const target = path.join(f.serverDir, relative);
+  const originalDate = "2023-04-05T06:07:08.000Z";
+  await f.service.restoreInstalled([
+    {
+      path: relative,
+      type: "mod",
+      sha512: hashes(f.old).sha512,
+      platform: selection.platform,
+      projectId: selection.projectId,
+      versionId: "old",
+      installedAt: originalDate,
+    },
+  ]);
+  f.versions.new.files[0].filename = "old.jar";
+  const review = await f.service.preview({
+    ...selection,
+    replacePath: relative,
+  });
+  const result = await finish(f.service, {
+    planId: review.planId,
+    confirmed: true,
+  });
+  assert.equal(result.status, "completed", result.error);
+  assert.deepEqual(await fs.readFile(target), f.newer);
+  const restarted = await f.boot();
+  const input = { ...selection, local: true };
+  const cold = await restarted.installed({ ...input, quick: true });
+  assert.equal(cold.items[0].addedAt, undefined);
+  const { items } = await restarted.installed(input);
+  assert.equal(items[0].addedAt, originalDate);
+  assert.equal(
+    items[0].modifiedAt,
+    (await fs.stat(target)).mtime.toISOString(),
+  );
+  const warm = await restarted.installed({ ...input, quick: true });
+  assert.equal(warm.items[0].addedAt, originalDate);
+  const disabled = await restarted.setActive({ path: relative, active: false });
+  assert.equal(disabled.addedAt, originalDate);
+  assert.equal(disabled.modifiedAt, items[0].modifiedAt);
+
+  const disabledPath = path.join(f.serverDir, disabled.path);
+  await fs.writeFile(disabledPath, "externally replaced contents");
+  const stat = await fs.stat(disabledPath);
+  const external = await restarted.installed(input);
+  assert.equal(
+    external.items[0].addedAt,
+    new Date(
+      stat.birthtimeMs > 0 ? stat.birthtimeMs : stat.mtimeMs,
+    ).toISOString(),
   );
 });
 

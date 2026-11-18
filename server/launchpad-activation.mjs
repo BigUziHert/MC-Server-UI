@@ -56,6 +56,7 @@ export function createModActivation(ctx) {
             "Only regular mod files can be enabled or disabled.",
           );
         const wasActive = !/\.disabled$/i.test(input.path);
+        const addedAt = await ctx.addedAt(input.path, source, before);
         const relative = input.active
           ? input.path.replace(/\.disabled$/i, "")
           : wasActive
@@ -67,7 +68,7 @@ export function createModActivation(ctx) {
             path: relative,
             active: input.active,
             modifiedAt: before.mtime.toISOString(),
-            addedAt: ctx.fileAddedAt(before),
+            addedAt,
           };
         const target = await ctx.safePath(ctx.serverDir, relative);
         let linked = false,
@@ -106,7 +107,7 @@ export function createModActivation(ctx) {
             path: relative,
             active: input.active,
             modifiedAt: sourceNow.mtime.toISOString(),
-            addedAt: ctx.fileAddedAt(sourceNow),
+            addedAt,
           };
         } catch (cause) {
           if (linked) {

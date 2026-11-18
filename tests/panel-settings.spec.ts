@@ -232,6 +232,15 @@ test("General settings save multiple automatic servers independently of sign-in 
       keepInTray: false,
     },
   ]);
+  const savedNotice = page.getByRole("status", { name: "Notification" });
+  await expect(savedNotice).toContainText(
+    "Panel startup and tray settings saved.",
+  );
+  await savedNotice
+    .getByRole("button", { name: "Dismiss notification" })
+    .click();
+  await expect(savedNotice).toHaveCount(0);
+  await expect(dialog).toBeVisible();
   await dialog.getByRole("button", { name: "Close Panel Settings" }).click();
   await page.reload();
   await openSettings(page);

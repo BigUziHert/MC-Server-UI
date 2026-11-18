@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Box, Plus, X } from "lucide-react";
+import { Box, Plus } from "lucide-react";
 import { EmptyFleet, ServerWorkspace } from "./App";
+import { NotificationProvider, useNotify } from "./NotificationBanner";
 import {
   api,
   PanelScope,
@@ -64,6 +65,14 @@ function managerAllowedFor(
 
 export default function DesktopWorkspace() {
   const connections = useDesktopConnections();
+  return (
+    <NotificationProvider connectionError={connections?.error}>
+      <Workspace connections={connections} />
+    </NotificationProvider>
+  );
+}
+
+function Workspace({ connections }: { connections: PanelConnections | null }) {
   const hasLocalOwner =
     connections?.panels.some((panel) => panel.local) === true;
   const currentConnections = useRef(connections);
@@ -133,7 +142,7 @@ export default function DesktopWorkspace() {
   }, []);
   const [managingConnections, setManagingConnections] = useState(false);
   const manageConnections = useCallback(() => setManagingConnections(true), []);
-  const [notice, setNotice] = useState("");
+  const notify = useNotify();
   const [selecting, setSelecting] = useState(false);
   const [refreshRevision, setRefreshRevision] = useState(0);
   const selectionRequest = useRef(0);
@@ -239,14 +248,14 @@ export default function DesktopWorkspace() {
         })
         .catch((cause) => {
           if (alive.current && selectionRequest.current === request)
-            setNotice(cause.message);
+            notify(cause.message, true);
         })
         .finally(() => {
           if (alive.current && selectionRequest.current === request)
             setSelecting(false);
         });
     },
-    [refresh, changeManager],
+    [refresh, changeManager, notify],
   );
   useEffect(() => {
     if (
@@ -296,11 +305,6 @@ export default function DesktopWorkspace() {
     selecting,
     select,
   ]);
-  useEffect(() => {
-    if (!notice) return;
-    const timer = setTimeout(() => setNotice(""), 7000);
-    return () => clearTimeout(timer);
-  }, [notice]);
 
   const panels = connections?.panels ?? [];
   const panel =
@@ -507,7 +511,7 @@ export default function DesktopWorkspace() {
                       <header className="topbar">
                         <span>{panel?.label ?? "This computer"}</span>
                         <div className="topbar-right">
-                          <PanelSettings notify={setNotice} />
+                          <PanelSettings notify={notify} />
                           <DesktopUpdates />
                         </div>
                       </header>
@@ -528,7 +532,7 @@ export default function DesktopWorkspace() {
                             onClick={() =>
                               void window.mcPanelConnections!.retry!(panel.id)
                                 .then(refresh)
-                                .catch((cause) => setNotice(cause.message))
+                                .catch((cause) => notify(cause.message, true))
                             }
                           >
                             Reconnect
@@ -573,7 +577,7 @@ export default function DesktopWorkspace() {
                     }
                     onAdd={add}
                     onConnect={setConnection}
-                    notify={setNotice}
+                    notify={notify}
                   />
                 )}
               </PanelScope.Provider>
@@ -709,9 +713,9 @@ export default function DesktopWorkspace() {
                         else refresh();
                       })
                       .catch((cause) => {
-                        if (currentCompletion()) setNotice(cause.message);
+                        if (currentCompletion()) notify(cause.message, true);
                       });
-                    setNotice(
+                    notify(
                       `${managerPanel?.label ?? "This computer"}: Server saved.`,
                     );
                     refresh();
@@ -737,22 +741,6 @@ export default function DesktopWorkspace() {
             </PropertyDraftsContext.Provider>
           </SessionActiveContext.Provider>
         </SessionScopeContext.Provider>
-      )}
-      {(notice || connections?.error) && (
-        <div
-          className="toast fleet-empty-toast"
-          role={notice ? "status" : "alert"}
-        >
-          <span>{notice || connections?.error}</span>
-          {notice && (
-            <button
-              aria-label="Dismiss server notification"
-              onClick={() => setNotice("")}
-            >
-              <X size={16} />
-            </button>
-          )}
-        </div>
       )}
     </DesktopWorkspaceContext.Provider>
   );

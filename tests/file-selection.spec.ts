@@ -937,6 +937,9 @@ test("partial deletion failures retain only failed targets and retry sequentiall
   await expect(dialog.getByRole("alert")).toContainText(
     "2 items moved to Recycle Bin. 1 item could not be moved and remains selected.",
   );
+  await expect(page.getByRole("alert", { name: "Notification" })).toHaveCount(
+    0,
+  );
   await expect(dialog.getByRole("list", { name: "Move errors" })).toContainText(
     "alpha.txt: Fixture permission denied.",
   );
@@ -958,10 +961,52 @@ test("partial deletion failures retain only failed targets and retry sequentiall
     .getByRole("button", { name: "Retry failed moves", exact: true })
     .click();
   await expect(dialog).not.toBeVisible();
+  await expect(page.getByRole("status", { name: "Notification" })).toHaveText(
+    "alpha.txt moved to Recycle Bin.",
+  );
   expect(await fileNames(request, files)).toEqual(["archive"]);
   expect(
     attempted.filter((target) => target === `${files.folder}/alpha.txt`),
   ).toHaveLength(2);
   expect(attempted).toHaveLength(4);
   expect(maximumActive).toBe(1);
+});
+
+test("a failed background move reports its result while another file dialog is open", async ({
+  page,
+  files,
+}) => {
+  await openFiles(page, files);
+  let release!: () => void;
+  const pending = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  await page.route("**/api/files?**", async (route) => {
+    if (route.request().method() !== "DELETE") return route.continue();
+    await pending;
+    await route.fulfill({
+      status: 403,
+      json: { error: "Fixture permission denied." },
+    });
+  });
+  await page
+    .getByRole("button", { name: "Delete beta.txt", exact: true })
+    .click();
+  const origin = page.getByRole("dialog", {
+    name: "Move this item to Recycle Bin?",
+  });
+  await origin
+    .getByRole("button", { name: "Move to Recycle Bin", exact: true })
+    .click();
+  await origin.getByRole("button", { name: "Close", exact: true }).click();
+  await page.getByRole("button", { name: "New file", exact: true }).click();
+  const current = page.getByRole("dialog", { name: "New file", exact: true });
+  await expect(current).toBeVisible();
+  release();
+  await expect(
+    current.getByRole("alert", { name: "Notification" }),
+  ).toContainText("1 item could not be moved");
+  await expect(
+    current.getByRole("textbox", { name: "File name" }),
+  ).toBeVisible();
 });

@@ -226,6 +226,7 @@ test("Versions refresh retains the selected release and an old dismissal cannot 
     id: "running-b",
     status: "running",
     message: "Installing the next runtime.",
+    progress: { message: "Installing the next runtime." },
   };
   let accepted = false,
     polls = 0;
@@ -317,6 +318,10 @@ test("Versions refresh retains the selected release and an old dismissal cannot 
   await heldDismiss!.fulfill({ json: { dismissed: true } });
   await expect.poll(() => polls).toBeGreaterThanOrEqual(2);
   await expect(page.locator(".versions-job")).toContainText(newJob.message);
+  newJob.status = "completed";
+  newJob.message = "The runtime update completed.";
+  await expect(page.locator(".versions-job")).toContainText(newJob.message);
+  await expect(page.getByText(newJob.message, { exact: true })).toHaveCount(1);
 });
 
 const event = {

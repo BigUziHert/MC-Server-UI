@@ -1088,10 +1088,6 @@ function AccessManagement({
           .filter(Boolean)
           .join(" "),
       );
-      notify(
-        "Invitation link could not be created. The account is still saved.",
-        true,
-      );
       return false;
     } finally {
       setInviting(null);

@@ -211,6 +211,8 @@ for (const type of Object.keys(folders)) {
     assert.equal(items.length, 1);
     assert.equal(items[0].versionId, "1");
     assert.equal(items[0].active, true);
+    const firstAdded = items[0].addedAt;
+    assert.ok(firstAdded);
     const disabled = await service.setActive({
       ...selection,
       path: items[0].path,
@@ -238,11 +240,18 @@ for (const type of Object.keys(folders)) {
     await finish(service, updated);
     items = (await service.installed({ ...selection, local: true })).items;
     assert.equal(items[0].versionId, "2");
+    assert.equal(items[0].addedAt, firstAdded);
+    assert.equal(
+      items[0].modifiedAt,
+      (await fs.stat(path.join(serverDir, items[0].path))).mtime.toISOString(),
+    );
     const active = await service.setActive({
       ...selection,
       path: items[0].path,
       active: true,
     });
+    assert.equal(active.addedAt, firstAdded);
+    assert.equal(active.modifiedAt, items[0].modifiedAt);
     const removal = await service.removalPreview({
       ...selection,
       path: active.path,

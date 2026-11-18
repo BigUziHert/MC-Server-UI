@@ -952,6 +952,11 @@ test("accepted installation cancellation waits for the action and ignores an old
   await expect(page.locator(".launchpad-job strong")).toHaveText(
     "Installation cancelled",
   );
+  await expect(
+    page.getByText("Installation cancelled. No server files were changed.", {
+      exact: true,
+    }),
+  ).toHaveCount(1);
   await expect(cancel).toHaveCount(0);
   expect(cancels).toBe(1);
 });
@@ -1645,6 +1650,9 @@ test("installed project links and update-all review span platforms and retry the
   await expect(
     page.getByRole("status", { name: "Installation status", exact: true }),
   ).toContainText("Installation completed");
+  await expect(
+    page.getByRole("button", { name: "Dismiss notification" }),
+  ).toHaveCount(0);
   expect(installs).toEqual([retryInput, retryInput]);
 });
 
@@ -1751,6 +1759,9 @@ test("modpack installation waits for the requested backup and stops on backup fa
   await dialog.getByRole("button", { name: "Confirm installation" }).click();
   await expect(dialog).not.toBeVisible();
   expect(calls).toEqual(["backup", "backup", "install"]);
+  await expect(
+    page.getByRole("button", { name: "Dismiss notification" }),
+  ).toHaveCount(0);
   await page
     .getByRole("link", { name: "View replaced files in Recycle Bin" })
     .click();

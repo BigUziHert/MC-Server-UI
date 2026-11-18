@@ -119,7 +119,7 @@ async function catalog(
   );
 }
 
-test("completed installations show five- and ten-second countdowns and stay dismissed on refresh", async ({
+test("completed installations show one five-second status banner and stay dismissed on refresh", async ({
   page,
 }) => {
   await page.clock.install({ time: new Date("2026-11-01T12:00:00Z") });
@@ -145,25 +145,19 @@ test("completed installations show five- and ten-second countdowns and stay dism
   );
   await page.goto("/#launchpad");
   const banner = page.getByRole("status", { name: "Installation status" });
-  const toast = page.locator(".toast").filter({ hasText: "Example updated." });
   await expect(banner).toContainText("Installation completed");
-  for (const [notice, duration] of [
-    [toast, "5s"],
-    [banner, "10s"],
-  ] as const) {
-    const bar = notice.locator(".dismiss-countdown");
-    await expect(bar).toBeVisible();
-    await expect(bar).toHaveAttribute("aria-hidden", "true");
-    await expect(bar).toHaveCSS("animation-duration", duration);
-    await expect(bar).not.toHaveCSS("animation-name", "none");
-  }
-  await page.clock.fastForward(4_000);
-  await expect(toast).toBeVisible();
-  await page.clock.fastForward(1_100);
-  await expect(toast).toHaveCount(0);
-  await page.clock.fastForward(3_900);
+  await expect(banner).toContainText("Example updated.");
+  await expect(page.getByText("Example updated.", { exact: true })).toHaveCount(
+    1,
+  );
+  const bar = banner.locator(".dismiss-countdown");
+  await expect(bar).toBeVisible();
+  await expect(bar).toHaveAttribute("aria-hidden", "true");
+  await expect(bar).toHaveCSS("animation-duration", "5s");
+  await expect(bar).not.toHaveCSS("animation-name", "none");
+  await page.clock.fastForward(4_900);
   await expect(banner).toBeVisible();
-  await page.clock.fastForward(1_100);
+  await page.clock.fastForward(100);
   await expect(banner).toHaveCount(0);
   await page.clock.resume();
   await page
@@ -294,16 +288,19 @@ test("installed mod controls display file modification time and toggle activity 
   await active.click();
   await expect(active).not.toBeChecked();
   await expect(row).toContainText("mods/Example.jar.disabled");
-  const toast = page.locator(".toast");
-  await expect(toast).toHaveText("Example disabled.");
+  const notice = page.getByRole("status", {
+    name: "Notification",
+    exact: true,
+  });
+  await expect(notice).toContainText("Example disabled.");
   await page.clock.fastForward(3_000);
   await active.click();
   await expect(active).toBeChecked();
   await expect(row).toContainText("mods/Example.jar");
   await page.clock.fastForward(2_100);
-  await expect(toast).toHaveText("Example enabled.");
-  await toast.getByRole("button", { name: "Dismiss notification" }).click();
-  await expect(toast).toHaveCount(0);
+  await expect(notice).toContainText("Example enabled.");
+  await notice.getByRole("button", { name: "Dismiss notification" }).click();
+  await expect(notice).toHaveCount(0);
   await expect(row.locator(`time[datetime="${item.addedAt}"]`)).toBeVisible();
   await expect(
     row.locator(`time[datetime="${item.modifiedAt}"]`),

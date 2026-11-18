@@ -7,13 +7,7 @@ import {
   type FormEvent,
 } from "react";
 import { Folder, FolderOpen, HardDrive, LoaderCircle, X } from "lucide-react";
-import {
-  formatBytes,
-  messageOf,
-  PanelScope,
-  useServerApi,
-  type PageProps,
-} from "./api";
+import { formatBytes, messageOf, PanelScope, useServerApi } from "./api";
 import HostDirectoryPicker from "./HostDirectoryPicker";
 import "./backup-location.css";
 
@@ -110,11 +104,10 @@ function LocationProgress({
 }
 
 export default function BackupLocation({
-  notify,
   serverBusy,
   onStateChange,
   onSettled,
-}: PageProps & {
+}: {
   serverBusy: boolean;
   onStateChange: (state: BackupLocationState) => void;
   onSettled: () => void;
@@ -140,8 +133,8 @@ export default function BackupLocation({
   const previousJob = useRef<LocationJob | null>(null);
   const dialogRef = useRef<HTMLDialogElement>(null);
   const changeButton = useRef<HTMLButtonElement>(null);
-  const callbacks = useRef({ notify, onStateChange, onSettled });
-  callbacks.current = { notify, onStateChange, onSettled };
+  const callbacks = useRef({ onStateChange, onSettled });
+  callbacks.current = { onStateChange, onSettled };
   const moving = starting || location?.job?.status === "running";
 
   const accept = useCallback((result: Location) => {
@@ -156,17 +149,13 @@ export default function BackupLocation({
       result.job.status !== "running"
     ) {
       callbacks.current.onSettled();
-      if (result.job.status === "completed") {
-        callbacks.current.notify(
-          result.job.error ||
-            "Backup location updated. Your backup history and schedule are ready to use.",
-          !!result.job.error,
-        );
-        if (moveDialogVersion.current === dialogVersion.current) {
-          dialogVersion.current++;
-          setOpen(false);
-          setBrowsing(false);
-        }
+      if (
+        result.job.status === "completed" &&
+        moveDialogVersion.current === dialogVersion.current
+      ) {
+        dialogVersion.current++;
+        setOpen(false);
+        setBrowsing(false);
       }
     }
   }, []);

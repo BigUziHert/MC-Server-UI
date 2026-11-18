@@ -1107,31 +1107,49 @@ input:disabled {
   justify-content: space-between;
   gap: 10px;
 }
-.toast {
+.notification-banner {
   position: fixed;
-  bottom: 25px;
-  left: calc(50% + 116px);
-  transform: translateX(-50%);
+  top: calc(env(safe-area-inset-top, 0px) + var(--notification-top, 12px));
+  left: calc(
+    var(--notification-sidebar, 0px) + var(--notification-gutter, 16px)
+  );
+  right: var(--notification-gutter, 16px);
   z-index: 100;
-  background: #303140;
-  border: 1px solid #71778f;
-  color: #eef0f8;
-  border-radius: 9px;
-  padding: 13px 16px;
-  box-shadow: 0 12px 40px #0006;
+  padding: 12px 18px;
+  box-shadow: 0 4px 16px #0004;
   display: flex;
   align-items: center;
-  gap: 9px;
-  font-size: 12px;
-  max-width: calc(100vw - 35px);
+  gap: 12px;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text);
 }
-.toast.error {
-  background: #442a27;
+.notification-banner > span:first-of-type {
+  flex: 1;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.notification-banner > svg,
+.notification-banner > button {
+  flex-shrink: 0;
+}
+.notification-banner.error {
   border-color: #9a5b4e;
   color: #ffd8cc;
 }
-.toast:has(> .dismiss-countdown) {
-  overflow: hidden;
+.notification-banner .dismiss-countdown {
+  animation-delay: var(--notification-delay, 0ms);
+}
+body:has(.topbar, .fleet-welcome-header) {
+  --notification-top: 78px;
+}
+body:has(.main-shell) {
+  --notification-sidebar: 232px;
+  --notification-gutter: 34px;
+}
+dialog:modal .notification-banner {
+  --notification-sidebar: 0px;
+  --notification-top: 12px;
 }
 .dismiss-countdown {
   position: absolute;
@@ -1142,7 +1160,7 @@ input:disabled {
   transform-origin: left;
   animation: dismiss-countdown linear forwards;
 }
-.toast.error .dismiss-countdown {
+.notification-banner.error .dismiss-countdown {
   background: currentColor;
 }
 @keyframes dismiss-countdown {
@@ -1152,12 +1170,6 @@ input:disabled {
   to {
     transform: scaleX(0);
   }
-}
-.toast button {
-  background: none;
-  padding: 2px;
-  color: inherit;
-  display: flex;
 }
 .modal-backdrop {
   position: fixed;
@@ -1342,6 +1354,9 @@ input:disabled {
   }
 }
 @media (min-width: 1600px) {
+  body:has(.main-shell) {
+    --notification-gutter: 45px;
+  }
   .main-content {
     padding: 40px 45px 25px;
   }
@@ -1396,8 +1411,9 @@ input:disabled {
   .metrics-grid {
     gap: 12px;
   }
-  .toast {
-    left: calc(50% + 104px);
+  body:has(.main-shell) {
+    --notification-sidebar: 208px;
+    --notification-gutter: 23px;
   }
 }
 @media (max-width: 1000px) {
@@ -1526,8 +1542,12 @@ input:disabled {
     width: 46px;
     height: 46px;
   }
-  .toast {
-    left: 50%;
+  body:has(.topbar, .fleet-welcome-header) {
+    --notification-top: 67px;
+  }
+  body:has(.main-shell) {
+    --notification-sidebar: 0px;
+    --notification-gutter: 18px;
   }
   .page-heading {
     align-items: flex-start;

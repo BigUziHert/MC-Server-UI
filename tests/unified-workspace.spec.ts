@@ -374,6 +374,8 @@ test("editing a remote server refreshes its current page without selecting Conso
   page,
 }) => {
   await fixture(page, { local: false });
+  await page.clock.install({ time: new Date("2026-11-01T12:00:00Z") });
+  await page.clock.pauseAt(new Date("2026-11-01T12:01:00Z"));
   await page.goto("/#properties");
   await expect(
     page.getByRole("textbox", { name: "MOTD", exact: true }),
@@ -402,6 +404,15 @@ test("editing a remote server refreshes its current page without selecting Conso
     )
     .toBe(true);
   await expect(page).toHaveURL(/#properties$/);
+  const notice = page.getByRole("status", {
+    name: "Notification",
+    exact: true,
+  });
+  await expect(notice).toContainText("Computer A: Server saved.");
+  await page.clock.fastForward(4_900);
+  await expect(notice).toBeVisible();
+  await page.clock.fastForward(100);
+  await expect(notice).toHaveCount(0);
   await expect(
     page.getByRole("textbox", { name: "MOTD", exact: true }),
   ).toBeVisible();

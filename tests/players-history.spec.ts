@@ -296,6 +296,12 @@ test("mobile moderation confirms a single-line reason, recovers from command err
   await expect(
     page.getByText("Player command requested", { exact: true }),
   ).toBeVisible();
+  await expect(
+    page.getByText(
+      "Requested kick History_Player Browser reason. Check Console for confirmation.",
+      { exact: true },
+    ),
+  ).toHaveCount(1);
 });
 
 test("offline management stays available while unreadable ban lists disable ban actions", async ({

@@ -41,7 +41,7 @@ import RefreshButton from "../RefreshButton";
 import StatePanel from "../StatePanel";
 import Pagination from "../Pagination";
 import Switch from "../Switch";
-import { DismissCountdown } from "../DismissCountdown";
+import { DismissCountdown, notificationDurationMs } from "../DismissCountdown";
 import {
   readPreference,
   writePreference,
@@ -332,7 +332,6 @@ type SortDirection = "asc" | "desc";
 const defaultInstalledDirection = (sort: InstalledSort): SortDirection =>
   ["name", "author", "category"].includes(sort) ? "asc" : "desc";
 
-const completedJobNoticeMs = 10_000;
 // Retain dismissals across page navigation, including a slow or offline remote
 // panel. Scope them to the server/account rather than hiding another panel's job.
 const dismissedJobs = new Map<string, Set<string>>();
@@ -1051,7 +1050,7 @@ export default function Launchpad({
       dismissCompletedJob(timedJobId);
       jobEpoch.current++;
       setJob((current) => (current?.id === timedJobId ? null : current));
-    }, completedJobNoticeMs);
+    }, notificationDurationMs);
     return () => window.clearTimeout(timer);
   }, [timedJobId, viewKey, dismissCompletedJob]);
 
@@ -1614,15 +1613,9 @@ export default function Launchpad({
         jobEpoch.current++;
         setJob(next.job);
         setJobError("");
-        if (next.job.status === "completed") {
+        if (["completed", "failed"].includes(next.job.status))
           void reconcileJob();
-          notify(next.job.message || "Installation completed.");
-        }
-        if (next.job.status === "failed") {
-          void reconcileJob();
-          notify(next.job.error || next.job.message, true);
-        }
-        if (["queued", "running"].includes(next.job.status))
+        else if (["queued", "running"].includes(next.job.status))
           timer = window.setTimeout(poll, 1000);
       } catch (cause) {
         if (!controller.signal.aborted) {
@@ -1650,7 +1643,7 @@ export default function Launchpad({
       controller.abort();
       window.clearTimeout(timer);
     };
-  }, [api, job?.id, job?.status, jobReload, notify, reconcileJob]);
+  }, [api, job?.id, job?.status, jobReload, reconcileJob]);
 
   async function actOnJob(action: "cancel" | "recover") {
     if (
@@ -1946,7 +1939,6 @@ export default function Launchpad({
       setSelection(null);
       setPlan(null);
       if (["completed", "failed"].includes(next.status)) void reconcileJob();
-      if (next.status === "completed") notify(next.message);
     };
     pending.current = true;
     setBusy("install");
@@ -2099,8 +2091,6 @@ export default function Launchpad({
       setJob(next);
       setJobError("");
       if (["completed", "failed"].includes(next.status)) void reconcileJob();
-      if (next.status === "completed")
-        notify(next.message || "Installation completed.");
     };
     pending.current = true;
     setBusy("install");
@@ -3030,7 +3020,7 @@ export default function Launchpad({
           {timedJobId && (
             <DismissCountdown
               key={`${viewKey}:${timedJobId}:${canDismissJob}`}
-              durationMs={completedJobNoticeMs}
+              durationMs={notificationDurationMs}
             />
           )}
           {jobError && (

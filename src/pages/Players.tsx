@@ -419,7 +419,6 @@ export default function Players({
       );
       if (currentSession !== session.current) return;
       setResult(response);
-      notify(response.message);
       setModerating(null);
       await refresh(true, true);
     } catch (cause) {
@@ -500,7 +499,6 @@ export default function Players({
       );
       if (currentSession !== session.current) return;
       setResult(response);
-      notify(response.message);
       setWhitelistAction(null);
       await refresh(true, true);
     } catch (cause) {
@@ -561,7 +559,6 @@ export default function Players({
       );
       if (currentSession !== session.current) return;
       setResult(response);
-      notify(response.message);
       setGranting(false);
       setRemoving(null);
       await refresh(true, true);
@@ -585,6 +582,26 @@ export default function Players({
         </div>
       </div>
 
+      {result && (
+        <div className="players-result" role="status">
+          <Info size={17} />
+          <div>
+            <strong>
+              {result.saved
+                ? "Player access saved"
+                : "Player command requested"}
+            </strong>
+            <p>{result.message}</p>
+          </div>
+          <button
+            className="btn icon"
+            aria-label="Dismiss operator result"
+            onClick={() => setResult(null)}
+          >
+            <X size={16} />
+          </button>
+        </div>
+      )}
       <div className="panel players-online-banner">
         <Users size={19} />
         <strong>
@@ -811,27 +828,6 @@ export default function Players({
           )}
         />
       </div>
-
-      {result && (
-        <div className="players-result" role="status">
-          <Info size={17} />
-          <div>
-            <strong>
-              {result.saved
-                ? "Player access saved"
-                : "Player command requested"}
-            </strong>
-            <p>{result.message}</p>
-          </div>
-          <button
-            className="btn icon"
-            aria-label="Dismiss operator result"
-            onClick={() => setResult(null)}
-          >
-            <X size={16} />
-          </button>
-        </div>
-      )}
 
       <section
         className="panel management-list players-history-panel"

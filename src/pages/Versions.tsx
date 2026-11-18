@@ -323,10 +323,6 @@ export default function Versions({
         if (cancelled) return;
         setJob(result);
         if (result.status === "completed") {
-          notify(
-            result.message ||
-              "Server software installed. Start the server when you are ready.",
-          );
           const [server, catalog] = await Promise.all([
             api<Current>("/server"),
             api<Catalog>("/versions"),
@@ -339,12 +335,7 @@ export default function Versions({
             });
             setRuntimeUpdate(catalog.runtimeUpdate ?? null);
           }
-        } else if (result.status === "failed")
-          notify(
-            result.error || result.message || "Installation failed.",
-            true,
-          );
-        else timer = setTimeout(poll, 1000);
+        } else if (result.status !== "failed") timer = setTimeout(poll, 1000);
       } catch (cause) {
         if (!cancelled) {
           setError(
@@ -366,7 +357,7 @@ export default function Versions({
       cancelled = true;
       clearTimeout(timer);
     };
-  }, [api, job?.id, jobBusy, notify]);
+  }, [api, job?.id, jobBusy]);
 
   async function chooseProvider(provider: Provider) {
     const token = ++generation.current;
@@ -635,9 +626,13 @@ export default function Versions({
             </strong>
             <p>
               {job.error ||
-                job.progress?.message ||
+                (jobBusy ? job.progress?.message : undefined) ||
                 job.message ||
-                "Preparing the official download…"}
+                (jobBusy
+                  ? "Preparing the official download…"
+                  : job.status === "completed"
+                    ? "Server software installed. Start the server when you are ready."
+                    : "Installation failed.")}
             </p>
           </div>
           {!jobBusy &&

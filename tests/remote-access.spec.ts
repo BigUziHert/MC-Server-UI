@@ -418,7 +418,17 @@ for (const width of [1280, 390]) {
         settingsRevision: "initial-settings-revision",
       },
     ]);
-    await expect(page.getByRole("status")).toContainText("Server saved.");
+    const notification = page.getByRole("status", { name: "Notification" });
+    await expect(notification).toContainText("Server saved.");
+    await expect(notification.locator(".dismiss-countdown")).toHaveCSS(
+      "animation-duration",
+      "5s",
+    );
+    const bounds = await notification.boundingBox();
+    expect(bounds!.y).toBeGreaterThanOrEqual(0);
+    expect(bounds!.y).toBeLessThan(900 / 4);
+    expect(bounds!.x).toBeGreaterThanOrEqual(0);
+    expect(bounds!.x + bounds!.width).toBeLessThanOrEqual(width);
     await openNavigation();
     const account = page.getByRole("button", {
       name: `Account menu for ${sister.email}`,

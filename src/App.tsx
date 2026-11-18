@@ -12,7 +12,6 @@ import {
   ArrowRight,
   Box,
   Check,
-  CheckCheck,
   ChevronRight,
   CircleHelp,
   Clock3,
@@ -63,7 +62,7 @@ import Versions from "./pages/Versions";
 import Launchpad from "./pages/Launchpad";
 import Properties from "./pages/Properties";
 import SearchField, { useDebouncedValue } from "./SearchField";
-import { DismissCountdown } from "./DismissCountdown";
+import { NotificationProvider, useNotify } from "./NotificationBanner";
 import Switch from "./Switch";
 import DesktopUpdates from "./DesktopUpdates";
 import PanelSettings from "./PanelSettings";
@@ -92,8 +91,6 @@ import ServerManager, {
 } from "./ServerManager";
 import "./welcome.css";
 import DesktopWorkspace from "./DesktopWorkspace";
-
-const TOAST_DURATION_MS = 5_000;
 
 type Page =
   | "console"
@@ -311,7 +308,9 @@ export default function App(props: Parameters<typeof PanelApp>[0]) {
   return window.mcPanelConnections?.unified ? (
     <DesktopWorkspace />
   ) : (
-    <PanelApp {...props} />
+    <NotificationProvider>
+      <PanelApp {...props} />
+    </NotificationProvider>
   );
 }
 
@@ -371,8 +370,7 @@ function PanelApp({
     firstServer?: boolean;
     desktopRequestId?: string;
   } | null>(null);
-  const [notice, setNotice] = useState("");
-  const notify = useCallback((message: string) => setNotice(message), []);
+  const notify = useNotify();
   const fleetRequest = useRef(0);
   const fleetInFlight = useRef(false);
   const desktopSelection = useRef<boolean | null>(null);
@@ -521,10 +519,11 @@ function PanelApp({
           nativePreferred &&
           !result.servers.some((server) => server.id === nativePreferred)
         )
-          setNotice(
+          notify(
             remote
               ? "That server is no longer shared with you."
               : "The selected local server is no longer available.",
+            true,
           );
         setSelectionReady(true);
         setError("");
@@ -549,7 +548,7 @@ function PanelApp({
         }
       }
     },
-    [remote, expireSession],
+    [remote, expireSession, notify],
   );
   useEffect(() => {
     if (!remote || !requestedRemoteServer || !sessionMounted.current) return;
@@ -641,16 +640,12 @@ function PanelApp({
       return;
     persistedSelection.current = activeId;
     void saveDesktopSelection(activeId || null).catch(() => {
-      setNotice(
+      notify(
         "Your server was selected, but the choice could not be saved for the next app launch.",
+        true,
       );
     });
-  }, [activeId, selectionReady]);
-  useEffect(() => {
-    if (!notice) return;
-    const timer = setTimeout(() => setNotice(""), 5000);
-    return () => clearTimeout(timer);
-  }, [notice]);
+  }, [activeId, selectionReady, notify]);
   const active = servers.find((server) => server.id === activeId);
   const canEditActive =
     !remote ||
@@ -678,7 +673,7 @@ function PanelApp({
     );
     setActiveId(server.id);
     if (!manager?.editing) window.location.hash = "console";
-    setNotice(
+    notify(
       manager?.editing
         ? "Server settings saved."
         : server.source === "imported"
@@ -700,7 +695,7 @@ function PanelApp({
     setLoading(false);
     setError("");
     setManager(null);
-    setNotice(
+    notify(
       "Server removed from the panel. Its files and backups are still on disk.",
     );
     void loadServers();
@@ -797,7 +792,7 @@ function PanelApp({
           onClose={() => setConnection(null)}
           onOpened={() => {
             setConnection(null);
-            setNotice("Connected panel opened.");
+            notify("Connected panel opened.");
           }}
         />
       )}
@@ -811,21 +806,6 @@ function PanelApp({
           onSaved={saved}
           onRemoved={removed}
         />
-      )}
-      {notice && (
-        <div
-          className={`toast ${!active || firstServerSetup ? "fleet-empty-toast" : ""}`}
-          role="status"
-        >
-          <CheckCheck size={18} />
-          <span>{notice}</span>
-          <button
-            aria-label="Dismiss server notification"
-            onClick={() => setNotice("")}
-          >
-            <X size={16} />
-          </button>
-        </div>
       )}
     </SessionExpiredContext.Provider>
   );
@@ -1094,12 +1074,6 @@ export function ServerWorkspace({
   );
   const [server, setServer] = useState<Server | null>(null);
   const [connectionError, setConnectionError] = useState("");
-  const toastSequence = useRef(0);
-  const [toast, setToast] = useState<{
-    id: number;
-    message: string;
-    error?: boolean;
-  } | null>(null);
   const [sidebar, setSidebar] = useState(false);
   const sidebarElement = useRef<HTMLElement>(null);
   const sidebarToggle = useRef<HTMLButtonElement>(null);
@@ -1165,11 +1139,7 @@ export function ServerWorkspace({
     cpu: [],
     memory: [],
   });
-  const notify = useCallback(
-    (message: string, error?: boolean) =>
-      setToast({ id: ++toastSequence.current, message, error }),
-    [],
-  );
+  const notify = useNotify();
   const statusRequest = useRef(0);
   const latestStatusResponse = useRef(0);
   const refresh = useCallback(async () => {
@@ -1214,14 +1184,6 @@ export function ServerWorkspace({
     window.addEventListener("hashchange", changed);
     return () => window.removeEventListener("hashchange", changed);
   }, []);
-  useEffect(() => {
-    if (!toast) return;
-    const timer = window.setTimeout(
-      () => setToast((current) => (current === toast ? null : current)),
-      TOAST_DURATION_MS,
-    );
-    return () => clearTimeout(timer);
-  }, [toast]);
   useEffect(() => {
     document.title = `${navigation.find((n) => n.id === page)?.label} · MC Panel`;
   }, [page]);
@@ -1555,22 +1517,6 @@ export function ServerWorkspace({
           </footer>
         </main>
       </div>
-      {toast && (
-        <div
-          className={`toast ${toast.error ? "error" : ""}`}
-          role={toast.error ? "alert" : "status"}
-        >
-          {toast.error ? <CircleHelp size={18} /> : <CheckCheck size={18} />}
-          <span>{toast.message}</span>
-          <button
-            aria-label="Dismiss notification"
-            onClick={() => setToast(null)}
-          >
-            <X size={16} />
-          </button>
-          <DismissCountdown key={toast.id} durationMs={TOAST_DURATION_MS} />
-        </div>
-      )}
       <PowerConfirmation controls={controls} />
       {help && (
         <div className="modal-backdrop" onClick={() => setHelp(false)}>

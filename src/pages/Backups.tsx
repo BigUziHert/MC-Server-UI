@@ -373,20 +373,18 @@ export default function Backups({
           (previous?.id === updated.id && isActiveJob(previous))) &&
         !isActiveJob(updated)
       ) {
-        if (updated.status === "completed") {
-          notify("Backup created. Your server files are safely archived.");
-          if (
-            currentDialog.current === "create" &&
-            createDialogVersion.current === dialogVersion.current
-          ) {
-            dialogVersion.current++;
-            setDialog(null);
-          }
+        if (
+          updated.status === "completed" &&
+          currentDialog.current === "create" &&
+          createDialogVersion.current === dialogVersion.current
+        ) {
+          dialogVersion.current++;
+          setDialog(null);
         }
         void reloadRef.current();
       }
     },
-    [notify],
+    [],
   );
 
   const load = useCallback(
@@ -1229,7 +1227,6 @@ export default function Backups({
               {canRead && canChangeLocation && (
                 <BackupLocation
                   key={scopeKey}
-                  notify={notify}
                   serverBusy={busy || starting || activeJob}
                   onStateChange={acceptLocationState}
                   onSettled={reloadAfterMove}
