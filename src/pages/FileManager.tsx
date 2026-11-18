@@ -8,6 +8,7 @@ import {
   useSyncExternalStore,
   type FormEvent,
   type ReactNode,
+  type RefObject,
 } from "react";
 import { createPortal } from "react-dom";
 import { SessionScopeContext } from "../session-scope";
@@ -442,6 +443,25 @@ function waitForMove(
     }
   });
 }
+// While its confirmation is in front, the dialog already displays any failure.
+// A closed or superseded dialog leaves that feedback to the workspace banner.
+function dialogResultNotification(
+  notify: PageProps["notify"],
+  origin: HTMLDialogElement | null,
+  revision: RefObject<number>,
+): PageProps["notify"] {
+  const submitted = revision.current;
+  return (message, failed) => {
+    if (
+      failed &&
+      submitted === revision.current &&
+      origin === notificationHost()
+    )
+      return;
+    notify(message, failed);
+  };
+}
+
 function resolveUnconfirmed(
   key: string,
   requestId: string,
@@ -1560,23 +1580,12 @@ export default function FileManager({
       if (movePending || checkingMove) return;
       setDialogError("");
       moveSelectionScope.current = listScope;
-      const origin = dialogRef.current;
-      const request = editRequestId.current;
       setDialogMoveId(
         startMoveBatch(
           api,
           moveKey,
           dialog.type === "delete" ? [dialog.entry] : dialog.entries,
-          (message, failed) => {
-            // The originating dialog owns the failure details while it is in front.
-            if (
-              failed &&
-              request === editRequestId.current &&
-              origin === notificationHost()
-            )
-              return;
-            notify(message, failed);
-          },
+          dialogResultNotification(notify, dialogRef.current, editRequestId),
         ),
       );
       return;
@@ -3231,7 +3240,7 @@ function RecycleBin({
       recoveryKey,
       action.type,
       action.targets,
-      notify,
+      dialogResultNotification(notify, actionDialog.current, restoreReview),
     );
     if (id) setAction({ ...action, batchId: id });
   }
@@ -3655,7 +3664,17 @@ function RecycleBin({
             {batch && action.batchId === batch.id && (
               <RecoveryProgress
                 batch={batch}
-                onCheck={() => checkRecoveryStatus(api, recoveryKey, notify)}
+                onCheck={() =>
+                  checkRecoveryStatus(
+                    api,
+                    recoveryKey,
+                    dialogResultNotification(
+                      notify,
+                      actionDialog.current,
+                      restoreReview,
+                    ),
+                  )
+                }
                 onDismiss={dismissStatus}
               />
             )}

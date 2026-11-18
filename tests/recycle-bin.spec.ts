@@ -954,6 +954,9 @@ test("permanent deletion confirms exact targets, retains failed selections, and 
   await expect(dialog.getByRole("alert")).toHaveText(
     "1 item permanently deleted. 1 item failed and remains selected.",
   );
+  await expect(page.getByRole("alert", { name: "Notification" })).toHaveCount(
+    0,
+  );
   await expect(
     dialog.getByRole("list", { name: "Recovery action errors" }),
   ).toContainText("Fixture recovery file is locked");
@@ -1032,6 +1035,9 @@ test("bulk restore keeps conflicts selected while restoring other entries withou
   await expect(dialog.getByRole("alert")).toHaveText(
     "1 item restored. 1 item failed and remains selected.",
   );
+  await expect(page.getByRole("alert", { name: "Notification" })).toHaveCount(
+    0,
+  );
   await expect(
     dialog.getByRole("list", { name: "Recovery action errors" }),
   ).toContainText("already exists");
@@ -1062,6 +1068,50 @@ test("bulk restore keeps conflicts selected while restoring other entries withou
   expect(remaining.map((item: { id: string }) => item.id)).toEqual([
     conflict.id,
   ]);
+});
+
+test("a background recovery failure reaches the top banner after its confirmation closes", async ({
+  page,
+  request,
+  bin,
+}) => {
+  const item = await recycle(request, bin, "recovery/treasure.txt");
+  let release!: () => void;
+  const held = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  await page.route(`**/api/files/recycle-bin/${item.id}?**`, async (route) => {
+    if (route.request().method() !== "DELETE") return route.continue();
+    await held;
+    return route.fulfill({ status: 409, json: { error: "File is locked." } });
+  });
+  try {
+    await openFiles(page, bin);
+    await openBin(page);
+    await page
+      .getByRole("button", { name: "Permanently delete treasure.txt" })
+      .click();
+    const dialog = page.getByRole("dialog", {
+      name: "Permanently delete from Recycle Bin?",
+    });
+    await dialog
+      .getByRole("button", { name: "Delete permanently", exact: true })
+      .click();
+    await dialog
+      .getByRole("button", { name: "Continue in background" })
+      .click();
+    await expect(dialog).not.toBeVisible();
+    await page.getByRole("button", { name: "Back to files" }).click();
+    await page.getByRole("button", { name: "New file", exact: true }).click();
+    const newer = page.getByRole("dialog", { name: "New file", exact: true });
+    await expect(newer).toBeVisible();
+    release();
+    await expect(
+      newer.getByRole("alert", { name: "Notification" }),
+    ).toContainText("1 item failed and remains selected.");
+  } finally {
+    release();
+  }
 });
 
 for (const action of ["delete", "restore"] as const) {
