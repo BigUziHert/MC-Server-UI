@@ -179,7 +179,7 @@ function installedProjectKeys(item: InstalledItem) {
   return keys;
 }
 
-function autoModpackProjectIndex(items: InstalledItem[]) {
+function installedProjectHashes(items: InstalledItem[]) {
   const projects = new Map<string, Set<string>>();
   for (const item of items) {
     for (const key of installedProjectKeys(item)) {
@@ -307,6 +307,9 @@ const autoModpackKinds = [
   { id: "resourcepack", label: "Resource Packs" },
   { id: "shader", label: "Shader Packs" },
 ] as const;
+function firstAutoModpackType(platform?: Platform) {
+  return autoModpackKinds.find(({ id }) => platform?.types.includes(id))?.id;
+}
 const rowsOptions = [5, 10, 25, 50, 75, 100];
 const installedSortOptions = [
   { id: "name", label: "Name" },
@@ -765,13 +768,18 @@ export default function Launchpad({
   const [scanRefreshing, setScanRefreshing] = useState(false);
   const [scanError, setScanError] = useState("");
   const [reload, setReload] = useState(0);
-  const browseAutoModpackMods =
-    activeTab === "mod" &&
-    !installedOnly &&
-    config?.targets?.includes("automodpack") === true;
-  const [packIndex, setPackIndex] = useState<{
+  const otherModTarget =
+    type === "mod" && !installedOnly && config?.targets?.includes("automodpack")
+      ? target === "automodpack"
+        ? "server"
+        : "automodpack"
+      : null;
+  const otherModLabel = otherModTarget === "server" ? "Mods" : "AutoModpack";
+  const OtherModIcon = otherModTarget === "server" ? Puzzle : Layers3;
+  const [otherModIndex, setOtherModIndex] = useState<{
     api: typeof api;
-    projects: ReturnType<typeof autoModpackProjectIndex>;
+    target: NonNullable<typeof otherModTarget>;
+    projects: ReturnType<typeof installedProjectHashes>;
   } | null>(null);
   const catalogRefresh = useRef(false);
   const scanEpoch = useRef(0);
@@ -830,6 +838,12 @@ export default function Launchpad({
   const tabs = useRef<HTMLDivElement>(null);
   const completedJob = useRef<{ scope: string; id: string } | null>(null);
   const source = config?.platforms.find((item) => item.id === platform);
+  const autoModpackType = firstAutoModpackType(source);
+  const canOpenTab = (tab: LaunchpadTab) =>
+    installedOnly ||
+    (tab === "automodpack"
+      ? Boolean(autoModpackType)
+      : Boolean(source?.types.includes(tab)));
   const inventoryReady = Boolean(config) && targetSupported;
   const sortOptions = source?.sortOptions ?? [];
   const catalogSort = sortOptions.some((item) => item.id === sort)
@@ -910,11 +924,9 @@ export default function Launchpad({
         if (initial) {
           const saved = readSavedView(viewKey);
           const compatiblePlatform = (item: Platform) =>
-            saved.type !== "automodpack" || item.types.includes("mod");
+            saved.type !== "automodpack" || Boolean(firstAutoModpackType(item));
           const first =
-            next.platforms.find(
-              (item) => item.id === saved.platform && compatiblePlatform(item),
-            ) ??
+            next.platforms.find((item) => item.id === saved.platform) ??
             next.platforms.find(
               (item) =>
                 item.id === "modrinth" &&
@@ -927,20 +939,24 @@ export default function Launchpad({
             next.platforms.find(compatiblePlatform) ??
             next.platforms[0];
           setPlatform(first?.id ?? "modrinth");
-          const initialType =
-            saved.type === "automodpack"
-              ? "mod"
-              : saved.type &&
-                  (saved.installedOnly || first?.types.includes(saved.type))
-                ? saved.type
-                : pluginLoaders.includes(next.loader ?? "") &&
-                    first?.types.includes("plugin")
-                  ? "plugin"
-                  : first?.types.includes("modpack")
-                    ? "modpack"
-                    : (first?.types[0] ?? "modpack");
+          const savedAutoType = firstAutoModpackType(first);
+          const restoreAutoModpack =
+            saved.type === "automodpack" &&
+            (saved.installedOnly || Boolean(savedAutoType));
+          const initialType = restoreAutoModpack
+            ? (savedAutoType ?? "mod")
+            : saved.type &&
+                saved.type !== "automodpack" &&
+                (saved.installedOnly || first?.types.includes(saved.type))
+              ? saved.type
+              : pluginLoaders.includes(next.loader ?? "") &&
+                  first?.types.includes("plugin")
+                ? "plugin"
+                : first?.types.includes("modpack")
+                  ? "modpack"
+                  : (first?.types[0] ?? "modpack");
           setType(initialType);
-          setTarget(saved.type === "automodpack" ? "automodpack" : undefined);
+          setTarget(restoreAutoModpack ? "automodpack" : undefined);
           setGameVersion(
             saved.gameVersion !== undefined
               ? saved.gameVersion
@@ -1251,17 +1267,17 @@ export default function Launchpad({
   ]);
 
   useEffect(() => {
-    if (!browseAutoModpackMods) {
-      setPackIndex(null);
+    if (!otherModTarget) {
+      setOtherModIndex(null);
       return;
     }
     const controller = new AbortController();
     const force = forceScan.current?.api === api;
-    async function read(local: boolean) {
+    const read = async (local: boolean) => {
       const result = await api<InstalledResult>(
         `/launchpad/installed?${queryString({
           type: "mod",
-          target: "automodpack",
+          target: otherModTarget,
           gameVersion: contentGameVersion,
           loader: contentLoader,
           local: local ? "true" : undefined,
@@ -1277,19 +1293,23 @@ export default function Launchpad({
         },
       );
       if (!controller.signal.aborted)
-        setPackIndex({ api, projects: autoModpackProjectIndex(result.items) });
+        setOtherModIndex({
+          api,
+          target: otherModTarget,
+          projects: installedProjectHashes(result.items),
+        });
       return result;
-    }
+    };
     void (async () => {
       const local = await read(true).catch(() => null);
       if (controller.signal.aborted || local?.items.length === 0) return;
       // Keep confirmed local matches available if the provider is offline.
       await read(false).catch(() => {
-        if (!local && !controller.signal.aborted) setPackIndex(null);
+        if (!local && !controller.signal.aborted) setOtherModIndex(null);
       });
     })();
     return () => controller.abort();
-  }, [api, browseAutoModpackMods, contentGameVersion, contentLoader, reload]);
+  }, [api, otherModTarget, contentGameVersion, contentLoader, reload]);
 
   useEffect(() => {
     if (!inventoryReady) {
@@ -2224,22 +2244,19 @@ export default function Launchpad({
     }
   }
   function changeTab(next: LaunchpadTab) {
-    if (busy || selection || removal) return;
+    if (busy || selection || removal || !canOpenTab(next)) return;
     const nextTarget = next === "automodpack" ? "automodpack" : undefined;
-    const nextType = next === "automodpack" ? "mod" : next;
+    const nextType = next === "automodpack" ? (autoModpackType ?? "mod") : next;
     setTarget(nextTarget);
-    if (nextTarget) selectAutoModpackType(nextType);
-    else changeType(nextType);
+    changeType(nextType);
   }
-  function selectAutoModpackType(next: ContentType) {
-    if (busy || selection || removal) return;
-    changeType(next);
-    if (!source?.types.includes(next)) {
-      const compatible =
-        config?.platforms.find(
-          (item) => item.available && item.types.includes(next),
-        ) ?? config?.platforms.find((item) => item.types.includes(next));
-      if (compatible) setPlatform(compatible.id);
+  function selectSupportedContent(next?: Platform) {
+    if (next?.types.includes(type)) return;
+    const stagedType = target && firstAutoModpackType(next);
+    if (stagedType) changeType(stagedType);
+    else {
+      setTarget(undefined);
+      changeType(next?.types[0] ?? "modpack");
     }
   }
   const entries = (installed?.items ?? [])
@@ -2320,7 +2337,7 @@ export default function Launchpad({
   const visibleProjects: {
     project: Project;
     entry?: InstalledItem;
-    packHashes?: Set<string>;
+    otherHashes?: Set<string>;
   }[] = installedOnly
     ? entries.slice(currentOffset, currentOffset + limit).map((entry) => ({
         project: {
@@ -2341,13 +2358,13 @@ export default function Launchpad({
           url: projectPageUrl({ ...project, projectId: project.id }),
         },
         entry: installedProjects.get(`${project.platform}:${project.id}`),
-        packHashes:
-          browseAutoModpackMods && packIndex?.api === api
-            ? packIndex.projects.get(`${project.platform}:${project.id}`)
+        otherHashes:
+          otherModIndex?.api === api && otherModIndex.target === otherModTarget
+            ? otherModIndex.projects.get(`${project.platform}:${project.id}`)
             : undefined,
       }));
-  function manageInAutoModpack(project: Project, hashes: Set<string>) {
-    changeTab("automodpack");
+  function manageOtherMod(project: Project, hashes: Set<string>) {
+    changeTab(otherModTarget === "server" ? "mod" : "automodpack");
     setInstalledOnly(true);
     setQuery({
       title: project.title,
@@ -2558,8 +2575,7 @@ export default function Launchpad({
               setInstalledOnly(checked);
               setOffset(0);
               setQuery("");
-              if (!checked && !target && !source?.types.includes(type))
-                changeType(source?.types[0] ?? "modpack");
+              if (!checked) selectSupportedContent(source);
             }}
           />
           <RefreshButton
@@ -2711,18 +2727,15 @@ export default function Launchpad({
                 setLoader("");
               setQuery("");
               setOffset(0);
-              if (!target && next && !next.types.includes(type))
-                changeType(next.types[0] ?? "modpack");
+              selectSupportedContent(next);
             }}
           >
             {installedOnly && <option value="all">All platforms</option>}
-            {config.platforms
-              .filter((item) => !target || item.types.includes(type))
-              .map((item) => (
-                <option key={item.id} value={item.id}>
-                  {item.name}
-                </option>
-              ))}
+            {config.platforms.map((item) => (
+              <option key={item.id} value={item.id}>
+                {item.name}
+              </option>
+            ))}
           </select>
         </label>
         <label>
@@ -2809,18 +2822,13 @@ export default function Launchpad({
             aria-selected={activeTab === id}
             aria-controls="launchpad-results"
             tabIndex={activeTab === id ? 0 : -1}
-            disabled={
-              Boolean(busy) ||
-              (id !== "automodpack" &&
-                !installedOnly &&
-                !source?.types.includes(id))
-            }
+            disabled={Boolean(busy) || !canOpenTab(id)}
             title={
-              id !== "automodpack" &&
-              !installedOnly &&
-              !source?.types.includes(id)
-                ? `${source?.name ?? "This platform"} does not offer ${label.toLowerCase()}.`
-                : undefined
+              canOpenTab(id)
+                ? undefined
+                : id === "automodpack"
+                  ? `${source?.name ?? "This platform"} does not offer mods, resource packs, or shader packs.`
+                  : `${source?.name ?? "This platform"} does not offer ${label.toLowerCase()}.`
             }
             onClick={() => changeTab(id)}
             onKeyDown={(event) => {
@@ -2829,11 +2837,8 @@ export default function Launchpad({
               )
                 return;
               event.preventDefault();
-              const supportedKinds = kinds.filter(
-                (item) =>
-                  item.id === "automodpack" ||
-                  installedOnly ||
-                  source?.types.includes(item.id),
+              const supportedKinds = kinds.filter((item) =>
+                canOpenTab(item.id),
               );
               const current = supportedKinds.findIndex(
                 (item) => item.id === activeTab,
@@ -2907,8 +2912,10 @@ export default function Launchpad({
               type="button"
               key={id}
               aria-pressed={type === id}
-              disabled={Boolean(busy)}
-              onClick={() => selectAutoModpackType(id)}
+              disabled={
+                Boolean(busy) || (!installedOnly && !source?.types.includes(id))
+              }
+              onClick={() => changeType(id)}
             >
               {label}
             </button>
@@ -3259,7 +3266,7 @@ export default function Launchpad({
                   "updated",
                 )}
               </div>
-              {visibleProjects.map(({ project, entry, packHashes }) => (
+              {visibleProjects.map(({ project, entry, otherHashes }) => (
                 <article
                   className="panel launchpad-project launchpad-installed-row"
                   key={entry?.path ?? `${project.platform}:${project.id}`}
@@ -3291,9 +3298,9 @@ export default function Launchpad({
                               : "Unidentified file"}
                           </span>
                         )}
-                        {packHashes && (
+                        {otherHashes && (
                           <span className="launchpad-badge">
-                            Installed in AutoModpack
+                            Installed in {otherModLabel}
                           </span>
                         )}
                         {entry?.update && (
@@ -3384,11 +3391,11 @@ export default function Launchpad({
                     <ProjectAuthors project={project} />
                   </div>
                   <div className="launchpad-project-action">
-                    {(packHashes ||
+                    {(otherHashes ||
                       !entry ||
                       (entry.platform && entry.projectId)) && (
                       <div className="launchpad-version-action">
-                        {(!packHashes || entry) && (
+                        {(!otherHashes || entry) && (
                           <button
                             className={`btn ${entry && !entry.update ? "" : "primary"}`}
                             aria-label={`${entry?.update ? "Update" : entry ? "Choose version for" : "Install"} ${project.title}`}
@@ -3421,20 +3428,18 @@ export default function Launchpad({
                             {entry.update.version || entry.update.name}
                           </div>
                         )}
-                        {packHashes && (
+                        {otherHashes && (
                           <button
                             type="button"
-                            className="btn launchpad-manage-pack"
+                            className="btn launchpad-manage-mod"
                             disabled={
                               Boolean(busy) ||
                               Boolean(selection) ||
                               Boolean(removal)
                             }
-                            onClick={() =>
-                              manageInAutoModpack(project, packHashes)
-                            }
+                            onClick={() => manageOtherMod(project, otherHashes)}
                           >
-                            <Layers3 size={15} /> Manage in AutoModpack
+                            <OtherModIcon size={15} /> Manage in {otherModLabel}
                           </button>
                         )}
                       </div>
@@ -3486,8 +3491,10 @@ export default function Launchpad({
                       <span
                         className="launchpad-active launchpad-empty-cell"
                         aria-label={
-                          packHashes
-                            ? "Not installed in server Mods"
+                          otherHashes
+                            ? target
+                              ? "Not installed in AutoModpack"
+                              : "Not installed in server Mods"
                             : "Not installed"
                         }
                       >

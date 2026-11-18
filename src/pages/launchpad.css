@@ -283,7 +283,7 @@
     minmax(120px, 0.35fr) 60px 80px 130px 130px;
   --installed-areas: "name action author active remove added modified";
 }
-.launchpad-installed-list:has(.launchpad-manage-pack) {
+.launchpad-installed-list:has(.launchpad-manage-mod) {
   --launchpad-action-width: 190px;
 }
 .launchpad-installed-list:focus-visible {

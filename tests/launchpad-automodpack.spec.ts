@@ -462,6 +462,108 @@ test("Mods catalog recognizes AutoModpack projects across providers and opens th
   expect(state.writes).toEqual([]);
 });
 
+test("browsing AutoModpack Mods lets a catalog reader manage the matching file in regular Mods", async ({
+  page,
+  serverId,
+}) => {
+  const permissions = ["server.view", "file.read"];
+  await page.addInitScript(() =>
+    localStorage.setItem("mc-panel.session.v1", "p".repeat(43)),
+  );
+  await page.route("**/api/access/session", (route) =>
+    route.fulfill({
+      json: {
+        role: "subuser",
+        userId: "reader",
+        email: "reader@example.test",
+        serverId,
+        permissions,
+      },
+    }),
+  );
+  await page.route("**/api/servers", (route) =>
+    route.fulfill({
+      json: {
+        servers: [
+          {
+            id: serverId,
+            name: "Shared",
+            status: "offline",
+            accessPermissions: permissions,
+          },
+        ],
+        defaultServerId: serverId,
+      },
+    }),
+  );
+  const state = await catalog(page, true, "curseforge");
+  const [listing] = state.projects;
+  const linked = {
+    ...item("mods/renamed.jar.disabled"),
+    title: "Client bindings",
+    platform: "modrinth",
+    projectId: "84",
+    active: false,
+    catalogAliases: [
+      { platform: listing.platform, projectId: "491", versionId: "621" },
+    ],
+  };
+  state.inventories.get("server:mod")!.push(linked);
+  state.inventories.set("automodpack:mod", [
+    { ...item(state.folder("mod"), "2.0"), platform: listing.platform },
+  ]);
+  state.projects.push(
+    { ...listing, id: "491", title: "Controlling" },
+    { ...listing, id: linked.projectId, title: linked.title },
+  );
+  await page.goto("/#launchpad");
+  const regularMods = page.getByRole("tab", { name: "Mods", exact: true });
+  await page.getByRole("tab", { name: "AutoModpack", exact: true }).click();
+  const row = (name: string) =>
+    page.getByRole("article", { name, exact: true });
+  const manage = (name: string) =>
+    row(name).getByRole("button", { name: "Manage in Mods", exact: true });
+  await expect(
+    row("Controlling").getByText("Installed in Mods", { exact: true }),
+  ).toBeVisible();
+  await expect(manage("Controlling")).toBeEnabled();
+  await expect(
+    row("Controlling").getByRole("button", { name: /^Install / }),
+  ).toHaveCount(0);
+  await expect(row("Controlling").getByRole("switch")).toHaveCount(0);
+  await expect(
+    row("Controlling").getByRole("button", { name: /^Remove / }),
+  ).toHaveCount(0);
+  // Its staged copy keeps its own version and permissions.
+  await expect(manage(project.title)).toBeEnabled();
+  await expect(row(project.title)).toContainText("Installed: 2.0");
+  await expect(row(project.title).getByRole("switch")).toBeDisabled();
+  // Same title and numeric ID as the server file, on a different catalog.
+  await expect(manage(linked.title)).toHaveCount(0);
+  await expect(
+    row(linked.title).getByRole("button", { name: `Install ${linked.title}` }),
+  ).toBeDisabled();
+
+  const installedOnly = page.getByRole("switch", {
+    name: "Show installed content",
+    exact: true,
+  });
+  await installedOnly.check();
+  await expect(row(project.title)).toContainText(state.folder("mod"));
+  await expect(row(linked.title)).toHaveCount(0);
+  await installedOnly.uncheck();
+  await manage("Controlling").click();
+  await expect(regularMods).toHaveAttribute("aria-selected", "true");
+  await expect(installedOnly).toBeChecked();
+  await expect(page.getByRole("article")).toHaveCount(1);
+  await expect(row(linked.title)).toContainText(linked.path);
+  await expect(row(linked.title).getByRole("switch")).not.toBeChecked();
+  await expect(row(linked.title).getByRole("switch")).toBeDisabled();
+  await page.getByRole("button", { name: "Clear search", exact: true }).click();
+  await expect(row(project.title)).toContainText("mods/shared.jar");
+  expect(state.writes).toEqual([]);
+});
+
 test("refreshing the Mods catalog clears the AutoModpack badge after the staged file is removed", async ({
   page,
 }) => {
@@ -595,9 +697,23 @@ for (const kind of kinds) {
     page,
   }, testInfo) => {
     const state = await catalog(page);
+    // Leave the project being installed absent from regular Mods.
+    const serverProject = { ...project, id: "server-mod", title: "Server mod" };
+    state.projects.push(serverProject);
+    state.inventories.set("server:mod", [
+      {
+        ...item("mods/server.jar"),
+        projectId: serverProject.id,
+        title: serverProject.title,
+      },
+    ]);
     await page.goto("/#launchpad");
     const row = page.getByRole("article", { name: project.title, exact: true });
-    await expect(row).toContainText("Installed: 1.0");
+    const serverRow = page.getByRole("article", {
+      name: serverProject.title,
+      exact: true,
+    });
+    await expect(serverRow).toContainText("Installed: 1.0");
     const tabs = page.getByRole("tablist", { name: "Content type" });
     await expect(tabs.getByRole("tab")).toHaveText([
       "Modpacks",
@@ -709,9 +825,9 @@ for (const kind of kinds) {
       .click();
     await expect(row).toHaveCount(0);
     await tabs.getByRole("tab", { name: "Mods", exact: true }).click();
-    await expect(row).toContainText("Installed: 1.0");
+    await expect(serverRow).toContainText("Installed: 1.0");
     await expect(
-      row.getByRole("switch", { name: `Active: ${project.title}` }),
+      serverRow.getByRole("switch", { name: `Active: ${serverProject.title}` }),
     ).toBeChecked();
     await tabs.getByRole("tab", { name: "AutoModpack", exact: true }).click();
     await expect(
@@ -742,27 +858,44 @@ for (const kind of kinds) {
         scopedReads.some((url) => url.pathname.endsWith(`/${endpoint}`)),
       ).toBe(true);
     expect(state.inventories.get("server:mod")?.[0]).toMatchObject({
-      path: "mods/shared.jar",
+      path: "mods/server.jar",
       versionName: "1.0",
       active: true,
     });
   });
 }
 
-test("AutoModpack stays available when the selected provider only offers plugins", async ({
+test("AutoModpack follows the selected platform when browsing and stays accessible in Installed only", async ({
   page,
   serverId,
 }) => {
   await catalog(page);
+  const specialists = [
+    { id: "ftb", name: "Feed The Beast", type: "modpack", tab: "Modpacks" },
+    { id: "atlauncher", name: "ATLauncher", type: "modpack", tab: "Modpacks" },
+    { id: "voidswrath", name: "Voids Wrath", type: "modpack", tab: "Modpacks" },
+    { id: "spigot", name: "Spigot", type: "plugin", tab: "Plugins" },
+  ];
   await page.route(/\/api\/launchpad(?:\?.*)?$/, (route) =>
     route.fulfill({
       json: {
         targets: ["server", "automodpack"],
         platforms: [
-          { id: "hangar", name: "Hangar", available: true, types: ["plugin"] },
+          ...specialists.map(({ id, name, type }) => ({
+            id,
+            name,
+            available: true,
+            types: [type],
+          })),
           {
             id: "modrinth",
             name: "Modrinth",
+            available: true,
+            types: ["mod", "resourcepack", "shader"],
+          },
+          {
+            id: "curseforge",
+            name: "CurseForge",
             available: true,
             types: ["mod", "resourcepack", "shader"],
           },
@@ -775,10 +908,36 @@ test("AutoModpack stays available when the selected provider only offers plugins
     }),
   );
   await page.goto("/#launchpad");
-  await page
-    .getByRole("combobox", { name: "Platform", exact: true })
-    .selectOption("hangar");
+  const platform = page.getByRole("combobox", {
+    name: "Platform",
+    exact: true,
+  });
   const auto = page.getByRole("tab", { name: "AutoModpack", exact: true });
+  for (const provider of specialists) {
+    await platform.selectOption(provider.id);
+    const tab = page.getByRole("tab", { name: provider.tab, exact: true });
+    await expect(tab).toHaveAttribute("aria-selected", "true");
+    await expect(auto).toBeDisabled();
+    await tab.press("End");
+    await expect(tab).toBeFocused();
+    await expect(platform).toHaveValue(provider.id);
+  }
+  const installed = page.getByRole("switch", {
+    name: "Show installed content",
+    exact: true,
+  });
+  await installed.check();
+  await expect(platform).toHaveValue("all");
+  await expect(auto).toBeEnabled();
+  await auto.click();
+  await expect(auto).toHaveAttribute("aria-selected", "true");
+  await installed.uncheck();
+  await expect(platform).toHaveValue("spigot");
+  await expect(
+    page.getByRole("tab", { name: "Plugins", exact: true }),
+  ).toHaveAttribute("aria-selected", "true");
+  await expect(auto).toBeDisabled();
+  await platform.selectOption("modrinth");
   await expect(auto).toBeEnabled();
   await auto.click();
   await expect(auto).toHaveAttribute("aria-selected", "true");
@@ -786,32 +945,36 @@ test("AutoModpack stays available when the selected provider only offers plugins
     page.getByRole("combobox", { name: "Platform", exact: true }),
   ).toHaveValue("modrinth");
   await expect(
-    page.getByRole("button", { name: `Install ${project.title}`, exact: true }),
+    page.getByRole("button", { name: "Manage in Mods", exact: true }),
   ).toBeVisible();
   await page
     .getByRole("group", { name: "AutoModpack content", exact: true })
     .getByRole("button", { name: "Shader Packs", exact: true })
     .click();
+  await platform.selectOption("curseforge");
+  await expect(auto).toHaveAttribute("aria-selected", "true");
+  await expect(platform.locator("option")).toHaveCount(6);
+  await platform.selectOption("ftb");
+  await expect(auto).toBeDisabled();
+  await expect(
+    page.getByRole("tab", { name: "Modpacks", exact: true }),
+  ).toHaveAttribute("aria-selected", "true");
   await page.evaluate((id) => {
     sessionStorage.setItem(
       `mc-panel.launchpad.view.${id}`,
       JSON.stringify({
         type: "automodpack",
-        platform: "hangar",
+        platform: "spigot",
         loader: "iris",
       }),
     );
   }, serverId);
   await page.reload();
-  await expect(auto).toHaveAttribute("aria-selected", "true");
+  await expect(platform).toHaveValue("spigot");
+  await expect(auto).toBeDisabled();
   await expect(
-    page
-      .getByRole("group", { name: "AutoModpack content", exact: true })
-      .getByRole("button", { name: "Mods", exact: true }),
-  ).toHaveAttribute("aria-pressed", "true");
-  await expect(
-    page.getByRole("combobox", { name: "Platform", exact: true }),
-  ).toHaveValue("modrinth");
+    page.getByRole("tab", { name: "Plugins", exact: true }),
+  ).toHaveAttribute("aria-selected", "true");
 });
 
 test("older panels never receive AutoModpack requests and regular Mods stays available", async ({
