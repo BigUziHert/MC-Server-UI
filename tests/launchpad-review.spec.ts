@@ -272,11 +272,14 @@ test("switching catalogs recognizes the same installed file and reviews versions
   ).toContainText(file.path);
   await removal.getByRole("button", { name: "Close", exact: true }).click();
 
+  const refresh = page.getByRole("button", {
+    name: "Refresh Launchpad and check updates",
+    exact: true,
+  });
+  await expect(refresh).toBeEnabled();
   changed = true;
   try {
-    await page
-      .getByRole("button", { name: "Refresh Launchpad and check updates" })
-      .click();
+    await refresh.click();
     await expect(
       linked.getByRole("button", { name: "Install Other listing" }),
     ).toBeVisible();
@@ -1102,6 +1105,7 @@ test("220 installed files stay usable while provider checks run without rescanni
   const requests: URL[] = [];
   let heldOnline: Route | undefined;
   let heldRefresh: Route | undefined;
+  let heldFinalPoll: Route | undefined;
   let localReads = 0;
   let onlineReads = 0;
   const warnings = [
@@ -1127,6 +1131,20 @@ test("220 installed files stay usable while provider checks run without rescanni
       heldOnline = route;
       return;
     }
+    if (onlineReads === 3) {
+      return route.fulfill({
+        json: {
+          items,
+          warnings: [],
+          checkingUpdates: true,
+          progress: { completed: 219, total: 220 },
+        },
+      });
+    }
+    if (onlineReads === 4) {
+      heldFinalPoll = route;
+      return;
+    }
     return route.fulfill({
       json: {
         items: items.map((item) => ({ ...item, updateCheck: "checked" })),
@@ -1140,7 +1158,22 @@ test("220 installed files stay usable while provider checks run without rescanni
   await page.goto("/#launchpad");
   const toggle = page.getByRole("switch", { name: "Show installed content" });
   await toggle.check();
+  const refreshButtons = page.getByRole("button", {
+    name: /^Refresh (?:bottom )?Launchpad and check updates$/,
+  });
+  const busyButtons = refreshButtons.and(
+    page.locator(':disabled[aria-busy="true"]'),
+  );
+  const idleButtons = refreshButtons.and(
+    page.locator(':enabled[aria-busy="false"]'),
+  );
+  const banner = page.getByRole("status", {
+    name: "Notification",
+    exact: true,
+  });
   await expect.poll(() => Boolean(heldOnline)).toBe(true);
+  await expect(busyButtons.locator("svg.spin")).toHaveCount(2);
+  await expect(banner).toHaveCount(0);
   await expect(page.getByRole("article")).toHaveCount(10);
   await expect(page.getByRole("tabpanel")).toHaveAttribute(
     "aria-busy",
@@ -1196,6 +1229,7 @@ test("220 installed files stay usable while provider checks run without rescanni
       exact: true,
     }),
   ).toHaveText("Checking updates for 180 of 220…");
+  await expect(busyButtons.locator("svg.spin")).toHaveCount(2);
   await expect.poll(() => onlineReads).toBe(2);
   await expect(
     page.getByRole("status", {
@@ -1203,6 +1237,7 @@ test("220 installed files stay usable while provider checks run without rescanni
       exact: true,
     }),
   ).toHaveCount(0);
+  await expect(idleButtons).toHaveCount(2);
   expect(requests.at(-1)!.searchParams.has("refresh")).toBe(false);
   const notices = page.locator(".launchpad-notices");
   await expect(notices).toHaveCount(1);
@@ -1232,6 +1267,7 @@ test("220 installed files stay usable while provider checks run without rescanni
     })
     .click();
   await expect.poll(() => Boolean(heldRefresh)).toBe(true);
+  await expect(busyButtons.locator("svg.spin")).toHaveCount(2);
   await expect(page.getByRole("article")).toHaveCount(25);
   await search.fill("Mod 219");
   await expect(page.getByRole("article")).toHaveCount(1);
@@ -1253,14 +1289,32 @@ test("220 installed files stay usable while provider checks run without rescanni
   });
   await heldRefresh!.fulfill({ json: { items, warnings: [] } });
   await expect(
-    page.getByRole("button", {
-      name: "Refresh Launchpad and check updates",
+    page.getByRole("status", {
+      name: "Installed content refresh",
       exact: true,
     }),
-  ).toBeEnabled();
+  ).toHaveText("Checking updates for 1 of 220…");
+  await expect(busyButtons.locator("svg.spin")).toHaveCount(2);
+  await expect
+    .poll(() => Boolean(heldFinalPoll), { timeout: 10_000 })
+    .toBe(true);
+  await expect(busyButtons.locator("svg.spin")).toHaveCount(2);
+  await expect(banner).toHaveCount(0);
+  await heldFinalPoll!.fulfill({
+    json: {
+      items: items.map((item) => ({ ...item, updateCheck: "checked" })),
+      warnings: [],
+    },
+  });
+  await expect(idleButtons).toHaveCount(2);
+  await expect(refreshButtons.locator("svg.spin")).toHaveCount(0);
+  await expect(banner).toHaveCount(0);
   expect(localReads).toBe(2);
-  expect(onlineReads).toBe(3);
-  expect(requests.at(-1)!.searchParams.get("refresh")).toBe("true");
+  expect(onlineReads).toBe(4);
+  expect(
+    requests.filter((url) => url.searchParams.get("refresh") === "true"),
+  ).toHaveLength(1);
+  expect(requests.at(-1)!.searchParams.has("refresh")).toBe(false);
 });
 
 test("a 120-second background check deadline preserves completed rows and fails only unfinished checks", async ({
@@ -1319,8 +1373,20 @@ test("a 120-second background check deadline preserves completed rows and fails 
     exact: true,
   });
   await expect(progress).toHaveText("Checking updates for 1 of 221…");
+  const refreshButtons = page.getByRole("button", {
+    name: /^Refresh (?:bottom )?Launchpad and check updates$/,
+  });
+  await expect(
+    refreshButtons
+      .and(page.locator(':disabled[aria-busy="true"]'))
+      .locator("svg.spin"),
+  ).toHaveCount(2);
   await page.clock.fastForward(120_001);
   await expect(progress).toHaveCount(0);
+  await expect(
+    refreshButtons.and(page.locator(':enabled[aria-busy="false"]')),
+  ).toHaveCount(2);
+  await expect(refreshButtons.locator("svg.spin")).toHaveCount(0);
   await expect(
     page.getByText(/The update check is taking longer than expected/).first(),
   ).toBeVisible();
@@ -1574,16 +1640,29 @@ test("installed project links and update-all review span platforms and retry the
   page,
 }) => {
   await catalog(page);
-  await page.route("**/api/launchpad/installed?**", (route) =>
-    route.fulfill({
-      json: {
-        items: [installed("Alpha"), installed("Beta", "curseforge")],
-        warnings: [],
-      },
-    }),
-  );
+  const items = [installed("Alpha"), installed("Beta", "curseforge")];
+  const updatedItems = items.map((item) => ({
+    ...item,
+    versionId: version.id,
+    versionName: version.version,
+    update: null,
+  }));
+  let postUpdateCheck: Route | undefined;
   let updates: unknown,
     installs: unknown[] = [];
+  await page.route("**/api/launchpad/installed?**", (route) => {
+    const url = new URL(route.request().url());
+    if (installs.length === 2 && url.searchParams.has("background")) {
+      postUpdateCheck = route;
+      return;
+    }
+    return route.fulfill({
+      json: {
+        items: installs.length === 2 ? updatedItems : items,
+        warnings: [],
+      },
+    });
+  });
   await page.route("**/api/launchpad/updates/preview", (route) => {
     updates = route.request().postDataJSON();
     return route.fulfill({ json: plan });
@@ -1647,12 +1726,39 @@ test("installed project links and update-all review span platforms and retry the
   await page
     .getByRole("button", { name: "Retry download", exact: true })
     .click();
+  await expect.poll(() => Boolean(postUpdateCheck)).toBe(true);
+  const refreshButtons = page.getByRole("button", {
+    name: /^Refresh (?:bottom )?Launchpad and check updates$/,
+  });
+  await expect(
+    refreshButtons
+      .and(page.locator(':disabled[aria-busy="true"]'))
+      .locator("svg.spin"),
+  ).toHaveCount(2);
+  const checkingStatus = page.getByRole("status", {
+    name: "Installed content refresh",
+    exact: true,
+  });
+  await expect(checkingStatus).toContainText("Checking for updates");
+  await expect(checkingStatus).toHaveCSS("clip-path", "inset(50%)");
   await expect(
     page.getByRole("status", { name: "Installation status", exact: true }),
   ).toContainText("Installation completed");
+  await expect(page.getByRole("dialog")).toHaveCount(0);
+  await expect(
+    page.getByRole("status", { name: "Notification", exact: true }),
+  ).toHaveCount(0);
   await expect(
     page.getByRole("button", { name: "Dismiss notification" }),
   ).toHaveCount(0);
+  await postUpdateCheck!.fulfill({
+    json: { items: updatedItems, warnings: [] },
+  });
+  await expect(
+    refreshButtons.and(page.locator(':enabled[aria-busy="false"]')),
+  ).toHaveCount(2);
+  await expect(checkingStatus).toHaveCount(0);
+  await expect(page.getByText("Up to date", { exact: true })).toHaveCount(2);
   expect(installs).toEqual([retryInput, retryInput]);
 });
 

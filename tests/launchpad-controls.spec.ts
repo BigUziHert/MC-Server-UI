@@ -1540,12 +1540,11 @@ test("the complete bottom toolbar shares search, sort and installed state with t
   await topToggle.uncheck();
   await expect(bottomToggle).not.toBeChecked();
   const priorRequests = searches.length;
-  await bottom
-    .getByRole("button", {
-      name: "Refresh bottom Launchpad and check updates",
-      exact: true,
-    })
-    .click();
+  const bottomRefresh = bottom.getByRole("button", {
+    name: "Refresh bottom Launchpad and check updates",
+    exact: true,
+  });
+  await bottomRefresh.click();
   await expect
     .poll(() =>
       searches
@@ -1553,6 +1552,10 @@ test("the complete bottom toolbar shares search, sort and installed state with t
         .some((url) => url.searchParams.get("refresh") === "true"),
     )
     .toBe(true);
+  await expect(bottomRefresh).toBeEnabled();
+  await expect(
+    page.getByRole("status", { name: "Notification", exact: true }),
+  ).toHaveCount(0);
 });
 
 test("top and bottom category filters have distinct panels and share selections on mobile", async ({

@@ -787,6 +787,12 @@ export default function Launchpad({
   const refreshSequence = useRef(0);
   const [manualRefreshing, setManualRefreshing] = useState(false);
   const manualCompletion = useRef<((success: boolean) => void) | null>(null);
+  const checkingForUpdates = manualRefreshing || scanRefreshing;
+  const checkStatus = scanLoading
+    ? "Reading installed files…"
+    : installed?.checkingUpdates && installed.progress
+      ? `Checking updates for ${Math.max(0, installed.progress.total - installed.progress.completed)} of ${installed.progress.total}…`
+      : "Checking for updates…";
   const [pendingPaths, setPendingPaths] = useState<Set<string>>(new Set());
   const reloadContent = useCallback(() => {
     catalogRefresh.current = true;
@@ -1003,24 +1009,31 @@ export default function Launchpad({
     [api, viewKey],
   );
 
-  const refreshInstalled = useCallback(async () => {
+  const refreshInstalled = useCallback(() => {
+    if (scanRefreshing || manualCompletion.current)
+      return Promise.resolve(false);
     catalogRefresh.current = true;
     const currentSession = session.current;
-    manualCompletion.current?.(false);
     setManualRefreshing(true);
-    const configured = await loadConfig(false, true);
-    if (currentSession !== session.current) return false;
-    if (!configured) {
-      setManualRefreshing(false);
-      return false;
-    }
-    forceScan.current = { api, token: ++refreshSequence.current };
-    const completion = new Promise<boolean>((resolve) => {
+    return new Promise<boolean>((resolve) => {
       manualCompletion.current = resolve;
+      void loadConfig(false, true).then((configured) => {
+        if (
+          currentSession !== session.current ||
+          manualCompletion.current !== resolve
+        )
+          return;
+        if (!configured) {
+          manualCompletion.current = null;
+          setManualRefreshing(false);
+          resolve(false);
+          return;
+        }
+        forceScan.current = { api, token: ++refreshSequence.current };
+        setReload((value) => value + 1);
+      });
     });
-    setReload((value) => value + 1);
-    return completion;
-  }, [api, loadConfig]);
+  }, [api, loadConfig, scanRefreshing]);
 
   const reconcileJob = useCallback(async () => {
     const currentSession = session.current;
@@ -2579,10 +2592,9 @@ export default function Launchpad({
                 ? "Refresh bottom Launchpad and check updates"
                 : "Refresh Launchpad and check updates"
             }
-            refreshing={manualRefreshing}
+            refreshing={checkingForUpdates}
             onRefresh={refreshInstalled}
             notify={notify}
-            successMessage="Launchpad refreshed."
           />
         </div>
       </div>
@@ -3041,6 +3053,7 @@ export default function Launchpad({
           variant="error"
           title="Installation status unavailable"
           message={jobError}
+          retryDisabled={checkingForUpdates}
           onRetry={() => {
             setJobError("");
             void refreshInstalled();
@@ -3077,20 +3090,13 @@ export default function Launchpad({
           )}
         </div>
       )}
-      {targetSupported && scanRefreshing && (!installedOnly || installed) && (
+      {checkingForUpdates && (
         <div
-          className="launchpad-scan-status"
+          className="launchpad-sr-only"
           role="status"
           aria-label="Installed content refresh"
         >
-          <LoaderCircle size={14} className="spin" />
-          <span>
-            {scanLoading
-              ? "Reading installed files…"
-              : installed?.checkingUpdates && installed.progress
-                ? `Checking updates for ${Math.max(0, installed.progress.total - installed.progress.completed)} of ${installed.progress.total}…`
-                : "Refreshing installed details and checking updates…"}
-          </span>
+          {checkStatus}
         </div>
       )}
       {scanError && installedOnly && installed && (
@@ -3099,7 +3105,7 @@ export default function Launchpad({
           <span>{scanError}</span>
           <button
             className="btn"
-            disabled={manualRefreshing}
+            disabled={checkingForUpdates}
             onClick={() => void refreshInstalled()}
           >
             Try again
@@ -3135,7 +3141,7 @@ export default function Launchpad({
           </div>
           <button
             className="btn"
-            disabled={manualRefreshing}
+            disabled={checkingForUpdates}
             onClick={() => void refreshInstalled()}
           >
             Try again
@@ -3193,6 +3199,7 @@ export default function Launchpad({
             variant="error"
             title={`Unable to load ${installedOnly ? "installed content" : "projects"}`}
             message={failed}
+            retryDisabled={installedOnly && checkingForUpdates}
             onRetry={() => {
               if (installedOnly) void refreshInstalled();
               else reloadContent();

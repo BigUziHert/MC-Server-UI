@@ -7,6 +7,7 @@ export default function StatePanel({
   icon,
   action,
   onRetry,
+  retryDisabled = false,
   className = "",
 }: {
   variant: "loading" | "error" | "empty";
@@ -15,6 +16,7 @@ export default function StatePanel({
   icon?: ReactNode;
   action?: ReactNode;
   onRetry?: () => void;
+  retryDisabled?: boolean;
   className?: string;
 }) {
   return (
@@ -39,7 +41,12 @@ export default function StatePanel({
       <h3>{title}</h3>
       {message && <p>{message}</p>}
       {variant === "error" && onRetry ? (
-        <button type="button" className="btn" onClick={onRetry}>
+        <button
+          type="button"
+          className="btn"
+          onClick={onRetry}
+          disabled={retryDisabled}
+        >
           Try again
         </button>
       ) : (

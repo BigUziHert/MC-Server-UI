@@ -120,7 +120,6 @@ test("Launchpad retains unchanged identity through stripped local refresh and re
   };
   let full = 0;
   let held: Route | undefined;
-  let background = false;
   const requests: URL[] = [];
   await page.route("**/api/launchpad/installed?**", (route) => {
     const url = new URL(route.request().url());
@@ -145,7 +144,6 @@ test("Launchpad retains unchanged identity through stripped local refresh and re
       held = route;
       return;
     }
-    if (background) background = false;
     return route.fulfill({
       json: { items: [known], warnings: [], checkingUpdates: false },
     });
@@ -156,17 +154,20 @@ test("Launchpad retains unchanged identity through stripped local refresh and re
   await expect(
     row.getByRole("button", { name: "Update Known Mod" }),
   ).toBeEnabled();
-  await page
-    .getByRole("button", { name: "Refresh Launchpad and check updates" })
-    .click();
+  const refresh = page.getByRole("button", {
+    name: "Refresh Launchpad and check updates",
+    exact: true,
+  });
+  await refresh.click();
   await expect.poll(() => Boolean(held)).toBe(true);
+  await expect(refresh).toBeDisabled();
+  await expect(refresh.locator("svg.spin")).toBeVisible();
   await expect(row).toContainText("Known author");
   await expect(row.locator("img")).toHaveAttribute("src", known.iconUrl);
   await expect(
     row.getByRole("button", { name: "Update Known Mod" }),
   ).toBeEnabled();
   expect(requests.at(-1)?.searchParams.get("background")).toBe("true");
-  background = true;
   await held!.fulfill({
     json: {
       items: [known],
@@ -178,11 +179,14 @@ test("Launchpad retains unchanged identity through stripped local refresh and re
   await expect(
     page.getByRole("status", { name: "Installed content refresh" }),
   ).toHaveText("Checking updates for 1 of 2…");
+  await expect(refresh).toBeDisabled();
   await expect.poll(() => full).toBe(3);
   expect(requests.at(-1)?.searchParams.has("refresh")).toBe(false);
+  await expect(refresh).toBeEnabled();
+  await expect(refresh.locator("svg.spin")).toHaveCount(0);
   await expect(
-    page.getByRole("button", { name: "Refresh Launchpad and check updates" }),
-  ).toBeEnabled();
+    page.getByText("Launchpad refreshed.", { exact: true }),
+  ).toHaveCount(0);
   await expect(
     page.getByRole("status", { name: "Installed content refresh" }),
   ).toHaveCount(0);
@@ -241,10 +245,13 @@ test("Launchpad drops stale identity for replaced bytes and does not resurrect d
   await expect(
     page.getByRole("article", { name: "Old identity", exact: true }),
   ).toBeVisible();
+  const refreshButton = page.getByRole("button", {
+    name: "Refresh Launchpad and check updates",
+    exact: true,
+  });
+  await expect(refreshButton).toBeEnabled();
   refresh = true;
-  await page
-    .getByRole("button", { name: "Refresh Launchpad and check updates" })
-    .click();
+  await refreshButton.click();
   await expect.poll(() => Boolean(held)).toBe(true);
   await expect(page.getByRole("article")).toHaveCount(1);
   await expect(page.getByRole("article")).toHaveAccessibleName("changed.jar");
@@ -2536,7 +2543,12 @@ test("Launchpad keeps refreshed local files usable after installation while remo
     name: "Installed content refresh",
     exact: true,
   });
-  await expect(refreshing).toBeVisible();
+  const refresh = page.getByRole("button", {
+    name: "Refresh Launchpad and check updates",
+    exact: true,
+  });
+  await expect(refreshing).toBeAttached();
+  await expect(refresh).toBeDisabled();
   await expect(paths).toHaveText([
     "mods/zeta.jar",
     "mods/better-2.jar",
@@ -2585,25 +2597,14 @@ test("Launchpad keeps refreshed local files usable after installation while remo
     fullRequests.map((url) => url.searchParams.get("refresh") === "true"),
   ).toEqual([false, false, true]);
   holdConfig = true;
-  await page
-    .getByRole("button", {
-      name: "Refresh Launchpad and check updates",
-      exact: true,
-    })
-    .click();
+  await refresh.click();
   await expect.poll(() => Boolean(delayedConfig)).toBe(true);
   expect(fullRequests.length).toBe(3);
-  await expect(refreshing).toHaveCount(0);
+  await expect(refresh).toBeDisabled();
   await delayedConfig!.fulfill({ json: { ...config } });
   holdConfig = false;
-  await expect(
-    page.getByRole("button", {
-      name: "Refresh Launchpad and check updates",
-      exact: true,
-    }),
-  ).toBeEnabled();
-  // Advance the scan debounce after the new config object arrives, without a wall-clock sleep.
   await page.clock.runFor(1000);
+  await expect(refresh).toBeEnabled();
   expect(configRequests).toBe(4);
   expect(localRequests).toBe(4);
   expect(fullRequests.length).toBe(4);
@@ -2613,18 +2614,15 @@ test("Launchpad keeps refreshed local files usable after installation while remo
     "mods/better-2.jar",
     "mods/zeta.jar",
   ]);
-  await page
-    .getByRole("button", {
-      name: "Refresh Launchpad and check updates",
-      exact: true,
-    })
-    .click();
+  await refresh.click();
   await expect.poll(() => Boolean(timedOutFull)).toBe(true);
-  await expect(refreshing).toBeVisible();
+  await expect(refreshing).toBeAttached();
+  await expect(refresh).toBeDisabled();
   await page.clock.runFor(45_001);
   await expect(page.getByRole("alert")).toContainText(
     "The online check took too long. Please try again shortly.",
   );
+  await expect(refresh).toBeEnabled();
   await expect(paths).toHaveText([
     "mods/alpha.jar",
     "mods/better-2.jar",
@@ -2811,7 +2809,7 @@ test("Launchpad preserves known updates and exposes successful-response provider
       name: "Installed content refresh",
       exact: true,
     }),
-  ).toBeVisible();
+  ).toBeAttached();
   await reentryResponse!.fulfill({
     status: 200,
     json: { items: inventory("unavailable"), warnings: [] },
@@ -3104,18 +3102,18 @@ for (const browse of [
     await expect(
       companion.getByText("Update available", { exact: true }),
     ).toHaveCount(0);
-    const fullCount = () =>
+    const forcedChecks = () =>
       installedRequests.filter(
-        (url) => url.searchParams.get("local") !== "true",
+        (url) => url.searchParams.get("refresh") === "true",
       ).length;
-    const beforeRefresh = fullCount();
+    const beforeRefresh = forcedChecks();
     await page
       .getByRole("button", {
         name: "Refresh Launchpad and check updates",
         exact: true,
       })
       .click();
-    await expect.poll(fullCount).toBeGreaterThan(beforeRefresh);
+    await expect.poll(forcedChecks).toBe(beforeRefresh + 1);
     await expect(update).toBeEnabled();
     await expect(jei).toContainText("Installed: 19.54.0.429");
     await expect(

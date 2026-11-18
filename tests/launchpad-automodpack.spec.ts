@@ -1,4 +1,4 @@
-import { test as base, expect, type Page } from "@playwright/test";
+import { test as base, expect, type Page, type Route } from "@playwright/test";
 import {
   createProcessServer,
   removeTestServer,
@@ -732,11 +732,32 @@ test("AutoModpack shows unlisted releases as neutral results and keeps real fail
     exact: true,
   });
   await expect(refresh).toBeEnabled();
+  let held: Route | undefined;
+  await page.route("**/api/launchpad/installed?**", (route) => {
+    const params = new URL(route.request().url()).searchParams;
+    if (
+      params.get("target") === "automodpack" &&
+      params.has("refresh") &&
+      !params.has("local")
+    ) {
+      held = route;
+      return;
+    }
+    return route.fallback();
+  });
   await refresh.click();
+  await expect.poll(() => Boolean(held)).toBe(true);
+  await expect(refresh).toBeDisabled();
+  await expect(refresh.locator("svg.spin")).toBeVisible();
+  await held!.fallback();
   const warning = page.locator(".launchpad-update-warning");
   await expect(warning).toContainText(
     "Could not check updates for 1 installed item.",
   );
+  await expect(refresh).toBeEnabled();
+  await expect(
+    page.getByText("Launchpad refreshed.", { exact: true }),
+  ).toHaveCount(0);
   await warning.getByText("View affected files", { exact: true }).click();
   await expect(warning).toContainText("Provider Failure");
   await expect(warning).not.toContainText("Eating Animations");
