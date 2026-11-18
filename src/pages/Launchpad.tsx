@@ -826,6 +826,11 @@ export default function Launchpad({
   >(null);
   const [job, setJob] = useState<Job | null>(null);
   const [jobError, setJobError] = useState("");
+  const [retryError, setRetryError] = useState<{
+    jobId: string;
+    message: string;
+    unconfirmed: boolean;
+  } | null>(null);
   const [jobReload, setJobReload] = useState(0);
   const [jobAction, setJobAction] = useState(false);
   const jobActionPending = useRef(false);
@@ -857,6 +862,10 @@ export default function Launchpad({
     : (sortOptions[0]?.id ?? "");
   const supported = targetSupported && Boolean(source?.types.includes(type));
   const working = Boolean(job && ["queued", "running"].includes(job.status));
+  const failedRetry = job && retryError?.jobId === job.id ? retryError : null;
+  const unconfirmedPlanId = failedRetry?.unconfirmed
+    ? job?.retryInput?.planId
+    : undefined;
   const timedJobId =
     job?.status === "completed" && !job.recoveryRequired ? job.id : null;
   const availableUpdates = (installed?.items ?? []).filter(
@@ -867,7 +876,11 @@ export default function Launchpad({
       !pendingPaths.has(item.path),
   );
   const canRecover = allowChanges && status === "offline" && !working;
-  const canInstall = canRecover && !job?.recoveryRequired && targetSupported;
+  const canInstall =
+    canRecover &&
+    !job?.recoveryRequired &&
+    !unconfirmedPlanId &&
+    targetSupported;
   const canDismissJob =
     permissions === undefined || permissions.includes("file.update");
   const contentName =
@@ -926,6 +939,12 @@ export default function Launchpad({
               : null,
           );
           setJobError("");
+          setRetryError((current) => {
+            if (!current || current.jobId !== next.job?.id) return null;
+            return current.unconfirmed
+              ? { ...current, unconfirmed: false }
+              : current;
+          });
         }
         if (initial) {
           const saved = readSavedView(viewKey);
@@ -1120,6 +1139,8 @@ export default function Launchpad({
     setPendingPaths(new Set());
     setStatusStale(false);
     setJob(null);
+    setJobError("");
+    setRetryError(null);
     setSelection(null);
     setPlan(null);
     setRemoval(null);
@@ -1603,8 +1624,16 @@ export default function Launchpad({
     versionReload,
   ]);
 
+  const findAcceptedJob = useCallback(
+    async (planId: string, previousJobId?: string, signal?: AbortSignal) => {
+      const { job } = await api<Config>("/launchpad", { signal });
+      return job?.planId === planId && job.id !== previousJobId ? job : null;
+    },
+    [api],
+  );
+
   useEffect(() => {
-    if (!job || !["queued", "running"].includes(job.status)) return;
+    if (!job || (!working && !unconfirmedPlanId)) return;
     const controller = new AbortController();
     let timer: number;
     const poll = async () => {
@@ -1614,21 +1643,35 @@ export default function Launchpad({
       }
       const epoch = jobEpoch.current;
       try {
-        const next = await api<{ job: Job }>(
-          `/launchpad/jobs/${encodeURIComponent(job.id)}`,
-          { signal: controller.signal },
-        );
+        // A retry with a lost response has no new job ID yet. Look up the
+        // reviewed plan until the host responds, without resubmitting it.
+        const next = unconfirmedPlanId
+          ? await findAcceptedJob(unconfirmedPlanId, job.id, controller.signal)
+          : (
+              await api<{ job: Job }>(
+                `/launchpad/jobs/${encodeURIComponent(job.id)}`,
+                { signal: controller.signal },
+              )
+            ).job;
         if (controller.signal.aborted) return;
         if (epoch !== jobEpoch.current) {
           timer = window.setTimeout(poll, 1000);
           return;
         }
         jobEpoch.current++;
-        setJob(next.job);
+        if (!next) {
+          setRetryError((current) =>
+            current?.jobId === job.id
+              ? { ...current, unconfirmed: false }
+              : current,
+          );
+          return;
+        }
+        setJob(next);
+        setRetryError(null);
         setJobError("");
-        if (["completed", "failed"].includes(next.job.status))
-          void reconcileJob();
-        else if (["queued", "running"].includes(next.job.status))
+        if (["completed", "failed"].includes(next.status)) void reconcileJob();
+        else if (["queued", "running"].includes(next.status))
           timer = window.setTimeout(poll, 1000);
       } catch (cause) {
         if (!controller.signal.aborted) {
@@ -1636,7 +1679,10 @@ export default function Launchpad({
             timer = window.setTimeout(poll, 1000);
             return;
           }
-          if ((cause as { status?: number }).status === 404) {
+          if (
+            !unconfirmedPlanId &&
+            (cause as { status?: number }).status === 404
+          ) {
             unavailableJobs.current.add(job.id);
             jobEpoch.current++;
             setJob(null);
@@ -1646,7 +1692,7 @@ export default function Launchpad({
             void reconcileJob();
             return;
           }
-          setJobError(messageOf(cause));
+          if (!unconfirmedPlanId) setJobError(messageOf(cause));
           timer = window.setTimeout(poll, 3000);
         }
       }
@@ -1656,7 +1702,16 @@ export default function Launchpad({
       controller.abort();
       window.clearTimeout(timer);
     };
-  }, [api, job?.id, job?.status, jobReload, reconcileJob]);
+  }, [
+    api,
+    job?.id,
+    job?.status,
+    working,
+    unconfirmedPlanId,
+    jobReload,
+    reconcileJob,
+    findAcceptedJob,
+  ]);
 
   async function actOnJob(action: "cancel" | "recover") {
     if (
@@ -1985,11 +2040,13 @@ export default function Launchpad({
     } catch (cause) {
       // The host owns accepted work even when the transport loses its response.
       // Correlate by review, never by whichever unrelated job is retained last.
-      const accepted = await recoverAcceptedJob(
-        plan.planId,
-        job?.id,
-        currentSession,
-        currentOperation,
+      if (
+        currentSession !== session.current ||
+        currentOperation !== operation.current
+      )
+        return;
+      const accepted = await findAcceptedJob(plan.planId, job?.id).catch(
+        () => null,
       );
       if (
         currentSession === session.current &&
@@ -2007,32 +2064,6 @@ export default function Launchpad({
         setBusy(null);
       }
     }
-  }
-  async function recoverAcceptedJob(
-    planId: string,
-    previousJobId: string | undefined,
-    currentSession: number,
-    currentOperation: number,
-  ) {
-    if (
-      currentSession !== session.current ||
-      currentOperation !== operation.current
-    )
-      return null;
-    try {
-      const next = await api<Config>("/launchpad");
-      if (
-        currentSession === session.current &&
-        currentOperation === operation.current &&
-        next.job?.planId === planId &&
-        next.job.id !== previousJobId
-      )
-        return next.job;
-    } catch {
-      // Keep the original submission error. Refresh can recover when the host
-      // becomes reachable again without repeating the installation request.
-    }
-    return null;
   }
   async function reviewAllUpdates() {
     if (pending.current || !canInstall || type === "modpack") return;
@@ -2099,39 +2130,37 @@ export default function Launchpad({
     const currentSession = session.current,
       currentOperation = ++operation.current;
     jobEpoch.current++;
-    const accept = (next: Job) => {
-      jobEpoch.current++;
-      setJob(next);
-      setJobError("");
-      if (["completed", "failed"].includes(next.status)) void reconcileJob();
-    };
     pending.current = true;
     setBusy("install");
     setJobError("");
     try {
-      const result = await post<{ job: Job }>(
+      const { job: next } = await post<{ job: Job }>(
         "/launchpad/install",
         job.retryInput,
       );
       if (
-        currentSession === session.current &&
-        currentOperation === operation.current
+        currentSession !== session.current ||
+        currentOperation !== operation.current
       )
-        accept(result.job);
+        return;
+      jobEpoch.current++;
+      setRetryError(null);
+      setJob(next);
+      if (["completed", "failed"].includes(next.status)) void reconcileJob();
     } catch (cause) {
-      const accepted = await recoverAcceptedJob(
-        job.retryInput.planId,
-        job.id,
-        currentSession,
-        currentOperation,
-      );
       if (
-        currentSession === session.current &&
-        currentOperation === operation.current
-      ) {
-        if (accepted) accept(accepted);
-        else setJobError(messageOf(cause));
-      }
+        currentSession !== session.current ||
+        currentOperation !== operation.current
+      )
+        return;
+      const status = (cause as { status?: number }).status;
+      // A conflict can mean another client already started this retry.
+      setRetryError({
+        jobId: job.id,
+        message: messageOf(cause),
+        unconfirmed:
+          !status || status === 408 || status === 409 || status >= 500,
+      });
     } finally {
       if (
         currentSession === session.current &&
@@ -2946,15 +2975,21 @@ export default function Launchpad({
             )}
             <div>
               <strong>
-                {working
-                  ? "Installing server content"
-                  : job.status === "completed"
-                    ? "Installation completed"
-                    : job.cancelled
-                      ? "Installation cancelled"
-                      : "Installation failed"}
+                {unconfirmedPlanId
+                  ? "Reconnecting to MC Panel"
+                  : working
+                    ? "Installing server content"
+                    : job.status === "completed"
+                      ? "Installation completed"
+                      : job.cancelled
+                        ? "Installation cancelled"
+                        : "Installation failed"}
               </strong>
-              <p>{job.error || job.message}</p>
+              <p role={failedRetry ? "alert" : undefined}>
+                {unconfirmedPlanId
+                  ? "Checking whether your download started."
+                  : failedRetry?.message || job.error || job.message}
+              </p>
               {job.retainedRecoveryPath && (
                 <p>Recovery copies: {job.retainedRecoveryPath}</p>
               )}
@@ -2967,15 +3002,18 @@ export default function Launchpad({
                   </a>
                 )}
             </div>
-            {job.status === "failed" && job.retryable && job.retryInput && (
-              <button
-                className="btn"
-                disabled={!canInstall || Boolean(busy)}
-                onClick={() => void retryDownload()}
-              >
-                Retry download
-              </button>
-            )}
+            {job.status === "failed" &&
+              job.retryable &&
+              job.retryInput &&
+              !unconfirmedPlanId && (
+                <button
+                  className="btn"
+                  disabled={!canInstall || Boolean(busy)}
+                  onClick={() => void retryDownload()}
+                >
+                  Retry download
+                </button>
+              )}
             {working && job.cancellable && allowChanges && (
               <button
                 className="btn"
@@ -2995,12 +3033,14 @@ export default function Launchpad({
               </button>
             )}
             {!working &&
+              !unconfirmedPlanId &&
               !job.recoveryRequired &&
               (permissions === undefined ||
                 permissions.includes("file.update")) && (
                 <button
                   className="btn icon"
                   aria-label="Dismiss installation status"
+                  disabled={busy === "install"}
                   onClick={() => {
                     const currentSession = session.current;
                     void post(
@@ -3035,15 +3075,9 @@ export default function Launchpad({
               durationMs={notificationDurationMs}
             />
           )}
-          {jobError && (
+          {working && jobError && (
             <div className="launchpad-error" role="alert">
-              <span>{jobError} The installation may still be running.</span>
-              <button
-                className="btn"
-                onClick={() => setJobReload((value) => value + 1)}
-              >
-                Try again
-              </button>
+              <span>{jobError} Reconnecting to MC Panel automatically.</span>
             </div>
           )}
         </div>

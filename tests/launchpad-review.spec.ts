@@ -474,71 +474,152 @@ for (const manual of [false, true]) {
   });
 }
 
-test("a lost retry response recovers the new attempt and can cancel it", async ({
-  page,
-}) => {
-  const previous = {
-    ...acceptedJob,
-    id: "failed-download",
-    status: "failed",
-    cancellable: false,
-    message: "Download stalled",
-    retryable: true,
-    retryInput: { planId: "review", confirmed: true },
-  };
-  await catalog(page, "mod", previous);
-  await page.route("**/api/launchpad/installed?**", (route) =>
-    route.fulfill({ json: { items: [], warnings: [] } }),
-  );
-  let accepted = false;
-  let cancelled = false;
-  let installs = 0;
-  await page.route(/\/api\/launchpad(?:\?.*)?$/, (route) =>
-    route.fulfill({
-      json: {
-        platforms: [
-          { id: "modrinth", name: "Modrinth", available: true, types: ["mod"] },
-        ],
-        status: "offline",
-        gameVersion: "1.21.1",
-        loader: "neoforge",
-        warnings: [],
-        job: accepted ? acceptedJob : previous,
-      },
-    }),
-  );
-  await page.route("**/api/launchpad/install", (route) => {
-    installs++;
-    expect(route.request().postDataJSON()).toEqual(previous.retryInput);
-    accepted = true;
-    return route.abort("connectionreset");
+for (const competingRetry of [false, true]) {
+  test(`${competingRetry ? "a competing retry conflict" : "a lost retry response"} recovers the new attempt and can cancel it`, async ({
+    page,
+  }) => {
+    const previous = {
+      ...acceptedJob,
+      id: "failed-download",
+      status: "failed",
+      cancellable: false,
+      message: "Download stalled",
+      retryable: true,
+      retryInput: { planId: "review", confirmed: true },
+    };
+    await catalog(page, "mod", previous);
+    await page.route("**/api/launchpad/installed?**", (route) =>
+      route.fulfill({ json: { items: [], warnings: [] } }),
+    );
+    let accepted = false;
+    let cancelled = false;
+    let installs = 0;
+    await page.route(/\/api\/launchpad(?:\?.*)?$/, (route) =>
+      route.fulfill({
+        json: {
+          platforms: [
+            {
+              id: "modrinth",
+              name: "Modrinth",
+              available: true,
+              types: ["mod"],
+            },
+          ],
+          status: "offline",
+          gameVersion: "1.21.1",
+          loader: "neoforge",
+          warnings: [],
+          job: accepted ? acceptedJob : previous,
+        },
+      }),
+    );
+    await page.route("**/api/launchpad/install", (route) => {
+      installs++;
+      expect(route.request().postDataJSON()).toEqual(previous.retryInput);
+      accepted = true;
+      if (competingRetry)
+        return route.fulfill({
+          status: 409,
+          json: { error: "An installation is already running." },
+        });
+      return route.abort("connectionreset");
+    });
+    const cancelledJob = {
+      ...acceptedJob,
+      status: "failed",
+      cancelled: true,
+      cancellable: false,
+      message: "Installation cancelled. No server files were changed.",
+    };
+    await page.route("**/api/launchpad/jobs/accepted-job", (route) =>
+      route.fulfill({ json: { job: cancelled ? cancelledJob : acceptedJob } }),
+    );
+    await page.route("**/api/launchpad/jobs/accepted-job/cancel", (route) => {
+      cancelled = true;
+      return route.fulfill({ json: { job: cancelledJob } });
+    });
+    await page.goto("/#launchpad");
+    await page
+      .getByRole("button", { name: "Retry download", exact: true })
+      .click();
+    await page
+      .getByRole("button", { name: "Cancel installation", exact: true })
+      .click();
+    await expect(
+      page.getByRole("status", { name: "Installation status", exact: true }),
+    ).toContainText("Installation cancelled");
+    expect(installs).toBe(1);
   });
-  const cancelledJob = {
-    ...acceptedJob,
-    status: "failed",
-    cancelled: true,
-    cancellable: false,
-    message: "Installation cancelled. No server files were changed.",
-  };
-  await page.route("**/api/launchpad/jobs/accepted-job", (route) =>
-    route.fulfill({ json: { job: cancelled ? cancelledJob : acceptedJob } }),
-  );
-  await page.route("**/api/launchpad/jobs/accepted-job/cancel", (route) => {
-    cancelled = true;
-    return route.fulfill({ json: { job: cancelledJob } });
+}
+
+for (const accepted of [true, false]) {
+  test(`a disconnected retry automatically ${accepted ? "finds its completed download" : "restores Retry download after confirming failure"}`, async ({
+    page,
+  }) => {
+    await page.clock.install({ time: new Date("2026-11-01T12:00:00Z") });
+    await page.clock.pauseAt(new Date("2026-11-01T12:01:00Z"));
+    const job = {
+      ...acceptedJob,
+      id: "previous-attempt",
+      status: "failed",
+      message: "Previous attempt failed.",
+      cancellable: false,
+      retryable: true,
+      retryInput: { planId: "review", confirmed: true },
+    };
+    await catalog(page, "mod", job);
+    let connected = true;
+    await page.route(/\/api\/launchpad(?:\?.*)?$/, (route) =>
+      connected ? route.fallback() : route.abort("connectionreset"),
+    );
+    let installs = 0;
+    await page.route("**/api/launchpad/install", (route) => {
+      installs++;
+      expect(route.request().postDataJSON()).toEqual(job.retryInput);
+      connected = false;
+      if (accepted)
+        Object.assign(job, {
+          id: "retried-download",
+          status: "completed",
+          completed: 1,
+          retryable: false,
+          message: "Retried download completed while disconnected.",
+        });
+      return route.abort("connectionreset");
+    });
+    await page.goto("/#launchpad");
+    const banner = page.getByRole("status", { name: "Installation status" });
+    const retry = banner.getByRole("button", {
+      name: "Retry download",
+      exact: true,
+    });
+    await retry.click();
+    const check = banner.getByRole("button", {
+      name: "Check status",
+      exact: true,
+    });
+    await expect(banner.getByRole("alert")).toBeVisible();
+    await expect(check).toHaveCount(0);
+    await expect(retry).toHaveCount(0);
+    await expect(page.getByLabel("Notification", { exact: true })).toHaveCount(
+      0,
+    );
+
+    connected = true;
+    await page.clock.fastForward(30_000);
+    if (accepted) {
+      await expect(banner).toContainText(
+        "Retried download completed while disconnected.",
+      );
+      await expect(banner.getByRole("alert")).toHaveCount(0);
+    } else {
+      await expect(retry).toBeEnabled();
+      await expect(banner.getByRole("alert")).toBeVisible();
+    }
+    await expect(check).toHaveCount(0);
+    expect(installs).toBe(1);
   });
-  await page.goto("/#launchpad");
-  await page
-    .getByRole("button", { name: "Retry download", exact: true })
-    .click();
-  await page
-    .getByRole("button", { name: "Cancel installation", exact: true })
-    .click();
-  await expect(
-    page.getByRole("status", { name: "Installation status", exact: true }),
-  ).toContainText("Installation cancelled");
-  expect(installs).toBe(1);
-});
+}
 
 test("failed submission does not attach another review's retained job", async ({
   page,
@@ -584,21 +665,30 @@ test("failed submission does not attach another review's retained job", async ({
 test("a failed retry does not mistake its prior failed job for a newly accepted attempt", async ({
   page,
 }) => {
-  await catalog(page, "mod", {
+  const job = {
     ...acceptedJob,
     status: "failed",
     cancellable: false,
     message: "Previous download stalled",
     retryable: true,
     retryInput: { planId: "review", confirmed: true },
-  });
+  };
+  await catalog(page, "mod", job);
   await page.route("**/api/launchpad/installed?**", (route) =>
     route.fulfill({ json: { items: [], warnings: [] } }),
   );
   let installs = 0;
   await page.route("**/api/launchpad/install", (route) => {
-    installs++;
-    return route.abort("connectionreset");
+    expect(route.request().postDataJSON()).toEqual(job.retryInput);
+    if (++installs === 1) return route.abort("connectionreset");
+    Object.assign(job, {
+      id: "successful-retry",
+      status: "completed",
+      completed: 1,
+      message: "Download completed.",
+      retryable: false,
+    });
+    return route.fulfill({ json: { job } });
   });
   await page.goto("/#launchpad");
   const retry = page.getByRole("button", {
@@ -611,12 +701,22 @@ test("a failed retry does not mistake its prior failed job for a newly accepted 
     exact: true,
   });
   await expect(status.getByRole("alert")).toContainText("Failed to fetch");
-  await expect(status).toContainText("Previous download stalled");
+  await expect(status).not.toContainText("Previous download stalled");
+  await expect(status).not.toContainText("may still be running");
+  await expect(
+    status.getByRole("button", { name: /^(?:Try again|Check status)$/i }),
+  ).toHaveCount(0);
+  await expect(page.getByLabel("Notification", { exact: true })).toHaveCount(0);
   await expect(retry).toBeEnabled();
   await expect(
     page.getByRole("button", { name: "Cancel installation", exact: true }),
   ).toHaveCount(0);
   expect(installs).toBe(1);
+  await retry.click();
+  await expect(status).toContainText("Installation completed");
+  await expect(status.getByRole("alert")).toHaveCount(0);
+  await expect(retry).toHaveCount(0);
+  expect(installs).toBe(2);
 });
 
 test("a delayed Refresh cannot overwrite a newer accepted job", async ({
@@ -855,6 +955,51 @@ for (const switchScope of [
     });
   }
 }
+
+test("a running installation reconnects automatically without retrying its download", async ({
+  page,
+}) => {
+  await page.clock.install({ time: new Date("2026-11-01T12:00:00Z") });
+  await page.clock.pauseAt(new Date("2026-11-01T12:01:00Z"));
+  const job = { ...acceptedJob };
+  await catalog(page, "mod", job);
+  let polls = 0;
+  await page.route("**/api/launchpad/jobs/accepted-job", (route) => {
+    if (++polls === 1) return route.abort("connectionreset");
+    Object.assign(job, {
+      status: "completed",
+      completed: 1,
+      cancellable: false,
+      message: "Installation finished while disconnected.",
+    });
+    return route.fulfill({ json: { job } });
+  });
+  let installs = 0;
+  await page.route("**/api/launchpad/install", (route) => {
+    installs++;
+    return route.abort();
+  });
+  await page.goto("/#launchpad");
+  const banner = page.getByRole("status", { name: "Installation status" });
+  await expect(banner.getByRole("alert")).toContainText("Failed to fetch");
+  await expect(page.getByLabel("Notification", { exact: true })).toHaveCount(0);
+  await expect(
+    banner.getByRole("button", { name: "Retry download", exact: true }),
+  ).toHaveCount(0);
+  const check = banner.getByRole("button", {
+    name: "Check status",
+    exact: true,
+  });
+  await expect(check).toHaveCount(0);
+  await page.clock.fastForward(3_000);
+  await expect(banner).toContainText(
+    "Installation finished while disconnected.",
+  );
+  await expect(banner.getByRole("alert")).toHaveCount(0);
+  await expect(check).toHaveCount(0);
+  expect(polls).toBe(2);
+  expect(installs).toBe(0);
+});
 
 test("Refresh keeps polling after an older job poll fails", async ({
   page,
