@@ -193,6 +193,9 @@ test("an unconfirmed background copy accepts a late success and refreshes withou
       exact: true,
     });
     await expect(progress).toContainText("outcome could not be confirmed");
+    await expect(page.getByRole("alert", { name: "Notification" })).toHaveCount(
+      0,
+    );
     expect(fixture.statusReads()).toBe(5);
     const requests = fixture.mutations.filter(
       (request) => request.path === "/api/files/copy",
@@ -212,10 +215,16 @@ test("an unconfirmed background copy accepts a late success and refreshes withou
     release();
     await expect(progress).toContainText("Transfer complete");
     await expect(dialog).toBeVisible();
+    await expect(
+      dialog.getByRole("status", { name: "Notification" }),
+    ).toContainText("copied to /destination.");
     await expect(dialog.getByLabel("File name", { exact: true })).toHaveValue(
       "keep-my-draft.txt",
     );
     await dialog.getByRole("button", { name: "Cancel", exact: true }).click();
+    await expect(
+      page.getByRole("status", { name: "Notification" }),
+    ).toHaveCount(0);
     await expect(
       page.getByRole("button", { name: "source.txt", exact: true }),
     ).toBeVisible();

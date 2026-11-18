@@ -219,6 +219,56 @@ test("refresh adopts a pristine schedule and resolves concurrent dirty edits exp
   expect(saved.enabled).toBe(true);
 });
 
+for (const reloadFails of [false, true]) {
+  test(`a stale backup schedule save reports the conflict once when the reload ${reloadFails ? "fails" : "succeeds"}`, async ({
+    page,
+    request,
+    backups,
+  }) => {
+    await openBackups(page, backups);
+    const headers = { "X-Server-Id": backups.id };
+    const { schedule } = await (
+      await request.get("/api/backups", { headers })
+    ).json();
+    const retention = page.getByLabel(/Scheduled backups to keep/);
+    await retention.fill("18");
+    const changed = await request.put("/api/backups/schedule", {
+      headers,
+      data: { ...schedule, retention: 15 },
+    });
+    expect(changed.ok()).toBe(true);
+    if (reloadFails)
+      await page.route("**/api/backups", (route) =>
+        route.fulfill({
+          status: 503,
+          json: { error: "The current schedule could not be read." },
+        }),
+      );
+    await page
+      .getByRole("button", { name: "Save schedule", exact: true })
+      .click();
+    const conflict = page
+      .getByRole("alert")
+      .filter({ hasText: "Your unsaved edits are still here." });
+    const toast = page.getByRole("alert", {
+      name: "Notification",
+      exact: true,
+    });
+    if (reloadFails) {
+      await expect(toast).toContainText(
+        "The backup schedule changed on another client.",
+      );
+      await expect(conflict).toHaveCount(0);
+    } else {
+      await expect(
+        conflict.getByRole("button", { name: "Keep my edits for review" }),
+      ).toBeVisible();
+      await expect(toast).toHaveCount(0);
+    }
+    await expect(retention).toHaveValue("18");
+  });
+}
+
 test("restore retries retain the confirmation ID after a lost response and a new review gets a new ID", async ({
   page,
   request,

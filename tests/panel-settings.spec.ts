@@ -236,6 +236,7 @@ test("General settings save multiple automatic servers independently of sign-in 
   await expect(savedNotice).toContainText(
     "Panel startup and tray settings saved.",
   );
+  await expect(savedNotice.locator(".dismiss-countdown")).toHaveCount(0);
   await savedNotice
     .getByRole("button", { name: "Dismiss notification" })
     .click();

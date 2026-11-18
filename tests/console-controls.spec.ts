@@ -669,6 +669,9 @@ for (const width of [1348, 390]) {
       await expect(stop).toBeDisabled();
       await start.click();
       await expect(stop).toBeEnabled();
+      const notice = page.getByRole("status", { name: "Notification" });
+      await expect(notice).toContainText("Server start requested.");
+      await expect(notice.locator(".dismiss-countdown")).toHaveCount(0);
       await page.getByRole("link", { name: "Console", exact: true }).click();
       const consolePower = page.locator(".server-power");
       const consoleStart = consolePower.getByRole("button", {
@@ -699,6 +702,7 @@ for (const width of [1348, 390]) {
         .getByRole("button", { name: "Restart server", exact: true })
         .click();
       await expect(consoleStop).toBeEnabled();
+      await expect(notice).toContainText("Server restart requested.");
       await openSidebar();
       await expect(stop).toBeEnabled();
       await stop.click();
@@ -706,6 +710,7 @@ for (const width of [1348, 390]) {
       await expect(start).toBeEnabled();
       await expect(consoleStart).toBeEnabled();
       await expect(consoleStop).toBeDisabled();
+      await expect(notice).toContainText("Server stop requested.");
       expect(actions).toEqual([
         { id: target.id, action: "start" },
         { id: target.id, action: "restart" },
@@ -833,8 +838,8 @@ for (const stopSource of ["power", "console"] as const) {
       finishStop();
       await stopResponse;
       await expect(
-        page.getByText("Server force stop requested.", { exact: true }),
-      ).toBeVisible();
+        page.getByRole("status", { name: "Notification" }),
+      ).toContainText("Server force stop requested.");
       await expect(
         page.getByText("Late command failure", { exact: true }),
       ).toHaveCount(0);

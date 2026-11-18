@@ -12,7 +12,6 @@ import {
   installedDependencySatisfies,
 } from "./launchpad-dependency-ranges.mjs";
 import { inspectInstalledMod } from "./launchpad-mod-metadata.mjs";
-import { updatedModDependencyWarnings } from "./launchpad-update-dependencies.mjs";
 import { readAutoModpackSources } from "./launchpad-automodpack-sources.mjs";
 import { createModRemoval } from "./launchpad-removal.mjs";
 import { createModActivation } from "./launchpad-activation.mjs";
@@ -3267,13 +3266,7 @@ export async function createLaunchpad(ctx) {
     } else throw error(400, "This provider's archive format is unsupported.");
     return { files, warnings, loaderInstall };
   }
-  async function reviewUpdatedDependencies(
-    input,
-    stage,
-    local,
-    files,
-    warnings,
-  ) {
+  async function verifyModReplacements(input, stage, local, files, warnings) {
     if (
       input.type !== "mod" ||
       !files.some((file) => file.action === "replace")
@@ -3284,45 +3277,30 @@ export async function createLaunchpad(ctx) {
         [file.expected ? file.path : null, file.previous?.path].filter(Boolean),
       ),
     );
-    const inspect = async (source, row) => {
+    const inspect = async (source, relativePath) => {
       try {
-        return {
-          row: {
-            ...row,
-            ...(await inspectInstalledMod(source, {
-              loader: input.loader,
-              signal: input.signal,
-              includeClient: input.target === "automodpack",
-            })),
-          },
-        };
+        const metadata = await inspectInstalledMod(source, {
+          loader: input.loader,
+          signal: input.signal,
+          includeClient: input.target === "automodpack",
+        });
+        return { providesMods: metadata.provided.length > 0 };
       } catch (cause) {
         input.signal.throwIfAborted();
         return {
-          row,
-          warning: `Dependency requirements in ${row.path} could not be verified: ${cause.message}`,
+          warning: `Dependency requirements in ${relativePath} could not be verified: ${cause.message}`,
         };
       }
     };
     const inspected = await mapReview(
-      local.filter((row) => row.active !== false),
-      async (row) => inspect(await safePath(serverDir, row.path), row),
+      local.filter((row) => row.active !== false && replaced.has(row.path)),
+      async (row) => inspect(await safePath(serverDir, row.path), row.path),
       input.signal,
     );
-    const before = inspected.map((value) => value.row);
     warnings.push(
       ...inspected.flatMap((value) => (value.warning ? [value.warning] : [])),
     );
-    const knownProviders = new Set(before.flatMap((row) => row.provided ?? []));
-    const affected = new Set(
-      before
-        .filter((row) => replaced.has(row.path))
-        .flatMap((row) => row.provided ?? []),
-    );
-    // Unrelated, already missing requirements do not become new update warnings.
-    // New declarations in a combined dependent update must also be inspected.
-    if (!affected.size) return;
-    const after = before.filter((row) => !replaced.has(row.path));
+    if (!inspected.some((row) => row.providesMods)) return;
     if (
       files.reduce((total, file) => total + (file.size ?? 0), 0) >
       2 * 1024 ** 3
@@ -3346,22 +3324,11 @@ export async function createLaunchpad(ctx) {
             400,
             "This installation exceeds the 2 GB total size limit.",
           );
-        return inspect(file.stagedPath, file);
+        return inspect(file.stagedPath, file.path);
       },
       input.signal,
     );
-    for (const { row, warning } of candidates) {
-      if (warning) warnings.push(warning);
-      after.push(row);
-      // Updating a dependent can tighten its requirements without changing
-      // the provider. Check known local providers even if the catalog omitted
-      // that dependency; unrelated pre-existing missing requirements stay out.
-      for (const id of row.required ?? [])
-        if (knownProviders.has(id)) affected.add(id);
-    }
-    warnings.push(
-      ...updatedModDependencyWarnings(before, after, affected, input.loader),
-    );
+    for (const { warning } of candidates) if (warning) warnings.push(warning);
   }
   function preview(raw) {
     const task = preparePreview(raw);
@@ -3816,13 +3783,7 @@ export async function createLaunchpad(ctx) {
             );
           claimedPaths.set(folded, file);
         }
-      await reviewUpdatedDependencies(
-        input,
-        stage,
-        [...local, ...reusedDependencies],
-        files,
-        result.warnings,
-      );
+      await verifyModReplacements(input, stage, local, files, result.warnings);
       await inspectUnavailableDependencies(result, input, stage);
       await assertReviewedInventory(
         { input, inventorySnapshot, ...sharedReview },

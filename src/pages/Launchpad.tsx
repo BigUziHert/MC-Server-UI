@@ -3819,11 +3819,17 @@ export default function Launchpad({
                   </ul>
                 )}
               {plan.warnings
-                .filter(
-                  (warning) =>
+                .filter((warning) => {
+                  // Older remote panels can still send dependency-range advisories.
+                  if (type === "mod")
+                    return !/^(?:These updates may not satisfy required mod dependencies|Dependency compatibility could not be verified):/i.test(
+                      warning,
+                    );
+                  return (
                     type !== "modpack" ||
-                    !/^(?:Skipped |Preserved server data:)/i.test(warning),
-                )
+                    !/^(?:Skipped |Preserved server data:)/i.test(warning)
+                  );
+                })
                 .map((warning) => (
                   <p className="launchpad-review-warning" key={warning}>
                     {warning}

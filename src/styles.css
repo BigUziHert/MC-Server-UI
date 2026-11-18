@@ -1107,49 +1107,46 @@ input:disabled {
   justify-content: space-between;
   gap: 10px;
 }
-.notification-banner {
+.toast {
   position: fixed;
-  top: calc(env(safe-area-inset-top, 0px) + var(--notification-top, 12px));
-  left: calc(
-    var(--notification-sidebar, 0px) + var(--notification-gutter, 16px)
-  );
-  right: var(--notification-gutter, 16px);
+  bottom: calc(25px + env(safe-area-inset-bottom, 0px));
+  left: calc((100% + var(--toast-sidebar, 0px)) / 2);
+  transform: translateX(-50%);
   z-index: 100;
-  padding: 12px 18px;
-  box-shadow: 0 4px 16px #0004;
+  width: max-content;
+  max-width: min(560px, calc(100vw - var(--toast-sidebar, 0px) - 32px));
+  padding: 13px 16px;
   display: flex;
   align-items: center;
-  gap: 12px;
-  font-size: 13px;
-  font-weight: 600;
-  color: var(--text);
-}
-.notification-banner > span:first-of-type {
-  flex: 1;
-  min-width: 0;
+  gap: 9px;
+  border: 1px solid #71778f;
+  border-radius: 9px;
+  background: #303140;
+  box-shadow: 0 12px 40px #0006;
+  color: #eef0f8;
+  font-size: 12px;
   overflow-wrap: anywhere;
 }
-.notification-banner > svg,
-.notification-banner > button {
-  flex-shrink: 0;
-}
-.notification-banner.error {
+.toast.error {
+  background: #442a27;
   border-color: #9a5b4e;
   color: #ffd8cc;
 }
-.notification-banner .dismiss-countdown {
-  animation-delay: var(--notification-delay, 0ms);
+.toast button {
+  display: flex;
+  padding: 2px;
+  background: none;
+  color: inherit;
 }
-body:has(.topbar, .fleet-welcome-header) {
-  --notification-top: 78px;
+@media (min-width: 761px) {
+  body:has(.main-shell) > .toast {
+    --toast-sidebar: 208px;
+  }
 }
-body:has(.main-shell) {
-  --notification-sidebar: 232px;
-  --notification-gutter: 34px;
-}
-dialog:modal .notification-banner {
-  --notification-sidebar: 0px;
-  --notification-top: 12px;
+@media (min-width: 1201px) {
+  body:has(.main-shell) > .toast {
+    --toast-sidebar: 232px;
+  }
 }
 .dismiss-countdown {
   position: absolute;
@@ -1160,15 +1157,12 @@ dialog:modal .notification-banner {
   transform-origin: left;
   animation: dismiss-countdown linear forwards;
 }
-.notification-banner.error .dismiss-countdown {
-  background: currentColor;
-}
 @keyframes dismiss-countdown {
   from {
-    transform: scaleX(1);
+    transform: scaleX(0);
   }
   to {
-    transform: scaleX(0);
+    transform: scaleX(1);
   }
 }
 .modal-backdrop {
@@ -1354,9 +1348,6 @@ dialog:modal .notification-banner {
   }
 }
 @media (min-width: 1600px) {
-  body:has(.main-shell) {
-    --notification-gutter: 45px;
-  }
   .main-content {
     padding: 40px 45px 25px;
   }
@@ -1410,10 +1401,6 @@ dialog:modal .notification-banner {
   }
   .metrics-grid {
     gap: 12px;
-  }
-  body:has(.main-shell) {
-    --notification-sidebar: 208px;
-    --notification-gutter: 23px;
   }
 }
 @media (max-width: 1000px) {
@@ -1541,13 +1528,6 @@ dialog:modal .notification-banner {
   .world-icon {
     width: 46px;
     height: 46px;
-  }
-  body:has(.topbar, .fleet-welcome-header) {
-    --notification-top: 67px;
-  }
-  body:has(.main-shell) {
-    --notification-sidebar: 0px;
-    --notification-gutter: 18px;
   }
   .page-heading {
     align-items: flex-start;

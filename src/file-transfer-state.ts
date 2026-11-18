@@ -1,5 +1,5 @@
 import { useSyncExternalStore } from "react";
-import { messageOf, type PageProps, type useServerApi } from "./api";
+import { messageOf, type useServerApi } from "./api";
 
 type Api = ReturnType<typeof useServerApi>["api"];
 export type Transfer = {
@@ -15,6 +15,11 @@ export type Transfer = {
   totalBytes: number | null;
 };
 type Report = (update: Partial<Transfer>) => void;
+export type FileOperationResult = (
+  id: string,
+  message: string,
+  failed: boolean,
+) => void;
 const transfers = new Map<string, Transfer>();
 const listeners = new Set<() => void>();
 const subscribe = (listener: () => void) => {
@@ -45,7 +50,7 @@ export function startFileTransfer(
   key: string,
   initial: Pick<Transfer, "kind" | "destination" | "serverName">,
   work: (report: Report, id: string) => Promise<string>,
-  notify: PageProps["notify"],
+  notify: FileOperationResult,
 ) {
   if (transfers.get(key)?.status === "running") return false;
   const id = crypto.randomUUID();
@@ -54,6 +59,12 @@ export function startFileTransfer(
     if (current?.id !== id) return;
     transfers.set(key, { ...current, ...update });
     emit();
+    if (update.status && update.status !== current.status && update.message)
+      notify(
+        id,
+        `${initial.serverName}: ${update.message}`,
+        update.status !== "completed",
+      );
   };
   transfers.set(key, {
     ...initial,
@@ -68,18 +79,14 @@ export function startFileTransfer(
   emit();
   void work(report, id)
     .then((message) => {
-      if (transfers.get(key)?.id !== id) return;
       report({ status: "completed", message });
-      notify(`${initial.serverName}: ${message}`);
     })
     .catch((cause) => {
-      if (transfers.get(key)?.id !== id) return;
       const message = messageOf(cause);
       report({
         status: cause instanceof UnconfirmedTransfer ? "unconfirmed" : "failed",
         message,
       });
-      notify(`${initial.serverName}: ${message}`, true);
     });
   return true;
 }

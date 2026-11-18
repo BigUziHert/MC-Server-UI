@@ -305,6 +305,7 @@ export default function Backups({
   const scheduleBaseline = useRef<Schedule>(defaults);
   scheduleDraft.current = schedule;
   const [scheduleConflict, setScheduleConflict] = useState(false);
+  const conflictPanel = useRef<HTMLDivElement>(null);
   const [timezone, setTimezone] = useState("server time");
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
@@ -648,10 +649,19 @@ export default function Backups({
       setSaved(true);
       notify("Backup schedule saved.");
     } catch (failure) {
-      if (token === generation.current) {
-        notify(messageOf(failure), true);
-        if ((failure as { status?: number }).status === 409) await load();
-      }
+      if (token !== generation.current) return;
+      const conflict = (failure as { status?: number }).status === 409;
+      if (conflict) await load();
+      if (token === generation.current)
+        notify(
+          messageOf(failure),
+          true,
+          conflict
+            ? () =>
+                !!conflictPanel.current &&
+                !document.querySelector("dialog:modal")
+            : undefined,
+        );
     } finally {
       if (token === generation.current) setSaving(false);
     }
@@ -1243,7 +1253,11 @@ export default function Backups({
                 </div>
                 <form onSubmit={saveSchedule}>
                   {scheduleConflict && (
-                    <div className="storage-form-error" role="alert">
+                    <div
+                      ref={conflictPanel}
+                      className="storage-form-error"
+                      role="alert"
+                    >
                       <p>
                         This schedule changed on another client. Your unsaved
                         edits are still here.

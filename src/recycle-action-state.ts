@@ -1,5 +1,6 @@
 import { useSyncExternalStore } from "react";
-import { messageOf, type PageProps, type useServerApi } from "./api";
+import { messageOf, type useServerApi } from "./api";
+import type { FileOperationResult } from "./file-transfer-state";
 
 export type RecoveryItem = {
   id: string;
@@ -242,7 +243,7 @@ function resolveUnconfirmed(
   key: string,
   batchId: string,
   requestId: string,
-  notify: PageProps["notify"],
+  notify: FileOperationResult,
   failure?: Error,
 ) {
   const batch = batches.get(key);
@@ -260,14 +261,18 @@ function resolveUnconfirmed(
       ? [...batch.failures, { item, message: failure.message }]
       : batch.failures,
   });
-  notify(recoverySummary(batches.get(key)!), !!failure);
+  notify(
+    batchId,
+    recoverySummary(batches.get(key)!),
+    !!failure || batch.failures.length > 0,
+  );
 }
 export function startRecoveryBatch(
   api: Api,
   key: string,
   type: RecoveryBatch["type"],
   targets: RecoveryItem[],
-  notify: PageProps["notify"],
+  notify: FileOperationResult,
   options: { single?: boolean; existing?: RecoveryOperation } = {},
 ) {
   if (!targets.length || recoveryPending(batches.get(key))) return null;
@@ -329,6 +334,7 @@ export function startRecoveryBatch(
     if (batch?.id !== id) return;
     update(key, id, { running: false, currentItemId: null });
     notify(
+      id,
       recoverySummary(batches.get(key)!),
       !!batch.unconfirmed || batch.failures.length > 0,
     );
@@ -338,7 +344,7 @@ export function startRecoveryBatch(
 export function checkRecoveryStatus(
   api: Api,
   key: string,
-  notify: PageProps["notify"],
+  notify: FileOperationResult,
 ) {
   const batch = batches.get(key);
   if (!batch?.unconfirmed || batch.running || batch.checking) return;

@@ -151,10 +151,23 @@ test("completed installations show one five-second status banner and stay dismis
     1,
   );
   const bar = banner.locator(".dismiss-countdown");
-  await expect(bar).toBeVisible();
   await expect(bar).toHaveAttribute("aria-hidden", "true");
   await expect(bar).toHaveCSS("animation-duration", "5s");
-  await expect(bar).not.toHaveCSS("animation-name", "none");
+  const fill = await bar.evaluate((element) => {
+    const animation = element.getAnimations()[0];
+    animation.pause();
+    const samples = [0, 2500, 5000].map((elapsed) => {
+      animation.currentTime = elapsed;
+      const { left, width } = element.getBoundingClientRect();
+      return { left, percent: Math.round((100 * width) / element.clientWidth) };
+    });
+    animation.currentTime = 0;
+    animation.play();
+    return samples;
+  });
+  expect(fill.map((sample) => sample.percent)).toEqual([0, 50, 100]);
+  expect(fill[1].left).toBe(fill[0].left);
+  expect(fill[2].left).toBe(fill[0].left);
   await page.clock.fastForward(4_900);
   await expect(banner).toBeVisible();
   await page.clock.fastForward(100);
@@ -164,6 +177,130 @@ test("completed installations show one five-second status banner and stay dismis
     .getByRole("button", { name: "Refresh Launchpad and check updates" })
     .click();
   await expect(banner).toHaveCount(0);
+});
+
+test("updating a mod shows only its inline installation banner and toggling it uses the bottom toast", async ({
+  page,
+}) => {
+  await page.clock.install({ time: new Date("2026-11-01T12:00:00Z") });
+  await catalog(page);
+  let mod = installed("Zulu", true, true);
+  const others = Array.from({ length: 9 }, (_, i) => installed(`Mod ${i + 1}`));
+  await page.route("**/api/launchpad/installed?**", (route) =>
+    route.fulfill({ json: { items: [...others, mod], warnings: [] } }),
+  );
+  await page.route("**/api/launchpad/versions?**", (route) =>
+    route.fulfill({ json: { versions: [version] } }),
+  );
+  await page.route("**/api/launchpad/preview", (route) =>
+    route.fulfill({
+      json: {
+        planId: "update-zulu",
+        title: mod.title,
+        versionName: version.version,
+        files: [{ path: mod.path, size: mod.size, action: "replace" }],
+        warnings: [],
+        expiresAt: "2099-01-01",
+      },
+    }),
+  );
+  await page.route("**/api/launchpad/install", (route) => {
+    mod = {
+      ...mod,
+      versionId: version.id,
+      versionName: version.version,
+      update: null,
+    };
+    return route.fulfill({
+      json: {
+        job: {
+          id: "updated-zulu",
+          status: "completed",
+          message: "Zulu updated.",
+          completed: 1,
+          total: 1,
+        },
+      },
+    });
+  });
+  await page.route("**/api/launchpad/jobs/updated-zulu/dismiss", (route) =>
+    route.fulfill({ json: { dismissed: true } }),
+  );
+  await page.route("**/api/launchpad/active", (route) => {
+    expect(route.request().postDataJSON()).toMatchObject({
+      path: mod.path,
+      active: false,
+    });
+    mod = { ...mod, path: `${mod.path}.disabled`, active: false };
+    return route.fulfill({ json: mod });
+  });
+
+  await page.goto("/#launchpad");
+  await page.getByRole("switch", { name: "Show installed content" }).check();
+  const row = page.getByRole("article", { name: mod.title, exact: true });
+  await row.getByRole("button", { name: "Update Zulu" }).click();
+  await page
+    .getByRole("button", { name: "Review installation", exact: true })
+    .click();
+  await page.clock.pauseAt(new Date("2026-11-01T12:01:00Z"));
+  await page
+    .getByRole("button", { name: "Confirm installation", exact: true })
+    .click();
+
+  const result = page.getByRole("status", {
+    name: "Installation status",
+    exact: true,
+  });
+  const notice = page.getByRole("status", {
+    name: "Notification",
+    exact: true,
+  });
+  const countdown = page.locator(".dismiss-countdown");
+  const toolbar = page.getByRole("group", { name: "Launchpad top controls" });
+  const results = page.getByRole("tabpanel");
+  await expect(result).toContainText("Zulu updated.");
+  await expect(notice).toHaveCount(0);
+  await expect(countdown).toHaveCount(1);
+  for (const width of [1280, 390]) {
+    await page.setViewportSize({ width, height: 800 });
+    await page.evaluate(() => window.scrollTo(0, 0));
+    const controls = (await toolbar.boundingBox())!;
+    const box = (await result.boundingBox())!;
+    const list = (await results.boundingBox())!;
+    expect(box.y).toBeGreaterThanOrEqual(controls.y + controls.height);
+    expect(box.y + box.height).toBeLessThanOrEqual(list.y);
+  }
+  await page.getByRole("button", { name: "Platform settings" }).click();
+  const settings = page.getByRole("dialog", { name: "Platform settings" });
+  await expect(settings).toBeVisible();
+  await expect(settings.getByText("Zulu updated.")).toHaveCount(0);
+  await page.keyboard.press("Escape");
+  await expect(settings).not.toBeVisible();
+  await page.clock.runFor(3_000);
+  await expect(row).toContainText("Installed: 2.0");
+  const active = row.getByRole("switch");
+  await active.scrollIntoViewIfNeeded();
+  await expect(result).not.toBeInViewport();
+
+  await active.click();
+  await expect(notice).toContainText("Zulu disabled.");
+  await expect(notice).toBeInViewport({ ratio: 1 });
+  const toastBox = (await notice.boundingBox())!;
+  const viewport = page.viewportSize()!;
+  expect(toastBox.y).toBeGreaterThan(viewport.height * 0.75);
+  expect(toastBox.width).toBeLessThan(viewport.width);
+  await expect(result).toContainText("Zulu updated.");
+  await expect(notice.locator(".dismiss-countdown")).toHaveCount(0);
+  await expect(
+    notice.getByRole("button", { name: "Dismiss notification" }),
+  ).toBeVisible();
+  await expect(countdown).toHaveCount(1);
+  await page.clock.fastForward(2_100);
+  await expect(result).toHaveCount(0);
+  await expect(countdown).toHaveCount(0);
+  await expect(notice).toBeVisible();
+  await page.clock.fastForward(3_000);
+  await expect(notice).toHaveCount(0);
 });
 
 test("leaving Launchpad dismisses a finished banner before its timeout", async ({

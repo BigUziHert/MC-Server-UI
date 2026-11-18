@@ -239,6 +239,11 @@ test("a phone only offers granted controls and scopes every action to the shared
       forbiddenRequests.push(pathname);
   });
   const actions: unknown[] = [];
+  await page.route(/\/api\/server(?:\?|$)/, (route) =>
+    route.fulfill({
+      json: { ...server, status: actions.length ? "starting" : "offline" },
+    }),
+  );
   await page.route(/\/api\/server\/power(?:\?|$)/, async (route) => {
     actions.push({
       body: route.request().postDataJSON(),
@@ -248,9 +253,12 @@ test("a phone only offers granted controls and scopes every action to the shared
   });
   await page.goto("/");
   await page.getByRole("button", { name: "Start", exact: true }).click();
-  await expect(page.getByRole("status")).toContainText(
-    "Server start requested.",
+  await expect(page.locator(".server-banner .status-badge")).toHaveText(
+    "starting",
   );
+  const notice = page.getByRole("status", { name: "Notification" });
+  await expect(notice).toContainText("Server start requested.");
+  await expect(notice.locator(".dismiss-countdown")).toHaveCount(0);
   expect(actions).toEqual([{ body: { action: "start" }, server: "family" }]);
   await expect(
     page.getByRole("button", { name: "Stop", exact: true }),
@@ -420,13 +428,10 @@ for (const width of [1280, 390]) {
     ]);
     const notification = page.getByRole("status", { name: "Notification" });
     await expect(notification).toContainText("Server saved.");
-    await expect(notification.locator(".dismiss-countdown")).toHaveCSS(
-      "animation-duration",
-      "5s",
-    );
+    await expect(notification.locator(".dismiss-countdown")).toHaveCount(0);
     const bounds = await notification.boundingBox();
-    expect(bounds!.y).toBeGreaterThanOrEqual(0);
-    expect(bounds!.y).toBeLessThan(900 / 4);
+    expect(bounds!.y).toBeGreaterThan((900 * 3) / 4);
+    expect(bounds!.y + bounds!.height).toBeLessThanOrEqual(900);
     expect(bounds!.x).toBeGreaterThanOrEqual(0);
     expect(bounds!.x + bounds!.width).toBeLessThanOrEqual(width);
     await openNavigation();

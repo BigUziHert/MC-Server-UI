@@ -3580,7 +3580,7 @@ test("Launchpad lists every affected file and reason beyond the current installe
   });
 });
 
-test("Launchpad allows confirming a Supplementaries update after a dependency compatibility warning", async ({
+test("Launchpad omits dependency-range advisories from older panels when updating a mod", async ({
   page,
   serverId,
 }) => {
@@ -3619,8 +3619,11 @@ test("Launchpad allows confirming a Supplementaries update after a dependency co
   await page.route("**/api/launchpad/versions?**", (route) =>
     route.fulfill({ json: { versions: [version] } }),
   );
-  const warning =
+  const previousAdvisory =
     'Dependency compatibility could not be verified: Supplementaries requires moonlight "[1.21.1-3.8,)". The resulting installed version is 1.21.1-3.7.2. You can continue, but the server may fail to start or mods may not work correctly.';
+  const rangeAdvisory =
+    'These updates may not satisfy required mod dependencies: Example Library (mods/example.jar) requires geckolib "4.9.3". The resulting installed versions of geckolib are 4.9.3.';
+  const separateWarning = "This file is marked client-only by its author.";
   await page.route("**/api/launchpad/preview", (route) => {
     expect(route.request().headers()["x-server-id"]).toBe(serverId);
     expect(route.request().postDataJSON()).toMatchObject({
@@ -3642,7 +3645,7 @@ test("Launchpad allows confirming a Supplementaries update after a dependency co
             action: "replace",
           },
         ],
-        warnings: [warning],
+        warnings: [previousAdvisory, rangeAdvisory, separateWarning],
         expiresAt: "2099-01-01T00:00:00Z",
       },
     });
@@ -3677,7 +3680,13 @@ test("Launchpad allows confirming a Supplementaries update after a dependency co
     name: "Review installation",
     exact: true,
   });
-  await expect(dialog.getByText(warning, { exact: true })).toBeVisible();
+  await expect(dialog.getByText(previousAdvisory, { exact: true })).toHaveCount(
+    0,
+  );
+  await expect(dialog.getByText(rangeAdvisory, { exact: true })).toHaveCount(0);
+  await expect(
+    dialog.getByText(separateWarning, { exact: true }),
+  ).toBeVisible();
   await expect(
     dialog.getByRole("list", { name: "Installation files", exact: true }),
   ).toContainText(newPath);

@@ -8503,7 +8503,7 @@ test("NeoForge combined Moonlight and Supplementaries updates accept the publish
 });
 
 for (const compatible of [true, false])
-  test(`NeoForge Amendments update checks its Minecraft-prefixed range against retained Moonlight (compatible=${compatible})`, async (t) => {
+  test(`NeoForge Amendments updates without advertising the retained Moonlight range (compatible=${compatible})`, async (t) => {
     const f = await moonlightUpdateFixture(t, {
       installedLibraryVersion: "1.21.1-3.7.2",
       range: null,
@@ -8516,11 +8516,9 @@ for (const compatible of [true, false])
       replacePath: "mods/addon.jar",
     };
     const plan = await f.service.preview(input);
-    assert.equal(
-      plan.warnings.some((warning) =>
-        /amendments.*requires moonlight.*\[1\.21\.1-3\.8,\)/.test(warning),
-      ),
-      !compatible,
+    assert.doesNotMatch(
+      plan.warnings.join(" "),
+      /These updates may not satisfy required mod dependencies/,
     );
     assert.deepEqual(
       plan.files.map((file) => file.path),
@@ -8552,7 +8550,7 @@ for (const compatible of [true, false])
   });
 
 for (const loader of ["forge", "neoforge", "fabric"])
-  test(`${loader} update warns about a retained addon's incompatible required library range and allows installation`, async (t) => {
+  test(`${loader} library update proceeds without a version-range advisory for a retained addon`, async (t) => {
     const f = await dependencyUpdateFixture(t, {
       loader,
       ...(loader === "fabric" ? { range: ">=1.0 <2.0" } : {}),
@@ -8563,16 +8561,9 @@ for (const loader of ["forge", "neoforge", "fabric"])
     });
     assert.equal(removal.blocked, true);
     const plan = await f.service.preview(f.input);
-    assert.ok(
-      plan.warnings.some(
-        (warning) =>
-          /addon.*mods\/addon.jar.*requires corelib/.test(warning) &&
-          warning.includes(loader === "fabric" ? ">=1.0 <2.0" : "[1.0,2.0)"),
-      ),
-    );
-    assert.match(
+    assert.doesNotMatch(
       plan.warnings.join(" "),
-      /install anyway.*server may fail to start/,
+      /requires corelib|These updates may not satisfy required mod dependencies/,
     );
     assert.deepEqual(
       await fs.readFile(path.join(f.serverDir, "mods", "old.jar")),
@@ -8601,7 +8592,7 @@ for (const loader of ["forge", "neoforge", "fabric"])
     );
   });
 
-test("combined updates use the resulting dependent requirements and retain checksum-verified downloads", async (t) => {
+test("combined updates share catalog dependencies and retain checksum-verified downloads", async (t) => {
   const f = await dependencyUpdateFixture(t);
   // Real catalog dependencies and explicit roots share the same candidate.
   f.versions.addon2.dependencies = [
@@ -8634,10 +8625,10 @@ test("combined updates use the resulting dependent requirements and retain check
   );
 });
 
-test("combined updates warn about incompatible new dependent declarations and allow installation", async (t) => {
+test("combined updates install their selected files without reporting dependency version ranges", async (t) => {
   const f = await dependencyUpdateFixture(t, { nextRange: "[3.0,4.0)" });
   const plan = await f.service.preview(f.bulk);
-  assert.match(plan.warnings.join(" "), /addon.*requires corelib.*\[3.0,4.0\)/);
+  assert.doesNotMatch(plan.warnings.join(" "), /requires corelib/);
   assert.deepEqual(
     await fs.readFile(path.join(f.serverDir, "mods", "old.jar")),
     f.library1,
@@ -8658,13 +8649,13 @@ test("combined updates warn about incompatible new dependent declarations and al
     );
 });
 
-test("combined updates also check newly introduced dependent requirements", async (t) => {
+test("combined updates omit advisories for newly introduced dependency ranges", async (t) => {
   const f = await dependencyUpdateFixture(t, {
     range: null,
     nextRange: "[3.0,4.0)",
   });
   const plan = await f.service.preview(f.bulk);
-  assert.match(plan.warnings.join(" "), /addon.*requires corelib.*\[3.0,4.0\)/);
+  assert.doesNotMatch(plan.warnings.join(" "), /requires corelib/);
 });
 
 test("a compatible library update keeps the retained dependent's exact path and bytes", async (t) => {
@@ -8683,7 +8674,7 @@ test("a compatible library update keeps the retained dependent's exact path and 
 });
 
 for (const compatible of [false, true])
-  test(`updating a dependent alone checks its new requirements against the retained library (compatible=${compatible})`, async (t) => {
+  test(`updating a dependent alone keeps the installed library without a version-range advisory (compatible=${compatible})`, async (t) => {
     const f = await dependencyUpdateFixture(t, {
       range: null,
       nextRange: compatible ? "[1.0,2.0)" : "[2.0,3.0)",
@@ -8700,12 +8691,7 @@ for (const compatible of [false, true])
       replacePath: "mods/addon.jar",
     };
     const plan = await f.service.preview(input);
-    assert.equal(
-      plan.warnings.some((warning) =>
-        /addon.*requires corelib.*\[2.0,3.0\)/.test(warning),
-      ),
-      !compatible,
-    );
+    assert.doesNotMatch(plan.warnings.join(" "), /requires corelib/);
     assert.deepEqual(
       plan.files.map((file) => file.path),
       ["mods/addon-new.jar"],
@@ -8742,7 +8728,7 @@ test("optional dependencies do not become required update blockers", async (t) =
   assert.equal(job.status, "completed", job.error);
 });
 
-test("update dependency inspection rejects a failed candidate checksum before changing files", async (t) => {
+test("mod update review rejects a failed candidate checksum before changing files", async (t) => {
   const f = await dependencyUpdateFixture(t);
   f.downloads.set(
     "https://cdn.modrinth.com/new.jar",

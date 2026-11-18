@@ -78,6 +78,7 @@ import {
   dismissFileTransfer,
   pasteFiles,
   UnconfirmedTransfer,
+  type FileOperationResult,
   type Transfer,
 } from "../file-transfer-state";
 import {
@@ -102,6 +103,7 @@ function TransferProgress({
   return (
     <section
       className="file-transfer-progress"
+      data-file-result={running ? undefined : transfer.id}
       role="status"
       aria-label="File transfer progress"
     >
@@ -443,22 +445,32 @@ function waitForMove(
     }
   });
 }
+function fileOperationNotification(
+  notify: PageProps["notify"],
+): FileOperationResult {
+  return (id, message, failed) =>
+    notify(
+      message,
+      failed,
+      () => !!notificationHost().querySelector(`[data-file-result="${id}"]`),
+    );
+}
+
 // While its confirmation is in front, the dialog already displays any failure.
-// A closed or superseded dialog leaves that feedback to the workspace banner.
 function dialogResultNotification(
   notify: PageProps["notify"],
   origin: HTMLDialogElement | null,
   revision: RefObject<number>,
 ): PageProps["notify"] {
   const submitted = revision.current;
-  return (message, failed) => {
+  return (message, failed, inlineResultVisible) => {
     if (
       failed &&
       submitted === revision.current &&
       origin === notificationHost()
     )
       return;
-    notify(message, failed);
+    notify(message, failed, inlineResultVisible);
   };
 }
 
@@ -578,7 +590,8 @@ function startMoveBatch(
       : targets.length === 1 && !failures.length
         ? `${targets[0].name} moved to Recycle Bin.`
         : `${completed.length} ${completed.length === 1 ? "item" : "items"} moved to Recycle Bin.${failures.length ? ` ${failures.length} ${failures.length === 1 ? "item could not be moved and remains" : "items could not be moved and remain"} selected.` : ""}`;
-    notify(summary, failures.length > 0 || !!unconfirmed);
+    if (unconfirmed) fileOperationNotification(notify)(id, summary, true);
+    else notify(summary, failures.length > 0);
   })();
   return id;
 }
@@ -616,6 +629,7 @@ function MoveProgress({
   return (
     <div
       className="recycle-bin-notice"
+      data-file-result={batch.unconfirmed ? batch.id : undefined}
       role="status"
       aria-label="Move to Recycle Bin progress"
     >
@@ -1305,7 +1319,7 @@ export default function FileManager({
           ? `${summary} Skipped ${result.skippedFiles} identical ${result.skippedFiles === 1 ? "file" : "files"}.`
           : summary;
       },
-      notify,
+      fileOperationNotification(notify),
     );
     if (uploadInput.current) uploadInput.current.value = "";
     if (folderInput.current) folderInput.current.value = "";
@@ -1341,9 +1355,6 @@ export default function FileManager({
           true,
         ),
       );
-    notify(
-      `${targets.length} ${targets.length === 1 ? "item" : "items"} ready to ${mode === "move" ? "move" : "paste"}.`,
-    );
   }
   function pasteSelection() {
     if (
@@ -1390,7 +1401,7 @@ export default function FileManager({
         if (clipboard.mode === "move") consumeFileClipboard(clipboard);
         return result;
       },
-      notify,
+      fileOperationNotification(notify),
     );
   }
 
@@ -2850,6 +2861,7 @@ function RecoveryProgress({
   return (
     <section
       className="recycle-action-progress"
+      data-file-result={batch.running ? undefined : batch.id}
       role="status"
       aria-label="Recovery operation progress"
     >
@@ -2970,6 +2982,10 @@ function RecycleBin({
   const { api, scopeKey } = useServerApi();
   const sessionScope = useContext(SessionScopeContext);
   const recoveryKey = `${sessionScope}:${scopeKey}:recovery`;
+  const notifyRecovery = useMemo(
+    () => fileOperationNotification(notify),
+    [notify],
+  );
   const batch = useRecoveryBatch(recoveryKey);
   const pending = recoveryPending(batch);
   const [checkingOperation, setCheckingOperation] = useState(true);
@@ -3056,9 +3072,16 @@ function RecycleBin({
           deletedAt: new Date().toISOString(),
           status: "ready" as const,
         };
-        startRecoveryBatch(api, recoveryKey, operation.type, [item], notify, {
-          existing: operation,
-        });
+        startRecoveryBatch(
+          api,
+          recoveryKey,
+          operation.type,
+          [item],
+          notifyRecovery,
+          {
+            existing: operation,
+          },
+        );
       })
       .catch(() => {
         // Older hosts can still perform the action. Its original response and a
@@ -3072,7 +3095,7 @@ function RecycleBin({
       restoreReview.current++;
       previewRequest.current?.abort();
     };
-  }, [api, recoveryKey, notify]);
+  }, [api, recoveryKey, notifyRecovery]);
   useEffect(() => {
     if (!batch) return;
     const signature = `${batch.id}:${batch.completed.join(",")}:${batch.failures.length}:${batch.running}:${!!batch.unconfirmed}:${batch.checking}`;
@@ -3177,7 +3200,7 @@ function RecycleBin({
         setAction({ type: "restore", targets: [item] });
         return;
       }
-      startRecoveryBatch(api, recoveryKey, "restore", [item], notify, {
+      startRecoveryBatch(api, recoveryKey, "restore", [item], notifyRecovery, {
         single: true,
       });
     } finally {
@@ -3240,7 +3263,9 @@ function RecycleBin({
       recoveryKey,
       action.type,
       action.targets,
-      dialogResultNotification(notify, actionDialog.current, restoreReview),
+      fileOperationNotification(
+        dialogResultNotification(notify, actionDialog.current, restoreReview),
+      ),
     );
     if (id) setAction({ ...action, batchId: id });
   }
@@ -3283,10 +3308,10 @@ function RecycleBin({
           <Folder size={16} /> Back to files
         </button>
       </div>
-      {batch && (
+      {batch && action?.batchId !== batch.id && (
         <RecoveryProgress
           batch={batch}
-          onCheck={() => checkRecoveryStatus(api, recoveryKey, notify)}
+          onCheck={() => checkRecoveryStatus(api, recoveryKey, notifyRecovery)}
           onDismiss={dismissStatus}
         />
       )}
@@ -3668,10 +3693,12 @@ function RecycleBin({
                   checkRecoveryStatus(
                     api,
                     recoveryKey,
-                    dialogResultNotification(
-                      notify,
-                      actionDialog.current,
-                      restoreReview,
+                    fileOperationNotification(
+                      dialogResultNotification(
+                        notify,
+                        actionDialog.current,
+                        restoreReview,
+                      ),
                     ),
                   )
                 }

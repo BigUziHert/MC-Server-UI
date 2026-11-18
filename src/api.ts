@@ -256,4 +256,10 @@ export function relativeTime(value: string) {
     day: "numeric",
   });
 }
-export type PageProps = { notify: (message: string, error?: boolean) => void };
+export type PageProps = {
+  notify: (
+    message: string,
+    error?: boolean,
+    inlineResultVisible?: () => boolean,
+  ) => void;
+};

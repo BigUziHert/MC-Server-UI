@@ -281,11 +281,17 @@ test("Copy and Paste retain nested files across folder and server navigation wit
     await expect(
       page.getByRole("status", { name: "Copied files" }),
     ).toContainText("Transfer source");
+    await expect(
+      page.getByRole("status", { name: "Notification" }),
+    ).toHaveCount(0);
     await page.getByRole("button", { name: "copies", exact: true }).click();
     await page.getByRole("button", { name: "Paste", exact: true }).click();
     await expect(
       page.getByRole("status", { name: "File transfer progress" }),
     ).toContainText("Transfer complete");
+    await expect(
+      page.getByRole("status", { name: "Notification" }),
+    ).toHaveCount(0);
     expect(
       await content(sourceId, "copies/transfer-pack/nested/settings.txt"),
     ).toBe("keep original settings\n");

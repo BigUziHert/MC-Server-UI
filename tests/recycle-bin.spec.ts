@@ -592,6 +592,9 @@ test("restore conflicts retain both versions and missing parent folders are recr
       exact: true,
     }),
   ).toContainText("treasure.txt restored to /recovery/treasure.txt.");
+  await expect(page.getByRole("status", { name: "Notification" })).toHaveCount(
+    0,
+  );
   expect(await contents(request, bin, "recovery/treasure.txt")).toBe(
     "Original treasure bytes\n",
   );
@@ -1070,7 +1073,7 @@ test("bulk restore keeps conflicts selected while restoring other entries withou
   ]);
 });
 
-test("a background recovery failure reaches the top banner after its confirmation closes", async ({
+test("a background recovery failure reaches the toast after its confirmation closes", async ({
   page,
   request,
   bin,
