@@ -642,7 +642,6 @@ function PanelApp({
     void saveDesktopSelection(activeId || null).catch(() => {
       notify(
         "Your server was selected, but the choice could not be saved for the next app launch.",
-        true,
       );
     });
   }, [activeId, selectionReady, notify]);

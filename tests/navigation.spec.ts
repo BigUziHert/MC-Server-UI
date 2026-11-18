@@ -337,9 +337,12 @@ test("native selection flush retries once after failure and drains choices queue
     "true",
   );
   await selectServer(page, serverId);
-  await expect(
-    page.getByRole("status").filter({ hasText: "choice could not be saved" }),
-  ).toBeVisible();
+  const notice = page.getByRole("status", {
+    name: "Notification",
+    exact: true,
+  });
+  await expect(notice).toBeVisible();
+  await expect(notice).toContainText("choice could not be saved");
   const failure = await page.evaluate(async () => {
     try {
       await window.__mcPanelFlushSelection?.();
