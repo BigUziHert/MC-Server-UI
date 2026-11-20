@@ -1242,6 +1242,65 @@ export async function createLaunchpad(ctx) {
       }),
     );
   }
+  function restoreCachedUpdate(input, item) {
+    const cached = updateCache.get(updateKey(input, item));
+    // Keep the last verified update visible even if its recheck fails.
+    if (cached?.value) item.update = cached.value;
+    else delete item.update;
+    item.updateCheck =
+      !enabled(input.refresh) && cached?.expiresAt > Date.now()
+        ? cached.unlisted
+          ? "unlisted"
+          : "checked"
+        : "pending";
+    if (item.updateCheck === "unlisted") item.updateIssue = cached.unlisted;
+    else delete item.updateIssue;
+  }
+  function applyCatalogUpdate(item, attempts) {
+    const offers = attempts
+      .filter((attempt) => attempt.update)
+      .sort(
+        (a, b) =>
+          Date.parse(b.update.publishedAt) - Date.parse(a.update.publishedAt),
+      );
+    // Attempts start with the recorded catalog, so it wins equal dates.
+    const result =
+      offers.find((attempt) => attempt.updateCheck === "checked") ??
+      attempts.find((attempt) => attempt.updateCheck === "checked") ??
+      attempts.find((attempt) => attempt.updateCheck === "unlisted") ??
+      offers[0] ??
+      attempts[0];
+    item.updateCheck = result.updateCheck;
+    if (result.updateIssue) item.updateIssue = result.updateIssue;
+    else delete item.updateIssue;
+    if (result.update) item.update = result.update;
+    else delete item.update;
+    if (result.platform !== item.platform)
+      item.updateSource = {
+        platform: result.platform,
+        projectId: result.projectId,
+        versionId: result.versionId,
+      };
+    else delete item.updateSource;
+  }
+  function restoreCatalogUpdates(input, item, aliases) {
+    if (!aliases.length) {
+      delete item.updateSource;
+      restoreCachedUpdate(input, item);
+      return [item];
+    }
+    const attempts = [
+      { ...item },
+      ...aliases.map((alias) => ({ ...item, ...alias })),
+    ];
+    for (const attempt of attempts) restoreCachedUpdate(input, attempt);
+    applyCatalogUpdate(item, attempts);
+    if (attempts.some((attempt) => attempt.updateCheck === "pending")) {
+      item.updateCheck = "pending";
+      delete item.updateIssue;
+    }
+    return attempts;
+  }
   async function checkUpdates(input, items, warnings) {
     if (
       input.type !== "modpack" &&
@@ -1261,7 +1320,7 @@ export async function createLaunchpad(ctx) {
     };
     const cooldownMessage = (cooldown) =>
       `${cooldown.message} Retry in ${Math.max(1, Math.ceil((cooldown.until - Date.now()) / 1000))} seconds.`;
-    const fail = (found, cause, item) => {
+    const fail = (found, cause, warnings, item) => {
       if (cause.cachedUpdateFailure) {
         warnings.push(cause.message);
         return;
@@ -1300,9 +1359,41 @@ export async function createLaunchpad(ctx) {
       if (unlisted) item.updateIssue = unlisted;
       else delete item.updateIssue;
     };
-    await Promise.all(
+    const alternateProviders = new Set();
+    for (const found of providers) {
+      if (
+        found.available !== false &&
+        found.types.includes(input.type) &&
+        items.some((item) =>
+          item.catalogAliases?.some((alias) => alias.platform === found.id),
+        ) &&
+        (!found.requiresKey || (await key()))
+      )
+        alternateProviders.add(found.id);
+    }
+    const origins = new Map();
+    const alternatives = new Map();
+    const attempts = items.flatMap((item) => {
+      const aliases = (item.catalogAliases ?? []).filter(
+        (alias) =>
+          alternateProviders.has(alias.platform) &&
+          alias.platform !== item.platform &&
+          alias.projectId &&
+          alias.versionId,
+      );
+      if (!aliases.length) {
+        if (item.catalogAliases?.length) restoreCatalogUpdates(input, item, []);
+        return [item];
+      }
+      const checks = restoreCatalogUpdates(input, item, aliases);
+      for (const check of checks) origins.set(check, item);
+      alternatives.set(item, checks);
+      return checks;
+    });
+    const reports = await Promise.all(
       providers.map(async (found) => {
-        const known = items.filter(
+        const warnings = [];
+        const known = attempts.filter(
           (item) => item.platform === found.id && item.projectId,
         );
         if (!known.length) return;
@@ -1400,7 +1491,7 @@ export async function createLaunchpad(ctx) {
                 issue: result.warnings?.join(" "),
               };
             } catch (cause) {
-              fail(found, cause);
+              fail(found, cause, warnings);
               return { checked, issue: cause.message };
             } finally {
               accepting = false;
@@ -1566,7 +1657,7 @@ export async function createLaunchpad(ctx) {
                     });
                     return { value };
                   } catch (cause) {
-                    fail(found, cause, item);
+                    fail(found, cause, warnings, item);
                     return { issue: cause.message };
                   }
                 })();
@@ -1599,9 +1690,22 @@ export async function createLaunchpad(ctx) {
             }
           }),
         );
+        return { known, warnings };
       }),
     );
     input.signal.throwIfAborted();
+    for (const [item, checks] of alternatives) applyCatalogUpdate(item, checks);
+    for (const report of reports) {
+      if (
+        report &&
+        (!report.known.some((attempt) => origins.has(attempt)) ||
+          report.known.some(
+            (attempt) =>
+              (origins.get(attempt) ?? attempt).updateCheck === "unavailable",
+          ))
+      )
+        warnings.push(...report.warnings);
+    }
   }
   function markDuplicates(items) {
     for (const item of items) delete item.duplicates;
@@ -1681,17 +1785,7 @@ export async function createLaunchpad(ctx) {
       const url = projectPageUrl(item);
       if (url) item.url = url;
       if (mode !== "full") continue;
-      const cached = updateCache.get(updateKey(input, item));
-      // Keep the last verified update visible if the provider is temporarily
-      // unavailable. Its expiry controls rechecking, not erasing known updates.
-      if (cached?.value) item.update = cached.value;
-      item.updateCheck =
-        !enabled(input.refresh) && cached?.expiresAt > Date.now()
-          ? cached.unlisted
-            ? "unlisted"
-            : "checked"
-          : "pending";
-      if (item.updateCheck === "unlisted") item.updateIssue = cached.unlisted;
+      restoreCatalogUpdates(input, item, item.catalogAliases ?? []);
     }
     markDuplicates(items);
     if (enabled(input.local)) return { items, warnings: scanWarnings };
@@ -1723,6 +1817,9 @@ export async function createLaunchpad(ctx) {
           else delete item.update;
           if (checked.updateIssue) item.updateIssue = checked.updateIssue;
           else delete item.updateIssue;
+          if (checked.updateSource) item.updateSource = checked.updateSource;
+          if (checked.catalogAliases)
+            item.catalogAliases = checked.catalogAliases;
         }
         markDuplicates(items);
         return structuredClone({

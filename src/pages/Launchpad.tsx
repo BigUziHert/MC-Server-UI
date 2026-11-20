@@ -82,6 +82,11 @@ type Version = {
   publishedAt: string;
   downloadable: boolean;
 };
+type CatalogIdentity = {
+  platform: string;
+  projectId: string;
+  versionId: string;
+};
 type Project = {
   id: string;
   platform: string;
@@ -104,13 +109,14 @@ type InstalledItem = {
   platform: string | null;
   projectId?: string;
   versionId?: string;
-  catalogAliases?: { platform: string; projectId: string; versionId: string }[];
+  catalogAliases?: CatalogIdentity[];
   versionName?: string;
   title?: string;
   iconUrl?: string;
   author?: string;
   authorLinks?: Project["authorLinks"];
   update?: Version | null;
+  updateSource?: CatalogIdentity;
   url?: string;
   updateCheck?: "checked" | "unavailable" | "pending" | "unlisted";
   updateIssue?: string;
@@ -203,6 +209,7 @@ function pendingInventory(result: InstalledResult): InstalledResult {
     items: result.items.map((item) => ({
       ...item,
       update: null,
+      updateSource: undefined,
       updateIssue: undefined,
       updateCheck: item.platform && item.projectId ? "pending" : undefined,
     })),
@@ -231,6 +238,10 @@ function mergeLocalInventory(
         authorLinks: old.authorLinks ?? item.authorLinks,
         url: old.url ?? item.url,
         update: old.update !== undefined ? old.update : item.update,
+        updateSource:
+          old.update !== undefined || old.updateCheck
+            ? old.updateSource
+            : item.updateSource,
         updateCheck: old.updateCheck ?? item.updateCheck,
         updateIssue: old.updateIssue ?? item.updateIssue,
         categories: old.categories ?? item.categories,
@@ -501,13 +512,18 @@ function updateCheckLabel(
   entry: InstalledItem,
   enabled: boolean,
   refreshing: boolean,
+  updatePlatform?: string,
 ) {
   if (!enabled || !entry.platform || !entry.projectId) return null;
-  if (entry.updateCheck === "unlisted") return "No release listed";
+  if (entry.updateCheck === "unlisted")
+    return updatePlatform
+      ? `No release listed on ${updatePlatform}`
+      : "No release listed";
   if (entry.updateCheck === "unavailable") return "Update check unavailable";
   if (entry.updateCheck === "pending")
     return refreshing ? "Checking updates…" : "Update check unavailable";
-  if (entry.updateCheck === "checked" && !entry.update) return "Up to date";
+  if (entry.updateCheck === "checked" && !entry.update)
+    return updatePlatform ? `Up to date on ${updatePlatform}` : "Up to date";
   return null;
 }
 const modLoaders = ["fabric", "forge", "neoforge", "quilt"];
@@ -1765,7 +1781,18 @@ export default function Launchpad({
         : contentGameVersion,
     );
     setTargetLoader(browsingModpack ? loader || contentLoader : contentLoader);
-    setSelection({ project, installed: entry });
+    const source = entry?.updateSource;
+    setSelection({
+      project: source
+        ? {
+            ...project,
+            id: source.projectId,
+            platform: source.platform,
+            url: projectPageUrl(source),
+          }
+        : project,
+      installed: entry && source ? { ...entry, ...source } : entry,
+    });
   }
   function closeSelection() {
     if (busy === "install") return;
@@ -2093,8 +2120,8 @@ export default function Launchpad({
         gameVersion: contentGameVersion,
         loader: contentLoader,
         updates: updates.map((item) => ({
-          platform: item.platform,
-          projectId: item.projectId,
+          platform: item.updateSource?.platform ?? item.platform,
+          projectId: item.updateSource?.projectId ?? item.projectId,
           versionId: item.update!.id,
           replacePath: item.path,
         })),
@@ -2357,13 +2384,17 @@ export default function Launchpad({
   for (const item of installed?.items ?? []) {
     indexInstalledProject(item);
     for (const alias of item.catalogAliases ?? []) {
-      // Update checks and release IDs belong to the file's primary provider.
+      const matchesUpdateSource =
+        alias.platform === item.updateSource?.platform &&
+        alias.projectId === item.updateSource.projectId &&
+        alias.versionId === item.updateSource.versionId;
       indexInstalledProject({
         ...item,
         ...alias,
-        update: undefined,
-        updateCheck: undefined,
-        updateIssue: undefined,
+        update: matchesUpdateSource ? item.update : undefined,
+        updateSource: undefined,
+        updateCheck: matchesUpdateSource ? item.updateCheck : undefined,
+        updateIssue: matchesUpdateSource ? item.updateIssue : undefined,
       });
     }
   }
@@ -2408,6 +2439,12 @@ export default function Launchpad({
       projectKey: `${project.platform}:${project.id}`,
       hashes,
     });
+  }
+  function platformName(platformId?: string) {
+    return (
+      config?.platforms.find((item) => item.id === platformId)?.name ??
+      platformId
+    );
   }
   const warnings = [
     ...new Set(
@@ -2751,7 +2788,7 @@ export default function Launchpad({
             disabled={installedOnly}
             title={
               installedOnly
-                ? "Installed content includes every platform."
+                ? "Shows installed content from every platform. Update checks use verified listings."
                 : undefined
             }
             onChange={(event) => {
@@ -3347,7 +3384,9 @@ export default function Launchpad({
                         )}
                         {entry?.update && (
                           <span className="launchpad-badge update">
-                            Update available
+                            {entry.updateSource
+                              ? `Update available on ${platformName(entry.updateSource.platform)}`
+                              : "Update available"}
                           </span>
                         )}
                         {entry?.active === false && hasActive && (
@@ -3355,9 +3394,7 @@ export default function Launchpad({
                         )}
                         {installedOnly && entry?.platform && (
                           <span className="launchpad-badge">
-                            {config.platforms.find(
-                              (item) => item.id === entry.platform,
-                            )?.name ?? entry.platform}
+                            {platformName(entry.platform)}
                           </span>
                         )}
                         {entry &&
@@ -3394,6 +3431,7 @@ export default function Launchpad({
                             entry,
                             updateFiltersReady,
                             scanRefreshing,
+                            platformName(entry.updateSource?.platform),
                           ) && (
                             <span
                               className={
@@ -3406,6 +3444,7 @@ export default function Launchpad({
                                 entry,
                                 updateFiltersReady,
                                 scanRefreshing,
+                                platformName(entry.updateSource?.platform),
                               )}
                             </span>
                           )}
@@ -3447,7 +3486,10 @@ export default function Launchpad({
                               Boolean(busy) ||
                               Boolean(entry && pendingPaths.has(entry.path)) ||
                               !config.platforms.find(
-                                (item) => item.id === project.platform,
+                                (item) =>
+                                  item.id ===
+                                  (entry?.updateSource?.platform ??
+                                    project.platform),
                               )?.available
                             }
                             onClick={() => chooseProject(project, entry)}

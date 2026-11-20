@@ -1907,6 +1907,96 @@ test("installed project links and update-all review span platforms and retry the
   expect(installs).toEqual([retryInput, retryInput]);
 });
 
+test("verified alternate listings supply installed versions and update reviews", async ({
+  page,
+}) => {
+  await catalog(page);
+  const source = { platform: "curseforge", projectId: "42", versionId: "100" };
+  const betaSource = { ...source, projectId: "43" };
+  const update = { ...version, id: "101" };
+  const currentVersion = { ...version, id: source.versionId, name: "Current" };
+  const items = [
+    {
+      ...installed("Alpha"),
+      catalogAliases: [source],
+      update,
+      updateSource: source,
+    },
+    {
+      ...installed("Beta"),
+      catalogAliases: [betaSource],
+      update: null,
+      updateSource: betaSource,
+    },
+  ];
+  await page.route("**/api/launchpad/installed?**", (route) =>
+    route.fulfill({ json: { items, warnings: [] } }),
+  );
+  await page.route("**/api/launchpad/versions?**", (route) =>
+    route.fulfill({ json: { versions: [currentVersion, update] } }),
+  );
+  await page.route("**/api/launchpad/preview", (route) =>
+    route.fulfill({ json: plan }),
+  );
+  await page.route("**/api/launchpad/updates/preview", (route) =>
+    route.fulfill({ json: plan }),
+  );
+  await page.route("**/api/launchpad/preview/review/cancel", (route) =>
+    route.fulfill({ json: {} }),
+  );
+
+  await page.goto("/#launchpad");
+  await page.getByRole("switch", { name: "Show installed content" }).check();
+  const row = page.getByRole("article", { name: "Alpha" });
+  await expect(row.getByText("modrinth", { exact: true })).toBeVisible();
+  await expect(row.getByText("Update available on curseforge")).toBeVisible();
+  await expect(page.getByText("Up to date on curseforge")).toBeVisible();
+
+  async function openVersions(button: string, projectId: string) {
+    const [request] = await Promise.all([
+      page.waitForRequest(/\/api\/launchpad\/versions\?/),
+      page.getByRole("button", { name: button, exact: true }).click(),
+    ]);
+    const query = new URL(request.url()).searchParams;
+    expect(query.get("platform")).toBe(source.platform);
+    expect(query.get("projectId")).toBe(projectId);
+  }
+  const close = page.getByRole("button", { name: "Close installation dialog" });
+  await openVersions("Choose version for Beta", betaSource.projectId);
+  await expect(
+    page
+      .getByLabel("Project version")
+      .getByRole("option", { name: "Current · Installed" }),
+  ).toHaveAttribute("value", source.versionId);
+  await close.click();
+
+  await openVersions("Update Alpha", source.projectId);
+  await expect(page.getByLabel("Project version")).toHaveValue(update.id);
+  const [single] = await Promise.all([
+    page.waitForRequest(/\/api\/launchpad\/preview$/),
+    page
+      .getByRole("button", { name: "Review installation", exact: true })
+      .click(),
+  ]);
+  const expected = {
+    platform: source.platform,
+    projectId: source.projectId,
+    versionId: update.id,
+    replacePath: items[0].path,
+  };
+  expect(single.postDataJSON()).toMatchObject(expected);
+  await expect(
+    page.getByRole("dialog", { name: "Review installation" }),
+  ).toBeVisible();
+  await close.click();
+
+  const [bulk] = await Promise.all([
+    page.waitForRequest(/\/api\/launchpad\/updates\/preview$/),
+    page.getByRole("button", { name: "Update all", exact: true }).click(),
+  ]);
+  expect(bulk.postDataJSON().updates).toEqual([expected]);
+});
+
 test("unreadable removal dependencies require acknowledgement before confirmation", async ({
   page,
 }) => {

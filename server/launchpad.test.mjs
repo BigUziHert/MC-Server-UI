@@ -5439,6 +5439,189 @@ for (const [type, folder, classId, slug, loader] of [
     ]);
   });
 
+test("verified alternate releases recover a missing catalog and can be installed through Update all", async (t) => {
+  const project = {
+    id: 11,
+    gameId: 432,
+    classId: 6,
+    name: "Cross-listed project",
+  };
+  const alternateRelease = bytes("newer CurseForge release");
+  const alternateUrl = "https://edge.forgecdn.net/alternate.jar";
+  let missingModrinth = true;
+  let verifiedMatch = false;
+  let newerAvailable = false;
+  const f = await fixture(t, {
+    request: (url, init) => {
+      const { pathname } = new URL(url);
+      if (missingModrinth && pathname === "/v2/version_files/update")
+        return Response.json({});
+      if (missingModrinth && pathname === "/v2/project/project/version")
+        return new Response(null, { status: 404 });
+      if (pathname === "/v1/categories")
+        return Response.json({
+          data: [{ id: 6, slug: "mc-mods", name: "Mods" }],
+        });
+      if (pathname === "/v1/mods") return Response.json({ data: [project] });
+      if (pathname === "/v1/mods/11") return Response.json({ data: project });
+      const old = {
+        id: 21,
+        modId: project.id,
+        displayName: "Installed release",
+        fileName: "old.jar",
+        fileDate: "2026-01-01",
+        gameVersions: ["1.21.1", "NeoForge"],
+        fileFingerprint: curseFingerprint(f.old),
+        fileLength: f.old.length,
+        downloadUrl: "https://edge.forgecdn.net/old.jar",
+        hashes: [{ algo: 1, value: hashes(f.old).sha1 }],
+      };
+      const newer = {
+        ...old,
+        id: 22,
+        displayName: "Newer alternate release",
+        fileName: "alternate.jar",
+        fileDate: "2026-03-01",
+        fileFingerprint: curseFingerprint(alternateRelease),
+        fileLength: alternateRelease.length,
+        downloadUrl: alternateUrl,
+        hashes: [{ algo: 1, value: hashes(alternateRelease).sha1 }],
+      };
+      if (pathname === "/v1/fingerprints/432") {
+        const fingerprints = JSON.parse(init.body).fingerprints;
+        return Response.json({
+          data: {
+            exactMatches: [old, newer]
+              .filter((file) => fingerprints.includes(file.fileFingerprint))
+              .map((file) => ({
+                id: project.id,
+                file: verifiedMatch
+                  ? file
+                  : { ...file, hashes: [{ algo: 1, value: "0".repeat(40) }] },
+              })),
+          },
+        });
+      }
+      if (pathname === "/v1/mods/11/files")
+        return Response.json({ data: newerAvailable ? [newer, old] : [old] });
+      if (pathname === "/v1/mods/11/files/22")
+        return Response.json({ data: newer });
+    },
+  });
+  f.downloads.set(alternateUrl, alternateRelease);
+  await fs.writeFile(
+    path.join(f.dataDir, "launchpad", "installed.json"),
+    JSON.stringify([
+      {
+        path: "mods/old.jar",
+        sha512: hashes(f.old).sha512,
+        platform: "modrinth",
+        projectId: "project",
+        versionId: "old",
+        type: "mod",
+      },
+    ]),
+  );
+  const service = await f.boot();
+  await service.settings({ curseforgeApiKey: "fixture-key" });
+
+  const unresolved = await service.installed(selection);
+  assert.equal(unresolved.items[0].updateCheck, "unavailable");
+  assert.equal(unresolved.items[0].catalogAliases, undefined);
+  assert.match(unresolved.warnings.join(" "), /404/);
+
+  verifiedMatch = true;
+  const recovered = await service.installed({ ...selection, refresh: true });
+  assert.equal(recovered.items[0].platform, "modrinth");
+  assert.equal(recovered.items[0].versionId, "old");
+  assert.equal(recovered.items[0].updateCheck, "checked");
+  assert.equal(recovered.items[0].updateIssue, undefined);
+  assert.equal(recovered.items[0].update, undefined);
+  assert.deepEqual(recovered.items[0].updateSource, {
+    platform: "curseforge",
+    projectId: "11",
+    versionId: "21",
+  });
+  assert.deepEqual(recovered.warnings, []);
+
+  missingModrinth = false;
+  newerAvailable = true;
+  const primaryPublishedAt = f.versions.new.date_published;
+  f.versions.new.date_published = "2026-03-01";
+  const tied = await service.installed({ ...selection, refresh: true });
+  assert.equal(tied.items[0].update.id, "new");
+  assert.equal(tied.items[0].updateSource, undefined);
+  f.versions.new.date_published = primaryPublishedAt;
+
+  let inventory = await service.installed({
+    ...selection,
+    refresh: true,
+    background: true,
+  });
+  assert.equal(inventory.checkingUpdates, true);
+  const deadline = performance.now() + 5000;
+  do {
+    inventory = await service.installed(selection);
+    if (!inventory.checkingUpdates) break;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  } while (performance.now() < deadline);
+  assert.equal(inventory.checkingUpdates, false);
+  const [item] = inventory.items;
+  assert.equal(item.platform, "modrinth");
+  assert.equal(item.updateCheck, "checked");
+  assert.deepEqual(item.updateSource, {
+    platform: "curseforge",
+    projectId: "11",
+    versionId: "21",
+  });
+  assert.equal(item.update.id, "22");
+  const local = await service.installed({
+    ...selection,
+    local: true,
+    quick: true,
+  });
+  assert.equal(local.items[0].updateCheck, "checked");
+  assert.equal(local.items[0].update.id, item.update.id);
+  assert.deepEqual(local.items[0].updateSource, item.updateSource);
+
+  const plan = await service.preview({
+    type: selection.type,
+    gameVersion: selection.gameVersion,
+    loader: selection.loader,
+    updates: [
+      {
+        platform: item.updateSource.platform,
+        projectId: item.updateSource.projectId,
+        versionId: item.update.id,
+        replacePath: item.path,
+      },
+    ],
+  });
+  assert.deepEqual(
+    plan.files.map(({ path, action, previousPath }) => ({
+      path,
+      action,
+      previousPath,
+    })),
+    [
+      {
+        path: "mods/alternate.jar",
+        action: "replace",
+        previousPath: item.path,
+      },
+    ],
+  );
+  const job = await finish(service, { planId: plan.planId, confirmed: true });
+  assert.equal(job.status, "completed", job.error);
+  assert.deepEqual(await fs.readdir(path.join(f.serverDir, "mods")), [
+    "alternate.jar",
+  ]);
+  assert.deepEqual(
+    await fs.readFile(path.join(f.serverDir, "mods/alternate.jar")),
+    alternateRelease,
+  );
+});
+
 test("a file removed during catalog checks does not hide another verified resource pack", async (t) => {
   let directory;
   const f = await fixture(t, {
