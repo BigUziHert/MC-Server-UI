@@ -56,6 +56,7 @@ import { minecraftGameVersion } from "./minecraft-version.mjs";
 import {
   createLauncherStop,
   minecraftServerMessage,
+  waterfallProxyMessage,
 } from "./launcher-stop.mjs";
 import { decodeText, encodeText } from "./text-encoding.mjs";
 import { updateProperties, encodeProperties } from "./properties.mjs";
@@ -1184,6 +1185,8 @@ export async function createPanel(options = {}) {
       let executable = configuration.javaPath;
       let windowsVerbatimArguments = false;
       let detectedStartup = {};
+      const waterfall =
+        String(configuration.software).toLowerCase() === "waterfall";
       if (configuration.launchType !== "jar") {
         detectedStartup = await validateStartupFiles(serverDir, configuration);
         launchArgs = configuration.launchArgs;
@@ -1208,21 +1211,26 @@ export async function createPanel(options = {}) {
           `-Xmx${memoryLimit}M`,
           "-jar",
           jar,
-          "nogui",
+          ...(waterfall ? [] : ["nogui"]),
         ];
       }
-      let eula = "";
-      try {
-        eula = await fs.readFile(await safePath(serverDir, "eula.txt"), "utf8");
-      } catch {
-        /* Shown as an actionable error below. */
+      if (!waterfall) {
+        let eula = "";
+        try {
+          eula = await fs.readFile(
+            await safePath(serverDir, "eula.txt"),
+            "utf8",
+          );
+        } catch {
+          /* Shown as an actionable error below. */
+        }
+        if (parseProperties(eula).get("eula")?.toLowerCase() !== "true")
+          throw error(
+            400,
+            "Read the Minecraft EULA, then set eula=true in your server eula.txt before starting.",
+          );
+        await writeProperties({ "server-port": configuration.port });
       }
-      if (parseProperties(eula).get("eula")?.toLowerCase() !== "true")
-        throw error(
-          400,
-          "Read the Minecraft EULA, then set eula=true in your server eula.txt before starting.",
-        );
-      await writeProperties({ "server-port": configuration.port });
       if (!configuration.minecraftVersion)
         detectedStartup = {
           ...detectedStartup,
@@ -1277,6 +1285,7 @@ export async function createPanel(options = {}) {
       }
       const stop = createLauncherStop({
         child,
+        waterfall,
         windowsBatch:
           process.platform === "win32" &&
           configuration.launchType === "script" &&
@@ -1306,12 +1315,12 @@ export async function createPanel(options = {}) {
           return;
         // Do not treat a player's chat containing "Done (" as a startup event.
         const clean = text.replace(/\x1b\[[0-9;]*m/g, "").trim();
-        if (
-          !/^(?:(?:(?:\[[^\]\r\n]{1,80}\]\s*)?\[(?:Server thread|main)\/INFO\](?:\s*\[[^\]\r\n]{1,120}\])?|\[\d{2}:\d{2}:\d{2} INFO\](?:\s*\[[^\]\r\n]{1,120}\])?):\s*|\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} \[INFO\]\s*)Done \(/.test(
-            clean,
-          )
-        )
-          return;
+        const listening = waterfall
+          ? /^Listening on \S+:\d+$/.test(waterfallProxyMessage(clean))
+          : /^(?:(?:(?:\[[^\]\r\n]{1,80}\]\s*)?\[(?:Server thread|main)\/INFO\](?:\s*\[[^\]\r\n]{1,120}\])?|\[\d{2}:\d{2}:\d{2} INFO\](?:\s*\[[^\]\r\n]{1,120}\])?):\s*|\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} \[INFO\]\s*)Done \(/.test(
+              clean,
+            );
+        if (!listening) return;
         becameReady = true;
         status = "running";
         void lifecycleAudit(

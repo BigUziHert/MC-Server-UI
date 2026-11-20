@@ -6,7 +6,7 @@ import path from "node:path";
 import { randomUUID, createHash } from "node:crypto";
 import { finished } from "node:stream/promises";
 import { cleanInstall, prepareCleanSettings } from "./clean-install.mjs";
-import { createVersionsService } from "./versions.mjs";
+import { createVersionsService, installedJarBuild } from "./versions.mjs";
 import { createPropertiesService } from "./properties.mjs";
 import { createLaunchpad, providerJson } from "./launchpad.mjs";
 import { createExtraProviders } from "./launchpad-extra.mjs";
@@ -90,6 +90,11 @@ async function runtimeLaunchState(ctx, current) {
   const provider = String(
     current.loader ?? current.software ?? "",
   ).toLowerCase();
+  if (provider === "arclight")
+    throw fail(
+      409,
+      "Arclight builds include different mod loaders. Choose a clean installation when replacing its runtime.",
+    );
   if (
     current.mode !== "live" ||
     ![
@@ -102,6 +107,14 @@ async function runtimeLaunchState(ctx, current) {
       "quilt",
       "forge",
       "neoforge",
+      "leaves",
+      "sponge",
+      "mohist",
+      "magma",
+      "waterfall",
+      "spigot",
+      "pufferfish",
+      "canvas",
     ].includes(provider) ||
     !current.gameVersion
   )
@@ -166,7 +179,22 @@ async function runtimeLaunchState(ctx, current) {
     gameVersion: current.gameVersion,
     build: ["forge", "neoforge", "fabric", "quilt"].includes(provider)
       ? (current.version ?? null)
-      : null,
+      : [
+            "leaves",
+            "sponge",
+            "mohist",
+            "magma",
+            "waterfall",
+            "spigot",
+            "pufferfish",
+            "canvas",
+          ].includes(provider)
+        ? (installedJarBuild(
+            provider,
+            current.gameVersion,
+            configuration.jar,
+          ) ?? null)
+        : null,
     configuration,
     script,
     args,
@@ -674,10 +702,14 @@ export async function createMinecraft(ctx) {
       "/api/versions",
       endpoint(async (_req, res) => {
         const current = await ctx.getServer({ refresh: true });
+        const [runtimeUpdate, url] = await Promise.all([
+          runtimeCapability(ctx, current),
+          versions.currentUrl?.(current),
+        ]);
         res.json({
           providers: versions.listProviders(),
-          current,
-          runtimeUpdate: await runtimeCapability(ctx, current),
+          current: { ...current, url },
+          runtimeUpdate,
           job:
             lastJob && terminal.visible(publicJob(jobs.get(lastJob)))
               ? publicJob(jobs.get(lastJob))

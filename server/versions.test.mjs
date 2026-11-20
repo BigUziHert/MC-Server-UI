@@ -16,6 +16,9 @@ const digest = (algorithm, value = jar) =>
 const NEO = "https://maven.neoforged.net/releases/net/neoforged/neoforge";
 const FORGE = "https://maven.minecraftforge.net/net/minecraftforge/forge";
 const PAPER = "https://fill.papermc.io/v3/projects";
+const VANILLA =
+  "https://piston-meta.mojang.com/mc/game/version_manifest_v2.json";
+const NOTES = "https://launchercontent.mojang.com/v2/";
 const XML = (versions) =>
   `<metadata><versioning><versions>${versions.map((version) => `<version>${version}</version>`).join("")}</versions></versioning></metadata>`;
 
@@ -101,20 +104,150 @@ async function generatedForge(
   await fs.writeFile(path.join(cwd, "installer.log"), "must-not-be-promoted");
 }
 
-test("provider catalog includes all requested software and distinguishes nine verified installers from official-download links", () => {
+test("provider catalog offers reviewed installers for all 18 software providers", () => {
   assert.equal(versionProviders.length, 18);
-  assert.equal(versionProviders.filter((entry) => entry.installable).length, 9);
+  assert.equal(
+    versionProviders.filter((entry) => entry.installable).length,
+    18,
+  );
   assert.equal(
     versionProviders.find((entry) => entry.id === "waterfall").badge,
     "Deprecated",
   );
-  assert.equal(
-    versionProviders.find((entry) => entry.id === "spigot").installable,
-    false,
-  );
   assert.ok(
     versionProviders.every((entry) => entry.website.startsWith("https://")),
   );
+});
+
+test("Versions links use official build pages across software catalogs", async (t) => {
+  const game = "1.21.1";
+  const releases = [
+    ["neoforge", "21.1.267", `${NEO}/21.1.267/neoforge-21.1.267-changelog.txt`],
+    [
+      "forge",
+      "1.21.1-52.1.20",
+      `${FORGE}/1.21.1-52.1.20/forge-1.21.1-52.1.20-changelog.txt`,
+    ],
+    [
+      "fabric",
+      "0.20.1",
+      "https://github.com/FabricMC/fabric-loader/releases/tag/0.20.1",
+    ],
+    [
+      "quilt",
+      "0.31.0",
+      "https://quiltmc.org/en/changelog/quilt-loader/0.31.0/",
+    ],
+    [
+      "purpur",
+      "2308",
+      "https://purpurmc.org/download/purpur/1.21.1#:~:text=2308",
+    ],
+  ];
+  const records = {
+    [`${NEO}/maven-metadata.xml`]: XML([
+      "21.1.267",
+      "21.1.266",
+      "21.1.265-beta",
+    ]),
+    [`${FORGE}/maven-metadata.xml`]: XML([
+      "1.21.1-52.1.20",
+      "1.12.2-14.23.5.2855",
+    ]),
+    "https://files.minecraftforge.net/net/minecraftforge/forge/index_1.21.1.html": `<a href="${FORGE}/1.21.1-52.1.20/forge-1.21.1-52.1.20-changelog.txt">Changelog</a>`,
+    "https://api.purpurmc.org/v2/purpur": { versions: [game] },
+    [`https://api.purpurmc.org/v2/purpur/${game}`]: {
+      builds: { all: ["2308"] },
+    },
+  };
+  for (const [meta, builds] of [
+    ["https://meta.fabricmc.net/v2/versions", ["0.20.1", "0.10.6+build.214"]],
+    ["https://meta.quiltmc.org/v3/versions", ["0.31.0", "0.31.0-beta.6"]],
+  ]) {
+    records[`${meta}/game`] = [{ version: game, stable: true }];
+    records[`${meta}/loader/${game}`] = builds.map((version) => ({
+      loader: { version },
+    }));
+  }
+  for (const provider of ["paper", "folia", "velocity"]) {
+    const version = provider === "velocity" ? "4.3.1" : game;
+    records[`${PAPER}/${provider}`] = { versions: { current: [version] } };
+    records[`${PAPER}/${provider}/versions/${version}/builds`] = [
+      { id: 132, channel: "STABLE", downloads: { "server:default": {} } },
+    ];
+  }
+  const { service } = await fixture(t, records);
+  for (const [provider, id, url] of releases) {
+    const { builds } = await service.builds(provider, game);
+    assert.equal(builds.find((build) => build.id === id)?.url, url);
+    assert.match((await service.versions(provider)).versions[0].url, /^https:/);
+  }
+  for (const provider of ["paper", "folia", "velocity"]) {
+    const version = provider === "velocity" ? "4.3.1" : game;
+    const url = `https://fill-ui.papermc.io/projects/${provider}/version/${version}`;
+    assert.equal((await service.versions(provider)).versions[0].url, url);
+    assert.equal(
+      (await service.builds(provider, version)).builds[0].url,
+      `${url}?build=132`,
+    );
+  }
+  assert.equal(
+    (await service.builds("neoforge", game)).builds.find(({ id }) =>
+      id.endsWith("-beta"),
+    ).url,
+    `${NEO}/21.1.265-beta/`,
+  );
+  assert.equal(
+    (await service.builds("forge", "1.12.2")).builds[0].url,
+    "https://files.minecraftforge.net/net/minecraftforge/forge/index_1.12.2.html#:~:text=14.23.5.2855",
+  );
+  assert.equal(
+    (await service.builds("fabric", game)).builds.at(-1).url,
+    "https://maven.fabricmc.net/net/fabricmc/fabric-loader/0.10.6%2Bbuild.214/",
+  );
+  assert.equal(
+    (await service.builds("quilt", game)).builds.find(({ id }) =>
+      id.endsWith("-beta.6"),
+    ).url,
+    "https://maven.quiltmc.org/repository/release/org/quiltmc/quilt-loader/0.31.0-beta.6/",
+  );
+  assert.equal(
+    await service.currentUrl({
+      software: "NeoForge",
+      gameVersion: game,
+      version: "21.1.266",
+    }),
+    `${NEO}/21.1.266/neoforge-21.1.266-changelog.txt`,
+  );
+  assert.equal(
+    await service.currentUrl({
+      software: "Forge",
+      gameVersion: game,
+      version: "52.1.20",
+    }),
+    releases[1][2],
+  );
+  assert.equal(
+    await service.currentUrl({
+      software: "Paper",
+      gameVersion: game,
+      version: game,
+      jar: "paper-1.21.1-132.jar",
+    }),
+    "https://fill-ui.papermc.io/projects/paper/version/1.21.1?build=132",
+  );
+  for (const provider of versionProviders.filter(
+    ({ installable, kind }) => !installable && kind === "server",
+  )) {
+    assert.equal(
+      await service.currentUrl({
+        software: provider.name,
+        gameVersion: game,
+        version: "21",
+      }),
+      provider.website,
+    );
+  }
 });
 
 test("NeoForge catalogs map both Minecraft numbering schemes and coalesce cached official requests", async (t) => {
@@ -206,7 +339,8 @@ test("unlisted providers, versions, builds and URL-shaped input cannot reach a d
       build: "https://evil.example/a.jar",
     },
     { provider: "neoforge", version: "1.21.1", build: "21.1.999" },
-    { provider: "spigot", version: "1.21.1", build: "1" },
+    { provider: "pufferfish", version: "1.21.1", build: "999999" },
+    { provider: "canvas", version: "26.3", build: "999999" },
   ])
     await assert.rejects(f.service.stage(selection, { stageDir: f.root }), {
       status: 400,
@@ -292,10 +426,56 @@ test("Paper uses the chosen build's SHA256 artifact and never executes the serve
   assert.equal(f.runs.length, 0);
 });
 
+test("Waterfall stages the verified proxy JAR and matching archived modules", async (t) => {
+  const url = "https://fill-data.papermc.io/v1/objects/test/waterfall.jar";
+  const moduleUrl =
+    "https://fill-data.papermc.io/v1/objects/test/cmd_alert.jar";
+  const module = Buffer.from("PK\x03\x04fixture Waterfall module");
+  const f = await fixture(t, {
+    [`${PAPER}/waterfall`]: { versions: { current: ["1.21"] } },
+    [`${PAPER}/waterfall/versions/1.21/builds`]: [
+      {
+        id: 615,
+        channel: "STABLE",
+        downloads: {
+          "server:default": { url, checksums: { sha256: digest("sha256") } },
+          "module:cmd_alert": {
+            url: moduleUrl,
+            checksums: { sha256: digest("sha256", module) },
+          },
+          "module:../outside": { url: "https://untrusted.test/file.jar" },
+        },
+      },
+    ],
+    [url]: jar,
+    [moduleUrl]: module,
+  });
+  const { builds } = await f.service.builds("waterfall", "1.21");
+  assert.equal(builds[0].javaVersion, 17);
+  assert.equal(builds[0].modules, undefined);
+  const result = await f.service.stage(
+    { provider: "waterfall", version: "1.21", build: "615" },
+    { stageDir: f.root },
+  );
+  assert.equal(result.configuration.software, "Waterfall");
+  assert.equal(result.configuration.version, "1.21");
+  assert.deepEqual(result.files.map(({ path }) => path).sort(), [
+    "modules/cmd_alert.jar",
+    "waterfall-1.21-615.jar",
+  ]);
+  assert.deepEqual(
+    await fs.readFile(path.join(result.stageDir, "modules/cmd_alert.jar")),
+    module,
+  );
+  assert.equal(f.runs.length, 0);
+});
+
 test("Vanilla verifies version metadata and server SHA1 from the official manifest", async (t) => {
   const metadataUrl =
     "https://piston-meta.mojang.com/v1/packages/fixture/1.21.1.json";
   const jarUrl = "https://piston-data.mojang.com/v1/objects/fixture/server.jar";
+  const article =
+    "https://feedback.minecraft.net/hc/en-us/articles/29100721259021-Minecraft-Java-Edition-1-21-1";
   const metadata = Buffer.from(
     JSON.stringify({
       javaVersion: { majorVersion: 21 },
@@ -303,7 +483,7 @@ test("Vanilla verifies version metadata and server SHA1 from the official manife
     }),
   );
   const f = await fixture(t, {
-    "https://piston-meta.mojang.com/mc/game/version_manifest_v2.json": {
+    [VANILLA]: {
       versions: [
         {
           id: "1.21.1",
@@ -313,12 +493,37 @@ test("Vanilla verifies version metadata and server SHA1 from the official manife
         },
       ],
     },
+    "https://feedback.minecraft.net/api/v2/help_center/articles/search.json?query=%221.21.1%22&locale=en-us":
+      {
+        results: [
+          {
+            title: "Minecraft - 1.21.1 (Bedrock)",
+            html_url: "https://feedback.minecraft.net/hc/en-us/articles/22",
+          },
+          {
+            title: "Minecraft Java Edition - 1.2.11",
+            html_url: "https://feedback.minecraft.net/hc/en-us/articles/23",
+          },
+          {
+            title: "Minecraft Java Edition - 1.21.1",
+            html_url: "https://untrusted.test/article",
+          },
+          {
+            title: "Minecraft Java Edition - 1.21.1 Release Candidate 1",
+            html_url: "https://feedback.minecraft.net/hc/en-us/articles/24",
+          },
+          { title: "Minecraft Java Edition 1.21.1", html_url: article },
+        ],
+      },
     [metadataUrl]: metadata,
     [jarUrl]: jar,
   });
+  const [build] = (await f.service.builds("vanilla", "1.21.1")).builds;
+  assert.equal(build.javaVersion, 21);
+  assert.equal(build.url, article);
   assert.equal(
-    (await f.service.builds("vanilla", "1.21.1")).builds[0].javaVersion,
-    21,
+    await f.service.currentUrl({ software: "Vanilla", version: "1.21.1" }),
+    article,
   );
   const result = await f.service.stage(
     { provider: "vanilla", version: "1.21.1", build: "1.21.1" },
@@ -330,8 +535,10 @@ test("Vanilla verifies version metadata and server SHA1 from the official manife
 
 test("Vanilla retains snapshot catalogs, including historical IDs with spaces, and stages only verified catalog artifacts", async (t) => {
   const version = "1.14.2 Pre-Release 4";
-  const metadataUrl =
-    "https://piston-meta.mojang.com/v1/packages/fixture/prerelease.json";
+  const metadataUrl = `https://piston-meta.mojang.com/v1/packages/${"a".repeat(40)}/1.14.2%20Pre-Release%204.json`;
+  const notesUrl = `${NOTES}javaPatchNotes/26-2.json`;
+  const articleUrl =
+    "https://www.minecraft.net/en-us/article/minecraft-java-edition-26-2";
   const jarUrl = "https://piston-data.mojang.com/v1/objects/fixture/server.jar";
   const metadata = Buffer.from(
     JSON.stringify({
@@ -339,7 +546,7 @@ test("Vanilla retains snapshot catalogs, including historical IDs with spaces, a
     }),
   );
   const f = await fixture(t, {
-    "https://piston-meta.mojang.com/mc/game/version_manifest_v2.json": {
+    [VANILLA]: {
       versions: [
         { id: "26.2", type: "release" },
         { id: "26.3-snapshot-1", type: "snapshot" },
@@ -356,14 +563,40 @@ test("Vanilla retains snapshot catalogs, including historical IDs with spaces, a
         { id: "1.14.2\noutside", type: "snapshot" },
       ],
     },
+    [`${NOTES}javaPatchNotes.json`]: {
+      entries: [
+        { version: "26.2", contentPath: "javaPatchNotes/26-2.json" },
+        {
+          version: "26.3-snapshot-1",
+          contentPath: "https://untrusted.test/notes.json",
+        },
+      ],
+    },
+    [articleUrl]: (_url, options) => {
+      assert.equal(options.method, "HEAD");
+      return new Response(null, { headers: { "content-type": "text/html" } });
+    },
     [metadataUrl]: metadata,
     [jarUrl]: jar,
   });
   assert.deepEqual((await f.service.versions("vanilla")).versions, [
-    { id: "26.2", label: "26.2", stable: true },
-    { id: "26.3-snapshot-1", label: "26.3-snapshot-1", stable: false },
-    { id: version, label: version, stable: false },
+    { id: "26.2", label: "26.2", stable: true, url: notesUrl },
+    {
+      id: "26.3-snapshot-1",
+      label: "26.3-snapshot-1",
+      stable: false,
+      url: "https://www.minecraft.net/en-us/download/server",
+    },
+    { id: version, label: version, stable: false, url: metadataUrl },
   ]);
+  assert.equal(
+    await f.service.currentUrl({ software: "Vanilla", version: "26.2" }),
+    articleUrl,
+  );
+  assert.equal(
+    (await f.service.builds("vanilla", version)).builds[0].url,
+    metadataUrl,
+  );
   assert.equal(
     (await f.service.builds("vanilla", version)).builds[0].stable,
     false,

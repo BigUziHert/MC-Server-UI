@@ -3,6 +3,7 @@ import path from "node:path";
 import os from "node:os";
 import { createHash } from "node:crypto";
 import { safeInstallPath } from "./launchpad-archives.mjs";
+import { isWaterfallModule } from "./versions.mjs";
 
 const fail = (status, message) => Object.assign(new Error(message), { status });
 const identity = (stat) => `${stat.dev}:${stat.ino}:${stat.birthtimeMs}`;
@@ -89,6 +90,9 @@ export async function runtimeUpdateFiles(result, ctx) {
       !preservedNames.has(key) &&
       !replacements.has(key) &&
       !/^libraries\/.+/i.test(relative) &&
+      !(
+        result.summary?.provider === "waterfall" && isWaterfallModule(relative)
+      ) &&
       !/^[^/]+\.jar$/i.test(relative)
     )
       throw fail(

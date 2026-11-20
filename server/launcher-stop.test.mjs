@@ -104,6 +104,26 @@ test("trusted game stop also handles in-game shutdown, while incomplete log chun
   assert.equal(child.stdin.writableEnded, true);
 });
 
+test("Waterfall writes end and recognizes its own shutdown log through console prompts", () => {
+  const writes = [];
+  const child = {
+    stdin: new Writable({
+      write(chunk, _encoding, callback) {
+        writes.push(chunk.toString());
+        callback();
+      },
+    }),
+  };
+  const stop = createLauncherStop({ child, waterfall: true });
+  stop.observe("[21:59:03 INFO]: <Alex> Closing listener /localhost:25577\n");
+  assert.equal(stop.shutdownStarted, false);
+  stop.requestStop();
+  assert.deepEqual(writes, ["end\n"]);
+  stop.observe("> > [21:59:04 INFO]: Closing listener [id: 0x123]\n");
+  assert.equal(stop.shutdownStarted, true);
+  child.stdin.end();
+});
+
 const json = (method, body) => ({ method, body: JSON.stringify(body) });
 async function eventually(check, label) {
   for (let attempt = 0; attempt < 150; attempt++) {

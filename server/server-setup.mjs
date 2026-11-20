@@ -21,6 +21,15 @@ const emptyServer = async () => ({
   loader: null,
 });
 
+function compatibleBuildJava(java, { requiredJavaVersion, maxJavaVersion }) {
+  return maxJavaVersion
+    ? compatibleJava(java) &&
+        Number.isInteger(java.majorVersion) &&
+        java.majorVersion >= requiredJavaVersion &&
+        java.majorVersion <= maxJavaVersion
+    : compatibleJava(java, requiredJavaVersion);
+}
+
 // Catalog reads have no selected server. Pack reviews use a disposable empty
 // workspace and the same checksum/path/dependency checks as scoped installs.
 export async function createServerSetup({ dataDir, safePath, ...options }) {
@@ -147,7 +156,9 @@ export async function createServerSetup({ dataDir, safePath, ...options }) {
     return [...unique.values()];
   }
   async function javaRequirement(input = {}, { officialOnly = false } = {}) {
-    const required = officialOnly ? undefined : input.requiredJavaVersion;
+    const spigot = input.provider === "spigot";
+    const required =
+      officialOnly || spigot ? undefined : input.requiredJavaVersion;
     if (
       required !== undefined &&
       (!Number.isInteger(required) || required < 8 || required > 100)
@@ -164,6 +175,7 @@ export async function createServerSetup({ dataDir, safePath, ...options }) {
     )
       throw fail(400, "Choose a Minecraft build.");
     let requiredJavaVersion = required ?? null;
+    let maxJavaVersion;
     const warnings = [];
     if (!requiredJavaVersion && input.gameVersion) {
       if (input.provider && input.provider !== "vanilla") {
@@ -174,22 +186,18 @@ export async function createServerSetup({ dataDir, safePath, ...options }) {
           );
           const selected = input.build
             ? catalog.builds.find((build) => build.id === input.build)
-            : null;
+            : catalog.builds.find((build) =>
+                Number.isInteger(build.javaVersion),
+              );
           if (input.build && !selected)
             throw fail(
               400,
               "This Minecraft build is no longer available. Choose it again.",
             );
-          requiredJavaVersion =
-            selected?.javaVersion ??
-            (input.build
-              ? null
-              : catalog.builds.find((build) =>
-                  Number.isInteger(build.javaVersion),
-                )?.javaVersion) ??
-            null;
+          requiredJavaVersion = selected?.javaVersion ?? null;
+          maxJavaVersion = selected?.maxJavaVersion;
         } catch (cause) {
-          if (officialOnly && input.build) throw cause;
+          if (spigot || (officialOnly && input.build)) throw cause;
         }
       }
       if (!requiredJavaVersion)
@@ -211,10 +219,22 @@ export async function createServerSetup({ dataDir, safePath, ...options }) {
           "The official catalog could not confirm this release's Java requirement. Refresh the list when the catalog is available.",
         );
     }
+    if (
+      maxJavaVersion !== undefined &&
+      (!Number.isInteger(maxJavaVersion) ||
+        !requiredJavaVersion ||
+        maxJavaVersion < requiredJavaVersion)
+    )
+      throw fail(502, "The official catalog returned an invalid Java range.");
+    const javaRange =
+      maxJavaVersion && maxJavaVersion !== requiredJavaVersion
+        ? `${requiredJavaVersion}–${maxJavaVersion}`
+        : requiredJavaVersion;
     return {
       requiredJavaVersion,
+      ...(maxJavaVersion !== undefined ? { maxJavaVersion } : {}),
       requirement: requiredJavaVersion
-        ? `Java ${requiredJavaVersion} (64-bit)`
+        ? `Java ${javaRange} (64-bit)`
         : input.gameVersion
           ? "Java requirement unavailable"
           : "Choose a Minecraft version to filter installed Java",
@@ -253,9 +273,7 @@ export async function createServerSetup({ dataDir, safePath, ...options }) {
     const installations = (
       input.gameVersion && !requirement.requiredJavaVersion
         ? []
-        : validated.filter((java) =>
-            compatibleJava(java, requirement.requiredJavaVersion),
-          )
+        : validated.filter((java) => compatibleBuildJava(java, requirement))
     ).map(({ path, version, majorVersion, vendor, architecture }) => ({
       path,
       version,
@@ -287,15 +305,13 @@ export async function createServerSetup({ dataDir, safePath, ...options }) {
       memoryLimitMB > 262144
     )
       throw fail(400, "Memory must be an integer between 256 and 262144 MB.");
-    const { requiredJavaVersion, requirement, warnings } =
-      await javaRequirement(input);
+    const criteria = await javaRequirement(input);
+    const { requiredJavaVersion, requirement, warnings } = criteria;
     let java;
     if (input.javaPath !== undefined) java = await javaProbe(input.javaPath);
     else {
       const detected = await allJava();
-      java = detected.find((entry) =>
-        compatibleJava(entry, requiredJavaVersion),
-      ) ?? {
+      java = detected.find((entry) => compatibleBuildJava(entry, criteria)) ?? {
         path: null,
         available: false,
         version: null,
@@ -308,10 +324,10 @@ export async function createServerSetup({ dataDir, safePath, ...options }) {
     if (
       requiredJavaVersion &&
       java.available &&
-      !compatibleJava(java, requiredJavaVersion)
+      !compatibleBuildJava(java, criteria)
     )
       warnings.push(
-        `This release requires Java ${requiredJavaVersion} (64-bit); the selected executable is Java ${java.majorVersion}${java.architecture ? ` (${java.architecture})` : ""}. Choose a compatible runtime from the list.`,
+        `This release requires ${requirement}. The selected executable is Java ${java.majorVersion}${java.architecture ? ` (${java.architecture})` : ""}. Choose a compatible runtime from the list.`,
       );
     if (memoryLimitMB >= memory.hostMemoryMB)
       warnings.push(
@@ -326,17 +342,15 @@ export async function createServerSetup({ dataDir, safePath, ...options }) {
         "The selected allocation is above currently available RAM. Close other applications or lower the allocation before starting.",
       );
     const compatible =
-      compatibleJava(java, requiredJavaVersion) &&
+      compatibleBuildJava(java, criteria) &&
       (!input.gameVersion || !!requiredJavaVersion);
     return {
       ...memory,
       installationDirectory: installation?.directory ?? null,
       supportDirectory: installation?.supportRoot ?? null,
       java,
-      requiredJavaVersion,
-      requirement,
+      ...criteria,
       memoryLimitMB,
-      warnings,
       compatible,
       ready: compatible && memoryLimitMB < memory.hostMemoryMB,
     };

@@ -1198,10 +1198,73 @@ test("Versions updates an imported NeoForge runtime without a clean install and 
   }
 });
 
+test("Versions offers the added installers and reviews Spigot with its BuildTools requirements", async ({
+  page,
+}) => {
+  await page.route("**/api/versions/spigot", (route) =>
+    route.fulfill({
+      json: { versions: [{ id: "1.21.1", label: "1.21.1", stable: true }] },
+    }),
+  );
+  await page.route("**/api/versions/spigot/1.21.1", (route) =>
+    route.fulfill({
+      json: {
+        builds: [
+          {
+            id: "4344",
+            label: "Build 4344",
+            stable: true,
+            javaVersion: 21,
+            maxJavaVersion: 23,
+          },
+        ],
+      },
+    }),
+  );
+  await page.goto("/#versions");
+  for (const name of [
+    "Leaves",
+    "Sponge",
+    "Arclight",
+    "Mohist",
+    "Magma",
+    "Waterfall",
+    "Spigot",
+    "Pufferfish",
+    "Canvas",
+  ]) {
+    const card = page.locator(".version-provider").filter({
+      has: page.getByRole("heading", { name, exact: true }),
+    });
+    await expect(
+      card.getByRole("button", { name: "Choose version" }),
+    ).toBeVisible();
+  }
+  await page
+    .locator(".version-provider-spigot")
+    .getByRole("button", {
+      name: "Choose version",
+    })
+    .click();
+  await page.getByRole("button", { name: "1.21.1", exact: true }).click();
+  await expect(page.getByText(/Java 21–23/)).toBeVisible();
+  await page.getByRole("button", { name: "Install", exact: true }).click();
+  const dialog = page.getByRole("dialog");
+  await expect(
+    dialog.getByText(/BuildTools compiles Spigot locally/),
+  ).toBeVisible();
+  await expect(
+    dialog.getByRole("button", { name: "Install version" }),
+  ).toBeDisabled();
+});
+
 test("Versions shows official builds and requires a reviewed choice before installation", async ({
   page,
   serverId,
 }, testInfo) => {
+  const currentUrl = "https://neoforged.net/builds/21.1.200";
+  const releaseUrl = "https://neoforged.net/releases/1.21.1";
+  const buildUrl = "https://neoforged.net/builds/21.1.250";
   const installations: unknown[] = [];
   await page.route("**/api/versions/install", (route) => {
     expect(route.request().headers()["x-server-id"]).toBe(serverId);
@@ -1238,27 +1301,61 @@ test("Versions shows official builds and requires a reviewed choice before insta
             website: "https://neoforged.net",
           },
         ],
+        current: { software: "NeoForge", version: "21.1.200", url: currentUrl },
         job: null,
       },
     }),
   );
   await page.route("**/api/versions/neoforge", (route) =>
     route.fulfill({
-      json: { versions: [{ id: "1.21.1", label: "1.21.1", stable: true }] },
+      json: {
+        versions: [
+          { id: "1.21.1", label: "1.21.1", stable: true, url: releaseUrl },
+        ],
+      },
     }),
   );
   await page.route("**/api/versions/neoforge/1.21.1", (route) =>
     route.fulfill({
       json: {
         builds: [
-          { id: "21.1.250", label: "21.1.250", stable: true, javaVersion: 21 },
+          {
+            id: "21.1.250",
+            label: "21.1.250",
+            stable: true,
+            javaVersion: 21,
+            url: buildUrl,
+          },
         ],
       },
     }),
   );
   await page.goto("/#versions");
+  await expect(
+    page.getByRole("link", {
+      name: "Open official page for NeoForge 21.1.200",
+    }),
+  ).toHaveAttribute("href", currentUrl);
   await page.getByRole("button", { name: "Choose version" }).click();
+  await expect(
+    page.getByRole("link", { name: "Open official page for NeoForge 1.21.1" }),
+  ).toHaveAttribute("href", releaseUrl);
   await page.getByRole("button", { name: "1.21.1", exact: true }).click();
+  await page
+    .context()
+    .route(buildUrl, (route) =>
+      route.fulfill({ body: "Official build details" }),
+    );
+  const buildLink = page.getByRole("link", {
+    name: "Open official page for NeoForge 21.1.250",
+  });
+  const [officialPage] = await Promise.all([
+    page.waitForEvent("popup"),
+    buildLink.click(),
+  ]);
+  await expect(officialPage).toHaveURL(buildUrl);
+  await officialPage.close();
+  await expect(page.getByRole("dialog")).not.toBeVisible();
   await expect(page.locator(".versions-build-icon img")).toHaveAttribute(
     "src",
     "/software-icons/neoforge.svg",
@@ -1271,7 +1368,11 @@ test("Versions shows official builds and requires a reviewed choice before insta
   await page.getByRole("button", { name: "Install", exact: true }).click();
   const dialog = page.getByRole("dialog");
   await expect(dialog).toBeVisible();
-  await expect(dialog).toContainText("21.1.250");
+  await expect(
+    dialog.getByRole("link", {
+      name: "Open official page for NeoForge 21.1.250",
+    }),
+  ).toHaveAttribute("href", buildUrl);
   await expect(dialog.getByRole("button", { name: /Install/ })).toBeDisabled();
   await expect(dialog).toContainText(/worlds|world/i);
   await expect(dialog).toContainText(
@@ -2746,6 +2847,10 @@ test("Launchpad preserves known updates and exposes successful-response provider
     name: "Companion Mod",
     exact: true,
   });
+  const companionVersions = companion.getByRole("button", {
+    name: "Choose version for Companion Mod",
+    exact: true,
+  });
   const update = page.getByRole("button", {
     name: "Update Better Mod",
     exact: true,
@@ -2756,9 +2861,7 @@ test("Launchpad preserves known updates and exposes successful-response provider
   });
   await expect(update).toBeEnabled();
   await expect(better).toContainText("Available: 2.0");
-  await expect(
-    companion.getByText("Up to date", { exact: true }),
-  ).toBeVisible();
+  await expect(companionVersions).toBeEnabled();
   await page
     .getByRole("button", {
       name: "Refresh Launchpad and check updates",
@@ -2780,9 +2883,6 @@ test("Launchpad preserves known updates and exposes successful-response provider
   await expect(
     companion.getByText("Update check unavailable", { exact: true }),
   ).toBeVisible();
-  await expect(companion.getByText("Up to date", { exact: true })).toHaveCount(
-    0,
-  );
   await page.getByRole("link", { name: "Console", exact: true }).click();
   await expect(
     page.getByRole("heading", { name: "Console", exact: true }),
@@ -2801,9 +2901,6 @@ test("Launchpad preserves known updates and exposes successful-response provider
   await expect(
     companion.getByText("Checking updates…", { exact: true }),
   ).toBeVisible();
-  await expect(companion.getByText("Up to date", { exact: true })).toHaveCount(
-    0,
-  );
   await expect(
     page.getByRole("status", {
       name: "Installed content refresh",
@@ -2828,9 +2925,6 @@ test("Launchpad preserves known updates and exposes successful-response provider
   await expect(
     companion.getByText("Update check unavailable", { exact: true }),
   ).toBeVisible();
-  await expect(companion.getByText("Up to date", { exact: true })).toHaveCount(
-    0,
-  );
   await expect(page.locator(".launchpad-project-body > p")).toHaveText([
     "mods/better-1.jar",
     "mods/companion.jar",
@@ -2842,9 +2936,7 @@ test("Launchpad preserves known updates and exposes successful-response provider
   await expect(update).toBeEnabled();
   await expect(better).toContainText("Available: 2.0");
   await expect(companion).toContainText("mods/companion.jar");
-  await expect(
-    companion.getByText("Up to date", { exact: true }),
-  ).toBeVisible();
+  await expect(companionVersions).toBeEnabled();
   await expect(
     page.getByText("Update check unavailable", { exact: true }),
   ).toHaveCount(0);
@@ -2858,9 +2950,6 @@ test("Launchpad preserves known updates and exposes successful-response provider
   );
   await expect(page.getByLabel("Loader", { exact: true })).toBeDisabled();
   await expect(update).toBeEnabled();
-  await expect(
-    companion.getByText("Up to date", { exact: true }),
-  ).toBeVisible();
   await page.getByRole("link", { name: "Console", exact: true }).click();
   await expect(
     page.getByRole("heading", { name: "Console", exact: true }),
@@ -2879,9 +2968,7 @@ test("Launchpad preserves known updates and exposes successful-response provider
   await expect(update).toBeEnabled();
   await expect(better).toContainText("Available: 2.0");
   await expect(companion).toContainText("mods/companion.jar");
-  await expect(
-    companion.getByText("Up to date", { exact: true }),
-  ).toBeVisible();
+  await expect(companionVersions).toBeEnabled();
   await expect(
     page.getByText("Update check unavailable", { exact: true }),
   ).toHaveCount(0);
@@ -3064,7 +3151,10 @@ for (const browse of [
       name: "Companion Mod",
       exact: true,
     });
-    await expect(jei.getByText("Up to date", { exact: true })).toBeVisible();
+    const companionVersions = companion.getByRole("button", {
+      name: "Choose version for Companion Mod",
+      exact: true,
+    });
     await page
       .getByRole("button", { name: "Choose version for JEI", exact: true })
       .click();
@@ -3096,12 +3186,7 @@ for (const browse of [
     await expect(jei).toContainText("mods/jei-older.jar");
     await expect(jei).toContainText("Available: 19.56.0.439");
     await expect(update).toBeEnabled();
-    await expect(
-      companion.getByText("Up to date", { exact: true }),
-    ).toBeVisible();
-    await expect(
-      companion.getByText("Update available", { exact: true }),
-    ).toHaveCount(0);
+    await expect(companionVersions).toBeEnabled();
     const forcedChecks = () =>
       installedRequests.filter(
         (url) => url.searchParams.get("refresh") === "true",
@@ -3116,9 +3201,7 @@ for (const browse of [
     await expect.poll(forcedChecks).toBe(beforeRefresh + 1);
     await expect(update).toBeEnabled();
     await expect(jei).toContainText("Installed: 19.54.0.429");
-    await expect(
-      companion.getByText("Up to date", { exact: true }),
-    ).toBeVisible();
+    await expect(companionVersions).toBeEnabled();
     expect(installedRequests.at(-1)!.searchParams.get("refresh")).toBe("true");
     for (const url of installedRequests)
       expect(Object.fromEntries(url.searchParams)).toMatchObject({

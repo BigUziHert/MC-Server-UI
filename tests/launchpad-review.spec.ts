@@ -1539,7 +1539,9 @@ test("a 120-second background check deadline preserves completed rows and fails 
     name: "Current Mod",
     exact: true,
   });
-  await expect(current.getByText("Up to date", { exact: true })).toBeVisible();
+  await expect(
+    current.getByRole("button", { name: "Choose version for Current Mod" }),
+  ).toBeEnabled();
   await expect(current.getByText("Update check unavailable")).toHaveCount(0);
   const verified = page.getByRole("article", {
     name: "Verified Update",
@@ -1565,9 +1567,6 @@ test("a 120-second background check deadline preserves completed rows and fails 
       { exact: true },
     ),
   ).toBeVisible();
-  await expect(unlisted.getByText("Up to date", { exact: true })).toHaveCount(
-    0,
-  );
   await expect(unlisted.getByText("Update check unavailable")).toHaveCount(0);
   await expect(
     page
@@ -1614,7 +1613,9 @@ test("a failed initial online refresh does not reuse an old checked status but k
     name: "Current Mod",
     exact: true,
   });
-  await expect(current.getByText("Up to date", { exact: true })).toBeVisible();
+  await expect(
+    current.getByRole("button", { name: "Choose version for Current Mod" }),
+  ).toBeEnabled();
   await expect.poll(() => onlineReads).toBe(1);
   const refresh = page.getByRole("button", {
     name: "Refresh Launchpad and check updates",
@@ -1623,7 +1624,6 @@ test("a failed initial online refresh does not reuse an old checked status but k
   await expect(refresh).toBeEnabled();
   await refresh.click();
   await expect(current.getByText("Update check unavailable")).toBeVisible();
-  await expect(current.getByText("Up to date", { exact: true })).toHaveCount(0);
   await expect(
     current.getByText("Fixture provider gateway offline.", { exact: true }),
   ).toBeVisible();
@@ -1739,15 +1739,17 @@ test("project names link to project pages in the list and installation dialog", 
   );
   await page.goto("/#launchpad");
   await page.getByRole("switch", { name: "Show installed content" }).check();
-  await expect(
-    page.getByRole("link", { name: "Open Alpha project page" }),
-  ).toHaveAttribute("href", "https://modrinth.com/project/Alpha");
-  await expect(
-    page.getByRole("link", { name: "Open Alpha project page" }),
-  ).toHaveText("Alpha");
-  await expect(
-    page.getByRole("link", { name: "Open Alpha project page" }),
-  ).toHaveCSS("text-decoration-line", "underline");
+  const alphaLink = page.getByRole("link", { name: "Open Alpha project page" });
+  await expect(alphaLink).toHaveAttribute(
+    "href",
+    "https://modrinth.com/project/Alpha",
+  );
+  await expect(alphaLink).toHaveText("Alpha");
+  await expect(alphaLink).toHaveCSS("text-decoration-line", "underline");
+  await expect(alphaLink).toHaveCSS(
+    "text-decoration-color",
+    await alphaLink.evaluate((link) => getComputedStyle(link).color),
+  );
   await expect(
     page.getByRole("heading", { name: "Alpha", exact: true }),
   ).toBeVisible();
@@ -1903,7 +1905,9 @@ test("installed project links and update-all review span platforms and retry the
     refreshButtons.and(page.locator(':enabled[aria-busy="false"]')),
   ).toHaveCount(2);
   await expect(checkingStatus).toHaveCount(0);
-  await expect(page.getByText("Up to date", { exact: true })).toHaveCount(2);
+  await expect(
+    page.getByRole("button", { name: /^Choose version for (Alpha|Beta)$/ }),
+  ).toHaveCount(2);
   expect(installs).toEqual([retryInput, retryInput]);
 });
 
@@ -1949,8 +1953,14 @@ test("verified alternate listings supply installed versions and update reviews",
   await page.getByRole("switch", { name: "Show installed content" }).check();
   const row = page.getByRole("article", { name: "Alpha" });
   await expect(row.getByText("modrinth", { exact: true })).toBeVisible();
-  await expect(row.getByText("Update available on curseforge")).toBeVisible();
-  await expect(page.getByText("Up to date on curseforge")).toBeVisible();
+  const updateButton = row.getByRole("button", { name: "Update Alpha" });
+  await expect(updateButton).toHaveClass(/\bprimary\b/);
+  await expect(updateButton).toHaveAccessibleDescription(
+    "Versions from curseforge",
+  );
+  await expect(
+    page.getByText(/^(?:Update available|Up to date)(?: on .+)?$/),
+  ).toHaveCount(0);
 
   async function openVersions(button: string, projectId: string) {
     const [request] = await Promise.all([

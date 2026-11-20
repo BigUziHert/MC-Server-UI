@@ -47,6 +47,11 @@ files:
   - server/properties.mjs
   - server/text-encoding.mjs
   - server/versions.mjs
+  - server/versions-canvas.mjs
+  - server/versions-forks.mjs
+  - server/versions-hybrid.mjs
+  - server/versions-pufferfish.mjs
+  - server/versions-spigot.mjs
   - server/launchpad.mjs
   - server/launchpad-target.mjs
   - server/launchpad-automodpack-sources.mjs

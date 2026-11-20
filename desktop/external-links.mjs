@@ -28,6 +28,86 @@ const websites = new Set([
   "magmafoundation.org",
 ]);
 
+const releaseId = "[a-z0-9](?:[a-z0-9._+-]|%2B){0,100}";
+const versionNotePaths = new Map([
+  [
+    "maven.neoforged.net",
+    new RegExp(
+      String.raw`^/releases/net/neoforged/neoforge/(${releaseId})/(?:neoforge-\1-changelog\.txt)?$`,
+      "i",
+    ),
+  ],
+  [
+    "maven.minecraftforge.net",
+    new RegExp(
+      String.raw`^/net/minecraftforge/forge/(${releaseId})/forge-\1-changelog\.txt$`,
+      "i",
+    ),
+  ],
+  [
+    "maven.fabricmc.net",
+    new RegExp(`^/net/fabricmc/fabric-loader/${releaseId}/$`, "i"),
+  ],
+  [
+    "maven.quiltmc.org",
+    new RegExp(
+      `^/repository/release/org/quiltmc/quilt-loader/${releaseId}/$`,
+      "i",
+    ),
+  ],
+  [
+    "github.com",
+    new RegExp(`^/FabricMC/fabric-loader/releases(?:/tag/${releaseId})?$`, "i"),
+  ],
+  [
+    "launchercontent.mojang.com",
+    new RegExp(String.raw`^/v2/javaPatchNotes/${releaseId}\.json$`, "i"),
+  ],
+  ["feedback.minecraft.net", /^\/hc\/en-us\/articles\/\d+(?:-[a-z0-9_-]+)?$/i],
+  [
+    "api.leavesmc.org",
+    new RegExp(
+      String.raw`^/v2/projects/leaves/versions/${releaseId}/builds(?:/\d+)?$`,
+      "i",
+    ),
+  ],
+  [
+    "repo.magmafoundation.org",
+    new RegExp(
+      String.raw`^/releases/org/magmafoundation/magma/(${releaseId})/magma-\1-changelog\.txt$`,
+      "i",
+    ),
+  ],
+  ["hub.spigotmc.org", /^\/versions\/(?:\d[a-z0-9.-]{0,29}\.json)?$/i],
+  [
+    "ci.pufferfish.host",
+    /^\/job\/Pufferfish-1\.(?:17|18|19|20|21)\/\d+\/(?:changes\/?)?$/,
+  ],
+  ["jenkins.canvasmc.io", /^\/job\/Canvas\/\d+\/(?:changes\/?)?$/],
+]);
+const fillVersionPath = new RegExp(
+  `^/projects/(?:paper|folia|velocity|waterfall)/version/${releaseId}$`,
+  "i",
+);
+const mojangVersionPath =
+  /^\/v1\/packages\/[a-f0-9]{40}\/[a-z0-9](?:[a-z0-9._+-]|%20|%2B){0,100}\.json$/i;
+
+function isVersionNotesPage(url) {
+  if (url.hash) return false;
+  if (url.hostname === "fill-ui.papermc.io")
+    return (
+      fillVersionPath.test(url.pathname) &&
+      (!url.search || /^\?build=\d+$/.test(url.search))
+    );
+  if (url.search) return false;
+  if (
+    url.hostname === "piston-meta.mojang.com" ||
+    url.hostname === "launchermeta.mojang.com"
+  )
+    return mojangVersionPath.test(url.pathname);
+  return versionNotePaths.get(url.hostname)?.test(url.pathname) === true;
+}
+
 export function externalWebsite(value, { publicPanelUrl } = {}) {
   try {
     if (typeof value !== "string") return null;
@@ -46,6 +126,7 @@ export function externalWebsite(value, { publicPanelUrl } = {}) {
     }
     if (url.port) return null;
     if (websites.has(url.hostname)) return url.href;
+    if (isVersionNotesPage(url)) return url.href;
     if (
       url.hostname === "aka.ms" &&
       url.pathname === "/MinecraftEULA" &&

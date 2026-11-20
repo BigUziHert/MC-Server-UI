@@ -702,10 +702,6 @@ test("AutoModpack shows unlisted releases as neutral results and keeps real fail
       row.locator(".launchpad-badge", { hasText: "No release listed" }),
     ).toBeVisible();
     await expect(row.getByText(note, { exact: true })).toBeVisible();
-    await expect(row.getByText("Up to date", { exact: true })).toHaveCount(0);
-    await expect(
-      row.getByText("Update available", { exact: true }),
-    ).toHaveCount(0);
     await expect(
       row.getByRole("button", { name: `Update ${release.title}`, exact: true }),
     ).toHaveCount(0);
@@ -769,8 +765,10 @@ test("AutoModpack shows unlisted releases as neutral results and keeps real fail
   await expect(
     page
       .getByRole("article", { name: "GroovyModLoader (GML)", exact: true })
-      .getByText("Up to date", { exact: true }),
-  ).toBeVisible();
+      .getByRole("button", {
+        name: "Choose version for GroovyModLoader (GML)",
+      }),
+  ).toBeEnabled();
   await expect(
     page.getByText("No release listed", { exact: true }),
   ).toHaveCount(0);

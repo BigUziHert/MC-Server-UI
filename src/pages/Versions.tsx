@@ -19,6 +19,7 @@ import SearchField, { useDebouncedValue } from "../SearchField";
 import RefreshButton from "../RefreshButton";
 import StatePanel from "../StatePanel";
 import Switch from "../Switch";
+import { safeProjectUrl } from "../../shared/launchpad-project.mjs";
 import "./management.css";
 import "./versions.css";
 
@@ -31,15 +32,17 @@ type Provider = {
   kind: "server" | "proxy";
   badge?: string;
 };
-type Release = { id: string; label: string; stable: boolean };
+type Release = { id: string; label: string; stable: boolean; url?: string };
 type Build = Release & {
   publishedAt?: string;
   javaVersion?: number;
+  maxJavaVersion?: number;
   recommended?: boolean;
 };
 type Current = {
   software: string;
   version: string;
+  url?: string;
   status: string;
   mode: "live";
 };
@@ -57,11 +60,48 @@ type Catalog = {
   job?: Job | null;
 };
 
+function VersionLink({
+  label,
+  software,
+  url,
+  iconOnly,
+}: {
+  label: string;
+  software?: string;
+  url?: string;
+  iconOnly?: boolean;
+}) {
+  const href = safeProjectUrl(url);
+  if (!href) return iconOnly ? null : label;
+  const description = `Open official page for ${software ? `${software} ` : ""}${label}`;
+  return (
+    <a
+      className={iconOnly ? "versions-release-link" : "versions-version-link"}
+      href={href}
+      target="_blank"
+      rel="noopener noreferrer"
+      aria-label={description}
+      title={iconOnly ? description : undefined}
+    >
+      {!iconOnly && label}
+      <ArrowUpRight size={iconOnly ? 16 : 13} aria-hidden="true" />
+    </a>
+  );
+}
+
 function installedRuntimeBuild(runtime?: RuntimeUpdate | null) {
   const build =
     runtime?.build ??
     (runtime?.provider === "vanilla" ? runtime.gameVersion : null);
   return build && /^\d[\w.+-]*$/.test(build) ? build : null;
+}
+
+function buildJava(build: Build) {
+  if (!build.javaVersion) return "";
+  if (!build.maxJavaVersion) return `Java ${build.javaVersion}+`;
+  return build.maxJavaVersion === build.javaVersion
+    ? `Java ${build.javaVersion}`
+    : `Java ${build.javaVersion}–${build.maxJavaVersion}`;
 }
 
 function newerStableBuild(candidate: Build, installed: string) {
@@ -176,6 +216,10 @@ export default function Versions({
   const currentProvider = providers.find(
     (provider) => provider.id === runtimeUpdate?.provider,
   );
+  const proxy =
+    selected?.kind === "proxy"
+      ? selected.name
+      : ["Velocity", "Waterfall"].find((name) => name === current?.software);
   const quickUpdateReason = !allowChanges
     ? "You do not have permission to update server software."
     : jobBusy || submitting
@@ -572,7 +616,14 @@ export default function Versions({
           <div>
             <p className="eyebrow">CURRENT SOFTWARE</p>
             <strong>
-              {current.software} <span>{current.version}</span>
+              {current.software}{" "}
+              <span>
+                <VersionLink
+                  label={current.version}
+                  software={current.software}
+                  url={current.url}
+                />
+              </span>
             </strong>
           </div>
           <span className={`status-badge ${current.status}`}>
@@ -666,16 +717,15 @@ export default function Versions({
             )}
         </section>
       )}
-      {(selected?.kind === "proxy" || current?.software === "Velocity") && (
+      {proxy && (
         <div className="management-notice">
           <Info size={18} />
           <div>
             <strong>Proxy setup</strong>
             <p>
-              Velocity connects players to your game servers. Before starting,
-              configure its bind address, port, and backend servers in
-              velocity.toml using File Manager. The panel’s Minecraft port
-              setting does not configure Velocity’s listener.
+              {proxy === "Waterfall"
+                ? "Waterfall is a discontinued proxy. After its first start, configure its listener and backend servers in config.yml using File Manager."
+                : "Velocity connects players to your game servers. Configure its bind address, port, and backend servers in velocity.toml using File Manager."}
             </p>
           </div>
         </div>
@@ -818,16 +868,23 @@ export default function Versions({
                   <StatePanel variant="loading" title="Loading releases…" />
                 ) : shownReleases.length ? (
                   shownReleases.map((release) => (
-                    <button
-                      key={release.id}
-                      className={version === release.id ? "active" : ""}
-                      onClick={() => void chooseVersion(release.id)}
-                      disabled={checkingUpdate}
-                    >
-                      <span>{release.label}</span>
-                      {!release.stable && <small>Experimental</small>}
-                      <ChevronRight size={14} />
-                    </button>
+                    <div className="versions-release" key={release.id}>
+                      <button
+                        className={version === release.id ? "active" : ""}
+                        onClick={() => void chooseVersion(release.id)}
+                        disabled={checkingUpdate}
+                      >
+                        <span>{release.label}</span>
+                        {!release.stable && <small>Experimental</small>}
+                        <ChevronRight size={14} />
+                      </button>
+                      <VersionLink
+                        label={release.label}
+                        software={selected.name}
+                        url={release.url}
+                        iconOnly
+                      />
+                    </div>
                   ))
                 ) : (
                   <StatePanel
@@ -900,7 +957,11 @@ export default function Versions({
                       </div>
                       <div className="versions-build-info">
                         <strong>
-                          {build.label}{" "}
+                          <VersionLink
+                            label={build.label}
+                            software={selected.name}
+                            url={build.url}
+                          />
                           {(build.recommended || index === 0) && (
                             <span className="tag">
                               {build.recommended
@@ -919,11 +980,11 @@ export default function Versions({
                                   day: "numeric",
                                 },
                               )
-                            : `Minecraft ${version}`}
-                          {build.javaVersion
-                            ? ` · Java ${build.javaVersion}+`
-                            : ""}{" "}
-                          · {build.stable ? "Stable" : "Experimental"}
+                            : selected.kind === "proxy"
+                              ? `Proxy release ${version}`
+                              : `Minecraft ${version}`}
+                          {build.javaVersion && ` · ${buildJava(build)}`} ·{" "}
+                          {build.stable ? "Stable" : "Experimental"}
                         </span>
                       </div>
                       <button
@@ -1003,10 +1064,25 @@ export default function Versions({
           </button>
         </div>
         <p className="management-dialog-description">
-          {updating ? "Update" : "Install"} {selected?.name} {confirming?.label}{" "}
-          for Minecraft {version}. The server will remain stopped when
-          installation finishes.
+          {updating ? "Update" : "Install"} {selected?.name}{" "}
+          {confirming && (
+            <VersionLink
+              label={confirming.label}
+              software={selected?.name}
+              url={confirming.url}
+            />
+          )}{" "}
+          for {selected?.kind === "proxy" ? "proxy release" : "Minecraft"}{" "}
+          {version}. The server will remain stopped when installation finishes.
         </p>
+        {selected?.id === "spigot" && (
+          <p>
+            BuildTools compiles Spigot locally using Git and the panel’s
+            configured JDK
+            {confirming?.javaVersion ? ` (${buildJava(confirming)})` : ""}. The
+            build can take several minutes.
+          </p>
+        )}
         {updateReason && (
           <p className="management-dialog-description">{updateReason}</p>
         )}

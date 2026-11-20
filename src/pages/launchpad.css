@@ -397,8 +397,10 @@
 .launchpad-installed-author a {
   color: inherit;
   text-decoration: underline;
-  text-decoration-color: var(--border);
   text-underline-offset: 3px;
+}
+.launchpad-installed-author a {
+  text-decoration-color: var(--border);
 }
 .launchpad-project-link:hover,
 .launchpad-project-link:focus-visible,

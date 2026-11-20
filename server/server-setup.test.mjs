@@ -1316,6 +1316,56 @@ test("Java selection exposes only compatible installed runtimes and refreshes wi
   assert.equal((await f.request("/api/servers")).body.servers.length, 0);
 });
 
+test("Spigot Java selection and preflight respect the selected official build's range", async (t) => {
+  const detected = [26, 25, 23, 21, 17].map((majorVersion) => ({
+    ...java,
+    majorVersion,
+    path: `java-${majorVersion}`,
+    architecture: "amd64",
+  }));
+  const f = await fixture(t, {
+    javaDiscovery: async () => detected,
+    javaProbe: async (executable) =>
+      detected.find(({ path }) => path === executable),
+    versionsService: {
+      ...versionService(),
+      builds: async () => ({
+        builds: [
+          { id: "another-build", javaVersion: 17, maxJavaVersion: 20 },
+          { id: "57", javaVersion: 21, maxJavaVersion: 25 },
+        ],
+      }),
+    },
+  });
+  const selection = { provider: "spigot", gameVersion: "1.21.1", build: "57" };
+  const listed = await f.request(
+    `/api/server-setup/java?${new URLSearchParams(selection)}&requiredJavaVersion=26`,
+  );
+  assert.equal(listed.status, 200);
+  assert.equal(listed.body.requirement, "Java 21–25 (64-bit)");
+  assert.equal(listed.body.maxJavaVersion, 25);
+  assert.deepEqual(
+    listed.body.installations.map((item) => item.majorVersion),
+    [25, 23, 21],
+  );
+  assert.equal(listed.body.recommendedPath, "java-25");
+
+  for (const [javaPath, compatible] of [
+    ["java-26", false],
+    ["java-23", true],
+  ]) {
+    const reviewed = await f.request(
+      "/api/server-setup/preflight",
+      json("POST", { ...selection, javaPath, requiredJavaVersion: 26 }),
+    );
+    assert.equal(reviewed.status, 200);
+    assert.equal(reviewed.body.ready, compatible);
+    assert.equal(reviewed.body.compatible, compatible);
+    if (!compatible)
+      assert.match(reviewed.body.warnings.join(" "), /requires Java 21–25/);
+  }
+});
+
 test(
   "Java install uses the selected build's official requirement and managed discovery survives restart",
   { skip: process.platform !== "win32" },

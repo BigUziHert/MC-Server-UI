@@ -708,6 +708,7 @@ export default function NewServerWizard({
         ready?: boolean;
         warnings?: string[];
         requiredJavaVersion?: number;
+        requirement?: string;
         installationDirectory?: string;
         supportDirectory?: string;
       }>("/server-setup/preflight", {
@@ -718,14 +719,20 @@ export default function NewServerWizard({
         javaPath: selectedJava.path,
         provider: kind === "software" ? provider?.id : packLoader,
         gameVersion,
+        build: kind === "software" ? buildId : undefined,
         requiredJavaVersion:
           kind === "software" ? build?.javaVersion : undefined,
       });
       if (!check.java.available || check.compatible === false) {
         setJavaRefresh((value) => value + 1);
+        const requirement =
+          check.requirement ||
+          (check.requiredJavaVersion
+            ? `Java ${check.requiredJavaVersion}`
+            : "A compatible Java runtime");
         throw new Error(
           check.java.error ||
-            `Java ${check.requiredJavaVersion || "for this Minecraft version"} is needed. Refresh Java and choose a compatible installation.`,
+            `${requirement} is needed. Refresh Java and choose a compatible installation.`,
         );
       }
       if (check.ready === false)

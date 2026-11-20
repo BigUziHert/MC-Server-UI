@@ -18,6 +18,15 @@ export function isMinecraftShutdownLine(text, { allowSaving = false } = {}) {
   );
 }
 
+export function waterfallProxyMessage(text) {
+  const clean = text.replace(/\x1b\[[0-9;]*m/g, "").trim();
+  return (
+    clean.match(/^(?:> *)*\d{2}:\d{2}:\d{2} \[INFO\] +(.+)$/)?.[1] ??
+    clean.match(/^(?:> *)*\[\d{2}:\d{2}:\d{2} INFO\]: +(.+)$/)?.[1] ??
+    ""
+  );
+}
+
 /** Tracks one owned child. Once Minecraft confirms shutdown, a Windows batch
  * launcher needs no more commands. End its input while the server finishes its
  * save, so even localized or hidden PAUSE commands receive EOF and complete.
@@ -27,6 +36,7 @@ export function isMinecraftShutdownLine(text, { allowSaving = false } = {}) {
 export function createLauncherStop({
   child,
   windowsBatch = false,
+  waterfall = false,
   onShutdownStarted = () => {},
   onInputClosed = () => {},
 }) {
@@ -62,7 +72,9 @@ export function createLauncherStop({
           .split(/\r?\n/)
           .slice(0, -1)
           .some((line) =>
-            isMinecraftShutdownLine(line, { allowSaving: requested }),
+            waterfall
+              ? /^Closing listener (?:\[|\/)/.test(waterfallProxyMessage(line))
+              : isMinecraftShutdownLine(line, { allowSaving: requested }),
           )
       ) {
         requested = true;
@@ -86,7 +98,7 @@ export function createLauncherStop({
       requested = true;
       if (paused) acknowledge();
       else if (child.stdin.writable && !child.stdin.writableEnded)
-        child.stdin.write("stop\n");
+        child.stdin.write(waterfall ? "end\n" : "stop\n");
     },
   };
 }

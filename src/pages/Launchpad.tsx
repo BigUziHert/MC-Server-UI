@@ -522,8 +522,6 @@ function updateCheckLabel(
   if (entry.updateCheck === "unavailable") return "Update check unavailable";
   if (entry.updateCheck === "pending")
     return refreshing ? "Checking updates…" : "Update check unavailable";
-  if (entry.updateCheck === "checked" && !entry.update)
-    return updatePlatform ? `Up to date on ${updatePlatform}` : "Up to date";
   return null;
 }
 const modLoaders = ["fabric", "forge", "neoforge", "quilt"];
@@ -3382,13 +3380,6 @@ export default function Launchpad({
                             Installed in {otherModLabel}
                           </span>
                         )}
-                        {entry?.update && (
-                          <span className="launchpad-badge update">
-                            {entry.updateSource
-                              ? `Update available on ${platformName(entry.updateSource.platform)}`
-                              : "Update available"}
-                          </span>
-                        )}
                         {entry?.active === false && hasActive && (
                           <span className="launchpad-badge">Disabled</span>
                         )}
@@ -3480,6 +3471,11 @@ export default function Launchpad({
                           <button
                             className={`btn ${entry && !entry.update ? "" : "primary"}`}
                             aria-label={`${entry?.update ? "Update" : entry ? "Choose version for" : "Install"} ${project.title}`}
+                            aria-description={
+                              entry?.updateSource
+                                ? `Versions from ${platformName(entry.updateSource.platform)}`
+                                : undefined
+                            }
                             disabled={
                               !allowChanges ||
                               working ||
