@@ -1,7 +1,9 @@
 import fs from "node:fs/promises";
 import { launchpadError as error } from "./launchpad-network.mjs";
 import {
+  assertContentChangeStatus,
   autoModpackFolder,
+  contentFileChangeError,
   contentTarget,
   isContentPath,
 } from "./launchpad-target.mjs";
@@ -28,14 +30,10 @@ export function createModActivation(ctx) {
     if (ctx.isRecoveryRequired())
       throw error(409, "Resolve installation recovery before changing mods.");
     operation = Promise.resolve().then(() =>
-      ctx.withMinecraftMutation(async () => {
+      ctx.withContentMutation(async () => {
         ctx.signal.throwIfAborted();
         const current = await ctx.getServer();
-        if (current.status !== "offline")
-          throw error(
-            409,
-            "Stop the server before enabling or disabling mods.",
-          );
+        assertContentChangeStatus(current.status);
         if (
           input.type === "mod" &&
           !["forge", "neoforge", "fabric", "quilt"].includes(current.loader)
@@ -126,7 +124,7 @@ export function createModActivation(ctx) {
               );
             }
           }
-          throw cause;
+          throw contentFileChangeError(cause, current.status);
         }
       }),
     );

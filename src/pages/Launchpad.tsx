@@ -156,6 +156,7 @@ type Job = {
 type Config = {
   platforms: Platform[];
   targets?: string[];
+  liveContentChanges?: boolean;
   gameVersion: string | null;
   loader: string | null;
   status: string;
@@ -890,11 +891,38 @@ export default function Launchpad({
       !pendingPaths.has(item.path),
   );
   const canRecover = allowChanges && status === "offline" && !working;
-  const canInstall =
-    canRecover &&
-    !job?.recoveryRequired &&
-    !unconfirmedPlanId &&
-    targetSupported;
+  const liveContentChanges = config?.liveContentChanges === true;
+  const reviewBlock = !allowChanges
+    ? "Your account does not have permission to change server content."
+    : working
+      ? "Another installation is still running."
+      : job?.recoveryRequired
+        ? "Resolve the interrupted installation before changing server content."
+        : unconfirmedPlanId
+          ? "Wait while the panel checks whether the last installation started."
+          : !targetSupported
+            ? "This panel does not support this content target."
+            : "";
+  const fileChangeBlock =
+    status === "offline" || (status === "running" && liveContentChanges)
+      ? ""
+      : !status
+        ? "Server status is unavailable. Wait for the panel to reconnect."
+        : status === "running"
+          ? "Stop the server in Console before changing files."
+          : "Wait for the server to finish starting or stopping before changing files.";
+  const modpackInstallBlock =
+    status === "running"
+      ? "Stop the server in Console before confirming a modpack installation."
+      : fileChangeBlock;
+  const installBlock =
+    reviewBlock || (type === "modpack" ? modpackInstallBlock : fileChangeBlock);
+  const canInstall = !installBlock;
+  const canReviewRemoval =
+    !reviewBlock && (liveContentChanges || status === "offline");
+  const canRetry =
+    !reviewBlock &&
+    !(job?.retryInput?.cleanInstall ? modpackInstallBlock : fileChangeBlock);
   const canDismissJob =
     permissions === undefined || permissions.includes("file.update");
   const contentName =
@@ -1813,7 +1841,7 @@ export default function Launchpad({
     setBusy(null);
   }
   async function reviewRemoval(entry: InstalledItem) {
-    if (pending.current || !canInstall) return;
+    if (pending.current || !canReviewRemoval) return;
     const currentSession = session.current,
       currentOperation = ++operation.current;
     setRemoval(entry);
@@ -1953,12 +1981,7 @@ export default function Launchpad({
       );
       return;
     }
-    if (!canInstall) {
-      setDialogError(
-        "Stop the server in Console before reviewing file changes.",
-      );
-      return;
-    }
+    if (reviewBlock) return;
     const currentSession = session.current,
       currentOperation = operation.current;
     setCleanAccepted(false);
@@ -2008,7 +2031,7 @@ export default function Launchpad({
     if (!plan || pending.current) return;
     if ((type === "modpack" || plan.cleanInstall) && !cleanAccepted) return;
     if (!canInstall) {
-      setDialogError("Stop the server in Console before installing.");
+      setDialogError(installBlock);
       return;
     }
     const currentSession = session.current,
@@ -2091,7 +2114,7 @@ export default function Launchpad({
     }
   }
   async function reviewAllUpdates() {
-    if (pending.current || !canInstall || type === "modpack") return;
+    if (pending.current || reviewBlock || type === "modpack") return;
     const updates = availableUpdates.slice(0, 50);
     if (!updates.length) return;
     const currentSession = session.current,
@@ -2150,7 +2173,7 @@ export default function Launchpad({
     }
   }
   async function retryDownload() {
-    if (pending.current || !canInstall || !job?.retryable || !job.retryInput)
+    if (pending.current || !canRetry || !job?.retryable || !job.retryInput)
       return;
     const currentSession = session.current,
       currentOperation = ++operation.current;
@@ -2625,7 +2648,7 @@ export default function Launchpad({
                 bottom ? `${updateLabel} from bottom toolbar` : undefined
               }
               disabled={
-                !canInstall ||
+                Boolean(reviewBlock) ||
                 Boolean(busy) ||
                 !updateFiltersReady ||
                 !installed?.items.some((item) => item.update)
@@ -2965,9 +2988,11 @@ export default function Launchpad({
         <div className="launchpad-inline-notice">
           <Info size={17} />
           <div>
-            {status
-              ? "You can browse while the server is running. Stop it in Console before installing or updating files."
-              : "Server status is unavailable. Installation will be available once the panel reconnects."}{" "}
+            {status === "running" && liveContentChanges
+              ? type === "modpack"
+                ? "You can review modpacks while the server is running. Stop the server before confirming an installation."
+                : "You can change content while the server is running. Restart the server to load your changes."
+              : fileChangeBlock}{" "}
             <a href="#console">Open Console</a>
           </div>
         </div>
@@ -3043,7 +3068,7 @@ export default function Launchpad({
               !unconfirmedPlanId && (
                 <button
                   className="btn"
-                  disabled={!canInstall || Boolean(busy)}
+                  disabled={!canRetry || Boolean(busy)}
                   onClick={() => void retryDownload()}
                 >
                   Retry download
@@ -3538,9 +3563,8 @@ export default function Launchpad({
                               pendingPaths.has(entry.path)
                             }
                             title={
-                              status !== "offline"
-                                ? `Stop the server before enabling or disabling ${contentName}s.`
-                                : `${entry.active === false ? "Enable" : "Disable"} ${project.title}`
+                              fileChangeBlock ||
+                              `${entry.active === false ? "Enable" : "Disable"} ${project.title}`
                             }
                             onCheckedChange={(active) =>
                               void setModActive(entry, active)
@@ -3551,13 +3575,9 @@ export default function Launchpad({
                           type="button"
                           className="btn launchpad-remove"
                           aria-label={`Remove ${project.title}`}
-                          title={
-                            status !== "offline"
-                              ? `Stop the server before removing ${contentName}s.`
-                              : `Review ${contentName} removal`
-                          }
+                          title={`Review ${contentName} removal`}
                           disabled={
-                            !canInstall ||
+                            !canReviewRemoval ||
                             Boolean(busy) ||
                             pendingPaths.has(entry.path)
                           }
@@ -3794,12 +3814,15 @@ export default function Launchpad({
                 {type === "modpack" ? (
                   <>
                     <strong>{plan.versionName}</strong> will be installed into a
-                    clean server folder. The server will remain stopped.
+                    clean server folder.
                   </>
                 ) : plan.files.length ? (
                   <>
                     <strong>{plan.versionName}</strong> will make these changes
-                    to this server. The server will remain stopped.
+                    to this server.
+                    {status === "running" &&
+                      liveContentChanges &&
+                      " Restart the server to load your changes."}
                   </>
                 ) : (
                   <>
@@ -4025,13 +4048,9 @@ export default function Launchpad({
               )}
             </>
           )}
-          {!canInstall && (
+          {(plan ? installBlock : reviewBlock) && (
             <p className="management-form-error" role="alert">
-              {!allowChanges
-                ? "Your account does not have permission to change server content."
-                : working
-                  ? "Another installation is still running."
-                  : "Stop the server in Console before installing or updating content."}
+              {plan ? installBlock : reviewBlock}
             </p>
           )}
           {dialogError && (
@@ -4099,7 +4118,7 @@ export default function Launchpad({
                 className="btn primary"
                 disabled={
                   Boolean(busy) ||
-                  !canInstall ||
+                  Boolean(reviewBlock) ||
                   !targetVersion.trim() ||
                   (needsLoader && !targetLoader) ||
                   (!selection?.bulk &&
@@ -4241,15 +4260,19 @@ export default function Launchpad({
             )}
           </>
         )}
-        {!canInstall && (
+        {removalPlan && (reviewBlock || fileChangeBlock) && (
           <p className="management-form-error" role="alert">
-            {!allowChanges
-              ? "Your account does not have permission to change server content."
-              : working
-                ? `Wait for the installation to finish before removing ${contentName}s.`
-                : `Stop the server in Console before removing ${contentName}s.`}
+            {reviewBlock || fileChangeBlock}
           </p>
         )}
+        {removalPlan &&
+          !removalPlan.blocked &&
+          status === "running" &&
+          !fileChangeBlock && (
+            <p className="management-dialog-description">
+              Restart the server to load your changes.
+            </p>
+          )}
         {removalError && (
           <p className="management-form-error" role="alert">
             {removalError}
@@ -4289,7 +4312,7 @@ export default function Launchpad({
             <button
               type="button"
               className="btn"
-              disabled={Boolean(busy) || !canInstall}
+              disabled={Boolean(busy) || !canReviewRemoval}
               onClick={() => void reviewRemoval(removal)}
             >
               Try again

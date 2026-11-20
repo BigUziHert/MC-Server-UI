@@ -998,27 +998,24 @@ for (const change of ["add", "replace", "remove"]) {
   });
 }
 
-test("removal requires a stopped supported server, an exact confirmation and a current review", async (t) => {
+test("removal requires a stable supported server, an exact confirmation and a current review", async (t) => {
   const f = await fixture(t, {
     files: { "selected.jar": mod("neoforge", "selected") },
   });
   f.state.server.status = "running";
-  await assert.rejects(
-    f.service.removalPreview({ path: "mods/selected.jar" }),
-    { status: 409 },
-  );
-  f.state.server.status = "offline";
   const plan = await f.service.removalPreview({ path: "mods/selected.jar" });
   for (const confirmed of [undefined, false, "true", 1])
     await assert.rejects(f.service.remove({ planId: plan.planId, confirmed }), {
       status: 400,
     });
+  for (const status of ["starting", "stopping"]) {
+    f.state.server.status = status;
+    await assert.rejects(
+      f.service.remove({ planId: plan.planId, confirmed: true }),
+      { status: 409 },
+    );
+  }
   f.state.server.status = "running";
-  await assert.rejects(
-    f.service.remove({ planId: plan.planId, confirmed: true }),
-    { status: 409 },
-  );
-  f.state.server.status = "offline";
   f.state.server.loader = "fabric";
   await assert.rejects(
     f.service.remove({ planId: plan.planId, confirmed: true }),

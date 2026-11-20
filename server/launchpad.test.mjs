@@ -2052,6 +2052,7 @@ for (const fails of [false, true]) {
 
 test("Launchpad hash-identifies installed mods, filters compatibility, confirms exact replacements and preserves originals", async (t) => {
   const f = await fixture(t);
+  f.setServer({ status: "running" });
   const catalog = await f.service.search(selection);
   assert.equal(catalog.projects[0].title, "Fixture Project");
   const search = new URL(
@@ -2089,12 +2090,14 @@ test("Launchpad hash-identifies installed mods, filters compatibility, confirms 
   await assert.rejects(f.service.install({ planId: plan.planId }), {
     status: 400,
   });
+  for (const status of ["starting", "stopping"]) {
+    f.setServer({ status });
+    await assert.rejects(
+      f.service.install({ planId: plan.planId, confirmed: true }),
+      { status: 409 },
+    );
+  }
   f.setServer({ status: "running" });
-  await assert.rejects(
-    f.service.install({ planId: plan.planId, confirmed: true }),
-    { status: 409 },
-  );
-  f.setServer({ status: "offline" });
   assert.equal(
     (await finish(f.service, { planId: plan.planId, confirmed: true })).status,
     "completed",
@@ -4505,8 +4508,9 @@ test("missing selected versions and transient dependency errors cannot be bypass
   assert.equal(f.mutations, 0);
 });
 
-test("partial promotion failure rolls back only newly installed files and restores replaced originals", async (t) => {
+test("a locked live destination rolls back newly installed files and restores replaced originals", async (t) => {
   const f = await fixture(t);
+  f.setServer({ status: "running" });
   f.versions.new.dependencies = [
     {
       project_id: "dependency",
@@ -4526,6 +4530,7 @@ test("partial promotion failure rolls back only newly installed files and restor
   });
   const job = await finish(f.service, { planId: plan.planId, confirmed: true });
   assert.equal(job.status, "failed");
+  assert.match(job.error, /Stop the server in Console and try again/);
   assert.match(job.error, /Previous server files were restored/);
   assert.deepEqual(
     await fs.readFile(path.join(f.serverDir, "mods", "old.jar")),
@@ -4541,6 +4546,7 @@ test("partial promotion failure rolls back only newly installed files and restor
 
 test("Modrinth packs replace old data with the verified runtime and server pack while retaining EULA acceptance", async (t) => {
   const f = await fixture(t, { type: "modpack" });
+  f.setServer({ status: "running" });
   await fs.mkdir(path.join(f.serverDir, "Survival"));
   await fs.writeFile(
     path.join(f.serverDir, "Survival", "level.dat"),
@@ -4609,6 +4615,16 @@ test("Modrinth packs replace old data with the verified runtime and server pack 
     f.service.install({ planId: plan.planId, confirmed: true }),
     /Confirm the clean installation/,
   );
+  await assert.rejects(
+    f.service.install({
+      planId: plan.planId,
+      confirmed: true,
+      cleanInstall: true,
+    }),
+    { status: 409 },
+  );
+  assert.equal(f.mutations, 0);
+  f.setServer({ status: "offline" });
   assert.equal(
     (
       await finish(f.service, {
@@ -9000,7 +9016,7 @@ test("installed files fall back to modified date when birthtime is unavailable",
   }
 });
 
-test("mod activation refuses running servers, invalid targets, and filename collisions", async (t) => {
+test("mod activation refuses server transitions, invalid targets, and filename collisions", async (t) => {
   const f = await fixture(t);
   for (const invalid of [
     "../old.jar",
@@ -9018,12 +9034,14 @@ test("mod activation refuses running servers, invalid targets, and filename coll
     f.service.setActive({ path: "mods/old.jar", active: "false" }),
     { status: 400 },
   );
-  f.setServer({ status: "online" });
-  await assert.rejects(
-    f.service.setActive({ path: "mods/old.jar", active: false }),
-    /Stop the server/,
-  );
-  f.setServer({ status: "offline" });
+  for (const status of ["starting", "stopping"]) {
+    f.setServer({ status });
+    await assert.rejects(
+      f.service.setActive({ path: "mods/old.jar", active: false }),
+      { status: 409 },
+    );
+  }
+  f.setServer({ status: "running" });
   const other = bytes("different disabled copy");
   await fs.writeFile(path.join(f.serverDir, "mods/old.jar.disabled"), other);
   await assert.rejects(
@@ -9040,8 +9058,9 @@ test("mod activation refuses running servers, invalid targets, and filename coll
   );
 });
 
-test("disabled mods stay disabled through bulk updates and can be removed", async (t) => {
+test("disabled mods stay disabled through bulk updates and can be removed while the server runs", async (t) => {
   const f = await fixture(t);
+  f.setServer({ status: "running" });
   const original = await f.service.setActive({
     path: "mods/old.jar",
     active: false,

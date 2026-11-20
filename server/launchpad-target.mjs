@@ -32,6 +32,27 @@ export function autoModpackFolder(input) {
 export const canActivateContent = (input) =>
   input.type === "mod" || input.target === "automodpack";
 
+export function assertContentChangeStatus(status) {
+  if (status !== "offline" && status !== "running")
+    throw error(
+      409,
+      "Wait for the server to finish starting or stopping before changing Launchpad content.",
+    );
+}
+
+export function contentFileChangeError(cause, status) {
+  if (
+    status === "running" &&
+    cause.status === undefined &&
+    ["EBUSY", "EPERM", "EACCES"].includes(cause.code)
+  )
+    return error(
+      409,
+      "A content file is in use or could not be changed. Stop the server in Console and try again.",
+    );
+  return cause;
+}
+
 export function contentFilePattern(input) {
   // AutoModpack excludes *.disabled when generating its pack, so the regular
   // Mods activation convention also works for staged ZIP packs.

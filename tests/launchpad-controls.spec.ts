@@ -1,4 +1,9 @@
-import { test as base, expect, type Page } from "@playwright/test";
+import {
+  test as base,
+  expect,
+  type APIRequestContext,
+  type Page,
+} from "@playwright/test";
 import {
   createProcessServer,
   removeTestServer,
@@ -80,8 +85,7 @@ const installed = (title: string, active = true, update = false) => ({
 async function catalog(
   page: Page,
   job?: Record<string, unknown>,
-  type = "mod",
-  platform = "curseforge",
+  { type = "mod", platform = "curseforge", status = "offline" } = {},
 ) {
   await page.route(/\/api\/launchpad(?:\?.*)?$/, (route) =>
     route.fulfill({
@@ -95,7 +99,8 @@ async function catalog(
             sortOptions: platform === "modrinth" ? modrinthSorts : sorts,
           },
         ],
-        status: "offline",
+        status,
+        liveContentChanges: true,
         gameVersion: "1.21.1",
         loader: "neoforge",
         gameVersions: ["1.21.1"],
@@ -117,6 +122,21 @@ async function catalog(
   await page.route("**/api/launchpad/installed?**", (route) =>
     route.fulfill({ json: { items: [], warnings: [] } }),
   );
+}
+
+async function startFixture(request: APIRequestContext, serverId: string) {
+  const headers = { "X-Server-Id": serverId };
+  const response = await request.post("/api/server/power", {
+    headers,
+    data: { action: "start" },
+  });
+  expect(response.ok(), await response.text()).toBe(true);
+  await expect
+    .poll(
+      async () =>
+        (await (await request.get("/api/server", { headers })).json()).status,
+    )
+    .toBe("running");
 }
 
 test("completed installations show one five-second status banner and stay dismissed on refresh", async ({
@@ -179,15 +199,21 @@ test("completed installations show one five-second status banner and stay dismis
   await expect(banner).toHaveCount(0);
 });
 
-test("updating a mod shows only its inline installation banner and toggling it uses the bottom toast", async ({
+test("Launchpad updates, disables and removes a mod while its server keeps running", async ({
   page,
+  request,
+  serverId,
 }) => {
+  await startFixture(request, serverId);
   await page.clock.install({ time: new Date("2026-11-01T12:00:00Z") });
-  await catalog(page);
+  await catalog(page, undefined, { status: "running" });
   let mod = installed("Zulu", true, true);
+  let removed = false;
   const others = Array.from({ length: 9 }, (_, i) => installed(`Mod ${i + 1}`));
   await page.route("**/api/launchpad/installed?**", (route) =>
-    route.fulfill({ json: { items: [...others, mod], warnings: [] } }),
+    route.fulfill({
+      json: { items: removed ? others : [...others, mod], warnings: [] },
+    }),
   );
   await page.route("**/api/launchpad/versions?**", (route) =>
     route.fulfill({ json: { versions: [version] } }),
@@ -233,6 +259,30 @@ test("updating a mod shows only its inline installation banner and toggling it u
     });
     mod = { ...mod, path: `${mod.path}.disabled`, active: false };
     return route.fulfill({ json: mod });
+  });
+  await page.route("**/api/launchpad/removal-preview", (route) => {
+    expect(route.request().postDataJSON()).toEqual({
+      path: mod.path,
+      type: "mod",
+    });
+    return route.fulfill({
+      json: {
+        planId: "remove-zulu",
+        title: mod.title,
+        files: [{ path: mod.path, size: mod.size }],
+        warnings: [],
+        dependents: [],
+        blocked: false,
+      },
+    });
+  });
+  await page.route("**/api/launchpad/remove", (route) => {
+    expect(route.request().postDataJSON()).toEqual({
+      planId: "remove-zulu",
+      confirmed: true,
+    });
+    removed = true;
+    return route.fulfill({ json: { ok: true } });
   });
 
   await page.goto("/#launchpad");
@@ -301,6 +351,84 @@ test("updating a mod shows only its inline installation banner and toggling it u
   await expect(notice).toBeVisible();
   await page.clock.fastForward(3_000);
   await expect(notice).toHaveCount(0);
+  await row.getByRole("button", { name: "Remove Zulu", exact: true }).click();
+  const removal = page.getByRole("dialog", { name: "Remove mod", exact: true });
+  await expect(removal).toContainText(mod.path);
+  await removal
+    .getByRole("button", { name: "Remove mod", exact: true })
+    .click();
+  await expect(row).toHaveCount(0);
+  await expect(notice).toContainText("Zulu moved to Recycle Bin.");
+  const server = await request.get("/api/server", {
+    headers: { "X-Server-Id": serverId },
+  });
+  expect((await server.json()).status).toBe("running");
+});
+
+test("a running server can review a modpack and confirm once it stops", async ({
+  page,
+  request,
+  serverId,
+}) => {
+  await startFixture(request, serverId);
+  await page.clock.install();
+  await catalog(page, undefined, { type: "modpack", status: "running" });
+  await page.route("**/api/launchpad/search?**", (route) =>
+    route.fulfill({
+      json: {
+        projects: [
+          { id: "pack", title: "Adventure Pack", platform: "curseforge" },
+        ],
+        total: 1,
+        offset: 0,
+        limit: 10,
+      },
+    }),
+  );
+  await page.route("**/api/launchpad/versions?**", (route) =>
+    route.fulfill({ json: { versions: [version] } }),
+  );
+  await page.route("**/api/launchpad/preview", (route) =>
+    route.fulfill({
+      json: {
+        planId: "review-pack",
+        title: "Adventure Pack",
+        versionName: version.version,
+        files: [{ path: "mods/new.jar", size: 100, action: "install" }],
+        warnings: [],
+        expiresAt: "2099-01-01",
+        cleanInstall: true,
+        summary: { fileCount: 1, totalBytes: 100 },
+      },
+    }),
+  );
+  await page.goto("/#launchpad");
+  await page.getByRole("tab", { name: "Modpacks", exact: true }).click();
+  await page
+    .getByRole("button", { name: "Install Adventure Pack", exact: true })
+    .click();
+  await page
+    .getByRole("button", { name: "Review installation", exact: true })
+    .click();
+  const dialog = page.getByRole("dialog", {
+    name: "Review installation",
+    exact: true,
+  });
+  const confirm = dialog.getByRole("button", {
+    name: "Confirm installation",
+    exact: true,
+  });
+  await dialog
+    .getByRole("checkbox", { name: /I understand this replaces/ })
+    .check();
+  await expect(confirm).toBeDisabled();
+  await expect(dialog.getByRole("alert")).toContainText(
+    /stop (?:the|this) server/i,
+  );
+
+  await stopTestServer(request, serverId);
+  await page.clock.fastForward(5_000);
+  await expect(confirm).toBeEnabled();
 });
 
 test("leaving Launchpad dismisses a finished banner before its timeout", async ({
@@ -466,7 +594,7 @@ test("installed mod controls display file modification time and toggle activity 
 test("installed modpacks display both shared date columns", async ({
   page,
 }) => {
-  await catalog(page, undefined, "modpack");
+  await catalog(page, undefined, { type: "modpack" });
   const pack = {
     ...installed("Example Pack"),
     path: ".launchpad/modpack",
@@ -844,7 +972,7 @@ test("catalog exposes supported CurseForge sort choices and sends the selected o
 test("Modrinth shows only supported catalog sorts, headers and category children", async ({
   page,
 }) => {
-  await catalog(page, undefined, "mod", "modrinth");
+  await catalog(page, undefined, { platform: "modrinth" });
   const searches: URL[] = [];
   await page.route("**/api/launchpad/search?**", (route) => {
     const url = new URL(route.request().url());

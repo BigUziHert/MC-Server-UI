@@ -4,7 +4,9 @@ import { inspectInstalledMod } from "./launchpad-mod-metadata.mjs";
 import { installedModVersionSatisfies } from "./launchpad-dependency-ranges.mjs";
 import { launchpadError as error } from "./launchpad-network.mjs";
 import {
+  assertContentChangeStatus,
   autoModpackFolder,
+  contentFileChangeError,
   contentFilePattern,
   contentTarget,
   isContentPath,
@@ -30,8 +32,6 @@ export function createModRemoval(ctx) {
     if (ctx.isBusy() || busy)
       throw error(409, "Wait for the current Launchpad operation to finish.");
     const current = await ctx.getServer();
-    if (current.status !== "offline")
-      throw error(409, "Stop the server before removing content.");
     if (
       type === "mod" &&
       !["neoforge", "forge", "fabric", "quilt"].includes(current.loader)
@@ -256,7 +256,13 @@ export function createModRemoval(ctx) {
         if (input.confirmed !== true)
           throw error(400, "Review the removal and confirm it first.");
         const planType = plans.get(input.planId)?.type ?? "mod";
-        await available(planType);
+        const current = await available(planType);
+        assertContentChangeStatus(current.status);
+        if (ctx.isRecoveryRequired())
+          throw error(
+            409,
+            "Resolve installation recovery before removing content.",
+          );
         // Recheck after the async status read before claiming the operation.
         if (busy || ctx.isBusy())
           throw error(
@@ -281,12 +287,13 @@ export function createModRemoval(ctx) {
         busy = true;
         ctx.onBusyChange?.();
         try {
-          return await ctx.withMinecraftMutation(async () => {
+          return await ctx.withContentMutation(async () => {
             const current = await ctx.getServer();
-            if (current.status !== "offline" || current.loader !== plan.loader)
+            assertContentChangeStatus(current.status);
+            if (current.loader !== plan.loader)
               throw error(
                 409,
-                "The server changed after this review. Stop it and review removal again.",
+                "The server changed after this review. Review removal again.",
               );
             if (
               snapshot(
@@ -306,7 +313,9 @@ export function createModRemoval(ctx) {
               );
             plans.delete(input.planId);
             metadata.clear();
-            const recycled = await ctx.recycle(plan.path);
+            const recycled = await ctx.recycle(plan.path).catch((cause) => {
+              throw contentFileChangeError(cause, current.status);
+            });
             try {
               await ctx.onRemoved(plan.path, plan.type);
             } catch (cause) {

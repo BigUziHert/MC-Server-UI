@@ -8,7 +8,7 @@ import { promoteVersion } from "./minecraft.mjs";
 import { createRecycleBin } from "./recycle-bin.mjs";
 import { containedSourcePath } from "./import.mjs";
 import { processStartup } from "../tests/fixtures/process-options.mjs";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 
 const json = (method, body) => ({ method, body: JSON.stringify(body) });
 const selection = {
@@ -44,6 +44,7 @@ async function fixture(
     stage,
     persistMinecraftConfiguration,
     extraProviders = [],
+    catalogFetch,
   } = {},
 ) {
   const temporary = await fs.realpath(os.tmpdir());
@@ -67,6 +68,7 @@ async function fixture(
     useEnvironment: false,
     versionsService: service,
     extraProviders,
+    catalogFetch,
     publicAddress: { resolve: async () => null },
     telemetry: { reset() {}, sample: async () => null },
     persistMinecraftConfiguration,
@@ -209,6 +211,88 @@ test("disconnecting an installation review aborts preparation and drains it befo
     controller.abort();
     release.resolve();
   }
+});
+
+test("Launchpad installs individual content while the server runs and holds the mutation lock until completion", async (t) => {
+  const release = gate();
+  let downloading = false;
+  const url = "https://cdn.modrinth.com/fixture.zip";
+  const bytes = Buffer.from("verified datapack");
+  const f = await fixture(t, {
+    running: true,
+    extraProviders: [
+      {
+        id: "fixture",
+        name: "Fixture",
+        types: ["datapack"],
+        downloadHosts: ["cdn.modrinth.com"],
+        resolve: async () => ({
+          title: "Fixture Datapack",
+          files: [
+            {
+              path: "fixture.zip",
+              url,
+              size: bytes.length,
+              hashes: {
+                sha512: createHash("sha512").update(bytes).digest("hex"),
+              },
+            },
+          ],
+        }),
+      },
+    ],
+    catalogFetch: async (address) => {
+      assert.equal(String(address), url);
+      downloading = true;
+      await release.promise;
+      return new Response(bytes);
+    },
+  });
+  const plan = await f.request(
+    "/api/launchpad/preview",
+    json("POST", {
+      platform: "fixture",
+      type: "datapack",
+      projectId: "project",
+      versionId: "new",
+      gameVersion: "1.21.4",
+    }),
+  );
+  assert.equal(plan.status, 200, JSON.stringify(plan.body));
+  const accepted = await f.request(
+    "/api/launchpad/install",
+    json("POST", { planId: plan.body.planId, confirmed: true }),
+  );
+  try {
+    assert.equal(accepted.status, 202, JSON.stringify(accepted.body));
+    await eventually(() => downloading);
+    assert.equal((await f.request("/api/server")).body.status, "running");
+    assert.equal(
+      (
+        await f.request(
+          "/api/server/power",
+          json("POST", { action: "restart" }),
+        )
+      ).status,
+      409,
+    );
+  } finally {
+    release.resolve();
+  }
+  const job = await eventually(async () => {
+    const { body } = await f.request(
+      `/api/launchpad/jobs/${accepted.body.job.id}`,
+    );
+    return ["completed", "failed"].includes(body.job.status) && body.job;
+  });
+  assert.equal(job.status, "completed", job.error);
+  assert.deepEqual(
+    await fs.readFile(
+      path.join(f.serverDir, "world", "datapacks", "fixture.zip"),
+    ),
+    bytes,
+  );
+  assert.equal((await f.request("/api/server")).body.status, "running");
 });
 
 async function makeStage({ stageDir }) {

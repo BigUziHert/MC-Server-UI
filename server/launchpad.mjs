@@ -16,8 +16,10 @@ import { readAutoModpackSources } from "./launchpad-automodpack-sources.mjs";
 import { createModRemoval } from "./launchpad-removal.mjs";
 import { createModActivation } from "./launchpad-activation.mjs";
 import {
+  assertContentChangeStatus,
   autoModpackFolder,
   canActivateContent,
+  contentFileChangeError,
   contentFilePattern,
   contentTarget,
   isContentPath,
@@ -346,6 +348,8 @@ export async function createLaunchpad(ctx) {
     fetch: rawRequest = fetch,
     recoveryFetch = rawRequest,
   } = ctx;
+  const withContentMutation = (work) =>
+    withMinecraftMutation(work, { allowWhileRunning: true });
   const lifetime = new AbortController();
   const request = (url, init = {}) => {
     lifetime.signal.throwIfAborted();
@@ -584,9 +588,10 @@ export async function createLaunchpad(ctx) {
     getServer,
     recycle,
     restore,
-    withMinecraftMutation,
+    withContentMutation,
     signal: lifetime.signal,
     isBusy: () => Boolean(active || preparingInstall || activation.busy),
+    isRecoveryRequired: () => recoveryRequired,
     onBusyChange: notifyBusy,
     async onRemoved(relative, type) {
       const previous = receipts;
@@ -640,7 +645,7 @@ export async function createLaunchpad(ctx) {
       );
     },
     getServer,
-    withMinecraftMutation,
+    withContentMutation,
     signal: lifetime.signal,
     isBusy: () => Boolean(active || preparingInstall || removal.busy),
     isRecoveryRequired: () => recoveryRequired,
@@ -2327,6 +2332,7 @@ export async function createLaunchpad(ctx) {
       // Older remote panels ignore unknown request fields. The shared UI must
       // see explicit target support before sending any AutoModpack requests.
       targets: ["server", "automodpack"],
+      liveContentChanges: !ctx.catalogOnly,
       loaders,
       gameVersions: versionsCache ?? [],
       gameVersion: current.gameVersion ?? null,
@@ -3974,10 +3980,8 @@ export async function createLaunchpad(ctx) {
     if (plan.input.type === "modpack") return promotePack(plan, job);
     {
       lifetime.signal.throwIfAborted();
-      await assertCompatibility(plan.input);
+      const { status } = await assertCompatibility(plan.input);
       await assertPackRuntime(plan.loaderInstall);
-      if ((await getServer()).status !== "offline")
-        throw error(409, "Stop the server before installing content.");
       lifetime.signal.throwIfAborted();
       const previousReceipts = [...receipts];
       const recovered = [],
@@ -4118,6 +4122,7 @@ export async function createLaunchpad(ctx) {
           }
         }
       } catch (cause) {
+        const failure = contentFileChangeError(cause, status);
         const failures = [];
         for (const written of promoted.reverse()) {
           try {
@@ -4148,11 +4153,11 @@ export async function createLaunchpad(ctx) {
         if (failures.length)
           throw error(
             409,
-            `${cause.message} Rollback needs attention for: ${[...new Set(failures)].join(", ")}. Preserved originals remain in Recycle Bin.`,
+            `${failure.message} Rollback needs attention for: ${[...new Set(failures)].join(", ")}. Preserved originals remain in Recycle Bin.`,
           );
         throw error(
-          cause.status ?? 500,
-          `${cause.message} Previous server files were restored.`,
+          failure.status ?? 500,
+          `${failure.message} Previous server files were restored.`,
         );
       }
     }
@@ -4333,7 +4338,8 @@ export async function createLaunchpad(ctx) {
         409,
         "This review expired. Review the version again before installing.",
       );
-    if (plan.input.type === "modpack" && input.cleanInstall !== true)
+    const isModpack = plan.input.type === "modpack";
+    if (isModpack && input.cleanInstall !== true)
       throw error(
         400,
         "Confirm the clean installation: all current server files, including worlds, mods and configuration, will be removed.",
@@ -4352,8 +4358,11 @@ export async function createLaunchpad(ctx) {
     // or Back request may dispose unclaimed reviews, never an accepted stage.
     plan.reserved = true;
     try {
-      if ((await getServer()).status !== "offline")
-        throw error(409, "Stop the server before installing content.");
+      const { status } = await getServer();
+      if (isModpack) {
+        if (status !== "offline")
+          throw error(409, "Stop the server before installing a modpack.");
+      } else assertContentChangeStatus(status);
       lifetime.signal.throwIfAborted();
     } catch (cause) {
       plan.reserved = false;
@@ -4382,9 +4391,12 @@ export async function createLaunchpad(ctx) {
     }
     const controller = new AbortController();
     activeController = controller;
+    const withInstallationMutation = isModpack
+      ? withMinecraftMutation
+      : withContentMutation;
     let operation;
     try {
-      operation = withMinecraftMutation(async () => {
+      operation = withInstallationMutation(async () => {
         job.status = "running";
         let failedFile;
         let outcome,

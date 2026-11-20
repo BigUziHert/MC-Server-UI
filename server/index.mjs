@@ -44,6 +44,7 @@ import {
 import { reconcileBackupCreations } from "./backup-creation-recovery.mjs";
 import { createOperationReceipts } from "./operation-receipts.mjs";
 import { createMinecraft } from "./minecraft.mjs";
+import { assertContentChangeStatus } from "./launchpad-target.mjs";
 import { createServerSetup } from "./server-setup.mjs";
 import {
   inspectInstallationDirectory,
@@ -1595,11 +1596,15 @@ export async function createPanel(options = {}) {
       activeMutations--;
     });
   };
-  function withMinecraftMutation(work, { requireStopped = true } = {}) {
+  function withMinecraftMutation(
+    work,
+    { requireStopped = true, allowWhileRunning = false } = {},
+  ) {
     if (closed) throw error(503, "The panel is shutting down.");
     if (minecraftBusy || configBusy || backupBusy || activeMutations)
       throw error(409, "Wait for the current server operation to finish.");
-    if (requireStopped && status !== "offline")
+    if (allowWhileRunning) assertContentChangeStatus(status);
+    else if (requireStopped && status !== "offline")
       throw error(
         409,
         "Stop the server before installing Minecraft software or content.",
