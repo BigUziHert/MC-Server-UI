@@ -59,9 +59,13 @@ export default function RefreshButton({
   );
 }
 
-/** Hover text for refresh buttons, e.g. "Refreshed: 5 minutes ago". */
-export function refreshedTooltip(at: number | null) {
-  if (at === null) return "Refreshed: never";
+/**
+ * Hover text for refresh buttons, e.g. "Refreshed: 5 minutes ago".
+ * Pass `loading` so a view whose time was reset shows "Refreshing…"
+ * while its first load is in flight.
+ */
+export function refreshedTooltip(at: number | null, loading = false) {
+  if (at === null) return loading ? "Refreshing…" : "Refreshed: never";
   const seconds = Math.max(0, Math.floor((Date.now() - at) / 1000));
   const unit = (value: number, name: string) =>
     `${value} ${name}${value === 1 ? "" : "s"}`;
