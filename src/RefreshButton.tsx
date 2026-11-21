@@ -22,7 +22,13 @@ export default function RefreshButton({
   const [pending, setPending] = useState(false);
   const [, setHoverTick] = useState(0);
   const title =
-    typeof tooltip === "function" ? tooltip() : (tooltip ?? label);
+    tooltip === undefined
+      ? label
+      : refreshing || pending
+        ? "Refreshing…"
+        : typeof tooltip === "function"
+          ? tooltip()
+          : tooltip;
   return (
     <button
       type="button"
@@ -61,21 +67,20 @@ export default function RefreshButton({
 
 /**
  * Hover text for refresh buttons, e.g. "Refreshed: 5 minutes ago".
- * Pass `loading` so a view whose time was reset shows "Refreshing…"
- * while its first load is in flight.
+ * Pass `loading` so the tooltip says "Refreshing…" while data is loading.
+ * Anything under a minute is shown as 1 minute.
  */
 export function refreshedTooltip(at: number | null, loading = false) {
-  if (at === null) return loading ? "Refreshing…" : "Refreshed: never";
-  const seconds = Math.max(0, Math.floor((Date.now() - at) / 1000));
+  if (loading) return "Refreshing…";
+  if (at === null) return "Refreshed: never";
+  const minutes = Math.max(1, Math.floor((Date.now() - at) / 60000));
   const unit = (value: number, name: string) =>
     `${value} ${name}${value === 1 ? "" : "s"}`;
   const ago =
-    seconds < 60
-      ? unit(seconds, "second")
-      : seconds < 3600
-        ? unit(Math.floor(seconds / 60), "minute")
-        : seconds < 86400
-          ? unit(Math.floor(seconds / 3600), "hour")
-          : unit(Math.floor(seconds / 86400), "day");
+    minutes < 60
+      ? unit(minutes, "minute")
+      : minutes < 1440
+        ? unit(Math.floor(minutes / 60), "hour")
+        : unit(Math.floor(minutes / 1440), "day");
   return `Refreshed: ${ago} ago`;
 }

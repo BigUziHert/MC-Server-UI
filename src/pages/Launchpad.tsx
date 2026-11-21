@@ -2682,7 +2682,9 @@ export default function Launchpad({
                 : "Refresh Launchpad and check updates"
             }
             refreshing={checkingForUpdates}
-            tooltip={() => refreshedTooltip(lastRefreshedAt)}
+            tooltip={() =>
+              refreshedTooltip(lastRefreshedAt, checkingForUpdates)
+            }
             onRefresh={refreshInstalled}
             notify={notify}
           />
