@@ -617,7 +617,7 @@ export default function Players({
           onRefresh={() => refresh(true)}
           notify={notify}
           successMessage="Players refreshed."
-          tooltip={() => refreshedTooltip(lastRefreshedAt)}
+          tooltip={() => refreshedTooltip(lastRefreshedAt, loading)}
         />
       </div>
       {error && (

@@ -225,7 +225,7 @@ export default function AuditLogs({
             <RefreshButton
               key={activityScope}
               label="Refresh audit logs"
-              tooltip={() => refreshedTooltip(lastRefreshedAt)}
+              tooltip={() => refreshedTooltip(lastRefreshedAt, loading)}
               refreshing={refreshing}
               onRefresh={() => refresh(true)}
               notify={notify}

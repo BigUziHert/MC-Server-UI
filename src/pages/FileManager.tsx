@@ -1120,6 +1120,7 @@ export default function FileManager({
   useEffect(() => {
     loaded.current = false;
     setEntries([]);
+    setLastRefreshedAt(null);
     setQuery("");
     setPage(1);
   }, [api, path]);
@@ -2037,7 +2038,7 @@ export default function FileManager({
               onRefresh={load}
               notify={notify}
               successMessage="Files refreshed."
-              tooltip={() => refreshedTooltip(lastRefreshedAt)}
+              tooltip={() => refreshedTooltip(lastRefreshedAt, loading)}
             />
           </div>
         </div>
@@ -3051,6 +3052,7 @@ function RecycleBin({
   useEffect(() => {
     loaded.current = false;
     setItems([]);
+    setLastRefreshedAt(null);
     setQuery("");
     void load();
     return () => {
@@ -3346,7 +3348,7 @@ function RecycleBin({
               onRefresh={load}
               notify={notify}
               successMessage="Recycle Bin refreshed."
-              tooltip={() => refreshedTooltip(lastRefreshedAt)}
+              tooltip={() => refreshedTooltip(lastRefreshedAt, loading)}
             />
           </div>
         </div>

@@ -998,7 +998,7 @@ export default function Backups({
                   onRefresh={() => load()}
                   notify={notify}
                   successMessage="Backups refreshed."
-                  tooltip={() => refreshedTooltip(lastRefreshedAt)}
+                  tooltip={() => refreshedTooltip(lastRefreshedAt, loading)}
                 />
               </div>
               {backups.length > 0 && (

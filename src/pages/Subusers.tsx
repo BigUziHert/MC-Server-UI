@@ -943,6 +943,7 @@ function AccessManagement({
     setDeleting(null);
     setResetting(null);
     setInvitation(null);
+    setLastRefreshedAt(null);
     void refresh();
     return () => request.current?.abort();
   }, [refresh]);
@@ -1314,7 +1315,7 @@ function AccessManagement({
               onRefresh={refresh}
               notify={notify}
               successMessage="Access records refreshed."
-              tooltip={() => refreshedTooltip(lastRefreshedAt)}
+              tooltip={() => refreshedTooltip(lastRefreshedAt, loading)}
             />
           </div>
         </div>

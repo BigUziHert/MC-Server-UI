@@ -750,7 +750,7 @@ export default function Versions({
               onRefresh={() => refresh(true)}
               notify={notify}
               successMessage="Versions refreshed."
-              tooltip={() => refreshedTooltip(lastRefreshedAt)}
+              tooltip={() => refreshedTooltip(lastRefreshedAt, loading)}
             />
             <SearchField
               className="management-search"
@@ -833,7 +833,7 @@ export default function Versions({
               onRefresh={() => refresh(true)}
               notify={notify}
               successMessage="Versions refreshed."
-              tooltip={() => refreshedTooltip(lastRefreshedAt)}
+              tooltip={() => refreshedTooltip(lastRefreshedAt, loading)}
             />
             <a
               className="versions-source"

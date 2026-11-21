@@ -165,6 +165,7 @@ export default function Properties({
     setPending(null);
     setMissingDraft(false);
     setDiscardMissingDraft(false);
+    setLastRefreshedAt(null);
     setLoading(true);
     setSaving(false);
     setError("");
@@ -412,7 +413,7 @@ export default function Properties({
           onRefresh={reload}
           notify={notify}
           successMessage="Properties refreshed."
-          tooltip={() => refreshedTooltip(lastRefreshedAt)}
+          tooltip={() => refreshedTooltip(lastRefreshedAt, loading)}
         />
       </div>
       {missingDraft && config && (
