@@ -37,7 +37,7 @@ import {
 } from "../api";
 import { canChangeContent } from "../page-permissions";
 import SearchField, { useDebouncedValue } from "../SearchField";
-import RefreshButton from "../RefreshButton";
+import RefreshButton, { refreshedTooltip } from "../RefreshButton";
 import StatePanel from "../StatePanel";
 import Pagination from "../Pagination";
 import Switch from "../Switch";
@@ -4424,20 +4424,4 @@ export default function Launchpad({
       </dialog>
     </div>
   );
-}
-
-function refreshedTooltip(at: number | null) {
-  if (at === null) return "Refreshed: never";
-  const seconds = Math.max(0, Math.floor((Date.now() - at) / 1000));
-  const unit = (value: number, name: string) =>
-    `${value} ${name}${value === 1 ? "" : "s"}`;
-  const ago =
-    seconds < 60
-      ? unit(seconds, "second")
-      : seconds < 3600
-        ? unit(Math.floor(seconds / 60), "minute")
-        : seconds < 86400
-          ? unit(Math.floor(seconds / 3600), "hour")
-          : unit(Math.floor(seconds / 86400), "day");
-  return `Refreshed: ${ago} ago`;
 }
