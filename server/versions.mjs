@@ -509,23 +509,34 @@ export function createVersionsService({
     }
     throw fail(502, "The official download service redirected too many times.");
   }
-  async function bytes(url, limit, signal) {
+  async function bytes(url, limit, signal, onBytes) {
     const result = await response(
       url,
       signal,
       limit > 8 * 1024 ** 2 ? 180000 : 20000,
     );
-    if (Number(result.headers.get("content-length")) > limit) {
+    const declared = Number(result.headers.get("content-length"));
+    if (declared > limit) {
       await result.body?.cancel();
       throw fail(502, "The official download exceeds the supported size.");
     }
+    // Compressed responses report the encoded length, which does not match
+    // the decoded bytes counted below, so only trust an identity length.
+    const total =
+      Number.isSafeInteger(declared) &&
+      declared > 0 &&
+      !result.headers.get("content-encoding")
+        ? declared
+        : 0;
     const chunks = [];
     let size = 0;
+    onBytes?.(0, total);
     for await (const chunk of result.body ?? []) {
       size += chunk.length;
       if (size > limit)
         throw fail(502, "The official download exceeds the supported size.");
       chunks.push(Buffer.from(chunk));
+      onBytes?.(size, total);
     }
     return Buffer.concat(chunks);
   }
@@ -940,6 +951,7 @@ export function createVersionsService({
     checksum,
     signal,
     limit = 512 * 1024 ** 2,
+    onBytes,
   ) {
     const length = { sha256: 64, sha1: 40, md5: 32 }[algorithm];
     if (
@@ -950,7 +962,7 @@ export function createVersionsService({
         502,
         "The official provider did not publish a usable checksum for this download.",
       );
-    const buffer = await bytes(url, limit, signal);
+    const buffer = await bytes(url, limit, signal, onBytes);
     if (
       createHash(algorithm).update(buffer).digest("hex") !==
       checksum.toLowerCase()
@@ -1106,11 +1118,29 @@ export function createVersionsService({
           : "sha256";
       checksum = id === "vanilla" ? data?.sha1 : data?.checksums?.[algorithm];
     }
-    onProgress({
-      phase: "download",
-      message: `Downloading and verifying ${selected.name} ${build}…`,
-    });
-    const buffer = await verifiedJar(artifact, algorithm, checksum, signal);
+    const downloadMessage = `Downloading and verifying ${selected.name} ${build}…`;
+    onProgress({ phase: "download", message: downloadMessage });
+    let reportedAt = 0;
+    const buffer = await verifiedJar(
+      artifact,
+      algorithm,
+      checksum,
+      signal,
+      undefined,
+      (completed, total) => {
+        // Chunks arrive many times a second; the UI polls once a second.
+        const now = Date.now();
+        if (completed > 0 && completed < total && now - reportedAt < 250)
+          return;
+        reportedAt = now;
+        onProgress({
+          phase: "download",
+          message: downloadMessage,
+          completed,
+          total,
+        });
+      },
+    );
     if (installerArgs) {
       const installerFile = path.join(root, "installer.jar");
       await fs.writeFile(installerFile, buffer, { flag: "wx" });

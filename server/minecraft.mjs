@@ -535,6 +535,13 @@ export async function createMinecraft(ctx) {
     jobs.set(job.id, job);
     lastJob = job.id;
   }
+  const jobProgress = ({ phase, message, completed, total }) => ({
+    ...(phase ? { phase } : {}),
+    ...(message ? { message } : {}),
+    ...(Number.isSafeInteger(total) && total > 0
+      ? { completed: Math.min(Math.max(0, completed ?? 0), total), total }
+      : {}),
+  });
   const publicJob = (job) =>
     job
       ? {
@@ -593,6 +600,7 @@ export async function createMinecraft(ctx) {
           javaPath: original?.javaPath ?? ctx.getConfiguration().javaPath,
           onProgress: (progress) => {
             job.message = progress.message;
+            job.progress = jobProgress(progress);
           },
           signal: controller.signal,
         });
@@ -621,6 +629,7 @@ export async function createMinecraft(ctx) {
           restoreInstalled: launchpad.restoreInstalled,
           onProgress: (progress) => {
             job.message = progress.message;
+            job.progress = jobProgress(progress);
           },
         };
         const recovery = original

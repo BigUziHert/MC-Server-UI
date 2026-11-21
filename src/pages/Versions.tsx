@@ -122,7 +122,12 @@ type Job = {
   state?: "queued" | "running" | "complete" | "failed";
   message?: string;
   error?: string;
-  progress?: { phase?: string; message?: string };
+  progress?: {
+    phase?: string;
+    message?: string;
+    completed?: number;
+    total?: number;
+  };
 };
 
 function normalizeJob(value: Job | { job: Job }): Job {
@@ -688,6 +693,13 @@ export default function Versions({
                     ? "Server software installed. Start the server when you are ready."
                     : "Installation failed.")}
             </p>
+            {jobBusy && (
+              <progress
+                aria-label="Installation progress"
+                max={Math.max(1, job.progress?.total ?? 0)}
+                value={job.progress?.total ? job.progress.completed : undefined}
+              />
+            )}
           </div>
           {!jobBusy &&
             (permissions === undefined ||

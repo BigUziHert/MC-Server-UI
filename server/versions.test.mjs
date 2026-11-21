@@ -321,7 +321,10 @@ test("NeoForge verifies its installer before running only in private staging and
       /world|server.properties|installer/.test(entry.path),
     ),
   );
-  assert.deepEqual(progress, ["download", "install", "ready"]);
+  assert.deepEqual(
+    progress.filter((phase, index) => phase !== progress[index - 1]),
+    ["download", "install", "ready"],
+  );
 });
 
 test("unlisted providers, versions, builds and URL-shaped input cannot reach a downloader or installer", async (t) => {
@@ -424,6 +427,41 @@ test("Paper uses the chosen build's SHA256 artifact and never executes the serve
   assert.equal(result.configuration.jar, "paper-1.21.1-12.jar");
   assert.equal(result.summary.checksumAlgorithm, "sha256");
   assert.equal(f.runs.length, 0);
+});
+
+test("server JAR downloads report byte progress only when the length is trustworthy", async (t) => {
+  const url = "https://fill-data.papermc.io/v1/objects/fixture/paper.jar";
+  const records = (headers) => ({
+    [`${PAPER}/paper`]: { versions: { 1.21: ["1.21.1"] } },
+    [`${PAPER}/paper/versions/1.21.1/builds`]: [
+      {
+        id: 12,
+        channel: "STABLE",
+        time: "2026-01-01T00:00:00Z",
+        downloads: {
+          "server:default": { url, checksums: { sha256: digest("sha256") } },
+        },
+      },
+    ],
+    [url]: () => new Response(jar, { headers }),
+  });
+  for (const [headers, expectedTotal] of [
+    [{ "content-length": String(jar.length) }, jar.length],
+    [{ "content-length": "3", "content-encoding": "gzip" }, 0],
+  ]) {
+    const f = await fixture(t, records(headers));
+    const progress = [];
+    await f.service.stage(
+      { provider: "paper", version: "1.21.1", build: "12" },
+      { stageDir: f.root, onProgress: (event) => progress.push(event) },
+    );
+    const download = progress.filter(
+      (event) => event.phase === "download" && "total" in event,
+    );
+    assert.ok(download.length >= 2);
+    assert.ok(download.every((event) => event.total === expectedTotal));
+    assert.equal(download.at(-1).completed, jar.length);
+  }
 });
 
 test("Waterfall stages the verified proxy JAR and matching archived modules", async (t) => {

@@ -396,8 +396,19 @@
 .versions-job {
   margin-bottom: 20px;
 }
+.versions-job > div {
+  flex: 1;
+  min-width: 0;
+}
 .versions-job p {
   overflow-wrap: anywhere;
+}
+.versions-job progress {
+  display: block;
+  width: 100%;
+  height: 7px;
+  margin-top: 10px;
+  accent-color: #a6a6a6;
 }
 @media (max-width: 1050px) {
   .version-provider-top {

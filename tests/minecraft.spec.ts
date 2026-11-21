@@ -760,6 +760,42 @@ async function mockQuickUpdate(page: Page, serverId: string) {
   return state;
 }
 
+test("Versions shows a progress bar that fills while the server software downloads", async ({
+  page,
+  serverId,
+}, testInfo) => {
+  const state = await mockQuickUpdate(page, serverId);
+  const progress = { phase: "download", completed: 0, total: 0 };
+  const job = () => ({
+    id: "downloading",
+    requestId: "fixture",
+    status: "running",
+    message: "Downloading and verifying NeoForge 21.1.251…",
+    progress: {
+      ...progress,
+      message: "Downloading and verifying NeoForge 21.1.251…",
+    },
+  });
+  state.job = job();
+  await page.route("**/api/versions/jobs/downloading", (route) =>
+    route.fulfill({ json: job() }),
+  );
+  await page.goto("/#versions");
+  const bar = page.getByRole("progressbar", {
+    name: "Installation progress",
+    exact: true,
+  });
+  await expect(bar).toBeVisible();
+  // Without a known size the bar stays indeterminate instead of empty.
+  await expect(bar).not.toHaveAttribute("value");
+  Object.assign(progress, { completed: 3_000_000, total: 8_000_000 });
+  await expect(bar).toHaveAttribute("value", "3000000");
+  await expect(bar).toHaveAttribute("max", "8000000");
+  await page.screenshot({
+    path: testInfo.outputPath("versions-download-progress.png"),
+  });
+});
+
 test("Versions reuses an uncertain confirmation ID and assigns a fresh ID after a new review", async ({
   page,
   serverId,
