@@ -199,6 +199,73 @@ test("completed installations show one five-second status banner and stay dismis
   await expect(banner).toHaveCount(0);
 });
 
+test("the installation bar fills by downloaded bytes and hands over to the dismiss timer", async ({
+  page,
+}, testInfo) => {
+  const job = {
+    id: "downloading",
+    status: "running",
+    message: "Verified 0 of 1 files…",
+    completed: 0,
+    total: 1,
+    cancellable: true,
+    progress: { completed: 420, total: 1000 },
+  };
+  await catalog(page, job);
+  await page.route("**/api/launchpad/jobs/downloading", (route) =>
+    route.fulfill({ json: { job } }),
+  );
+  await page.goto("/#launchpad");
+  const banner = page.getByRole("status", { name: "Installation status" });
+  const bar = banner.getByRole("progressbar", {
+    name: "Installation progress",
+    exact: true,
+  });
+  // A single mod still moves while it downloads, before any file is installed.
+  await expect(bar).toHaveAttribute("value", "420");
+  await expect(bar).toHaveAttribute("max", "1000");
+  await expect(banner.locator(".dismiss-countdown")).toHaveCount(0);
+  await banner.screenshot({
+    path: testInfo.outputPath("launchpad-download-progress.png"),
+  });
+  Object.assign(job, {
+    status: "completed",
+    message: "Example installed.",
+    completed: 1,
+    cancellable: false,
+    progress: { completed: 1000, total: 1000 },
+  });
+  await expect(banner).toContainText("Installation completed");
+  await expect(bar).toHaveCount(0);
+  await expect(banner.locator(".dismiss-countdown")).toHaveCount(1);
+  await banner.screenshot({
+    path: testInfo.outputPath("launchpad-dismiss-timer.png"),
+  });
+});
+
+test("jobs from older panels without byte progress still fill by installed files", async ({
+  page,
+}) => {
+  const job = {
+    id: "legacy",
+    status: "running",
+    message: "Installing mods/example.jar",
+    completed: 1,
+    total: 4,
+  };
+  await catalog(page, job);
+  await page.route("**/api/launchpad/jobs/legacy", (route) =>
+    route.fulfill({ json: { job } }),
+  );
+  await page.goto("/#launchpad");
+  const bar = page.getByRole("progressbar", {
+    name: "Installation progress",
+    exact: true,
+  });
+  await expect(bar).toHaveAttribute("value", "1");
+  await expect(bar).toHaveAttribute("max", "4");
+});
+
 test("Launchpad updates, disables and removes a mod while its server keeps running", async ({
   page,
   request,

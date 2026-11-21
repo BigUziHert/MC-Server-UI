@@ -143,7 +143,7 @@ type Job = {
   status?: string;
   error?: string;
   message?: string;
-  progress?: { message?: string };
+  progress?: { message?: string; completed?: number; total?: number };
   completed?: number;
   total?: number;
 };
@@ -285,6 +285,11 @@ export default function NewServerWizard({
   const [configurationDetailsOpen, setConfigurationDetailsOpen] =
     useState(false);
   const [progress, setProgress] = useState("");
+  // Measured job progress; null keeps the bar indeterminate.
+  const [jobProgress, setJobProgress] = useState<{
+    completed: number;
+    total: number;
+  } | null>(null);
   const [created, setCreated] = useState<ServerRecord | null>(null);
   const controller = useRef(new AbortController());
   const heading = useRef<HTMLHeadingElement>(null);
@@ -802,11 +807,21 @@ export default function NewServerWizard({
     observedJobs.current.add(`${type}:${job.id}`);
     activeJob.current = { kind: type, id: job.id };
     let current = job;
+    setJobProgress(null);
     while (!terminal(current)) {
       setProgress(
         current.progress?.message ||
           current.message ||
           "Installing verified downloads…",
+      );
+      const measured = current.progress;
+      setJobProgress(
+        measured?.total && measured.total > 0
+          ? {
+              completed: Math.min(measured.completed ?? 0, measured.total),
+              total: measured.total,
+            }
+          : null,
       );
       await wait(controller.current.signal);
       const response = await request<Job | { job: Job }>(
@@ -817,6 +832,7 @@ export default function NewServerWizard({
       current = "job" in response ? response.job : response;
     }
     activeJob.current = null;
+    setJobProgress(null);
     if ((current.state || current.status) === "failed") {
       if (type === "versions") runtimeRequestId.current = crypto.randomUUID();
       throw new Error(
@@ -1971,7 +1987,13 @@ export default function NewServerWizard({
                   ? "Your server wasn’t created. Go back to correct your settings; your selections are saved."
                   : "We couldn’t confirm server creation. Retry to continue without creating a duplicate."}
           </p>
-          {busy && <progress aria-label="Installation progress" />}
+          {busy && (
+            <progress
+              aria-label="Installation progress"
+              max={jobProgress?.total ?? 1}
+              value={jobProgress?.completed}
+            />
+          )}
         </div>
       )}
       {step === "done" && (

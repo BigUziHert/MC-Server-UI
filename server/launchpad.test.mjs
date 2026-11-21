@@ -270,7 +270,8 @@ async function fixture(t, options = {}) {
             { id: provider === "forge" ? `${version}-21.1.200` : "21.1.200" },
           ],
         }),
-        stage: async (input, { stageDir }) => {
+        stage: async (input, { stageDir, onProgress }) => {
+          await options.runtimeStage?.(onProgress);
           const output = path.join(stageDir, "server");
           await fs.mkdir(output);
           await fs.writeFile(
@@ -765,6 +766,55 @@ test("bulk update review shares dependencies and a failed download preserves eve
       .length,
     1,
   );
+});
+
+test("installation progress moves by downloaded bytes before any file is installed", async (t) => {
+  let release;
+  const gate = new Promise((resolve) => (release = resolve));
+  const url = "https://cdn.modrinth.com/new.jar";
+  let body;
+  const f = await fixture(t, {
+    request: (address) =>
+      String(address) === url
+        ? new Response(
+            new ReadableStream({
+              async start(controller) {
+                const half = Math.floor(body.length / 2);
+                controller.enqueue(body.subarray(0, half));
+                await gate;
+                controller.enqueue(body.subarray(half));
+                controller.close();
+              },
+            }),
+          )
+        : null,
+  });
+  body = f.downloads.get(url);
+  f.downloads.delete(url);
+  f.setServer({ status: "offline" });
+  const plan = await f.service.preview({
+    ...selection,
+    replacePath: "mods/old.jar",
+  });
+  const { job } = await f.service.install({
+    planId: plan.planId,
+    confirmed: true,
+  });
+  const half = Math.floor(body.length / 2);
+  const expected = Math.floor((900 * half) / body.length);
+  const deadline = performance.now() + 10_000;
+  let current;
+  do {
+    current = f.service.job(job.id).job;
+    if (current.progress?.completed >= expected) break;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  } while (performance.now() < deadline);
+  assert.equal(current.completed, 0, "no file has been installed yet");
+  assert.deepEqual(current.progress, { completed: expected, total: 1000 });
+  release();
+  const done = await waitForJob(f.service, job.id);
+  assert.equal(done.status, "completed", done.error);
+  assert.deepEqual(done.progress, { completed: 1000, total: 1000 });
 });
 
 test("installed project URLs survive receipts and never replace download URLs", async (t) => {
@@ -4545,7 +4595,23 @@ test("a locked live destination rolls back newly installed files and restores re
 });
 
 test("Modrinth packs replace old data with the verified runtime and server pack while retaining EULA acceptance", async (t) => {
-  const f = await fixture(t, { type: "modpack" });
+  const runtimeProgress = [];
+  let installing;
+  const f = await fixture(t, {
+    type: "modpack",
+    runtimeStage: async (onProgress) => {
+      const id = (await installing).job.id;
+      for (const completed of [0, 50, 100]) {
+        onProgress({
+          phase: "download",
+          message: "Downloading server software…",
+          completed,
+          total: 100,
+        });
+        runtimeProgress.push(f.service.job(id).job.progress.completed);
+      }
+    },
+  });
   f.setServer({ status: "running" });
   await fs.mkdir(path.join(f.serverDir, "Survival"));
   await fs.writeFile(
@@ -4625,16 +4691,16 @@ test("Modrinth packs replace old data with the verified runtime and server pack 
   );
   assert.equal(f.mutations, 0);
   f.setServer({ status: "offline" });
-  assert.equal(
-    (
-      await finish(f.service, {
-        planId: plan.planId,
-        confirmed: true,
-        cleanInstall: true,
-      })
-    ).status,
-    "completed",
-  );
+  installing = f.service.install({
+    planId: plan.planId,
+    confirmed: true,
+    cleanInstall: true,
+  });
+  const installed = await waitForJob(f.service, (await installing).job.id);
+  assert.equal(installed.status, "completed", installed.error);
+  // Pack files fill 60%, the server software download the next 30%.
+  assert.deepEqual(runtimeProgress, [600, 750, 900]);
+  assert.deepEqual(installed.progress, { completed: 1000, total: 1000 });
   assert.equal(
     await fs.readFile(path.join(f.serverDir, "config", "common.cfg"), "utf8"),
     "server override",

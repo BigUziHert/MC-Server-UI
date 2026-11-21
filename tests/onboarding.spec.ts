@@ -1673,6 +1673,56 @@ for (const kind of ["software", "modpack"] as const) {
   });
 }
 
+test("software creation fills its installation bar while the server software downloads", async ({
+  page,
+  setup,
+}, testInfo) => {
+  const job = {
+    id: "downloading-paper",
+    status: "running",
+    message: "Downloading and verifying Paper 12…",
+    progress: {
+      phase: "download",
+      message: "Downloading and verifying Paper 12…",
+      completed: 0,
+      total: 0,
+    },
+  };
+  await page.route("**/api/versions/install", (route) =>
+    route.fulfill({ status: 202, json: job }),
+  );
+  await page.route("**/api/versions/jobs/downloading-paper", (route) =>
+    route.fulfill({ json: job }),
+  );
+  await openCreate(page);
+  await choosePaper(page);
+  const dialog = await configure(page, setup, "Measured Paper world");
+  await dialog
+    .getByRole("button", { name: "Create and install", exact: true })
+    .click();
+  const bar = dialog.getByRole("progressbar", {
+    name: "Installation progress",
+    exact: true,
+  });
+  await expect(bar).toBeVisible();
+  // Until the download size is known, the bar stays indeterminate.
+  await expect(bar).not.toHaveAttribute("value");
+  job.progress = { ...job.progress, completed: 3_000_000, total: 8_000_000 };
+  await expect(bar).toHaveAttribute("value", "3000000");
+  await expect(bar).toHaveAttribute("max", "8000000");
+  await dialog.screenshot({
+    path: testInfo.outputPath("wizard-download-progress.png"),
+  });
+  Object.assign(job, {
+    status: "completed",
+    message: "Paper installed successfully.",
+    progress: undefined,
+  });
+  await expect(
+    dialog.getByRole("button", { name: "Open Console", exact: true }),
+  ).toBeEnabled();
+});
+
 test("mobile software review stays within the viewport and can be cancelled without creation", async ({
   page,
   setup,

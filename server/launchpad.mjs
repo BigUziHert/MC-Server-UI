@@ -28,6 +28,7 @@ import { categoryIds } from "../shared/launchpad-categories.mjs";
 import { createLaunchpadMetadataCache } from "./launchpad-metadata-cache.mjs";
 import { createLaunchpadCatalogCache } from "./launchpad-catalog-cache.mjs";
 import { mapReview, parallelTransfers } from "./launchpad-transfers.mjs";
+import { createInstallProgress } from "./launchpad-progress.mjs";
 import { recoverJarIdentity } from "./launchpad-jar-recovery.mjs";
 import { createVersionsService } from "./versions.mjs";
 import { cleanInstall, prepareCleanSettings } from "./clean-install.mjs";
@@ -432,6 +433,8 @@ export async function createLaunchpad(ctx) {
   const plans = new Map();
   const noOpReviews = new Map();
   const jobs = new Map();
+  // Kept beside the job, not on it, so job snapshots stay plain data.
+  const installProgress = new WeakMap();
   const previews = new Set();
   // These caches accelerate display only. Preview and installation still hash
   // destination bytes afresh before allowing any replacement.
@@ -4099,6 +4102,7 @@ export async function createLaunchpad(ctx) {
           // post-verification stat to bytes that an external editor may change.
           fileCache.delete(file.path);
           job.completed++;
+          installProgress.get(job)?.installed(job.completed, job.total);
         }
         await saveReceipts();
         const changes = new Map();
@@ -4181,6 +4185,7 @@ export async function createLaunchpad(ctx) {
         signal: lifetime.signal,
         onProgress: (value) => {
           job.message = value.message;
+          installProgress.get(job)?.runtime(value.completed, value.total);
         },
       });
       const runtimePaths = new Set(
@@ -4304,6 +4309,7 @@ export async function createLaunchpad(ctx) {
       });
       Object.assign(job, packRecovery);
       job.completed = job.total;
+      installProgress.get(job)?.finish();
       await ctx
         .audit?.(
           "Modpack installed",
@@ -4382,6 +4388,10 @@ export async function createLaunchpad(ctx) {
       total: plan.files.length,
       createdAt: new Date().toISOString(),
     };
+    installProgress.set(
+      job,
+      createInstallProgress(job, plan.files, { modpack: isModpack }),
+    );
     jobs.set(job.id, job);
     lastJob = job.id;
     for (const [id, previous] of jobs) {
@@ -4430,6 +4440,8 @@ export async function createLaunchpad(ctx) {
                       {
                         signal,
                         curseforgeKey: key,
+                        onBytes: (bytes) =>
+                          installProgress.get(job)?.downloaded(index, bytes),
                       },
                     );
                     file.stagedPath = destination;
@@ -4446,6 +4458,7 @@ export async function createLaunchpad(ctx) {
                       `This installation exceeds the ${plan.input.type === "modpack" ? 4 : 2} GB total size limit.`,
                     );
                   file.sha512 = verified.sha512;
+                  installProgress.get(job)?.staged(index);
                   job.message = `Verified ${++verifiedCount} of ${plan.files.length} files…`;
                 } catch (cause) {
                   transferFailure ??= { path: file.path, phase: filePhase };
@@ -4465,6 +4478,7 @@ export async function createLaunchpad(ctx) {
           await promote(plan, job);
           await recovery.commit();
           removal.invalidate();
+          installProgress.get(job)?.finish();
           outcome = {
             status: "completed",
             message: `${plan.title} installed. Replaced files remain recoverable in Recycle Bin.`,

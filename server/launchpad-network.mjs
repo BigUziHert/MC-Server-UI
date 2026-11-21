@@ -222,7 +222,7 @@ export async function downloadVerified(
   target,
   hosts,
   request = fetch,
-  { signal, curseforgeKey } = {},
+  { signal, curseforgeKey, onBytes } = {},
 ) {
   const [algorithm, expected] = strongestHash(file.hashes);
   const limit = file.archive === true ? 2 * 1024 ** 3 : 512 * 1024 ** 2;
@@ -279,6 +279,7 @@ export async function downloadVerified(
         );
       hash.update(chunk);
       await handle.writeFile(chunk);
+      onBytes?.(size);
     }
     deadline.signal.throwIfAborted();
     if (

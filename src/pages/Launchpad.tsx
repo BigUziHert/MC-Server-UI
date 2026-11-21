@@ -139,6 +139,8 @@ type Job = {
   message: string;
   completed: number;
   total: number;
+  /** Byte-weighted progress across downloading and installing. */
+  progress?: { completed: number; total: number };
   error?: string;
   retryable?: boolean;
   cancellable?: boolean;
@@ -3130,8 +3132,14 @@ export default function Launchpad({
           {working && (
             <progress
               aria-label="Installation progress"
-              max={Math.max(1, job.total)}
-              value={job.total > 0 ? job.completed : undefined}
+              max={Math.max(1, job.progress?.total ?? job.total)}
+              value={
+                job.progress?.total
+                  ? job.progress.completed
+                  : job.total > 0
+                    ? job.completed
+                    : undefined
+              }
             />
           )}
           {timedJobId && (
