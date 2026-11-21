@@ -25,7 +25,7 @@ import {
 import { ServerScope, useServerApi, type PageProps } from "../api";
 import PlayerHead from "../PlayerHead";
 import SearchField, { useDebouncedValue } from "../SearchField";
-import RefreshButton from "../RefreshButton";
+import RefreshButton, { refreshedTooltip } from "../RefreshButton";
 import StatePanel from "../StatePanel";
 import SharedPagination from "../Pagination";
 import Switch from "../Switch";
@@ -213,6 +213,7 @@ export default function Players({
   const [data, setData] = useState<PlayersResponse | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
+  const [lastRefreshedAt, setLastRefreshedAt] = useState<number | null>(null);
   const [search, setSearch] = useState("");
   const [historySearch, setHistorySearch] = useState("");
   const query = useDebouncedValue(search),
@@ -256,6 +257,7 @@ export default function Players({
           if (currentRequest !== request.current) return false;
           setData(response);
           setError("");
+          setLastRefreshedAt(Date.now());
           return true;
         } catch (e) {
           if (currentRequest !== request.current) return false;
@@ -280,6 +282,7 @@ export default function Players({
   useEffect(() => {
     session.current += 1;
     setData(null);
+    setLastRefreshedAt(null);
     setResult(null);
     setBusy(false);
     setFormError("");
@@ -614,6 +617,7 @@ export default function Players({
           onRefresh={() => refresh(true)}
           notify={notify}
           successMessage="Players refreshed."
+          tooltip={() => refreshedTooltip(lastRefreshedAt)}
         />
       </div>
       {error && (

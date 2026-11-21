@@ -16,7 +16,7 @@ import {
 import { ServerScope, useServerApi, type PageProps } from "../api";
 import { canChangeContent } from "../page-permissions";
 import SearchField, { useDebouncedValue } from "../SearchField";
-import RefreshButton from "../RefreshButton";
+import RefreshButton, { refreshedTooltip } from "../RefreshButton";
 import StatePanel from "../StatePanel";
 import Switch from "../Switch";
 import { safeProjectUrl } from "../../shared/launchpad-project.mjs";
@@ -201,6 +201,7 @@ export default function Versions({
   const [loading, setLoading] = useState(true);
   const [loadingBuilds, setLoadingBuilds] = useState(false);
   const [error, setError] = useState("");
+  const [lastRefreshedAt, setLastRefreshedAt] = useState<number | null>(null);
   const [confirming, setConfirming] = useState<Build | null>(null);
   const [accepted, setAccepted] = useState(false);
   const [installMode, setInstallMode] = useState<"update" | "clean">("clean");
@@ -283,6 +284,7 @@ export default function Versions({
         setJob(catalog.job ? normalizeJob(catalog.job) : null);
         setCurrent({ ...server, ...catalog.current, status: server.status });
         setRuntimeUpdate(catalog.runtimeUpdate ?? null);
+        setLastRefreshedAt(Date.now());
         return true;
       } catch (cause) {
         if (token === generation.current)
@@ -302,6 +304,7 @@ export default function Versions({
     setProviders([]);
     setCurrent(null);
     setRuntimeUpdate(null);
+    setLastRefreshedAt(null);
     setReleases([]);
     setBuilds([]);
     setReleaseSearch("");
@@ -747,6 +750,7 @@ export default function Versions({
               onRefresh={() => refresh(true)}
               notify={notify}
               successMessage="Versions refreshed."
+              tooltip={() => refreshedTooltip(lastRefreshedAt)}
             />
             <SearchField
               className="management-search"
@@ -829,6 +833,7 @@ export default function Versions({
               onRefresh={() => refresh(true)}
               notify={notify}
               successMessage="Versions refreshed."
+              tooltip={() => refreshedTooltip(lastRefreshedAt)}
             />
             <a
               className="versions-source"

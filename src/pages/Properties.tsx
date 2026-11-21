@@ -8,7 +8,7 @@ import {
   type PropertyConfig as Config,
 } from "../property-drafts";
 import SearchField, { useDebouncedValue } from "../SearchField";
-import RefreshButton from "../RefreshButton";
+import RefreshButton, { refreshedTooltip } from "../RefreshButton";
 import StatePanel from "../StatePanel";
 import Switch from "../Switch";
 import "./properties.css";
@@ -54,6 +54,7 @@ export default function Properties({
   const [pendingReload, setPendingReload] = useState(false);
   const [pending, setPending] = useState<string | null>(null);
   const [missingDraft, setMissingDraft] = useState(false);
+  const [lastRefreshedAt, setLastRefreshedAt] = useState<number | null>(null);
   const [discardMissingDraft, setDiscardMissingDraft] = useState(false);
   const request = useRef(0),
     session = useRef(0),
@@ -121,6 +122,7 @@ export default function Properties({
           `/minecraft/properties/file?path=${encodeURIComponent(file)}`,
         );
         if (id !== request.current) return false;
+        setLastRefreshedAt(Date.now());
         setMissingDraft(false);
         if (discard) drafts.delete(draftKey);
         const draft = drafts.get(draftKey);
@@ -194,7 +196,10 @@ export default function Properties({
             data.files[0].path;
           setSelected(file);
           void load(file);
-        } else setLoading(false);
+        } else {
+          setLastRefreshedAt(Date.now());
+          setLoading(false);
+        }
       })
       .catch((cause) => {
         if (id === session.current) {
@@ -249,6 +254,7 @@ export default function Properties({
       setFocusedTab(target);
       if (target) return await load(target, target === selected, discard);
       if (discard) drafts.delete(draftKey);
+      setLastRefreshedAt(Date.now());
       setMissingDraft(false);
       setConfig(null);
       setValues({});
@@ -406,6 +412,7 @@ export default function Properties({
           onRefresh={reload}
           notify={notify}
           successMessage="Properties refreshed."
+          tooltip={() => refreshedTooltip(lastRefreshedAt)}
         />
       </div>
       {missingDraft && config && (

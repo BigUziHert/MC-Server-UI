@@ -19,7 +19,7 @@ import {
   type PageProps,
 } from "../api";
 import SearchField, { useDebouncedValue } from "../SearchField";
-import RefreshButton from "../RefreshButton";
+import RefreshButton, { refreshedTooltip } from "../RefreshButton";
 import StatePanel from "../StatePanel";
 import Pagination, { usePageSize } from "../Pagination";
 import "./management.css";
@@ -60,6 +60,7 @@ export default function AuditLogs({
   const [search, setSearch] = useState("");
   const [category, setCategory] = useState<Category | "all">("all");
   const [updatedAt, setUpdatedAt] = useState<Date | null>(null);
+  const [lastRefreshedAt, setLastRefreshedAt] = useState<number | null>(null);
 
   const [refreshing, setRefreshing] = useState(false);
   const [page, setPage] = useState(1),
@@ -88,6 +89,7 @@ export default function AuditLogs({
           );
           loaded.current = true;
           setUpdatedAt(new Date());
+          setLastRefreshedAt(Date.now());
           return true;
         } catch (cause) {
           if (token === generation.current)
@@ -117,6 +119,7 @@ export default function AuditLogs({
     setRefreshing(false);
     setEntries([]);
     setUpdatedAt(null);
+    setLastRefreshedAt(null);
     setSearch("");
     setCategory("all");
     setPage(1);
@@ -222,6 +225,7 @@ export default function AuditLogs({
             <RefreshButton
               key={activityScope}
               label="Refresh audit logs"
+              tooltip={() => refreshedTooltip(lastRefreshedAt)}
               refreshing={refreshing}
               onRefresh={() => refresh(true)}
               notify={notify}

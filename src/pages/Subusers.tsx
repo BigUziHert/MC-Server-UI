@@ -26,7 +26,7 @@ import {
   type PageProps,
 } from "../api";
 import SearchField, { useDebouncedValue } from "../SearchField";
-import RefreshButton from "../RefreshButton";
+import RefreshButton, { refreshedTooltip } from "../RefreshButton";
 import StatePanel from "../StatePanel";
 import { copyText } from "../clipboard";
 import Pagination, { usePageSize } from "../Pagination";
@@ -843,6 +843,7 @@ function AccessManagement({
   const [inviting, setInviting] = useState<string | null>(null);
   const [invitationError, setInvitationError] = useState("");
   const [invitation, setInvitation] = useState<Invitation | null>(null);
+  const [lastRefreshedAt, setLastRefreshedAt] = useState<number | null>(null);
   const dialog = useRef<HTMLDialogElement>(null);
   const emailInput = useRef<HTMLInputElement>(null);
   const cancelButton = useRef<HTMLButtonElement>(null);
@@ -908,6 +909,7 @@ function AccessManagement({
         setAccounts(panelResult?.users ?? (accountsView ? result.users : []));
         setAccessSettings(settings);
         setError("");
+        setLastRefreshedAt(Date.now());
         loaded.current = true;
         return true;
       } catch (cause) {
@@ -1312,6 +1314,7 @@ function AccessManagement({
               onRefresh={refresh}
               notify={notify}
               successMessage="Access records refreshed."
+              tooltip={() => refreshedTooltip(lastRefreshedAt)}
             />
           </div>
         </div>

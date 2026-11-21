@@ -52,7 +52,7 @@ import "./storage.css";
 import "./storage-dialog.css";
 import SearchField, { useDebouncedValue } from "../SearchField";
 import FileTextEditor, { type FileTextEditorHandle } from "../FileTextEditor";
-import RefreshButton from "../RefreshButton";
+import RefreshButton, { refreshedTooltip } from "../RefreshButton";
 import StatePanel from "../StatePanel";
 import Pagination, { usePageSize } from "../Pagination";
 import { collectDesktopClipboardUpload } from "../desktop-clipboard";
@@ -785,6 +785,7 @@ export default function FileManager({
   const loaded = useRef(false);
   useEffect(() => setPage(1), [debouncedQuery, pageSize, path]);
   const [loading, setLoading] = useState(true);
+  const [lastRefreshedAt, setLastRefreshedAt] = useState<number | null>(null);
   const [searchProgress, setSearchProgress] = useState(0);
   const [uploadLimit, setUploadLimit] = useState({ scope: "", value: 20 });
   const [fileCapabilities, setFileCapabilities] = useState({
@@ -980,6 +981,7 @@ export default function FileManager({
         loaded.current = true;
         const resultEntries = [...matches.values()];
         setEntries(resultEntries);
+        setLastRefreshedAt(Date.now());
         const available = new Set(matches.keys());
         setSelected(
           (previous) =>
@@ -2035,6 +2037,7 @@ export default function FileManager({
               onRefresh={load}
               notify={notify}
               successMessage="Files refreshed."
+              tooltip={() => refreshedTooltip(lastRefreshedAt)}
             />
           </div>
         </div>
@@ -2996,6 +2999,7 @@ function RecycleBin({
   const debouncedQuery = useDebouncedValue(query);
   const loaded = useRef(false);
   const [loading, setLoading] = useState(true);
+  const [lastRefreshedAt, setLastRefreshedAt] = useState<number | null>(null);
   const [error, setError] = useState("");
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [action, setAction] = useState<{
@@ -3028,6 +3032,7 @@ function RecycleBin({
       if (id === requestId.current) {
         loaded.current = true;
         setItems(result.items);
+        setLastRefreshedAt(Date.now());
         const available = new Set(result.items.map((item) => item.id));
         setSelected(
           (previous) =>
@@ -3341,6 +3346,7 @@ function RecycleBin({
               onRefresh={load}
               notify={notify}
               successMessage="Recycle Bin refreshed."
+              tooltip={() => refreshedTooltip(lastRefreshedAt)}
             />
           </div>
         </div>

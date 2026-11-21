@@ -29,7 +29,7 @@ import {
 } from "../api";
 import "./storage.css";
 import "./storage-dialog.css";
-import RefreshButton from "../RefreshButton";
+import RefreshButton, { refreshedTooltip } from "../RefreshButton";
 import StatePanel from "../StatePanel";
 import Switch from "../Switch";
 import DownloadButton from "../DownloadButton";
@@ -308,6 +308,7 @@ export default function Backups({
   const conflictPanel = useRef<HTMLDivElement>(null);
   const [timezone, setTimezone] = useState("server time");
   const [loading, setLoading] = useState(true);
+  const [lastRefreshedAt, setLastRefreshedAt] = useState<number | null>(null);
   const [error, setError] = useState("");
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
@@ -406,6 +407,7 @@ export default function Backups({
         if (token !== generation.current || sequence !== loadSequence.current)
           return false;
         setBackups(result.backups);
+        setLastRefreshedAt(Date.now());
         setMissingBackupIds(new Set(result.missingBackupIds ?? []));
         if (revision === jobRevision.current && !startingRef.current)
           acceptJob(result.job || null);
@@ -444,6 +446,7 @@ export default function Backups({
   useEffect(() => {
     generation.current++;
     setBackups([]);
+    setLastRefreshedAt(null);
     setMissingBackupIds(new Set());
     setSelected(new Set());
     setDialog(null);
@@ -995,6 +998,7 @@ export default function Backups({
                   onRefresh={() => load()}
                   notify={notify}
                   successMessage="Backups refreshed."
+                  tooltip={() => refreshedTooltip(lastRefreshedAt)}
                 />
               </div>
               {backups.length > 0 && (
