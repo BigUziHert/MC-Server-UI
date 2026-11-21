@@ -8,6 +8,7 @@ export default function RefreshButton({
   onRefresh,
   notify,
   successMessage,
+  tooltip,
 }: {
   label: string;
   refreshing?: boolean;
@@ -15,15 +16,25 @@ export default function RefreshButton({
   onRefresh: () => Promise<boolean | void>;
   notify?: PageProps["notify"];
   successMessage?: string;
+  /** Hover text; a function is re-evaluated each time the pointer enters. */
+  tooltip?: string | (() => string);
 }) {
   const [pending, setPending] = useState(false);
+  const [, setHoverTick] = useState(0);
+  const title =
+    typeof tooltip === "function" ? tooltip() : (tooltip ?? label);
   return (
     <button
       type="button"
       className="btn icon"
       aria-label={label}
       aria-busy={refreshing || pending}
-      title={label}
+      title={title}
+      onMouseEnter={
+        typeof tooltip === "function"
+          ? () => setHoverTick((tick) => tick + 1)
+          : undefined
+      }
       disabled={disabled || refreshing || pending}
       onClick={async () => {
         if (pending) return;

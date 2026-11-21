@@ -801,6 +801,7 @@ export default function Launchpad({
   const forceScan = useRef<{ api: typeof api; token: number } | null>(null);
   const refreshSequence = useRef(0);
   const [manualRefreshing, setManualRefreshing] = useState(false);
+  const [lastRefreshedAt, setLastRefreshedAt] = useState<number | null>(null);
   const manualCompletion = useRef<((success: boolean) => void) | null>(null);
   const checkingForUpdates = manualRefreshing || scanRefreshing;
   const checkStatus = scanLoading
@@ -1578,6 +1579,7 @@ export default function Launchpad({
           if (current()) {
             setScanLoading(false);
             setScanRefreshing(false);
+            if (success) setLastRefreshedAt(Date.now());
             if (
               forcedRequest &&
               forceScan.current?.token === forcedRequest.token
@@ -2680,6 +2682,7 @@ export default function Launchpad({
                 : "Refresh Launchpad and check updates"
             }
             refreshing={checkingForUpdates}
+            tooltip={() => refreshedTooltip(lastRefreshedAt)}
             onRefresh={refreshInstalled}
             notify={notify}
           />
@@ -4421,4 +4424,20 @@ export default function Launchpad({
       </dialog>
     </div>
   );
+}
+
+function refreshedTooltip(at: number | null) {
+  if (at === null) return "Refreshed: never";
+  const seconds = Math.max(0, Math.floor((Date.now() - at) / 1000));
+  const unit = (value: number, name: string) =>
+    `${value} ${name}${value === 1 ? "" : "s"}`;
+  const ago =
+    seconds < 60
+      ? unit(seconds, "second")
+      : seconds < 3600
+        ? unit(Math.floor(seconds / 60), "minute")
+        : seconds < 86400
+          ? unit(Math.floor(seconds / 3600), "hour")
+          : unit(Math.floor(seconds / 86400), "day");
+  return `Refreshed: ${ago} ago`;
 }
