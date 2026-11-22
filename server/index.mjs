@@ -91,6 +91,11 @@ import {
   parseProperties,
 } from "./import.mjs";
 
+/** Console lines each server keeps in memory for the panel console. */
+export const CONSOLE_HISTORY_LINES = 10_000;
+/** Upper bound on retained console text, so very long lines cannot exhaust memory. */
+const CONSOLE_HISTORY_CHARS = 8 * 1024 * 1024;
+
 const projectDir = path.resolve(
   path.dirname(fileURLToPath(import.meta.url)),
   "..",
@@ -917,7 +922,10 @@ export async function createPanel(options = {}) {
     }
   };
   let lineId = 0;
+  // Rolling console history. Line ids are consecutive, so a client can ask
+  // for only the lines after the last one it has (see GET /api/console).
   const lines = [];
+  let lineChars = 0;
   const onlinePlayers = new Map();
   const playerUuids = new Map();
   const playerHistory = createPlayerHistory({
@@ -993,7 +1001,14 @@ export async function createPanel(options = {}) {
         .slice(0, 16384),
     };
     lines.push(line);
-    if (lines.length > 1500) lines.splice(0, lines.length - 1500);
+    lineChars += line.message.length;
+    let drop = 0;
+    while (
+      lines.length - drop > CONSOLE_HISTORY_LINES ||
+      (lineChars > CONSOLE_HISTORY_CHARS && lines.length - drop > 1)
+    )
+      lineChars -= lines[drop++].message.length;
+    if (drop) lines.splice(0, drop);
     events.emit("line", line);
   };
   reportPersistenceFailure = (cause) => {
@@ -2409,7 +2424,23 @@ export async function createPanel(options = {}) {
       res.json({ ok: true, iconPreference: state.iconPreference });
     }),
   );
-  app.get("/api/console", (_req, res) => res.json({ lines }));
+  app.get("/api/console", (req, res) => {
+    // `?after=<id>` returns only newer lines when that id is still within the
+    // retained history; otherwise (first load, gap or panel restart) the full
+    // history is returned. `incremental` tells clients they may send `after`.
+    const after =
+      typeof req.query.after === "string" && /^\d{1,15}$/.test(req.query.after)
+        ? Number(req.query.after)
+        : null;
+    const oldest = lines.length ? Number(lines[0].id) : lineId + 1;
+    if (after !== null && after <= lineId && after >= oldest - 1)
+      return res.json({
+        lines: lines.slice(lines.length - (lineId - after)),
+        after: String(after),
+        incremental: true,
+      });
+    res.json({ lines, incremental: true });
+  });
   const loadPlayerHistory = async () => {
     const [cache, savedBans, operators, savedWhitelist, settings] =
       await Promise.all([

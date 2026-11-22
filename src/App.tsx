@@ -3,8 +3,10 @@ import {
   useContext,
   useEffect,
   useId,
+  useMemo,
   useRef,
   useState,
+  type ReactElement,
 } from "react";
 import {
   ArrowDown,
@@ -139,6 +141,9 @@ type LogLine = {
   level: string;
   message: string;
 };
+/** Matches the server's rolling console history. */
+const CONSOLE_HISTORY_LINES = 10_000;
+
 const consoleLevelFilters = [
   { value: "all", label: "All logs" },
   { value: "error", label: "ERROR" },
@@ -1819,17 +1824,45 @@ function ConsolePage({
   const historyDraft = useRef("");
   const logRequest = useRef(0);
   const latestLogResponse = useRef(0);
+  // Last line id received from a host that supports incremental reads, or
+  // null to request the full history (first load, server change, old host).
+  const logCursor = useRef<string | null>(null);
   const loadLogs = useCallback(async () => {
     if (!canConsole) return;
     const request = ++logRequest.current;
+    const after = logCursor.current;
     try {
-      const result = await api<{ lines: LogLine[] }>("/console");
+      const result = await api<{
+        lines: LogLine[];
+        after?: string;
+        incremental?: boolean;
+      }>(after ? `/console?after=${encodeURIComponent(after)}` : "/console");
       if (request < latestLogResponse.current) return;
       latestLogResponse.current = request;
-      const latest = Number(result.lines.at(-1)?.id ?? 0);
-      if (latest && latest < lastLogId.current) setHiddenUntil(null);
-      if (latest) lastLogId.current = latest;
-      setLines(result.lines);
+      const delta =
+        after !== null &&
+        result.after === after &&
+        Number(after) <= lastLogId.current;
+      if (delta) {
+        const fresh = result.lines.filter(
+          (line) => Number(line.id) > lastLogId.current,
+        );
+        if (fresh.length) {
+          lastLogId.current = Number(fresh.at(-1)!.id);
+          setLines((previous) =>
+            [...previous, ...fresh].slice(-CONSOLE_HISTORY_LINES),
+          );
+        }
+      } else {
+        const latest = Number(result.lines.at(-1)?.id ?? 0);
+        if (latest && latest < lastLogId.current) setHiddenUntil(null);
+        if (latest) lastLogId.current = latest;
+        setLines(result.lines);
+      }
+      logCursor.current =
+        result.incremental === true && lastLogId.current
+          ? String(lastLogId.current)
+          : null;
       setLogError(false);
     } catch {
       if (request < latestLogResponse.current) return;
@@ -1839,6 +1872,7 @@ function ConsolePage({
   }, [api, canConsole]);
   useEffect(() => {
     if (!canConsole) return;
+    logCursor.current = null;
     void loadLogs();
     const timer = setInterval(loadLogs, 1500);
     return () => {
@@ -1936,19 +1970,46 @@ function ConsolePage({
     Math.min(100, Math.max(0, (value / cpuCapacity) * 100));
   const cpuUnavailable = unavailable || server?.cpu == null || cpuCapacity <= 0;
   const playersUnavailable = server?.playersAvailable === false;
-  const visibleLines = lines
-    .filter(
-      (line) => hiddenUntil === null || Number(line.id) > Number(hiddenUntil),
-    )
-    .filter(
+  const visibleLines = useMemo(() => {
+    const needle = (showSearch ? query : "").toLowerCase();
+    return lines.filter(
       (line) =>
-        levelFilter === "all" || consoleLevelGroup(line.level) === levelFilter,
-    )
-    .filter((line) =>
-      `${line.message} ${line.level}`
-        .toLowerCase()
-        .includes((showSearch ? query : "").toLowerCase()),
+        (hiddenUntil === null || Number(line.id) > Number(hiddenUntil)) &&
+        (levelFilter === "all" ||
+          consoleLevelGroup(line.level) === levelFilter) &&
+        (!needle ||
+          `${line.message} ${line.level}`.toLowerCase().includes(needle)),
     );
+  }, [lines, hiddenUntil, levelFilter, showSearch, query]);
+  // Reuse each row's element while its line is retained, so appending to a
+  // long history only renders the new rows.
+  const logRows = useRef(new WeakMap<LogLine, ReactElement>());
+  const renderedLines = useMemo(
+    () =>
+      visibleLines.map((line) => {
+        let row = logRows.current.get(line);
+        if (!row) {
+          row = (
+            <div
+              className={`log-line log-${line.level}`}
+              // Keep retained rows mounted so scroll anchoring survives log rotation.
+              key={line.id}
+            >
+              <time>
+                {/^\d{2}:\d{2}/.test(line.time)
+                  ? line.time
+                  : new Date(line.time).toLocaleTimeString("en-GB")}
+              </time>
+              <span className="log-level">{line.level.toUpperCase()}</span>
+              <span className="log-message">{line.message}</span>
+            </div>
+          );
+          logRows.current.set(line, row);
+        }
+        return row;
+      }),
+    [visibleLines],
+  );
   return (
     <>
       <div className="page-heading console-heading">
@@ -2243,23 +2304,7 @@ function ConsolePage({
                   Console connection unavailable. Retrying…
                 </div>
               ) : visibleLines.length ? (
-                visibleLines.map((line) => (
-                  <div
-                    className={`log-line log-${line.level}`}
-                    // Keep retained rows mounted so scroll anchoring survives log rotation.
-                    key={line.id}
-                  >
-                    <time>
-                      {/^\d{2}:\d{2}/.test(line.time)
-                        ? line.time
-                        : new Date(line.time).toLocaleTimeString("en-GB")}
-                    </time>
-                    <span className="log-level">
-                      {line.level.toUpperCase()}
-                    </span>
-                    <span className="log-message">{line.message}</span>
-                  </div>
-                ))
+                renderedLines
               ) : (
                 <div className="console-empty">
                   <Terminal size={24} />

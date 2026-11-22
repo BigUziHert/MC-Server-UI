@@ -119,7 +119,7 @@ for (const width of [1348, 390]) {
     let lines = Array.from({ length: 1000 }, (_, index) => line(index + 1));
     const append = (count: number) => {
       const latest = lines.at(-1)!.id;
-      // Match the server's rolling 1,500-line console history.
+      // Simulate a host whose rolling console history holds 1,500 lines.
       lines = [
         ...lines,
         ...Array.from({ length: count }, (_, index) =>
