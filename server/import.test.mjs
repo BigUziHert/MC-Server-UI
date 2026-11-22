@@ -1314,142 +1314,157 @@ test("startup configuration rejects malformed arguments and paths", () => {
     assert.throws(() => validateServerConfiguration(config));
 });
 
-test("custom launcher restart waits for the entire owned tree after its wrapper exits", async (t) => {
-  const launches = [];
-  const killers = [];
-  const { directory, prepare, boot } = await fixture(t, {
-    stopTimeoutMs: 5,
-    createWindowsProcessTree: (child, settings) => ({
-      terminate: () => terminateProcessTree(child, { ...settings, tree: true }),
-    }),
-    spawnServer: () => {
-      const child = mockServer();
-      child.pid = 12345 + launches.length;
-      // This wrapper does not exit in response to stop; its tree must be drained.
-      child.stdin = new Writable({
-        write(_chunk, _encoding, callback) {
-          callback();
-        },
-      });
-      launches.push(child);
-      return child;
-    },
-    spawnProcess: () => {
-      const killer = new EventEmitter();
-      killers.push(killer);
-      return killer;
-    },
-  });
-  await prepare(directory, { jars: [] });
-  await fs.writeFile(
-    path.join(directory, "run.bat"),
-    "call custom-server.bat\n",
-  );
-  await fs.writeFile(path.join(directory, "eula.txt"), "eula=true\n");
-  const panel = await boot();
-  assert.equal(
-    (
-      await panel.request(
-        "/api/server-import",
-        json("POST", {
-          directory,
-          launchType: "script",
-          launchScript: "run.bat",
-        }),
-      )
-    ).status,
-    201,
-  );
-  assert.equal(
-    (
-      await panel.request(
-        "/api/server/power",
-        json("POST", { action: "start" }),
-      )
-    ).status,
-    200,
-  );
-  assert.equal(
-    (
-      await panel.request(
-        "/api/server/power",
-        json("POST", { action: "restart" }),
-      )
-    ).status,
-    200,
-  );
-  await eventually(() => killers.length === 1);
-  launches[0].emit("close", 1);
-  await new Promise((resolve) => setTimeout(resolve, 10));
-  assert.equal(launches.length, 1);
-  assert.equal((await panel.request("/api/server")).body.status, "stopping");
-  assert.equal(
-    (
-      await panel.request(
-        "/api/server/power",
-        json("POST", { action: "start" }),
-      )
-    ).status,
-    409,
-  );
-  killers[0].emit("close", 0);
-  await eventually(() => launches.length === 2);
-  let closed = false;
-  const closing = panel.close().then(() => (closed = true));
-  await eventually(() => killers.length === 2);
-  launches[1].emit("close", 1);
-  await new Promise((resolve) => setTimeout(resolve, 10));
-  assert.equal(closed, false);
-  killers[1].emit("close", 0);
-  await closing;
-  assert.equal(closed, true);
-});
+// Launches through run.bat, which the panel only starts on Windows.
+test(
+  "custom launcher restart waits for the entire owned tree after its wrapper exits",
+  { skip: process.platform !== "win32" },
+  async (t) => {
+    const launches = [];
+    const killers = [];
+    const { directory, prepare, boot } = await fixture(t, {
+      stopTimeoutMs: 5,
+      createWindowsProcessTree: (child, settings) => ({
+        terminate: () =>
+          terminateProcessTree(child, { ...settings, tree: true }),
+      }),
+      spawnServer: () => {
+        const child = mockServer();
+        child.pid = 12345 + launches.length;
+        // This wrapper does not exit in response to stop; its tree must be drained.
+        child.stdin = new Writable({
+          write(_chunk, _encoding, callback) {
+            callback();
+          },
+        });
+        launches.push(child);
+        return child;
+      },
+      spawnProcess: () => {
+        const killer = new EventEmitter();
+        killers.push(killer);
+        return killer;
+      },
+    });
+    await prepare(directory, { jars: [] });
+    await fs.writeFile(
+      path.join(directory, "run.bat"),
+      "call custom-server.bat\n",
+    );
+    await fs.writeFile(path.join(directory, "eula.txt"), "eula=true\n");
+    const panel = await boot();
+    assert.equal(
+      (
+        await panel.request(
+          "/api/server-import",
+          json("POST", {
+            directory,
+            launchType: "script",
+            launchScript: "run.bat",
+          }),
+        )
+      ).status,
+      201,
+    );
+    assert.equal(
+      (
+        await panel.request(
+          "/api/server/power",
+          json("POST", { action: "start" }),
+        )
+      ).status,
+      200,
+    );
+    assert.equal(
+      (
+        await panel.request(
+          "/api/server/power",
+          json("POST", { action: "restart" }),
+        )
+      ).status,
+      200,
+    );
+    await eventually(() => killers.length === 1);
+    launches[0].emit("close", 1);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    assert.equal(launches.length, 1);
+    assert.equal((await panel.request("/api/server")).body.status, "stopping");
+    assert.equal(
+      (
+        await panel.request(
+          "/api/server/power",
+          json("POST", { action: "start" }),
+        )
+      ).status,
+      409,
+    );
+    killers[0].emit("close", 0);
+    await eventually(() => launches.length === 2);
+    let closed = false;
+    const closing = panel.close().then(() => (closed = true));
+    await eventually(() => killers.length === 2);
+    launches[1].emit("close", 1);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    assert.equal(closed, false);
+    killers[1].emit("close", 0);
+    await closing;
+    assert.equal(closed, true);
+  },
+);
 
-test("graceful-only fleet shutdown cancels an existing stop deadline and waits for the world save", async (t) => {
-  const child = mockServer();
-  const commands = [];
-  child.pid = 12345;
-  child.kill = () =>
-    assert.fail("An update must not force-kill the saving server");
-  child.stdin = new Writable({
-    write(chunk, _encoding, callback) {
-      commands.push(chunk.toString());
-      callback();
-    },
-  });
-  const { directory, prepare, boot } = await fixture(t, {
-    stopTimeoutMs: 30,
-    spawnServer: () => child,
-    spawnProcess: () =>
-      assert.fail("An update must not terminate the process tree"),
-  });
-  await prepare(directory, { jars: [] });
-  await fs.writeFile(
-    path.join(directory, "run.bat"),
-    "call custom-server.bat\n",
-  );
-  await fs.writeFile(path.join(directory, "eula.txt"), "eula=true\n");
-  const panel = await boot();
-  await panel.request(
-    "/api/server-import",
-    json("POST", { directory, launchType: "script", launchScript: "run.bat" }),
-  );
-  await panel.request("/api/server/power", json("POST", { action: "start" }));
-  await panel.request("/api/server/power", json("POST", { action: "stop" }));
-  let completed = false;
-  const closing = panel
-    .close({ gracefulOnly: true })
-    .then(() => (completed = true));
-  try {
-    await new Promise((resolve) => setTimeout(resolve, 80));
-    assert.equal(completed, false);
-    assert.ok(commands.every((command) => command === "stop\n"));
-  } finally {
-    child.emit("close", 0);
-  }
-  await closing;
-  assert.equal(completed, true);
-});
+// Launches through run.bat, which the panel only starts on Windows.
+test(
+  "graceful-only fleet shutdown cancels an existing stop deadline and waits for the world save",
+  { skip: process.platform !== "win32" },
+  async (t) => {
+    const child = mockServer();
+    const commands = [];
+    child.pid = 12345;
+    child.kill = () =>
+      assert.fail("An update must not force-kill the saving server");
+    child.stdin = new Writable({
+      write(chunk, _encoding, callback) {
+        commands.push(chunk.toString());
+        callback();
+      },
+    });
+    const { directory, prepare, boot } = await fixture(t, {
+      stopTimeoutMs: 30,
+      spawnServer: () => child,
+      spawnProcess: () =>
+        assert.fail("An update must not terminate the process tree"),
+    });
+    await prepare(directory, { jars: [] });
+    await fs.writeFile(
+      path.join(directory, "run.bat"),
+      "call custom-server.bat\n",
+    );
+    await fs.writeFile(path.join(directory, "eula.txt"), "eula=true\n");
+    const panel = await boot();
+    await panel.request(
+      "/api/server-import",
+      json("POST", {
+        directory,
+        launchType: "script",
+        launchScript: "run.bat",
+      }),
+    );
+    await panel.request("/api/server/power", json("POST", { action: "start" }));
+    await panel.request("/api/server/power", json("POST", { action: "stop" }));
+    let completed = false;
+    const closing = panel
+      .close({ gracefulOnly: true })
+      .then(() => (completed = true));
+    try {
+      await new Promise((resolve) => setTimeout(resolve, 80));
+      assert.equal(completed, false);
+      assert.ok(commands.every((command) => command === "stop\n"));
+    } finally {
+      child.emit("close", 0);
+    }
+    await closing;
+    assert.equal(completed, true);
+  },
+);
 
 test("an imported folder disappearing during the session does not block unrelated import or creation", async (t) => {
   const { root, directory, prepare, boot } = await fixture(t);
