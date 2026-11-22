@@ -91,6 +91,9 @@
 }
 .launchpad-toolbar-actions {
   position: relative;
+  /* Stay at the right edge, even when the toolbar wraps, so the
+     category panel (anchored to the right) opens on-screen. */
+  margin-left: auto;
   display: flex;
   align-items: center;
   flex: 0 1 auto;
@@ -882,6 +885,9 @@
   }
   .launchpad-project-action .btn {
     width: 100%;
+  }
+  .launchpad-toolbar-actions {
+    margin-left: 0;
   }
   .launchpad-category-panel {
     right: auto;
