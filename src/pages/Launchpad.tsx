@@ -2541,91 +2541,91 @@ export default function Launchpad({
             setOffset(0);
           }}
         />
-        {installedOnly ? (
-          <div className="launchpad-sort">
-            <label htmlFor={sortId}>Sort by</label>
-            <select
-              id={sortId}
-              aria-label={
-                bottom
-                  ? "Sort bottom installed content"
-                  : "Sort installed content"
-              }
-              value={
-                installedSortOptions.some((item) => item.id === installedSort)
-                  ? installedSort
-                  : ""
-              }
-              onChange={(event) => {
-                setInstalledSort(event.target.value as InstalledSort);
-                setInstalledDirection(
-                  defaultInstalledDirection(
-                    event.target.value as InstalledSort,
-                  ),
-                );
-                setOffset(0);
-              }}
-            >
-              {!installedSortOptions.some(
-                (item) => item.id === installedSort,
-              ) && (
-                <option value="" disabled>
-                  Column order
-                </option>
-              )}
-              {installedSortOptions.map((item) => (
-                <option key={item.id} value={item.id}>
-                  {item.label}
-                </option>
-              ))}
-            </select>
-            <button
-              type="button"
-              className="btn icon"
-              aria-label={
-                bottom
-                  ? "Reverse bottom installed sort order"
-                  : "Reverse installed sort order"
-              }
-              title={
-                installedDirection === "asc"
-                  ? "Ascending — click for descending"
-                  : "Descending — click for ascending"
-              }
-              onClick={() => {
-                setInstalledDirection((current) =>
-                  current === "asc" ? "desc" : "asc",
-                );
-                setOffset(0);
-              }}
-            >
-              {installedDirection === "asc" ? (
-                <ArrowUp size={14} />
-              ) : (
-                <ArrowDown size={14} />
-              )}
-            </button>
-          </div>
-        ) : sortOptions.length > 0 && source?.available && supported ? (
-          <label className="launchpad-sort">
-            Sort by
-            <select
-              aria-label={bottom ? "Sort bottom Launchpad" : "Sort Launchpad"}
-              value={catalogSort}
-              onChange={(event) => {
-                setSort(event.target.value);
-                setOffset(0);
-              }}
-            >
-              {sortOptions.map((item) => (
-                <option key={item.id} value={item.id}>
-                  {item.label}
-                </option>
-              ))}
-            </select>
-          </label>
-        ) : null}
-        <div className="launchpad-toolbar-actions">
+        <div className="launchpad-sort-group">
+          {installedOnly ? (
+            <div className="launchpad-sort">
+              <label htmlFor={sortId}>Sort by</label>
+              <select
+                id={sortId}
+                aria-label={
+                  bottom
+                    ? "Sort bottom installed content"
+                    : "Sort installed content"
+                }
+                value={
+                  installedSortOptions.some((item) => item.id === installedSort)
+                    ? installedSort
+                    : ""
+                }
+                onChange={(event) => {
+                  setInstalledSort(event.target.value as InstalledSort);
+                  setInstalledDirection(
+                    defaultInstalledDirection(
+                      event.target.value as InstalledSort,
+                    ),
+                  );
+                  setOffset(0);
+                }}
+              >
+                {!installedSortOptions.some(
+                  (item) => item.id === installedSort,
+                ) && (
+                  <option value="" disabled>
+                    Column order
+                  </option>
+                )}
+                {installedSortOptions.map((item) => (
+                  <option key={item.id} value={item.id}>
+                    {item.label}
+                  </option>
+                ))}
+              </select>
+              <button
+                type="button"
+                className="btn icon"
+                aria-label={
+                  bottom
+                    ? "Reverse bottom installed sort order"
+                    : "Reverse installed sort order"
+                }
+                title={
+                  installedDirection === "asc"
+                    ? "Ascending — click for descending"
+                    : "Descending — click for ascending"
+                }
+                onClick={() => {
+                  setInstalledDirection((current) =>
+                    current === "asc" ? "desc" : "asc",
+                  );
+                  setOffset(0);
+                }}
+              >
+                {installedDirection === "asc" ? (
+                  <ArrowUp size={14} />
+                ) : (
+                  <ArrowDown size={14} />
+                )}
+              </button>
+            </div>
+          ) : sortOptions.length > 0 && source?.available && supported ? (
+            <label className="launchpad-sort">
+              Sort by
+              <select
+                aria-label={bottom ? "Sort bottom Launchpad" : "Sort Launchpad"}
+                value={catalogSort}
+                onChange={(event) => {
+                  setSort(event.target.value);
+                  setOffset(0);
+                }}
+              >
+                {sortOptions.map((item) => (
+                  <option key={item.id} value={item.id}>
+                    {item.label}
+                  </option>
+                ))}
+              </select>
+            </label>
+          ) : null}
           {["mod", "resourcepack", "shader"].includes(type) &&
             (installedOnly ||
               (source?.available &&
@@ -2645,6 +2645,8 @@ export default function Launchpad({
                 }}
               />
             )}
+        </div>
+        <div className="launchpad-toolbar-actions">
           {installedOnly && type !== "modpack" && allowChanges && (
             <button
               className="btn primary"

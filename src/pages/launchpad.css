@@ -84,15 +84,26 @@
   padding: 14px 16px;
 }
 .search-field.launchpad-search {
-  flex: 1 1 200px;
+  flex: 1 1 170px;
   width: auto;
   min-width: 170px;
   max-width: 330px;
 }
+/* Sort by and Filters stay together; the category panel anchors here. */
+.launchpad-sort-group {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex: 0 1 auto;
+  min-width: 0;
+}
+.launchpad-sort-group:empty {
+  display: none;
+}
 .launchpad-toolbar-actions {
   position: relative;
-  /* Stay at the right edge, even when the toolbar wraps, so the
-     category panel (anchored to the right) opens on-screen. */
+  /* Keep refresh at the far right of the row, even when it wraps. */
   margin-left: auto;
   display: flex;
   align-items: center;
@@ -865,8 +876,11 @@
     flex-basis: 100%;
     max-width: none;
   }
-  .launchpad-sort {
+  .launchpad-sort-group {
     flex-basis: 100%;
+  }
+  .launchpad-sort-group .launchpad-sort {
+    flex: 1 1 auto;
   }
   .launchpad-project {
     gap: 13px;
