@@ -1607,7 +1607,7 @@ test("Minecraft heads use UUIDs or usernames and Players polling updates joins a
   await expect(page.locator(".online-players")).toHaveCount(0);
   await openPage(page, "players", "Players");
   const onlineRoster = page.getByRole("region", {
-    name: "Online Players",
+    name: "Online players",
     exact: true,
   });
   const playerRows = onlineRoster.getByRole("listitem");
@@ -1680,7 +1680,7 @@ test("failed skin requests use local Minecraft heads and changing a player ident
   );
   await page.goto("/#players");
   const onlineRoster = page.getByRole("region", {
-    name: "Online Players",
+    name: "Online players",
     exact: true,
   });
   let fallback = onlineRoster.getByRole("img", {
@@ -1699,7 +1699,7 @@ test("failed skin requests use local Minecraft heads and changing a player ident
   expect(failedRequests).toHaveLength(1);
   await expect(
     onlineRoster.getByRole("listitem", {
-      name: "Online Players OfflineSkin",
+      name: "Online players OfflineSkin",
       exact: true,
     }),
   ).toBeVisible();

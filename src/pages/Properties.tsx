@@ -400,13 +400,15 @@ export default function Properties({
       </div>
       <div className="properties-toolbar">
         <SearchField
-          className="storage-search"
+          className="storage-search page-search"
           aria-label="Search properties"
           placeholder="Search properties…"
           value={search}
           onValueChange={setSearch}
         />
-        <span>{filtered.length} properties</span>
+        <span>
+          {filtered.length} {filtered.length === 1 ? "property" : "properties"}
+        </span>
         <RefreshButton
           label="Refresh properties"
           disabled={loading || saving || missingDraft}

@@ -27,6 +27,7 @@ import {
   messageOf,
   type PageProps,
 } from "../api";
+import "./management.css";
 import "./storage.css";
 import "./storage-dialog.css";
 import RefreshButton, { refreshedTooltip } from "../RefreshButton";
@@ -982,16 +983,18 @@ export default function Backups({
             <section className="panel backup-history">
               <div className="storage-section-heading">
                 <div>
-                  <h2>
-                    <History size={17} />
-                    Backup history
-                  </h2>
+                  <div className="storage-section-title">
+                    <h2>
+                      <History size={17} />
+                      Backup history
+                    </h2>
+                    <span className="management-count">{backups.length}</span>
+                  </div>
                   <p>
                     New backups are automatically compressed as .tar.gz
                     archives.
                   </p>
                 </div>
-                <span className="badge">{backups.length} total</span>
                 <RefreshButton
                   label="Refresh backups"
                   disabled={busy || saving}
@@ -1687,7 +1690,7 @@ export default function Backups({
                 onClick={closeDialog}
                 disabled={busy}
               >
-                {dialog === "create" ? "Close" : "Cancel"}
+                {dialog === "create" && showProgress ? "Close" : "Cancel"}
               </button>
               <button
                 className={`btn ${dialog === "create" ? "primary" : "danger"}`}

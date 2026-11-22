@@ -1301,7 +1301,7 @@ function AccessManagement({
           </div>
           <div className="subusers-controls">
             <SearchField
-              className="subusers-search"
+              className="subusers-search page-search"
               aria-label="Search access records"
               placeholder={
                 accountsView ? "Search panel users…" : "Search subusers…"

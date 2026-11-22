@@ -509,6 +509,15 @@
   margin: 0;
   color: var(--storage-muted);
 }
+.storage-section-title {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 0 0 8px;
+}
+.storage-section-title h2 {
+  margin: 0;
+}
 .storage-section-heading .badge {
   font-size: 10px;
   white-space: nowrap;

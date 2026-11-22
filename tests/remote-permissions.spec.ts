@@ -489,7 +489,7 @@ test("remote audit readers keep server filters without offering owner-only panel
   const calls = await sharedPanel(page, ["audit.read"]);
   await page.goto("/#audit");
   await expect(
-    page.getByRole("heading", { name: "Audit logs", exact: true }),
+    page.getByRole("heading", { name: "Audit Logs", exact: true }),
   ).toBeVisible();
   const row = page.getByRole("row").filter({
     hasText: "Updated shared server settings",

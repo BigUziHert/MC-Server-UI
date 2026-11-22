@@ -1770,8 +1770,13 @@ input:disabled {
   padding: 0;
   border: 0;
 }
-.launchpad-toolbar .pagination > span {
+.launchpad-toolbar:not(.launchpad-toolbar-bottom) .pagination > span {
   display: none;
+}
+.launchpad-toolbar-bottom .pagination > span {
+  color: var(--muted);
+  font-size: 12px;
+  white-space: nowrap;
 }
 .players-roster-search {
   margin: 10px;

@@ -756,18 +756,9 @@ export default function Versions({
       {!selected ? (
         <>
           <div className="versions-toolbar">
-            <RefreshButton
-              label="Refresh versions"
-              disabled={jobBusy || submitting || checkingUpdate}
-              onRefresh={() => refresh(true)}
-              notify={notify}
-              successMessage="Versions refreshed."
-              tooltip={() => refreshedTooltip(lastRefreshedAt, loading)}
-            />
             <SearchField
-              className="management-search"
+              className="management-search page-search"
               aria-label="Search server software"
-              grow
               placeholder="Search server software…"
               value={search}
               onValueChange={setSearch}
@@ -777,6 +768,14 @@ export default function Versions({
                 ? `${shownProviders.length} software options`
                 : "Official provider catalogs"}
             </span>
+            <RefreshButton
+              label="Refresh versions"
+              disabled={jobBusy || submitting || checkingUpdate}
+              onRefresh={() => refresh(true)}
+              notify={notify}
+              successMessage="Versions refreshed."
+              tooltip={() => refreshedTooltip(lastRefreshedAt, loading)}
+            />
           </div>
           {loading && !providers.length ? (
             <StatePanel variant="loading" title="Loading server software…" />
@@ -839,14 +838,6 @@ export default function Versions({
               <ArrowLeft size={15} /> All software
             </button>
             <h2>{selected.name}</h2>
-            <RefreshButton
-              label="Refresh versions"
-              disabled={jobBusy || submitting || checkingUpdate}
-              onRefresh={() => refresh(true)}
-              notify={notify}
-              successMessage="Versions refreshed."
-              tooltip={() => refreshedTooltip(lastRefreshedAt, loading)}
-            />
             <a
               className="versions-source"
               href={selected.website}
@@ -855,6 +846,14 @@ export default function Versions({
             >
               Official source <ArrowUpRight size={14} />
             </a>
+            <RefreshButton
+              label="Refresh versions"
+              disabled={jobBusy || submitting || checkingUpdate}
+              onRefresh={() => refresh(true)}
+              notify={notify}
+              successMessage="Versions refreshed."
+              tooltip={() => refreshedTooltip(lastRefreshedAt, loading)}
+            />
           </div>
           <div className="versions-browser">
             <section className="panel versions-releases">

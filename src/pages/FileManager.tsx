@@ -2044,7 +2044,7 @@ export default function FileManager({
         </div>
         <div className="files-filter">
           <SearchField
-            className="storage-search"
+            className="storage-search page-search"
             ref={searchInput}
             placeholder="Search files and folders…"
             aria-label="Search files and folders"
@@ -2052,15 +2052,13 @@ export default function FileManager({
             onValueChange={setQuery}
           />
           <div className="file-selection-slot">
-            {!selectedEntries.length && (
+            {!selectedEntries.length && (error || loading) && (
               <span className="muted files-count">
                 {error
                   ? "Unavailable"
-                  : loading
-                    ? requestedQuery
-                      ? `${searchProgress} matches · searching…`
-                      : "Loading…"
-                    : `${entries.length} ${requestedQuery ? "matches" : "items"}`}
+                  : requestedQuery
+                    ? `${searchProgress} matches · searching…`
+                    : "Loading…"}
               </span>
             )}
             <div
@@ -2427,6 +2425,7 @@ export default function FileManager({
             onPageChange={setPage}
             onPageSizeChange={setPageSize}
             label="files"
+            itemLabel="items"
             disabled={saving}
           />
         )}
@@ -2668,7 +2667,9 @@ export default function FileManager({
                     ? `Create in /${path || "server"}`
                     : dialog.type === "edit" || dialog.type === "rename"
                       ? `/${dialog.entry.path}`
-                      : "You can restore these items from Recycle Bin."}
+                      : dialog.type === "delete-many"
+                        ? "You can restore these items from Recycle Bin."
+                        : "You can restore this item from Recycle Bin."}
                 </p>
               </div>
               <button
@@ -3306,10 +3307,6 @@ function RecycleBin({
       <div className="page-heading">
         <div>
           <h1>Recycle Bin</h1>
-          <p>
-            Restore deleted files and backup archives, or permanently remove
-            recovery data.
-          </p>
         </div>
         <button className="btn" onClick={onBack}>
           <Folder size={16} /> Back to files
@@ -3364,7 +3361,7 @@ function RecycleBin({
         </div>
         <div className="files-filter">
           <SearchField
-            className="storage-search"
+            className="storage-search page-search"
             ref={searchInput}
             aria-label="Search recycled items"
             placeholder="Search recycled items…"

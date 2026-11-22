@@ -23,6 +23,19 @@
 .console-log-search-field {
   flex: 1;
 }
+/* Shared width for a page's main list search. */
+.search-field.page-search {
+  flex: 0 1 330px;
+  width: 330px;
+  max-width: 100%;
+  box-sizing: border-box;
+}
+@media (max-width: 680px) {
+  .search-field.page-search {
+    flex: 1 1 100%;
+    width: 100%;
+  }
+}
 .search-field > svg {
   width: 16px;
   height: 16px;

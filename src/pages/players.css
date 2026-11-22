@@ -29,40 +29,27 @@
 }
 .players-roster {
   min-width: 0;
+  overflow: hidden;
 }
 .players-roster-heading {
   display: flex;
   align-items: center;
-  gap: 8px;
-  min-height: 34px;
-  padding: 0 1px 10px;
-}
-.players-roster-heading h2 {
-  margin: 0;
-  color: var(--text);
-  font-size: 13px;
-  font-weight: 650;
-}
-.players-roster-heading .management-count {
-  font-size: 10px;
-  padding: 2px 5px;
-  min-width: 20px;
-  text-align: center;
+  gap: 10px;
+  min-height: 60px;
+  padding: 12px 16px 12px 18px;
+  border-bottom: 1px solid #272833;
+  box-sizing: border-box;
 }
 .players-roster-tools {
   margin-left: auto;
   display: flex;
   align-items: center;
-  gap: 7px;
+  gap: 8px;
 }
-.players-roster-tools .btn.icon {
-  width: 26px;
-  height: 26px;
-  padding: 4px;
-}
-.players-roster-body {
-  overflow: hidden;
-  border-radius: 6px;
+.players-roster-tools .btn {
+  min-height: 30px;
+  padding: 5px 10px;
+  font-size: 12px;
 }
 .players-roster-body > ul {
   list-style: none;

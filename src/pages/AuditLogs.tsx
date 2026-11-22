@@ -162,7 +162,7 @@ export default function AuditLogs({
     <div className="management-page">
       <div className="page-heading management-heading">
         <div>
-          <h1>Audit logs</h1>
+          <h1>Audit Logs</h1>
         </div>
       </div>
 
@@ -215,8 +215,7 @@ export default function AuditLogs({
               </select>
             )}
             <SearchField
-              className="management-search"
-              grow
+              className="management-search page-search"
               aria-label="Search audit logs"
               placeholder="Search audit logs…"
               value={search}

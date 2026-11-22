@@ -2487,6 +2487,7 @@ export default function Launchpad({
     return (
       <Pagination
         label={bottom ? "Launchpad bottom" : "Launchpad"}
+        itemLabel={installedOnly ? "installed items" : "projects"}
         page={Math.floor(currentOffset / limit) + 1}
         pageSize={limit}
         total={total}
@@ -2530,8 +2531,7 @@ export default function Launchpad({
       >
         {pagination(bottom)}
         <SearchField
-          className="launchpad-search"
-          grow
+          className="launchpad-search page-search"
           aria-label={bottom ? "Search bottom Launchpad" : "Search Launchpad"}
           clearLabel={bottom ? "Clear bottom search" : "Clear search"}
           placeholder={`Search ${contentLabel.toLowerCase()}…`}
@@ -3337,13 +3337,17 @@ export default function Launchpad({
                 onRetry={reloadContent}
               />
             )}
-            <div className="launchpad-result-count">
-              {total.toLocaleString()}{" "}
-              {installedOnly ? "installed items" : "projects"}
-              {listedGameVersion ? ` · Minecraft ${listedGameVersion}` : ""}
-              {listedLoader ? ` · ${loaderName(listedLoader)}` : ""}
-              {installedOnly && <span> · Updates always appear first.</span>}
-            </div>
+            {(listedGameVersion || listedLoader || installedOnly) && (
+              <div className="launchpad-result-count">
+                {[
+                  listedGameVersion && `Minecraft ${listedGameVersion}`,
+                  listedLoader && loaderName(listedLoader),
+                  installedOnly && "Updates always appear first.",
+                ]
+                  .filter(Boolean)
+                  .join(" · ")}
+              </div>
+            )}
             <div
               className={`launchpad-installed-list${hasActive ? " has-active" : ""}`}
               tabIndex={0}

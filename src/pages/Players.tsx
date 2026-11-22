@@ -18,8 +18,9 @@ import {
   LogOut,
   Ban,
   Undo2,
-  Plus,
+  ListChecks,
   UserCheck,
+  UserPlus,
   UserMinus,
 } from "lucide-react";
 import { ServerScope, useServerApi, type PageProps } from "../api";
@@ -118,10 +119,12 @@ function usePlayerPagination<T>(id: string, players: T[], filter = "") {
 
 function Pagination({
   title,
+  label = title.toLowerCase(),
   paging,
   disabled,
 }: {
   title: string;
+  label?: string;
   paging: ReturnType<typeof usePlayerPagination>;
   disabled: boolean;
 }) {
@@ -133,7 +136,7 @@ function Pagination({
       onPageChange={(page) => paging.changePage(page - 1)}
       onPageSizeChange={paging.changeSize}
       pageSizes={pageSizes}
-      label={title.toLowerCase()}
+      label={label}
       disabled={disabled}
       ariaLabels={{
         pageSize: title + " rows per page",
@@ -148,6 +151,8 @@ function Pagination({
 function Roster({
   id,
   title,
+  icon,
+  countLabel,
   players,
   empty,
   loading,
@@ -158,6 +163,8 @@ function Roster({
 }: {
   id: string;
   title: string;
+  icon: ReactNode;
+  countLabel?: string;
   players: Operator[];
   empty: string;
   loading: boolean;
@@ -172,13 +179,16 @@ function Roster({
     if (list.current) list.current.scrollTop = 0;
   }, [paging.scrollKey]);
   return (
-    <section className="players-roster" aria-labelledby={`${id}-title`}>
+    <section className="panel players-roster" aria-labelledby={`${id}-title`}>
       <header className="players-roster-heading">
-        <h2 id={`${id}-title`}>{title}</h2>
-        <span className="management-count">{players.length}</span>
+        <div className="management-section-title">
+          {icon}
+          <h2 id={`${id}-title`}>{title}</h2>
+          <span className="management-count">{players.length}</span>
+        </div>
         <div className="players-roster-tools">{tools}</div>
       </header>
-      <div className="panel players-roster-body">
+      <div className="players-roster-body">
         {children}
         {loading ? (
           <StatePanel variant="loading" title="Loading players…" />
@@ -199,7 +209,12 @@ function Roster({
             ))}
           </ul>
         )}
-        <Pagination title={title} paging={paging} disabled={loading} />
+        <Pagination
+          title={title}
+          label={countLabel}
+          paging={paging}
+          disabled={loading}
+        />
       </div>
     </section>
   );
@@ -632,7 +647,8 @@ export default function Players({
       <div className="players-rosters">
         <Roster
           id="online-players"
-          title="Online Players"
+          title="Online players"
+          icon={<Users size={17} />}
           players={online}
           empty="No players online."
           loading={loading && !data}
@@ -705,7 +721,8 @@ export default function Players({
         />
         <Roster
           id="banned-players"
-          title="Banned Players"
+          title="Banned players"
+          icon={<Ban size={17} />}
           players={banned}
           empty={
             data?.bansAvailable === false
@@ -728,10 +745,26 @@ export default function Players({
         <Roster
           id="operators"
           title="Operators"
+          icon={<ShieldCheck size={17} />}
           players={filtered}
           filter={search}
           empty={search ? "No matching players" : "No operators."}
           loading={loading && !data}
+          tools={
+            <button
+              className="btn"
+              disabled={!canManage || busy}
+              onClick={() => {
+                setName("");
+                setGrantUuid(undefined);
+                setManualGrant(true);
+                setFormError("");
+                setGranting(true);
+              }}
+            >
+              <ShieldPlus size={14} /> Add operator
+            </button>
+          }
           actions={(player) => (
             <button
               className="btn icon"
@@ -755,23 +788,12 @@ export default function Players({
               onValueChange={setSearch}
             />
           )}
-          <button
-            className="btn"
-            disabled={!canManage || busy}
-            onClick={() => {
-              setName("");
-              setGrantUuid(undefined);
-              setManualGrant(true);
-              setFormError("");
-              setGranting(true);
-            }}
-          >
-            <ShieldPlus size={14} /> Add operator
-          </button>
         </Roster>
         <Roster
           id="whitelist"
           title="Whitelist"
+          icon={<ListChecks size={17} />}
+          countLabel="whitelisted players"
           players={whitelist}
           empty={
             data?.whitelistAvailable === false
@@ -782,15 +804,14 @@ export default function Players({
           tools={
             <>
               <button
-                className="btn icon"
+                className="btn"
                 aria-label="Add player to whitelist"
-                title="Add player"
                 disabled={
                   !canManage || busy || data?.whitelistAvailable === false
                 }
                 onClick={() => openWhitelist({ kind: "add" })}
               >
-                <Plus size={14} />
+                <UserPlus size={14} /> Add player
               </button>
               <Switch
                 aria-label="Enable whitelist"
@@ -845,7 +866,7 @@ export default function Players({
           </div>
           <div className="management-controls">
             <SearchField
-              className="management-search"
+              className="management-search page-search"
               aria-label="Search player history"
               clearLabel="Clear player history search"
               placeholder="Search players…"
@@ -1171,6 +1192,7 @@ export default function Players({
               <label htmlFor="whitelist-name">Minecraft username</label>
               <input
                 id="whitelist-name"
+                placeholder="Player_username"
                 value={whitelistName}
                 onChange={(event) => setWhitelistName(event.target.value)}
                 readOnly={Boolean(whitelistAction.player)}

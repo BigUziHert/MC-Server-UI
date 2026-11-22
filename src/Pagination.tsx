@@ -34,6 +34,7 @@ export default function Pagination({
   onPageSizeChange,
   pageSizes = defaultPageSizes,
   label = "results",
+  itemLabel = label,
   disabled = false,
   ariaLabels,
 }: {
@@ -44,6 +45,8 @@ export default function Pagination({
   onPageSizeChange?: (size: number) => void;
   pageSizes?: number[];
   label?: string;
+  /** Visible noun after the count; defaults to `label`. */
+  itemLabel?: string;
   disabled?: boolean;
   ariaLabels?: {
     pageSize: string;
@@ -58,9 +61,9 @@ export default function Pagination({
     <footer className="pagination" aria-label={`${label} pagination`}>
       <span>
         {total
-          ? `${(current - 1) * pageSize + 1}–${Math.min(current * pageSize, total)} of ${total}`
+          ? `${((current - 1) * pageSize + 1).toLocaleString()}–${Math.min(current * pageSize, total).toLocaleString()} of ${total.toLocaleString()}`
           : "0"}{" "}
-        {label}
+        {itemLabel}
       </span>
       <div>
         {onPageSizeChange && (
@@ -90,7 +93,7 @@ export default function Pagination({
           <ChevronLeft size={16} />
         </button>
         <span role="status" aria-label={ariaLabels?.page ?? `${label} page`}>
-          Page {current} of {pages}
+          Page {current.toLocaleString()} of {pages.toLocaleString()}
         </span>
         <button
           type="button"
