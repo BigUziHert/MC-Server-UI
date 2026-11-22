@@ -357,6 +357,10 @@ function rememberDismissedJob(scope: string, id: string) {
   while (dismissedJobs.size > 100)
     dismissedJobs.delete(dismissedJobs.keys().next().value!);
 }
+// The sort in use before typing a search switched to Relevancy.
+type SearchSortRestore =
+  | { mode: "catalog"; sort: string }
+  | { mode: "installed"; sort: InstalledSort; direction: SortDirection };
 type SavedView = {
   platform?: string;
   type?: LaunchpadTab;
@@ -711,6 +715,9 @@ export default function Launchpad({
   const [installedSort, setInstalledSort] = useState<InstalledSort>("name");
   const [installedDirection, setInstalledDirection] =
     useState<SortDirection>("asc");
+  // Clearing the search restores this, unless another sort was picked meanwhile.
+  const [searchSortRestore, setSearchSortRestore] =
+    useState<SearchSortRestore | null>(null);
   const [installedOnly, setInstalledOnly] = useState(false);
   const [categories, setCategories] = useState<string[]>([]);
   const categoryKey = ["mod", "resourcepack", "shader"].includes(type)
@@ -1194,6 +1201,7 @@ export default function Launchpad({
     setSettingsOpen(false);
     setApiKey("");
     setQuery("");
+    setSearchSortRestore(null);
     setSort("downloads");
     setInstalledSort("name");
     setInstalledDirection("asc");
@@ -1243,9 +1251,17 @@ export default function Launchpad({
           gameVersion,
           loader,
           installedOnly,
-          sort,
-          installedSort,
-          installedDirection,
+          sort:
+            searchSortRestore?.mode === "catalog" && sort === "relevance"
+              ? searchSortRestore.sort
+              : sort,
+          ...(searchSortRestore?.mode === "installed" &&
+          installedSort === "relevance"
+            ? {
+                installedSort: searchSortRestore.sort,
+                installedDirection: searchSortRestore.direction,
+              }
+            : { installedSort, installedDirection }),
           categories,
         }),
         "session",
@@ -1266,6 +1282,7 @@ export default function Launchpad({
     sort,
     installedSort,
     installedDirection,
+    searchSortRestore,
     categories,
   ]);
 
@@ -2321,11 +2338,49 @@ export default function Launchpad({
             ? config!.loader!
             : "",
     );
+    restoreSearchSort();
     setQuery("");
     setOffset(0);
     if (next !== type) {
       setResults(null);
       setSearchError("");
+    }
+  }
+  // Typing a search shows the best matches first; clearing it restores the
+  // previous sort unless another one was picked during the search.
+  function changeSearch(value: string) {
+    const searching = Boolean(value.trim());
+    if (searching && !query.trim()) {
+      if (installedOnly) {
+        if (installedSort !== "relevance") {
+          setSearchSortRestore({
+            mode: "installed",
+            sort: installedSort,
+            direction: installedDirection,
+          });
+          setInstalledSort("relevance");
+          setInstalledDirection("desc");
+        }
+      } else if (
+        catalogSort !== "relevance" &&
+        sortOptions.some((item) => item.id === "relevance")
+      ) {
+        setSearchSortRestore({ mode: "catalog", sort: catalogSort });
+        setSort("relevance");
+      }
+    } else if (!searching) restoreSearchSort();
+    setQuery(value);
+    setOffset(0);
+  }
+  function restoreSearchSort() {
+    const saved = searchSortRestore;
+    if (!saved) return;
+    setSearchSortRestore(null);
+    if (saved.mode === "catalog") {
+      if (sort === "relevance") setSort(saved.sort);
+    } else if (installedSort === "relevance") {
+      setInstalledSort(saved.sort);
+      setInstalledDirection(saved.direction);
     }
   }
   function changeTab(next: LaunchpadTab) {
@@ -2536,10 +2591,7 @@ export default function Launchpad({
           clearLabel={bottom ? "Clear bottom search" : "Clear search"}
           placeholder={`Search ${contentLabel.toLowerCase()}…`}
           value={query}
-          onValueChange={(value) => {
-            setQuery(value);
-            setOffset(0);
-          }}
+          onValueChange={changeSearch}
         />
         <div className="launchpad-sort-group">
           {installedOnly ? (
@@ -2673,6 +2725,7 @@ export default function Launchpad({
             }
             checked={installedOnly}
             onCheckedChange={(checked) => {
+              restoreSearchSort();
               setInstalledOnly(checked);
               setOffset(0);
               setQuery("");
@@ -2828,6 +2881,7 @@ export default function Launchpad({
               setPlatform(event.target.value);
               if (type === "shader" && event.target.value === "curseforge")
                 setLoader("");
+              restoreSearchSort();
               setQuery("");
               setOffset(0);
               selectSupportedContent(next);

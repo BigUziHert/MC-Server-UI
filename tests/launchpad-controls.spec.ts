@@ -1969,3 +1969,90 @@ test("top and bottom category filters have distinct panels and share selections 
     path: testInfo.outputPath("bottom-toolbar-filters-mobile.png"),
   });
 });
+
+test("typing a search sorts by Relevancy and clearing it restores the previous sort", async ({
+  page,
+}) => {
+  await catalog(page, undefined, { platform: "modrinth" });
+  const searches: URL[] = [];
+  await page.route("**/api/launchpad/search?**", (route) => {
+    searches.push(new URL(route.request().url()));
+    return route.fulfill({
+      json: { projects: [], total: 0, offset: 0, limit: 10 },
+    });
+  });
+  await page.route("**/api/launchpad/installed?**", (route) =>
+    route.fulfill({
+      json: { items: [installed("Alpha"), installed("Bravo")], warnings: [] },
+    }),
+  );
+  await page.goto("/#launchpad");
+  const top = page.getByRole("group", {
+    name: "Launchpad top controls",
+    exact: true,
+  });
+  const search = top.getByLabel("Search Launchpad", { exact: true });
+  const sort = top.getByLabel("Sort Launchpad", { exact: true });
+  const lastSearch = () => {
+    const url = searches.at(-1);
+    return url
+      ? `${url.searchParams.get("query") ?? ""}|${url.searchParams.get("sort")}`
+      : "";
+  };
+  await sort.selectOption("newest");
+  await expect.poll(lastSearch).toBe("|newest");
+
+  await search.fill("map");
+  await expect(sort).toHaveValue("relevance");
+  await expect.poll(lastSearch).toBe("map|relevance");
+  await search.fill("maps");
+  await expect(sort).toHaveValue("relevance");
+  await top.getByRole("button", { name: "Clear search", exact: true }).click();
+  await expect(sort).toHaveValue("newest");
+  await expect.poll(lastSearch).toBe("|newest");
+
+  // A sort picked during the search is kept after clearing it.
+  await search.fill("map");
+  await expect(sort).toHaveValue("relevance");
+  await sort.selectOption("popular");
+  await search.fill("");
+  await expect(sort).toHaveValue("popular");
+  await expect.poll(lastSearch).toBe("|popular");
+
+  // Leaving mid-search does not bring the page back on Relevancy.
+  await search.fill("map");
+  await expect(sort).toHaveValue("relevance");
+  await page.reload();
+  await expect(sort).toHaveValue("popular");
+  await expect(search).toHaveValue("");
+
+  // Installed content follows the same rule.
+  await top
+    .getByRole("switch", { name: "Show installed content", exact: true })
+    .click();
+  const installedSort = top.getByLabel("Sort installed content", {
+    exact: true,
+  });
+  await installedSort.selectOption("downloads");
+  await search.fill("alp");
+  await expect(installedSort).toHaveValue("relevance");
+  await expect(page.getByRole("article")).toHaveCount(1);
+  await search.fill("");
+  await expect(installedSort).toHaveValue("downloads");
+  await expect(page.getByRole("article")).toHaveCount(2);
+});
+
+test("typing a search keeps the sort on a platform without Relevancy", async ({
+  page,
+}) => {
+  await catalog(page);
+  await page.goto("/#launchpad");
+  const top = page.getByRole("group", {
+    name: "Launchpad top controls",
+    exact: true,
+  });
+  const sort = top.getByLabel("Sort Launchpad", { exact: true });
+  await sort.selectOption("updated");
+  await top.getByLabel("Search Launchpad", { exact: true }).fill("map");
+  await expect(sort).toHaveValue("updated");
+});
