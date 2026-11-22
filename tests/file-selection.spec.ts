@@ -299,6 +299,11 @@ test("file context menu and shortcuts copy, select all, and confirm deletion wit
     page.getByRole("status", { name: "File transfer progress" }),
   ).toContainText("Skipped 1 identical file.");
   await page.keyboard.press("Backspace");
+  // beta.txt was just pasted into archive too, so wait for a row that only
+  // the parent folder has before selecting all.
+  await expect(
+    page.getByRole("button", { name: "archive", exact: true }),
+  ).toBeVisible();
   await expect(beta).toBeVisible();
   await page.keyboard.press("Control+a");
   await expect(

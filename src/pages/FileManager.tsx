@@ -2,6 +2,7 @@ import {
   useCallback,
   useContext,
   useEffect,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
@@ -1475,7 +1476,9 @@ export default function FileManager({
   useEffect(() => setContextMenu(null), [listScope, showingBin, dialog]);
   useEffect(() => () => clipboardReadAbort.current?.abort(), [listScope]);
 
-  useEffect(() => {
+  // Layout effect: re-register before paint so a key pressed as soon as a
+  // folder appears never reaches a handler that still sees it loading.
+  useLayoutEffect(() => {
     const editingText = (target: EventTarget | null) =>
       target instanceof Element &&
       !!target.closest(
