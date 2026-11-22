@@ -654,7 +654,7 @@ test("audit filters show file, server and player actions", async ({
       })
       .toMatchObject(state);
   }
-  await openPage(page, "audit", "Audit logs");
+  await openPage(page, "audit", "Audit Logs");
   const filters = page.getByRole("group", {
     name: "Filter by activity category",
   });
@@ -734,7 +734,7 @@ test("all pages fit a mobile viewport and navigation remains usable", async ({
     { hash: "subusers", heading: "Subusers" },
     { hash: "players", heading: "Players" },
     { hash: "backups", heading: "Backups" },
-    { hash: "audit", heading: "Audit logs" },
+    { hash: "audit", heading: "Audit Logs" },
   ];
   for (const destination of pages) {
     await test.step(destination.heading, async () => {

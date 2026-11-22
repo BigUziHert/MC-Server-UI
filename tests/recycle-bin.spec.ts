@@ -461,7 +461,7 @@ test("protected Recycle Bin restores deleted files and complete folders to their
     exact: true,
   });
   await expect(dialog).toContainText(
-    "You can restore these items from Recycle Bin.",
+    "You can restore this item from Recycle Bin.",
   );
   await dialog
     .getByRole("button", { name: "Move to Recycle Bin", exact: true })
