@@ -240,7 +240,7 @@ test("clicking a search result reveals, selects and scrolls to the exact file on
       .getByRole("button", { name: "deep", exact: true }),
   ).toHaveAttribute("aria-current", "location");
   await expect(page.getByLabel("files pagination")).toContainText(
-    "26–45 of 45 files",
+    "26–45 of 45 items",
   );
   await expect(
     page.getByRole("checkbox", { name: "Select test.json", exact: true }),
@@ -259,7 +259,7 @@ test("clicking a search result reveals, selects and scrolls to the exact file on
     .click();
   await expect(search(page)).toHaveValue("");
   await expect(page.getByLabel("files pagination")).toContainText(
-    "26–45 of 45 files",
+    "26–45 of 45 items",
   );
   await expect(
     page.getByRole("checkbox", { name: "Select test.json", exact: true }),
@@ -334,7 +334,7 @@ test("search stays under the current folder, paginates every match and clears on
   await page.getByRole("button", { name: "Server root", exact: true }).click();
   await search(page).fill("match-");
   await expect(page.getByLabel("files pagination")).toContainText(
-    "1–25 of 34 files",
+    "1–25 of 34 items",
   );
   await page
     .getByRole("checkbox", { name: "Select all visible files and folders" })
@@ -343,7 +343,7 @@ test("search stays under the current folder, paginates every match and clears on
     .getByRole("button", { name: "Next files page", exact: true })
     .click();
   await expect(page.getByLabel("files pagination")).toContainText(
-    "26–34 of 34 files",
+    "26–34 of 34 items",
   );
   await expect(
     page.getByRole("button", { name: "config/deep/match-33.txt", exact: true }),
