@@ -528,7 +528,7 @@ function updateCheckLabel(
       : "No release listed";
   if (entry.updateCheck === "unavailable") return "Update check unavailable";
   if (entry.updateCheck === "pending")
-    return refreshing ? "Checking updates…" : "Update check unavailable";
+    return refreshing ? null : "Update check unavailable";
   return null;
 }
 const modLoaders = ["fabric", "forge", "neoforge", "quilt"];

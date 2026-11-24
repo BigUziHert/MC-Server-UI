@@ -2936,7 +2936,7 @@ test("Launchpad preserves known updates and exposes successful-response provider
   await expect(companion).toContainText("mods/companion.jar");
   await expect(
     companion.getByText("Checking updates…", { exact: true }),
-  ).toBeVisible();
+  ).toHaveCount(0);
   await expect(
     page.getByRole("status", {
       name: "Installed content refresh",
