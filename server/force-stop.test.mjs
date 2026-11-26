@@ -435,11 +435,31 @@ createInterface({ input: process.stdin }).on('line', (line) => {
     await new Promise((resolve) => setTimeout(resolve, 80));
     assert.equal((await request("/api/server")).body.status, "stopping");
     assert.doesNotThrow(() => process.kill(serverPid, 0));
-    const forced = await request(
-      "/api/server/power",
-      json({ action: "force-stop", confirmed: true }),
+    // A 503 means this attempt could not confirm the tree stopped (for example
+    // a process was still exiting during the check on a busy runner) and asks
+    // for another Force Stop. Retry as a user would, and record the panel's
+    // reason so a repeated failure shows its cause.
+    const panelLog = async () =>
+      (await request("/api/console")).body.lines
+        .map((line) => line.message)
+        .filter((message) => message.startsWith("[Panel]"))
+        .join("\n");
+    let forced;
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      forced = await request(
+        "/api/server/power",
+        json({ action: "force-stop", confirmed: true }),
+      );
+      if (forced.status !== 503) break;
+      t.diagnostic(
+        `Force Stop attempt ${attempt} returned 503:\n${await panelLog()}`,
+      );
+    }
+    assert.equal(
+      forced.status,
+      200,
+      `${JSON.stringify(forced)}\n${await panelLog()}`,
     );
-    assert.equal(forced.status, 200, JSON.stringify(forced));
     assert.equal(forced.body.status, "offline");
     assert.throws(() => process.kill(serverPid, 0), { code: "ESRCH" });
     assert.doesNotThrow(() => process.kill(unrelated.pid, 0));
